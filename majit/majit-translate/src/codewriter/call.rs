@@ -92,6 +92,22 @@ pub fn access_directly_origin_path(path: &CallPath) -> Option<CallPath> {
     Some(origin)
 }
 
+/// The identity-qualified spelling of `origin`'s funcobj among `aliases`
+/// (`trait_impl_identity_path`), or `origin` when this funcobj has no
+/// such alias. `FunctionDesc.cachedgraph` stores the `(AccessDirect, None)`
+/// graph on that same desc, so the AccessDirect copy must name it.
+pub(crate) fn access_directly_identity_origin(origin: &CallPath, aliases: &[CallPath]) -> CallPath {
+    aliases
+        .iter()
+        .find(|path| {
+            path.segments
+                .iter()
+                .any(|seg| crate::front::mir::is_trait_impl_identity_segment(seg))
+        })
+        .cloned()
+        .unwrap_or_else(|| origin.clone())
+}
+
 /// True when `kind` is an identity whose result is the value it reloads or
 /// casts: the predicates `jtransform` folds to `same_as`, plus a GC-root
 /// reload (`is_gc_root_reload`). The reloaded value is the call's first
@@ -2776,6 +2792,14 @@ impl StoreCore {
             return;
         };
         std::rc::Rc::make_mut(slot).remove_path(path);
+    }
+
+    /// Origin used to look up the FunctionDesc of an AccessDirect copy:
+    /// the identity-qualified spelling of the funcobj `path` copies
+    /// (`cachedgraph`).
+    pub(crate) fn access_directly_desc_origin(&self, path: &CallPath) -> CallPath {
+        let origin = access_directly_origin_path(path).unwrap_or_else(|| path.clone());
+        access_directly_identity_origin(&origin, &self.alias_paths(&origin))
     }
 
     /// Register `path` as another spelling of the funcobj `existing` names,
@@ -5851,7 +5875,10 @@ impl CallControl {
         // (`bookkeeper.py` `Bookkeeper.getdesc`); an Opaque FunDecl
         // (`extfunc.py`) is not harvested, so a missing direct record
         // on an unharvested foreign crate is not an alias of `module::f`.
-        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix_with(
+            &path.segments,
+            &self.struct_fields.foreign_callables,
+        ) {
             let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
             if let Some(alt) = self.func_effects(&stripped)
                 && (alt.recorded_oopspec().is_some()
@@ -7086,7 +7113,13 @@ impl CallControl {
     /// backs a residual call in upstream only if the graph is not looked
     /// inside.
     fn ensure_access_directly_copy(&mut self, origin: &CallPath) -> Option<CallPath> {
-        let ad_path = access_directly_path(origin);
+        let aliases = self.function_graphs.alias_paths(origin);
+        // `cachedgraph` stores the `(AccessDirect, None)` graph on the
+        // same FunctionDesc as the regular graph. Trait-impl methods
+        // register that desc under `trait_impl_identity_path`, so the
+        // copy's CallPath must keep that identity.
+        let identity_origin = access_directly_identity_origin(origin, &aliases);
+        let ad_path = access_directly_path(&identity_origin);
         if self.function_graphs.contains_key(&ad_path) {
             return Some(ad_path);
         }
@@ -7094,7 +7127,6 @@ impl CallControl {
         if origin_graph.func.jit_look_inside == Some(false) {
             return None;
         }
-        let aliases = self.function_graphs.alias_paths(origin);
         // `description.py FunctionDesc.cachedgraph` → `copygraph`: a
         // distinct graph with fresh Variables. `FunctionGraph.clone`
         // aliases `Variable` identity (`Rc`), so the AccessDirect
@@ -8992,7 +9024,10 @@ impl CallControl {
         if self.has_callable_graph(path) {
             return Some(path.clone());
         }
-        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix(&path.segments) {
+        if let Some(stripped_segs) = crate::local_crates::strip_alias_crate_prefix_with(
+            &path.segments,
+            &self.struct_fields.foreign_callables,
+        ) {
             let stripped = CallPath::from_segments(stripped_segs.iter().map(String::as_str));
             if self.has_callable_graph(&stripped) {
                 return Some(stripped);
@@ -13205,6 +13240,19 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Ref,
             2 * crate::layout::target_word_size(),
         ),
+        // A shared `&[u8]` / `*const [u8]` / `Option<&[u8]>` is the
+        // two-word fat window `{data: Address, len: Signed}`. Data is
+        // `CCHARP`, not a GC pointer. `&mut [u8]` stays the list arm
+        // below.
+        s if majit_ir::descr::is_shared_u8_slice_spelling(s)
+            || majit_ir::descr::is_option_of_u8_window_spelling(s) =>
+        {
+            (
+                ArrayFlag::Struct,
+                majit_ir::value::Type::Int,
+                2 * crate::layout::target_word_size(),
+            )
+        }
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
             || s.starts_with("Box<")
@@ -14279,6 +14327,28 @@ mod tests {
         BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
     };
 
+    /// `cachedgraph` stores the AccessDirect copy on the identity-qualified
+    /// FunctionDesc (`trait_impl_identity_path`). Charon's `<Impl>` token
+    /// is not that identity.
+    #[test]
+    fn access_directly_identity_origin_prefers_the_impl_segment() {
+        let origin = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let identity = CallPath::from_segments([
+            "eval",
+            "<Impl>",
+            "<impl SharedOpcodeHandler for PyFrame>",
+            "anchor",
+        ]);
+        assert_eq!(
+            access_directly_identity_origin(&origin, &[origin.clone(), identity.clone()]),
+            identity
+        );
+        assert_eq!(
+            access_directly_identity_origin(&origin, &[origin.clone()]),
+            origin
+        );
+    }
+
     /// Production BFS (`helper_roots` empty) seeds the builtin-wrapper PBC
     /// family into `candidate_graphs`, the two-phase prepass's subject set.
     /// RPython `call.py find_all_graphs` reaches `BuiltinCode.func` from the
@@ -14301,6 +14371,21 @@ mod tests {
             cc.is_candidate(&wrapper),
             "a registered __majit_wrap_* graph must be a two-phase candidate"
         );
+    }
+
+    /// A shared `&[u8]` is two words (`two_word_fat_struct`). A W1
+    /// `*const BytesBlock` stays one GC word.
+    #[test]
+    fn get_type_flag_shared_u8_slice_is_two_word_fat() {
+        let word = crate::layout::target_word_size();
+        let (flag, ty, size) = get_type_flag("&[u8]", &HashSet::new());
+        assert_eq!(size, 2 * word);
+        assert_eq!(flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_ne!(ty, majit_ir::value::Type::Ref);
+        let (_, _, size_bb) = get_type_flag("*const BytesBlock", &HashSet::new());
+        assert_eq!(size_bb, word);
+        let (_, _, size_opt) = get_type_flag("Option<&[u8]>", &HashSet::new());
+        assert_eq!(size_opt, 2 * word);
     }
 
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
@@ -16811,6 +16896,71 @@ mod tests {
         let g1 = cc.function_graphs().get(&ad).expect("AD copy");
         let g2 = cc.function_graphs().get(&alias_ad).expect("alias AD copy");
         assert!(std::rc::Rc::ptr_eq(&g1, &g2));
+    }
+
+    /// A hinted call at the plain impl-method path keys the AccessDirect
+    /// copy on the identity-qualified origin of the same funcobj
+    /// (`FunctionDesc.cachedgraph`).
+    #[test]
+    fn access_directly_copy_keys_the_identity_qualified_origin() {
+        let mut cc = CallControl::new();
+        let identity = CallPath::from_segments([
+            "eval",
+            "<Impl>",
+            "<impl SharedOpcodeHandler for PyFrame>",
+            "anchor",
+        ]);
+        let plain = CallPath::from_segments(["eval", "<Impl>", "anchor"]);
+        let mut inner = FunctionGraph::new("anchor");
+        inner.source_identity =
+            Some("eval::<Impl>::<impl SharedOpcodeHandler for PyFrame>::anchor".into());
+        let ip = inner.alloc_value_var();
+        inner.block_mut(inner.startblock).inputargs.push(ip);
+        cc.register_function_graph(identity.clone(), inner.clone());
+        cc.register_function_graph(plain.clone(), inner);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(plain.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path.clone()]);
+
+        let identity_ad = access_directly_path(&identity);
+        assert!(
+            cc.function_graphs().get(&identity_ad).is_some(),
+            "AccessDirect copy must name the identity-qualified origin"
+        );
+        let caller = cc.function_graphs().get(&caller_path).expect("caller");
+        let targets: Vec<_> = caller.blocks[0]
+            .operations
+            .iter()
+            .filter_map(call_op_target_path)
+            .collect();
+        assert!(
+            targets.contains(&identity_ad),
+            "AccessDirect call must name the identity copy: {targets:?}"
+        );
+        assert!(cc.is_candidate(&identity_ad));
     }
 
     /// An AccessDirect graph that forwards its flagged input retargets the
@@ -23543,36 +23693,37 @@ mod tests {
     /// local-crate alias (`bookkeeper.py` `Bookkeeper.getdesc`).
     #[test]
     fn graphs_from_and_bfs_agree_on_foreign_body_crate_qualified_function_path() {
-        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
-            let mut cc = CallControl::new();
-            let registered = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
-            let portal = CallPath::from_segments(["portal"]);
-            let spelled = CallTarget::function_path(["core", "num", "<Impl>", "div_ceil"]);
-            cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
-            cc.register_function_graph(registered.clone(), FunctionGraph::new("div_ceil"));
-            cc.mark_portal(portal.clone());
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "num::<Impl>::div_ceil");
+        cc.set_struct_fields(fields);
+        let registered = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
+        let portal = CallPath::from_segments(["portal"]);
+        let spelled = CallTarget::function_path(["core", "num", "<Impl>", "div_ceil"]);
+        cc.register_function_graph(portal.clone(), graph_calling("portal", spelled.clone()));
+        cc.register_function_graph(registered.clone(), FunctionGraph::new("div_ceil"));
+        cc.mark_portal(portal.clone());
 
-            let mut policy = crate::policy::DefaultJitPolicy::new();
-            cc.find_all_graphs(&mut policy);
-            assert!(
-                cc.is_candidate(&registered),
-                "BFS must follow the crate-stripped funcobj of a FunDecl with a body"
-            );
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_all_graphs(&mut policy);
+        assert!(
+            cc.is_candidate(&registered),
+            "BFS must follow the crate-stripped funcobj of a FunDecl with a body"
+        );
 
-            let portal_graph = cc
-                .function_graphs
-                .get(&portal)
-                .expect("portal graph")
-                .clone();
-            let op = &portal_graph.block(portal_graph.startblock).operations[0];
-            assert_eq!(
-                cc.graphs_from(op),
-                Some(vec![registered.clone()]),
-                "emit must use the registered stripped path BFS followed"
-            );
-            assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
-            assert!(cc.direct_graph_for(&spelled).is_some());
-        });
+        let portal_graph = cc
+            .function_graphs
+            .get(&portal)
+            .expect("portal graph")
+            .clone();
+        let op = &portal_graph.block(portal_graph.startblock).operations[0];
+        assert_eq!(
+            cc.graphs_from(op),
+            Some(vec![registered.clone()]),
+            "emit must use the registered stripped path BFS followed"
+        );
+        assert_eq!(cc.guess_call_kind(op), CallKind::Regular);
+        assert!(cc.direct_graph_for(&spelled).is_some());
     }
 
     /// A FunctionPath whose leaf equals an impl method's leaf must not

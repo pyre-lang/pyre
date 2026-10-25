@@ -104,6 +104,9 @@ pub struct Llbc {
     /// once from every `FunDecl` this artefact carries (local and
     /// external). `None` once the scan has finished without a match.
     eval_fn_type_id: std::sync::OnceLock<Option<u64>>,
+    /// First name segment of every `FunDecl` that carries an unstructured
+    /// body, sorted and deduplicated. Resolved once from the artefact.
+    body_crate_roots: std::sync::OnceLock<Vec<String>>,
     /// Function paths, from this artefact or any it links against, whose
     /// body can leave shadow-stack slots published past its return or read
     /// slots below the depth it was entered at.  A caller that calls one
@@ -327,6 +330,7 @@ impl Llbc {
             root_stack_effects: parking_lot::RwLock::new((Vec::new(), Vec::new())),
             exception_carrier: parking_lot::RwLock::new(String::new()),
             eval_fn_type_id: std::sync::OnceLock::new(),
+            body_crate_roots: std::sync::OnceLock::new(),
             stack_sensitive_fns: parking_lot::RwLock::new(Vec::new()),
             stack_sensitive_ready: std::sync::atomic::AtomicBool::new(false),
             stack_depth_neutral_fns: parking_lot::RwLock::new(Vec::new()),
@@ -440,6 +444,27 @@ impl Llbc {
                 .and_then(|fd| fd.signature.inputs.first())
                 .and_then(tyref_dedup_id)
         })
+    }
+
+    /// Whether some `FunDecl` whose first name segment is `crate_root`
+    /// carries an unstructured body. The root set is computed once.
+    pub fn has_body_under_crate_root(&self, crate_root: &str) -> bool {
+        self.body_crate_roots
+            .get_or_init(|| {
+                let mut roots: Vec<String> = self
+                    .iter_fun_decls()
+                    .filter(|fd| fd.has_unstructured_body())
+                    .filter_map(|fd| match fd.item_meta.name.first() {
+                        Some(ullbc::NameSeg::Ident { ident: (root, _) }) => Some(root.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                roots.sort();
+                roots.dedup();
+                roots
+            })
+            .binary_search_by(|root| root.as_str().cmp(crate_root))
+            .is_ok()
     }
 
     /// Record function paths whose shadow-stack effect a caller cannot see

@@ -1753,14 +1753,15 @@ fn a_char_element_indexes_to_an_int_banked_array_read() {
 }
 
 /// `align.unwrap_or('>')` over an `Option<char>` joins the `Some` payload with
-/// the literal default. A `char` is an int-kind scalar, so both links into the
-/// join carry an Int: the payload read and the literal's `ConstInt` code point.
-/// A literal lowered as a `__str_const` string would put a Ref on one link and
-/// an Int on the other, which `flatten` cannot rename into one register.
+/// the literal default. A Rust `char` is a Unicode scalar
+/// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`): the literal
+/// is the integer code point plus `unichr`. Both links into the join are
+/// int-kind (`UniChar` rtypes in the int bank). A `__str_const` string
+/// would put a Ref on one link, which `flatten` cannot rename.
 #[test]
 fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
     use majit_translate::flowspace::model::Variable;
-    use majit_translate::model::{LinkArg, OpKind, ValueType};
+    use majit_translate::model::{CallTarget, LinkArg, OpKind, ValueType};
 
     let graph = lower_function(load_corpus(), "char_unwrap_or_join").expect("lowering");
     let producer = |var: &Variable| -> Option<&OpKind> {
@@ -1772,11 +1773,15 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
             .map(|op| &op.kind)
     };
     assert!(
-        !graph.blocks.iter().flat_map(|b| b.operations.iter()).any(|op| matches!(
-            &op.kind,
-            OpKind::Call { target: majit_translate::model::CallTarget::FunctionPath { segments, .. }, .. }
-                if segments.first().map(String::as_str) == Some("__str_const")
-        )),
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.first().map(String::as_str) == Some("__str_const")
+            )),
         "a char literal lowers to no __str_const",
     );
     assert!(
@@ -1787,9 +1792,11 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
             .any(|op| matches!(op.kind, OpKind::ConstInt(0x3e))),
         "the '>' default is the Int code point 0x3e",
     );
-    // Every link argument into a block input produced by the literal or by
-    // the `Some.__pos_0` payload read is int-kind, and at least one input
-    // receives both — the `unwrap_or` join.
+    let is_unichr =
+        |segments: &[String]| segments.first().map(String::as_str) == Some("__majit_unichr");
+    // Every link argument into a block input produced by the unichr
+    // literal or by the `Some.__pos_0` payload read is int-kind, and at
+    // least one input receives both — the `unwrap_or` join.
     let mut joins = 0;
     for target in &graph.blocks {
         for (slot, _) in target.inputargs.iter().enumerate() {
@@ -1800,7 +1807,11 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
                         continue;
                     };
                     match producer(v) {
-                        Some(OpKind::ConstInt(0x3e)) => kinds.push(("literal", ValueType::Int)),
+                        Some(OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            result_ty,
+                            ..
+                        }) if is_unichr(segments) => kinds.push(("literal", result_ty.clone())),
                         Some(OpKind::FieldRead { field, ty, .. }) if field.name == "__pos_0" => {
                             kinds.push(("payload", ty.clone()))
                         }

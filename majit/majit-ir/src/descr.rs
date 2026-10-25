@@ -947,9 +947,10 @@ pub fn strip_instantiation_suffix(name: &str) -> &str {
 
 /// Shared immutable `&[u8]` / `*const [u8]` (and Charon `&Slice<u8>`).
 ///
-/// RPython bytes are `str` (`rstr.py` `STR` / `SomeString`). A shared
-/// byte slice is that string; `&mut [u8]`, `*mut [u8]`, bare `[u8]`,
-/// `Vec<u8>`, and `Box<[u8]>` stay a list of unsigned.
+/// A shared byte slice is the two-word fat window `{data, len}`
+/// (`two_word_fat_struct` / `dyn_fat_field_annotation`). It is not
+/// `rstr.py` `STR`. `&mut [u8]`, `*mut [u8]`, bare `[u8]`, `Vec<u8>`,
+/// and `Box<[u8]>` stay a list of unsigned.
 pub fn is_shared_u8_slice_spelling(spelling: &str) -> bool {
     let t = spelling.trim();
     let rest = if let Some(rest) = t.strip_prefix("*const ") {
@@ -972,6 +973,17 @@ pub fn is_shared_u8_slice_spelling(spelling: &str) -> bool {
     rest == "[u8]" || rest == "Slice<u8>"
 }
 
+/// `Option<&[u8]>` / Charon `Option<[u8]>` / `Option<Slice<u8>>`: a
+/// nullable window, not a nullable `STR`.
+pub fn is_option_of_u8_window_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    let Some(inner) = t.strip_prefix("Option<").and_then(|s| s.strip_suffix('>')) else {
+        return false;
+    };
+    let inner = inner.trim();
+    is_shared_u8_slice_spelling(inner) || inner == "[u8]" || inner == "Slice<u8>"
+}
+
 /// Whether `spelling` is a list-shaped container type (`Vec<T>`,
 /// `VecDeque<T>`, `&[T]`, `[T; N]`, Charon builtin `Slice<T>`) that the
 /// annotator's `project_struct_field_type` maps to a `SomeList` element
@@ -982,7 +994,7 @@ pub fn is_shared_u8_slice_spelling(spelling: &str) -> bool {
 /// parameter seam route it through the list model instead.  Mirrors the
 /// `Vec<` / `[` / `Slice<` arms of `project_struct_field_type`.
 ///
-/// A shared `&[u8]` is `rstr.py` `STR`, not this family.
+/// A shared `&[u8]` is a fat window, not this family.
 pub fn is_list_container_spelling(spelling: &str) -> bool {
     if is_shared_u8_slice_spelling(spelling) {
         return false;
@@ -10739,6 +10751,11 @@ mod tests {
         assert!(!is_shared_u8_slice_spelling("&mut [u8]"));
         assert!(!is_shared_u8_slice_spelling("[u8]"));
         assert!(!is_shared_u8_slice_spelling("&[u8; 4]"));
+        assert!(is_option_of_u8_window_spelling("Option<&[u8]>"));
+        assert!(is_option_of_u8_window_spelling("Option<[u8]>"));
+        assert!(is_option_of_u8_window_spelling("Option<Slice<u8>>"));
+        assert!(!is_option_of_u8_window_spelling("Option<&mut [u8]>"));
+        assert!(!is_option_of_u8_window_spelling("&[u8]"));
     }
 
     #[test]

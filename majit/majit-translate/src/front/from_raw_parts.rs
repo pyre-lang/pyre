@@ -41,6 +41,11 @@ use crate::flowspace::model::Variable;
 use crate::front::mir::{resolve_to_producer_op, value_type_bank};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
+/// `llmemory.offsetof(STR, 'chars')`: hash, then length, then chars
+pub(crate) fn str_chars_offset() -> u64 {
+    2 * crate::layout::target_word_size() as u64
+}
+
 /// Rewrite every residual `from_raw_parts{,_mut}` whose pointer is a
 /// length-prefixed GC-string header view into `same_as(header)`.  Returns
 /// the number of sites rewritten.
@@ -67,6 +72,13 @@ pub(crate) fn rewire_from_raw_parts_sites(graph: &mut FunctionGraph) -> usize {
         let Some(live_ty) = var_value_type(graph, &live) else {
             continue;
         };
+        // Dest is W1 (`ValueType::Str`) → identity on the header.
+        // Dest is a window → do not alias the slice to the header; the
+        // front already planted `{chars, len}` or the residual stays a
+        // window (F5).
+        if !matches!(result_ty, ValueType::Str) {
+            continue;
+        }
         if bytes_block || matches!(live_ty, ValueType::Str) {
             result_ty = ValueType::Str;
         }
@@ -210,9 +222,7 @@ fn chars_field_header(graph: &FunctionGraph, ptr: &Variable) -> Option<Variable>
 }
 
 fn is_chars_offset(n: i64) -> bool {
-    // `llmemory.offsetof(STR, 'chars')` — hash, then len, then chars.
-    // pyre lays that out as `LOWLEVEL_STRING_CHARS_OFFSET` (two words).
-    n == (2 * crate::layout::target_word_size()) as i64
+    n == str_chars_offset() as i64
 }
 
 fn const_int_of(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
@@ -484,7 +494,7 @@ mod tests {
                 OpKind::Call {
                     target: from_raw_parts_target(),
                     args: crate::model::call_args(vec![chars, len]),
-                    result_ty: ValueType::Ref(None),
+                    result_ty: ValueType::Str,
                 },
                 true,
             )
@@ -511,8 +521,105 @@ mod tests {
                     result_ty: ValueType::Str,
                     ..
                 } => {}
-                other => panic!("BytesBlock view must be Str, got {other:?}"),
+                other => panic!("BytesBlock view dest STR must be Str, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn chars_field_from_raw_parts_window_dest_is_not_str() {
+        let mut g = FunctionGraph::new("test_from_raw_parts_chars_window");
+        let a = g.startblock;
+        let header = g
+            .push_op_var(
+                a,
+                OpKind::Input {
+                    name: "block".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let chars = g
+            .push_op_var(
+                a,
+                OpKind::FieldRead {
+                    base: header.clone(),
+                    field: FieldDescriptor {
+                        name: "chars".to_string(),
+                        owner_root: Some("BytesBlock".to_string()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: true,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let len = g
+            .push_op_var(
+                a,
+                OpKind::FieldRead {
+                    base: header.clone(),
+                    field: FieldDescriptor {
+                        name: "length".to_string(),
+                        owner_root: Some("BytesBlock".to_string()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ty: ValueType::Unsigned,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let slice = g
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: from_raw_parts_target(),
+                    args: crate::model::call_args(vec![chars, len]),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        g.set_return(a, Some(slice.clone()));
+
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
+        assert!(
+            residual_from_raw_parts(&g),
+            "window dest must not alias the STR header"
+        );
+        let slice_op = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&slice))
+            .expect("from_raw_parts result");
+        match &slice_op.kind {
+            OpKind::Call {
+                result_ty: ValueType::Str,
+                ..
+            }
+            | OpKind::UnaryOp {
+                result_ty: ValueType::Str,
+                ..
+            } => panic!("window dest from_raw_parts must not be Str"),
+            _ => {}
         }
     }
 
@@ -521,7 +628,7 @@ mod tests {
         let mut g = FunctionGraph::new("test_from_raw_parts_utf8");
         let a = g.startblock;
         let header = str_header(&mut g, a);
-        let chars_off = (2 * crate::layout::target_word_size()) as i64;
+        let chars_off = str_chars_offset() as i64;
         let offset = g.push_op_var(a, OpKind::ConstInt(chars_off), true).unwrap();
         let chars = g
             .push_op_var(
@@ -551,7 +658,7 @@ mod tests {
                 OpKind::Call {
                     target: from_raw_parts_target(),
                     args: crate::model::call_args(vec![chars, len]),
-                    result_ty: ValueType::Ref(None),
+                    result_ty: ValueType::Str,
                 },
                 true,
             )
@@ -574,7 +681,7 @@ mod tests {
         let mut g = FunctionGraph::new("test_from_raw_parts_sub");
         let a = g.startblock;
         let header = str_header(&mut g, a);
-        let chars_off = (2 * crate::layout::target_word_size()) as i64;
+        let chars_off = str_chars_offset() as i64;
         let offset = g.push_op_var(a, OpKind::ConstInt(chars_off), true).unwrap();
         let chars = g
             .push_op_var(
@@ -708,7 +815,7 @@ mod tests {
         let h_add = b_add_args[0].clone();
         let len_add = b_add_args[1].clone();
         g.set_goto(b_len, b_add, vec![h_len, len.clone()]);
-        let chars_off = (2 * crate::layout::target_word_size()) as u64;
+        let chars_off = str_chars_offset();
         let offset = g
             .push_op_var(b_add, OpKind::ConstUInt(chars_off), true)
             .unwrap();
@@ -741,24 +848,14 @@ mod tests {
             .unwrap();
         g.set_return(b_frp, Some(slice));
 
-        assert_eq!(rewire_from_raw_parts_sites(&mut g), 1);
+        // Dest `ValueType::Ref(None)` is a window, not W1 STR. The
+        // post-pass only aliases a header-proven view when the dest is
+        // `Str`; a window keeps `{chars, len}` / the residual call (F5).
+        assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
         assert!(
-            !residual_from_raw_parts(&g),
-            "SSA+cast STR header view must be gone"
+            residual_from_raw_parts(&g),
+            "window dest from_raw_parts stays residual"
         );
-        let frp = &g.blocks[b_frp.0];
-        assert!(
-            frp.operations
-                .iter()
-                .all(|op| { !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "same_as") }),
-            "the slice is the threaded header, with no same_as copy"
-        );
-        assert_eq!(
-            frp.inputargs.len(),
-            3,
-            "header must be threaded onto the unique predecessor edge"
-        );
-        assert_eq!(frp.exits[0].args[0].as_variable(), Some(&frp.inputargs[2]));
     }
 
     #[test]
@@ -893,11 +990,7 @@ mod tests {
         let live_int = b_args[0].clone();
         g.set_goto(a, b, vec![as_int]);
         let offset = g
-            .push_op_var(
-                b,
-                OpKind::ConstInt((2 * crate::layout::target_word_size()) as i64),
-                true,
-            )
+            .push_op_var(b, OpKind::ConstInt(str_chars_offset() as i64), true)
             .unwrap();
         let chars = g
             .push_op_var(
@@ -964,12 +1057,24 @@ mod tests {
                 true,
             )
             .unwrap();
-        g.set_return(a, Some(slice));
+        g.set_return(a, Some(slice.clone()));
 
         assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
         assert!(
             residual_from_raw_parts(&g),
             "an unproven ptr+len view must stay residual"
+        );
+        let slice_ty = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&slice))
+            .and_then(|op| match &op.kind {
+                OpKind::Call { result_ty, .. } => Some(result_ty),
+                _ => None,
+            });
+        assert!(
+            !matches!(slice_ty, Some(ValueType::Str)),
+            "residual from_raw_parts of a non-STR address is a window"
         );
     }
 
@@ -1045,12 +1150,24 @@ mod tests {
                 true,
             )
             .unwrap();
-        g.set_return(a, Some(slice));
+        g.set_return(a, Some(slice.clone()));
 
         assert_eq!(rewire_from_raw_parts_sites(&mut g), 0);
         assert!(
             residual_from_raw_parts(&g),
             "an exporter window is not a GC-string header"
+        );
+        let slice_ty = g.blocks[a.0]
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref() == Some(&slice))
+            .and_then(|op| match &op.kind {
+                OpKind::Call { result_ty, .. } => Some(result_ty),
+                _ => None,
+            });
+        assert!(
+            !matches!(slice_ty, Some(ValueType::Str)),
+            "exporter window from_raw_parts is not Str"
         );
     }
 

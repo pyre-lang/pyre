@@ -1259,7 +1259,7 @@ fn is_vec_push_segments(segments: &[String]) -> bool {
 /// `ll_dict_setitem_with_hash` / `ll_dict_get`). The owner segment is the
 /// type; `unspecialized_leaf` sees through the monomorphized copy. The
 /// hash in the leaf is not part of the match.
-fn rdict_type_leaf(seg: &str) -> bool {
+pub(crate) fn rdict_type_leaf(seg: &str) -> bool {
     let leaf = seg.rsplit("::").next().unwrap_or(seg);
     leaf == "RDict" || leaf.starts_with("RDict<")
 }
@@ -3383,6 +3383,12 @@ pub fn translate_op(
                         {
                             Some("get_raw_address_of_string")
                         }
+                        [leaf]
+                            if leaf
+                                == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST =>
+                        {
+                            Some("nonmoving_raw_ptr_for_resizable_list")
+                        }
                         _ => None,
                     };
                     if let Some(builtin) = builtin {
@@ -5219,6 +5225,16 @@ pub(crate) fn derive_subject_inputcells(
                 ));
                 continue;
             }
+            // Window pair data is Unsigned (`getcalldescr` Int-kind) named
+            // `CCHARP`. `valuetype_to_someshell` would seed `SomeInteger`
+            // (`r_uint`); seed `SomePtr(CCHARP)` so a `direct_ptradd`
+            // result (`ann_direct_ptradd` returns `s_p`) unions.
+            if class_root.as_deref() == Some("CCHARP") {
+                cells.push(lltype_to_annotation(
+                    crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+                ));
+                continue;
+            }
             // A list-typed param (`Vec<T>`, `&[T]`, Charon `Slice<T>`) is
             // the annotator's list model regardless of the Input's
             // register bank: a one-word item slice can arrive as `Int`
@@ -5749,6 +5765,8 @@ fn field_spelling_is_dyn_fat(
         return false;
     };
     crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(ty)
+        || majit_ir::descr::is_shared_u8_slice_spelling(ty)
+        || majit_ir::descr::is_option_of_u8_window_spelling(ty)
 }
 
 /// Index of the metadata (`true`) or data (`false`) word in
@@ -7117,6 +7135,33 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_ccharp_unsigned_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_window");
+        let entry = graph.startblock;
+        let p_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "data".to_string(),
+                    ty: ValueType::Unsigned,
+                    class_root: Some("CCHARP".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("CCHARP window-data Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Unsigned + class_root CCHARP must seed SomePtr(CCHARP), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_option_fn_int_input_as_someptr() {
         let mut graph = LegacyGraph::new("takes_option_fn");
         let entry = graph.startblock;
@@ -7215,33 +7260,32 @@ mod tests {
             .fields
             .insert("core::ops::range::RangeInclusive".to_string(), rows.clone());
         fields.fields.insert("RangeInclusive".to_string(), rows);
+        fields.note_foreign_body_crate_root("core");
         bk.set_struct_fields(Rc::new(fields));
 
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            let cells = derive_subject_inputcells(&graph, Some(&bk))
-                .expect("suffixed RangeInclusive must seed from template rows");
-            let SomeValue::Instance(value) = &cells[0] else {
-                panic!(
-                    "RangeInclusive<i64> must seed SomeInstance, got {:?}",
-                    cells[0]
-                )
-            };
-            let classdef = value
-                .classdef
-                .as_ref()
-                .expect("template field_rows must intern RangeInclusive<i64>");
-            let start = classdef
-                .borrow()
-                .attrs
-                .get("start")
-                .expect("start attr projected")
-                .s_value
-                .clone();
-            assert!(
-                matches!(start, SomeValue::Integer(_)),
-                "??TypeVar#0 on RangeInclusive<i64> must become i64, got {start:?}"
-            );
-        });
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("suffixed RangeInclusive must seed from template rows");
+        let SomeValue::Instance(value) = &cells[0] else {
+            panic!(
+                "RangeInclusive<i64> must seed SomeInstance, got {:?}",
+                cells[0]
+            )
+        };
+        let classdef = value
+            .classdef
+            .as_ref()
+            .expect("template field_rows must intern RangeInclusive<i64>");
+        let start = classdef
+            .borrow()
+            .attrs
+            .get("start")
+            .expect("start attr projected")
+            .s_value
+            .clone();
+        assert!(
+            matches!(start, SomeValue::Integer(_)),
+            "??TypeVar#0 on RangeInclusive<i64> must become i64, got {start:?}"
+        );
     }
 
     #[test]
@@ -8417,6 +8461,11 @@ mod tests {
     /// The view is `w_obj._utf8`: the `value` getfield of the receiver
     /// narrowed to `W_UnicodeObject`, typed `Str`, so `strlen` reads the
     /// rstr `STR` payload and not the wrapper.
+    ///
+    /// `w_str_cut`'s `piece: &Wtf8` is already a one-word STR
+    /// (`rtype_len` / `ll_strlen`). That parameter stays a STR view at
+    /// its definition, so `piece.len()` plants `__strlen` on the STR
+    /// Input rather than converting to a window first.
     #[test]
     fn strlen_arg_at_real_w_str_get_wtf8_sites_is_the_utf8_field() {
         use majit_charon_reader::Llbc;
@@ -8448,14 +8497,24 @@ mod tests {
             instance_sites.is_empty(),
             "__strlen still sees an Instance Input at real sites: {instance_sites:?}"
         );
-        let not_utf8: Vec<_> = all_sites
+        let not_str_owner: Vec<_> = all_sites
             .iter()
-            .filter(|(_, _, is_utf8_read, _)| !*is_utf8_read)
+            .filter(|(_, desc, is_utf8_read, _)| {
+                !*is_utf8_read && desc.as_str() != "Input ty=Str class_root=None"
+            })
             .collect();
         assert!(
-            not_utf8.is_empty(),
-            "__strlen argument is not the W_UnicodeObject.value read at: {not_utf8:?}"
+            not_str_owner.is_empty(),
+            "__strlen argument is neither the W_UnicodeObject.value read nor a STR Input at: {not_str_owner:?}"
         );
+        for name in ["w_str_cut", "str_byte_window"] {
+            assert!(
+                all_sites
+                    .iter()
+                    .any(|(n, _, is_utf8_read, _)| *n == name && *is_utf8_read),
+                "{name} must still strlen the W_UnicodeObject.value field"
+            );
+        }
     }
 
     #[test]
@@ -10473,6 +10532,48 @@ mod tests {
                 .expect("get_raw_address_of_string builtin")
         );
         assert_eq!(translated[0].args[1..], [s]);
+        assert_eq!(translated[0].result, result_var);
+    }
+
+    #[test]
+    fn translate_op_nonmoving_raw_ptr_for_resizable_list_marker_calls_the_builtin() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let lst = Hlvalue::Variable(Variable::new());
+        let result_var = Hlvalue::Variable(Variable::new());
+        value_map.insert(vars[0].clone(), lst.clone());
+        value_map.insert(vars[1].clone(), result_var.clone());
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST.into(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![vars[0].clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("__majit_nonmoving_raw_ptr_for_resizable_list marker must lower");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "simple_call");
+        let Hlvalue::Constant(ref callable) = translated[0].args[0] else {
+            panic!("simple_call callable must be a Constant");
+        };
+        let ConstValue::HostObject(ref host) = callable.value else {
+            panic!("callable must be ConstValue::HostObject");
+        };
+        assert_eq!(
+            *host,
+            HOST_ENV
+                .lookup_builtin("nonmoving_raw_ptr_for_resizable_list")
+                .expect("nonmoving_raw_ptr_for_resizable_list builtin")
+        );
+        assert_eq!(translated[0].args[1..], [lst]);
         assert_eq!(translated[0].result, result_var);
     }
 

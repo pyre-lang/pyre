@@ -13014,7 +13014,10 @@ fn enum_variants_for_ctor_base<'a>(
 ) -> Option<&'a std::collections::HashMap<i64, String>> {
     let map = cc.enum_variant_by_discriminant();
     let stripped = majit_ir::descr::strip_generic_args(result_base);
+    let base_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
     map.get(stripped.as_ref())
+        .or_else(|| map.get(result_base))
+        .or_else(|| map.get(base_leaf))
 }
 
 /// `jtransform.py Transformer.optimize_goto_if_not` — fuse a

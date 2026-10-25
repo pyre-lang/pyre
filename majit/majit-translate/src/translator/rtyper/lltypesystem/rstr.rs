@@ -53,8 +53,8 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _func, _ptr, _ptr_obj, Array, ForwardReference, GcKind, LowLevelType, LowLevelValue,
-    MallocFlavor, Ptr, PtrTarget, Struct, malloc,
+    _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GcKind, LowLevelType, LowLevelValue,
+    MallocFlavor, Ptr, PtrTarget, Struct, functionptr, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -2244,6 +2244,893 @@ pub(crate) fn build_ll_str2unicode_helper_graph(name: &str) -> Result<PyGraph, T
     Ok(helper_pygraph_from_graph(
         graph,
         vec!["str".to_string()],
+        func,
+    ))
+}
+
+fn join_chars_item_lltype(items_ptr_lltype: &LowLevelType) -> Result<LowLevelType, TyperError> {
+    let LowLevelType::Ptr(ptr) = items_ptr_lltype else {
+        return Err(TyperError::message(format!(
+            "ll_join_chars helper expects Ptr(GcArray(Unsigned|Char)), got {items_ptr_lltype:?}"
+        )));
+    };
+    let PtrTarget::Array(arr) = &ptr.TO else {
+        return Err(TyperError::message(format!(
+            "ll_join_chars helper Ptr.TO must be Array, got {:?}",
+            ptr.TO
+        )));
+    };
+    match &arr.OF {
+        LowLevelType::Unsigned | LowLevelType::Char => Ok(arr.OF.clone()),
+        other => Err(TyperError::message(format!(
+            "ll_join_chars helper array element must be Unsigned or Char, got {other:?}"
+        ))),
+    }
+}
+
+fn string2list_dst_items(
+    list_ptr_lltype: &LowLevelType,
+    item_lltype: &LowLevelType,
+) -> Result<(bool, LowLevelType), TyperError> {
+    let LowLevelType::Ptr(ptr) = list_ptr_lltype else {
+        return Err(TyperError::message(format!(
+            "ll_string2list helper expects Ptr(list or GcArray), got {list_ptr_lltype:?}"
+        )));
+    };
+    match &ptr.TO {
+        PtrTarget::Array(arr) => {
+            if &arr.OF != item_lltype {
+                return Err(TyperError::message(format!(
+                    "ll_string2list helper fixed list stores {:?}, item_lltype is {item_lltype:?}",
+                    arr.OF
+                )));
+            }
+            Ok((false, list_ptr_lltype.clone()))
+        }
+        PtrTarget::Struct(st) => {
+            let items = st._flds.get("items").cloned().ok_or_else(|| {
+                TyperError::message("ll_string2list helper resized list has no items field")
+            })?;
+            Ok((true, items))
+        }
+        other => Err(TyperError::message(format!(
+            "ll_string2list helper Ptr.TO must be Array or Struct, got {other:?}"
+        ))),
+    }
+}
+
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isvirtual`. Spine B splits that name on `::` so
+/// `rewrite_op_direct_call` emits `ref_isvirtual`.
+fn isvirtual_intrinsic_funcptr(ptr_lltype: LowLevelType) -> Constant {
+    let ft = FuncType {
+        args: vec![ptr_lltype],
+        result: LowLevelType::Bool,
+    };
+    let ptr = functionptr(
+        ft.clone(),
+        "majit_rlib::jit::isvirtual",
+        None,
+        Some("majit_rlib::jit::isvirtual".to_string()),
+    );
+    Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(ptr)),
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        })),
+    )
+}
+
+/// Synthesise `LLHelpers.ll_join_chars` (`lltypesystem/rstr.py`):
+///
+/// ```python
+/// @jit.look_inside_iff(lambda length, chars, RES: jit.isconstant(length) and jit.isvirtual(chars))
+/// def ll_join_chars(length, chars, RES):
+///     result = mallocstr(length)
+///     res_chars = result.chars
+///     i = 0
+///     while i < length:
+///         res_chars[i] = cast_primitive(Char, chars[i])
+///         i += 1
+///     return result
+/// ```
+///
+/// This graph is the original loop. `look_inside_iff` (`rlib/jit.py`)
+/// wraps it: `unroll_safe(func)` then `specialize:call_location`.
+/// `mallocstr` is inlined as `malloc_varsize(STR)` plus `setfield(hash, 0)`.
+/// `cast_primitive(Char, Unsigned)` is `cast_uint_to_int` then
+/// `cast_int_to_char`; a `Char` item needs no cast.
+pub(crate) fn build_ll_join_chars_helper_graph(
+    name: &str,
+    items_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+
+    let item_lltype = join_chars_item_lltype(&items_ptr_lltype)?;
+    let dst_chars_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+    let str_struct_lltype = struct_lltype_from_strptr(&STRPTR)?;
+
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let chars_field_const =
+        || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
+    let hash_field_const =
+        || constant_with_lltype(ConstValue::byte_str("hash"), LowLevelType::Void);
+
+    let length_arg = variable_with_lltype("length", LowLevelType::Signed);
+    let chars_arg = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let res_arg = variable_with_lltype("RES", LowLevelType::Void);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(length_arg.clone()),
+        Hlvalue::Variable(chars_arg.clone()),
+        Hlvalue::Variable(res_arg),
+    ]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let chars_for_cond = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let result_for_cond = variable_with_lltype("result", STRPTR.clone());
+    let res_chars_for_cond = variable_with_lltype("res_chars", dst_chars_ptr_lltype.clone());
+    let length_for_cond = variable_with_lltype("length", LowLevelType::Signed);
+    let i_for_cond = variable_with_lltype("i", LowLevelType::Signed);
+    let block_loop_cond = Block::shared(vec![
+        Hlvalue::Variable(chars_for_cond.clone()),
+        Hlvalue::Variable(result_for_cond.clone()),
+        Hlvalue::Variable(res_chars_for_cond.clone()),
+        Hlvalue::Variable(length_for_cond.clone()),
+        Hlvalue::Variable(i_for_cond.clone()),
+    ]);
+
+    let chars_for_body = variable_with_lltype("chars", items_ptr_lltype);
+    let result_for_body = variable_with_lltype("result", STRPTR.clone());
+    let res_chars_for_body = variable_with_lltype("res_chars", dst_chars_ptr_lltype.clone());
+    let length_for_body = variable_with_lltype("length", LowLevelType::Signed);
+    let i_for_body = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(chars_for_body.clone()),
+        Hlvalue::Variable(result_for_body.clone()),
+        Hlvalue::Variable(res_chars_for_body.clone()),
+        Hlvalue::Variable(length_for_body.clone()),
+        Hlvalue::Variable(i_for_body.clone()),
+    ]);
+
+    let result = variable_with_lltype("result", STRPTR.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "malloc_varsize",
+        vec![
+            lowlevel_type_const(str_struct_lltype),
+            gc_flavor_const()?,
+            Hlvalue::Variable(length_arg.clone()),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    let set_hash = variable_with_lltype("set_hash", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(result.clone()),
+            hash_field_const(),
+            signed_const(0),
+        ],
+        Hlvalue::Variable(set_hash),
+    ));
+    let res_chars = variable_with_lltype("res_chars", dst_chars_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![Hlvalue::Variable(result.clone()), chars_field_const()],
+        Hlvalue::Variable(res_chars.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(chars_arg),
+                Hlvalue::Variable(result),
+                Hlvalue::Variable(res_chars),
+                Hlvalue::Variable(length_arg),
+                signed_const(0),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let keep_going = variable_with_lltype("keep_going", LowLevelType::Bool);
+    block_loop_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(i_for_cond.clone()),
+                Hlvalue::Variable(length_for_cond.clone()),
+            ],
+            Hlvalue::Variable(keep_going.clone()),
+        ));
+    block_loop_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(keep_going));
+    block_loop_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(chars_for_cond),
+                Hlvalue::Variable(result_for_cond.clone()),
+                Hlvalue::Variable(res_chars_for_cond),
+                Hlvalue::Variable(length_for_cond),
+                Hlvalue::Variable(i_for_cond),
+            ],
+            Some(block_body.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(result_for_cond)],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let stored = match item_lltype {
+        LowLevelType::Unsigned => {
+            let v = variable_with_lltype("v", LowLevelType::Unsigned);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "getarrayitem",
+                vec![
+                    Hlvalue::Variable(chars_for_body.clone()),
+                    Hlvalue::Variable(i_for_body.clone()),
+                ],
+                Hlvalue::Variable(v.clone()),
+            ));
+            let t = variable_with_lltype("t", LowLevelType::Signed);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_uint_to_int",
+                vec![Hlvalue::Variable(v)],
+                Hlvalue::Variable(t.clone()),
+            ));
+            let c = variable_with_lltype("c", LowLevelType::Char);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_int_to_char",
+                vec![Hlvalue::Variable(t)],
+                Hlvalue::Variable(c.clone()),
+            ));
+            c
+        }
+        LowLevelType::Char => {
+            let c = variable_with_lltype("c", LowLevelType::Char);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "getarrayitem",
+                vec![
+                    Hlvalue::Variable(chars_for_body.clone()),
+                    Hlvalue::Variable(i_for_body.clone()),
+                ],
+                Hlvalue::Variable(c.clone()),
+            ));
+            c
+        }
+        _ => unreachable!("join_chars_item_lltype rejects other elements"),
+    };
+    let void_set = variable_with_lltype("set", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(res_chars_for_body.clone()),
+            Hlvalue::Variable(i_for_body.clone()),
+            Hlvalue::Variable(stored),
+        ],
+        Hlvalue::Variable(void_set),
+    ));
+    let i_next = variable_with_lltype("i_next", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_for_body), signed_const(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(chars_for_body),
+                Hlvalue::Variable(result_for_body),
+                Hlvalue::Variable(res_chars_for_body),
+                Hlvalue::Variable(length_for_body),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_loop_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `look_inside_iff` (`rlib/jit.py`): `unroll_safe(func)` then
+    // `func._annspecialcase_ = "specialize:call_location"`.
+    func._jit_unroll_safe_ = true;
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["length".to_string(), "chars".to_string(), "RES".to_string()],
+        func,
+    ))
+}
+
+/// `look_inside_iff`'s `@dont_look_inside` trampoline: one `direct_call`
+/// of the original `ll_join_chars` loop (`rlib/jit.py` `look_inside_iff`).
+pub(crate) fn build_ll_join_chars_trampoline_helper_graph(
+    name: &str,
+    items_ptr_lltype: LowLevelType,
+    orig_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let length_arg = variable_with_lltype("length", LowLevelType::Signed);
+    let chars_arg = variable_with_lltype("chars", items_ptr_lltype);
+    let res_arg = variable_with_lltype("RES", LowLevelType::Void);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(length_arg.clone()),
+        Hlvalue::Variable(chars_arg.clone()),
+        Hlvalue::Variable(res_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let result = variable_with_lltype("result", STRPTR.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(orig_fn),
+            Hlvalue::Variable(length_arg),
+            Hlvalue::Variable(chars_arg),
+            Hlvalue::Variable(res_arg),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `@dont_look_inside` (`rlib/jit.py` `look_inside_iff`); the trampoline
+    // also receives `specialize:call_location`.
+    func._jit_look_inside_ = Some(false);
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["length".to_string(), "chars".to_string(), "RES".to_string()],
+        func,
+    ))
+}
+
+/// `rlib/jit.py isvirtual`: the interpreter fallback is
+/// `NonConstant(False)` inside the marked intrinsic; the traced path is
+/// the oopspec `jit.isvirtual`, rewritten to `ref_isvirtual`. The
+/// argument is the chars array pointer (`LIST.ll_items`), matching
+/// `LLHelpers.ll_join_chars`.
+pub(crate) fn build_ll_join_chars_isvirtual_helper_graph(
+    name: &str,
+    items_ptr_lltype: LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let value = variable_with_lltype("value", items_ptr_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let result = variable_with_lltype("result", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isvirtual_intrinsic_funcptr(items_ptr_lltype)),
+            Hlvalue::Variable(value),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `rlib/jit.py isvirtual` is `@specialize.call_location()`.
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["value".to_string()],
+        func,
+    ))
+}
+
+/// `rlib/jit.py look_inside_iff` wrapper around `ll_join_chars`:
+///
+/// ```python
+/// def f(length, chars, RES):
+///     if not we_are_jitted() or (isconstant(length) and isvirtual(chars)):
+///         return orig(length, chars, RES)
+///     else:
+///         return trampoline(length, chars, RES)
+/// ```
+///
+/// `we_are_jitted` is the `SpecTag` exitswitch (true link first, matching
+/// `build_ll_alloc_and_set_look_inside_iff_helper_graph`). The predicate
+/// short-circuits: `isconstant` false goes to the trampoline, true checks
+/// `isvirtual(chars)`.
+pub(crate) fn build_ll_join_chars_look_inside_iff_helper_graph(
+    name: &str,
+    items_ptr_lltype: LowLevelType,
+    orig_fn: Constant,
+    trampoline_fn: Constant,
+    isconstant_fn: Constant,
+    isvirtual_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let length_arg = variable_with_lltype("length", LowLevelType::Signed);
+    let chars_arg = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let res_arg = variable_with_lltype("RES", LowLevelType::Void);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(length_arg.clone()),
+        Hlvalue::Variable(chars_arg.clone()),
+        Hlvalue::Variable(res_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", STRPTR.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+
+    let orig_length = variable_with_lltype("length", LowLevelType::Signed);
+    let orig_chars = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let orig_res = variable_with_lltype("RES", LowLevelType::Void);
+    let block_orig = Block::shared(vec![
+        Hlvalue::Variable(orig_length.clone()),
+        Hlvalue::Variable(orig_chars.clone()),
+        Hlvalue::Variable(orig_res.clone()),
+    ]);
+    let orig_result = variable_with_lltype("result", STRPTR.clone());
+    block_orig.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(orig_fn),
+            Hlvalue::Variable(orig_length),
+            Hlvalue::Variable(orig_chars),
+            Hlvalue::Variable(orig_res),
+        ],
+        Hlvalue::Variable(orig_result.clone()),
+    ));
+    block_orig.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(orig_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let tr_length = variable_with_lltype("length", LowLevelType::Signed);
+    let tr_chars = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let tr_res = variable_with_lltype("RES", LowLevelType::Void);
+    let block_tramp = Block::shared(vec![
+        Hlvalue::Variable(tr_length.clone()),
+        Hlvalue::Variable(tr_chars.clone()),
+        Hlvalue::Variable(tr_res.clone()),
+    ]);
+    let tr_result = variable_with_lltype("result", STRPTR.clone());
+    block_tramp
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(trampoline_fn),
+                Hlvalue::Variable(tr_length),
+                Hlvalue::Variable(tr_chars),
+                Hlvalue::Variable(tr_res),
+            ],
+            Hlvalue::Variable(tr_result.clone()),
+        ));
+    block_tramp.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(tr_result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let virt_length = variable_with_lltype("length", LowLevelType::Signed);
+    let virt_chars = variable_with_lltype("chars", items_ptr_lltype.clone());
+    let virt_res = variable_with_lltype("RES", LowLevelType::Void);
+    let block_isvirtual = Block::shared(vec![
+        Hlvalue::Variable(virt_length.clone()),
+        Hlvalue::Variable(virt_chars.clone()),
+        Hlvalue::Variable(virt_res.clone()),
+    ]);
+    let is_virt = variable_with_lltype("is_virtual", LowLevelType::Bool);
+    block_isvirtual
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(isvirtual_fn),
+                Hlvalue::Variable(virt_chars.clone()),
+            ],
+            Hlvalue::Variable(is_virt.clone()),
+        ));
+    block_isvirtual.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_virt));
+    block_isvirtual.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(virt_length.clone()),
+                Hlvalue::Variable(virt_chars.clone()),
+                Hlvalue::Variable(virt_res.clone()),
+            ],
+            Some(block_orig.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(virt_length),
+                Hlvalue::Variable(virt_chars),
+                Hlvalue::Variable(virt_res),
+            ],
+            Some(block_tramp.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let const_length = variable_with_lltype("length", LowLevelType::Signed);
+    let const_chars = variable_with_lltype("chars", items_ptr_lltype);
+    let const_res = variable_with_lltype("RES", LowLevelType::Void);
+    let block_isconstant = Block::shared(vec![
+        Hlvalue::Variable(const_length.clone()),
+        Hlvalue::Variable(const_chars.clone()),
+        Hlvalue::Variable(const_res.clone()),
+    ]);
+    let is_const = variable_with_lltype("is_constant", LowLevelType::Bool);
+    block_isconstant
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(isconstant_fn),
+                Hlvalue::Variable(const_length.clone()),
+            ],
+            Hlvalue::Variable(is_const.clone()),
+        ));
+    block_isconstant.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_const));
+    block_isconstant.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(const_length.clone()),
+                Hlvalue::Variable(const_chars.clone()),
+                Hlvalue::Variable(const_res.clone()),
+            ],
+            Some(block_isvirtual),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(const_length),
+                Hlvalue::Variable(const_chars),
+                Hlvalue::Variable(const_res),
+            ],
+            Some(block_tramp),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(length_arg.clone()),
+                Hlvalue::Variable(chars_arg.clone()),
+                Hlvalue::Variable(res_arg.clone()),
+            ],
+            Some(block_isconstant),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(length_arg),
+                Hlvalue::Variable(chars_arg),
+                Hlvalue::Variable(res_arg),
+            ],
+            Some(block_orig),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["length".to_string(), "chars".to_string(), "RES".to_string()],
+        func,
+    ))
+}
+
+/// Synthesise `LLHelpers.ll_string2list` (`lltypesystem/rstr.py`):
+///
+/// ```python
+/// @jit.dont_look_inside
+/// def ll_string2list(RESLIST, src):
+///     length = len(src.chars)
+///     lst = RESLIST.ll_newlist(length)
+///     dst = lst.ll_items()
+///     # copy src.chars[i] into dst[i]
+///     return lst
+/// ```
+///
+/// `RESLIST.ll_newlist` is the `newlist_fn` callee, the same way the
+/// alloc_and_set builders take `newlist_fn`. `DST.OF` of a `Vec<u8>`
+/// list is `Unsigned`, which is not `SRC.chars.OF` (`Char`), so the
+/// copy is a per-element loop with `cast_char_to_int` then
+/// `cast_int_to_uint`. A `Char` item list needs no cast. No
+/// `raw_memcopy`. `_jit_look_inside_ = False` (`dont_look_inside`);
+/// there is no trampoline.
+pub(crate) fn build_ll_string2list_helper_graph(
+    name: &str,
+    list_ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    newlist_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    if !matches!(item_lltype, LowLevelType::Unsigned | LowLevelType::Char) {
+        return Err(TyperError::message(format!(
+            "ll_string2list helper item type must be Unsigned or Char, got {item_lltype:?}"
+        )));
+    }
+    let (resized, items_ptr_lltype) = string2list_dst_items(&list_ptr_lltype, &item_lltype)?;
+    let src_chars_ptr_lltype = chars_array_ptr_lltype_from_strptr(&STRPTR)?;
+
+    let signed_const = |n: i64| constant_with_lltype(ConstValue::Int(n), LowLevelType::Signed);
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let chars_field_const =
+        || constant_with_lltype(ConstValue::byte_str("chars"), LowLevelType::Void);
+    let items_field_const =
+        || constant_with_lltype(ConstValue::byte_str("items"), LowLevelType::Void);
+
+    let reslist_arg = variable_with_lltype("RESLIST", LowLevelType::Void);
+    let src_arg = variable_with_lltype("src", STRPTR.clone());
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(reslist_arg),
+        Hlvalue::Variable(src_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", list_ptr_lltype.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let src_chars_for_cond = variable_with_lltype("chars", src_chars_ptr_lltype.clone());
+    let lst_for_cond = variable_with_lltype("lst", list_ptr_lltype.clone());
+    let dst_for_cond = variable_with_lltype("dst", items_ptr_lltype.clone());
+    let length_for_cond = variable_with_lltype("length", LowLevelType::Signed);
+    let i_for_cond = variable_with_lltype("i", LowLevelType::Signed);
+    let block_loop_cond = Block::shared(vec![
+        Hlvalue::Variable(src_chars_for_cond.clone()),
+        Hlvalue::Variable(lst_for_cond.clone()),
+        Hlvalue::Variable(dst_for_cond.clone()),
+        Hlvalue::Variable(length_for_cond.clone()),
+        Hlvalue::Variable(i_for_cond.clone()),
+    ]);
+
+    let src_chars_for_body = variable_with_lltype("chars", src_chars_ptr_lltype.clone());
+    let lst_for_body = variable_with_lltype("lst", list_ptr_lltype.clone());
+    let dst_for_body = variable_with_lltype("dst", items_ptr_lltype.clone());
+    let length_for_body = variable_with_lltype("length", LowLevelType::Signed);
+    let i_for_body = variable_with_lltype("i", LowLevelType::Signed);
+    let block_body = Block::shared(vec![
+        Hlvalue::Variable(src_chars_for_body.clone()),
+        Hlvalue::Variable(lst_for_body.clone()),
+        Hlvalue::Variable(dst_for_body.clone()),
+        Hlvalue::Variable(length_for_body.clone()),
+        Hlvalue::Variable(i_for_body.clone()),
+    ]);
+
+    let src_chars = variable_with_lltype("chars", src_chars_ptr_lltype);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getsubstruct",
+        vec![Hlvalue::Variable(src_arg), chars_field_const()],
+        Hlvalue::Variable(src_chars.clone()),
+    ));
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(src_chars.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let lst = variable_with_lltype("lst", list_ptr_lltype.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(newlist_fn),
+            Hlvalue::Variable(length.clone()),
+        ],
+        Hlvalue::Variable(lst.clone()),
+    ));
+    let dst = if resized {
+        let items = variable_with_lltype("dst", items_ptr_lltype);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![Hlvalue::Variable(lst.clone()), items_field_const()],
+            Hlvalue::Variable(items.clone()),
+        ));
+        items
+    } else {
+        lst.clone()
+    };
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(src_chars),
+                Hlvalue::Variable(lst),
+                Hlvalue::Variable(dst),
+                Hlvalue::Variable(length),
+                signed_const(0),
+            ],
+            Some(block_loop_cond.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let keep_going = variable_with_lltype("keep_going", LowLevelType::Bool);
+    block_loop_cond
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_lt",
+            vec![
+                Hlvalue::Variable(i_for_cond.clone()),
+                Hlvalue::Variable(length_for_cond.clone()),
+            ],
+            Hlvalue::Variable(keep_going.clone()),
+        ));
+    block_loop_cond.borrow_mut().exitswitch = Some(Hlvalue::Variable(keep_going));
+    block_loop_cond.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(src_chars_for_cond),
+                Hlvalue::Variable(lst_for_cond.clone()),
+                Hlvalue::Variable(dst_for_cond),
+                Hlvalue::Variable(length_for_cond),
+                Hlvalue::Variable(i_for_cond),
+            ],
+            Some(block_body.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(lst_for_cond)],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    let stored = match item_lltype {
+        LowLevelType::Unsigned => {
+            let c = variable_with_lltype("c", LowLevelType::Char);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "getarrayitem",
+                vec![
+                    Hlvalue::Variable(src_chars_for_body.clone()),
+                    Hlvalue::Variable(i_for_body.clone()),
+                ],
+                Hlvalue::Variable(c.clone()),
+            ));
+            let t = variable_with_lltype("t", LowLevelType::Signed);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_char_to_int",
+                vec![Hlvalue::Variable(c)],
+                Hlvalue::Variable(t.clone()),
+            ));
+            let v = variable_with_lltype("v", LowLevelType::Unsigned);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "cast_int_to_uint",
+                vec![Hlvalue::Variable(t)],
+                Hlvalue::Variable(v.clone()),
+            ));
+            v
+        }
+        LowLevelType::Char => {
+            let c = variable_with_lltype("c", LowLevelType::Char);
+            block_body.borrow_mut().operations.push(SpaceOperation::new(
+                "getarrayitem",
+                vec![
+                    Hlvalue::Variable(src_chars_for_body.clone()),
+                    Hlvalue::Variable(i_for_body.clone()),
+                ],
+                Hlvalue::Variable(c.clone()),
+            ));
+            c
+        }
+        _ => unreachable!("item_lltype already validated"),
+    };
+    let void_set = variable_with_lltype("set", LowLevelType::Void);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "setarrayitem",
+        vec![
+            Hlvalue::Variable(dst_for_body.clone()),
+            Hlvalue::Variable(i_for_body.clone()),
+            Hlvalue::Variable(stored),
+        ],
+        Hlvalue::Variable(void_set),
+    ));
+    let i_next = variable_with_lltype("i_next", LowLevelType::Signed);
+    block_body.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(i_for_body), signed_const(1)],
+        Hlvalue::Variable(i_next.clone()),
+    ));
+    block_body.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(src_chars_for_body),
+                Hlvalue::Variable(lst_for_body),
+                Hlvalue::Variable(dst_for_body),
+                Hlvalue::Variable(length_for_body),
+                Hlvalue::Variable(i_next),
+            ],
+            Some(block_loop_cond),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `@jit.dont_look_inside` (`rlib/jit.py`): `func._jit_look_inside_ = False`.
+    func._jit_look_inside_ = Some(false);
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["RESLIST".to_string(), "src".to_string()],
         func,
     ))
 }
@@ -12044,6 +12931,252 @@ mod tests {
             seen.push(block);
         }
         seen
+    }
+
+    fn unsigned_items_ptr() -> LowLevelType {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Unsigned)),
+        }))
+    }
+
+    fn unsigned_list_ptr() -> LowLevelType {
+        let items = unsigned_items_ptr();
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc_with_hints(
+                "list",
+                vec![
+                    ("length".into(), LowLevelType::Signed),
+                    ("items".into(), items),
+                ],
+                vec![("list".into(), ConstValue::Bool(true))],
+            )),
+        }))
+    }
+
+    fn dummy_fn(tag: i64) -> Constant {
+        Constant::with_concretetype(ConstValue::Int(tag), LowLevelType::Void)
+    }
+
+    fn callee_tag(op: &SpaceOperation) -> i64 {
+        let Hlvalue::Constant(c) = &op.args[0] else {
+            panic!("direct_call callee must be a Constant");
+        };
+        match c.value {
+            ConstValue::Int(n) => n,
+            _ => panic!("expected Int dummy callee, got {:?}", c.value),
+        }
+    }
+
+    fn exit_target(
+        block: &crate::flowspace::model::BlockRef,
+        want_true: bool,
+    ) -> crate::flowspace::model::BlockRef {
+        block
+            .borrow()
+            .exits
+            .iter()
+            .find_map(|link| {
+                let link = link.borrow();
+                let is_true = matches!(
+                    link.exitcase,
+                    Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
+                );
+                (is_true == want_true).then(|| link.target.as_ref().unwrap().clone())
+            })
+            .expect("branch target")
+    }
+
+    /// `LLHelpers.ll_join_chars` inlines `mallocstr` then copies with
+    /// `cast_primitive(Char, Unsigned)` = `cast_uint_to_int` then
+    /// `cast_int_to_char`. The original is `unroll_safe`.
+    #[test]
+    fn build_ll_join_chars_synthesizes_malloc_and_cast_loop() {
+        let helper = build_ll_join_chars_helper_graph("ll_join_chars__orig", unsigned_items_ptr())
+            .expect("build_ll_join_chars_helper_graph");
+        assert!(
+            helper.func._jit_unroll_safe_,
+            "look_inside_iff marks the original unroll_safe"
+        );
+        assert_eq!(
+            helper.func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let inner = helper.graph.borrow();
+        let blocks = collect_reachable_blocks(&inner.startblock);
+        let all_ops: Vec<String> = blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for name in [
+            "malloc_varsize",
+            "getarrayitem",
+            "cast_uint_to_int",
+            "cast_int_to_char",
+            "setarrayitem",
+        ] {
+            assert!(
+                all_ops.iter().any(|op| op == name),
+                "expected {name} in {all_ops:?}"
+            );
+        }
+        let loop_cond = inner.startblock.borrow().exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .unwrap()
+            .clone();
+        let loop_body = exit_target(&loop_cond, true);
+        for (label, block) in [("cond", &loop_cond), ("body", &loop_body)] {
+            let has_call = block
+                .borrow()
+                .operations
+                .iter()
+                .any(|op| op.opname == "direct_call");
+            assert!(
+                !has_call,
+                "ll_join_chars original must not direct_call in the {label}"
+            );
+        }
+    }
+
+    /// `rlib/jit.py look_inside_iff` wrapper: `we_are_jitted` SpecTag
+    /// (true link first). Not-jitted calls orig; jitted checks
+    /// `isconstant(length) and isvirtual(chars)` and otherwise calls
+    /// the trampoline.
+    #[test]
+    fn build_ll_join_chars_look_inside_iff_wrapper_calls_orig_or_trampoline() {
+        let orig_fn = dummy_fn(1);
+        let trampoline_fn = dummy_fn(2);
+        let helper = build_ll_join_chars_look_inside_iff_helper_graph(
+            "ll_join_chars",
+            unsigned_items_ptr(),
+            orig_fn,
+            trampoline_fn,
+            dummy_fn(3),
+            dummy_fn(4),
+        )
+        .expect("build_ll_join_chars_look_inside_iff_helper_graph");
+        assert_eq!(
+            helper.func.annspecialcase, None,
+            "look_inside_iff wrapper f does not get call_location"
+        );
+        let inner = helper.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.inputargs.len(), 3);
+        assert_eq!(startblock.exits.len(), 2);
+        let Some(Hlvalue::Constant(c)) = &startblock.exitswitch else {
+            panic!("exitswitch must be the we_are_jitted SpecTag constant");
+        };
+        assert!(matches!(c.value, ConstValue::SpecTag(_)));
+        let jit_true = startblock.exits[0].borrow();
+        assert!(matches!(
+            jit_true.exitcase,
+            Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(true)
+        ));
+        let pred = jit_true.target.as_ref().unwrap().clone();
+        let jit_false = startblock.exits[1].borrow();
+        assert!(matches!(
+            jit_false.exitcase,
+            Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)
+        ));
+        let orig_block = jit_false.target.as_ref().unwrap().clone();
+        drop(jit_true);
+        drop(jit_false);
+        drop(startblock);
+
+        let orig_ops = orig_block.borrow();
+        assert_eq!(orig_ops.operations.len(), 1);
+        assert_eq!(orig_ops.operations[0].opname, "direct_call");
+        assert_eq!(callee_tag(&orig_ops.operations[0]), 1);
+        drop(orig_ops);
+
+        let pred_ops = pred.borrow();
+        assert_eq!(pred_ops.operations[0].opname, "direct_call");
+        assert_eq!(callee_tag(&pred_ops.operations[0]), 3);
+        drop(pred_ops);
+        let tramp_block = exit_target(&pred, false);
+        let tramp_ops = tramp_block.borrow();
+        assert_eq!(tramp_ops.operations[0].opname, "direct_call");
+        assert_eq!(callee_tag(&tramp_ops.operations[0]), 2);
+    }
+
+    /// `LLHelpers.ll_string2list` is `@jit.dont_look_inside`, preallocates
+    /// via `RESLIST.ll_newlist`, then copies with Char→Unsigned casts.
+    /// `raw_memcopy` is illegal when `DST.OF` is `Unsigned`.
+    #[test]
+    fn build_ll_string2list_is_dont_look_inside_and_preallocates() {
+        let helper = build_ll_string2list_helper_graph(
+            "ll_string2list",
+            unsigned_list_ptr(),
+            LowLevelType::Unsigned,
+            dummy_fn(7),
+        )
+        .expect("build_ll_string2list_helper_graph");
+        assert_eq!(helper.func._jit_look_inside_, Some(false));
+        let inner = helper.graph.borrow();
+        let start = inner.startblock.borrow();
+        let start_ops: Vec<&str> = start
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert!(
+            start_ops.contains(&"direct_call"),
+            "newlist_fn is called before the loop, got {start_ops:?}"
+        );
+        assert_eq!(
+            start_ops.iter().filter(|op| **op == "direct_call").count(),
+            1
+        );
+        let newlist_op = start
+            .operations
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("newlist direct_call");
+        assert_eq!(callee_tag(newlist_op), 7);
+        let loop_cond = start.exits[0].borrow().target.as_ref().unwrap().clone();
+        drop(start);
+        let loop_body = exit_target(&loop_cond, true);
+        for (label, block) in [("cond", &loop_cond), ("body", &loop_body)] {
+            let has_call = block
+                .borrow()
+                .operations
+                .iter()
+                .any(|op| op.opname == "direct_call");
+            assert!(!has_call, "loop {label} must not call newlist again");
+        }
+        let blocks = collect_reachable_blocks(&inner.startblock);
+        let all_ops: Vec<String> = blocks
+            .iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            all_ops.iter().any(|op| op == "cast_char_to_int"),
+            "expected cast_char_to_int in {all_ops:?}"
+        );
+        assert!(
+            all_ops.iter().any(|op| op == "cast_int_to_uint"),
+            "expected cast_int_to_uint in {all_ops:?}"
+        );
+        assert!(
+            !all_ops.iter().any(|op| op == "raw_memcopy"),
+            "Unsigned DST.OF must not raw_memcopy Char"
+        );
     }
 
     /// `LLHelpers.ll_int` keeps PyPy's base parser shape: base range

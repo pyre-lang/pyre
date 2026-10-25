@@ -236,6 +236,11 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         "get_raw_address_of_string",
         builtin_get_raw_address_of_string,
     );
+    analyzer_for(
+        &mut reg,
+        "nonmoving_raw_ptr_for_resizable_list",
+        builtin_nonmoving_raw_ptr_for_resizable_list,
+    );
     // builtin.py:102-130 — bool / int / float / chr / unichr /
     // unicode / bytearray.
     analyzer_for(&mut reg, "bool", builtin_bool);
@@ -952,6 +957,30 @@ pub fn builtin_get_raw_address_of_string(
         ));
     }
     let _s_str = arg_at(args_s, 0, "builtin_get_raw_address_of_string");
+    Ok(raw_alloc_ptr_somevalue())
+}
+
+/// Translator-synthesised `rgc.nonmoving_raw_ptr_for_resizable_list(lst)`:
+/// `SomePtr(CCHARP)`.  The argument is a `SomeList`; anything else is an
+/// error (`rgc.py` `_check_resizable_list_of_chars`).  The front spells a
+/// `Vec<u8>` / `&mut [u8]` window borrow as
+/// `__majit_nonmoving_raw_ptr_for_resizable_list(lst)`.
+pub fn builtin_nonmoving_raw_ptr_for_resizable_list(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    _kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if args_s.len() != 1 {
+        return Err(AnnotatorError::new(
+            "nonmoving_raw_ptr_for_resizable_list() takes exactly one argument",
+        ));
+    }
+    let s_list = arg_at(args_s, 0, "builtin_nonmoving_raw_ptr_for_resizable_list");
+    if !matches!(s_list, SomeValue::List(_)) {
+        return Err(AnnotatorError::new(format!(
+            "nonmoving_raw_ptr_for_resizable_list() argument must be a list, got {s_list:?}"
+        )));
+    }
     Ok(raw_alloc_ptr_somevalue())
 }
 
@@ -5173,6 +5202,42 @@ mod tests {
             panic!("CCHARP is a pointer");
         };
         assert_eq!(result, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
+    }
+
+    #[test]
+    fn builtin_nonmoving_raw_ptr_for_resizable_list_returns_ccharp() {
+        use crate::annotator::model::{SomeInteger, SomeList, SomePtr};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            SomeValue::Integer(SomeInteger::new(true, true)),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(SomeList::new(listdef));
+        let result =
+            builtin_nonmoving_raw_ptr_for_resizable_list(&bk, &[Some(s_list)], &no_kwds()).unwrap();
+        let LowLevelType::Ptr(ptr_ty) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        assert_eq!(result, SomeValue::Ptr(SomePtr::new(*ptr_ty)));
+    }
+
+    #[test]
+    fn builtin_nonmoving_raw_ptr_for_resizable_list_rejects_non_list() {
+        use crate::annotator::model::SomeString;
+
+        let bk = bk();
+        let s_str = SomeValue::String(SomeString::new(false, true));
+        let err = builtin_nonmoving_raw_ptr_for_resizable_list(&bk, &[Some(s_str)], &no_kwds())
+            .expect_err("non-list argument must error");
+        assert!(
+            err.to_string().contains("must be a list"),
+            "expected SomeList-only error, got {err}"
+        );
     }
 
     #[test]

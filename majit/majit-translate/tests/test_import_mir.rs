@@ -411,8 +411,16 @@ fn pycode_code_ptr_is_raw_int_kind() {
         .iter()
         .find(|f| f.name == "w_code_addr2line")
         .expect("w_code_addr2line graph");
-    cw.dual_gate_publish_concretetypes(w_code.graph(), &mut callcontrol, "w_code_get_ptr");
-    cw.dual_gate_publish_concretetypes(addr2line.graph(), &mut callcontrol, "w_code_addr2line");
+    cw.dual_gate_publish_concretetypes(
+        w_code.graph(),
+        &mut callcontrol,
+        &CallPath::from_segments(["w_code_get_ptr"]),
+    );
+    cw.dual_gate_publish_concretetypes(
+        addr2line.graph(),
+        &mut callcontrol,
+        &CallPath::from_segments(["w_code_addr2line"]),
+    );
 
     let bk = callcontrol.bookkeeper().expect("dual-gate bookkeeper");
     let classdef = bk

@@ -30,23 +30,11 @@ use std::cell::RefCell;
 
 struct CrateAliasRoots {
     local: Vec<String>,
-    /// Crate roots of admitted FunDecls that carry an unstructured body
-    /// and are not already in `local`. Used for generic-struct ClassDefs
-    /// (`owner_in_foreign_body_crate`); not a function-path alias root.
-    foreign_body: Vec<String>,
-    /// Harvested foreign FunDecls that actually lowered a body:
-    /// `(crate_root, crate-stripped name_path)`. Lookup strips the crate
-    /// prefix only for these callables (`Bookkeeper.getdesc`).
-    foreign_callables: Vec<(String, String)>,
 }
 
 impl CrateAliasRoots {
     const fn new() -> Self {
-        Self {
-            local: Vec::new(),
-            foreign_body: Vec::new(),
-            foreign_callables: Vec::new(),
-        }
+        Self { local: Vec::new() }
     }
 }
 
@@ -70,35 +58,19 @@ thread_local! {
 }
 
 /// Replace this thread's registered local-crate set with one pipeline
-/// invocation's LLBC crate names and clear harvested foreign-body roots.
-/// A later invocation on the same thread overwrites (per-invocation
-/// semantics, like the `STRUCT_ORIGIN_REGISTRY` re-seed).
+/// invocation's LLBC crate names. A later invocation on the same thread
+/// overwrites (per-invocation semantics, like the
+/// `STRUCT_ORIGIN_REGISTRY` re-seed). Harvested foreign-body tables live
+/// on the translation's `StructFieldRegistry`.
 pub(crate) fn register_local_crate_roots(names: impl IntoIterator<Item = String>) {
     REGISTERED.with(|registered| {
-        let mut registered = registered.borrow_mut();
-        registered.local = names.into_iter().collect();
-        registered.foreign_body.clear();
-        registered.foreign_callables.clear();
+        registered.borrow_mut().local = names.into_iter().collect();
     });
 }
 
 fn set_local_crate_roots(names: Vec<String>) {
     REGISTERED.with(|registered| {
         registered.borrow_mut().local = names;
-    });
-}
-
-#[cfg(test)]
-fn set_foreign_body_crate_roots(names: Vec<String>) {
-    REGISTERED.with(|registered| {
-        registered.borrow_mut().foreign_body = names;
-    });
-}
-
-#[cfg(test)]
-fn set_foreign_body_callables(callables: Vec<(String, String)>) {
-    REGISTERED.with(|registered| {
-        registered.borrow_mut().foreign_callables = callables;
     });
 }
 
@@ -111,16 +83,6 @@ pub(crate) fn is_local_crate_root(seg: &str) -> bool {
     REGISTERED.with(|registered| registered.borrow().local.iter().any(|r| r == seg))
 }
 
-/// Harvested crate roots of foreign FunDecls whose body is present.
-#[cfg(test)]
-pub(crate) fn foreign_body_crate_roots() -> Vec<String> {
-    REGISTERED.with(|registered| registered.borrow().foreign_body.clone())
-}
-
-pub(crate) fn is_foreign_body_crate_root(seg: &str) -> bool {
-    REGISTERED.with(|registered| registered.borrow().foreign_body.iter().any(|r| r == seg))
-}
-
 /// True when `seg` is a crate prefix that every path under it may strip:
 /// `crate` or a local crate. A harvested foreign crate is not an alias
 /// root; only a FunDecl that lowered a body strips (`Bookkeeper.getdesc`).
@@ -128,121 +90,33 @@ pub(crate) fn is_crate_alias_root(seg: &str) -> bool {
     seg == "crate" || is_local_crate_root(seg)
 }
 
-/// Record a FunDecl's crate root when that FunDecl has a body and the
-/// crate is not already a local alias root. Opaque FunDecls never call
-/// this (`note_body_crate_root` gates on `has_unstructured_body`).
-pub(crate) fn note_foreign_body_crate_root(seg: &str) {
-    if seg == "crate" || is_local_crate_root(seg) {
-        return;
-    }
-    REGISTERED.with(|registered| {
-        let mut registered = registered.borrow_mut();
-        if !registered.foreign_body.iter().any(|r| r == seg) {
-            registered.foreign_body.push(seg.to_string());
-        }
-    });
-}
-
-/// Record a foreign FunDecl that lowered a body, so lookup may strip
-/// `crate_root` from this callable's path only (`Bookkeeper.getdesc`).
-pub(crate) fn note_foreign_body_callable(crate_root: &str, stripped_path: &str) {
-    if crate_root == "crate" || is_local_crate_root(crate_root) || stripped_path.is_empty() {
-        return;
-    }
-    REGISTERED.with(|registered| {
-        let mut registered = registered.borrow_mut();
-        if !registered
-            .foreign_callables
-            .iter()
-            .any(|(root, path)| root == crate_root && path == stripped_path)
-        {
-            registered
-                .foreign_callables
-                .push((crate_root.to_string(), stripped_path.to_string()));
-        }
-    });
-}
-
-pub(crate) fn is_foreign_body_callable(crate_root: &str, stripped_path: &str) -> bool {
-    REGISTERED.with(|registered| {
-        registered
-            .borrow()
-            .foreign_callables
-            .iter()
-            .any(|(root, path)| root == crate_root && path == stripped_path)
-    })
-}
-
-pub(crate) fn foreign_body_callables() -> Vec<(String, String)> {
-    REGISTERED.with(|registered| registered.borrow().foreign_callables.clone())
+/// Strip a leading `crate` / local crate. `None` when the path must keep
+/// its spelling. Harvested foreign callables use
+/// [`strip_alias_crate_prefix_with`].
+pub(crate) fn strip_alias_crate_prefix(segments: &[String]) -> Option<Vec<String>> {
+    strip_alias_crate_prefix_with(segments, &[])
 }
 
 /// Strip a leading `crate` / local crate, or a harvested foreign callable's
-/// crate root. `None` when the path must keep its spelling.
-pub(crate) fn strip_alias_crate_prefix(segments: &[String]) -> Option<Vec<String>> {
+/// crate root from `callables`. `None` when the path must keep its spelling.
+pub(crate) fn strip_alias_crate_prefix_with(
+    segments: &[String],
+    callables: &[(String, String)],
+) -> Option<Vec<String>> {
     let first = segments.first()?;
     if is_crate_alias_root(first) {
         return Some(segments[1..].to_vec());
     }
     if segments.len() > 1 {
         let remainder = segments[1..].join("::");
-        if is_foreign_body_callable(first, &remainder) {
+        if callables
+            .iter()
+            .any(|(root, path)| root == first && path == &remainder)
+        {
             return Some(segments[1..].to_vec());
         }
     }
     None
-}
-
-/// Run `f` with `root` present in the foreign-body alias set, then
-/// restore the previous set.
-#[cfg(test)]
-pub(crate) fn with_foreign_body_crate_root<R>(root: &str, f: impl FnOnce() -> R) -> R {
-    struct Restore(Vec<String>);
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            set_foreign_body_crate_roots(std::mem::take(&mut self.0));
-        }
-    }
-
-    let previous = foreign_body_crate_roots();
-    if previous.iter().any(|registered| registered == root) {
-        return f();
-    }
-    let mut scoped = previous.clone();
-    scoped.push(root.to_string());
-    set_foreign_body_crate_roots(scoped);
-    let _restore = Restore(previous);
-    f()
-}
-
-/// Run `f` with `(root, stripped_path)` harvested as a foreign callable,
-/// then restore the previous set.
-#[cfg(test)]
-pub(crate) fn with_foreign_body_callable<R>(
-    root: &str,
-    stripped_path: &str,
-    f: impl FnOnce() -> R,
-) -> R {
-    struct Restore(Vec<(String, String)>);
-
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            set_foreign_body_callables(std::mem::take(&mut self.0));
-        }
-    }
-
-    let previous = foreign_body_callables();
-    if previous.iter().any(|(registered_root, registered_path)| {
-        registered_root == root && registered_path == stripped_path
-    }) {
-        return f();
-    }
-    let mut scoped = previous.clone();
-    scoped.push((root.to_string(), stripped_path.to_string()));
-    set_foreign_body_callables(scoped);
-    let _restore = Restore(previous);
-    f()
 }
 
 /// Run one stand-alone, single-LLBC lowering with that artefact's crate root
@@ -254,7 +128,7 @@ pub(crate) fn with_foreign_body_callable<R>(
 /// scoped seed their transparent constructors retain the defining crate while
 /// the layout metadata derived from the same LLBC uses crate-relative names.
 /// Preserve any surrounding multi-crate invocation and restore it even when
-/// lowering unwinds. Does not clear harvested foreign-body roots.
+/// lowering unwinds. Harvested foreign-body tables live on the registry.
 pub(crate) fn with_local_crate_root<R>(root: &str, f: impl FnOnce() -> R) -> R {
     struct Restore(Vec<String>);
 
@@ -280,50 +154,55 @@ mod tests {
     use super::*;
 
     #[test]
-    fn foreign_body_root_is_alias_and_not_local() {
-        with_foreign_body_crate_root("core", || {
-            assert!(!is_crate_alias_root("core"));
-            assert!(is_foreign_body_crate_root("core"));
-            assert!(!is_local_crate_root("core"));
-            assert!(is_crate_alias_root("crate"));
-        });
-        assert!(!is_foreign_body_crate_root("core"));
-        with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
-            assert!(is_foreign_body_callable("core", "num::<Impl>::div_ceil"));
-            assert!(!is_foreign_body_callable("core", "mem::transmute"));
-            let stripped = strip_alias_crate_prefix(&[
+    fn harvested_foreign_callable_strips_only_that_path() {
+        assert!(!is_crate_alias_root("core"));
+        assert!(!is_local_crate_root("core"));
+        assert!(is_crate_alias_root("crate"));
+        let callables = vec![("core".to_string(), "num::<Impl>::div_ceil".to_string())];
+        let stripped = strip_alias_crate_prefix_with(
+            &[
                 "core".to_string(),
                 "num".to_string(),
                 "<Impl>".to_string(),
                 "div_ceil".to_string(),
-            ]);
-            assert_eq!(
-                stripped,
-                Some(vec![
-                    "num".to_string(),
-                    "<Impl>".to_string(),
-                    "div_ceil".to_string()
-                ])
-            );
-            assert_eq!(
-                strip_alias_crate_prefix(&[
+            ],
+            &callables,
+        );
+        assert_eq!(
+            stripped,
+            Some(vec![
+                "num".to_string(),
+                "<Impl>".to_string(),
+                "div_ceil".to_string()
+            ])
+        );
+        assert_eq!(
+            strip_alias_crate_prefix_with(
+                &[
                     "core".to_string(),
                     "mem".to_string(),
                     "transmute".to_string()
-                ]),
-                None
-            );
-        });
+                ],
+                &callables
+            ),
+            None
+        );
+        assert_eq!(
+            strip_alias_crate_prefix(&[
+                "core".to_string(),
+                "num".to_string(),
+                "<Impl>".to_string(),
+                "div_ceil".to_string(),
+            ]),
+            None
+        );
     }
 
     #[test]
-    fn with_local_crate_root_preserves_foreign_body() {
-        with_foreign_body_crate_root("core", || {
-            with_local_crate_root("pyre_interpreter", || {
-                assert!(is_foreign_body_crate_root("core"));
-                assert!(is_local_crate_root("pyre_interpreter"));
-            });
-            assert!(is_foreign_body_crate_root("core"));
+    fn with_local_crate_root_does_not_make_foreign_crate_an_alias() {
+        with_local_crate_root("pyre_interpreter", || {
+            assert!(is_local_crate_root("pyre_interpreter"));
+            assert!(!is_crate_alias_root("core"));
         });
     }
 }

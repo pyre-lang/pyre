@@ -4880,7 +4880,9 @@ fn isconstant_intrinsic_funcptr() -> Constant {
 /// `rlib/jit.py isconstant`: the interpreter fallback is
 /// `NonConstant(False)` inside the marked intrinsic; the traced path is
 /// the oopspec `jit.isconstant`, rewritten to `int_isconstant`.
-fn build_ll_alloc_and_set_isconstant_helper_graph(name: &str) -> Result<PyGraph, TyperError> {
+pub(crate) fn build_ll_alloc_and_set_isconstant_helper_graph(
+    name: &str,
+) -> Result<PyGraph, TyperError> {
     let value = variable_with_lltype("value", LowLevelType::Signed);
     let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
     let return_var = variable_with_lltype("result", LowLevelType::Bool);

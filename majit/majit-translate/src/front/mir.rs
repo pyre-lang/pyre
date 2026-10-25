@@ -381,6 +381,12 @@ pub(crate) fn trait_impl_identity_path(module: &str, identity: &str, leaf: &str)
     segments
 }
 
+/// Whether `segment` is the trait-impl identity segment
+/// [`trait_impl_identity_path`] writes.
+pub(crate) fn is_trait_impl_identity_segment(segment: &str) -> bool {
+    segment.starts_with("<impl ") && segment.ends_with('>')
+}
+
 pub(crate) fn absorb_semantic_program(
     merged: &mut Option<crate::front::semantic::SemanticProgram>,
     prog: crate::front::semantic::SemanticProgram,
@@ -424,6 +430,13 @@ pub(crate) fn absorb_semantic_program(
             acc.struct_fields
                 .raw_word_owners
                 .extend(prog.struct_fields.raw_word_owners);
+            for root in prog.struct_fields.foreign_body_roots {
+                acc.struct_fields.note_foreign_body_crate_root(&root);
+            }
+            for (crate_root, stripped) in prog.struct_fields.foreign_callables {
+                acc.struct_fields
+                    .note_foreign_body_callable(&crate_root, &stripped);
+            }
             for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
                 acc.enum_variant_by_discriminant
                     .entry(enum_key)
@@ -1685,6 +1698,9 @@ impl CrateLoweringState {
             crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
                 llbc,
             ));
+        for fd in llbc.iter_local_fns() {
+            note_body_crate_root_into(fd, &mut struct_fields);
+        }
         Self {
             known_trait_names,
             struct_field_attrs,
@@ -1723,6 +1739,13 @@ impl CrateLoweringState {
                 .fields
                 .entry(key.clone())
                 .or_insert_with(|| fields.clone());
+        }
+        for root in &other.foreign_body_roots {
+            self.struct_fields.note_foreign_body_crate_root(root);
+        }
+        for (crate_root, stripped) in &other.foreign_callables {
+            self.struct_fields
+                .note_foreign_body_callable(crate_root, stripped);
         }
     }
 
@@ -1803,7 +1826,6 @@ impl<'l> CrateLowering<'l> {
         if !self.admit_decl(fd, module_filter, function_filter) {
             return None;
         }
-        note_body_crate_root(fd);
         if self.declare_llexternal(fd) {
             return None;
         }
@@ -2524,17 +2546,21 @@ fn fun_decl_is_jit_conditional_call(fd: &FunDecl) -> bool {
 /// (`bookkeeper.py` `Bookkeeper.getdesc` → `description.py`
 /// `FunctionDesc.getuniquegraph` / `cachedgraph` → `translator.py`
 /// `TranslationContext.buildflowgraph`). An Opaque FunDecl is
-/// `extfunc.py` / `lloperation.py` and stays residual.
-pub(crate) fn note_body_crate_root(fd: &FunDecl) {
+/// `extfunc.py` / `lloperation.py` and stays residual. Tables live on
+/// the translation's `StructFieldRegistry`.
+fn note_body_crate_root_into(
+    fd: &FunDecl,
+    fields: &mut crate::front::semantic::StructFieldRegistry,
+) {
     if !fd.has_unstructured_body() {
         return;
     }
     let Some(NameSeg::Ident { ident: (root, _) }) = fd.item_meta.name.first() else {
         return;
     };
-    crate::local_crates::note_foreign_body_crate_root(root);
+    fields.note_foreign_body_crate_root(root);
     let stripped = strip_crate_prefix(&fd.item_meta.name_path());
-    crate::local_crates::note_foreign_body_callable(root, &stripped);
+    fields.note_foreign_body_callable(root, &stripped);
 }
 
 fn decl_fn_path(module_path: &str, name: &str) -> String {
@@ -3179,8 +3205,13 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
             ValueType::Str
         }
         _ => {
-            if majit_ir::descr::is_shared_u8_slice_spelling(type_name) {
-                ValueType::Str
+            if majit_ir::descr::is_shared_u8_slice_spelling(type_name)
+                || majit_ir::descr::is_option_of_u8_window_spelling(type_name)
+            {
+                // Two-word fat window `{data: Address, len: Signed}`.
+                // `getkind` of that raw struct is int; the descr size is
+                // two words (`get_type_flag`).
+                ValueType::Int
             } else {
                 ValueType::Ref(None)
             }
@@ -8936,6 +8967,9 @@ struct Lowering<'a> {
     block_entry_string_byte_view_locals: Vec<bit_set::BitSet>,
     block_byte_view_seen: Vec<bit_set::BitSet>,
     block_byte_view_conflict: Vec<bit_set::BitSet>,
+    block_entry_list_view_locals: Vec<bit_set::BitSet>,
+    block_list_view_seen: Vec<bit_set::BitSet>,
+    block_list_view_conflict: Vec<bit_set::BitSet>,
     /// Maps each MIR local whose current binding was produced by a
     /// positional [`Rvalue::Aggregate`] (tuple / array / closure — any
     /// kind for which [`Lowering::resolve_aggregate_adt`] returns
@@ -9082,6 +9116,14 @@ struct Lowering<'a> {
     /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
     /// same shape as [`Lowering::positional_aggregate_locals`].
     string_byte_view_locals: Vec<usize>,
+    /// Shared `&[u8]` locals that alias a W2 list owner (`Vec<u8>` /
+    /// `Box<[u8]>` / `&mut [u8]`). One list word; converted to a window
+    /// only at a window boundary. Restored per block from
+    /// [`Lowering::block_entry_list_view_locals`].
+    list_view_locals: Vec<usize>,
+    /// Per-local: the list-view owner is a fixed-size list (`Box<[u8]>` /
+    /// `[u8; N]`). Whole-body, from [`body_owner_view_locals`].
+    list_view_fixed: Vec<bool>,
     /// Field-read results whose declared type is an inline fat pointer
     /// (`Box<[T]>`, `Box<str>`, `Box<dyn Trait>`). The length is the
     /// metadata word and an index uses the data word; neither is a
@@ -9336,9 +9378,9 @@ fn pygraph_initial_block(
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(locals, llbc, &[]);
+    let len_shadow = pair_len_shadows_of(locals, llbc, &[], &[], &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
-    let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
+    let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
     // Arguments become startblock inputargs in source order
     // (RPython parity: `flowcontext.py` `init_locals_stack` fills
     // `locals_w`; arguments are `model.py` `Block` inputargs).
@@ -9513,6 +9555,13 @@ fn pygraph_initial_block(
         }
         let len_slot = len_shadow[i];
         let (ty, class_root) = match len_slot {
+            Some(_) if tyref_is_u8_window(&local.ty, llbc) => {
+                // Window data word is CCHARP (`rffi.py` `CCHARP`). The
+                // register bank stays Unsigned so `getcalldescr` sees
+                // Int-kind; `class_root` lets `derive_subject_inputcells`
+                // seed `SomePtr` so `ann_direct_ptradd` (`s_p`) unions.
+                (ValueType::Unsigned, Some("CCHARP".to_string()))
+            }
             Some(_) => (ValueType::Unsigned, None),
             None => (ty, class_root),
         };
@@ -9592,16 +9641,18 @@ impl<'a> Lowering<'a> {
             gc_struct_ids,
             self_dont_look_inside,
         );
-        let mut graph = FunctionGraph::new(name);
         let n_locals = body.locals.locals.len();
-        let len_shadow = pair_len_shadows(body, llbc);
+        let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
+            pair_len_shadows(body, llbc, &name);
+        let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
         let item_addr = item_addr_locals(body, llbc, &slice_next_iter);
         let n_slots = n_locals + len_shadow.iter().flatten().count();
-        // A body returning a pair slice takes the address of the caller's
-        // length slot as a trailing parameter, held in one more local slot.
-        let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
+        // A body returning a pair slice or a window takes the address of
+        // the caller's length slot as a trailing parameter. A STR-view
+        // local 0 has no length shadow and still needs the slot.
+        let ret_len_slot_local = ret_len_slot_index(&body.locals, llbc, &len_shadow, n_slots);
         let n_slots = n_slots + usize::from(ret_len_slot_local.is_some());
         let mut local_var: Vec<Option<LocalValue>> = vec![None; n_slots];
 
@@ -9643,6 +9694,9 @@ impl<'a> Lowering<'a> {
             // (mirrors the `parse.rs` arg-binding path).
             graph.name_value_var(&var, name.clone());
             *slot = Some(LocalValue::One(var.clone()));
+            if str_view_locals.get(i).copied().unwrap_or(false) {
+                stamp_as_rstr_str(&var);
+            }
             let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves, gc_struct_ids);
             // A parameter with no runtime representation (`Arg<T>`'s
             // `PhantomData` marker is the case in point — rustc gives it no
@@ -9769,7 +9823,19 @@ impl<'a> Lowering<'a> {
             }
             let len_slot = len_shadow[i];
             let (ty, class_root) = match len_slot {
+                Some(_) if tyref_is_u8_window(&local.ty, llbc) => {
+                    // Window data word is CCHARP (`rffi.py` `CCHARP`). The
+                    // register bank stays Unsigned so `getcalldescr` sees
+                    // Int-kind; `class_root` lets `derive_subject_inputcells`
+                    // seed `SomePtr` so `ann_direct_ptradd` (`s_p`) unions.
+                    (ValueType::Unsigned, Some("CCHARP".to_string()))
+                }
                 Some(_) => (ValueType::Unsigned, None),
+                None if str_view_locals.get(i).copied().unwrap_or(false)
+                    && tyref_is_u8_window(&local.ty, llbc) =>
+                {
+                    (ValueType::Str, None)
+                }
                 None => (ty, class_root),
             };
             input_ops.push(SpaceOperation {
@@ -10032,12 +10098,32 @@ impl<'a> Lowering<'a> {
             block_entry_positional_aggregate_locals,
             block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
             block_positional_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
-            block_entry_string_byte_view_locals: vec![
-                bit_set::BitSet::with_capacity(n_locals);
-                nrows
-            ],
+            block_entry_string_byte_view_locals: {
+                let mut rows = vec![bit_set::BitSet::with_capacity(n_locals); nrows];
+                for (i, marked) in str_view_locals.iter().enumerate() {
+                    if *marked {
+                        for row in &mut rows {
+                            row.insert(i);
+                        }
+                    }
+                }
+                rows
+            },
             block_byte_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
             block_byte_view_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_entry_list_view_locals: {
+                let mut rows = vec![bit_set::BitSet::with_capacity(n_locals); nrows];
+                for (i, marked) in list_view_locals.iter().enumerate() {
+                    if *marked {
+                        for row in &mut rows {
+                            row.insert(i);
+                        }
+                    }
+                }
+                rows
+            },
+            block_list_view_seen: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
+            block_list_view_conflict: vec![bit_set::BitSet::with_capacity(n_locals); nrows],
             positional_aggregate_locals: std::collections::HashMap::new(),
             binop_result_locals: compute_binop_result_locals(llbc, body),
             builder_mode: false,
@@ -10053,7 +10139,17 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             const_struct_fields: vec![None; n_locals],
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
-            string_byte_view_locals: Vec::new(),
+            string_byte_view_locals: str_view_locals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, marked)| marked.then_some(i))
+                .collect(),
+            list_view_locals: list_view_locals
+                .iter()
+                .enumerate()
+                .filter_map(|(i, marked)| marked.then_some(i))
+                .collect(),
+            list_view_fixed,
             fat_box_vars: Vec::new(),
             dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
@@ -10926,6 +11022,7 @@ impl<'a> Lowering<'a> {
         self.string_byte_view_locals = self.block_entry_string_byte_view_locals[row]
             .iter()
             .collect();
+        self.list_view_locals = self.block_entry_list_view_locals[row].iter().collect();
 
         // 1. Statements -> SpaceOperations on the corresponding block.
         for (s_idx, st) in bb.statements.iter().enumerate() {
@@ -11151,19 +11248,21 @@ impl<'a> Lowering<'a> {
                 // later emit a symmetric `FieldRead __pos_<N>` carrying
                 // the same owner (see `resolve_place`).
                 let positional_owner = self.positional_aggregate_owner(&rvalue, &dest_ty);
-                let src_ty = rvalue_coercion_src_ty(&rvalue).map(clone_tyref);
-                let copy_u8_list_to_str =
-                    should_copy_u8_list_to_str(&dest_ty, src_ty.as_ref(), self.llbc);
                 // `as_bytes()` marks its dest; a later `Copy` / `&*view`
                 // assign must keep the mark so `slice::len` / `Rvalue::Len`
                 // still emit `__strlen` rather than `arraylen_gc`.
                 let dest_local = i as usize;
                 let inherit_byte_view = match &rvalue {
-                    Rvalue::Use(op, _) => self.operand_is_string_byte_view(op),
-                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => self
-                        .string_byte_view_locals
-                        .iter()
-                        .any(|&local| place_references_local(place, local)),
+                    Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                        self.operand_is_string_byte_view(op)
+                            || operand_tyref(op).is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
+                    }
+                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                        self.string_byte_view_locals
+                            .iter()
+                            .any(|&local| place_references_local(place, local))
+                            || tyref_is_w1_str(&place.ty, self.llbc)
+                    }
                     _ => false,
                 };
                 if inherit_byte_view {
@@ -11176,6 +11275,30 @@ impl<'a> Lowering<'a> {
                     // keep `strlen`/`strgetitem` on a `W_UnicodeObject`.
                     self.string_byte_view_locals
                         .retain(|&local| local != dest_local);
+                }
+                let inherit_list_view = match &rvalue {
+                    Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                        self.operand_is_list_view(op)
+                            || operand_tyref(op).is_some_and(|ty| tyref_is_u8_list(ty, self.llbc))
+                    }
+                    Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                        self.place_is_list_view(place)
+                            || tyref_is_u8_list(&place.ty, self.llbc)
+                            || matches!(
+                                &place.kind,
+                                PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                                    if atom == "Deref"
+                                        && tyref_is_u8_list(&inner.ty, self.llbc)
+                            )
+                    }
+                    _ => false,
+                };
+                if inherit_list_view {
+                    if !self.list_view_locals.contains(&dest_local) {
+                        self.list_view_locals.push(dest_local);
+                    }
+                } else {
+                    self.list_view_locals.retain(|&local| local != dest_local);
                 }
                 // `_j = copy (*_i)` reads the singleton word out of the
                 // `get_or_init` borrow; `_j` carries the same object.
@@ -11226,11 +11349,32 @@ impl<'a> Lowering<'a> {
                     self.positional_aggregate_locals.remove(&dest_local);
                     return Ok(());
                 }
-                let (op, mut result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
-                // Bind the rvalue op first so `ll_join_chars` reads a live
-                // source. `Unsize` of `[u8; N]` / `&[u8; N]` onto a shared
-                // `&[u8]` (and `Some` of that slice) is `rstr.py`
-                // `LLHelpers.ll_join_chars`.
+                if self.list_view_locals.contains(&dest_local)
+                    && tyref_is_u8_window(&dest_ty, self.llbc)
+                {
+                    let list = match &rvalue {
+                        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                            Some(self.resolve_operand(mir_bb, op.clone())?)
+                        }
+                        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                            Some(match &place.kind {
+                                PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                                    if atom == "Deref" =>
+                                {
+                                    self.resolve_place(mir_bb, inner.as_ref().clone())?
+                                }
+                                _ => self.resolve_place(mir_bb, place.clone())?,
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(list) = list {
+                        self.bind_list_view_local(dest_local, list);
+                        self.positional_aggregate_locals.remove(&dest_local);
+                        return Ok(());
+                    }
+                }
+                let (op, result_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                 if let Some(op) = op {
                     let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -11238,18 +11382,15 @@ impl<'a> Lowering<'a> {
                         kind: op,
                     });
                 }
-                if copy_u8_list_to_str {
-                    result_var = self.emit_ll_join_chars(self.emit_bb(mir_bb), result_var);
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
-                }
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
                 // overwrites the slot. A pair-slice item address
                 // (`IterMut` payload) keeps the address, so `*slot = v`
                 // writes through `ptr`.
+                if inherit_byte_view && tyref_is_one_word_str_view(&dest_ty, self.llbc) {
+                    stamp_as_rstr_str(&result_var);
+                }
                 self.local_var[i as usize] = Some(
                     if self.item_addr.get(i as usize).copied().unwrap_or(false) {
                         LocalValue::ItemAddr(result_var.clone())
@@ -11276,6 +11417,14 @@ impl<'a> Lowering<'a> {
                 // projection element. The destination local is NOT
                 // updated — the write goes through indirection, the
                 // base local remains the same Variable.
+                if (tyref_is_u8_window(&dest_ty, self.llbc)
+                    || (self.rvalue_is_str_view_source(&rvalue)
+                        && tyref_is_bare_u8_slice(&dest_ty, self.llbc)))
+                    && let Some((ptr, len)) = self.window_rvalue_parts(mir_bb, &rvalue)?
+                {
+                    let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+                    return self.emit_window_field_write(mir_bb, *inner, elem, ptr, len);
+                }
                 let value = match self.field_write_inline_const(&inner, &elem, &rvalue, &dest_ty) {
                     // An int / bool / float field write keeps its constant
                     // operand inline (`LinkArg::Const`) instead of
@@ -11296,10 +11445,7 @@ impl<'a> Lowering<'a> {
                         LinkArg::Const(crate::flowspace::model::Constant::new(const_value))
                     }
                     None => {
-                        let src_ty = rvalue_coercion_src_ty(&rvalue).map(clone_tyref);
-                        let copy_u8_list_to_str =
-                            should_copy_u8_list_to_str(&dest_ty, src_ty.as_ref(), self.llbc);
-                        let (op, mut value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
+                        let (op, value_var) = self.build_rvalue(mir_bb, rvalue, &dest_ty)?;
                         // If `build_rvalue` produced an op, emit it first
                         // so `value_var` is bound before the write reads
                         // it.
@@ -11309,9 +11455,6 @@ impl<'a> Lowering<'a> {
                                 result: Some(value_var.clone()),
                                 kind: op,
                             });
-                        }
-                        if copy_u8_list_to_str {
-                            value_var = self.emit_ll_join_chars(self.emit_bb(mir_bb), value_var);
                         }
                         LinkArg::Value(value_var)
                     }
@@ -11778,6 +11921,9 @@ impl<'a> Lowering<'a> {
             decode_constant(self.llbc, value).ok()?,
         ) {
             (ValueType::Int, DecodedConst::Int(n)) => Some(ConstValue::Int(n)),
+            (ValueType::Int, DecodedConst::UniChar(code)) => {
+                char::from_u32(code).map(|c| ConstValue::UniStr(c.to_string()))
+            }
             // Charon records a generic integer 0 as unsigned. `intmask`
             // (`rarithmetic.py`) is the signed word; `allocated: 0` on
             // `W_ListObject` is `isize` (`rlist.py` `ll_newlist`).
@@ -15151,11 +15297,7 @@ impl<'a> Lowering<'a> {
                 let projection = self.place_borrow_takes_address(&place)
                     && !tyref_is_string_builder(&place.ty, self.llbc);
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
-                // `&arr` of a Local `Vec<u8>` / `[u8; N]` into a shared
-                // `&[u8]` dest is copied in `lower_assign` (`ll_join_chars`).
-                // A Deref reborrow of an existing `&[u8]` keeps the identity
-                // because `should_copy_u8_list_to_str` is false for a
-                // shared source.
+                // A Deref reborrow of an existing `&[u8]` keeps the identity.
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
@@ -15364,7 +15506,12 @@ impl<'a> Lowering<'a> {
             // call; needs no descriptor for now.
             Rvalue::Len(place) => {
                 // A pair slice's length is its second word, a raw-buffer
-                // array's its type's length.
+                // array's its type's length. A window's length is `FatLen`.
+                if tyref_is_u8_window(&place.ty, self.llbc)
+                    && let Some((_, len)) = self.pair_place_parts(mir_bb, &place)?
+                {
+                    return Ok((None, len));
+                }
                 if let Some(seq) = self.item_seq_of_place(&place) {
                     return Ok((None, self.item_seq_len(mir_bb, seq)?));
                 }
@@ -15382,7 +15529,6 @@ impl<'a> Lowering<'a> {
                     .string_byte_view_locals
                     .iter()
                     .any(|local| place_references_local(&place, *local))
-                    || tyref_is_shared_u8_slice(&place.ty, self.llbc)
                 {
                     "__strlen"
                 } else {
@@ -15496,11 +15642,67 @@ impl<'a> Lowering<'a> {
                     AggregateShape::Ctor(ctor) => {
                         // A pair-slice operand is its pointer here and its
                         // length beside it; the field stores both words.
+                        // Owner → window is only for a window field
+                        // (`FmtArg::Bytes.__pos_0: &[u8]`). A `(&String,)`
+                        // format interpolant stays the rust-heap header.
                         let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
                         let mut pair_lens: Vec<Option<Variable>> =
                             Vec::with_capacity(operands.len());
-                        for op in operands {
+                        for (i, op) in operands.into_iter().enumerate() {
                             if let Some((ptr, len)) = self.pair_value_operand(mir_bb, &op)? {
+                                arg_vars.push(ptr);
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
+                            if let Some((ptr, len)) = self.window_operand(mir_bb, &op)? {
+                                arg_vars.push(ptr);
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
+                            let field_is_window =
+                                ctor.fields.get(i).is_some_and(|field| field.window);
+                            // A STR-view `&[u8]` stored into a window field
+                            // (`FmtArg::Bytes.__pos_0`) or into a Result/enum
+                            // payload whose operand is that slice (`Result<[u8],
+                            // PyError>::Ok`) borrows `{chars, length}` here
+                            // (`rffi.get_nonmovingbuffer`). The sibling window
+                            // operand already writes CCHARP + len; leaving the
+                            // STR header as `__pos_0` unions Integer ∪ List.
+                            if self.operand_is_string_byte_view(&op)
+                                && (field_is_window
+                                    || operand_tyref(&op)
+                                        .is_some_and(|ty| tyref_is_u8_window(ty, self.llbc)))
+                            {
+                                let src_ty = operand_tyref(&op).map(clone_tyref);
+                                let var = self.resolve_operand(mir_bb, op)?;
+                                let (ptr, len) =
+                                    self.owner_to_window(mir_bb, var, src_ty.as_ref())?;
+                                arg_vars.push(self.ensure_window_ccharp(mir_bb, ptr));
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
+                            if self.operand_is_list_view(&op)
+                                && (field_is_window
+                                    || operand_tyref(&op)
+                                        .is_some_and(|ty| tyref_is_u8_window(ty, self.llbc)))
+                            {
+                                let var = self.resolve_operand(mir_bb, op)?;
+                                let (ptr, len) = self.emit_list_view_to_window(mir_bb, var)?;
+                                arg_vars.push(self.ensure_window_ccharp(mir_bb, ptr));
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
+                            if field_is_window
+                                && operand_tyref(&op).is_some_and(|src_ty| {
+                                    tyref_is_string_value(src_ty, self.llbc)
+                                        || tyref_raw_ptr_pointee_is_string_value(src_ty, self.llbc)
+                                        || tyref_is_u8_list(src_ty, self.llbc)
+                                })
+                            {
+                                let src_ty = operand_tyref(&op).map(clone_tyref);
+                                let var = self.resolve_operand(mir_bb, op)?;
+                                let (ptr, len) =
+                                    self.owner_to_window(mir_bb, var, src_ty.as_ref())?;
                                 arg_vars.push(ptr);
                                 pair_lens.push(Some(len));
                                 continue;
@@ -15669,6 +15871,27 @@ impl<'a> Lowering<'a> {
                         Some(OpKind::BinOp {
                             op: "ne".to_string(),
                             lhs: addr,
+                            rhs: zero,
+                            result_ty: ValueType::Int,
+                        }),
+                        res,
+                    ));
+                }
+                // `Option<&[u8]>` is a nullable window: `None` is a null
+                // data word. The discriminant is that null test, not a
+                // `__discriminant` field of a tagged aggregate.
+                if tyref_is_u8_window(&place.ty, self.llbc)
+                    && let Some((data, _)) = self.pair_place_parts(mir_bb, &place)?
+                {
+                    let zero = self.emit_const_uint(mir_bb, 0);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.niche_disc_vars.insert(res.id());
+                    return Ok((
+                        Some(OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: data,
                             rhs: zero,
                             result_ty: ValueType::Int,
                         }),
@@ -16276,6 +16499,194 @@ impl<'a> Lowering<'a> {
         self.local_var[local] = Some(LocalValue::Pair(ptr, len.clone()));
         self.local_var[len_slot] = Some(LocalValue::One(len));
         self.positional_aggregate_locals.remove(&local);
+        self.string_byte_view_locals.retain(|&l| l != local);
+        self.list_view_locals.retain(|&l| l != local);
+    }
+
+    /// One-word `Ptr(STR)` view (`space.bytes_w`). No window, no
+    /// `emit_str_to_window` at the definition.
+    fn bind_str_view_local(&mut self, dest_local: usize, value: Variable) {
+        stamp_as_rstr_str(&value);
+        self.alias_dest_to_arg0(dest_local, value, true);
+    }
+
+    /// A W1 STR source into a window dest (`len_shadow`) borrows
+    /// `{chars, length}` here. A STR-view dest stays one `Ptr(STR)` word.
+    fn bind_str_source_to_dest(&mut self, mir_bb: usize, dest_local: usize, header: Variable) {
+        let window_dest = self.len_shadow.get(dest_local).copied().flatten().is_some()
+            && self
+                .body
+                .locals
+                .locals
+                .get(dest_local)
+                .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc));
+        if window_dest {
+            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+            self.bind_pair_local(dest_local, ptr, len);
+        } else {
+            self.bind_str_view_local(dest_local, header);
+        }
+    }
+
+    fn local_holds_str_view(&self, local: usize) -> bool {
+        self.string_byte_view_locals.contains(&local)
+            && matches!(
+                self.local_var.get(local).and_then(Option::as_ref),
+                Some(LocalValue::One(_))
+            )
+    }
+
+    /// One-word list view of a W2 owner. No window, no
+    /// `emit_list_to_window` at the definition.
+    fn bind_list_view_local(&mut self, dest_local: usize, list: Variable) {
+        self.string_byte_view_locals
+            .retain(|&local| local != dest_local);
+        if !self.list_view_locals.contains(&dest_local) {
+            self.list_view_locals.push(dest_local);
+        }
+        self.local_var[dest_local] = Some(LocalValue::One(list));
+    }
+
+    fn local_holds_list_view(&self, local: usize) -> bool {
+        self.list_view_locals.contains(&local)
+            && matches!(
+                self.local_var.get(local).and_then(Option::as_ref),
+                Some(LocalValue::One(_))
+            )
+    }
+
+    fn operand_is_list_view(&self, op: &Operand) -> bool {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => self
+                .list_view_locals
+                .iter()
+                .any(|&local| place_references_local(place, local)),
+            Operand::Const(_) => false,
+        }
+    }
+
+    fn place_is_list_view(&self, place: &Place) -> bool {
+        self.list_view_locals
+            .iter()
+            .any(|&local| place_references_local(place, local))
+    }
+
+    fn list_view_local_of_var(&self, var: &Variable) -> Option<usize> {
+        self.list_view_locals.iter().copied().find(|&local| {
+            self.local_var
+                .get(local)
+                .and_then(Option::as_ref)
+                .and_then(|value| value.one().ok())
+                .is_some_and(|current| current == *var)
+        })
+    }
+
+    /// Window-boundary conversion of a list view (`rlist.py` `ll_length` /
+    /// `ll_getitem_nonneg` keep the list until this point). A fixed-size
+    /// owner has no `nonmoving_raw_ptr_for_resizable_list`
+    /// (`rgc._check_resizable_list_of_chars`).
+    fn emit_list_view_to_window(
+        &mut self,
+        mir_bb: usize,
+        list: Variable,
+    ) -> Result<(Variable, Variable), LowerError> {
+        let fixed = self
+            .list_view_local_of_var(&list)
+            .is_some_and(|local| self.list_view_fixed.get(local).copied().unwrap_or(false));
+        if fixed {
+            return Err(LowerError::Unsupported(
+                "fixed-size list has no nonmoving raw ptr (rgc._check_resizable_list_of_chars)"
+                    .to_string(),
+            ));
+        }
+        self.emit_list_to_window(mir_bb, list, None)
+    }
+
+    /// A one-word owner (STR or list) assigned into a window dest becomes
+    /// `{CCHARP, len}` here.
+    fn convert_one_word_owner_to_window_dest(
+        &mut self,
+        mir_bb: usize,
+        dest: usize,
+        var: Variable,
+        src_ty: Option<&TyRef>,
+    ) -> Result<(), LowerError> {
+        if self.local_holds_str_view(dest) {
+            self.bind_str_source_to_dest(mir_bb, dest, var);
+            return Ok(());
+        }
+        let (ptr, len) = self.owner_to_window(mir_bb, var, src_ty)?;
+        let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+        self.bind_pair_local(dest, ptr, len);
+        Ok(())
+    }
+
+    fn var_is_str_repr(&self, var: &Variable) -> bool {
+        if var.concretetype().as_ref()
+            == Some(&*crate::translator::rtyper::lltypesystem::rstr::STRPTR)
+        {
+            return true;
+        }
+        self.string_byte_view_locals.iter().any(|&local| {
+            self.local_var
+                .get(local)
+                .and_then(Option::as_ref)
+                .and_then(|value| value.one().ok())
+                .is_some_and(|current| current == *var)
+        })
+    }
+
+    /// Producer `ValueType::Str` or a `STRPTR` concretetype. Used when the
+    /// place's static type is a window but the bound value is already a
+    /// string (`rstr.py` `STR`).
+    fn var_has_str_value_type(&self, var: &Variable) -> bool {
+        if var.concretetype().as_ref()
+            == Some(&*crate::translator::rtyper::lltypesystem::rstr::STRPTR)
+        {
+            return true;
+        }
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                ty: ValueType::Str,
+                ..
+            } | OpKind::Call {
+                result_ty: ValueType::Str,
+                ..
+            } | OpKind::Input {
+                ty: ValueType::Str,
+                ..
+            }
+        )
+    }
+
+    fn rvalue_is_str_view_source(&self, rvalue: &Rvalue) -> bool {
+        match rvalue {
+            Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                self.operand_is_string_byte_view(op)
+                    || operand_tyref(op).is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
+            }
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                self.string_byte_view_locals
+                    .iter()
+                    .any(|&local| place_references_local(place, local))
+                    || tyref_is_w1_str(&place.ty, self.llbc)
+            }
+            _ => false,
+        }
     }
 
     fn bind_slice_iter(&mut self, local: usize, index: Variable, items: Variable) {
@@ -16343,6 +16754,18 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// `(ptr, len)` of a pair-slice or window operand.
+    fn pair_or_window_operand(
+        &mut self,
+        mir_bb: usize,
+        op: &Operand,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        if let Some((ptr, len, _)) = self.pair_operand(mir_bb, op)? {
+            return Ok(Some((ptr, len)));
+        }
+        self.window_operand(mir_bb, op)
+    }
+
     /// `(ptr, len)` of an aggregate operand or assigned value that holds a
     /// pair slice: a `&[T]`, or a reference to one, which aliases its
     /// referent.  `None` for any other operand.
@@ -16381,7 +16804,45 @@ impl<'a> Lowering<'a> {
     ) -> Result<Option<(Variable, Variable)>, LowerError> {
         match &place.kind {
             PlaceKind::Local(local) if self.len_shadow[*local as usize].is_some() => {
-                self.pair_local_parts(mir_bb, *local as usize).map(Some)
+                match self
+                    .local_var
+                    .get(*local as usize)
+                    .and_then(|slot| slot.as_ref())
+                {
+                    Some(LocalValue::Pair(_, _)) => {
+                        let (ptr, len) = self.pair_local_parts(mir_bb, *local as usize)?;
+                        if tyref_is_u8_window(&place.ty, self.llbc) {
+                            Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)))
+                        } else {
+                            Ok(Some((ptr, len)))
+                        }
+                    }
+                    Some(LocalValue::One(_))
+                        if self.local_holds_str_view(*local as usize)
+                            || self.local_holds_list_view(*local as usize) =>
+                    {
+                        Ok(None)
+                    }
+                    _ => {
+                        let (ptr, len) = self.pair_local_parts(mir_bb, *local as usize)?;
+                        if tyref_is_u8_window(&place.ty, self.llbc) {
+                            Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)))
+                        } else {
+                            Ok(Some((ptr, len)))
+                        }
+                    }
+                }
+            }
+            PlaceKind::Local(local) if self.local_holds_str_view(*local as usize) => Ok(None),
+            PlaceKind::Local(local) if self.local_holds_list_view(*local as usize) => Ok(None),
+            // `*s` of a window / pair slice is the fat value `s` already
+            // holds: the referent is unsized, so the borrow is the pair.
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                if atom == "Deref"
+                    && (tyref_is_u8_window(&inner.ty, self.llbc)
+                        || self.pair_slice_kind(&inner.ty).is_some()) =>
+            {
+                self.pair_place_parts(mir_bb, inner)
             }
             // `*r` for a reference `r` to a pair is the pair `r` aliases.
             PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
@@ -16396,6 +16857,12 @@ impl<'a> Lowering<'a> {
                     && tyref_pair_field_kind(&place.ty, self.llbc).is_some() =>
             {
                 self.pair_field_parts(mir_bb, place)
+            }
+            _ if tyref_is_u8_window(&place.ty, self.llbc)
+                && !matches!(place.kind, PlaceKind::Local(_)) =>
+            {
+                let var = self.resolve_place(mir_bb, place.clone())?;
+                Ok(Some(self.split_window_value(mir_bb, var)?))
             }
             _ => Ok(None),
         }
@@ -17312,6 +17779,29 @@ impl<'a> Lowering<'a> {
         rvalue: Rvalue,
     ) -> Result<(), LowerError> {
         let dest_ty = clone_tyref(&self.body.locals.locals[dest].ty);
+        if self.rvalue_is_str_view_source(&rvalue) && tyref_is_u8_window(&dest_ty, self.llbc) {
+            // Dest has a length shadow: it is a window. Convert on this
+            // write (`rffi.get_nonmovingbuffer` / `ll_chars`), not at the
+            // STR-view definition.
+            let header = match &rvalue {
+                Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                    self.resolve_operand(mir_bb, op.clone())?
+                }
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                    self.resolve_place(mir_bb, place.clone())?
+                }
+                _ => {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: STR view local {dest} from {}",
+                        rvalue_variant_name(&rvalue)
+                    )));
+                }
+            };
+            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+            self.bind_pair_local(dest, ptr, len);
+            return Ok(());
+        }
         // A reference to a pair slice aliases the pair it borrows.
         let dest_is_pair_ref = tyref_pair_slice_item_kind(&dest_ty, self.llbc).is_none()
             && self.pair_iter_kind(&dest_ty).is_none();
@@ -17325,10 +17815,12 @@ impl<'a> Lowering<'a> {
             Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } if dest_is_pair_ref => {
                 self.pair_place_parts(mir_bb, place)?
             }
-            // `&*s` reborrows the pair `s` holds.
+            // `&*s` reborrows the pair / window `s` holds.
             Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
                 PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
-                    if atom == "Deref" && self.pair_slice_kind(&inner.ty).is_some() =>
+                    if atom == "Deref"
+                        && (self.pair_slice_kind(&inner.ty).is_some()
+                            || tyref_is_u8_window(&inner.ty, self.llbc)) =>
                 {
                     self.pair_place_parts(mir_bb, inner)?
                 }
@@ -17352,6 +17844,10 @@ impl<'a> Lowering<'a> {
             .map(|(ptr, len, _)| (ptr, len)),
             _ => None,
         };
+        let source = match source {
+            Some(pair) => Some(pair),
+            None => self.window_rvalue_parts(mir_bb, &rvalue)?,
+        };
         let Some((ptr, len)) = source else {
             let detail = match &rvalue {
                 Rvalue::Cast(kind, ..) => format!("Cast {kind}"),
@@ -17360,6 +17856,11 @@ impl<'a> Lowering<'a> {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: pair slice local {dest} from {detail}"
             )));
+        };
+        let ptr = if tyref_is_u8_window(&dest_ty, self.llbc) {
+            self.ensure_window_ccharp(mir_bb, ptr)
+        } else {
+            ptr
         };
         self.bind_pair_local(dest, ptr, len);
         Ok(())
@@ -17493,13 +17994,7 @@ impl<'a> Lowering<'a> {
             && let Ok(decoded) = decode_constant(self.llbc, &value)
         {
             let bb_id = self.block_id[mir_bb];
-            let res = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(res.clone()),
-                kind: decoded_const_to_op(decoded),
-            });
+            let res = self.emit_decoded_const(bb_id, decoded);
             self.bind_initializer_result(mir_bb, dest_local, target, res)?;
             return Ok(true);
         }
@@ -17712,12 +18207,41 @@ impl<'a> Lowering<'a> {
     /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
     /// pair slice, or it is a slice method that reads one.
     fn is_pair_call(&self, call: &CallPayload, dest_local: usize) -> bool {
+        let dest_is_window_slot = self.len_shadow.get(dest_local).copied().flatten().is_some()
+            && self
+                .body
+                .locals
+                .locals
+                .get(dest_local)
+                .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc));
+        // A W1 STR view stays one `Ptr(STR)` word. Index / `len` / `eq`
+        // take the HEAD STR-view lowering (`string_byte_view_locals`).
+        // A mixed STR/list dest has a length shadow and converts here.
+        if !dest_is_window_slot {
+            if call_dest_is_w1_str_source(call, self.llbc) {
+                return false;
+            }
+            if operand_local(call.args.first())
+                .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+            {
+                return false;
+            }
+            if self.local_holds_list_view(dest_local)
+                || operand_local(call.args.first())
+                    .is_some_and(|local| self.local_holds_list_view(local))
+            {
+                return false;
+            }
+        }
         // A length slot means this dest is a pair in this frame only when
-        // its MIR type is a pair slice, an option of one, or a slice
-        // iterator. `IterMut::next` writes `Option<&mut T>`, which is an
-        // item address, not a slice.
+        // its MIR type is a pair slice, an option of one, a slice
+        // iterator, or a u8 window. `IterMut::next` writes `Option<&mut T>`,
+        // which is an item address, not a slice.
         if self.len_shadow[dest_local].is_some()
             && self.body.locals.locals.get(dest_local).is_some_and(|loc| {
+                if tyref_is_u8_window(&loc.ty, self.llbc) {
+                    return true;
+                }
                 let pair_dest = self.pair_slice_kind(&loc.ty).is_some()
                     || self.pair_iter_kind(&loc.ty).is_some()
                     || self.option_pair_slice_kind(&loc.ty).is_some();
@@ -17761,36 +18285,47 @@ impl<'a> Lowering<'a> {
                 || (self.local_is_object_vec_header(local)
                     && regular_call_name_path(reg, self.llbc).as_deref()
                         != Some("core::slice::<Impl>::reverse"))
-        }) && call
-            .args
-            .first()
-            .and_then(operand_tyref)
-            .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
-            && regular_call_name_path(reg, self.llbc).is_some_and(|path| match path.as_str() {
+        }) && call.args.first().and_then(operand_tyref).is_some_and(|ty| {
+            self.pair_slice_kind(ty).is_some() || tyref_is_u8_window(ty, self.llbc)
+        }) && regular_call_name_path(reg, self.llbc).is_some_and(|path| {
+            let window_recv = call
+                .args
+                .first()
+                .and_then(operand_tyref)
+                .is_some_and(|ty| tyref_is_u8_window(ty, self.llbc));
+            match path.as_str() {
                 "core::slice::<Impl>::len"
                 | "core::slice::<Impl>::is_empty"
-                | "core::slice::<Impl>::reverse"
+                | "core::slice::<Impl>::as_ptr"
+                | "core::slice::<Impl>::as_mut_ptr" => true,
+                "core::slice::index::<Impl>::index"
+                | "core::slice::index::<Impl>::index_mut"
+                | "core::ops::index::<Impl>::index"
+                | "core::ops::index::<Impl>::index_mut" => window_recv,
+                "core::slice::<Impl>::reverse"
                 | "core::slice::<Impl>::rotate_left"
                 | "core::slice::<Impl>::rotate_right"
                 | "core::slice::<Impl>::copy_from_slice"
-                | "core::slice::<Impl>::as_ptr"
-                | "core::slice::<Impl>::as_mut_ptr"
                 | "core::slice::<Impl>::contains"
                 | "core::slice::<Impl>::first"
                 | "core::slice::<Impl>::last"
-                | "alloc::slice::<Impl>::to_vec" => true,
+                | "alloc::slice::<Impl>::to_vec" => !window_recv,
                 // Only the scalar `SliceIndex` instantiation yields one item.
-                "core::slice::<Impl>::get" => call
-                    .args
-                    .get(1)
-                    .and_then(|op| {
-                        operand_tyref(op)
-                            .map(clone_tyref)
-                            .or_else(|| const_operand_tyref(op, self.llbc))
-                    })
-                    .is_some_and(|ty| tyref_to_ast_string(&ty, self.llbc) == "usize"),
+                "core::slice::<Impl>::get" => {
+                    !window_recv
+                        && call
+                            .args
+                            .get(1)
+                            .and_then(|op| {
+                                operand_tyref(op)
+                                    .map(clone_tyref)
+                                    .or_else(|| const_operand_tyref(op, self.llbc))
+                            })
+                            .is_some_and(|ty| tyref_to_ast_string(&ty, self.llbc) == "usize")
+                }
                 _ => false,
-            })
+            }
+        })
     }
 
     /// A call that defines a pair slice, or a slice method over one.
@@ -17836,13 +18371,47 @@ impl<'a> Lowering<'a> {
         let dest_ty = clone_tyref(&call.dest.ty);
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len() + 1);
         let mut pair_lens: Vec<(usize, Variable)> = Vec::new();
+        let host_dict = is_rdict_host_rewritten_call(reg, self.llbc);
+        let input_flags = regular_call_fun_decl_id(&reg.kind)
+            .and_then(|id| self.llbc.fn_by_id(id))
+            .map(|fd| self.pair_or_window_fun_inputs(fd, &reg.generics).0)
+            .unwrap_or_default();
         for op in &call.args {
-            match self.pair_operand(mir_bb, op)? {
-                Some((ptr, len, _)) => {
-                    pair_lens.push((args.len(), len));
+            let index = args.len();
+            match self.pair_or_window_operand(mir_bb, op)? {
+                Some((ptr, len)) => {
+                    if host_dict && index != 0 {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: window argument of {name}"
+                        )));
+                    }
+                    pair_lens.push((index, len));
                     args.push(ptr);
                 }
-                None => args.push(self.resolve_operand(mir_bb, op.clone())?),
+                None => {
+                    if !host_dict
+                        && input_flags.get(index).copied().unwrap_or(false)
+                        && self.operand_is_string_byte_view(op)
+                        && !self.is_wtf8_from_bytes_identity(reg, &dest_ty)
+                        && !tyref_is_u8_window(&dest_ty, self.llbc)
+                        && !tyref_is_string_value(&dest_ty, self.llbc)
+                    {
+                        let var = self.resolve_operand(mir_bb, op.clone())?;
+                        let (ptr, len) = self.owner_to_window(mir_bb, var, operand_tyref(op))?;
+                        pair_lens.push((index, len));
+                        args.push(self.ensure_window_ccharp(mir_bb, ptr));
+                    } else if !host_dict
+                        && input_flags.get(index).copied().unwrap_or(false)
+                        && self.operand_is_list_view(op)
+                    {
+                        let var = self.resolve_operand(mir_bb, op.clone())?;
+                        let (ptr, len) = self.emit_list_view_to_window(mir_bb, var)?;
+                        pair_lens.push((index, len));
+                        args.push(self.ensure_window_ccharp(mir_bb, ptr));
+                    } else {
+                        args.push(self.resolve_operand(mir_bb, op.clone())?);
+                    }
+                }
             }
         }
         // Whole-list `&mut vec` / `&mut vec[..]` of `Vec<PyObjectRef>` is
@@ -17937,6 +18506,31 @@ impl<'a> Lowering<'a> {
                 range,
             ));
             self.bind_slice_iter(dest_local, iter, args[0].clone());
+        } else if self.len_shadow[dest_local].is_some() && tyref_is_u8_window(&dest_ty, self.llbc) {
+            if call_dest_is_w1_str_source(&call, self.llbc) {
+                let header = if self.is_w_bytes_data(reg) || self.is_w_bytes_block(reg) {
+                    let bb_id = self.emit_bb(mir_bb);
+                    self.emit_w_bytes_data_str_read(bb_id, args[0].clone())
+                } else if self.is_w_str_storage(reg) {
+                    let bb_id = self.emit_bb(mir_bb);
+                    self.emit_w_str_utf8_read(bb_id, args[0].clone())
+                } else {
+                    args[0].clone()
+                };
+                self.bind_str_source_to_dest(mir_bb, dest_local, header);
+            } else {
+                let (ptr, len) = self.lower_window_dest_call(
+                    mir_bb,
+                    &name,
+                    &args,
+                    &arg_tys,
+                    &pair_lens,
+                    reg,
+                    arg_is_range_full,
+                )?;
+                let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+                self.bind_pair_local(dest_local, ptr, len);
+            }
         } else if self.len_shadow[dest_local].is_some() {
             // `<[T; N]>::index(&a, range)` over a raw-buffer array.
             let array_receiver = match (name.as_str(), call.args.first()) {
@@ -18094,13 +18688,35 @@ impl<'a> Lowering<'a> {
                                 &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
                             )
                         }
+                        Some(ValueType::Ref(_)) => {
+                            let bb_id = self.emit_bb(mir_bb);
+                            let (retype, ptr) =
+                                push_ptr_to_unsigned_cast(&mut self.graph, bb_id, args[0].clone());
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(ptr.clone()),
+                                kind: retype,
+                            });
+                            ptr
+                        }
                         other => {
                             return Err(LowerError::Unsupported(format!(
                                 "bb{mir_bb}: from_raw_parts over a {other:?} pointer"
                             )));
                         }
                     };
-                    (ptr, args[1].clone())
+                    // W3 is only a `u8` window (`tyref_is_u8_window`).
+                    // `from_raw_parts` of `*mut i64` / `*mut PyObjectRef`
+                    // keeps the window-commit pair `(ptr, n)`.
+                    let data = if tyref_is_u8_window(&dest_ty, self.llbc) {
+                        self.emit_window_from_raw_parts_ptr(
+                            mir_bb,
+                            ptr,
+                            arg_tys.first().and_then(Option::as_ref),
+                        )
+                    } else {
+                        ptr
+                    };
+                    (data, args[1].clone())
                 }
                 _ => {
                     let fd = self.pair_callee_decl(mir_bb, reg, &name, &pair_lens, true)?;
@@ -18115,9 +18731,9 @@ impl<'a> Lowering<'a> {
                         vec![],
                         ValueType::Unsigned,
                     );
+                    let target_op = self.pair_call_target(mir_bb, reg, &args, &pair_lens)?;
                     let mut call_args = splice_pair_lens(args, pair_lens);
                     call_args.push(slot.clone());
-                    let target_op = self.pair_call_target(mir_bb, reg, &call_args)?;
                     let ptr = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -18239,6 +18855,16 @@ impl<'a> Lowering<'a> {
                 }
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
                     args[0].clone()
+                }
+                "core::slice::index::<Impl>::index"
+                | "core::slice::index::<Impl>::index_mut"
+                | "core::ops::index::<Impl>::index"
+                | "core::ops::index::<Impl>::index_mut"
+                    if args.len() == 2 =>
+                {
+                    // Scalar `s[i]` of a window is `&u8` at `data + i`.
+                    // The following Deref is the 1-byte `raw_load`.
+                    self.window_ptr_add(mir_bb, args[0].clone(), args[1].clone())
                 }
                 "core::slice::<Impl>::contains" => {
                     let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
@@ -18594,6 +19220,47 @@ impl<'a> Lowering<'a> {
         (ptr, len)
     }
 
+    /// FunDecl slots that take the two-word pair/window ABI.
+    ///
+    /// A generic translation subject (`hash_of<Q>` with `Q = [u8]`)
+    /// declares `&Q`; the specialized body sees `&[u8]` and gets a
+    /// length slot (`pair_len_shadows_of`). The call site substitutes
+    /// the same `generics.types` so the argument list matches that
+    /// body. An opaque std helper (`core::slice::<Impl>::get`) has no
+    /// body to specialize: its unsubstituted `&[T]` stays one word and
+    /// the length stays in the caller frame.
+    fn pair_or_window_fun_inputs(
+        &self,
+        fd: &FunDecl,
+        generics: &serde_json::Value,
+    ) -> (Vec<bool>, bool) {
+        let substituted = crate::front::clause_spec::decl_has_unstructured_body(fd)
+            .then(|| crate::front::clause_spec::concrete_type_args(generics, self.llbc))
+            .flatten()
+            .map(|(types, consts)| {
+                crate::front::clause_spec::substituted_signature(
+                    &fd.signature,
+                    self.llbc,
+                    &types,
+                    &consts,
+                )
+            });
+        let inputs = substituted
+            .as_ref()
+            .map(|sig| sig.inputs.as_slice())
+            .unwrap_or(fd.signature.inputs.as_slice());
+        let output = substituted
+            .as_ref()
+            .map(|sig| &sig.output)
+            .unwrap_or(&fd.signature.output);
+        let is_pair_or_window =
+            |ty: &TyRef| self.pair_slice_kind(ty).is_some() || tyref_is_u8_window(ty, self.llbc);
+        (
+            inputs.iter().map(is_pair_or_window).collect(),
+            is_pair_or_window(output),
+        )
+    }
+
     /// The declaration of a callee that takes or returns pair slices: its
     /// declared parameters must be pair slices exactly where the call passes
     /// one, and its result one when `returns_pair`.  A generic callee, whose
@@ -18614,10 +19281,12 @@ impl<'a> Lowering<'a> {
         let fd = regular_call_fun_decl_id(&reg.kind)
             .and_then(|id| self.llbc.fn_by_id(id))
             .ok_or_else(mismatch)?;
-        let params_match = fd.signature.inputs.iter().enumerate().all(|(index, ty)| {
-            self.pair_slice_kind(ty).is_some() == pair_lens.iter().any(|(at, _)| *at == index)
-        });
-        let result_matches = self.pair_slice_kind(&fd.signature.output).is_some() == returns_pair;
+        let (input_flags, output_is_pair) = self.pair_or_window_fun_inputs(fd, &reg.generics);
+        let params_match = input_flags
+            .iter()
+            .enumerate()
+            .all(|(index, wants)| *wants == pair_lens.iter().any(|(at, _)| *at == index));
+        let result_matches = output_is_pair == returns_pair;
         if !params_match || !result_matches || abstract_trait_call_target(reg, self.llbc).is_some()
         {
             return Err(mismatch());
@@ -18627,21 +19296,32 @@ impl<'a> Lowering<'a> {
 
     /// The call target of a monomorphic callee taking pair slices.  A
     /// method target keeps its receiver in `args[0]`, so a pair receiver
-    /// names the function by path instead.
+    /// names the function by path instead.  A pair or window argument
+    /// that is not the receiver is the same: the host method rewrite
+    /// (`getattr` + `simple_call`) keeps the unspliced arity
+    /// (`RDict::get` is receiver + key; `OrderedDictRepr.rtype_method_get`
+    /// → `ll_dict_get`), while the specialized body takes the two-word ABI.
     fn pair_call_target(
         &self,
         mir_bb: usize,
         reg: &RegularCall,
         args: &[Variable],
+        pair_lens: &[(usize, Variable)],
     ) -> Result<CallTarget, LowerError> {
         let (segments, method_hint) = self.call_target_segments(mir_bb, reg, None)?;
         let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
         let receiver_is_pair = fun_decl_id
             .and_then(|id| self.llbc.fn_by_id(id))
             .and_then(|fd| fd.signature.inputs.first())
-            .is_some_and(|ty| self.pair_slice_kind(ty).is_some());
+            .is_some_and(|ty| {
+                self.pair_slice_kind(ty).is_some() || tyref_is_u8_window(ty, self.llbc)
+            })
+            || pair_lens.iter().any(|(at, _)| *at == 0);
+        let non_receiver_pair = pair_lens.iter().any(|(at, _)| *at != 0);
         Ok(match method_hint {
-            Some((owner_root, leaf)) if !args.is_empty() && !receiver_is_pair => {
+            Some((owner_root, leaf))
+                if !args.is_empty() && !receiver_is_pair && !non_receiver_pair =>
+            {
                 let mut target = CallTarget::method(leaf, Some(owner_root));
                 if let Some(id) = fun_decl_id {
                     target = target.with_fun_decl_id(id);
@@ -18739,6 +19419,7 @@ impl<'a> Lowering<'a> {
             let code = match decoded {
                 DecodedConst::Int(n) => Some(n),
                 DecodedConst::UInt(n) => i64::try_from(n).ok(),
+                DecodedConst::UniChar(code) => Some(i64::from(code)),
                 _ => None,
             };
             if let Some(code) = code
@@ -19379,7 +20060,45 @@ impl<'a> Lowering<'a> {
             });
             return Ok(var);
         }
-        let op = match decode_constant(self.llbc, value)? {
+        let decoded = decode_constant(self.llbc, value)?;
+        let bb_id = self.emit_bb(mir_bb);
+        Ok(self.emit_decoded_const(bb_id, decoded))
+    }
+
+    /// Emit `decoded` onto `bb_id`. A Unicode scalar is
+    /// `bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`: the
+    /// integer code point plus `unichr`.
+    fn emit_decoded_const(
+        &mut self,
+        bb_id: crate::model::BlockId,
+        decoded: DecodedConst,
+    ) -> Variable {
+        if let DecodedConst::UniChar(code) = decoded {
+            let code_v = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(code_v.clone()),
+                kind: OpKind::ConstInt(i64::from(code)),
+            });
+            let var = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![code_v]),
+                    result_ty: ValueType::Int,
+                },
+            });
+            return var;
+        }
+        let op = match decoded {
+            DecodedConst::UniChar(_) => unreachable!("handled above"),
             DecodedConst::Int(n) => OpKind::ConstInt(n),
             DecodedConst::UInt(n) => OpKind::ConstUInt(n),
             DecodedConst::Int128(n) => OpKind::ConstInt128(n),
@@ -19446,12 +20165,11 @@ impl<'a> Lowering<'a> {
         let var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        let bb_id = self.emit_bb(mir_bb);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(var.clone()),
             kind: op,
         });
-        Ok(var)
+        var
     }
 
     /// A safe `Index` / `IndexMut` / `.len()` of a `Vec` or slice takes the
@@ -19509,6 +20227,61 @@ impl<'a> Lowering<'a> {
         }
         let marked = self.fat_box_vars.clone();
         retarget_fat_operand(&mut self.graph, &marked, bb_id, var, part)
+    }
+
+    /// Window `{data, len}` words of a fat box. Data is `CCHARP`.
+    fn window_fat_component(
+        &mut self,
+        bb_id: BlockId,
+        var: &Variable,
+        part: crate::model::VecFieldPart,
+    ) -> Option<Variable> {
+        if self.fat_box_vars.is_empty() {
+            return None;
+        }
+        let marked = self.fat_box_vars.clone();
+        retarget_window_fat_operand(&mut self.graph, &marked, bb_id, var, part)
+    }
+
+    fn is_fat_box_var(&self, var: &Variable) -> bool {
+        let peeled = peel_copy_var(&self.graph, var);
+        self.fat_box_vars
+            .iter()
+            .any(|marked| marked == var || marked == &peeled)
+    }
+
+    /// True when `var` is a GC pointer / string, so a window pair must
+    /// `cast_ptr_to_int` it into `CCHARP`. An `Input` of `Unsigned` is
+    /// already the pair data word.
+    fn var_is_gc_ref_value(&self, var: &Variable) -> bool {
+        if crate::model::FunctionGraph::concretetype_of(var) == crate::model::ConcreteType::GcRef {
+            return true;
+        }
+        let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) else {
+            return false;
+        };
+        let Some(op) = self
+            .graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+        else {
+            return false;
+        };
+        matches!(
+            &op.kind,
+            OpKind::FieldRead {
+                ty: ValueType::Ref(_) | ValueType::Str,
+                ..
+            } | OpKind::Call {
+                result_ty: ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder,
+                ..
+            } | OpKind::Input {
+                ty: ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder,
+                ..
+            }
+        )
     }
 }
 
@@ -19838,6 +20611,47 @@ fn retarget_fat_operand(
         _ => return None,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::FieldRead {
+            base,
+            field,
+            ty,
+            pure,
+        },
+    });
+    Some(res)
+}
+
+/// Window pair `{data, len}` split of an inline fat box. Data is `CCHARP`
+/// (`Address` / int-kind), even when the owner is a GC `Box<[u8]>`: the
+/// pair ABI is two integers, not a GC fat-ref plus a length.
+fn retarget_window_fat_operand(
+    graph: &mut FunctionGraph,
+    fat_box_vars: &[Variable],
+    bb_id: BlockId,
+    var: &Variable,
+    part: crate::model::VecFieldPart,
+) -> Option<Variable> {
+    if fat_box_vars.is_empty()
+        || !matches!(
+            part,
+            crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen
+        )
+    {
+        return None;
+    }
+    let (base, mut field, pure) = fat_field_producer(graph, fat_box_vars, var)?;
+    field.vec_part = Some(part);
+    field.taken_by_address = false;
+    field.inline_vec = false;
+    field.owner_declared_gc = Some(false);
+    let ty = match part {
+        crate::model::VecFieldPart::FatLen => ValueType::Int,
+        crate::model::VecFieldPart::FatData => ValueType::Unsigned,
+        _ => return None,
+    };
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
         result: Some(res.clone()),
         kind: OpKind::FieldRead {
@@ -20326,10 +21140,12 @@ impl<'a> Lowering<'a> {
         pair_field: bool,
     ) -> Result<Variable, LowerError> {
         let place_ty = clone_tyref(&place.ty);
-        // A pair slice's `PtrMetadata` is its length word.
+        // A pair slice's `PtrMetadata` is its length word. A window's is
+        // the same length word (`FatLen`).
         if let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind
             && atom == "PtrMetadata"
-            && self.pair_slice_kind(&inner.ty).is_some()
+            && (self.pair_slice_kind(&inner.ty).is_some()
+                || tyref_is_u8_window(&inner.ty, self.llbc))
             && let Some((_, len)) = self.pair_place_parts(mir_bb, inner)?
         {
             return Ok(len);
@@ -20466,16 +21282,33 @@ impl<'a> Lowering<'a> {
                     Some(LocalValue::Pair(_, _))
                 ) =>
             {
-                self.local_var[i as usize]
-                    .as_ref()
-                    .unwrap()
-                    .one()
-                    .map_err(|err| match err {
-                        LowerError::Unsupported(msg) => {
-                            LowerError::Unsupported(format!("bb{mir_bb}: {msg}"))
-                        }
-                        other => other,
-                    })
+                // A window's one-word consumer sees the `CCHARP` data
+                // word; the length stays in the shadow (`link_word`).
+                // Word-sized pair slices still refuse a one-word read.
+                let local = i as usize;
+                if self
+                    .body
+                    .locals
+                    .locals
+                    .get(local)
+                    .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc))
+                {
+                    Ok(self.local_var[local]
+                        .as_ref()
+                        .expect("pair local is bound")
+                        .link_word())
+                } else {
+                    self.local_var[local]
+                        .as_ref()
+                        .unwrap()
+                        .one()
+                        .map_err(|err| match err {
+                            LowerError::Unsupported(msg) => {
+                                LowerError::Unsupported(format!("bb{mir_bb}: {msg}"))
+                            }
+                            other => other,
+                        })
+                }
             }
             // A reference-item `Option<&T>` is one word: the item itself,
             // since a reference aliases its referent, or the null pointer
@@ -20920,6 +21753,8 @@ impl<'a> Lowering<'a> {
                     });
                     if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
                         || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
+                        || tyref_is_u8_window(&field_ty, self.llbc)
+                        || tyref_is_u8_window(&place_ty, self.llbc)
                         || constants_box
                     {
                         self.fat_box_vars.push(res.clone());
@@ -20961,8 +21796,11 @@ impl<'a> Lowering<'a> {
                         || self
                             .string_byte_view_locals
                             .iter()
-                            .any(|&local| place_references_local(&inner, local))
-                        || tyref_is_shared_u8_slice(&inner.ty, self.llbc);
+                            .any(|&local| place_references_local(&inner, local));
+                    let list_view = self.place_is_list_view(inner.as_ref());
+                    let window_index = !string_byte_view
+                        && !list_view
+                        && self.place_is_window_index_base(inner.as_ref());
                     let string_array_view = self
                         .string_array_view_locals
                         .iter()
@@ -20976,6 +21814,20 @@ impl<'a> Lowering<'a> {
                             array_type_id.as_deref(),
                         );
                     }
+                    if window_index {
+                        let data = if let Some((ptr, _)) =
+                            self.pair_place_parts(mir_bb, inner.as_ref())?
+                        {
+                            ptr
+                        } else {
+                            let base = self.resolve_place(mir_bb, *inner)?;
+                            let bb_id = self.emit_bb(mir_bb);
+                            self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatData)
+                                .unwrap_or(base)
+                        };
+                        let loaded = self.emit_window_raw_load(mir_bb, data, idx_var);
+                        return Ok(loaded);
+                    }
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let res = self
@@ -20988,7 +21840,7 @@ impl<'a> Lowering<'a> {
                     // `Box<[T]>`'s data word has no length header. `[u8]` is
                     // the length-prefixed byte block, so only this base is
                     // remapped onto `Vec<T>`.
-                    let fat_data = if string_byte_view {
+                    let fat_data = if string_byte_view || list_view {
                         None
                     } else {
                         self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatData)
@@ -21452,9 +22304,15 @@ impl<'a> Lowering<'a> {
                         result: Some(offset.clone()),
                         kind: OpKind::ConstInt(0),
                     });
-                    let loaded = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    // Integer pointee (`u8` window byte, `CCHARP`) is `CHAR`.
+                    // `Unknown` banks as `'r'` and `rewrite_op_raw_load`
+                    // wraps the loaded word in `cast_int_to_ptr`.
+                    let loaded_ct = if matches!(item_ty, ValueType::Int | ValueType::Unsigned) {
+                        crate::model::ConcreteType::Signed
+                    } else {
+                        crate::model::ConcreteType::Unknown
+                    };
+                    let loaded = self.graph.alloc_value_var_with_type(loaded_ct);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(loaded.clone()),
                         kind: OpKind::RawLoad {
@@ -22107,6 +22965,9 @@ impl<'a> Lowering<'a> {
                     .1 == majit_ir::value::Type::Void
                         || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc)),
                     narrow_root: self.typed_ref_field_narrow_root(declared_ty),
+                    window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
+                        || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
+                        || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),
                 }
             })
             .collect();
@@ -23436,9 +24297,21 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // A pair slice returns its pointer and stores its length
-                // through the caller's slot.
+                // through the caller's slot. A STR-view local 0 becomes a
+                // window here (`rffi.get_raw_address_of_string`).
                 if let Some(ret_slot) = self.ret_len_slot_local {
-                    let (ptr, len) = self.pair_local_parts(mir_bb, 0)?;
+                    let (ptr, len) = match self.local_var[0].as_ref() {
+                        Some(LocalValue::One(header))
+                            if self.local_holds_str_view(0) || self.var_is_str_repr(header) =>
+                        {
+                            let (ptr, len) = self.emit_str_to_window(mir_bb, header.clone());
+                            (self.ensure_window_ccharp(mir_bb, ptr), len)
+                        }
+                        Some(LocalValue::One(list)) if self.local_holds_list_view(0) => {
+                            self.emit_list_view_to_window(mir_bb, list.clone())?
+                        }
+                        _ => self.pair_local_parts(mir_bb, 0)?,
+                    };
                     let slot = self.local_var[ret_slot]
                         .as_ref()
                         .and_then(|value| value.one().ok())
@@ -24610,17 +25483,15 @@ impl<'a> Lowering<'a> {
         let first_arg_is_string_byte_view = call
             .args
             .first()
-            .is_some_and(|op| self.operand_is_string_byte_view(op))
-            || first_arg_ty
-                .as_ref()
-                .is_some_and(|ty| tyref_is_shared_u8_slice(ty, self.llbc));
+            .is_some_and(|op| self.operand_is_string_byte_view(op));
+        let first_arg_is_list_view = call
+            .args
+            .first()
+            .is_some_and(|op| self.operand_is_list_view(op));
         let second_arg_is_string_byte_view = call
             .args
             .get(1)
-            .is_some_and(|op| self.operand_is_string_byte_view(op))
-            || second_arg_ty
-                .as_ref()
-                .is_some_and(|ty| tyref_is_shared_u8_slice(ty, self.llbc));
+            .is_some_and(|op| self.operand_is_string_byte_view(op));
         // A constant word (`vb.int_eq(1)`) has no place type. Its declared
         // `ty` is what the int-comparison residual classifies, the same way
         // `RBigInt::from(1)` uses `const_arg_ty`.
@@ -24717,11 +25588,106 @@ impl<'a> Lowering<'a> {
             }
             _ => None,
         };
+        // A monomorphic `&[T]` / `&[u8]` FunDecl takes the two-word ABI.
+        // A generic translation subject is substituted with the call's
+        // `generics.types` (`hash_of<Q>` with `Q = [u8]` → `&[u8]`).
+        // Generic `core::slice::<Impl>::get` is opaque (no unstructured
+        // body) and still spells `&[T]`; splicing the window length there
+        // makes `pair_callee_decl` reject the call. Those sites keep the
+        // data word as the receiver and leave the length in the frame
+        // (`slice_get` reads it via FatLen / the recorded diamond).
+        let (pair_input_is_pair_or_window, callee_output_is_window): (Vec<bool>, bool) =
+            match &call.func {
+                CallFunc::Regular(reg) => regular_call_fun_decl_id(&reg.kind)
+                    .and_then(|id| self.llbc.fn_by_id(id))
+                    .map(|fd| {
+                        let (inputs, output) = self.pair_or_window_fun_inputs(fd, &reg.generics);
+                        (
+                            inputs,
+                            output
+                                && fd.is_global_initializer().is_none()
+                                && !fundecl_is_promoted_const(fd),
+                        )
+                    })
+                    .unwrap_or_default(),
+                _ => (Vec::new(), false),
+            };
         let mut pair_lens: Vec<(usize, Variable)> = Vec::new();
+        let from_bytes_identity = match &call.func {
+            CallFunc::Regular(reg) => self.is_wtf8_from_bytes_identity(reg, &call.dest.ty),
+            _ => false,
+        };
+        // Len / index / to_vec / a list-view dest keep the list
+        // (`rlist.py` `ll_length` / `ll_getitem_nonneg` / `ll_copy`).
+        let keep_list_view_arg = match &call.func {
+            CallFunc::Regular(reg) => {
+                self.is_slice_len(reg)
+                    || self.is_slice_is_empty(reg)
+                    || self.is_slice_scalar_index_call(reg, second_arg_ty.as_ref())
+                    || regular_call_name_path(reg, self.llbc)
+                        .as_deref()
+                        .is_some_and(|name| name == "alloc::slice::<Impl>::to_vec")
+                    || self.list_view_locals.contains(&dest_local)
+            }
+            _ => false,
+        };
+        let host_dict = match &call.func {
+            CallFunc::Regular(reg) => is_rdict_host_rewritten_call(reg, self.llbc),
+            _ => false,
+        };
+        let host_dict_name = match &call.func {
+            CallFunc::Regular(reg) if host_dict => {
+                regular_call_name_path(reg, self.llbc).unwrap_or_else(|| "RDict".to_string())
+            }
+            _ => String::new(),
+        };
         for op in call.args {
-            if let Some((ptr, len, _)) = self.pair_operand(mir_bb, &op)? {
-                pair_lens.push((args.len(), len));
+            let index = args.len();
+            let decl_wants_pair = pair_input_is_pair_or_window
+                .get(index)
+                .copied()
+                .unwrap_or(false);
+            if let Some((ptr, len)) = self.pair_or_window_operand(mir_bb, &op)? {
+                if host_dict && index != 0 {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: window argument of {host_dict_name}"
+                    )));
+                }
+                let src_is_window =
+                    operand_tyref(&op).is_some_and(|ty| tyref_is_u8_window(ty, self.llbc));
+                if decl_wants_pair || !src_is_window {
+                    pair_lens.push((index, len));
+                }
+                let ptr = if src_is_window {
+                    self.ensure_window_ccharp(mir_bb, ptr)
+                } else {
+                    ptr
+                };
                 args.push(ptr);
+                continue;
+            }
+            if !host_dict
+                && decl_wants_pair
+                && self.operand_is_string_byte_view(&op)
+                && !from_bytes_identity
+                && !tyref_is_u8_window(&call.dest.ty, self.llbc)
+                && !tyref_is_string_value(&call.dest.ty, self.llbc)
+            {
+                let var = self.resolve_operand(mir_bb, op.clone())?;
+                let (ptr, len) = self.owner_to_window(mir_bb, var, operand_tyref(&op))?;
+                pair_lens.push((index, len));
+                args.push(self.ensure_window_ccharp(mir_bb, ptr));
+                continue;
+            }
+            if !host_dict
+                && decl_wants_pair
+                && self.operand_is_list_view(&op)
+                && !keep_list_view_arg
+            {
+                let var = self.resolve_operand(mir_bb, op)?;
+                let (ptr, len) = self.emit_list_view_to_window(mir_bb, var)?;
+                pair_lens.push((index, len));
+                args.push(self.ensure_window_ccharp(mir_bb, ptr));
                 continue;
             }
             args.push(self.resolve_operand(mir_bb, op)?);
@@ -24741,6 +25707,22 @@ impl<'a> Lowering<'a> {
         });
 
         let class = call.func.classify();
+        // A STR view is one word, so `pair_lens` is empty. Rewrite to
+        // `same_as` after Result-scope / combinator capture so identity
+        // shares that tail; a true W3 window copies with `charpsize2str`.
+        let from_bytes_one_word = from_bytes_identity && args.len() == 1 && pair_lens.is_empty();
+        let from_bytes_window_len = if from_bytes_identity {
+            pair_lens
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .map(|(_, len)| len.clone())
+        } else {
+            None
+        };
+        let window_recv_len = pair_lens
+            .iter()
+            .find(|(index, _)| *index == 0)
+            .map(|(_, len)| len.clone());
         // Full `name_path()` of a `CallKind::Fun` callee, captured for the
         // `Result<T, PyError>` scope decision at the `?`-diamond capture
         // site below: the built `CallTarget::Method` keeps only the leaf,
@@ -24830,20 +25812,21 @@ impl<'a> Lowering<'a> {
             // A call passing pair slices is the plain call of a callee that
             // declares them, with each length after its pointer.
             (CallClass::Direct | CallClass::Trait, CallFunc::Regular(reg))
-                if !pair_lens.is_empty() =>
+                if !pair_lens.is_empty() && !from_bytes_identity =>
             {
                 let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                 self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
                 // The `?`-site capture below keys the callee's scope on it.
                 callee_name_path = Some(name);
+                let target = self.pair_call_target(mir_bb, &reg, &args, &pair_lens)?;
                 let args = splice_pair_lens(args, pair_lens);
                 OpKind::Call {
-                    target: self.pair_call_target(mir_bb, &reg, &args)?,
+                    target,
                     args: crate::model::call_args(args),
                     result_ty: result_ty.clone(),
                 }
             }
-            _ if !pair_lens.is_empty() && !passes_pairs_indirectly => {
+            _ if !pair_lens.is_empty() && !passes_pairs_indirectly && !from_bytes_identity => {
                 return Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: pair slice through a dynamic call"
                 )));
@@ -25352,15 +26335,24 @@ impl<'a> Lowering<'a> {
                         .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())
                         || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local))
                 {
-                    if should_copy_u8_list_to_str(&call.dest.ty, first_arg_ty.as_ref(), self.llbc) {
-                        let dest = self.emit_ll_join_chars(bb_id, args[0].clone());
-                        self.local_var[dest_local] = Some(LocalValue::One(dest));
-                        if !self.string_byte_view_locals.contains(&dest_local) {
-                            self.string_byte_view_locals.push(dest_local);
-                        }
-                    } else {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    }
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // A shared `&[u8]` dest produced by deref / as-slice of a W2
+                // list owner aliases the list (`rlist.py` `ll_length` /
+                // `ll_getitem_nonneg`). Convert to a window only at a
+                // window boundary.
+                if args.len() == 1
+                    && self.list_view_locals.contains(&dest_local)
+                    && (first_arg_is_list_view
+                        || first_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| tyref_is_u8_list(ty, self.llbc)))
+                {
+                    self.bind_list_view_local(dest_local, args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25449,7 +26441,7 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if args.len() == 1 && self.is_utf8_payload_bytes_identity(&reg) {
-                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    self.bind_str_source_to_dest(mir_bb, dest_local, args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25469,10 +26461,7 @@ impl<'a> Lowering<'a> {
                 // Pin-free tuple eq compares two of these with `ll_streq`.
                 if args.len() == 1 && self.is_w_str_storage(&reg) {
                     let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
+                    self.bind_str_source_to_dest(mir_bb, dest_local, dest);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25482,7 +26471,7 @@ impl<'a> Lowering<'a> {
                 // on the `STR` header. Mark dest a byte view so `len` /
                 // index plant `strlen` / `strgetitem`.
                 if args.len() == 1 && self.is_bytes_block_chars(&reg) {
-                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    self.bind_str_source_to_dest(mir_bb, dest_local, args[0].clone());
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25492,10 +26481,7 @@ impl<'a> Lowering<'a> {
                 // the `rstr.py` `STR` (`W_BytesObject._value`).
                 if args.len() == 1 && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg)) {
                     let dest = self.emit_w_bytes_data_str_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
+                    self.bind_str_source_to_dest(mir_bb, dest_local, dest);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25524,7 +26510,7 @@ impl<'a> Lowering<'a> {
                         Some(built) => built,
                         None => args[0].clone(),
                     };
-                    self.alias_dest_to_arg0(dest_local, arg, true);
+                    self.bind_str_source_to_dest(mir_bb, dest_local, arg);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25560,19 +26546,9 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Wtf8::from_bytes_unchecked(&[u8]) -> &Wtf8`.  `rstr.STR`
-                // stores the UTF-8/WTF-8 bytes in the string itself
-                // (`rutf8` reads that same buffer), so a Wtf8 view of those
-                // bytes is the string.  Alias the result to the byte operand
-                // instead of leaving an unregistered call.  The destination
-                // must be a string value; a non-string use keeps the call.
-                if args.len() == 1 && self.is_wtf8_from_bytes_identity(&reg, &call.dest.ty) {
-                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
+                // `Wtf8::from_bytes_unchecked` / `str::from_utf8_unchecked`
+                // identity is rewritten to `same_as` after Result-scope /
+                // combinator capture (`from_bytes_one_word`).
                 // Checked `Wtf8::from_bytes(&[u8]) -> Option<&Wtf8>`:
                 // `rutf8.py check_utf8` with `allow_surrogates=True`, then
                 // Ok → `Option::Some` of the unchecked identity, Err → None.
@@ -25956,6 +26932,24 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `s.as_bytes().iter().position(|&b| b == c)` is RPython
+                // `str.find(c)` (`LLHelpers.ll_find_char` /
+                // `rpython_str_find_char`). The residual FunDecl is an
+                // empty GraphCache stub; mergeinputargs of its iterator
+                // slot unions every callsite.
+                if args.len() == 2
+                    && self.try_lower_str_view_iter_position(
+                        mir_bb,
+                        &reg,
+                        &args,
+                        dest_local,
+                        dest_class_ty,
+                        target,
+                        second_arg_ty.as_ref(),
+                    )?
+                {
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -26007,16 +27001,6 @@ impl<'a> Lowering<'a> {
                             kind: cast_int_to_ptr_call(args[0].clone()),
                         });
                         self.local_var[dest_local] = Some(LocalValue::One(casted));
-                    } else if should_copy_u8_list_to_str(
-                        &call.dest.ty,
-                        first_arg_ty.as_ref(),
-                        self.llbc,
-                    ) {
-                        let dest = self.emit_ll_join_chars(bb_id, args[0].clone());
-                        self.local_var[dest_local] = Some(LocalValue::One(dest));
-                        if !self.string_byte_view_locals.contains(&dest_local) {
-                            self.string_byte_view_locals.push(dest_local);
-                        }
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
@@ -26326,8 +27310,13 @@ impl<'a> Lowering<'a> {
                     let mut array_type_id = array_type_id;
                     // `Box<[u8]>[i]` addresses the data word. The `[u8]`
                     // identity is length-prefixed; the fat box is not.
-                    let fat_data =
-                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData);
+                    // A list view of a W2 owner stays the list
+                    // (`rlist.py` `ll_getitem_nonneg`).
+                    let fat_data = if first_arg_is_list_view {
+                        None
+                    } else {
+                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData)
+                    };
                     if fat_data.is_some() {
                         let receiver = first_arg_ty
                             .as_ref()
@@ -26858,11 +27847,11 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `*slice.as_ptr().add(i)` on a shared `&[u8]` is
-                // `ll_stritem_nonneg` (`rstr.py`); on `&mut [u8]` it is
-                // `getarrayitem` on the list of unsigned. The as_ptr
-                // identity aliases the data pointer to the slice, so
-                // the `.add` receiver traces to `core::slice::<Impl>::as_ptr`.
+                // `*slice.as_ptr().add(i)` on a shared `&[u8]` is a
+                // one-byte `raw_load` of the window (`CCHARP`); on
+                // `&mut [u8]` it is `getarrayitem` on the list of
+                // unsigned. A W1 `as_bytes()` view keeps
+                // `__string_byte_getitem`.
                 if let Some((item_ty, array_type_id)) = self.u8_slice_elem_ptr_add(
                     &reg,
                     args.len(),
@@ -26870,9 +27859,14 @@ impl<'a> Lowering<'a> {
                     first_arg_ty.as_ref(),
                     dest_local,
                 ) {
+                    let window_load = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| raw_ptr_u8_is_const(ty, self.llbc));
+                    // A `u8` element is `CHAR` (`Signed`). `Unknown` banks
+                    // as `'r'` and `rewrite_op_raw_load` wraps the byte.
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
                     let kind = if first_arg_is_string_byte_view {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -26881,6 +27875,14 @@ impl<'a> Lowering<'a> {
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                             result_ty: ValueType::Int,
+                        }
+                    } else if window_load {
+                        OpKind::RawLoad {
+                            base: args[0].clone(),
+                            offset: args[1].clone(),
+                            item_ty: ValueType::Unsigned,
+                            itemsize: 1,
+                            is_item_signed: false,
                         }
                     } else {
                         OpKind::ArrayRead {
@@ -28223,15 +29225,42 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // The concrete container `IntoIterator::into_iter` impls
-                // (`&[T]`/`Vec`/`[T;N]`) construct a container iterator.
-                // Emit the `iter` operation on the container receiver — the
-                // `("slice","iter")` bridge routes it to `Repr::rtype_iter`
-                // (`ListIteratorRepr` via `make_iterator_repr`) — instead of
-                // the unregistered concrete-impl `FunctionPath` callee.  The
-                // canonical `core::slice::iter` segments are the bridge's
-                // recognised token; the receiver annotation (a `SomeList`)
-                // supplies the actual element repr.
-                if args.len() == 1 && self.is_concrete_iter_constructor(&reg) {
+                // (`&[T]`/`Vec`/`[T;N]`) and `<[T]>::iter` / `iter_mut`
+                // construct a container iterator. Emit the `iter` operation
+                // on the container receiver — the `("slice","iter")` bridge
+                // routes it to `Repr::rtype_iter` — instead of the FunDecl
+                // `&[T]` signature, which would annotate a STR-view
+                // receiver as List (`List ∪ String` at getslice). A window
+                // `CCHARP` data word is not a container; it stays residual.
+                // A STR-view receiver is copied through `ll_str2uintlist`
+                // first so `iter` walks a list and the STR SSA stays
+                // `String` for `__getslice` / `__strlen`.
+                // `s.as_bytes().iter().position(|&b| b == c)` does not
+                // walk the iterator: the successor is `str.find(c)`, so
+                // the STR is forwarded as the haystack and the list copy
+                // is not emitted (its inlined helper was a used-before-
+                // definition of the find needle).
+                if args.len() == 1
+                    && self.is_concrete_iter_constructor(&reg)
+                    && !args[0]
+                        .concretetype()
+                        .as_ref()
+                        .is_some_and(lltype_is_ccharp)
+                {
+                    if (first_arg_is_string_byte_view || self.var_is_str_repr(&args[0]))
+                        && self.mir_target_is_const_eq_iter_position(target)
+                    {
+                        self.bind_str_view_local(dest_local, args[0].clone());
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                    let recv = if first_arg_is_string_byte_view || self.var_is_str_repr(&args[0]) {
+                        self.emit_ll_str_to_u8_list(bb_id, args[0].clone())
+                    } else {
+                        args[0].clone()
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -28246,7 +29275,7 @@ impl<'a> Lowering<'a> {
                                 ],
                                 fun_decl_id: None,
                             },
-                            args: crate::model::call_args(vec![args[0].clone()]),
+                            args: crate::model::call_args(vec![recv]),
                             result_ty: ValueType::Ref(None),
                         },
                     });
@@ -28293,7 +29322,8 @@ impl<'a> Lowering<'a> {
                 {
                     let res = self
                         .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    stamp_as_ccharp(&res);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
@@ -28425,7 +29455,7 @@ impl<'a> Lowering<'a> {
                 // graph-less std helper.  A string-byte-view (`as_bytes()`)
                 // is `ll_strlen == 0`, not a GcArray header read.
                 if args.len() == 1 && self.is_slice_is_empty(&reg) {
-                    let fat_len = if first_arg_is_string_byte_view {
+                    let fat_len = if first_arg_is_string_byte_view || first_arg_is_list_view {
                         None
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
@@ -28442,6 +29472,15 @@ impl<'a> Lowering<'a> {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![args[0].clone()]),
+                                result_ty: ValueType::Int,
+                            }
+                        } else if first_arg_is_list_view {
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__len".to_string()],
                                     fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -28497,7 +29536,7 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1 && self.is_slice_len(&reg) {
                     // `Box<[T]>::len` is the fat pointer's metadata word.
                     // `arraylen_gc` would dereference the data word.
-                    let fat_len = if first_arg_is_string_byte_view {
+                    let fat_len = if first_arg_is_string_byte_view || first_arg_is_list_view {
                         None
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
@@ -28517,6 +29556,15 @@ impl<'a> Lowering<'a> {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![args[0].clone()]),
+                                result_ty: ValueType::Int,
+                            }
+                        } else if first_arg_is_list_view {
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__len".to_string()],
                                     fun_decl_id: None,
                                 },
                                 args: crate::model::call_args(vec![args[0].clone()]),
@@ -28905,15 +29953,7 @@ impl<'a> Lowering<'a> {
                 //
                 // `Vec<PyObjectRef>::as_slice` is [`Self::try_lower_object_vec_whole_list_view`].
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
-                    if should_copy_u8_list_to_str(&call.dest.ty, first_arg_ty.as_ref(), self.llbc) {
-                        let dest = self.emit_ll_join_chars(bb_id, args[0].clone());
-                        self.local_var[dest_local] = Some(LocalValue::One(dest));
-                        if !self.string_byte_view_locals.contains(&dest_local) {
-                            self.string_byte_view_locals.push(dest_local);
-                        }
-                    } else {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    }
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -28925,23 +29965,16 @@ impl<'a> Lowering<'a> {
                 // `NonNull::as_ptr`).  A `Vec::as_ptr` is deliberately excluded
                 // (its items live behind a getfield, not the receiver) — see
                 // `is_container_as_ptr_identity`.
-                // `<[u8]>::as_ptr` is the byte string's `chars` pointer
-                // (`rstr.py` `STR`). Mark it so `*p.add(i)` becomes
-                // `strgetitem`. Any other slice keeps the receiver's mark.
+                // A window's `as_ptr` is `FatData` only; it does not mark
+                // `string_byte_view`. A W1 `as_bytes()` view keeps the mark
+                // via `alias_dest_to_arg0_inherit`.
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
                     // A fat `Box<[T]>` receiver's data word is not the box
                     // variable. `arraylen_gc` on that word reads a constant.
-                    // `<[u8]>::as_ptr` still takes the byte-view mark so a
-                    // later index is the `chars` read (`rstr.py` `STR`).
-                    let byte_slice = first_arg_ty
-                        .as_ref()
-                        .is_some_and(|ty| tyref_is_shared_u8_slice(ty, self.llbc));
                     if let Some(data) =
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData)
                     {
-                        self.alias_dest_to_arg0(dest_local, data, byte_slice);
-                    } else if byte_slice {
-                        self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                        self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
@@ -31214,11 +32247,18 @@ impl<'a> Lowering<'a> {
         }
         // Last-write-wins: a residual Call is not `as_bytes` /
         // `w_str_get_wtf8`.  Those arms mark dest and return above.
-        // `as_bytes()[a..b]` falls through as `__getslice_*`, not a
-        // string slice (`_ll_stringslice`), so the dest is not a
-        // string byte view.
-        self.string_byte_view_locals
-            .retain(|&local| local != dest_local);
+        // A STR-view receiver whose dest is still a string or a shared
+        // `&[u8]` keeps the mark: `&view[a..b]` is `__getslice_*` of the
+        // header (`rstr.py` `LLHelpers.ll_stringslice_startstop`).
+        if first_arg_is_string_byte_view && tyref_is_one_word_str_view(&call.dest.ty, self.llbc) {
+            if !self.string_byte_view_locals.contains(&dest_local) {
+                self.string_byte_view_locals.push(dest_local);
+            }
+            stamp_as_rstr_str(&result_var);
+        } else {
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+        }
         // `Result::as_ref` / `Result::expect`. The callee is that result-module
         // item: `core::result::<Impl>::as_ref` on the `Method` spelling, and
         // `result::Result::as_ref` when a raw `&Result` takes the static
@@ -32320,6 +33360,42 @@ impl<'a> Lowering<'a> {
             self.rewrite_equal_layout_result_branch(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
         let mut op_kind =
             self.stamp_result_branch_payloads(op_kind, first_arg_ty.as_ref(), &call.dest.ty);
+        if from_bytes_identity && !resolved_call_args.is_empty() {
+            // `rstr.STR` stores the UTF-8/WTF-8 bytes in the string itself
+            // (`rutf8` reads that same buffer), so a Wtf8 view of those
+            // bytes is the string. Bind dest to the argument with no op
+            // after Result-scope / combinator capture so a following `?`
+            // still sees an immediate `Result::branch` consumer.
+            // A W3 window copies (`rffi.py` `charpsize2str`).
+            let src = resolved_call_args[0].clone();
+            if first_arg_is_string_byte_view || self.var_is_str_repr(&src) {
+                self.alias_dest_to_arg0(dest_local, src, true);
+                stamp_as_rstr_str(&resolved_call_args[0]);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph.set_goto(bb_id, target_bb, link_args);
+                return Ok(());
+            }
+            let window_len = from_bytes_window_len
+                .clone()
+                .or_else(|| self.window_len_companion(&src));
+            if from_bytes_one_word && window_len.is_none() {
+                self.alias_dest_to_arg0(dest_local, src, true);
+                stamp_as_rstr_str(&resolved_call_args[0]);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph.set_goto(bb_id, target_bb, link_args);
+                return Ok(());
+            }
+            if let Some(len) = window_len {
+                let header = self.emit_charpsize2str(mir_bb, src, len);
+                self.bind_str_view_local(dest_local, header);
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph.set_goto(bb_id, target_bb, link_args);
+                return Ok(());
+            }
+        }
         // `lower_std_primitive_op` rewrites an identity wrapper
         // (`Box::as_ref` / `as_mut`, `Cell::get`, scalar `clone`) to
         // `same_as` only when the banks agree. Bind the destination
@@ -32365,10 +33441,122 @@ impl<'a> Lowering<'a> {
         if matches!(&op_kind, OpKind::Call { .. }) && tyref_is_fat_dyn(&call.dest.ty, self.llbc) {
             self.dyn_return_calls.push(result_var.clone());
         }
+        // A callee whose output is a window uses the two-word return ABI
+        // wherever the call is lowered (`ret_len_slot_local` /
+        // `SLICE_LEN_SLOT_NEW` / `TAKE`), including a dest that is a STR
+        // view, a list, or unused. Identity wrappers returned above, so a
+        // W1 source whose output type is also `&[u8]` does not leave a
+        // dead slot. A STR-view range index stays two arguments so
+        // `front::slice_index` can rewrite it to `__getslice_*`
+        // (`rewire_one_slice_index_site` requires `args.len() == 2`).
+        let range_index_consumer = matches!(
+            &op_kind,
+            OpKind::Call { args, .. }
+                if args.len() == 2
+                    && (self
+                        .slice_index_rangefrom_sites
+                        .iter()
+                        .any(|site| site.range_result == args[1])
+                        || self
+                            .slice_index_rangeto_sites
+                            .iter()
+                            .any(|site| site.range_result == args[1])
+                        || self
+                            .slice_index_range_sites
+                            .iter()
+                            .any(|site| site.range_result == args[1]))
+        );
+        if range_index_consumer
+            && !first_arg_is_string_byte_view
+            && resolved_call_args.len() >= 2
+            && !self.var_is_str_repr(&resolved_call_args[0])
+        {
+            let ptr = resolved_call_args[0].clone();
+            if let Some(len) = window_recv_len
+                .clone()
+                .or_else(|| self.window_len_companion(&ptr))
+            {
+                let arg_is_range_full = second_arg_ty
+                    .as_ref()
+                    .is_some_and(|ty| tyref_to_ast_string(ty, self.llbc) == "RangeFull");
+                let (ptr, len) = self.window_subslice(
+                    mir_bb,
+                    ptr,
+                    len,
+                    &resolved_call_args[1],
+                    arg_is_range_full,
+                    true,
+                )?;
+                let ptr = if tyref_is_u8_window(&call.dest.ty, self.llbc) {
+                    self.ensure_window_ccharp(mir_bb, ptr)
+                } else {
+                    ptr
+                };
+                if self.len_shadow.get(dest_local).copied().flatten().is_some()
+                    && tyref_is_u8_window(&call.dest.ty, self.llbc)
+                {
+                    self.bind_pair_local(dest_local, ptr, len);
+                } else {
+                    self.local_var[dest_local] = Some(LocalValue::One(ptr));
+                }
+                let target_bb = self.block_id[target];
+                let link_args = self.edge_args(mir_bb, target)?;
+                self.graph.set_goto(bb_id, target_bb, link_args);
+                return Ok(());
+            }
+        }
+        let window_ret_slot =
+            if callee_output_is_window && !first_arg_is_string_byte_view && !range_index_consumer {
+                if let OpKind::Call { args, .. } = &mut op_kind {
+                    let slot = self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::SLICE_LEN_SLOT_NEW,
+                        vec![],
+                        ValueType::Unsigned,
+                    );
+                    args.push(crate::model::LinkArg::from(slot.clone()));
+                    Some(slot)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
+        if let Some(slot) = window_ret_slot {
+            let len = self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::SLICE_LEN_SLOT_TAKE,
+                vec![slot],
+                ValueType::Unsigned,
+            );
+            let ptr = self.ensure_window_ccharp(mir_bb, result_var.clone());
+            self.string_byte_view_locals
+                .retain(|&local| local != dest_local);
+            if self.len_shadow.get(dest_local).copied().flatten().is_some() {
+                self.bind_pair_local(dest_local, ptr, len);
+            } else {
+                self.local_var[dest_local] = Some(LocalValue::One(ptr));
+            }
+        }
+        if self.len_shadow.get(dest_local).copied().flatten().is_some()
+            && tyref_is_u8_window(&call.dest.ty, self.llbc)
+            && let Some(var) = self
+                .local_var
+                .get(dest_local)
+                .and_then(|slot| slot.as_ref())
+                .and_then(|value| value.one().ok())
+        {
+            self.convert_one_word_owner_to_window_dest(
+                mir_bb,
+                dest_local,
+                var,
+                first_arg_ty.as_ref(),
+            )?;
+        }
         self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies)?;
         // Reload before `edge_args` so the successor sees the word the
         // callee wrote through the raw out-parameter.
@@ -32776,6 +33964,11 @@ impl<'a> Lowering<'a> {
                 {
                     if self.spec_body
                         && let Some(fd) = self.llbc.fn_by_id(fn_id)
+                        && fd
+                            .src
+                            .as_ref()
+                            .and_then(|s| s.get("TraitDefault"))
+                            .is_none()
                     {
                         let combined =
                             merge_impl_and_method_generics(&impl_generics, &reg.generics);
@@ -35610,25 +36803,8 @@ impl<'a> Lowering<'a> {
         self.emit_w_bytes_data_field_read(bb_id, base, ValueType::Str)
     }
 
-    /// `rstr.py` `LLHelpers.ll_join_chars`: copy a list of chars into a `STR`.
-    fn emit_ll_join_chars(&mut self, bb_id: BlockId, chars: Variable) -> Variable {
-        let dest = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
-        stamp_as_rstr_str(&dest);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(dest.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::function_path([crate::front::join_chars::LL_JOIN_CHARS]),
-                args: crate::model::call_args(vec![chars]),
-                result_ty: ValueType::Str,
-            },
-        });
-        dest
-    }
-
-    /// Inverse of [`Self::emit_ll_join_chars`]: copy a `STR` into a list of
-    /// unsigned (`Vec<u8>`). `list(str)` yields `Char`.
+    /// Copy a `STR` into a list of unsigned (`Vec<u8>`). `list(str)` yields
+    /// `Char`. Inverse of `rstr.py` `LLHelpers.ll_join_chars`.
     fn emit_ll_str_to_u8_list(&mut self, bb_id: BlockId, s: Variable) -> Variable {
         let dest = self
             .graph
@@ -35642,6 +36818,861 @@ impl<'a> Lowering<'a> {
             },
         });
         dest
+    }
+
+    /// `{chars address, length}` of a `Ptr(STR)` header. Owner → window is a
+    /// borrow: `rffi.get_raw_address_of_string` (`rgc.can_move` →
+    /// `rgc.move_out_of_nursery`, then `offsetof(STR, 'chars')`) plus
+    /// `__strlen`.
+    fn emit_str_to_window(&mut self, mir_bb: usize, header: Variable) -> (Variable, Variable) {
+        let bb_id = self.emit_bb(mir_bb);
+        let data = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        stamp_as_ccharp(&data);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(data.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.to_string(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![header.clone()]),
+                result_ty: ValueType::Int,
+            },
+        });
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__strlen".to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![header]),
+                result_ty: ValueType::Int,
+            },
+        });
+        (data, len)
+    }
+
+    /// `{items address, length}` of a `Vec<u8>` / `&mut [u8]` list. Owner →
+    /// window is a borrow (`rgc.nonmoving_raw_ptr_for_resizable_list`).
+    /// A fixed-size list (`Box<[u8]>` / `[u8; N]`) has no raw pointer:
+    /// `rgc._check_resizable_list_of_chars` forces `listdef.resize()`.
+    fn emit_list_to_window(
+        &mut self,
+        mir_bb: usize,
+        list: Variable,
+        src_ty: Option<&TyRef>,
+    ) -> Result<(Variable, Variable), LowerError> {
+        if let Some(len) = self.window_len_companion(&list) {
+            return Ok((self.ensure_window_ccharp(mir_bb, list), len));
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(data) =
+            self.window_fat_component(bb_id, &list, crate::model::VecFieldPart::FatData)
+        {
+            let len = self
+                .window_fat_component(bb_id, &list, crate::model::VecFieldPart::FatLen)
+                .unwrap_or_else(|| {
+                    let len = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(len.clone()),
+                        kind: OpKind::ArrayLen {
+                            base: list.clone(),
+                            array_type_id: Some("[u8]".to_string()),
+                            nolength: false,
+                        },
+                    });
+                    len
+                });
+            return Ok((self.ensure_window_ccharp(mir_bb, data), len));
+        }
+        if src_ty.is_some_and(|ty| tyref_is_fixed_u8_list(ty, self.llbc)) {
+            return Err(LowerError::Unsupported(
+                "fixed-size list has no nonmoving raw ptr (rgc._check_resizable_list_of_chars)"
+                    .to_string(),
+            ));
+        }
+        let data = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        stamp_as_ccharp(&data);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(data.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
+                            .to_string(),
+                    ],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![list.clone()]),
+                result_ty: ValueType::Int,
+            },
+        });
+        let data = self.ensure_window_ccharp(mir_bb, data);
+        // `<Vec<u8>>::len()` on a `SomeList` receiver is `__len`
+        // ([`Self::is_container_len`]; `rlist.py` `ll_length`).
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["__len".to_string()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![list]),
+                result_ty: ValueType::Int,
+            },
+        });
+        Ok((data, len))
+    }
+
+    /// Window data word is `CCHARP` (int-kind address) on every link.
+    /// A GC fat box is split; a GC header is `rffi.cast(CCHARP, p)`;
+    /// a Signed address is `cast_int_to_ptr(CCHARP, int)` (`lltype.py`
+    /// `ann_cast_int_to_ptr`) so merge does not union `Ptr(Array)` with
+    /// `Integer`.
+    fn ensure_window_ccharp(&mut self, mir_bb: usize, ptr: Variable) -> Variable {
+        if self.is_fat_box_var(&ptr) {
+            if let Ok((data, _)) = self.split_window_value(mir_bb, ptr.clone()) {
+                return data;
+            }
+        }
+        if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return ptr;
+        }
+        if self.var_is_gc_ref_value(&ptr) {
+            let bb_id = self.emit_bb(mir_bb);
+            return emit_rffi_cast_to_carray_ptr(
+                &mut self.graph,
+                bb_id,
+                ptr,
+                &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
+            );
+        }
+        let kind = ptr.concretetype().as_ref().map(crate::model::getkind);
+        if matches!(kind, Some(crate::model::ConcreteType::Signed))
+            && !ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp)
+        {
+            let bb_id = self.emit_bb(mir_bb);
+            emit_cast_int_to_ccharp(&mut self.graph, bb_id, ptr)
+        } else {
+            ptr
+        }
+    }
+
+    /// `usize` / raw pointer whose window data word is not yet `CCHARP`.
+    fn mir_ty_is_raw_ptr_or_int(&self, ty: Option<&TyRef>) -> bool {
+        let Some(ty) = ty else {
+            return false;
+        };
+        if tyref_is_raw_pointer(ty, self.llbc) {
+            return true;
+        }
+        matches!(
+            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+            ValueType::Int | ValueType::Unsigned
+        )
+    }
+
+    /// `from_raw_parts{,_mut}` data word: cast a raw pointer / integer to
+    /// `CCHARP` at this producer (`lltype.py` `ann_cast_int_to_ptr`).
+    fn emit_window_from_raw_parts_ptr(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        ptr_ty: Option<&TyRef>,
+    ) -> Variable {
+        if self.mir_ty_is_raw_ptr_or_int(ptr_ty)
+            && !ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp)
+        {
+            let bb_id = self.emit_bb(mir_bb);
+            emit_cast_int_to_ccharp(&mut self.graph, bb_id, ptr)
+        } else {
+            self.ensure_window_ccharp(mir_bb, ptr)
+        }
+    }
+
+    /// Length word of a window data `var`, if this frame already holds it.
+    fn window_len_companion(&self, var: &Variable) -> Option<Variable> {
+        for (local, slot) in self.local_var.iter().enumerate() {
+            let Some(value) = slot.as_ref() else {
+                continue;
+            };
+            match value {
+                LocalValue::Pair(ptr, len) if ptr == var => return Some(len.clone()),
+                LocalValue::One(ptr) if ptr == var => {
+                    let shadow = self.len_shadow.get(local).copied().flatten()?;
+                    match self.local_var.get(shadow).and_then(|slot| slot.as_ref()) {
+                        Some(LocalValue::One(len)) => return Some(len.clone()),
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Window → STR copy (`rffi.py` `charpsize2str`,
+    /// `majit_rlib::rffi::buffer::charpsize2str`).
+    fn emit_charpsize2str(&mut self, mir_bb: usize, ptr: Variable, len: Variable) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let header = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(header.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path([
+                    "majit_rlib",
+                    "rffi",
+                    "buffer",
+                    "charpsize2str",
+                ]),
+                args: crate::model::call_args(vec![ptr, len]),
+                result_ty: ValueType::Str,
+            },
+        });
+        stamp_as_rstr_str(&header);
+        header
+    }
+
+    /// One-byte `raw_load` at `data + index` (`CCHARP`).
+    ///
+    /// The result is `Signed` (`rstr.py` `CHAR`): `Unknown` banks as `'r'`
+    /// and `rewrite_op_raw_load` would wrap the byte in `cast_int_to_ptr`.
+    fn emit_window_raw_load(&mut self, mir_bb: usize, data: Variable, index: Variable) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base: data,
+                offset: index,
+                item_ty: ValueType::Unsigned,
+                itemsize: 1,
+                is_item_signed: false,
+            },
+        });
+        loaded
+    }
+
+    /// Byte-stride `data + k` of a window (`direct_ptradd` of `Char`).
+    fn window_ptr_add(&mut self, mir_bb: usize, ptr: Variable, count: Variable) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        let item = item_lltype_for_size(1);
+        let addr = push_direct_ptradd(&mut self.graph, bb_id, ptr, count, &item);
+        self.ensure_window_ccharp(mir_bb, addr)
+    }
+
+    /// Base of `xs[i]` whose item is a window byte (`s[i]` or `(*s)[i]`).
+    fn place_is_window_index_base(&self, place: &Place) -> bool {
+        if self.place_is_list_view(place) {
+            return false;
+        }
+        if tyref_is_u8_window(&place.ty, self.llbc)
+            || tyref_is_shared_u8_slice(&place.ty, self.llbc)
+        {
+            return true;
+        }
+        if let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind
+            && atom == "Deref"
+            && tyref_is_u8_window(&inner.ty, self.llbc)
+        {
+            return true;
+        }
+        false
+    }
+
+    /// `(ptr, len)` of a window operand, `None` when `op` is not a window.
+    fn window_operand(
+        &mut self,
+        mir_bb: usize,
+        op: &Operand,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => return Ok(None),
+        };
+        if place_is_bare_global(place) {
+            return Ok(None);
+        }
+        let window_place = tyref_is_u8_window(&place.ty, self.llbc)
+            || matches!(
+                &place.kind,
+                PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                    if atom == "Deref" && tyref_is_u8_window(&inner.ty, self.llbc)
+            );
+        if window_place {
+            if let Some((ptr, len)) = self.pair_place_parts(mir_bb, place)? {
+                return Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)));
+            }
+        }
+        if self.operand_is_string_byte_view(op) || self.operand_is_list_view(op) {
+            return Ok(None);
+        }
+        if !window_place {
+            return Ok(None);
+        }
+        if let PlaceKind::Local(local) = place.kind {
+            let var = self.resolve_place(mir_bb, place.clone())?;
+            if self.local_holds_str_view(local as usize) || self.var_is_str_repr(&var) {
+                let (ptr, len) = self.emit_str_to_window(mir_bb, var);
+                return Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)));
+            }
+            return Ok(Some(self.owner_to_window(mir_bb, var, Some(&place.ty))?));
+        }
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: window read through a projection"
+        )))
+    }
+
+    /// `(ptr, len)` of an rvalue flowing into a window dest, or `None`
+    /// when the rvalue is not a window / owner conversion this lowering
+    /// knows.
+    fn window_rvalue_parts(
+        &mut self,
+        mir_bb: usize,
+        rvalue: &Rvalue,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        match rvalue {
+            Rvalue::Use(op, _) => {
+                if operand_tyref(op).is_some_and(|ty| tyref_is_u8_window(ty, self.llbc)) {
+                    return self.window_operand(mir_bb, op);
+                }
+                if let Some(parts) = self.window_operand(mir_bb, op)? {
+                    return Ok(Some(parts));
+                }
+                let Some(var) = (match op {
+                    Operand::Copy(place) | Operand::Move(place) if !place_is_bare_global(place) => {
+                        self.resolve_place(mir_bb, place.clone()).ok()
+                    }
+                    _ => None,
+                }) else {
+                    return Ok(None);
+                };
+                Ok(Some(self.owner_to_window(
+                    mir_bb,
+                    var,
+                    operand_tyref(op),
+                )?))
+            }
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+                PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                    if place_is_bare_global(inner) {
+                        return Ok(None);
+                    }
+                    if let Some(parts) = self.pair_place_parts(mir_bb, inner)? {
+                        return Ok(Some(parts));
+                    }
+                    let var = self.resolve_place(mir_bb, inner.as_ref().clone())?;
+                    Ok(Some(self.owner_to_window(mir_bb, var, Some(&inner.ty))?))
+                }
+                _ => {
+                    if place_is_bare_global(place) {
+                        return Ok(None);
+                    }
+                    if let Some(parts) = self.pair_place_parts(mir_bb, place)? {
+                        return Ok(Some(parts));
+                    }
+                    if let Some(parts) = self.u8_array_unsize_source(mir_bb, place) {
+                        return Ok(Some(parts));
+                    }
+                    let var = self.resolve_place(mir_bb, place.clone())?;
+                    Ok(Some(self.owner_to_window(mir_bb, var, Some(&place.ty))?))
+                }
+            },
+            Rvalue::UnaryOp(cast, Operand::Copy(src) | Operand::Move(src))
+                if cast_kind_is_unsize(cast) =>
+            {
+                Ok(self.u8_array_unsize_source(mir_bb, src))
+            }
+            Rvalue::Cast(cast, op, _) => match op {
+                Operand::Copy(src) | Operand::Move(src) if cast_kind_is_unsize(cast) => {
+                    if let Some(parts) = self.u8_array_unsize_source(mir_bb, src) {
+                        return Ok(Some(parts));
+                    }
+                    self.window_operand(mir_bb, op)
+                }
+                _ => self.window_operand(mir_bb, op),
+            },
+            _ => Ok(None),
+        }
+    }
+
+    /// Split a fat window SSA (`FieldRead` or residual call result) into
+    /// `{data, len}`.
+    fn split_window_value(
+        &mut self,
+        mir_bb: usize,
+        fat: Variable,
+    ) -> Result<(Variable, Variable), LowerError> {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(data) =
+            self.window_fat_component(bb_id, &fat, crate::model::VecFieldPart::FatData)
+            && let Some(len) =
+                self.window_fat_component(bb_id, &fat, crate::model::VecFieldPart::FatLen)
+        {
+            return Ok((self.ensure_window_ccharp(mir_bb, data), len));
+        }
+        let data = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(data.clone()),
+            kind: OpKind::FieldRead {
+                base: fat.clone(),
+                field: FieldDescriptor::new("data", None)
+                    .with_vec_part(crate::model::VecFieldPart::FatData)
+                    .with_owner_declared_gc(Some(false)),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+        });
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: OpKind::FieldRead {
+                base: fat,
+                field: FieldDescriptor::new("len", None)
+                    .with_vec_part(crate::model::VecFieldPart::FatLen)
+                    .with_owner_declared_gc(Some(false)),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        });
+        Ok((self.ensure_window_ccharp(mir_bb, data), len))
+    }
+
+    /// Convert a STR / list / fat-box owner into a window pair.
+    /// Decide by the value's representation first: a STR header is
+    /// `emit_str_to_window` whatever the place's static type is.
+    fn owner_to_window(
+        &mut self,
+        mir_bb: usize,
+        var: Variable,
+        src_ty: Option<&TyRef>,
+    ) -> Result<(Variable, Variable), LowerError> {
+        if let Some(len) = self.window_len_companion(&var) {
+            return Ok((self.ensure_window_ccharp(mir_bb, var), len));
+        }
+        if var.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return Err(LowerError::Unsupported(
+                "owner_to_window: window data word without a length".to_string(),
+            ));
+        }
+        if self.var_is_str_repr(&var)
+            || self.var_has_str_value_type(&var)
+            || src_ty.is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
+        {
+            let (ptr, len) = self.emit_str_to_window(mir_bb, var);
+            return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
+        }
+        if self.list_view_local_of_var(&var).is_some() {
+            return self.emit_list_view_to_window(mir_bb, var);
+        }
+        if src_ty.is_some_and(|ty| tyref_is_u8_list(ty, self.llbc)) {
+            return self.emit_list_to_window(mir_bb, var, src_ty);
+        }
+        if src_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc)) {
+            let bb_id = self.emit_bb(mir_bb);
+            if let Some(data) =
+                self.window_fat_component(bb_id, &var, crate::model::VecFieldPart::FatData)
+            {
+                let len = self
+                    .window_fat_component(bb_id, &var, crate::model::VecFieldPart::FatLen)
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: window fat box has no length word"
+                        ))
+                    })?;
+                return Ok((data, len));
+            }
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: owner_to_window: unclassified owner"
+            )));
+        }
+        self.emit_list_to_window(mir_bb, var, src_ty)
+    }
+
+    /// `[u8; N]` / `&[u8; N]` unsized onto a window: `{array, N}`.
+    fn u8_array_unsize_source(
+        &mut self,
+        mir_bb: usize,
+        src: &Place,
+    ) -> Option<(Variable, Variable)> {
+        let PlaceKind::Local(local) = src.kind else {
+            return None;
+        };
+        let array_ty = ref_pointee_ty(&src.ty, self.llbc).unwrap_or_else(|| clone_tyref(&src.ty));
+        let (item, len) = tyref_raw_array_parts(&array_ty, self.llbc)?;
+        if json_ty_scalar_element_spelling(item, self.llbc).as_deref() != Some("u8") {
+            return None;
+        }
+        let ptr = self
+            .local_var
+            .get(local as usize)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())?;
+        let bb_id = self.emit_bb(mir_bb);
+        let ptr = push_cast_ptr_to_int(&mut self.graph, bb_id, ptr);
+        let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+        let len = self.emit_const_uint(mir_bb, len);
+        Some((ptr, len))
+    }
+
+    /// Subslice of a window: `{data + start, end - start}` (byte stride).
+    fn window_subslice(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        len: Variable,
+        range: &Variable,
+        range_is_full: bool,
+        checked: bool,
+    ) -> Result<(Variable, Variable), LowerError> {
+        if range_is_full {
+            return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
+        }
+        let (start, end) = if let Some(site) = self
+            .slice_index_range_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            (Some(site.start.clone()), site.end.clone())
+        } else if let Some(site) = self
+            .slice_index_rangefrom_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            (Some(site.start.clone()), len.clone())
+        } else if let Some(site) = self
+            .slice_index_rangeto_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            (None, site.end.clone())
+        } else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: window subslice by a range this body did not build"
+            )));
+        };
+        let Some(start) = start else {
+            if !checked {
+                return Ok((self.ensure_window_ccharp(mir_bb, ptr), end));
+            }
+            let in_bounds = self.emit_uint_binop(mir_bb, "le", end.clone(), len);
+            let carried = self.fork_in_bounds(mir_bb, in_bounds, &[ptr, end])?;
+            return Ok((
+                self.ensure_window_ccharp(mir_bb, carried[0].clone()),
+                carried[1].clone(),
+            ));
+        };
+        let (ptr, start, end) = if checked {
+            let start_le_end = self.emit_uint_binop(mir_bb, "le", start.clone(), end.clone());
+            let end_le_len = self.emit_uint_binop(mir_bb, "le", end.clone(), len);
+            let in_bounds = self.emit_uint_binop(mir_bb, "bitand", start_le_end, end_le_len);
+            let carried = self.fork_in_bounds(mir_bb, in_bounds, &[ptr, start, end])?;
+            (carried[0].clone(), carried[1].clone(), carried[2].clone())
+        } else {
+            (ptr, start, end)
+        };
+        let ptr = self.window_ptr_add(mir_bb, ptr, start.clone());
+        let len = self.emit_uint_binop(mir_bb, "sub", end, start);
+        Ok((ptr, len))
+    }
+
+    /// Dest is a window local: STR→WINDOW / LIST→WINDOW / `(p, n)` /
+    /// identity / residual fat split. Never `ll_join_chars`.
+    fn lower_window_dest_call(
+        &mut self,
+        mir_bb: usize,
+        name: &str,
+        args: &[Variable],
+        arg_tys: &[Option<TyRef>],
+        pair_lens: &[(usize, Variable)],
+        reg: &RegularCall,
+        arg_is_range_full: bool,
+    ) -> Result<(Variable, Variable), LowerError> {
+        if matches!(
+            name,
+            "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
+        ) && args.len() == 2
+        {
+            let ptr_ty = arg_tys.first().and_then(Option::as_ref).map(|ty| {
+                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+            });
+            let ptr = match ptr_ty {
+                Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
+                    self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                }
+                Some(ValueType::Ref(_)) => {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let (retype, ptr) =
+                        push_ptr_to_unsigned_cast(&mut self.graph, bb_id, args[0].clone());
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(ptr.clone()),
+                        kind: retype,
+                    });
+                    ptr
+                }
+                _ => args[0].clone(),
+            };
+            return Ok((
+                self.emit_window_from_raw_parts_ptr(
+                    mir_bb,
+                    ptr,
+                    arg_tys.first().and_then(Option::as_ref),
+                ),
+                args[1].clone(),
+            ));
+        }
+        if is_slice_from_ref_name(name) && args.len() == 1 {
+            let ptr_ty = arg_tys.first().and_then(Option::as_ref).map(|ty| {
+                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+            });
+            let ptr = match ptr_ty {
+                Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
+                    self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                }
+                Some(ValueType::Ref(_)) => {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let (retype, ptr) =
+                        push_ptr_to_unsigned_cast(&mut self.graph, bb_id, args[0].clone());
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(ptr.clone()),
+                        kind: retype,
+                    });
+                    ptr
+                }
+                _ => args[0].clone(),
+            };
+            let len = self.emit_const_uint(mir_bb, 1);
+            return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
+        }
+        if matches!(
+            name,
+            "core::slice::index::<Impl>::index"
+                | "core::slice::index::<Impl>::index_mut"
+                | "core::slice::<Impl>::get"
+                | "alloc::vec::<Impl>::index"
+                | "alloc::vec::<Impl>::index_mut"
+                | "core::array::<Impl>::index"
+                | "core::array::<Impl>::index_mut"
+        ) && args.len() == 2
+        {
+            if let Some(len) = pair_lens
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .map(|(_, len)| len.clone())
+                .or_else(|| self.window_len_companion(&args[0]))
+            {
+                return self.window_subslice(
+                    mir_bb,
+                    args[0].clone(),
+                    len,
+                    &args[1],
+                    arg_is_range_full,
+                    true,
+                );
+            }
+        }
+        if let Some((0, len)) = pair_lens.first().cloned() {
+            return Ok((self.ensure_window_ccharp(mir_bb, args[0].clone()), len));
+        }
+        let first_ty = arg_tys.first().and_then(Option::as_ref);
+        let w1_str = first_ty.is_some_and(|ty| {
+            tyref_is_string_value(ty, self.llbc)
+                || tyref_raw_ptr_pointee_is_string_value(ty, self.llbc)
+        });
+        let str_src = args.len() == 1
+            && ((self.is_string_as_bytes_identity(reg, first_ty) && w1_str)
+                || self.is_utf8_payload_bytes_identity(reg)
+                || self.is_bytes_block_chars(reg)
+                || self.is_w_bytes_data(reg)
+                || self.is_w_bytes_block(reg)
+                || self.is_w_str_storage(reg)
+                || w1_str);
+        if str_src {
+            let header = if self.is_w_bytes_data(reg) || self.is_w_bytes_block(reg) {
+                let bb_id = self.emit_bb(mir_bb);
+                self.emit_w_bytes_data_str_read(bb_id, args[0].clone())
+            } else if self.is_w_str_storage(reg) {
+                let bb_id = self.emit_bb(mir_bb);
+                self.emit_w_str_utf8_read(bb_id, args[0].clone())
+            } else {
+                args[0].clone()
+            };
+            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
+        }
+        if args.len() == 1
+            && (self.is_container_slice_identity(reg)
+                || self.is_container_identity_deref(reg)
+                || first_ty.is_some_and(|ty| tyref_is_u8_list(ty, self.llbc)))
+        {
+            return self.emit_list_to_window(mir_bb, args[0].clone(), first_ty);
+        }
+        if args.len() == 1 && self.list_view_local_of_var(&args[0]).is_some() {
+            return self.emit_list_view_to_window(mir_bb, args[0].clone());
+        }
+        if args.len() == 2
+            && first_ty.is_some_and(|ty| tyref_is_u8_list(ty, self.llbc))
+            && matches!(
+                name,
+                "alloc::vec::<Impl>::index"
+                    | "alloc::vec::<Impl>::index_mut"
+                    | "core::slice::index::<Impl>::index"
+                    | "core::slice::index::<Impl>::index_mut"
+            )
+        {
+            let (ptr, len) = self.emit_list_to_window(mir_bb, args[0].clone(), first_ty)?;
+            return self.window_subslice(mir_bb, ptr, len, &args[1], arg_is_range_full, true);
+        }
+        if args.len() == 1
+            && first_ty
+                .is_some_and(|ty| tyref_is_w1_str(ty, self.llbc) || tyref_is_u8_list(ty, self.llbc))
+        {
+            return Ok(self.owner_to_window(mir_bb, args[0].clone(), first_ty)?);
+        }
+        // A callee whose output is a window uses the two-word return ABI:
+        // the caller allocates `ret_len_slot_local` (`SLICE_LEN_SLOT_NEW`),
+        // passes it, and reads the length (`SLICE_LEN_SLOT_TAKE`). Same
+        // path as `lower_pair_call` residual pair-return.
+        if regular_call_fun_decl_id(&reg.kind)
+            .and_then(|id| self.llbc.fn_by_id(id))
+            .is_some_and(|fd| self.pair_or_window_fun_inputs(fd, &reg.generics).1)
+        {
+            let slot = self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::SLICE_LEN_SLOT_NEW,
+                vec![],
+                ValueType::Unsigned,
+            );
+            let target_op = self.pair_call_target(mir_bb, reg, args, pair_lens)?;
+            let mut call_args = splice_pair_lens(args.to_vec(), pair_lens.to_vec());
+            call_args.push(slot.clone());
+            let ptr = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let bb_id = self.emit_bb(mir_bb);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(ptr.clone()),
+                kind: OpKind::Call {
+                    target: target_op,
+                    args: crate::model::call_args(call_args),
+                    result_ty: ValueType::Unsigned,
+                },
+            });
+            let len = self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::SLICE_LEN_SLOT_TAKE,
+                vec![slot],
+                ValueType::Unsigned,
+            );
+            return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
+        }
+        let target_op = self.pair_call_target(mir_bb, reg, args, pair_lens)?;
+        let call_args = splice_pair_lens(args.to_vec(), pair_lens.to_vec());
+        let fat = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(fat.clone()),
+            kind: OpKind::Call {
+                target: target_op,
+                args: crate::model::call_args(call_args),
+                result_ty: ValueType::Int,
+            },
+        });
+        self.fat_box_vars.push(fat.clone());
+        self.split_window_value(mir_bb, fat)
+    }
+
+    /// Two `FieldWrite`s of a window pair into a fat `{data, len}` field.
+    fn emit_window_field_write(
+        &mut self,
+        mir_bb: usize,
+        inner: Place,
+        elem: ProjectionElem,
+        ptr: Variable,
+        len: Variable,
+    ) -> Result<(), LowerError> {
+        let ProjectionElem::Tagged(v) = elem else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: window field write through a non-field projection"
+            )));
+        };
+        let field_payload = v.as_object().and_then(|m| m.get("Field")).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: window field write without a Field payload"
+            ))
+        })?;
+        let field_base_ty = clone_tyref(&inner.ty);
+        let base_is_deref = matches!(
+            &inner.kind,
+            PlaceKind::Projection(_, ProjectionElem::Atom(atom)) if atom == "Deref"
+        );
+        let base = self.resolve_place(mir_bb, inner)?;
+        let bb_id = self.emit_bb(mir_bb);
+        let field = match self.resolve_adt_field(&field_base_ty, field_payload) {
+            Some((owner_root, field_name, _, owner_id, host_index)) => {
+                FieldDescriptor::new(field_name, Some(owner_root))
+                    .with_owner_id(owner_id)
+                    .with_owner_declared_gc(Some(false))
+                    .with_base_is_deref(base_is_deref)
+                    .with_host_index(host_index)
+            }
+            None => {
+                let idx = self.positional_field_index(field_payload).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: window field write: unresolved field index"
+                    ))
+                })?;
+                FieldDescriptor::new(format!("__pos_{idx}"), None)
+                    .with_owner_declared_gc(Some(false))
+                    .with_base_is_deref(base_is_deref)
+            }
+        };
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: base.clone(),
+                field: field
+                    .clone()
+                    .with_vec_part(crate::model::VecFieldPart::FatData),
+                value: LinkArg::Value(ptr),
+                ty: ValueType::Unsigned,
+            },
+        });
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base,
+                field: field.with_vec_part(crate::model::VecFieldPart::FatLen),
+                value: LinkArg::Value(len),
+                ty: ValueType::Int,
+            },
+        });
+        Ok(())
     }
 
     fn emit_w_bytes_data_field_read(
@@ -36850,6 +38881,232 @@ impl<'a> Lowering<'a> {
         emitted.as_slice() == ["slice", "iter", "Iter", "copied"]
     }
 
+    fn is_slice_iter_position(&self, mir_bb: usize, reg: &RegularCall) -> bool {
+        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg, None) else {
+            return false;
+        };
+        emitted.as_slice() == ["slice", "iter", "Iter", "position"]
+            || (emitted.last().map(String::as_str) == Some("position")
+                && emitted.iter().any(|s| s == "Iter" || s == "iterator"))
+    }
+
+    /// Haystack STR of a `["core","slice","iter"]` iterator that was
+    /// copied through `ll_str2uintlist`, or whose receiver is already a
+    /// STR view. A STR-view `iter().position` look-ahead aliases the
+    /// iterator local to the STR itself.
+    fn str_origin_of_slice_iter(&self, iter: &Variable) -> Option<Variable> {
+        if self.var_is_str_repr(iter) {
+            return Some(iter.clone());
+        }
+        let recv = self.slice_iter_receiver(iter)?;
+        if let Some(s) = self.str_from_uintlist_copy(&recv) {
+            return Some(s);
+        }
+        self.var_is_str_repr(&recv).then_some(recv)
+    }
+
+    /// Successor terminator is `Iter::position` with a `|&b| b == c`
+    /// predicate, so the iterator is never walked.
+    fn mir_target_is_const_eq_iter_position(&self, target: usize) -> bool {
+        let Some(bb) = self.body.body.get(target) else {
+            return false;
+        };
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(self.llbc) else {
+            return false;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            return false;
+        };
+        if call.args.len() != 2 || !self.is_slice_iter_position(target, reg) {
+            return false;
+        }
+        let pred_ty = match call.args.get(1) {
+            Some(Operand::Copy(p) | Operand::Move(p)) => clone_tyref(&p.ty),
+            Some(op @ Operand::Const(_)) => {
+                let Some(ty) = const_operand_tyref(op, self.llbc) else {
+                    return false;
+                };
+                ty
+            }
+            _ => return false,
+        };
+        self.const_eq_u8_of_predicate(&pred_ty).is_some()
+    }
+
+    fn slice_iter_receiver(&self, iter: &Variable) -> Option<Variable> {
+        let op = self.producer_op(iter)?;
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            return None;
+        };
+        if segments.as_slice() != ["core", "slice", "iter"] || args.len() != 1 {
+            return None;
+        }
+        args[0].as_variable().cloned()
+    }
+
+    fn str_from_uintlist_copy(&self, var: &Variable) -> Option<Variable> {
+        let op = self.producer_op(var)?;
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            return None;
+        };
+        if segments.as_slice() != [crate::front::join_chars::LL_STR2UINTLIST] || args.len() != 1 {
+            return None;
+        }
+        args[0].as_variable().cloned()
+    }
+
+    fn producer_op(&self, var: &Variable) -> Option<&SpaceOperation> {
+        let (block_id, idx) = resolve_to_producer_op(&self.graph, var)?;
+        self.graph
+            .blocks
+            .iter()
+            .find(|block| block.id == block_id)
+            .and_then(|block| block.operations.get(idx))
+    }
+
+    /// Constant byte a predicate closure compares its item against
+    /// (`|&byte| byte == c`). The needle lives in the closure FunDecl
+    /// body; captures are empty.
+    fn const_eq_u8_of_predicate(&self, pred_ty: &TyRef) -> Option<u8> {
+        let def_id = self
+            .tyref_adt_def_id(pred_ty)
+            .or_else(|| self.tyref_ref_adt_def_id(pred_ty))?;
+        let td = self.llbc.type_by_id(def_id)?;
+        if !type_decl_is_closure_env(td) {
+            return None;
+        }
+        for fd in self.llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let Some(first) = fd.signature.inputs.first() else {
+                continue;
+            };
+            let first_id = self
+                .tyref_adt_def_id(first)
+                .or_else(|| self.tyref_ref_adt_def_id(first));
+            if first_id != Some(def_id) {
+                continue;
+            }
+            let Some(body) = fd.unstructured() else {
+                continue;
+            };
+            if let Some(byte) = const_eq_u8_in_unstructured(self.llbc, &body) {
+                return Some(byte);
+            }
+        }
+        None
+    }
+
+    /// `iter().position(|&b| b == c)` of a STR-view slice iterator is
+    /// `str.find(c)` (`rpython_str_find_char`) wrapped as `Option<usize>`.
+    fn try_lower_str_view_iter_position(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+        pred_ty: Option<&TyRef>,
+    ) -> Result<bool, LowerError> {
+        if args.len() != 2 || !self.is_slice_iter_position(mir_bb, reg) {
+            return Ok(false);
+        }
+        let Some(haystack) = self.str_origin_of_slice_iter(&args[0]) else {
+            return Ok(false);
+        };
+        let Some(pred_ty) = pred_ty else {
+            return Ok(false);
+        };
+        let Some(byte) = self.const_eq_u8_of_predicate(pred_ty) else {
+            return Ok(false);
+        };
+        let Some((option_owner, some_owner, payload_ty)) =
+            self.resolve_bool_then_option_dest(dest_ty)
+        else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        // Needle is a 1-char STR. `emit_str_const` is the `__str_const`
+        // define the adapter pre-folds to `Constant('text')`; a raw
+        // `ConstStr` is skipped (`translate_op`) without that fold, so
+        // `find`'s needle is used before definition.
+        let needle = emit_str_const(&mut self.graph, bb_id, &char::from(byte).to_string());
+        let start = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(start.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let idx = crate::front::str_find::emit_rpython_str_find_char(
+            &mut self.graph,
+            bb_id,
+            &[haystack, needle, start],
+        )
+        .map_err(LowerError::Unsupported)?;
+        let neg1 = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(neg1.clone()),
+            kind: OpKind::ConstInt(-1),
+        });
+        let found = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(found.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: idx.clone(),
+                rhs: neg1,
+                result_ty: ValueType::Bool,
+            },
+        });
+        let option_owner_some = option_owner.clone();
+        self.close_call_diamond(
+            mir_bb,
+            target,
+            dest_local,
+            found,
+            false,
+            false,
+            std::slice::from_ref(&idx),
+            &[],
+            move |this, some_bb, mapped| {
+                crate::front::bool_then::emit_option_variant(
+                    &mut this.graph,
+                    some_bb,
+                    &option_owner_some,
+                    1,
+                    Some((some_owner.as_str(), mapped[0].clone(), payload_ty.clone())),
+                )
+            },
+            move |this, none_bb, _| {
+                crate::front::bool_then::emit_option_variant(
+                    &mut this.graph,
+                    none_bb,
+                    &option_owner,
+                    0,
+                    None,
+                )
+            },
+        )?;
+        Ok(true)
+    }
+
     fn is_const_ptr_as_ref(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -37243,10 +39500,9 @@ impl<'a> Lowering<'a> {
     /// (the container) differs from the destination (a fresh iterator), so
     /// they cannot be identity-aliased; the caller lowers them to the
     /// `iter` operation on the container instead of an unregistered
-    /// `FunctionPath` callee.  The explicit `<[T]>::iter` already routes to
-    /// `iter` through the `("slice","iter")` bridge
-    /// (`flowspace_adapter::nonraising_core_bridge_opname`), so it is not
-    /// matched here.
+    /// `FunctionPath` callee.  `<[T]>::iter` / `iter_mut` take the same
+    /// bridge with `fun_decl_id: None`: the FunDecl input is unsubstituted
+    /// `&[T]`, which would paint a STR-view receiver as List.
     fn is_concrete_iter_constructor(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -37269,6 +39525,8 @@ impl<'a> Lowering<'a> {
                     // slice it owns (`project_struct_field_type` strips the
                     // `Box`), so both walk the receiver's list.
                     | "alloc::boxed::iter::<Impl>::into_iter"
+                    | "core::slice::<Impl>::iter"
+                    | "core::slice::<Impl>::iter_mut"
             )
         })
     }
@@ -39329,7 +41587,7 @@ impl<'a> Lowering<'a> {
         if tyref_is_shared_u8_slice(&inner_ty, self.llbc)
             || tyref_is_bare_u8_slice(&inner_ty, self.llbc)
         {
-            return Some(ValueType::Str);
+            return Some(ValueType::Int);
         }
         Some(tyref_enum_payload_value_type(
             &inner_ty,
@@ -39470,15 +41728,15 @@ impl<'a> Lowering<'a> {
     /// repr upstream. Ordinary pointer payloads already share InstanceRepr and
     /// need no projection.
     fn option_niche_null_cast(&self, option_ty: &TyRef) -> Option<(String, ValueType)> {
+        // `Option<&[u8]>` is a two-word nullable window, so
+        // `tyref_is_niche_option_ptr` is false. The None arm is still a
+        // null `CCHARP` data word, not `convert_const(None)` on
+        // `StringRepr`.
+        if tyref_is_option_of_shared_u8_slice(option_ty, self.llbc) {
+            return Some(("&[u8]".to_string(), ValueType::Int));
+        }
         if !self.tyref_is_niche_option_ptr(option_ty) {
             return None;
-        }
-        // `Option<&[u8]>` (Charon `Option<[u8]>`) is a nullable rstr `STR`:
-        // its `None` is `convert_const(None)` on `StringRepr`. The root keeps
-        // the shared borrow, which `project_struct_field_type` projects to
-        // `s_str0`; the stripped `[u8]` would project a list.
-        if tyref_is_option_of_shared_u8_slice(option_ty, self.llbc) {
-            return Some(("&[u8]".to_string(), ValueType::Str));
         }
         let adt = tyref_node(option_ty, self.llbc)?
             .as_object()?
@@ -39742,14 +42000,13 @@ impl<'a> Lowering<'a> {
     fn slice_receiver_is_string_byte_view(
         &self,
         arg_locals: &[Option<usize>],
-        first_arg_ty: Option<&TyRef>,
+        _first_arg_ty: Option<&TyRef>,
     ) -> bool {
         arg_locals
             .first()
             .copied()
             .flatten()
             .is_some_and(|local| self.string_byte_view_locals.contains(&local))
-            || first_arg_ty.is_some_and(|ty| tyref_is_shared_u8_slice(ty, self.llbc))
     }
 
     /// Stamp byte-view / ARRAY identity onto a `first` / `last` site.
@@ -41834,11 +44091,11 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
         }
-        // Shared `&[u8]` is rstr `STR` (one GC pointer), the same
-        // nullable-string niche as `&str`. Charon spells `Option<&[u8]>`
-        // as `Option<[u8]>`.
-        if tyref_is_option_of_shared_u8_slice(ty, self.llbc) {
-            return true;
+        // `Option<&[u8]>` is a two-word nullable window, not a one-word
+        // STR niche. Pair locals carry it as `{data, len}` with a null
+        // data word for `None`.
+        if tyref_is_u8_window(ty, self.llbc) {
+            return false;
         }
         // A `Vec` of one-word items is the header address, never null
         // (`RustVecRepr`). Charon's `Option<Vec<T>>` layout may still be
@@ -41933,9 +44190,11 @@ impl<'a> Lowering<'a> {
             if stripped.get("Adt").and_then(type_decl_ref_builtin) == Some("Str") {
                 return true;
             }
-            // Shared `&[u8]` is the same one-word `STR` as `&str`.
+            // Shared `&[u8]` is a two-word window. `Option<&[u8]>` is
+            // handled above (`tyref_is_u8_window`); a bare `[u8]`
+            // referent is not a one-word STR niche.
             if tyref_is_bare_u8_slice(&TyRef::Other(stripped.clone()), self.llbc) {
-                return true;
+                return false;
             }
             // `&*mut T` is a thin shared reference even though its pointee is
             // itself a raw pointer rather than a nominal ADT.  This is the
@@ -42120,7 +44379,7 @@ impl<'a> Lowering<'a> {
         if tyref_is_shared_u8_slice(&payload_ty, self.llbc)
             || tyref_is_bare_u8_slice(&payload_ty, self.llbc)
         {
-            return true;
+            return false;
         }
         let Some(node) = strip_ty_wrappers(payload, self.llbc) else {
             return false;
@@ -42561,12 +44820,7 @@ impl<'a> Lowering<'a> {
         if tyref_is_string_value(ty, self.llbc) {
             return true;
         }
-        let Some(node) = tyref_node(ty, self.llbc).and_then(|n| strip_ty_wrappers(n, self.llbc))
-        else {
-            return false;
-        };
-        let rendered = charon_type_value_to_ast_string(node, self.llbc, 0);
-        rendered == "[u8]" || rendered == "&[u8]"
+        false
     }
 
     fn scalar_cmp_bank(&self, ty: &TyRef) -> Option<ValueType> {
@@ -43739,6 +45993,7 @@ impl<'a> Lowering<'a> {
                     name: format!("__pos_{i}"),
                     void: false,
                     narrow_root: None,
+                    window: false,
                 })
                 .collect(),
         };
@@ -45288,27 +47543,86 @@ impl<'a> Lowering<'a> {
 
     fn edge_args(&mut self, from_bb: usize, target_bb: usize) -> Result<Vec<Variable>, LowerError> {
         let local_indices = self.target_input_locals(target_bb)?;
+        let mut converted_lens: Vec<(usize, Variable)> = Vec::new();
         let mut args = Vec::with_capacity(local_indices.len());
-        for local_idx in local_indices {
-            let var = self
+        for local_idx in local_indices.iter().copied() {
+            if let Some((_, len)) = converted_lens
+                .iter()
+                .find(|(shadow, _)| *shadow == local_idx)
+            {
+                args.push(len.clone());
+                continue;
+            }
+            let shadow = self.len_shadow.get(local_idx).copied().flatten();
+            let convert_on_link = (self.local_holds_str_view(local_idx)
+                || self.local_holds_list_view(local_idx))
+                && shadow.is_some_and(|slot| local_indices.contains(&slot));
+            if convert_on_link {
+                let header = self
+                    .local_var
+                    .get(local_idx)
+                    .and_then(|slot| slot.as_ref())
+                    .and_then(|value| value.one().ok())
+                    .ok_or_else(|| {
+                        LowerError::Unsupported("owner view joins a window".to_string())
+                    })?;
+                let (ptr, len) = if self.local_holds_str_view(local_idx) {
+                    let (ptr, len) = self.emit_str_to_window(from_bb, header);
+                    (self.ensure_window_ccharp(from_bb, ptr), len)
+                } else {
+                    self.emit_list_view_to_window(from_bb, header)?
+                };
+                if let Some(slot) = shadow {
+                    converted_lens.push((slot, len));
+                }
+                self.merge_positional_aggregate_state(target_bb, local_idx);
+                self.merge_string_byte_view_state(target_bb, local_idx, false);
+                self.merge_list_view_state(target_bb, local_idx, false);
+                args.push(ptr);
+                continue;
+            }
+            let var = match self
                 .local_var
                 .get(local_idx)
                 .and_then(|slot| slot.as_ref())
                 .map(LocalValue::link_word)
-                .ok_or_else(|| {
+            {
+                Some(var) => var,
+                None => {
+                    let owner_is_str = self.len_shadow.iter().enumerate().any(|(owner, slot)| {
+                        *slot == Some(local_idx)
+                            && (self.local_holds_str_view(owner)
+                                || self
+                                    .local_var
+                                    .get(owner)
+                                    .and_then(|entry| entry.as_ref())
+                                    .and_then(|value| value.one().ok())
+                                    .is_some())
+                    });
+                    if owner_is_str {
+                        return Err(LowerError::Unsupported(
+                            "STR view joins a window".to_string(),
+                        ));
+                    }
                     let n_locals = self.body.locals.locals.len();
                     let ty = if local_idx < n_locals {
                         tyref_to_ast_string(&self.body.locals.locals[local_idx].ty, self.llbc)
                     } else {
                         "len_shadow_or_slot".to_string()
                     };
-                    LowerError::Unsupported(format!(
+                    return Err(LowerError::Unsupported(format!(
                         "bb{from_bb}: edge to bb{target_bb} needs live MIR local {local_idx} ({ty}), \
                          but it is uninitialised"
-                    ))
-                })?;
+                    )));
+                }
+            };
             self.merge_positional_aggregate_state(target_bb, local_idx);
-            self.merge_string_byte_view_state(target_bb, local_idx);
+            self.merge_string_byte_view_state(
+                target_bb,
+                local_idx,
+                self.local_holds_str_view(local_idx),
+            );
+            self.merge_list_view_state(target_bb, local_idx, self.local_holds_list_view(local_idx));
             args.push(var);
         }
         Ok(args)
@@ -45371,7 +47685,7 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    fn merge_string_byte_view_state(&mut self, target_bb: usize, local_idx: usize) {
+    fn merge_string_byte_view_state(&mut self, target_bb: usize, local_idx: usize, incoming: bool) {
         if !self.block_id.is_lowered(target_bb) {
             return;
         }
@@ -45379,7 +47693,6 @@ impl<'a> Lowering<'a> {
         if self.block_byte_view_conflict[row].contains(local_idx) {
             return;
         }
-        let incoming = self.string_byte_view_locals.contains(&local_idx);
         if !self.block_byte_view_seen[row].contains(local_idx) {
             self.block_byte_view_seen[row].insert(local_idx);
             if incoming {
@@ -45391,6 +47704,28 @@ impl<'a> Lowering<'a> {
         if current != incoming {
             self.block_byte_view_conflict[row].insert(local_idx);
             self.block_entry_string_byte_view_locals[row].remove(local_idx);
+        }
+    }
+
+    fn merge_list_view_state(&mut self, target_bb: usize, local_idx: usize, incoming: bool) {
+        if !self.block_id.is_lowered(target_bb) {
+            return;
+        }
+        let row = self.block_id.row(target_bb);
+        if self.block_list_view_conflict[row].contains(local_idx) {
+            return;
+        }
+        if !self.block_list_view_seen[row].contains(local_idx) {
+            self.block_list_view_seen[row].insert(local_idx);
+            if incoming {
+                self.block_entry_list_view_locals[row].insert(local_idx);
+            }
+            return;
+        }
+        let current = self.block_entry_list_view_locals[row].contains(local_idx);
+        if current != incoming {
+            self.block_list_view_conflict[row].insert(local_idx);
+            self.block_entry_list_view_locals[row].remove(local_idx);
         }
     }
 }
@@ -56804,6 +59139,30 @@ fn depth0_typevar_index(node: &serde_json::Value) -> Option<usize> {
         .map(|index| index as usize)
 }
 
+fn depth0_constvar_index(node: &serde_json::Value) -> Option<usize> {
+    if let Some(n) = node.get("Var").and_then(serde_json::Value::as_u64) {
+        return Some(n as usize);
+    }
+    for key in ["Var", "ConstVar", "TypeVar"] {
+        let Some(var) = node.get(key) else {
+            continue;
+        };
+        if let Some(bound) = var.get("Bound").and_then(serde_json::Value::as_array) {
+            if bound.first()?.as_u64()? != 0 {
+                return None;
+            }
+            return Some(bound.get(1)?.as_u64()? as usize);
+        }
+        if let Some(index) = var.get("Free").and_then(serde_json::Value::as_u64) {
+            return Some(index as usize);
+        }
+        if let Some(index) = var.as_u64() {
+            return Some(index as usize);
+        }
+    }
+    None
+}
+
 fn ref_inner_and_kind(r: &serde_json::Value) -> (Option<&serde_json::Value>, Option<&str>) {
     if let Some(arr) = r.as_array() {
         (arr.get(1), arr.get(2).and_then(serde_json::Value::as_str))
@@ -56821,13 +59180,14 @@ fn json_ref_kind_is_mut(kind: Option<&str>) -> bool {
     kind.is_some_and(|k| k.eq_ignore_ascii_case("Mut"))
 }
 
-/// Unify `pattern` (method first input after impl TypeVars) against the
+/// Unify `pattern` (impl `Self`, or a nested type argument) against the
 /// call receiver. Shared vs Mut vs owned wrappers stay distinct:
 /// `strip_ty_wrappers` would over-peel `&&T`. `ClassDesc.lookup`.
 fn unify_receiver_ty(
     pattern: &serde_json::Value,
     actual: &serde_json::Value,
     subst: &mut Vec<Option<serde_json::Value>>,
+    const_subst: &mut Vec<Option<serde_json::Value>>,
     llbc: &Llbc,
 ) -> bool {
     let Some(pattern) = strip_ty_indirections(pattern, llbc) else {
@@ -56860,7 +59220,7 @@ fn unify_receiver_ty(
             return false;
         }
         match (pty, aty) {
-            (Some(pty), Some(aty)) => unify_receiver_ty(pty, aty, subst, llbc),
+            (Some(pty), Some(aty)) => unify_receiver_ty(pty, aty, subst, const_subst, llbc),
             _ => false,
         }
     } else if pattern.get("Ref").is_some() || actual.get("Ref").is_some() {
@@ -56893,6 +59253,7 @@ fn unify_receiver_ty(
             aa.get("generics")
                 .and_then(|g| g.get("const_generics"))
                 .and_then(serde_json::Value::as_array),
+            const_subst,
         ) {
             return false;
         }
@@ -56904,6 +59265,7 @@ fn unify_receiver_ty(
                 .and_then(|g| g.get("types"))
                 .and_then(serde_json::Value::as_array),
             subst,
+            const_subst,
             llbc,
         )
     } else {
@@ -56914,6 +59276,7 @@ fn unify_receiver_ty(
 fn unify_const_generic_lists(
     pattern: Option<&Vec<serde_json::Value>>,
     actual: Option<&Vec<serde_json::Value>>,
+    const_subst: &mut Vec<Option<serde_json::Value>>,
 ) -> bool {
     let empty: Vec<serde_json::Value> = Vec::new();
     let pattern = pattern.unwrap_or(&empty);
@@ -56921,20 +59284,29 @@ fn unify_const_generic_lists(
     if pattern.len() != actual.len() {
         return false;
     }
-    pattern
-        .iter()
-        .zip(actual.iter())
-        .all(|(pattern, actual)| pattern == actual || const_generic_is_var(pattern))
-}
-
-fn const_generic_is_var(value: &serde_json::Value) -> bool {
-    value.get("Var").is_some() || value.get("ConstVar").is_some() || value.get("TypeVar").is_some()
+    pattern.iter().zip(actual.iter()).all(|(pattern, actual)| {
+        if let Some(index) = depth0_constvar_index(pattern) {
+            if index >= const_subst.len() {
+                const_subst.resize(index + 1, None);
+            }
+            match &const_subst[index] {
+                Some(bound) => bound == actual,
+                None => {
+                    const_subst[index] = Some(actual.clone());
+                    true
+                }
+            }
+        } else {
+            pattern == actual
+        }
+    })
 }
 
 fn unify_generic_type_lists(
     pattern: Option<&Vec<serde_json::Value>>,
     actual: Option<&Vec<serde_json::Value>>,
     subst: &mut Vec<Option<serde_json::Value>>,
+    const_subst: &mut Vec<Option<serde_json::Value>>,
     llbc: &Llbc,
 ) -> bool {
     let empty: Vec<serde_json::Value> = Vec::new();
@@ -56946,7 +59318,7 @@ fn unify_generic_type_lists(
     pattern
         .iter()
         .zip(actual.iter())
-        .all(|(p, a)| unify_receiver_ty(p, a, subst, llbc))
+        .all(|(p, a)| unify_receiver_ty(p, a, subst, const_subst, llbc))
 }
 
 fn types_equal_after_subst(
@@ -56961,7 +59333,7 @@ fn types_equal_after_subst(
         .map(|bound| bound.clone().unwrap_or(serde_json::Value::Null))
         .collect();
     crate::front::clause_spec::substitute_type_vars(&mut pattern, llbc, &types, &[]);
-    unify_receiver_ty(&pattern, actual, &mut Vec::new(), llbc)
+    unify_receiver_ty(&pattern, actual, &mut Vec::new(), &mut Vec::new(), llbc)
 }
 
 fn trait_generic_args_match(
@@ -56997,44 +59369,40 @@ fn trait_generic_args_match(
 
 fn reconstructed_impl_generics(
     subst: &[Option<serde_json::Value>],
+    const_subst: &[Option<serde_json::Value>],
     row: &serde_json::Value,
-    recv: &serde_json::Value,
-) -> serde_json::Value {
-    let types: Vec<serde_json::Value> = subst
-        .iter()
-        .map(|bound| {
-            bound
-                .clone()
-                .unwrap_or_else(|| serde_json::json!({"TypeVar": {"Bound": [0, 0]}}))
-        })
-        .collect();
-    let const_generics = adt_const_generics(recv);
+) -> Option<serde_json::Value> {
+    let type_n = row
+        .pointer("/generics/types")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(subst.len());
+    let const_n = row
+        .pointer("/generics/const_generics")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(const_subst.len());
+    let types = filled_subst(subst, type_n)?;
+    let const_generics = filled_subst(const_subst, const_n)?;
     let trait_refs = row
         .pointer("/generics/trait_refs")
         .cloned()
         .unwrap_or_else(|| serde_json::json!([]));
-    serde_json::json!({
+    Some(serde_json::json!({
         "types": types,
         "const_generics": const_generics,
         "trait_refs": trait_refs,
-    })
+    }))
 }
 
-fn adt_const_generics(ty: &serde_json::Value) -> serde_json::Value {
-    let mut node = ty;
-    for _ in 0..8 {
-        if let Some(r) = node.get("Ref") {
-            let inner = r.as_array().and_then(|a| a.get(1)).or_else(|| r.get("ty"));
-            if let Some(inner) = inner {
-                node = inner;
-                continue;
-            }
-        }
-        break;
+fn filled_subst(subst: &[Option<serde_json::Value>], n: usize) -> Option<Vec<serde_json::Value>> {
+    if subst.len() < n {
+        return None;
     }
-    node.pointer("/Adt/generics/const_generics")
+    subst[..n]
+        .iter()
         .cloned()
-        .unwrap_or_else(|| serde_json::json!([]))
+        .collect::<Option<Vec<serde_json::Value>>>()
 }
 
 fn merge_impl_and_method_generics(
@@ -57060,8 +59428,10 @@ fn merge_impl_and_method_generics(
 }
 
 /// Unique impl of `trait_id` whose method first input unifies with the
-/// call receiver, including reference wrappers and trait generic args.
-/// Zero or several matches stay unresolved (`ClassDesc.lookup`).
+/// call receiver, including every reference layer and trait generic args.
+/// Const-generic bindings come from that unification
+/// (`FunctionDesc.cachedgraph`). Zero or several matches stay unresolved
+/// (`ClassDesc.lookup`).
 fn trait_impl_match_for_receiver(
     first_arg_ty: &TyRef,
     payload: &serde_json::Value,
@@ -57099,20 +59469,20 @@ fn trait_impl_match_for_receiver(
         };
         let pattern = tyref_as_json(first_input);
         let mut subst = Vec::new();
-        if !unify_receiver_ty(&pattern, &recv, &mut subst, llbc) {
+        let mut const_subst = Vec::new();
+        if !unify_receiver_ty(&pattern, &recv, &mut subst, &mut const_subst, llbc) {
             continue;
         }
         if !trait_generic_args_match(impl_trait, call_types, &subst, llbc) {
             continue;
         }
+        let Some(impl_generics) = reconstructed_impl_generics(&subst, &const_subst, row) else {
+            continue;
+        };
         if found.is_some() {
             return None;
         }
-        found = Some((
-            impl_id,
-            fn_id,
-            reconstructed_impl_generics(&subst, row, &recv),
-        ));
+        found = Some((impl_id, fn_id, impl_generics));
     }
     found
 }
@@ -61122,7 +63492,7 @@ pub(crate) fn collect_foreign_opaque_method_externals(
         if fd.is_global_initializer().is_some() {
             continue;
         }
-        if let Some((_owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
+        if let Some((owner_qualified, leaf)) = impl_method_owner_for_fundecl(llbc, fd) {
             let Some(owner_def_id) = impl_owner_adt_def_id_for_fundecl(llbc, fd) else {
                 continue;
             };
@@ -61150,12 +63520,20 @@ pub(crate) fn collect_foreign_opaque_method_externals(
             else {
                 continue;
             };
-            let segments = spec_segments(llbc, fd, &leaf);
-            out.push((
-                segments,
-                Signature::new(fundecl_stub_argnames(fd), None, None),
-                result_ty,
-            ));
+            let signature = Signature::new(fundecl_stub_argnames(fd), None, None);
+            let mut segments: Vec<String> =
+                owner_qualified.split("::").map(str::to_string).collect();
+            segments.push(leaf.clone());
+            // A callsite names the method `owner::leaf`
+            // (`CallControl.guess_call_kind`); `opaque_nullary_impl_target`
+            // names it by its identity-qualified path. Both spellings
+            // register the one callable (`extfunc.py` `register_external`),
+            // as `free_function_alias_paths` does for a free function.
+            let identity = spec_segments(llbc, fd, &leaf);
+            if identity != segments {
+                out.push((identity, signature.clone(), result_ty.clone()));
+            }
+            out.push((segments, signature, result_ty));
             continue;
         }
         if let Some(row) = local_crate_opaque_import_external(llbc, fd) {
@@ -62497,8 +64875,19 @@ fn emit_rffi_cast_to_carray_ptr(
     ptr: Variable,
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
-    use crate::flowspace::model::ConstValue;
     let addr = push_cast_ptr_to_int(graph, bb_id, ptr);
+    emit_cast_int_to_carray_ptr(graph, bb_id, addr, item)
+}
+
+/// 2-arg `lltype.cast_int_to_ptr(PtrT, int)` (`lltype.py`
+/// `ann_cast_int_to_ptr`). The result is a raw `CArrayPtr` / `CCHARP`.
+fn emit_cast_int_to_carray_ptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
     let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
     let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     raw.set_concretetype(Some(ptr_ty.clone()));
@@ -62520,6 +64909,17 @@ fn emit_rffi_cast_to_carray_ptr(
         },
     });
     raw
+}
+
+/// `cast_int_to_ptr(CCHARP, int)` so a window data word is `CCHARP` rather
+/// than a bare `Integer`.
+fn emit_cast_int_to_ccharp(graph: &mut FunctionGraph, bb_id: BlockId, addr: Variable) -> Variable {
+    emit_cast_int_to_carray_ptr(
+        graph,
+        bb_id,
+        addr,
+        &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
+    )
 }
 
 /// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
@@ -62643,6 +65043,12 @@ fn direct_ptradd_pointer_operand(graph: &FunctionGraph, ptr: Variable) -> Variab
 
 fn is_raw_array_ptr(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
     raw_array_ptr_item(ty).is_some()
+}
+
+fn lltype_is_ccharp(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    raw_array_ptr_item(ty).is_some_and(|of| {
+        *of == crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char
+    })
 }
 
 fn raw_array_ptr_item(
@@ -63411,6 +65817,9 @@ fn tyref_to_value_type_with(
     if tyref_is_rust_heap_string(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
     }
+    if tyref_is_u8_window(ty, llbc) {
+        return ValueType::Int;
+    }
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
         || tyref_is_option_of_string_family(ty, llbc)
@@ -63554,6 +65963,43 @@ fn tuple_element_field_value_type(
 /// `impl_method_owner_for_fundecl` stamps on the impl's `self_ty_root`.
 fn closure_env_call_once_owner(td: &TypeDecl) -> String {
     strip_crate_prefix(&td.item_meta.name_path())
+}
+
+/// Byte compared in a predicate body of the form `item == c`.
+fn const_eq_u8_in_unstructured(llbc: &Llbc, body: &Unstructured) -> Option<u8> {
+    let mut found = None;
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(_, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind() else {
+                continue;
+            };
+            if binop_label(&op).ok()?.as_str() != "eq" {
+                continue;
+            }
+            let Some(byte) = operand_const_u8(llbc, &lhs).or_else(|| operand_const_u8(llbc, &rhs))
+            else {
+                continue;
+            };
+            match found {
+                None => found = Some(byte),
+                Some(prev) if prev == byte => {}
+                Some(_) => return None,
+            }
+        }
+    }
+    found
+}
+
+fn operand_const_u8(llbc: &Llbc, op: &Operand) -> Option<u8> {
+    let Operand::Const(value) = op else {
+        return None;
+    };
+    match decode_constant(llbc, value).ok()? {
+        DecodedConst::Int(n) => u8::try_from(n).ok(),
+        DecodedConst::UInt(n) => u8::try_from(n).ok(),
+        DecodedConst::UniChar(c) => u8::try_from(c).ok(),
+        _ => None,
+    }
 }
 
 /// Whether `td` is a compiler-generated closure environment.
@@ -64549,12 +66995,17 @@ fn dont_look_inside_return_container_root(
     // the inlined `_orig_` body's `SomeRustVec` (`ll_newlist` after
     // `l.length = n`).
     let spelling = annotation_struct_field_type(ty, llbc, gc_struct_ids);
+    if majit_ir::descr::is_shared_u8_slice_spelling(&spelling)
+        || majit_ir::descr::is_option_of_u8_window_spelling(&spelling)
+    {
+        return Some(spelling);
+    }
     slice_or_vec_container_root_spelling(&spelling).map(str::to_string)
 }
 
 /// Spellings whose residual stub must be `SomeList`, not a classdef-less
 /// `ref`. `*mut Vec<T>` / `*mut [T]` already qualify; a shared `&[u8]`
-/// is `rstr.py` `STR` and is excluded below. `getanyitem` on the
+/// is a fat window and is excluded below. `getanyitem` on the
 /// classdef-less shell panics.
 fn slice_or_vec_container_root_spelling(spelling: &str) -> Option<&str> {
     if majit_ir::descr::is_shared_u8_slice_spelling(spelling) {
@@ -64616,12 +67067,12 @@ mod slice_or_vec_container_root_spelling_tests {
 }
 
 /// Whether a callee's result is a pointer to the low-level `STR` storage
-/// (`*mut Utf8Str` / rstr `rpy_string` / shared `&[u8]`) — the value
+/// (`*mut Utf8Str` / rstr `rpy_string`) — the value
 /// `FunctionGraph::return_is_str` carries so a `dont_look_inside` stub
 /// returns `SomeString` instead of the classdef-less `ref` shell.  Reads the
 /// same `Result<T, PyError>` payload [`dont_look_inside_return_token`]
 /// reads.  A by-value Rust `String` does not qualify: the residual-call ABI
-/// cannot return its three words.
+/// cannot return its three words. A shared `&[u8]` is a window, not STR.
 fn dont_look_inside_return_is_str(
     output: &TyRef,
     llbc: &Llbc,
@@ -64660,16 +67111,57 @@ fn tyref_is_rbigint(ty: &TyRef, llbc: &Llbc) -> bool {
         })
 }
 
-/// True when `ty` (after `&`/`&mut`/`*` wrappers) is
-/// `core::ops::range::RangeInclusive`. Gates the AnonConst un-promote
-/// of a promoted `(a..=b)` so a same-named static of any other type
-/// stays a Global read.
-fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_node(ty, llbc)
-        .and_then(|n| strip_ty_wrappers(n, llbc))
-        .and_then(adt_node_def_id)
+/// True when `ty` (after stripping `&`/`&mut`/`*` wrappers) resolves to
+/// `adt_path` whose sole element type is a word-sized signed integer
+/// (`I64` / `Isize`). Exclusive `Range` is a struct ADT; inclusive
+/// `RangeInclusive` is a struct after CHARON include.
+fn tyref_is_word_signed_range_adt(
+    ty: &TyRef,
+    llbc: &Llbc,
+    adt_path: &str,
+    require_opaque: bool,
+) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(adt) = node
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|v| v.as_object())
+    else {
+        return false;
+    };
+    let is_range = adt_node_def_id(node)
         .and_then(|id| llbc.type_by_id(id))
-        .is_some_and(|td| td.item_meta.name_path() == "core::ops::range::RangeInclusive")
+        .is_some_and(|td| {
+            (!require_opaque || matches!(td.kind, TypeDeclKind::Opaque))
+                && td.item_meta.name_path() == adt_path
+        });
+    if !is_range {
+        return false;
+    }
+    let elem = type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+        .and_then(|n| strip_ty_wrappers(n, llbc));
+    matches!(
+        elem.and_then(|e| e.as_object())
+            .and_then(|m| m.get("Scalar"))
+            .and_then(|l| l.get("Integer"))
+            .and_then(|l| l.get("Signed"))
+            .and_then(serde_json::Value::as_str),
+        Some("I64" | "Isize")
+    )
+}
+
+/// True when `ty` is `core::ops::range::RangeInclusive` over `I64` /
+/// `Isize`. Gates the AnonConst un-promote of a promoted `(a..=b)` so a
+/// same-named static of any other type, and a character range, stays a
+/// Global read. `bookkeeper.py` `immutablevalue`.
+fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_word_signed_range_adt(ty, llbc, "core::ops::range::RangeInclusive", false)
 }
 
 /// Classify a struct field [`TyRef`] into the RPython `lltype` register
@@ -64776,6 +67268,9 @@ fn tyref_to_attr_value_type_with(
     // A Rust-heap `String` is not rstr `STR`; seed it as `SomeInstance(String)`.
     if tyref_is_rust_heap_string(ty, llbc) {
         return ValueType::Ref(tyref_class_root_with(ty, llbc, tombstoned));
+    }
+    if tyref_is_u8_window(ty, llbc) {
+        return ValueType::Int;
     }
     if tyref_is_string_value(ty, llbc)
         || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
@@ -64975,16 +67470,35 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
 /// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
 /// string-family value whose storage is rstr `STR`:
 /// the `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, pyre's `BytesBlock`
-/// owner, `Utf8Str`, the `{Builtin: "Str"}` node, or a shared `&[u8]` /
-/// `*const [u8]`. A Rust-heap `alloc::string::String` is Vec-shaped
-/// (`{cap, ptr, len}`) and is not this family.
+/// owner, `Utf8Str`, the `{Builtin: "Str"}` node. A shared `&[u8]` /
+/// `*const [u8]` is a fat window, not this family. A Rust-heap
+/// `alloc::string::String` is Vec-shaped (`{cap, ptr, len}`) and is not
+/// this family.
 fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_shared_u8_slice(ty, llbc) {
-        return true;
-    }
     let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
         return false;
     };
+    node_is_string_value(node, llbc)
+}
+
+/// One-word STR view: `&[u8]` / `&str` / the string ADT itself.
+/// `&&[u8]` / `&&str` is a reborrow of that word, not a second `Ptr(STR)`.
+fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_u8_window(ty, llbc) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    if let Some(arr) = node.get("Ref").and_then(serde_json::Value::as_array) {
+        let Some(pointee) = arr.get(1).and_then(|p| strip_ty_indirections(p, llbc)) else {
+            return false;
+        };
+        if pointee.get("Ref").is_some() {
+            return false;
+        }
+        return node_is_string_value(pointee, llbc);
+    }
     node_is_string_value(node, llbc)
 }
 
@@ -66351,13 +68865,17 @@ fn adt_node_class_root_leaf(
                 .is_some_and(|types| types.iter().any(|t| adt_type_arg_is_pointer_like(t, llbc)));
             // A generic struct in a harvested foreign-body crate is one
             // class per instantiation (`bookkeeper.py` `getuniqueclassdef`).
-            // Local-crate structs stay unsuffixed (closures). The
+            // Local-crate structs stay unsuffixed (closures). Exclusive
+            // `Range` / `RangeInclusive` are named during type harvest so
+            // the class does not wait on FunDecl crate-root notes. The
             // container family above stays excluded; Opaque TypeDecls
             // are not `Struct` and do not match.
+            let classed_struct = range_struct_instantiation_suffix(&name, adt, llbc).is_some()
+                || range_inclusive_struct_instantiation_suffix(&name, adt, llbc).is_some();
             let foreign_struct =
                 foreign_body_generic_struct_instantiation_suffix(&name, adt, llbc).is_some();
             let paint_core_enum = (unary && split && !pointer_niche) || (tagged_result && split);
-            if !foreign_struct && !paint_core_enum {
+            if !classed_struct && !foreign_struct && !paint_core_enum {
                 return None;
             }
         }
@@ -66418,22 +68936,67 @@ fn entry_struct_instantiation_suffix(
     split_struct_instantiation_suffix(adt, llbc)
 }
 
-/// `<T>` suffix for a generic struct whose path is in a harvested
-/// foreign-body crate. RPython has no generic classes: each
-/// monomorphization is its own class (`bookkeeper.py` `getuniqueclassdef`).
-/// Local-crate structs are not split (prepass4: seeding every suffixed
-/// root added closure failures).
+/// `<Idx>` suffix for exclusive `core::ops::range::Range`. Named-ADT
+/// arguments split (`bookkeeper.py` `getuniqueclassdef`); an unsuffixed
+/// `Range` unions `start` across instantiations.
+fn range_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if name_path != "core::ops::range::Range" && !name_path.ends_with("::ops::range::Range") {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
+/// `<Idx>` suffix for `core::ops::range::RangeInclusive`. Scalar type
+/// args (`RangeInclusive<u8>` vs `<i64>`) change field layout and split
+/// (`bookkeeper.py` `getuniqueclassdef`). Named during type harvest so
+/// the class does not wait on FunDecl crate-root notes.
+fn range_inclusive_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if name_path != "core::ops::range::RangeInclusive"
+        && !name_path.ends_with("::ops::range::RangeInclusive")
+    {
+        return None;
+    }
+    split_struct_instantiation_suffix(adt, llbc)
+}
+
+/// True when this artefact harvested a FunDecl body under `crate_root`.
+/// Same admission as [`note_body_crate_root_into`]: not `crate`, not a
+/// local alias root, and some FunDecl with an unstructured body starts
+/// at that crate (`bookkeeper.py` `Bookkeeper.getdesc`).
+fn llbc_harvested_foreign_body_crate_root(llbc: &Llbc, crate_root: &str) -> bool {
+    if crate_root == "crate" || crate::local_crates::is_local_crate_root(crate_root) {
+        return false;
+    }
+    llbc.has_body_under_crate_root(crate_root)
+}
+
+/// `<T>` suffix for a generic struct in a harvested foreign-body crate.
+/// RPython has no generic classes: each monomorphization is its own
+/// class (`bookkeeper.py` `getuniqueclassdef`). Local-crate structs
+/// are not split (prepass4: seeding every suffixed root added closure
+/// failures).
 ///
-/// Scalar type args (`RangeInclusive<u8>` vs `<i64>`) change field
-/// layout and split. Named-ADT args (`CodeObject<ConstantData>`) are
-/// the omitted-default spelling of one class and stay unsuffixed.
+/// Scalar type args (`Slot<i64>` vs `<f64>`) change field layout and
+/// split. Named-ADT args (`CodeObject<ConstantData>`) are the
+/// omitted-default spelling of one class and stay unsuffixed.
+/// Harvested crate roots used to live in TLS (`is_foreign_body_crate_root`);
+/// they now live on `StructFieldRegistry`, and this site reconstructs
+/// the same FunDecl-body set from the artefact (`note_body_crate_root_into`).
 fn foreign_body_generic_struct_instantiation_suffix(
     name_path: &str,
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
 ) -> Option<String> {
     let crate_root = name_path.split("::").next().unwrap_or(name_path);
-    if !crate::local_crates::is_foreign_body_crate_root(crate_root) {
+    if !llbc_harvested_foreign_body_crate_root(llbc, crate_root) {
         return None;
     }
     let def_id = type_decl_ref_adt_id(adt)?;
@@ -66458,6 +69021,8 @@ fn struct_instantiation_suffix(
     llbc: &Llbc,
 ) -> Option<String> {
     entry_struct_instantiation_suffix(name_path, adt, llbc)
+        .or_else(|| range_struct_instantiation_suffix(name_path, adt, llbc))
+        .or_else(|| range_inclusive_struct_instantiation_suffix(name_path, adt, llbc))
         .or_else(|| foreign_body_generic_struct_instantiation_suffix(name_path, adt, llbc))
 }
 
@@ -66538,8 +69103,8 @@ fn tyref_is_raw_u8_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
 }
 
 /// Shared immutable `&[u8]` / `*const [u8]` (Charon `Ref`/`RawPtr` of
-/// `Slice<u8>`). RPython bytes are `str` (`rstr.py` `STR`). `&mut [u8]`
-/// / `*mut [u8]` stay a list of unsigned.
+/// `Slice<u8>`). This TyRef is a fat window, not `rstr.py` `STR`.
+/// `&mut [u8]` / `*mut [u8]` stay a list of unsigned.
 fn tyref_is_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
         return false;
@@ -66589,8 +69154,8 @@ fn tyref_is_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
 
 /// Bare unsized `[u8]` / Charon `Slice<u8>` (no `Ref`/`RawPtr` wrapper).
 /// Charon spells `Option<&[u8]>` as `Option<[u8]>`; the payload is the
-/// fat shared slice, which this source translator represents as rstr
-/// `STR`.
+/// fat shared slice's referent, not already-STR. A window is the
+/// `Ref`/`RawPtr` wrapper (`tyref_is_shared_u8_slice`).
 fn tyref_is_bare_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
         return false;
@@ -66608,7 +69173,7 @@ fn tyref_is_bare_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
 }
 
-/// `Option<&[u8]>` / Charon `Option<[u8]>`: the payload is rstr `STR`.
+/// `Option<&[u8]>` / Charon `Option<[u8]>`: a nullable fat window.
 fn tyref_is_option_of_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     crate::front::result_exc::tyref_option_payload(ty, llbc).is_some_and(|payload| {
         tyref_is_shared_u8_slice(&payload, llbc) || tyref_is_bare_u8_slice(&payload, llbc)
@@ -66625,30 +69190,72 @@ fn tyref_is_option_of_string_family(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|payload| tyref_is_string_family(&payload, llbc))
 }
 
-/// `Vec<u8>` / list-of-chars → shared `&[u8]` is `rstr.py`
-/// `LLHelpers.ll_join_chars` (a copy into a `STR`). Identity when the
-/// source is already that string. `Option<&[u8]>` is the same nullable
-/// string (`tyref_is_niche_option_ptr`).
-fn should_copy_u8_list_to_str(dest_ty: &TyRef, src_ty: Option<&TyRef>, llbc: &Llbc) -> bool {
-    let dest_wants_str = tyref_is_shared_u8_slice(dest_ty, llbc)
-        || tyref_is_option_of_shared_u8_slice(dest_ty, llbc);
-    dest_wants_str
-        && src_ty.is_some_and(|t| {
-            !tyref_is_shared_u8_slice(t, llbc)
-                && !tyref_is_bare_u8_slice(t, llbc)
-                && !tyref_is_string_family(t, llbc)
-                && !tyref_is_option_of_shared_u8_slice(t, llbc)
-        })
+/// Shared `&[u8]` / `*const [u8]` / `Option<&[u8]>`: the W3 window.
+fn tyref_is_u8_window(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_shared_u8_slice(ty, llbc) || tyref_is_option_of_shared_u8_slice(ty, llbc)
 }
 
-/// Source type of an rvalue used to decide list→`STR` copies.
-fn rvalue_coercion_src_ty(rvalue: &Rvalue) -> Option<&TyRef> {
-    match rvalue {
-        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) | Rvalue::UnaryOp(_, op) => operand_tyref(op),
-        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => Some(&place.ty),
-        Rvalue::Aggregate(_, ops) => ops.first().and_then(operand_tyref),
-        _ => None,
+/// `Vec<u8>` / `&mut [u8]` / `*mut [u8]` / `Box<[u8]>`: W2 list.
+/// Bare unsized `[u8]` is the window referent (`tyref_is_bare_u8_slice`),
+/// not a list: a `Deref` of `&[u8]` keeps the window / STR view.
+fn tyref_is_u8_list(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_u8_window(ty, llbc) || tyref_is_bare_u8_slice(ty, llbc) {
+        return false;
     }
+    if tyref_is_box_u8_slice(ty, llbc) {
+        return true;
+    }
+    let spelling = tyref_to_ast_string(ty, llbc);
+    majit_ir::descr::is_list_container_spelling(&spelling)
+        && (spelling.contains("[u8]")
+            || spelling.contains("Vec<u8>")
+            || spelling.contains("Slice<u8>"))
+}
+
+/// `Box<[u8]>` (and a `Ref` of one): a Box ADT whose type argument is a
+/// `[u8]` slice. The Box identity is the LLBC `builtin: "Box"` tag, or
+/// the `alloc::boxed::Box` decl the tag names; the argument is the
+/// `Slice` of `u8`.
+fn tyref_is_box_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    let Some(adt) = node.get("Adt").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let is_box = adt.get("builtin").and_then(serde_json::Value::as_str) == Some("Box")
+        || type_decl_ref_adt_id(adt)
+            .and_then(|id| llbc.type_by_id(id))
+            .is_some_and(|decl| decl.item_meta.name_path() == "alloc::boxed::Box");
+    if !is_box {
+        return false;
+    }
+    let Some(first) = type_decl_ref_generics(adt, llbc)
+        .and_then(|generics| generics.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+        .and_then(|ty| strip_ty_indirections(ty, llbc))
+    else {
+        return false;
+    };
+    first
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .is_some_and(|item| json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8"))
+}
+
+/// Fixed-size u8 list owner: `Box<[u8]>` or `[u8; N]`.
+/// `rgc._check_resizable_list_of_chars` forces `listdef.resize()`, so
+/// a fixed list has no `nonmoving_raw_ptr_for_resizable_list`.
+fn tyref_is_fixed_u8_list(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_box_u8_slice(ty, llbc) {
+        return true;
+    }
+    let array_ty = ref_pointee_ty(ty, llbc).unwrap_or_else(|| clone_tyref(ty));
+    tyref_raw_array_parts(&array_ty, llbc).is_some_and(|(item, _)| {
+        json_ty_scalar_element_spelling(item, llbc).as_deref() == Some("u8")
+    })
 }
 
 fn tyref_is_raw_byte_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -66817,6 +69424,20 @@ fn raw_ptr_u8_slice_element(ty: &TyRef, llbc: &Llbc) -> Option<(ValueType, Strin
         return None;
     }
     Some((ValueType::Unsigned, "[u8]".to_string()))
+}
+
+/// `*const u8` (shared window `as_ptr`), not `*mut u8` (list items).
+fn raw_ptr_u8_is_const(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
+        return false;
+    };
+    let Some(arr) = node.get("RawPtr").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    let Some(kind) = arr.get(1).and_then(serde_json::Value::as_str) else {
+        return false;
+    };
+    kind != "Mut" && raw_ptr_u8_slice_element(ty, llbc).is_some()
 }
 
 /// The `__cast_pointer` marker call — front::mir's carrier for
@@ -70001,6 +72622,10 @@ fn charon_adt_to_ast_string(
         if type_args.is_empty() {
             return leaf;
         }
+        // Keep supplied type arguments (`bookkeeper.py`
+        // `getuniqueclassdef`). An omitted-default spelling is only
+        // valid when Charon carries the declared default and the
+        // argument equals it.
         return format!("{leaf}<{}>", type_args.join(","));
     }
     // A field type copied from another crate names the ADT by path. The
@@ -71073,53 +73698,16 @@ enum DecodedConst {
     SingleFloat(u32),
     /// String / byte-string literals. The IR has no dedicated string
     /// constant opkind; the codewriter treats these as opaque pointer-typed
-    /// values. A `char` literal is not one of them: it decodes to
-    /// [`Self::Int`]. We carry the textual representation as a
-    /// unique-string `ConstValue` so the generated IR is stable across
-    /// runs.
+    /// values. We carry the textual representation as a unique-string
+    /// `ConstValue` so the generated IR is stable across runs.
     Str(String),
+    /// A Rust `char` literal: one Unicode scalar
+    /// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`).
+    UniChar(u32),
     /// Constant function pointer (`FnDef`). Encoded as a synthetic
     /// `FunctionPath` so it shares the existing `Call` lowering path
     /// when threaded into an indirect call site.
     FnPath(Vec<String>),
-}
-
-/// The `OpKind` `build_rvalue` emits for a decoded constant. A promoted-const
-/// accessor that copies such a literal is this same translation-time
-/// `Constant` (`rtyper` prebuilt `Constant` of a global; residualizing it
-/// would keep a function pointer `Transformer.handle_residual_call` cannot
-/// bind).
-fn decoded_const_to_op(decoded: DecodedConst) -> OpKind {
-    match decoded {
-        DecodedConst::Int(n) => OpKind::ConstInt(n),
-        DecodedConst::UInt(n) => OpKind::ConstUInt(n),
-        DecodedConst::Int128(n) => OpKind::ConstInt128(n),
-        DecodedConst::UInt128(n) => OpKind::ConstUInt128(n),
-        DecodedConst::Bool(b) => OpKind::ConstBool(b),
-        DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
-        DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
-        DecodedConst::Str(s) => OpKind::Call {
-            target: CallTarget::FunctionPath {
-                segments: vec!["__str_const".to_string(), s],
-                fun_decl_id: None,
-            },
-            args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(None),
-        },
-        DecodedConst::FnPath(segments) => {
-            let mut synthetic = Vec::with_capacity(segments.len() + 1);
-            synthetic.push(crate::model::FN_CONST_HEAD.to_string());
-            synthetic.extend(segments);
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: synthetic,
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![]),
-                result_ty: ValueType::Int,
-            }
-        }
-    }
 }
 
 /// Literal value tracked by [`const_eval_init_body`].
@@ -71378,6 +73966,7 @@ fn operand_as_signed_int(llbc: &Llbc, op: &Operand) -> Option<i64> {
             DecodedConst::UInt(n) => i64::try_from(n).ok(),
             DecodedConst::Int128(n) => i64::try_from(n).ok(),
             DecodedConst::UInt128(n) => i64::try_from(n).ok(),
+            DecodedConst::UniChar(code) => Some(i64::from(code)),
             _ => None,
         },
         Operand::Copy(place) | Operand::Move(place) => {
@@ -71456,6 +74045,7 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
         DecodedConst::UInt128(n) => Some(OpKind::ConstUInt128(n)),
         DecodedConst::Bool(b) => Some(OpKind::ConstBool(b)),
         DecodedConst::Float(bits) => Some(OpKind::ConstFloat(bits)),
+        DecodedConst::UniChar(code) => Some(OpKind::ConstInt(i64::from(code))),
         // A `const NAME: &str = "..."` global reads as a named-const
         // fold, not a static address; without this arm the read falls
         // through to a residual `FunctionPath` Call on the const path
@@ -72838,6 +75428,7 @@ fn const_lit_from_decoded(value: DecodedConst) -> Option<ConstLit> {
         DecodedConst::Bool(b) => Some(ConstLit::Bool(b)),
         DecodedConst::Float(bits) => Some(ConstLit::Float(bits)),
         DecodedConst::SingleFloat(bits) => Some(ConstLit::SingleFloat(bits)),
+        DecodedConst::UniChar(code) => Some(ConstLit::Int(i64::from(code))),
         _ => None,
     }
 }
@@ -73471,13 +76062,13 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     if let Some(s) = lit_obj.get("Str").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
     }
-    // A `char` is one code point, RPython's `UniChar`: an int-kind scalar
-    // (`getkind(UniChar) == 'int'`), the same bank a `char` field or array
-    // element read produces and the value a `SwitchInt` arm matches.
+    // A `char` is one Unicode scalar (`bookkeeper.py` `immutablevalue`
+    // `SomeUnicodeCodePoint`). SwitchInt arms are the same length-1
+    // unicode (`AbstractUniCharRepr.convert_const`).
     if let Some(s) = lit_obj.get("Char").and_then(Value::as_str) {
         let mut chars = s.chars();
         return match (chars.next(), chars.next()) {
-            (Some(c), None) => Ok(DecodedConst::Int(i64::from(u32::from(c)))),
+            (Some(c), None) => Ok(DecodedConst::UniChar(u32::from(c))),
             _ => Err(LowerError::Schema(format!(
                 "Char literal is not one code point: {lit}"
             ))),
@@ -74433,6 +77024,9 @@ struct AggregateField {
     void: bool,
     /// Instance root the stored value is narrowed to.
     narrow_root: Option<String>,
+    /// Shared `&[u8]` field: store `{data, len}` via `FatData`/`FatLen`,
+    /// not `pair_len_field_name`.
+    window: bool,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -74465,6 +77059,38 @@ fn emit_aggregate_ctor_with_pairs(
             continue;
         };
         if let Some(Some(len)) = pair_lens.get(i) {
+            if field.window {
+                for (part, stored, ty) in [
+                    (
+                        crate::model::VecFieldPart::FatData,
+                        value.clone(),
+                        ValueType::Unsigned,
+                    ),
+                    (
+                        crate::model::VecFieldPart::FatLen,
+                        len.clone(),
+                        ValueType::Int,
+                    ),
+                ] {
+                    graph.block_mut(block).operations.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: res.clone(),
+                            field: crate::model::FieldDescriptor::new(
+                                field.name.clone(),
+                                Some(ctor.result_owner.clone()),
+                            )
+                            .with_owner_id(ctor.owner_id)
+                            .with_base_is_deref(false)
+                            .with_vec_part(part)
+                            .with_owner_declared_gc(Some(false)),
+                            value: crate::model::LinkArg::Value(stored),
+                            ty,
+                        },
+                    });
+                }
+                continue;
+            }
             let len_name = pair_len_field_name(&field.name);
             for (name, value) in [(field.name.clone(), value.clone()), (len_name, len.clone())] {
                 graph.block_mut(block).operations.push(SpaceOperation {
@@ -77559,9 +80185,363 @@ fn item_addr_locals(
     addr
 }
 
-fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
+fn pair_len_shadows(
+    body: &Unstructured,
+    llbc: &Llbc,
+    graph_name: &str,
+) -> (Vec<Option<usize>>, Vec<bool>, Vec<bool>, Vec<bool>) {
     let views = objectptr_pair_view_locals(body, llbc);
-    pair_len_shadows_of(&body.locals, llbc, &views)
+    let (mut str_views, list_views, list_view_fixed) = body_owner_view_locals(body, llbc);
+    // `RDict` / `HashMap` key parameters are `space.bytes_w` / `str`
+    // (`BytesDictStrategy.unwrap`), one `Ptr(STR)` word. A window ABI on
+    // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
+    mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
+    (
+        pair_len_shadows_of(&body.locals, llbc, &views, &str_views, &list_views),
+        str_views,
+        list_views,
+        list_view_fixed,
+    )
+}
+
+/// Whether `ty` is a W1 STR owner (`rstr.py` `STR` / `space.bytes_w`).
+fn tyref_is_w1_str(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
+}
+
+fn place_is_w1_str_or_marked(place: &Place, mark: &[bool], llbc: &Llbc) -> bool {
+    if tyref_is_w1_str(&place.ty, llbc) {
+        return true;
+    }
+    match &place.kind {
+        PlaceKind::Local(i) => mark.get(*i as usize).copied().unwrap_or(false),
+        PlaceKind::Projection(inner, _) => place_is_w1_str_or_marked(inner, mark, llbc),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+    }
+}
+
+fn operand_is_w1_str_or_marked(op: &Operand, mark: &[bool], llbc: &Llbc) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_is_w1_str_or_marked(place, mark, llbc),
+        Operand::Const(_) => false,
+    }
+}
+
+fn rvalue_copies_str_view(rvalue: &Rvalue, mark: &[bool], llbc: &Llbc) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => operand_is_w1_str_or_marked(op, mark, llbc),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_is_w1_str_or_marked(place, mark, llbc)
+        }
+        _ => false,
+    }
+}
+
+fn place_is_w2_list_or_marked(place: &Place, mark: &[bool], llbc: &Llbc) -> bool {
+    if tyref_is_u8_list(&place.ty, llbc) {
+        return true;
+    }
+    match &place.kind {
+        PlaceKind::Local(i) => mark.get(*i as usize).copied().unwrap_or(false),
+        PlaceKind::Projection(inner, _) => place_is_w2_list_or_marked(inner, mark, llbc),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+    }
+}
+
+fn operand_is_w2_list_or_marked(op: &Operand, mark: &[bool], llbc: &Llbc) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => {
+            place_is_w2_list_or_marked(place, mark, llbc)
+        }
+        Operand::Const(_) => false,
+    }
+}
+
+fn rvalue_copies_list_view(rvalue: &Rvalue, mark: &[bool], llbc: &Llbc) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => operand_is_w2_list_or_marked(op, mark, llbc),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_is_w2_list_or_marked(place, mark, llbc)
+        }
+        _ => false,
+    }
+}
+
+fn rvalue_list_view_is_fixed(rvalue: &Rvalue, llbc: &Llbc) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+            operand_tyref(op).is_some_and(|ty| tyref_is_fixed_u8_list(ty, llbc))
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            tyref_is_fixed_u8_list(&place.ty, llbc)
+        }
+        _ => false,
+    }
+}
+
+/// A 1-arg call whose dest is a shared `&[u8]` and whose first argument
+/// is a W2 list owner (`Vec<u8>` / `&mut [u8]` / `Box<[u8]>`).
+fn call_dest_is_w2_list_source(call: &CallPayload, llbc: &Llbc) -> bool {
+    if !tyref_is_u8_window(&call.dest.ty, llbc) || call.args.len() != 1 {
+        return false;
+    }
+    call.args
+        .first()
+        .and_then(operand_tyref)
+        .is_some_and(|ty| tyref_is_u8_list(ty, llbc))
+}
+
+/// A 1-arg call whose dest is a shared `&[u8]` / `*const [u8]` and whose
+/// defining value is a W1 STR source (`BytesDictStrategy.unwrap` /
+/// `space.bytes_w`). Matches [`Lowering::lower_window_dest_call`]'s
+/// `str_src` predicate.
+fn call_dest_is_w1_str_source(call: &CallPayload, llbc: &Llbc) -> bool {
+    if !tyref_is_u8_window(&call.dest.ty, llbc) {
+        return false;
+    }
+    let CallFunc::Regular(reg) = &call.func else {
+        return false;
+    };
+    if call.args.len() != 1 {
+        return false;
+    }
+    let first_ty = call.args.first().and_then(operand_tyref);
+    let w1_str = first_ty.is_some_and(|ty| tyref_is_w1_str(ty, llbc));
+    let Some(path) = regular_call_name_path(reg, llbc) else {
+        return w1_str;
+    };
+    let leaf = path.rsplit("::").next().unwrap_or("");
+    let as_bytes = (leaf == "as_bytes" || (leaf == "bytes" && path.contains("str"))) && w1_str;
+    as_bytes
+        || leaf == "utf8_payload_bytes"
+        || leaf == "bytes_block_chars"
+        || leaf == "w_bytes_data"
+        || leaf == "w_bytes_block"
+        || leaf == "w_str_storage"
+        || w1_str
+}
+
+/// Body locals whose every window-typed def is a W1 STR source or a W2
+/// list view (or a Use/Ref/Cast/reborrow of one). Parameters keep the
+/// two-word window ABI, except `RDict` / `HashMap` key formals
+/// (`mark_dict_method_str_view_keys`). A mixed STR/list/window local is
+/// excluded so it keeps a length shadow.
+fn body_owner_view_locals(body: &Unstructured, llbc: &Llbc) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+    let n = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    let mut str_view = vec![false; n];
+    let mut list_view = vec![false; n];
+    let mut list_view_fixed = vec![false; n];
+    let mut window_def = vec![false; n];
+    let mut pending_window = vec![false; n];
+    let mut w1_call_def = vec![false; n];
+    let mut list_call_def = vec![false; n];
+    let is_body_local = |dest: usize| dest < n && !(dest >= 1 && dest <= arg_count);
+    for bb in &body.body {
+        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+            && let PlaceKind::Local(dest) = call.dest.kind
+        {
+            let dest = dest as usize;
+            if is_body_local(dest) && tyref_is_u8_window(&call.dest.ty, llbc) {
+                if call_dest_is_w1_str_source(&call, llbc) {
+                    str_view[dest] = true;
+                    w1_call_def[dest] = true;
+                } else if call_dest_is_w2_list_source(&call, llbc) {
+                    list_view[dest] = true;
+                    list_call_def[dest] = true;
+                    if call
+                        .args
+                        .first()
+                        .and_then(operand_tyref)
+                        .is_some_and(|ty| tyref_is_fixed_u8_list(ty, llbc))
+                    {
+                        list_view_fixed[dest] = true;
+                    }
+                } else {
+                    pending_window[dest] = true;
+                }
+            }
+        }
+        for st in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if !is_body_local(dest) || !tyref_is_u8_window(&place.ty, llbc) {
+                continue;
+            }
+            match rvalue {
+                Rvalue::Use(_, _)
+                | Rvalue::Cast(_, _, _)
+                | Rvalue::Ref { .. }
+                | Rvalue::RawPtr { .. } => {}
+                _ => window_def[dest] = true,
+            }
+        }
+    }
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+                && let PlaceKind::Local(dest) = call.dest.kind
+            {
+                let dest = dest as usize;
+                if is_body_local(dest) && tyref_is_u8_window(&call.dest.ty, llbc) {
+                    if !str_view[dest]
+                        && call
+                            .args
+                            .first()
+                            .is_some_and(|op| operand_is_w1_str_or_marked(op, &str_view, llbc))
+                    {
+                        str_view[dest] = true;
+                        changed = true;
+                    }
+                    if !list_view[dest]
+                        && call
+                            .args
+                            .first()
+                            .is_some_and(|op| operand_is_w2_list_or_marked(op, &list_view, llbc))
+                    {
+                        list_view[dest] = true;
+                        if call
+                            .args
+                            .first()
+                            .and_then(operand_tyref)
+                            .is_some_and(|ty| tyref_is_fixed_u8_list(ty, llbc))
+                        {
+                            list_view_fixed[dest] = true;
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            for st in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let dest = dest as usize;
+                if !is_body_local(dest) || !tyref_is_u8_window(&place.ty, llbc) {
+                    continue;
+                }
+                if !str_view[dest] && rvalue_copies_str_view(rvalue, &str_view, llbc) {
+                    str_view[dest] = true;
+                    changed = true;
+                }
+                if !list_view[dest] && rvalue_copies_list_view(rvalue, &list_view, llbc) {
+                    list_view[dest] = true;
+                    if rvalue_list_view_is_fixed(rvalue, llbc) {
+                        list_view_fixed[dest] = true;
+                    }
+                    changed = true;
+                }
+            }
+        }
+    }
+    for i in 0..n {
+        // A local defined by both a W1-source call and a window-returning
+        // call keeps a length shadow so the window arm uses the two-word
+        // return ABI. A slice of a STR view is pending_window plus
+        // copy-propagated str_view with no W1 call def, and stays a view.
+        // A STR view on one path and a list view on another is a window.
+        if str_view[i] && list_view[i] {
+            window_def[i] = true;
+        }
+        if (w1_call_def[i] || list_call_def[i]) && pending_window[i] {
+            window_def[i] = true;
+        }
+        if pending_window[i] && !str_view[i] && !list_view[i] {
+            window_def[i] = true;
+        }
+    }
+    for i in 0..n {
+        if str_view[i] && window_def[i] {
+            str_view[i] = false;
+        }
+        if list_view[i] && window_def[i] {
+            list_view[i] = false;
+            list_view_fixed[i] = false;
+        }
+    }
+    (str_view, list_view, list_view_fixed)
+}
+
+/// Trailing length-slot parameter of a body that returns a pair or a
+/// window, including a STR-view local 0 that has no length shadow.
+fn ret_len_slot_index(
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+    len_shadow: &[Option<usize>],
+    n_slots: usize,
+) -> Option<usize> {
+    if len_shadow.first().copied().flatten().is_some() {
+        return Some(n_slots);
+    }
+    locals
+        .locals
+        .first()
+        .is_some_and(|local| tyref_is_u8_window(&local.ty, llbc))
+        .then_some(n_slots)
+}
+
+/// Graph name of an `RDict` method whose key formal is `&Q`
+/// (`rordereddict.py` `ll_dict_get` / `ll_dict_lookup`). Body formals of a
+/// descended method stay STR views (`space.bytes_w`).
+fn is_rdict_borrowed_key_method(name: &str) -> bool {
+    matches!(
+        rdict_method_leaf_if_owner(name),
+        Some("get" | "get_mut" | "contains_key" | "remove")
+    )
+}
+
+/// Owner segment of `name` must satisfy `rdict_type_leaf`; otherwise the leaf
+/// is ignored. `unspecialized_leaf` sees through a monomorphized copy.
+fn rdict_method_leaf_if_owner(name: &str) -> Option<&str> {
+    let mut segs = name.rsplit("::");
+    let leaf = segs.next()?;
+    let leaf = crate::front::clause_spec::unspecialized_leaf(leaf);
+    let owner = segs.next().unwrap_or("");
+    crate::translator::rtyper::flowspace_adapter::rdict_type_leaf(owner).then_some(leaf)
+}
+
+/// Key formals of [`is_rdict_borrowed_key_method`] that are a shared
+/// `&[u8]` stay `Ptr(STR)` (`space.bytes_w`). Local 0 is the return; local 1
+/// is the receiver.
+fn mark_dict_method_str_view_keys(
+    graph_name: &str,
+    body: &Unstructured,
+    llbc: &Llbc,
+    str_views: &mut [bool],
+) {
+    if !is_rdict_borrowed_key_method(graph_name) {
+        return;
+    }
+    let arg_count = body.locals.arg_count as usize;
+    for i in 2..=arg_count {
+        if i < str_views.len()
+            && body
+                .locals
+                .locals
+                .get(i)
+                .is_some_and(|local| tyref_is_u8_window(&local.ty, llbc))
+        {
+            str_views[i] = true;
+        }
+    }
+}
+
+/// `RDict::insert` / `RDict::get` (`rordereddict.py`
+/// `ll_dict_setitem_with_hash` / `ll_dict_get` / `ll_dict_lookup`). The key
+/// is one `str` word (`space.bytes_w`); never a spliced window.
+fn is_rdict_host_rewritten_call(reg: &RegularCall, llbc: &Llbc) -> bool {
+    regular_call_name_path(reg, llbc)
+        .is_some_and(|path| matches!(rdict_method_leaf_if_owner(&path), Some("insert" | "get")))
 }
 
 /// Locals that hold the `{ptr, len}` view of an object-pointer `Vec`
@@ -77647,6 +80627,8 @@ fn pair_len_shadows_of(
     locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
     view_locals: &[bool],
+    str_view_locals: &[bool],
+    list_view_locals: &[bool],
 ) -> Vec<Option<usize>> {
     let n_locals = locals.locals.len();
     let arg_count = locals.arg_count as usize;
@@ -77656,6 +80638,20 @@ fn pair_len_shadows_of(
         .iter()
         .enumerate()
         .map(|(index, local)| {
+            // A shared `&[u8]` / `*const [u8]` / `Option<&[u8]>` is the
+            // two-word window `{data, len}`, independent of
+            // `PAIR_SLICE_ITEM_KINDS` (`u8` is not a word item). A W1 STR
+            // view (`space.bytes_w`) stays one `Ptr(STR)` word. A W2 list
+            // view of a `Vec<u8>` / `Box<[u8]>` owner stays the list.
+            if tyref_is_u8_window(&local.ty, llbc) {
+                if str_view_locals.get(index).copied().unwrap_or(false)
+                    || list_view_locals.get(index).copied().unwrap_or(false)
+                {
+                    return None;
+                }
+                next += 1;
+                return Some(next - 1);
+            }
             let kind = if index <= arg_count {
                 tyref_pair_slice_item_kind(&local.ty, llbc)
             } else {
@@ -78552,6 +81548,16 @@ fn stamp_as_rstr_str(var: &Variable) {
     use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
     FunctionGraph::set_concretetype_of_inline(var, crate::model::ConcreteType::GcRef);
     var.set_concretetype(Some(STRPTR.clone()));
+}
+
+/// Shim / window data word is `CCHARP` (`rffi.py` `CCHARP`). The result
+/// bank stays `ValueType::Int` (`SomePtr` is not a `ValueType`).
+fn stamp_as_ccharp(var: &Variable) {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    var.set_concretetype(Some(lltype_for_direct_ptradd_pointer(
+        None,
+        &LowLevelType::Char,
+    )));
 }
 
 /// `rutf8.unichr_as_utf8(code, allow_surrogates=True)` for a Unicode
@@ -84344,11 +87350,11 @@ mod tests {
     #[test]
     fn decode_char_literal_is_its_int_code_point() {
         let llbc = empty_llbc();
-        for (lit, code) in [(">", 0x3e_i64), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
+        for (lit, code) in [(">", 0x3e_u32), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
             let json = serde_json::json!({ "Char": lit });
             assert!(
-                matches!(decode_literal(&json), Ok(DecodedConst::Int(n)) if n == code),
-                "char literal {lit:?} decodes to Int({code})",
+                matches!(decode_literal(&json), Ok(DecodedConst::UniChar(n)) if n == code),
+                "char literal {lit:?} decodes to UniChar({code})",
             );
             // SwitchInt arms rtype through `AbstractUniCharRepr.convert_const`.
             assert!(
@@ -85064,12 +88070,10 @@ mod tests {
                 }
             }
         });
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            assert_eq!(
-                super::adt_node_class_root_leaf(&node, &llbc, super::no_tombstoned_leaves()),
-                Some("RangeInclusive<i64>".to_string())
-            );
-        });
+        assert_eq!(
+            super::adt_node_class_root_leaf(&node, &llbc, super::no_tombstoned_leaves()),
+            Some("RangeInclusive<i64>".to_string())
+        );
     }
 
     #[test]
@@ -85159,17 +88163,10 @@ mod tests {
             crate::front::clause_spec::substituted_unstructured(fd, &llbc, &[], &[i64_ty], &[])
                 .expect("substituted start_bound body");
         let self_ty = &copied.locals.locals[1].ty;
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            assert_eq!(
-                super::tyref_ref_param_class_root(
-                    self_ty,
-                    &llbc,
-                    super::no_tombstoned_leaves(),
-                    None
-                ),
-                Some("RangeInclusive<i64>".to_string())
-            );
-        });
+        assert_eq!(
+            super::tyref_ref_param_class_root(self_ty, &llbc, super::no_tombstoned_leaves(), None),
+            Some("RangeInclusive<i64>".to_string())
+        );
     }
 
     #[test]
@@ -90718,6 +93715,2772 @@ mod tests {
         );
     }
 
+    fn window_span() -> serde_json::Value {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }})
+    }
+
+    fn window_meta(path: &[&str], is_local: bool) -> serde_json::Value {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": window_span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": is_local
+        })
+    }
+
+    fn window_local(i: u64, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"index": i, "name": null, "span": window_span(), "ty": ty})
+    }
+
+    fn window_place(kind: serde_json::Value, ty: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({"kind": kind, "ty": ty})
+    }
+
+    fn window_u8() -> serde_json::Value {
+        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+    }
+
+    fn window_usize() -> serde_json::Value {
+        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
+    }
+
+    fn window_empty_generics() -> serde_json::Value {
+        serde_json::json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []})
+    }
+
+    fn window_slice() -> serde_json::Value {
+        serde_json::json!({"Slice": [window_u8(), null]})
+    }
+
+    fn window_shared_slice() -> serde_json::Value {
+        serde_json::json!({"Ref": ["Erased", window_slice(), "Shared"]})
+    }
+
+    fn window_mut_slice() -> serde_json::Value {
+        serde_json::json!({"Ref": ["Erased", window_slice(), "Mut"]})
+    }
+
+    fn window_const_slice_ptr() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [window_slice(), "Const"]})
+    }
+
+    fn window_const_u8_ptr() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [window_u8(), "Const"]})
+    }
+
+    fn window_mut_u8_ptr() -> serde_json::Value {
+        serde_json::json!({"RawPtr": [window_u8(), "Mut"]})
+    }
+
+    fn window_opaque_fun(
+        def_id: u64,
+        path: &[&str],
+        inputs: Vec<serde_json::Value>,
+        output: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": window_meta(path, false),
+            "signature": {"is_unsafe": true, "inputs": inputs, "output": output},
+            "body": "Opaque"
+        })
+    }
+
+    fn window_llbc(
+        types: Vec<serde_json::Value>,
+        funs: Vec<serde_json::Value>,
+    ) -> majit_charon_reader::Llbc {
+        window_llbc_with_globals(types, funs, Vec::new())
+    }
+
+    fn window_llbc_with_globals(
+        types: Vec<serde_json::Value>,
+        funs: Vec<serde_json::Value>,
+        globals: Vec<serde_json::Value>,
+    ) -> majit_charon_reader::Llbc {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": funs,
+                "global_decls": globals,
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("window fixture Llbc parses")
+    }
+
+    fn window_graph_ops(graph: &crate::model::FunctionGraph) -> Vec<&crate::model::SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect()
+    }
+
+    fn window_call_leafs(graph: &crate::model::FunctionGraph) -> Vec<String> {
+        use crate::model::{CallTarget, OpKind};
+        window_graph_ops(graph)
+            .into_iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn window_has_join_chars(graph: &crate::model::FunctionGraph) -> bool {
+        window_call_leafs(graph).iter().any(|leaf| {
+            leaf == "ll_join_chars" || leaf == "ll_str2uintlist" || leaf == "ll_string2list"
+        })
+    }
+
+    fn window_unwind_and_return_blocks() -> (serde_json::Value, serde_json::Value) {
+        (
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": window_span(), "kind": "UnwindResume"}
+            }),
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }),
+        )
+    }
+
+    /// F1: a `*const [u8]` field read is the two-word window, not STR.
+    #[test]
+    fn window_f1_const_u8_slice_field_read_is_fat_window() {
+        use crate::model::{OpKind, ValueType, VecFieldPart};
+
+        let holder_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let field_ty = window_const_slice_ptr();
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "Holder"], true),
+            "kind": {"Struct": [{
+                "name": "data",
+                "ty": field_ty,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            }]}
+        });
+        let slot_place = window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Projection": [
+                    window_place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &field_ty,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_f1_read"], true),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": field_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &field_ty),
+                    window_local(1, &holder_ref)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &field_ty),
+                            {"Use": [{"Copy": slot_place}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }]
+            }}
+        });
+        let llbc = window_llbc(vec![holder], vec![caller]);
+        let graph = super::lower_function(&llbc, "window_f1_read").expect("lower F1");
+        let ops = window_graph_ops(&graph);
+        let fat_data = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty, .. }
+                    if field.name == "data"
+                        && field.vec_part == Some(VecFieldPart::FatData)
+                        && !matches!(ty, ValueType::Str)
+            )
+        });
+        let fat_len = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty, .. }
+                    if field.name == "data"
+                        && field.vec_part == Some(VecFieldPart::FatLen)
+                        && !matches!(ty, ValueType::Str)
+            )
+        });
+        let str_read = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty: ValueType::Str, .. } if field.name == "data"
+            )
+        });
+        assert!(
+            fat_data && fat_len,
+            "F1 field read is FatData/FatLen; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !str_read,
+            "F1 field read is not getfield of Str; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !window_has_join_chars(&graph),
+            "F1 must not copy; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// F3: `&*m` of `m: &mut [u8]` into a `&[u8]` dest is LIST→WINDOW.
+    #[test]
+    fn window_f3_mut_slice_reborrow_is_list_to_window() {
+        let shared = window_shared_slice();
+        let mut_slice = window_mut_slice();
+        let bare = window_slice();
+        let deref = window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &mut_slice),
+                "Deref"
+            ]}),
+            &bare,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_f3_reborrow"], true),
+            "signature": {"is_unsafe": false, "inputs": [mut_slice], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &mut_slice)
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &shared),
+                            {"Ref": {"place": deref, "kind": "Shared", "ptr_metadata": null}}
+                        ]}
+                    }],
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }]
+            }}
+        });
+        let llbc = window_llbc(vec![], vec![caller]);
+        let graph = super::lower_function(&llbc, "window_f3_reborrow").expect("lower F3");
+        assert!(
+            !window_has_join_chars(&graph),
+            "F3 &*m is a list-to-window borrow; graph={}",
+            graph.dump()
+        );
+        let aliases_as_str = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                crate::model::OpKind::Call {
+                    result_ty: crate::model::ValueType::Str,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !aliases_as_str,
+            "F3 must not alias the list as Str; graph={}",
+            graph.dump()
+        );
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
+            }),
+            "F3 LIST→WINDOW is nonmoving_raw_ptr_for_resizable_list; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let buf_field = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                crate::model::OpKind::FieldRead { field, .. } if field.name == "buf"
+            )
+        });
+        assert!(
+            !buf_field,
+            "F3 must not FieldRead buf; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// B1: `Vec<u8>` reborrowed into a `&[u8]` window dest is LIST→WINDOW
+    /// via `rgc.nonmoving_raw_ptr_for_resizable_list`, never `FieldRead "buf"`.
+    #[test]
+    fn window_vec_u8_as_slice_is_list_to_window() {
+        use crate::model::OpKind;
+
+        let u8_ty = window_u8();
+        let vec_generics = serde_json::json!({
+            "regions": [], "types": [u8_ty], "const_generics": [], "trait_refs": []
+        });
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": vec_generics}
+        });
+        let vec_ref = serde_json::json!({"Ref": ["Erased", vec_ty.clone(), "Mut"]});
+        let shared = window_shared_slice();
+        let vec_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["alloc", "vec", "Vec"], false),
+            "kind": {"Struct": []}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_slice = window_opaque_fun(
+            1,
+            &["alloc", "vec", "<Impl>", "as_slice"],
+            vec![vec_ref.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_vec_u8_as_slice"], true),
+            "signature": {"is_unsafe": false, "inputs": [vec_ref], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &vec_ref)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &vec_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![vec_decl], vec![caller, as_slice]);
+        let graph =
+            super::lower_function(&llbc, "window_vec_u8_as_slice").expect("lower Vec<u8> as_slice");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
+            }),
+            "Vec<u8> as_slice is nonmoving_raw_ptr_for_resizable_list; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let buf_field = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "buf"
+            )
+        });
+        assert!(
+            !buf_field,
+            "Vec<u8> as_slice must not FieldRead buf; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !window_has_join_chars(&graph),
+            "Vec<u8> as_slice is a list-to-window borrow; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// A `&&[u8]` reborrow of a STR view is identity on the one `Ptr(STR)`
+    /// word: the dest is not stamped as a second string pointer.
+    #[test]
+    fn str_view_shared_slice_reborrow_is_one_word() {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let view_ref = serde_json::json!({"Ref": ["Erased", shared.clone(), "Shared"]});
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let (unwind, _) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let view_place = window_place(serde_json::json!({"Local": 2}), &shared);
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "str_view_reborrow"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": view_ref},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &view_ref),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &view_ref),
+                                {"Ref": {"place": view_place, "kind": "Shared", "ptr_metadata": null}}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8], vec![caller, as_bytes]);
+        let graph = super::lower_function(&llbc, "str_view_reborrow")
+            .expect("lower &&[u8] reborrow of a STR view");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING || leaf == "__strlen"
+            }),
+            "&&[u8] reborrow of a STR view is identity; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let returned = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.exits.iter())
+            .find(|link| link.target == graph.returnblock)
+            .and_then(|link| link.args.first())
+            .and_then(crate::model::LinkArg::as_variable)
+            .expect("return carries the view word");
+        assert_eq!(
+            returned.concretetype().as_ref(),
+            Some(&*STRPTR),
+            "&&[u8] reborrow keeps one Ptr(STR) word; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// F4: `&mut [u8]` written through `as_mut_ptr` does not copy.
+    #[test]
+    fn window_f4_mut_slice_as_mut_ptr_write_is_not_a_copy() {
+        use crate::model::OpKind;
+
+        let mut_slice = window_mut_slice();
+        let mut_ptr = window_mut_u8_ptr();
+        let u8_ty = window_u8();
+        let (unwind, _) = window_unwind_and_return_blocks();
+        let store_place = window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 0}), &mut_ptr),
+                "Deref"
+            ]}),
+            &u8_ty,
+        );
+        let one = serde_json::json!({"Const": [
+            {"Integer": {"Unsigned": ["U8", "1"]}},
+            u8_ty
+        ]});
+        let as_mut_ptr = window_opaque_fun(
+            1,
+            &["core", "slice", "<Impl>", "as_mut_ptr"],
+            vec![mut_slice.clone()],
+            mut_ptr.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_f4_as_mut_ptr"], true),
+            "signature": {"is_unsafe": true, "inputs": [mut_slice], "output": mut_ptr},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &mut_ptr),
+                    window_local(1, &mut_slice)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &mut_slice)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &mut_ptr)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                store_place,
+                                {"Use": [one, "No"]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![], vec![caller, as_mut_ptr]);
+        let graph = super::lower_function(&llbc, "window_f4_as_mut_ptr").expect("lower F4");
+        assert!(
+            !window_has_join_chars(&graph),
+            "F4 as_mut_ptr write is not a copy; graph={}",
+            graph.dump()
+        );
+        let residual_as_mut_ptr = window_call_leafs(&graph)
+            .iter()
+            .any(|leaf| leaf == "as_mut_ptr");
+        assert!(
+            !residual_as_mut_ptr,
+            "F4 as_mut_ptr is identity on the list items; graph={}",
+            graph.dump()
+        );
+        let wrote = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::RawStore { .. } | OpKind::ArrayWrite { .. }
+            )
+        });
+        assert!(
+            wrote,
+            "F4 writes through the mut pointer; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// F5: `from_raw_parts` of a non-STR address is a window, not STR.
+    #[test]
+    fn window_f5_from_raw_parts_of_non_str_address_is_window() {
+        use crate::model::{OpKind, ValueType};
+
+        let shared = window_shared_slice();
+        let ptr = window_const_u8_ptr();
+        let n = window_usize();
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let from_raw = window_opaque_fun(
+            1,
+            &["core", "slice", "raw", "from_raw_parts"],
+            vec![ptr.clone(), n.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_f5_from_raw_parts"], true),
+            "signature": {"is_unsafe": true, "inputs": [ptr, n], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 2, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &ptr),
+                    window_local(2, &n)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 1}), &ptr)},
+                                {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![], vec![caller, from_raw]);
+        let graph = super::lower_function(&llbc, "window_f5_from_raw_parts").expect("lower F5");
+        assert!(
+            !window_has_join_chars(&graph),
+            "F5 is a window of (p, n); graph={}",
+            graph.dump()
+        );
+        let paints_str = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    result_ty: ValueType::Str,
+                    ..
+                } | OpKind::FieldRead {
+                    ty: ValueType::Str,
+                    ..
+                }
+            )
+        });
+        assert!(
+            !paints_str,
+            "F5 from_raw_parts dest is not Str; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// `fn f() -> &'static [u8] { g() }` with opaque `g`: a nullary call
+    /// whose dest is a shared `&[u8]` window must not index `args[0]`.
+    #[test]
+    fn window_nullary_opaque_call_to_shared_slice_does_not_panic() {
+        let shared = window_shared_slice();
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let g = window_opaque_fun(1, &["fixture", "g"], vec![], shared.clone());
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_nullary_g"], true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 0, "locals": [
+                    window_local(0, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![], vec![caller, g]);
+        let _ = super::lower_function(&llbc, "window_nullary_g");
+    }
+
+    /// `fn f(b: &[u8]) -> i64 { g(b) }` with opaque window-param `g`: pass
+    /// the two parameter words, never the list shim.
+    #[test]
+    fn window_param_passed_to_opaque_window_fn_is_identity() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+
+        let shared = window_shared_slice();
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let g = window_opaque_fun(1, &["fixture", "g"], vec![shared.clone()], i64_ty.clone());
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_pass_param"], true),
+            "signature": {"is_unsafe": true, "inputs": [shared], "output": i64_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &i64_ty),
+                    window_local(1, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![], vec![caller, g]);
+        let graph = super::lower_function(&llbc, "window_pass_param")
+            .expect("lower window param pass-through");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
+            }),
+            "window param must not take the list shim; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let inputs: Vec<_> = window_graph_ops(&graph)
+            .into_iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { .. } => op.result.clone(),
+                _ => None,
+            })
+            .collect();
+        let g_args: Option<Vec<_>> = window_graph_ops(&graph).into_iter().find_map(|op| match &op
+            .kind
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("g") => Some(
+                args.iter()
+                    .filter_map(LinkArg::as_variable)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        let g_args = g_args.expect("opaque g is called");
+        assert_eq!(
+            g_args.len(),
+            2,
+            "g receives the two window words; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            inputs.len(),
+            2,
+            "window param is two Input words; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            g_args,
+            inputs,
+            "g receives the two parameter words unchanged; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// `fn f(b: &[u8]) { let r = &*b; g(r) }`: the Deref reborrow of a
+    /// window param stays the two parameter words. Bare `[u8]` is the
+    /// window referent, not a W2 list, so the list shim is not applied.
+    #[test]
+    fn window_param_deref_reborrow_passed_to_opaque_window_fn_is_identity() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+
+        let shared = window_shared_slice();
+        let bare = window_slice();
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let g = window_opaque_fun(1, &["fixture", "g"], vec![shared.clone()], i64_ty.clone());
+        let deref = window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &shared),
+                "Deref"
+            ]}),
+            &bare,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_pass_deref"], true),
+            "signature": {"is_unsafe": true, "inputs": [shared], "output": i64_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &i64_ty),
+                    window_local(1, &shared),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 2}), &shared),
+                                {"Ref": {"place": deref, "kind": "Shared", "ptr_metadata": null}}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &i64_ty)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![], vec![caller, g]);
+        let graph = super::lower_function(&llbc, "window_pass_deref")
+            .expect("lower window param Deref reborrow");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
+            }),
+            "Deref of a window param must not take the list shim; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let inputs: Vec<_> = window_graph_ops(&graph)
+            .into_iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { .. } => op.result.clone(),
+                _ => None,
+            })
+            .collect();
+        let g_args: Option<Vec<_>> = window_graph_ops(&graph).into_iter().find_map(|op| match &op
+            .kind
+        {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("g") => Some(
+                args.iter()
+                    .filter_map(LinkArg::as_variable)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        });
+        let g_args = g_args.expect("opaque g is called");
+        assert_eq!(
+            g_args,
+            inputs,
+            "g receives the two parameter words; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// A subslice of a `from_raw_parts` window is `window_subslice`, not
+    /// STR `getslice`.
+    #[test]
+    fn window_from_raw_parts_subslice_is_not_getslice() {
+        use crate::model::OpKind;
+
+        let shared = window_shared_slice();
+        let ptr = window_const_u8_ptr();
+        let n = window_usize();
+        let range_generics = serde_json::json!({
+            "regions": [],
+            "types": [n.clone()],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let range_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": range_generics.clone()}
+        });
+        let range = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["core", "ops", "range", "Range"], true),
+            "kind": {"Struct": [
+                {"name": "start", "ty": n, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}},
+                {"name": "end", "ty": n, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let from_raw = window_opaque_fun(
+            1,
+            &["core", "slice", "raw", "from_raw_parts"],
+            vec![ptr.clone(), n.clone()],
+            shared.clone(),
+        );
+        let generic_slice = serde_json::json!({
+            "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+        });
+        let index = window_opaque_fun(
+            2,
+            &["core", "slice", "index", "<Impl>", "index"],
+            vec![generic_slice, range_adt.clone()],
+            shared.clone(),
+        );
+        let range_place = window_place(serde_json::json!({"Local": 6}), &range_adt);
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_from_raw_parts_subslice"], true),
+            "signature": {"is_unsafe": true, "inputs": [ptr, n, n, n], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 4, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &ptr),
+                    window_local(2, &n),
+                    window_local(3, &n),
+                    window_local(4, &n),
+                    window_local(5, &shared),
+                    window_local(6, &range_adt)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 1}), &ptr)},
+                                {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 5}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                range_place,
+                                {"Aggregate": [
+                                    {"Adt": [
+                                        {"id": 0, "generics": range_generics.clone()},
+                                        0,
+                                        null
+                                    ]},
+                                    [
+                                        {"Copy": window_place(serde_json::json!({"Local": 3}), &n)},
+                                        {"Copy": window_place(serde_json::json!({"Local": 4}), &n)}
+                                    ]
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 5}), &shared)},
+                                {"Move": window_place(serde_json::json!({"Local": 6}), &range_adt)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![range], vec![caller, from_raw, index]);
+        let graph = super::lower_function(&llbc, "window_from_raw_parts_subslice")
+            .expect("lower from_raw_parts window subslice");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs
+                .iter()
+                .any(|leaf| leaf.starts_with("__getslice_") || leaf == "getslice"),
+            "window subslice is not getslice; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let has_getslice = window_graph_ops(&graph)
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::GetSlice { .. }));
+        assert!(
+            !has_getslice,
+            "window subslice has no GetSlice op; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// Match arms join at a window local, then a subslice: the real
+    /// `Buffer::as_bytes` Sub shape. The join is a window, so the index
+    /// is `window_subslice` (`direct_ptradd`), not STR `GetSlice`.
+    #[test]
+    fn window_match_join_then_subslice_is_not_getslice() {
+        use crate::model::OpKind;
+
+        let shared = window_shared_slice();
+        let ptr = window_const_u8_ptr();
+        let n = window_usize();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let range_generics = serde_json::json!({
+            "regions": [],
+            "types": [n.clone()],
+            "const_generics": [],
+            "trait_refs": []
+        });
+        let range_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": range_generics.clone()}
+        });
+        let range = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["core", "ops", "range", "Range"], true),
+            "kind": {"Struct": [
+                {"name": "start", "ty": n, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}},
+                {"name": "end", "ty": n, "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let from_raw = window_opaque_fun(
+            1,
+            &["core", "slice", "raw", "from_raw_parts"],
+            vec![ptr.clone(), n.clone()],
+            shared.clone(),
+        );
+        let generic_slice = serde_json::json!({
+            "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+        });
+        let index = window_opaque_fun(
+            2,
+            &["core", "slice", "index", "<Impl>", "index"],
+            vec![generic_slice, range_adt.clone()],
+            shared.clone(),
+        );
+        let range_place = window_place(serde_json::json!({"Local": 9}), &range_adt);
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_match_join_subslice"], true),
+            "signature": {"is_unsafe": true, "inputs": [bool_ty, ptr, n, ptr, n, n, n], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 7, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &bool_ty),
+                    window_local(2, &ptr),
+                    window_local(3, &n),
+                    window_local(4, &ptr),
+                    window_local(5, &n),
+                    window_local(6, &n),
+                    window_local(7, &n),
+                    window_local(8, &shared),
+                    window_local(9, &range_adt)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Switch": {
+                            "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                            "targets": {"If": [2, 3]}
+                        }}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 2}), &ptr)},
+                                {"Copy": window_place(serde_json::json!({"Local": 3}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 8}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 4}), &ptr)},
+                                {"Copy": window_place(serde_json::json!({"Local": 5}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 8}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                range_place,
+                                {"Aggregate": [
+                                    {"Adt": [
+                                        {"id": 0, "generics": range_generics.clone()},
+                                        0,
+                                        null
+                                    ]},
+                                    [
+                                        {"Copy": window_place(serde_json::json!({"Local": 6}), &n)},
+                                        {"Copy": window_place(serde_json::json!({"Local": 7}), &n)}
+                                    ]
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 8}), &shared)},
+                                {"Move": window_place(serde_json::json!({"Local": 9}), &range_adt)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 5, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![range], vec![caller, from_raw, index]);
+        let graph = super::lower_function(&llbc, "window_match_join_subslice")
+            .expect("lower match-join window subslice");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf.starts_with("__getslice_")
+                    || leaf == "getslice"
+                    || leaf.contains("ll_listslice")
+            }),
+            "join-then-subslice is not getslice/ll_listslice; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let has_getslice = window_graph_ops(&graph)
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::GetSlice { .. }));
+        assert!(
+            !has_getslice,
+            "join-then-subslice has no GetSlice op; graph={}",
+            graph.dump()
+        );
+        assert!(
+            leafs.iter().any(|leaf| leaf == "direct_ptradd"),
+            "join-then-subslice is window_subslice (direct_ptradd); leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    /// STR→WINDOW: `s.as_bytes()` of a `Utf8Str` stays a `Ptr(STR)` view at
+    /// the definition; `{chars, length}` is borrowed at the window return.
+    #[test]
+    fn window_str_to_window_as_bytes_of_utf8str() {
+        use crate::model::{OpKind, ValueType};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_str_to_window"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &utf8_ref)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8], vec![caller, as_bytes]);
+        let graph = super::lower_function(&llbc, "window_str_to_window").expect("lower STR→WINDOW");
+        assert!(
+            !window_has_join_chars(&graph),
+            "STR→WINDOW is a borrow of chars+len; graph={}",
+            graph.dump()
+        );
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs
+                .iter()
+                .any(|leaf| { leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING })
+                && leafs.iter().any(|leaf| leaf == "__strlen"),
+            "STR→WINDOW plants get_raw_address_of_string and length; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let paints_str = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: crate::model::CallTarget::FunctionPath { segments, .. },
+                    result_ty: ValueType::Str,
+                    ..
+                } if segments.last().map(String::as_str) == Some("as_bytes")
+            )
+        });
+        assert!(
+            !paints_str,
+            "as_bytes dest is a window, not Str; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// Keep-gain: `FmtArg::Bytes(qualname.as_bytes())` writes a window
+    /// into a window field.
+    #[test]
+    fn window_keep_gain_fmtarg_bytes_pos0_is_window_write() {
+        use crate::model::{OpKind, ValueType, VecFieldPart};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let fmt_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let fmt_arg = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["error", "FmtArg"], true),
+            "kind": {"Enum": [{
+                "name": "Bytes",
+                "fields": [{
+                    "name": null,
+                    "ty": shared,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+                }],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            }]}
+        });
+        let (unwind, _) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_keep_gain_fmtarg"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": fmt_adt},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &fmt_adt),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &fmt_adt),
+                                {"Aggregate": [
+                                    {"Adt": [1, 0, null]},
+                                    [{"Move": window_place(serde_json::json!({"Local": 2}), &shared)}]
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8, fmt_arg], vec![caller, as_bytes]);
+        let graph =
+            super::lower_function(&llbc, "window_keep_gain_fmtarg").expect("lower Keep-gain");
+        assert!(
+            !window_has_join_chars(&graph),
+            "Keep-gain write is not a copy; graph={}",
+            graph.dump()
+        );
+        let ops = window_graph_ops(&graph);
+        let data_write = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, ty, .. }
+                    if field.name == "__pos_0"
+                        && field.vec_part == Some(VecFieldPart::FatData)
+                        && !matches!(ty, ValueType::Str)
+            )
+        });
+        let len_write = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, ty, .. }
+                    if field.name == "__pos_0"
+                        && field.vec_part == Some(VecFieldPart::FatLen)
+                        && !matches!(ty, ValueType::Str)
+            )
+        });
+        let str_or_list_write = ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, ty: ValueType::Str | ValueType::Ref(_), .. }
+                    if field.name == "__pos_0" && field.vec_part.is_none()
+            )
+        });
+        assert!(
+            data_write && len_write,
+            "Keep-gain __pos_0 is FatData/FatLen; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !str_or_list_write,
+            "Keep-gain field and value are windows; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// `k = w_bytes_data(key); entries.get(k)` keeps `k` as one `Ptr(STR)`
+    /// word (`space.bytes_w` / `BytesDictStrategy.unwrap`). The host
+    /// `RDict::get` (`rtype_method_get` → `ll_dict_get`) sees two args.
+    #[test]
+    fn w_bytes_data_local_stays_str_view_for_rdict_get() {
+        use crate::model::{CallTarget, OpKind};
+
+        let rdict_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let bytes_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+        });
+        let rdict_ref = serde_json::json!({"Ref": ["Erased", rdict_adt, "Shared"]});
+        let bytes_ref = serde_json::json!({"Ref": ["Erased", bytes_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let n = window_usize();
+        let rdict = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "RDict"], true),
+            "kind": {"Struct": []}
+        });
+        let w_bytes = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["pyre_object", "bytesobject", "W_BytesObject"], true),
+            "kind": {"Struct": []}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let w_bytes_data = window_opaque_fun(
+            1,
+            &["pyre_object", "bytesobject", "w_bytes_data"],
+            vec![bytes_ref.clone()],
+            shared.clone(),
+        );
+        let get = window_opaque_fun(
+            2,
+            &["fixture", "RDict", "get"],
+            vec![rdict_ref.clone(), shared.clone()],
+            n.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "w_bytes_data_rdict_get"], true),
+            "signature": {"is_unsafe": false, "inputs": [rdict_ref, bytes_ref], "output": n},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 2, "locals": [
+                    window_local(0, &n),
+                    window_local(1, &rdict_ref),
+                    window_local(2, &bytes_ref),
+                    window_local(3, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &bytes_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 1}), &rdict_ref)},
+                                {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &n)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![rdict, w_bytes], vec![caller, w_bytes_data, get]);
+        let graph = super::lower_function(&llbc, "w_bytes_data_rdict_get")
+            .expect("lower STR-view RDict::get");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf == "direct_ptradd"
+                    || leaf == "__strlen"
+                    || leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
+            }),
+            "STR-view key is not converted to a window; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let get_args: Vec<usize> = window_graph_ops(&graph)
+            .into_iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("get") => Some(args.len()),
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    args,
+                    ..
+                } if name == "get" => Some(args.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            get_args.as_slice(),
+            &[2],
+            "RDict::get is receiver + STR key; graph={}",
+            graph.dump()
+        );
+        assert!(
+            !super::is_rdict_borrowed_key_method("fixture::NotRDictish::get"),
+            "fixture::NotRDictish::get is not an RDict method"
+        );
+    }
+
+    /// A STR-source local passed to `fn f(d: &[u8])` borrows a window at
+    /// the call (`rffi.get_raw_address_of_string`), not at the definition.
+    #[test]
+    fn str_view_borrows_window_at_window_param() {
+        use crate::model::{CallTarget, OpKind};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let unit = serde_json::json!({"Tuple": []});
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let callee = window_opaque_fun(
+            2,
+            &["fixture", "window_param"],
+            vec![shared.clone()],
+            unit.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "str_view_window_param"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": unit},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &unit),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &unit)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8], vec![caller, as_bytes, callee]);
+        let graph = super::lower_function(&llbc, "str_view_window_param")
+            .expect("lower STR view at window param");
+        assert!(
+            !window_has_join_chars(&graph),
+            "window borrow is not a copy; graph={}",
+            graph.dump()
+        );
+        let at_call = graph.blocks.iter().any(|block| {
+            let has_window_ops = block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => matches!(
+                    segments.last().map(String::as_str),
+                    Some("__strlen") | Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                ),
+                _ => false,
+            });
+            let has_callee = block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => segments.last().map(String::as_str) == Some("window_param") && args.len() == 2,
+                _ => false,
+            });
+            has_window_ops && has_callee
+        });
+        assert!(
+            at_call,
+            "emit_str_to_window is at the window-param call; graph={}",
+            graph.dump()
+        );
+        let buf_field = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "buf"
+            )
+        });
+        assert!(
+            !buf_field,
+            "STR→window must not FieldRead buf; graph={}",
+            graph.dump()
+        );
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs
+                .iter()
+                .any(|leaf| { leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING })
+                && leafs.iter().any(|leaf| leaf == "__strlen"),
+            "STR→window data word is GET_RAW_ADDRESS_OF_STRING plus __strlen; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    /// `as_bytes().iter()` of a STR view is identity then the
+    /// `("slice","iter")` bridge (`fun_decl_id: None`). The FunDecl input
+    /// is generic `&[T]`; keeping that id would annotate the STR as List.
+    #[test]
+    fn str_view_iter_borrows_window_at_slice_iter() {
+        use crate::model::{CallTarget, OpKind};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let u8_ty = window_u8();
+        let generic_slice = serde_json::json!({
+            "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+        });
+        let iter_generics = serde_json::json!({
+            "regions": [], "types": [u8_ty], "const_generics": [], "trait_refs": []
+        });
+        let iter_ty = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": iter_generics}
+        });
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let iter_td = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["core", "slice", "iter", "Iter"], false),
+            "kind": {"Struct": []}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let slice_iter = window_opaque_fun(
+            2,
+            &["core", "slice", "<Impl>", "iter"],
+            vec![generic_slice],
+            iter_ty.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "str_view_slice_iter"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": iter_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &iter_ty),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &iter_ty)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8, iter_td], vec![caller, as_bytes, slice_iter]);
+        let graph = super::lower_function(&llbc, "str_view_slice_iter")
+            .expect("lower STR-view as_bytes().iter()");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs
+                .iter()
+                .any(|leaf| leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING),
+            "as_bytes of a STR view stays identity; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            leafs
+                .iter()
+                .any(|leaf| leaf == crate::front::join_chars::LL_STR2UINTLIST),
+            "slice::iter of a STR view copies through ll_str2uintlist; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let iter_bridge = window_graph_ops(&graph).iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id,
+                        ..
+                    },
+                args,
+                ..
+            } => {
+                segments.as_slice() == ["core".to_string(), "slice".to_string(), "iter".to_string()]
+                    && fun_decl_id.is_none()
+                    && args.len() == 1
+            }
+            _ => false,
+        });
+        assert!(
+            iter_bridge,
+            "slice::iter of a STR view is the slice-iter bridge; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    /// `import_head` does `name.as_bytes().iter().position(|&b| b == b'.')`.
+    /// That is RPython `str.find(".")` (`rpython_str_find_char`), not a
+    /// residual `Iter::position` FunDecl whose empty GraphCache stub
+    /// unions every callsite's iterator slot.
+    #[test]
+    fn import_head_str_view_position_is_str_find() {
+        use crate::model::{CallTarget, OpKind};
+
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::importing::import_head")
+            .expect("lower import_head");
+        let mut has_find = false;
+        let mut residual_position = 0usize;
+        let mut invented_charpsize = 0usize;
+        let mut str2uintlist = 0usize;
+        let mut str_const_needle = 0usize;
+        let mut raw_const_str = 0usize;
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "find" => has_find = true,
+                OpKind::ConstStr(_) => raw_const_str += 1,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    if segments.as_slice() == ["slice", "iter", "Iter", "position"]
+                        || (segments.last().map(String::as_str) == Some("position")
+                            && segments.iter().any(|s| s == "Iter" || s == "iterator"))
+                    {
+                        residual_position += 1;
+                    }
+                    if segments.as_slice()
+                        == ["rpython", "rtyper", "lltypesystem", "rffi", "charpsize2str"]
+                    {
+                        invented_charpsize += 1;
+                    }
+                    if segments.as_slice() == [crate::front::join_chars::LL_STR2UINTLIST] {
+                        str2uintlist += 1;
+                    }
+                    if segments.len() == 2 && segments[0] == "__str_const" {
+                        str_const_needle += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            has_find,
+            "import_head must emit str.find; residual_position={residual_position} graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            str2uintlist,
+            0,
+            "import_head position is str.find; no ll_str2uintlist copy; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            residual_position,
+            0,
+            "import_head must not residualize Iter::position; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            invented_charpsize,
+            0,
+            "import_head must not invent rffi.charpsize2str; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            raw_const_str,
+            0,
+            "find needle must be __str_const, not ConstStr; graph={}",
+            graph.dump()
+        );
+        assert!(
+            str_const_needle >= 1,
+            "find needle must be __str_const; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// B3: `bytes = utf8_payload_bytes(h); s = from_utf8_unchecked(bytes)`
+    /// stays a STR view: identity, no residual `from_utf8_unchecked`, no
+    /// STR→window at the definition of `bytes`.
+    #[test]
+    fn utf8_payload_bytes_from_utf8_unchecked_is_str_view_identity() {
+        use crate::model::{CallTarget, OpKind};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let payload = window_opaque_fun(
+            1,
+            &["pyre_object", "unicodeobject", "utf8_payload_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let from_utf8 = window_opaque_fun(
+            2,
+            &["core", "str", "converts", "from_utf8_unchecked"],
+            vec![shared.clone()],
+            str_ty.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "utf8_payload_from_utf8"], true),
+            "signature": {"is_unsafe": true, "inputs": [utf8_ref], "output": str_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &str_ty),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &str_ty)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8], vec![caller, payload, from_utf8]);
+        let graph = super::lower_function(&llbc, "utf8_payload_from_utf8")
+            .expect("lower utf8_payload_bytes then from_utf8_unchecked");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| leaf == "from_utf8_unchecked"),
+            "from_utf8_unchecked of a STR view is identity; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING || leaf == "__strlen"
+            }),
+            "bytes stays a STR view at definition; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let residual_payload = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("utf8_payload_bytes")
+            )
+        });
+        assert!(
+            !residual_payload,
+            "utf8_payload_bytes is a STR-view alias; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// B3: `from_utf8_unchecked(&bytes[a..])` of a W1 STR view lowers
+    /// through the STR getslice (`rstr.py` `LLHelpers.ll_stringslice_startstop`).
+    #[test]
+    fn from_utf8_unchecked_of_str_view_rangefrom_is_getslice() {
+        use crate::model::{CallTarget, OpKind};
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let n = window_usize();
+        let rangefrom_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let rangefrom = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["core", "ops", "range", "RangeFrom"], true),
+            "kind": {"Struct": [{
+                "name": "start",
+                "ty": n,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            }]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let payload = window_opaque_fun(
+            1,
+            &["pyre_object", "unicodeobject", "utf8_payload_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let generic_slice = serde_json::json!({
+            "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+        });
+        let index = window_opaque_fun(
+            2,
+            &["core", "slice", "index", "<Impl>", "index"],
+            vec![generic_slice, rangefrom_adt.clone()],
+            shared.clone(),
+        );
+        let from_utf8 = window_opaque_fun(
+            3,
+            &["core", "str", "converts", "from_utf8_unchecked"],
+            vec![shared.clone()],
+            str_ty.clone(),
+        );
+        let range_place = window_place(serde_json::json!({"Local": 4}), &rangefrom_adt);
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "utf8_payload_getslice_from_utf8"], true),
+            "signature": {"is_unsafe": true, "inputs": [utf8_ref, n], "output": str_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 2, "locals": [
+                    window_local(0, &str_ty),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &n),
+                    window_local(3, &shared),
+                    window_local(4, &rangefrom_adt),
+                    window_local(5, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                range_place,
+                                {"Aggregate": [
+                                    {"Adt": [1, 0, null]},
+                                    [{"Copy": window_place(serde_json::json!({"Local": 2}), &n)}]
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
+                                {"Move": window_place(serde_json::json!({"Local": 4}), &rangefrom_adt)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 5}), &shared)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 3},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 5}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &str_ty)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(
+            vec![utf8, rangefrom],
+            vec![caller, payload, index, from_utf8],
+        );
+        let graph = super::lower_function(&llbc, "utf8_payload_getslice_from_utf8")
+            .expect("lower from_utf8_unchecked of STR-view RangeFrom");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| leaf == "from_utf8_unchecked"),
+            "from_utf8_unchecked of a STR-view subslice is identity; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            leafs.iter().any(|leaf| leaf.starts_with("__getslice_")),
+            "STR-view subslice is __getslice_*; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let residual_index = window_graph_ops(&graph).iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("index")
+            )
+        });
+        assert!(
+            !residual_index,
+            "slice::index of a STR view is getslice; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// Mixed W1 `w_bytes_data` / window `w_bytearray_data` dest is
+    /// `bytes_like_data`: the window arm uses the two-word return ABI
+    /// (`SLICE_LEN_SLOT_NEW` / extra arg / `TAKE`).
+    #[test]
+    fn mixed_w1_and_window_return_passes_len_slot() {
+        use crate::model::{CallTarget, OpKind};
+
+        let obj_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let obj_ref = serde_json::json!({"Ref": ["Erased", obj_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let pyobj = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "bytesobject", "W_BytesObject"], true),
+            "kind": {"Struct": [
+                {"name": "data", "ty": shared, "attr_info": null}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let w_bytes_data = window_opaque_fun(
+            1,
+            &["pyre_object", "bytesobject", "w_bytes_data"],
+            vec![obj_ref.clone()],
+            shared.clone(),
+        );
+        let w_bytearray_data = window_opaque_fun(
+            2,
+            &["pyre_object", "bytearrayobject", "w_bytearray_data"],
+            vec![obj_ref.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "bytesobject", "bytes_like_data"], true),
+            "signature": {"is_unsafe": true, "inputs": [obj_ref, bool_ty], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 2, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &obj_ref),
+                    window_local(2, &bool_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Switch": {
+                            "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
+                            "targets": {"If": [2, 3]}
+                        }}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &obj_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &obj_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![pyobj], vec![caller, w_bytes_data, w_bytearray_data]);
+        let graph = super::lower_function(&llbc, "bytes_like_data")
+            .expect("lower mixed w_bytes_data / w_bytearray_data");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs.iter().any(|leaf| leaf == "ll_slice_len_slot_new")
+                && leafs.iter().any(|leaf| leaf == "ll_slice_len_slot_take"),
+            "window-return call passes SLICE_LEN_SLOT_NEW / TAKE; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let window_call_has_slot = window_graph_ops(&graph).iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } => segments.last().map(String::as_str) == Some("w_bytearray_data") && args.len() >= 2,
+            _ => false,
+        });
+        assert!(
+            window_call_has_slot,
+            "w_bytearray_data takes the length slot argument; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// Empty-array Unsize and a STR-view `as_bytes` join a window local:
+    /// both data words are `CCHARP` (`cast_int_to_ptr` / GET_RAW_ADDRESS).
+    #[test]
+    fn window_join_empty_array_unsize_and_str_view_is_ccharp() {
+        let shared = window_shared_slice();
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let usize_zero = serde_json::json!([
+            {"Integer": {"Unsigned": ["Usize", "0"]}},
+            {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+        ]);
+        let array_ty = serde_json::json!({"Array": [window_u8(), usize_zero, null]});
+        let array_ref = serde_json::json!({"Ref": ["Erased", array_ty, "Shared"]});
+        let usize_lit = serde_json::json!({
+            "Const": [
+                {"Integer": {"Unsigned": ["Usize", "0"]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ]
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![str_ty.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "bytesobject", "w_bytes_empty"], true),
+            "signature": {"is_unsafe": true, "inputs": [bool_ty, array_ref, str_ty], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 3, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &bool_ty),
+                    window_local(2, &array_ref),
+                    window_local(3, &str_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Switch": {
+                            "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                            "targets": {"If": [2, 3]}
+                        }}}
+                    },
+                    unwind,
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &shared),
+                                {"UnaryOp": [
+                                    {"Cast": {"Unsize": [
+                                        array_ref.clone(),
+                                        shared.clone(),
+                                        {"Length": usize_lit}
+                                    ]}},
+                                    {"Move": window_place(serde_json::json!({"Local": 2}), &array_ref)}
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": {"Goto": {"target": 4}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &str_ty)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(Vec::new(), vec![caller, as_bytes]);
+        let graph = super::lower_function(&llbc, "w_bytes_empty")
+            .expect("lower empty-array unsize join STR view");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs.iter().any(|leaf| leaf == "cast_int_to_ptr"),
+            "empty-array unsize data word is cast_int_to_ptr(CCHARP); leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            leafs
+                .iter()
+                .any(|leaf| { leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING }),
+            "STR-view arm data word is GET_RAW_ADDRESS_OF_STRING; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    /// A shared `&[u8]` reborrow of `&Box<[u8]>` stays the list: `len` /
+    /// index are `__len` / `ArrayRead`, never the resizable-list raw ptr.
+    #[test]
+    fn list_view_box_u8_slice_len_index_stays_the_list() {
+        use crate::model::OpKind;
+
+        let u8_ty = window_u8();
+        let n = window_usize();
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let shared = window_shared_slice();
+        let box_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": "Box",
+                "generics": {
+                    "regions": [],
+                    "types": [window_slice()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let box_ref = serde_json::json!({"Ref": ["Erased", box_ty, "Shared"]});
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let deref = window_opaque_fun(
+            1,
+            &["core", "ops", "deref", "<Impl>", "deref"],
+            vec![box_ref.clone()],
+            shared.clone(),
+        );
+        let len = window_opaque_fun(
+            2,
+            &["core", "slice", "<Impl>", "len"],
+            vec![shared.clone()],
+            n.clone(),
+        );
+        let generic_slice = serde_json::json!({
+            "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+        });
+        let index = window_opaque_fun(
+            3,
+            &["core", "slice", "index", "<Impl>", "index"],
+            vec![generic_slice, n.clone()],
+            u8_ty.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "list_view_box_u8"], true),
+            "signature": {"is_unsafe": false, "inputs": [box_ref, n], "output": bool_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 2, "locals": [
+                    window_local(0, &bool_ty),
+                    window_local(1, &box_ref),
+                    window_local(2, &n),
+                    window_local(3, &shared),
+                    window_local(4, &n),
+                    window_local(5, &u8_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &box_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 4}), &n)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 3},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
+                                {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 5}), &u8_ty)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &bool_ty),
+                                {"BinaryOp": [
+                                    "Lt",
+                                    {"Copy": window_place(serde_json::json!({"Local": 5}), &u8_ty)},
+                                    {"Copy": window_place(serde_json::json!({"Local": 4}), &n)}
+                                ]}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": "Return"}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(Vec::new(), vec![caller, deref, len, index]);
+        let graph = super::lower_function(&llbc, "list_view_box_u8")
+            .expect("lower &Box<[u8]> list-view len/index");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            !leafs.iter().any(|leaf| {
+                leaf == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST
+                    || leaf == "cast_int_to_ptr"
+            }),
+            "Box<[u8]> list view must not take a raw ptr; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            leafs.iter().any(|leaf| leaf == "__len"),
+            "Box<[u8]> list view len is __len; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let getitem = window_graph_ops(&graph).iter().any(|op| {
+            matches!(&op.kind, OpKind::ArrayRead { .. })
+                || matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().is_some_and(|leaf| {
+                        leaf == "ll_getitem_nonneg" || leaf == "__getitem__"
+                    })
+                )
+        });
+        assert!(
+            getitem,
+            "Box<[u8]> list view index is list getitem; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    /// A window local joined from a STR view and `from_raw_parts` of an
+    /// integer address has a CCHARP data word on both links.
+    #[test]
+    fn window_join_str_view_and_from_raw_parts_is_ccharp() {
+        use crate::model::LinkArg;
+
+        let shared = window_shared_slice();
+        let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+        let bool_ty = serde_json::json!({"Scalar": "Bool"});
+        let n = window_usize();
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![str_ty.clone()],
+            shared.clone(),
+        );
+        let from_raw = window_opaque_fun(
+            2,
+            &["core", "slice", "raw", "from_raw_parts"],
+            vec![n.clone(), n.clone()],
+            shared.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "window_join_from_raw_parts"], true),
+            "signature": {"is_unsafe": true, "inputs": [bool_ty, n, n, str_ty], "output": shared},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 4, "locals": [
+                    window_local(0, &shared),
+                    window_local(1, &bool_ty),
+                    window_local(2, &n),
+                    window_local(3, &n),
+                    window_local(4, &str_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Switch": {
+                            "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
+                            "targets": {"If": [2, 3]}
+                        }}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 2}), &n)},
+                                {"Copy": window_place(serde_json::json!({"Local": 3}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 4}), &str_ty)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &shared)
+                        }, "target": 4, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(Vec::new(), vec![caller, as_bytes, from_raw]);
+        let graph = super::lower_function(&llbc, "window_join_from_raw_parts")
+            .expect("lower STR-view join from_raw_parts");
+        let mut by_target: Vec<(crate::model::BlockId, Vec<&crate::model::Link>)> = Vec::new();
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target == graph.returnblock || link.target == graph.exceptblock {
+                    continue;
+                }
+                if let Some((_, links)) = by_target.iter_mut().find(|(id, _)| *id == link.target) {
+                    links.push(link);
+                } else {
+                    by_target.push((link.target, vec![link]));
+                }
+            }
+        }
+        let join_links = by_target
+            .into_iter()
+            .find(|(_, links)| links.len() == 2)
+            .map(|(_, links)| links)
+            .expect("window local has a two-predecessor join");
+        for link in &join_links {
+            let has_ccharp = link.args.iter().any(|arg| {
+                LinkArg::as_variable(arg).is_some_and(|var| {
+                    var.concretetype()
+                        .as_ref()
+                        .is_some_and(super::lltype_is_ccharp)
+                })
+            });
+            assert!(
+                has_ccharp,
+                "join link data word is CCHARP; args={:?} graph={}",
+                link.args,
+                graph.dump()
+            );
+        }
+    }
+
+    /// `s.as_bytes()[i]` of a `Utf8Str` is `__string_byte_getitem`, not a
+    /// 1-byte `RawLoad`.
+    #[test]
+    fn str_view_index_is_strgetitem() {
+        use crate::model::OpKind;
+
+        let utf8_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+        let shared = window_shared_slice();
+        let u8_ty = window_u8();
+        let n = window_usize();
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_bytes = window_opaque_fun(
+            1,
+            &["core", "str", "<Impl>", "as_bytes"],
+            vec![utf8_ref.clone()],
+            shared.clone(),
+        );
+        let generic_slice = serde_json::json!({
+            "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+        });
+        let index = window_opaque_fun(
+            2,
+            &["core", "slice", "index", "<Impl>", "index"],
+            vec![generic_slice, n.clone()],
+            u8_ty.clone(),
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "str_view_index"], true),
+            "signature": {"is_unsafe": false, "inputs": [utf8_ref, n], "output": u8_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 2, "locals": [
+                    window_local(0, &u8_ty),
+                    window_local(1, &utf8_ref),
+                    window_local(2, &n),
+                    window_local(3, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [
+                                {"Copy": window_place(serde_json::json!({"Local": 3}), &shared)},
+                                {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                            ],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &u8_ty)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![utf8], vec![caller, as_bytes, index]);
+        let graph = super::lower_function(&llbc, "str_view_index").expect("lower STR-view index");
+        let leafs = window_call_leafs(&graph);
+        assert!(
+            leafs.iter().any(|leaf| leaf == "__string_byte_getitem"),
+            "as_bytes()[i] is string byte getitem; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        let raw_load = window_graph_ops(&graph)
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::RawLoad { .. }));
+        assert!(
+            !raw_load,
+            "as_bytes()[i] is not a 1-byte RawLoad; graph={}",
+            graph.dump()
+        );
+    }
+
+    #[test]
+    fn window_classifier_predicates() {
+        use crate::model::ValueType;
+
+        let utf8 = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+            "kind": {"Struct": []}
+        });
+        let llbc = window_llbc(vec![utf8, option_enum(1)], vec![]);
+        let shared = TyRef::Other(window_shared_slice());
+        let mut_slice = TyRef::Other(window_mut_slice());
+        let bare = TyRef::Other(window_slice());
+        let const_ptr = TyRef::Other(window_const_slice_ptr());
+        let utf8_ty = TyRef::Other(serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        }));
+        assert!(super::tyref_is_shared_u8_slice(&shared, &llbc));
+        assert!(super::tyref_is_shared_u8_slice(&const_ptr, &llbc));
+        assert!(!super::tyref_is_shared_u8_slice(&mut_slice, &llbc));
+        assert!(!super::tyref_is_shared_u8_slice(&utf8_ty, &llbc));
+        assert!(super::tyref_is_bare_u8_slice(&bare, &llbc));
+        assert!(!super::tyref_is_bare_u8_slice(&shared, &llbc));
+        assert!(!super::tyref_is_string_value(&shared, &llbc));
+        assert!(super::tyref_is_string_value(&utf8_ty, &llbc));
+        assert!(super::tyref_is_u8_window(&shared, &llbc));
+        assert!(super::tyref_is_u8_window(&const_ptr, &llbc));
+        assert!(!super::tyref_is_u8_window(&mut_slice, &llbc));
+        let box_u8 = TyRef::Other(serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "builtin": "Box",
+                "generics": {
+                    "regions": [],
+                    "types": [window_slice()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }));
+        let box_u8_ref = TyRef::Other(serde_json::json!({"Ref": ["Erased", {
+            "Adt": {
+                "id": 0,
+                "builtin": "Box",
+                "generics": {
+                    "regions": [],
+                    "types": [window_slice()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }, "Shared"]}));
+        assert!(super::tyref_is_box_u8_slice(&box_u8, &llbc));
+        assert!(super::tyref_is_box_u8_slice(&box_u8_ref, &llbc));
+        assert!(super::tyref_is_u8_list(&box_u8, &llbc));
+        assert!(super::tyref_is_u8_list(&box_u8_ref, &llbc));
+        assert!(super::tyref_is_fixed_u8_list(&box_u8, &llbc));
+        assert!(!super::tyref_is_u8_window(&box_u8, &llbc));
+        let tomb = std::collections::HashSet::new();
+        let gc = std::collections::HashSet::new();
+        assert!(!matches!(
+            super::tyref_to_value_type_with(&shared, &llbc, &tomb, &gc),
+            ValueType::Str
+        ));
+        let option_shared = TyRef::Other(option_adt_node(1, window_shared_slice()));
+        let option_bare = TyRef::Other(option_adt_node(1, window_slice()));
+        let option_mut = TyRef::Other(option_adt_node(
+            1,
+            serde_json::json!({"Ref": ["Erased", window_slice(), "Mut"]}),
+        ));
+        assert!(super::tyref_is_option_of_shared_u8_slice(
+            &option_shared,
+            &llbc
+        ));
+        assert!(super::tyref_is_option_of_shared_u8_slice(
+            &option_bare,
+            &llbc
+        ));
+        assert!(!super::tyref_is_option_of_shared_u8_slice(
+            &option_mut,
+            &llbc
+        ));
+        assert!(!matches!(
+            super::tyref_to_value_type_with(&option_shared, &llbc, &tomb, &gc),
+            ValueType::Str
+        ));
+        assert!(!super::dont_look_inside_return_is_str(
+            &shared,
+            &llbc,
+            crate::ErrorCarrierSpec::default()
+        ));
+    }
+
     #[test]
     fn fixed_array_suffix_separates_item_type_and_length() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
@@ -91540,7 +97303,23 @@ mod tests {
         });
         let start_bound = serde_json::json!({
             "def_id": 1,
-            "item_meta": meta(&["core", "ops", "range", "Range", "start_bound"]),
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["ops", 0]},
+                    {"Ident": ["range", 0]},
+                    {"Ident": ["Range", 0]},
+                    {"Impl": {
+                        "Ty": {"skip_binder": {"Value": [0, range_adt.clone()]}},
+                        "Trait": 0
+                    }},
+                    {"Ident": ["start_bound", 0]}
+                ],
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
             "signature": {
                 "is_unsafe": false,
                 "inputs": [{"Ref": [null, range_adt.clone(), "Shared"]}],
@@ -91585,15 +97364,111 @@ mod tests {
             },
             0
         ]);
+        let identity = crate::front::clause_spec::render_trait_impl(&llbc, 0)
+            .expect("RangeBounds impl identity");
         let got = super::trait_method_on_known_receiver(Some(&recv), &payload, &llbc);
         assert_eq!(
             got.map(|(_, segs, _)| segs),
-            Some(vec![
-                "ops".to_string(),
-                "range".to_string(),
-                "Range".to_string(),
-                "start_bound".to_string()
-            ])
+            Some(super::trait_impl_identity_path(
+                "ops::range::Range",
+                &identity,
+                "start_bound"
+            ))
+        );
+    }
+
+    #[test]
+    fn trait_impl_for_ref_selects_on_double_ref_receiver() {
+        // `impl Trait for &Foo` with `fn method(&self)`: the first
+        // argument is `&&Foo`. `ClassDesc.lookup` matches the method's
+        // first-input type, keeping every reference layer.
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            })
+        };
+        let foo_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": {"types": []}}
+        });
+        let ref_foo = serde_json::json!({"Ref": [null, foo_adt.clone(), "Shared"]});
+        let ref_ref_foo = serde_json::json!({"Ref": [null, ref_foo.clone(), "Shared"]});
+        let foo_td = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "Foo"]),
+            "kind": {"Struct": []}
+        });
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["Foo", 0]},
+                    {"Impl": {
+                        "Ty": {"skip_binder": {"Value": [0, ref_foo.clone()]}},
+                        "Trait": 0
+                    }},
+                    {"Ident": ["method", 0]}
+                ],
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": false
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_ref_foo.clone()],
+                "output": {"Tuple": []}
+            },
+            "body": {"Unstructured": {
+                "span": span.clone(),
+                "locals": {"arg_count": 1, "locals": []},
+                "body": []
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [foo_td],
+                "fun_decls": [null, method],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Trait"]),
+                    "methods": [{"skip_binder": {"name": "method"}}]
+                }],
+                "trait_impls": [{
+                    "impl_trait": {"id": 0, "generics": {"types": [ref_foo]}},
+                    "generics": {"types": [], "const_generics": [], "trait_refs": []},
+                    "methods": [{
+                        "kind": {"TraitMethod": [0, 0]},
+                        "skip_binder": {"id": 1}
+                    }]
+                }]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let recv = TyRef::Other(ref_ref_foo);
+        let payload = serde_json::json!([
+            {
+                "kind": {"Clause": {"Bound": [0, 0]}},
+                "trait_decl_ref": {"skip_binder": {"id": 0}}
+            },
+            0
+        ]);
+        let got = super::trait_impl_match_for_receiver(&recv, &payload, &llbc);
+        assert_eq!(
+            got.map(|(impl_id, fn_id, _)| (impl_id, fn_id)),
+            Some((0, 1)),
+            "impl Trait for &Foo must match a &&Foo argument"
         );
     }
 
@@ -91607,17 +97482,38 @@ mod tests {
         let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
         let mut subst = vec![Some(tv0.clone())];
-        assert!(!super::unify_receiver_ty(&tv0, &i64_ty, &mut subst, &llbc));
+        let mut const_subst = Vec::new();
+        assert!(!super::unify_receiver_ty(
+            &tv0,
+            &i64_ty,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
         let mut subst = vec![Some(i64_ty.clone())];
-        assert!(super::unify_receiver_ty(&tv0, &i64_ty, &mut subst, &llbc));
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &tv0,
+            &i64_ty,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
         let mut subst = vec![Some(i64_ty.clone())];
-        assert!(!super::unify_receiver_ty(&tv0, &f64_ty, &mut subst, &llbc));
+        let mut const_subst = Vec::new();
+        assert!(!super::unify_receiver_ty(
+            &tv0,
+            &f64_ty,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
     }
 
     #[test]
     fn unify_receiver_ty_distinguishes_adt_const_generics() {
-        // `Buffer<4>` must not match `Buffer<8>`. Reconstructed
-        // const generics come from the receiver, not the impl row.
+        // `Buffer<4>` must not match `Buffer<8>`. Declaration parameters
+        // bind by position (`FunctionDesc.cachedgraph`).
         let llbc = empty_llbc();
         let cg = |n: &str| {
             serde_json::json!([
@@ -91629,24 +97525,121 @@ mod tests {
             serde_json::json!({
                 "Adt": {
                     "id": 0,
-                    "generics": {"types": [], "const_generics": cg(n)}
+                    "generics": {"types": [], "const_generics": [cg(n)]}
                 }
             })
         };
+        let buf_var = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {"types": [], "const_generics": [{"Var": 0}]}
+            }
+        });
         let buf4 = buf("4");
         let buf8 = buf("8");
         let mut subst = Vec::new();
-        assert!(super::unify_receiver_ty(&buf4, &buf4, &mut subst, &llbc));
-        assert!(!super::unify_receiver_ty(&buf4, &buf8, &mut subst, &llbc));
-        let recv = serde_json::json!({"Ref": [null, buf4.clone(), "Shared"]});
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &buf4,
+            &buf4,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        assert!(!super::unify_receiver_ty(
+            &buf4,
+            &buf8,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &buf_var,
+            &buf4,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
         let row = serde_json::json!({
             "generics": {
                 "const_generics": [{"Var": 0}],
                 "trait_refs": []
             }
         });
-        let got = super::reconstructed_impl_generics(&[], &row, &recv);
-        assert_eq!(got["const_generics"], cg("4"));
+        let got = super::reconstructed_impl_generics(&subst, &const_subst, &row)
+            .expect("const N bound from Buffer<4>");
+        assert_eq!(got["const_generics"], serde_json::json!([cg("4")]));
+    }
+
+    #[test]
+    fn reconstructed_impl_generics_binds_swapped_const_params() {
+        // `impl<const N, const M> Trait for Pair<M, N>` with `Pair<2, 3>`
+        // binds N=3, M=2 (`FunctionDesc.cachedgraph`).
+        let llbc = empty_llbc();
+        let cg = |n: &str| {
+            serde_json::json!([
+                {"Integer": {"Unsigned": ["Usize", n]}},
+                {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+            ])
+        };
+        let pair_pattern = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "types": [],
+                    "const_generics": [{"Var": 1}, {"Var": 0}]
+                }
+            }
+        });
+        let pair_actual = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "types": [],
+                    "const_generics": [cg("2"), cg("3")]
+                }
+            }
+        });
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        assert!(super::unify_receiver_ty(
+            &pair_pattern,
+            &pair_actual,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
+        let row = serde_json::json!({
+            "generics": {
+                "const_generics": [{"Var": 0}, {"Var": 1}],
+                "trait_refs": []
+            }
+        });
+        let got =
+            super::reconstructed_impl_generics(&subst, &const_subst, &row).expect("N and M bound");
+        assert_eq!(got["const_generics"], serde_json::json!([cg("3"), cg("2")]));
+        let mut subst = Vec::new();
+        let mut const_subst = Vec::new();
+        let pair_repeat = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "types": [],
+                    "const_generics": [{"Var": 0}, {"Var": 0}]
+                }
+            }
+        });
+        assert!(!super::unify_receiver_ty(
+            &pair_repeat,
+            &pair_actual,
+            &mut subst,
+            &mut const_subst,
+            &llbc
+        ));
     }
 
     #[test]
@@ -102234,40 +108227,39 @@ mod tests {
             false,
         )
         .unwrap();
-        crate::local_crates::with_foreign_body_crate_root("core", || {
-            let kind = serde_json::json!({"Adt": [0]});
-            let dest = |ty: serde_json::Value| {
-                TyRef::Other(serde_json::json!({
-                    "Value": [7, option_adt_node(0, ty)]
-                }))
-            };
-            let leaf_of = |ty: serde_json::Value| {
-                let (_, leaf, _, _, _, _) = lowering
-                    .resolve_aggregate_adt(&kind, Some(&dest(ty)))
-                    .expect("RangeInclusive constructor");
-                leaf
-            };
-            let i64_leaf = leaf_of(option_int_arg(true));
-            let char_leaf = leaf_of(serde_json::json!({"Scalar": "Char"}));
-            assert_eq!(i64_leaf, "RangeInclusive<i64>");
-            assert_eq!(char_leaf, "RangeInclusive<char>");
-            assert_ne!(
-                i64_leaf, char_leaf,
-                "a bare type_id head must not intern both instantiations as RangeInclusive"
-            );
-            let (_, bare_leaf, _, _, _, _) = lowering
-                .resolve_aggregate_adt(&kind, None)
-                .expect("presence check without dest_ty still resolves the ADT");
-            assert_eq!(
-                bare_leaf, "RangeInclusive",
-                "without a dest_ty the presence check may keep the unsuffixed leaf"
-            );
-            // Product `new` spells the Aggregate head as a TypeDeclRef whose
-            // `types` are still `TypeVar`. That is nonempty, so a "has any
-            // type args" test interned `RangeInclusive<TypeVar#0>` for every
-            // spec and unioned `start`. Prefer dest_ty when the head is not
-            // concrete (`bookkeeper.py` `getuniqueclassdef`).
-            let kind_tvar = serde_json::json!({"Adt": [{
+        let kind = serde_json::json!({"Adt": [0]});
+        let dest = |ty: serde_json::Value| {
+            TyRef::Other(serde_json::json!({
+                "Value": [7, option_adt_node(0, ty)]
+            }))
+        };
+        let leaf_of = |ty: serde_json::Value| {
+            let (_, leaf, _, _, _, _) = lowering
+                .resolve_aggregate_adt(&kind, Some(&dest(ty)))
+                .expect("RangeInclusive constructor");
+            leaf
+        };
+        let i64_leaf = leaf_of(option_int_arg(true));
+        let char_leaf = leaf_of(serde_json::json!({"Scalar": "Char"}));
+        assert_eq!(i64_leaf, "RangeInclusive<i64>");
+        assert_eq!(char_leaf, "RangeInclusive<char>");
+        assert_ne!(
+            i64_leaf, char_leaf,
+            "a bare type_id head must not intern both instantiations as RangeInclusive"
+        );
+        let (_, bare_leaf, _, _, _, _) = lowering
+            .resolve_aggregate_adt(&kind, None)
+            .expect("presence check without dest_ty still resolves the ADT");
+        assert_eq!(
+            bare_leaf, "RangeInclusive",
+            "without a dest_ty the presence check may keep the unsuffixed leaf"
+        );
+        // Product `new` spells the Aggregate head as a TypeDeclRef whose
+        // `types` are still `TypeVar`. That is nonempty, so a "has any
+        // type args" test interned `RangeInclusive<TypeVar#0>` for every
+        // spec and unioned `start`. Prefer dest_ty when the head is not
+        // concrete (`bookkeeper.py` `getuniqueclassdef`).
+        let kind_tvar = serde_json::json!({"Adt": [{
                 "id": 0,
                 "generics": {
                     "regions": [],
@@ -102277,18 +108269,17 @@ mod tests {
                 },
                 "builtin": null
             }, null, null]});
-            let leaf_tvar = |ty: serde_json::Value| {
-                let (_, leaf, _, _, _, _) = lowering
-                    .resolve_aggregate_adt(&kind_tvar, Some(&dest(ty)))
-                    .expect("RangeInclusive constructor with TypeVar head");
-                leaf
-            };
-            assert_eq!(leaf_tvar(option_int_arg(true)), "RangeInclusive<i64>");
-            assert_eq!(
-                leaf_tvar(serde_json::json!({"Scalar": "Char"})),
-                "RangeInclusive<char>"
-            );
-        });
+        let leaf_tvar = |ty: serde_json::Value| {
+            let (_, leaf, _, _, _, _) = lowering
+                .resolve_aggregate_adt(&kind_tvar, Some(&dest(ty)))
+                .expect("RangeInclusive constructor with TypeVar head");
+            leaf
+        };
+        assert_eq!(leaf_tvar(option_int_arg(true)), "RangeInclusive<i64>");
+        assert_eq!(
+            leaf_tvar(serde_json::json!({"Scalar": "Char"})),
+            "RangeInclusive<char>"
+        );
     }
 
     #[test]
@@ -108579,11 +114570,11 @@ mod tests {
         );
     }
 
-    /// `Option<&[u8]>` None is `convert_const(None)` on `StringRepr`. The
-    /// cast root keeps the shared borrow so `project_struct_field_type`
-    /// projects `s_str0`. `Option<&mut [u8]>` is a list of unsigned.
+    /// `Option<&[u8]>` None is a null window data word, not
+    /// `convert_const(None)` on `StringRepr`. `Option<&mut [u8]>` is a
+    /// list of unsigned.
     #[test]
-    fn option_niche_null_cast_shared_u8_slice_is_str() {
+    fn option_niche_null_cast_shared_u8_slice_is_window() {
         use crate::model::ValueType;
 
         let llbc = llbc_with_types("fixture", vec![option_enum(0)], vec![]);
@@ -108624,10 +114615,12 @@ mod tests {
             0,
             serde_json::json!({"Ref": ["Erased", slice, "Mut"]}),
         ));
-        assert_eq!(
-            lowering.option_niche_null_cast(&option_shared),
-            Some(("&[u8]".to_string(), ValueType::Str)),
-            "Option<&[u8]> None is StringRepr convert_const(None)"
+        assert!(
+            matches!(
+                lowering.option_niche_null_cast(&option_shared),
+                Some((root, ty)) if root == "&[u8]" && !matches!(ty, ValueType::Str)
+            ),
+            "Option<&[u8]> None is a null window data word"
         );
         assert!(
             !matches!(
@@ -118070,6 +124063,7 @@ mod tests {
                 name: "__pos_0".into(),
                 void: false,
                 narrow_root: None,
+                window: false,
             }],
         })
     }
@@ -118202,6 +124196,7 @@ mod tests {
                 name: "__pos_0".into(),
                 void: false,
                 narrow_root: None,
+                window: false,
             }],
         })
     }

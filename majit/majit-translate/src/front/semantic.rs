@@ -235,15 +235,15 @@ impl<'de> Deserialize<'de> for FieldRow {
     }
 }
 
-/// Drop a leading local or foreign crate root so intern spellings
-/// (`ops::range::RangeInclusive`) match harvested keys
+/// Drop a leading local or harvested foreign-body crate root so intern
+/// spellings (`ops::range::RangeInclusive`) match harvested keys
 /// (`core::ops::range::RangeInclusive`). `bookkeeper.py`
 /// `getuniqueclassdef` keys by the class object, not the import prefix.
-pub(crate) fn crate_relative_struct_path(path: &str) -> &str {
+pub(crate) fn crate_relative_struct_path<'a>(path: &'a str, foreign_roots: &[String]) -> &'a str {
     match path.split_once("::") {
         Some((root, rest))
-            if crate::local_crates::is_foreign_body_crate_root(root)
-                || crate::local_crates::is_local_crate_root(root) =>
+            if crate::local_crates::is_local_crate_root(root)
+                || foreign_roots.iter().any(|r| r == root) =>
         {
             rest
         }
@@ -365,6 +365,17 @@ pub struct StructFieldRegistry {
     /// GC header is absent, so a pointer to it stays an instance.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub(crate) raw_word_owners: std::collections::HashSet<String>,
+    /// Crate roots of FunDecls that lowered a body and are not local
+    /// alias roots. Intern and field lookup strip these prefixes
+    /// (`bookkeeper.py` `getuniqueclassdef`). Owned by this harvested
+    /// registry, not TLS.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) foreign_body_roots: Vec<String>,
+    /// Harvested foreign FunDecls that lowered a body:
+    /// `(crate_root, crate-stripped name_path)`. Lookup strips the crate
+    /// prefix only for these callables (`bookkeeper.py` `Bookkeeper.getdesc`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) foreign_callables: Vec<(String, String)>,
 }
 
 /// `struct_name → [FieldRow]`, with an O(1) key-set fingerprint. `insert` /
@@ -749,9 +760,39 @@ impl StructFieldRegistry {
         self.fields.get(key).map(Vec::as_slice)
     }
 
+    /// Record a FunDecl crate root when that FunDecl has a body and the
+    /// crate is not already a local alias root.
+    pub(crate) fn note_foreign_body_crate_root(&mut self, root: &str) {
+        if root == "crate" || crate::local_crates::is_local_crate_root(root) {
+            return;
+        }
+        if !self.foreign_body_roots.iter().any(|r| r == root) {
+            self.foreign_body_roots.push(root.to_string());
+        }
+    }
+
+    /// Record a foreign FunDecl that lowered a body, so lookup may strip
+    /// `crate_root` from this callable's path only (`Bookkeeper.getdesc`).
+    pub(crate) fn note_foreign_body_callable(&mut self, crate_root: &str, stripped_path: &str) {
+        if crate_root == "crate"
+            || crate::local_crates::is_local_crate_root(crate_root)
+            || stripped_path.is_empty()
+        {
+            return;
+        }
+        if !self
+            .foreign_callables
+            .iter()
+            .any(|(root, path)| root == crate_root && path == stripped_path)
+        {
+            self.foreign_callables
+                .push((crate_root.to_string(), stripped_path.to_string()));
+        }
+    }
+
     /// True when a harvested TypeDecl path for `owner` starts with a
-    /// foreign-body crate root (`local_crates::is_foreign_body_crate_root`).
-    /// A generic struct in that crate is its own class per instantiation
+    /// foreign-body crate root recorded on this registry. A generic struct
+    /// in that crate is its own class per instantiation
     /// (`bookkeeper.py` `getuniqueclassdef`); local-crate structs stay
     /// unsuffixed so closures are not seeded from template rows.
     ///
@@ -761,7 +802,7 @@ impl StructFieldRegistry {
     pub(crate) fn owner_in_foreign_body_crate(&self, owner: &str) -> bool {
         let stripped = majit_ir::descr::strip_generic_args(owner);
         let crate_root = stripped.split("::").next().unwrap_or(stripped.as_ref());
-        if crate::local_crates::is_foreign_body_crate_root(crate_root) {
+        if self.foreign_body_roots.iter().any(|r| r == crate_root) {
             return true;
         }
         let leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
@@ -776,30 +817,15 @@ impl StructFieldRegistry {
             };
             return bucket.iter().any(|key| {
                 let crate_root = key.split("::").next().unwrap_or(key.as_str());
-                crate::local_crates::is_foreign_body_crate_root(crate_root)
+                self.foreign_body_roots.iter().any(|r| r == crate_root)
             });
         }
-        let tail = crate_relative_struct_path(stripped.as_ref());
+        let tail = crate_relative_struct_path(stripped.as_ref(), &self.foreign_body_roots);
         self.fields.keys().any(|k| {
             let ks = majit_ir::descr::strip_generic_args(k);
             let root = ks.split("::").next().unwrap_or(ks.as_ref());
-            crate::local_crates::is_foreign_body_crate_root(root)
-                && crate_relative_struct_path(ks.as_ref()) == tail
-        })
-    }
-
-    /// True when a harvested field row is the same struct template as
-    /// `stripped` (`bookkeeper.py` `getuniqueclassdef` by class object).
-    /// Crate-stripped intern spellings (`bytecode::CodeObject`) match a
-    /// harvested `rustpython_compiler_core::bytecode::CodeObject`.
-    pub(crate) fn covers_stripped_template(&self, stripped: &str) -> bool {
-        let stripped_canon = majit_ir::descr::canonical_struct_name(stripped);
-        let stripped_rel = crate_relative_struct_path(stripped);
-        self.fields.keys().any(|k| {
-            let ks = majit_ir::descr::strip_generic_args(k);
-            ks.as_ref() == stripped
-                || majit_ir::descr::canonical_struct_name(ks.as_ref()) == stripped_canon
-                || crate_relative_struct_path(ks.as_ref()) == stripped_rel
+            self.foreign_body_roots.iter().any(|r| r == root)
+                && crate_relative_struct_path(ks.as_ref(), &self.foreign_body_roots) == tail
         })
     }
 
@@ -1413,5 +1439,85 @@ mod tests {
             serde_json::from_value(json).expect("registry deserializes");
         assert_eq!(restored.field_type("Foo", "x"), Some("i64"));
         assert!(restored.owner_or_variant_has_field("a::Foo", "x"));
+    }
+
+    #[test]
+    fn absorb_semantic_program_merges_foreign_registry_tables() {
+        let mut first = SemanticProgram::default();
+        first.struct_fields.note_foreign_body_crate_root("core");
+        first
+            .struct_fields
+            .note_foreign_body_callable("core", "num::<Impl>::div_ceil");
+        first.struct_fields.fields.insert(
+            "core::A".to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+
+        let mut second = SemanticProgram::default();
+        second.struct_fields.note_foreign_body_crate_root("alloc");
+        second
+            .struct_fields
+            .note_foreign_body_callable("alloc", "vec::<Impl>::push");
+        second.struct_fields.fields.insert(
+            "alloc::B".to_string(),
+            vec![("y".to_string(), "u8".to_string())],
+        );
+
+        let mut merged = None;
+        let mut seen_function_keys = std::collections::HashSet::new();
+        let mut seen_struct_names = std::collections::HashSet::new();
+        let mut seen_trait_names = std::collections::HashSet::new();
+        let dedup = |f: &SemanticFunction| f.name.clone();
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            first,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        crate::front::mir::absorb_semantic_program(
+            &mut merged,
+            second,
+            &mut seen_function_keys,
+            &mut seen_struct_names,
+            &mut seen_trait_names,
+            &dedup,
+        );
+        let acc = merged.expect("merged program");
+        assert!(
+            acc.struct_fields
+                .foreign_body_roots
+                .iter()
+                .any(|root| root == "core"),
+            "first program's foreign_body_roots survive: {:?}",
+            acc.struct_fields.foreign_body_roots
+        );
+        assert!(
+            acc.struct_fields
+                .foreign_body_roots
+                .iter()
+                .any(|root| root == "alloc"),
+            "second program's foreign_body_roots merge in: {:?}",
+            acc.struct_fields.foreign_body_roots
+        );
+        assert!(
+            acc.struct_fields
+                .foreign_callables
+                .iter()
+                .any(|(root, path)| { root == "core" && path == "num::<Impl>::div_ceil" }),
+            "first program's foreign_callables survive: {:?}",
+            acc.struct_fields.foreign_callables
+        );
+        assert!(
+            acc.struct_fields
+                .foreign_callables
+                .iter()
+                .any(|(root, path)| { root == "alloc" && path == "vec::<Impl>::push" }),
+            "second program's foreign_callables merge in: {:?}",
+            acc.struct_fields.foreign_callables
+        );
+        assert!(acc.struct_fields.fields.contains_key("core::A"));
+        assert!(acc.struct_fields.fields.contains_key("alloc::B"));
     }
 }

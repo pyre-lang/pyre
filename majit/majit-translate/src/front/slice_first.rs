@@ -353,11 +353,9 @@ fn rewire_one_slice_first_site(
                 .ok_or_else(|| format!("{name}: RangeFrom start not threaded into Some arm"))?;
             let subslice = graph.alloc_value_var();
             // List getslice of `Vec<u8>` / `&mut [u8]` into a niche
-            // `Option<&[u8]>` is `rstr.py` `LLHelpers.ll_join_chars`:
-            // the Option payload is rstr `STR`. A `string_byte_view`
-            // receiver is already that string; identity getslice.
-            let copy_list_to_str =
-                site.niche && !site.string_byte_view && matches!(site.payload_ty, ValueType::Str);
+            // `Option<&[u8]>` is a window borrow, not `ll_join_chars`.
+            // A `string_byte_view` receiver is already W1 STR; identity
+            // getslice. Owner → window never copies.
             graph.block_mut(then_bb).operations.push(SpaceOperation {
                 result: Some(subslice.clone()),
                 kind: OpKind::Call {
@@ -366,29 +364,10 @@ fn rewire_one_slice_first_site(
                         fun_decl_id: None,
                     },
                     args: crate::model::call_args(vec![slice_in_then, start_in_then]),
-                    result_ty: if copy_list_to_str {
-                        ValueType::Ref(None)
-                    } else {
-                        site.payload_ty.clone()
-                    },
+                    result_ty: site.payload_ty.clone(),
                 },
             });
-            if copy_list_to_str {
-                let dest = graph.alloc_value_var();
-                graph.block_mut(then_bb).operations.push(SpaceOperation {
-                    result: Some(dest.clone()),
-                    kind: OpKind::Call {
-                        target: CallTarget::function_path([
-                            crate::front::join_chars::LL_JOIN_CHARS,
-                        ]),
-                        args: crate::model::call_args(vec![subslice]),
-                        result_ty: ValueType::Str,
-                    },
-                });
-                dest
-            } else {
-                subslice
-            }
+            subslice
         }
     };
     let then_result = if site.niche {
@@ -1093,7 +1072,7 @@ mod tests {
         let mut site = slice_first_site(opt);
         site.access = SliceAccess::RangeFrom { range, start };
         site.niche = true;
-        site.payload_ty = ValueType::Str;
+        site.payload_ty = ValueType::Int;
         site.string_byte_view = false;
         assert_eq!(rewire_slice_first_call_sites(&mut g, &[site]), 1);
         assert!(
@@ -1109,21 +1088,6 @@ mod tests {
                 })
             }),
             "successful arm still emits getslice"
-        );
-        assert!(
-            g.blocks.iter().any(|block| {
-                block.operations.iter().any(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments.first().map(String::as_str)
-                            == Some(crate::front::join_chars::LL_JOIN_CHARS)
-                    )
-                })
-            }),
-            "list getslice into a niche STR Option copies via ll_join_chars"
         );
     }
 

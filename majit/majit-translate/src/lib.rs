@@ -844,7 +844,11 @@ fn pin_builtin_graphs(
 /// when the function lives inside a `mod foo { fn bar() }` block);
 /// `source_module` is the file's crate-stripped path (populated by
 /// `front::mir` from the module portion of Charon's `name_path()`).
-fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::parse::CallPath> {
+fn free_function_alias_paths(
+    name: &str,
+    source_module: &str,
+    foreign_callables: &[(String, String)],
+) -> Vec<crate::parse::CallPath> {
     let segments: Vec<&str> = name.split("::").collect();
     let mut paths = Vec::new();
     paths.push(crate::parse::CallPath::from_segments(
@@ -905,8 +909,8 @@ fn free_function_alias_paths(name: &str, source_module: &str) -> Vec<crate::pars
     } else {
         format!("{source_module}::{name}")
     };
-    for (crate_root, stripped) in crate::local_crates::foreign_body_callables() {
-        if stripped != harvest {
+    for (crate_root, stripped) in foreign_callables {
+        if stripped != &harvest {
             continue;
         }
         let mut alias_segs = vec![crate_root.as_str()];
@@ -964,7 +968,11 @@ fn apply_harvested_funcobj_hints(
             vec![crate::parse::CallPath::from_segments(segs.iter().copied())]
         } else {
             let module = module_segs.join("::");
-            free_function_alias_paths(name, &module)
+            free_function_alias_paths(
+                name,
+                &module,
+                &call_control.struct_fields().foreign_callables,
+            )
         };
         for p in &paths {
             call_control.mark_decorator_hints(p, hints);
@@ -1806,7 +1814,11 @@ fn analyze_pipeline_from_module_paths(
             // below uses the same helper so call sites that hit a
             // module-qualified spelling find both the graph and its
             // elidable/loopinvariant/oopspec hints.
-            for path in free_function_alias_paths(&func.name, &func.module_path) {
+            for path in free_function_alias_paths(
+                &func.name,
+                &func.module_path,
+                &program.struct_fields.foreign_callables,
+            ) {
                 register_function_graph_alias(
                     &mut canonical_function_graphs,
                     &mut canonical_function_alias_source,
@@ -2179,7 +2191,11 @@ fn analyze_pipeline_from_module_paths(
         let Some(graph) = graph else {
             continue;
         };
-        for path in free_function_alias_paths(&func.name, &func.module_path) {
+        for path in free_function_alias_paths(
+            &func.name,
+            &func.module_path,
+            &program.struct_fields.foreign_callables,
+        ) {
             call_control.register_function_graph_with_hints(
                 path,
                 graph.clone(),
@@ -2607,7 +2623,11 @@ fn analyze_pipeline_from_module_paths(
             // above so every spelling the call-site might canonicalise
             // to also finds the `#[oopspec]` / `#[loop_invariant]` /
             // `#[cannot_collect]` / elidable hint.
-            free_function_alias_paths(&func.name, &func.module_path)
+            free_function_alias_paths(
+                &func.name,
+                &func.module_path,
+                &program.struct_fields.foreign_callables,
+            )
         };
         for path in &paths {
             call_control.mark_decorator_hints(path, &func.hints);
@@ -4778,26 +4798,25 @@ mod free_function_alias_paths_tests {
 
     #[test]
     fn free_function_alias_paths_prefixes_harvested_foreign_body_crate() {
-        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
-            let paths = free_function_alias_paths("div_ceil", "num::<Impl>");
-            let expected = CallPath::from_segments(["core", "num", "<Impl>", "div_ceil"]);
-            let stripped = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
-            assert!(
-                paths.iter().any(|p| p == &expected),
-                "callsite spelling must be a registered alias: {paths:?}"
-            );
-            assert!(
-                paths.iter().any(|p| p == &stripped),
-                "crate-stripped harvest spelling must remain: {paths:?}"
-            );
-            let opaque = free_function_alias_paths("transmute", "mem");
-            assert!(
-                !opaque
-                    .iter()
-                    .any(|p| p.segments.first().map(String::as_str) == Some("core")),
-                "an Opaque FunDecl must not gain a harvested crate prefix: {opaque:?}"
-            );
-        });
+        let callables = vec![("core".to_string(), "num::<Impl>::div_ceil".to_string())];
+        let paths = free_function_alias_paths("div_ceil", "num::<Impl>", &callables);
+        let expected = CallPath::from_segments(["core", "num", "<Impl>", "div_ceil"]);
+        let stripped = CallPath::from_segments(["num", "<Impl>", "div_ceil"]);
+        assert!(
+            paths.iter().any(|p| p == &expected),
+            "callsite spelling must be a registered alias: {paths:?}"
+        );
+        assert!(
+            paths.iter().any(|p| p == &stripped),
+            "crate-stripped harvest spelling must remain: {paths:?}"
+        );
+        let opaque = free_function_alias_paths("transmute", "mem", &callables);
+        assert!(
+            !opaque
+                .iter()
+                .any(|p| p.segments.first().map(String::as_str) == Some("core")),
+            "an Opaque FunDecl must not gain a harvested crate prefix: {opaque:?}"
+        );
     }
 }
 
@@ -4839,7 +4858,7 @@ mod harvested_funcobj_hints_tests {
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = CallControl::new();
             let graph = FunctionGraph::new("invert");
-            for alias in free_function_alias_paths("invert", "objspace::descroperation") {
+            for alias in free_function_alias_paths("invert", "objspace::descroperation", &[]) {
                 cc.register_function_graph(alias, graph.clone());
             }
             apply_harvested_funcobj_hints(&mut cc, &harvested);
@@ -4868,7 +4887,7 @@ mod harvested_funcobj_hints_tests {
         crate::local_crates::with_local_crate_root("pyre_interpreter", || {
             let mut cc = CallControl::new();
             let graph = FunctionGraph::new("invert");
-            for alias in free_function_alias_paths("invert", "objspace::descroperation") {
+            for alias in free_function_alias_paths("invert", "objspace::descroperation", &[]) {
                 cc.register_function_graph(alias, graph.clone());
             }
             let mut harvested = std::collections::HashMap::new();

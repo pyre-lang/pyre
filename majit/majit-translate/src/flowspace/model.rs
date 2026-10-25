@@ -1821,6 +1821,12 @@ impl HostEnv {
             "get_raw_address_of_string",
             HostObject::new_builtin_callable("get_raw_address_of_string"),
         );
+        // Front-end spelling of `rgc.nonmoving_raw_ptr_for_resizable_list(lst)`:
+        // a list-family `&[u8]` window data word is the list's raw header.
+        self.insert_builtin(
+            "nonmoving_raw_ptr_for_resizable_list",
+            HostObject::new_builtin_callable("nonmoving_raw_ptr_for_resizable_list"),
+        );
     }
 
     fn bootstrap_std_modules(&mut self) {

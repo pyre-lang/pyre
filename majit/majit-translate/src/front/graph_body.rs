@@ -233,12 +233,8 @@ impl GraphBodyProvider {
         function_filter: Option<&HashSet<String>>,
     ) -> Vec<SemanticFunction> {
         // `bookkeeper.py` `Bookkeeper.getdesc` keys by the function object.
-        // Record every body-carrying FunDecl when the crate is declared,
-        // before any caller lookup and independent of `admit_decl` /
-        // `decl_header_graph` success.
-        for fd in krate.llbc.iter_local_fns() {
-            mir::note_body_crate_root(fd);
-        }
+        // Body-carrying FunDecls were recorded on this crate's
+        // `StructFieldRegistry` in `CrateLoweringState::new`.
         krate.lowering(&self.tables, |lowering| {
             krate
                 .llbc
@@ -253,7 +249,6 @@ impl GraphBodyProvider {
                         lowering.record_decl_failure(fd, DeclBuildError::NoBody);
                         return None;
                     };
-                    mir::note_body_crate_root(fd);
                     let declared = Rc::new(declared);
                     if lowering.declare_llexternal(fd) {
                         return Some(header.into_semantic(LazyGraph::external(declared)));

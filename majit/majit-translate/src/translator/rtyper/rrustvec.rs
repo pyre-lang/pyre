@@ -149,7 +149,7 @@ impl RustVecRepr {
     }
 }
 
-fn genop_helper_call(
+pub(crate) fn genop_helper_call(
     hop: &HighLevelOp,
     path: &str,
     args_v: Vec<Hlvalue>,

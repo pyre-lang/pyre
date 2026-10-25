@@ -361,13 +361,14 @@ impl CodeWriter {
     /// `Variable.concretetype` cells. A Match returns the `LegacyToTyped` map so
     /// post-jtransform operands can be rebound to typed variables. A Skip runs
     /// the legacy annotator and resolver, commits their kinds, and returns
-    /// `None`. `diag_label` identifies either outcome in diagnostics.
+    /// `None`. `path` identifies either outcome in diagnostics.
     pub fn dual_gate_publish_concretetypes(
         &mut self,
         graph: &FunctionGraph,
         callcontrol: &mut CallControl,
-        diag_label: &str,
+        path: &crate::parse::CallPath,
     ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
+        let diag_label = path.canonical_key();
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
             // When the two-phase prepass populated the cache, read the cached
@@ -376,7 +377,10 @@ impl CodeWriter {
             // Skip). The legacy-baseline comparison + fallback stay per-graph.
             if registry.two_phase_prepass_done() {
                 crate::translator::rtyper::cutover::dual_gate_outcome_from_cache(
-                    graph, &registry, diag_label,
+                    graph,
+                    &registry,
+                    callcontrol.function_graphs(),
+                    path,
                 )
             } else {
                 crate::translator::rtyper::cutover::dual_gate_check_with_registry(
@@ -636,14 +640,13 @@ impl CodeWriter {
         // [`Self::dual_gate_type_state`] helper so the parser-level
         // debug snapshot in `make_jitcodes`
         // (in `lib.rs`) can route through the same path.
-        let canonical_diag = path.canonical_key().to_string();
         // `dual_gate_publish_concretetypes` commits every resolved
         // kind to each backing `Variable.concretetype` cell in both
         // arms, so downstream consumers read kinds via
         // `FunctionGraph::concretetype_of(&v)` directly.
         let real_value_to_var = crate::codewriter::transform_profile::time_phase(
             "step0_dual_gate_publish_concretetypes",
-            || self.dual_gate_publish_concretetypes(graph, callcontrol, &canonical_diag),
+            || self.dual_gate_publish_concretetypes(graph, callcontrol, path),
         );
 
         // Indirect calls were lowered in place on the graphs `CallControl`

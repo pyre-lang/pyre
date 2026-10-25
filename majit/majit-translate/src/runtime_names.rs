@@ -137,6 +137,11 @@ pub(crate) mod shims {
     /// `str::as_ptr()`: the front respells `s.as_ptr()` as
     /// `__majit_get_raw_address_of_string(s)`, `rffi.get_raw_address_of_string`.
     pub(crate) const GET_RAW_ADDRESS_OF_STRING: &str = "__majit_get_raw_address_of_string";
+    /// LIST → window: the front respells a `Vec<u8>` / `&mut [u8]` borrow as
+    /// `__majit_nonmoving_raw_ptr_for_resizable_list(lst)`,
+    /// `rgc.nonmoving_raw_ptr_for_resizable_list`.
+    pub(crate) const NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST: &str =
+        "__majit_nonmoving_raw_ptr_for_resizable_list";
     pub(crate) const STRINGBUILDER_NEW: &str = "__majit_stringbuilder_new";
     pub(crate) const STRINGBUILDER_APPEND: &str = "__majit_stringbuilder_append";
     pub(crate) const STRINGBUILDER_BUILD: &str = "__majit_stringbuilder_build";

@@ -833,7 +833,15 @@ impl CallRegistry {
         // harvested foreign-body crate root. A callsite that still
         // spells the crate-qualified path must hit the same
         // FunctionDesc (`bookkeeper.getdesc` identity on the callable).
-        if let Some(stripped) = crate::local_crates::strip_alias_crate_prefix(key.segments()) {
+        let stripped = {
+            let fields = self.bookkeeper.struct_fields.borrow();
+            let callables = fields
+                .as_ref()
+                .map(|reg| reg.foreign_callables.as_slice())
+                .unwrap_or(&[]);
+            crate::local_crates::strip_alias_crate_prefix_with(key.segments(), callables)
+        };
+        if let Some(stripped) = stripped {
             let stripped_key = FunctionPathKey::from_segments(stripped);
             if let Some(entry) = self.lookup_registered(&stripped_key) {
                 return Some(entry);
@@ -1691,49 +1699,51 @@ mod tests {
 
     #[test]
     fn lookup_hits_a_stripped_foreign_body_crate_prefix() {
-        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
-            let bk = Rc::new(Bookkeeper::new());
-            let registry = CallRegistry::new(bk);
-            let registered = registry.get_or_register(
-                FunctionPathKey::from_segments(["num", "<Impl>", "div_ceil"]),
-                signature(&["self", "rhs"]),
-            );
-            let crate_hit = registry
-                .lookup(&FunctionPathKey::from_segments([
-                    "core", "num", "<Impl>", "div_ceil",
-                ]))
-                .expect("harvested foreign callable must share the stripped FunctionDesc");
-            assert!(
-                Rc::ptr_eq(&registered, &crate_hit),
-                "stripped lookup must return the same FunctionEntry"
-            );
-        });
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "num::<Impl>::div_ceil");
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+        let registered = registry.get_or_register(
+            FunctionPathKey::from_segments(["num", "<Impl>", "div_ceil"]),
+            signature(&["self", "rhs"]),
+        );
+        let crate_hit = registry
+            .lookup(&FunctionPathKey::from_segments([
+                "core", "num", "<Impl>", "div_ceil",
+            ]))
+            .expect("harvested foreign callable must share the stripped FunctionDesc");
+        assert!(
+            Rc::ptr_eq(&registered, &crate_hit),
+            "stripped lookup must return the same FunctionEntry"
+        );
     }
 
     #[test]
     fn lookup_does_not_strip_unharvested_foreign_crate() {
-        crate::local_crates::with_foreign_body_callable("core", "num::<Impl>::div_ceil", || {
-            let bk = Rc::new(Bookkeeper::new());
-            let registry = CallRegistry::new(bk);
-            let _div_ceil = registry.get_or_register(
-                FunctionPathKey::from_segments(["num", "<Impl>", "div_ceil"]),
-                signature(&["self", "rhs"]),
-            );
-            let _transmute = registry.get_or_register(
-                FunctionPathKey::from_segments(["mem", "transmute"]),
-                signature(&["src"]),
-            );
-            assert!(
-                registry
-                    .lookup(&FunctionPathKey::from_segments([
-                        "core",
-                        "mem",
-                        "transmute",
-                    ]))
-                    .is_none(),
-                "an Opaque foreign FunDecl must not strip its crate prefix even when another core body is harvested"
-            );
-        });
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.note_foreign_body_callable("core", "num::<Impl>::div_ceil");
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk);
+        let _div_ceil = registry.get_or_register(
+            FunctionPathKey::from_segments(["num", "<Impl>", "div_ceil"]),
+            signature(&["self", "rhs"]),
+        );
+        let _transmute = registry.get_or_register(
+            FunctionPathKey::from_segments(["mem", "transmute"]),
+            signature(&["src"]),
+        );
+        assert!(
+            registry
+                .lookup(&FunctionPathKey::from_segments([
+                    "core",
+                    "mem",
+                    "transmute",
+                ]))
+                .is_none(),
+            "an Opaque foreign FunDecl must not strip its crate prefix even when another core body is harvested"
+        );
     }
 
     #[test]

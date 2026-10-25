@@ -242,6 +242,12 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "get_raw_address_of_string",
             rtype_builtin_get_raw_address_of_string,
         ),
+        // Translator shim: `__majit_nonmoving_raw_ptr_for_resizable_list`
+        // → `rgc.nonmoving_raw_ptr_for_resizable_list`.
+        (
+            "nonmoving_raw_ptr_for_resizable_list",
+            rtype_builtin_nonmoving_raw_ptr_for_resizable_list,
+        ),
         // rbuiltin.py:709-715
         ("hasattr", rtype_builtin_hasattr),
         // rbuiltin.py:264-267
@@ -2396,6 +2402,63 @@ pub fn rtype_builtin_get_raw_address_of_string(
         },
     )?;
     hop.gendirectcall(&helper, vlist)
+}
+
+/// `nonmoving_raw_ptr_for_resizable_list(lst)` — the front's
+/// `__majit_nonmoving_raw_ptr_for_resizable_list` spelling of
+/// `rgc.nonmoving_raw_ptr_for_resizable_list`.
+///
+/// `rgc.py` `Entry.specialize_call` for `_nonmoving_raw_ptr_for_resizable_list`
+/// takes the list repr and `gendirectcall`s
+/// `ll_nonmovable_raw_ptr_for_resizable_list`. A `Vec<u8>` `SomeList` is
+/// `ListRepr` (`Ptr(GcStruct list {length, items})`); the items address is
+/// `ll_vec_as_ptr` of that header word (`cast_ptr_to_int`), then `CCHARP`.
+pub fn rtype_builtin_nonmoving_raw_ptr_for_resizable_list(
+    hop: &HighLevelOp,
+    _kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+    use crate::translator::rtyper::rint::signed_repr;
+    use crate::translator::rtyper::rrustvec::{
+        genop_helper_call, pair_rustvec_integer_convert_from_to,
+    };
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let r_list = arg_repr(hop, 0)?;
+    let list_ll = r_list.lowleveltype();
+    if !matches!(list_ll, LowLevelType::Ptr(_)) {
+        return Err(TyperError::message(format!(
+            "nonmoving_raw_ptr_for_resizable_list: list repr lowleveltype {:?} has no raw header word",
+            list_ll
+        )));
+    }
+    let v_list = hop.inputarg(&r_list, 0)?;
+    hop.exception_cannot_occur()?;
+    let r_int = signed_repr();
+    let v_header = {
+        let mut llops = hop.llops.borrow_mut();
+        pair_rustvec_integer_convert_from_to(r_list.as_ref(), r_int.as_ref(), &v_list, &mut llops)?
+            .ok_or_else(|| {
+                TyperError::message(
+                    "nonmoving_raw_ptr_for_resizable_list: header word conversion failed",
+                )
+            })?
+    };
+    let v_items = genop_helper_call(
+        hop,
+        "majit_rlib::lltypesystem::rvec::ll_vec_as_ptr",
+        vec![v_header],
+        vec![LowLevelType::Signed],
+        LowLevelType::Signed,
+    )?
+    .ok_or_else(|| {
+        TyperError::message("nonmoving_raw_ptr_for_resizable_list: ll_vec_as_ptr returned void")
+    })?;
+    Ok(hop.genop(
+        "cast_int_to_ptr",
+        vec![v_items],
+        GenopResult::LLType((*CCHARP).clone()),
+    ))
 }
 
 /// The receiver of an exception `__init__` hop, as `InstanceRepr`.
