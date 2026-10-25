@@ -1537,7 +1537,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     }
                     let roots = pyre_object::gc_roots::push_roots();
                     let args_base = roots.pin_roots(args);
-                    let arg1 = roots.get(args_base + 1);
+                    let mut arg1 = roots.get(args_base + 1);
                     let mut obj = roots.get(args_base);
                     drop(roots);
                     // `interp_mmap.py write_byte(byte=int)` —
@@ -1545,9 +1545,9 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
                     // `check_valid()` and `check_writeable()`, then
                     // `chr(byte)` raises ValueError on values outside
                     // 0..256.
-                    let raw = pyre_object::with_roots!(obj => mmap_index_w(obj, arg1))?;
-                    mmap_check_valid(obj)?;
-                    mmap_check_writeable(obj)?;
+                    let raw = pyre_object::with_roots!(obj, arg1 => mmap_index_w(obj, arg1))?;
+                    pyre_object::with_roots!(obj => mmap_check_valid(obj))?;
+                    pyre_object::with_roots!(obj => mmap_check_writeable(obj))?;
                     if !(0..=255).contains(&raw) {
                         return Err(pyre_interpreter::PyError::value_error(
                             "byte must be in range(0, 256)",

@@ -14733,14 +14733,21 @@ fn patch_getset_descriptor_metadata() {
     if !crate::type_dict_has_storage(tp) {
         return;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let tp_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _tp = pyre_object::gc_roots::pin_root(tp);
     // `descrobject.c descr_members` supplies __objclass__ and __name__.  This
     // post-init pass runs with the type object already built, so `w_cls` is
     // bound here rather than by `stamp_new_descr_self`.
     for (name, kind) in DESCR_MEMBERS {
         crate::type_dict_store(
-            tp,
+            pyre_object::gc_roots::shadow_stack_get(tp_slot),
             name,
-            pyre_object::w_member_new_direct(kind, name.to_owned(), tp),
+            pyre_object::w_member_new_direct(
+                kind,
+                name.to_owned(),
+                pyre_object::gc_roots::shadow_stack_get(tp_slot),
+            ),
         );
     }
     // typedef.py __qualname__ = GetSetProperty(descr_get_qualname)
@@ -14761,9 +14768,6 @@ fn patch_getset_descriptor_metadata() {
     //     qualname = "%s.%s" % (type_qualname, self.name)
     //     return space.newtext(qualname)
     // ```
-    let _roots = pyre_object::gc_roots::push_roots();
-    let tp_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _tp = pyre_object::gc_roots::pin_root(tp);
     let qualname_meta_getter = make_builtin_function_with_arity(
         "__qualname__",
         |args| {
@@ -16309,8 +16313,8 @@ fn init_type_type(ns: PyObjectRef) {
             //         w_type.setdictvalue(space, '__module__', w_value)
             // Writes directly into the type's namespace dict so
             // `A.__module__ = "x"` is reflected in `A.__dict__`.
-            let cls = args[1];
-            let value = args[2];
+            let mut cls = args[1];
+            let mut value = args[2];
             check_set_special_type_attr(cls, value, "__module__")?;
             unsafe {
                 if pyre_object::is_type(cls) {
@@ -16320,7 +16324,9 @@ fn init_type_type(ns: PyObjectRef) {
                             "cannot set '__module__' attribute of immutable type '{name}'"
                         )));
                     }
-                    crate::type_dict_store(cls, "__module__", value);
+                    pyre_object::with_roots!(cls, value => {
+                        crate::type_dict_store(cls, "__module__", value)
+                    });
                     // CPython 3.14 type_set_module clears the compiler's
                     // source-location metadata when the owning module changes.
                     crate::type_dict_delete(cls, "__firstlineno__");

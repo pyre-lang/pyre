@@ -701,13 +701,18 @@ pub fn complete_struct_or_union(
                 // A nested anonymous struct or union: its fields are spliced
                 // in at this offset under their own names.
                 for w_srcfld in super::ctypestruct::fields_list_of(ftype)? {
-                    let srcfld = super::ctypestruct::W_CField::from_obj(w_srcfld)
-                        .ok_or_else(|| PyError::system_error("field list holds a non-field"))?;
+                    let iter_roots = pyre_object::gc_roots::push_roots();
+                    let src_slot = iter_roots.pin_roots(&[w_srcfld]);
+                    let srcfld =
+                        super::ctypestruct::W_CField::from_obj(iter_roots.get(src_slot))
+                            .ok_or_else(|| PyError::system_error("field list holds a non-field"))?;
                     let w_fld = super::ctypestruct::make_shifted(srcfld, byteoffset, fflags);
-                    let fld_slot = roots.pin_roots(&[w_fld]);
-                    append(roots.get(fld_slot));
-                    if let Some(name) = super::ctypestruct::name_of_field(ftype, w_srcfld)? {
-                        record(&name, roots.get(fld_slot));
+                    let fld_slot = iter_roots.pin_roots(&[w_fld]);
+                    append(iter_roots.get(fld_slot));
+                    if let Some(name) =
+                        super::ctypestruct::name_of_field(ftype, iter_roots.get(src_slot))?
+                    {
+                        record(&name, iter_roots.get(fld_slot));
                     }
                 }
                 // Such a structure can never be passed by value.

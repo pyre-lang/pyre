@@ -60,27 +60,30 @@ pub fn seed_main_module_attrs(
     main_module: pyre_object::PyObjectRef,
     main_file: Option<&str>,
 ) {
+    let _seed_roots = pyre_object::gc_roots::push_roots();
+    let canonical_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(canonical);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(main_module);
     unsafe {
         pyre_object::dictmultiobject::w_dict_setitem_str(
-            canonical,
+            pyre_object::gc_roots::shadow_stack_get(canonical_slot),
             "__spec__",
             pyre_object::w_none(),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str(
-            canonical,
+            pyre_object::gc_roots::shadow_stack_get(canonical_slot),
             "__package__",
             pyre_object::w_none(),
         );
         pyre_object::dictmultiobject::w_dict_setitem_str(
-            canonical,
+            pyre_object::gc_roots::shadow_stack_get(canonical_slot),
             "__doc__",
             pyre_object::w_none(),
         );
     }
     if let Some(file) = main_file {
         let _roots = pyre_object::gc_roots::push_roots();
-        let module_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(main_module);
         let file_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(file));
         let _ = crate::baseobjspace::setattr_str(

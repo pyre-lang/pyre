@@ -8344,7 +8344,8 @@ pub unsafe fn object_setattr_surrogate(
                     w_type_get_name(obj)
                 )));
             }
-            if crate::type_dict_store_wtf8(obj, name, value) {
+            if pyre_object::with_roots!(obj, value, w_name => crate::type_dict_store_wtf8(obj, name, value))
+            {
                 pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
                 mutated_wtf8(obj, name);
                 return Ok(w_none());
@@ -9081,12 +9082,18 @@ pub(crate) fn type_get_annotations(obj: PyObjectRef) -> PyResult {
     } else {
         pyre_object::w_dict_new()
     };
-    crate::type_dict_store(obj(), "__annotations_cache__", annotations);
+    let annotations_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(annotations);
+    crate::type_dict_store(
+        obj(),
+        "__annotations_cache__",
+        pyre_object::gc_roots::shadow_stack_get(annotations_slot),
+    );
     pyre_object::gc_hook::try_gc_write_barrier(obj() as pyre_object::gc_hook::GCREF);
-    Ok(annotations)
+    Ok(pyre_object::gc_roots::shadow_stack_get(annotations_slot))
 }
 
-pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) fn type_set_annotations(mut obj: PyObjectRef, mut value: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__annotations__' attribute of immutable type '{}'",
@@ -9096,10 +9103,12 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
     // CPython updates an explicit class-body __annotations__ key in place;
     // otherwise the descriptor stores through __annotations_cache__.
     if crate::type_dict_lookup(obj, "__annotations__").is_some() {
-        crate::type_dict_store(obj, "__annotations__", value);
+        pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, "__annotations__", value));
         crate::type_dict_delete(obj, "__annotations_cache__");
     } else {
-        crate::type_dict_store(obj, "__annotations_cache__", value);
+        pyre_object::with_roots!(obj, value => {
+            crate::type_dict_store(obj, "__annotations_cache__", value)
+        });
     }
     // Both bookkeeping keys are popped, not reset: a class whose annotations
     // were assigned has no lazy thunk left and neither key stays visible in
@@ -9114,7 +9123,7 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
 /// CPython 3.14 `type_set___annotate__`: the lazy annotation callable is an
 /// own-type slot, never inherited, and replacing it invalidates the result
 /// cached by `type_get_annotations`.
-pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) fn type_set_annotate(mut obj: PyObjectRef, mut value: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__annotate__' attribute of immutable type '{}'",
@@ -9127,7 +9136,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
     // CPython stores descriptor assignments in the compiler-facing slot.
     // An explicit class-body __annotate__ key remains an ordinary visible
     // class attribute and intentionally shadows this internal slot.
-    crate::type_dict_store(obj, "__annotate_func__", value);
+    pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, "__annotate_func__", value));
     // Setting None preserves an already materialized annotations cache;
     // installing a new callable invalidates it.
     if !unsafe { is_none(value) } {
@@ -9143,7 +9152,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
 /// Static types have no slot and raise AttributeError rather than returning
 /// None.  A class-body `__annotate__` entry is an ordinary own-class value
 /// and takes precedence over the compiler-facing slot.
-pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
+pub(crate) fn type_get_annotate(mut obj: PyObjectRef) -> PyResult {
     if !unsafe { pyre_object::w_type_is_cpython_heaptype(obj) } {
         return Err(PyError::attribute_error(format!(
             "type object '{}' has no attribute '__annotate__'",
@@ -9158,7 +9167,7 @@ pub(crate) fn type_get_annotate(obj: PyObjectRef) -> PyResult {
     }
     // A class that declared no annotations acquires the slot on the first
     // read, so `__annotate_func__` becomes visible in `cls.__dict__`.
-    crate::type_dict_store(obj, "__annotate_func__", w_none());
+    pyre_object::with_roots!(obj => crate::type_dict_store(obj, "__annotate_func__", w_none()));
     pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     Ok(w_none())
 }
@@ -9176,14 +9185,14 @@ pub(crate) fn type_get_type_params(obj: PyObjectRef) -> PyResult {
     Ok(w_tuple_new(vec![]))
 }
 
-pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) fn type_set_type_params(mut obj: PyObjectRef, mut value: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__type_params__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
         )));
     }
-    crate::type_dict_store(obj, "__type_params__", value);
+    pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, "__type_params__", value));
     pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
     unsafe { mutated(obj, "__type_params__") };
     Ok(w_none())
@@ -9259,14 +9268,14 @@ pub(crate) fn type_get_doc(obj: PyObjectRef) -> PyResult {
 }
 
 /// PyPy `typeobject.py descr_set__doc`.
-pub(crate) fn type_set_doc(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
+pub(crate) fn type_set_doc(mut obj: PyObjectRef, mut value: PyObjectRef) -> PyResult {
     if unsafe { w_type_is_cpython_immutabletype(obj) } {
         return Err(PyError::type_error(format!(
             "cannot set '__doc__' attribute of immutable type '{}'",
             unsafe { w_type_get_name(obj) },
         )));
     }
-    crate::type_dict_store(obj, "__doc__", value);
+    pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, "__doc__", value));
     unsafe { mutated(obj, "__doc__") };
     Ok(w_none())
 }
@@ -15684,7 +15693,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> P
                 return Ok(w_none());
             }
             if name == "__module__" {
-                crate::type_dict_store(obj, name, value);
+                pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, name, value));
                 crate::type_dict_delete(obj, "__firstlineno__");
                 mutated(obj, name);
                 return Ok(w_none());
@@ -15734,7 +15743,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> P
                         value,
                     ))?;
                 } else {
-                    crate::type_dict_store(obj, name, value);
+                    pyre_object::with_roots!(obj, value => crate::type_dict_store(obj, name, value));
                     mutated(obj, name);
                 }
                 pyre_object::gc_hook::try_gc_write_barrier(obj as pyre_object::gc_hook::GCREF);
@@ -18196,8 +18205,10 @@ pub fn pick_builtin_obj_checked(
     if !w_globals.is_null() {
         match finditem_str(w_globals, "__builtins__") {
             Ok(Some(w_builtin)) if !w_builtin.is_null() => {
+                let mut w_builtin = w_builtin;
                 if !exec_ctx.is_null() {
-                    let space_builtin = unsafe { (*exec_ctx).get_builtin() };
+                    let space_builtin =
+                        pyre_object::with_roots!(w_builtin => unsafe { (*exec_ctx).get_builtin() });
                     if !space_builtin.is_null() && std::ptr::eq(w_builtin, space_builtin) {
                         return Ok(w_builtin);
                     }
@@ -18267,11 +18278,17 @@ fn build_default_pick_builtin_module() -> PyObjectRef {
     // `Module(space, None, w_builtin)` aliasing-constructor path
     // hands the dict object straight through without the
     // `DictStorage` carrier.
-    let w_dict = pyre_object::w_module_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_module_dict_new());
     unsafe {
-        pyre_object::w_dict_setitem_str(w_dict, "None", pyre_object::w_none());
+        pyre_object::w_dict_setitem_str(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            "None",
+            pyre_object::w_none(),
+        );
     }
-    pyre_object::w_module_new_aliasing_dict("", w_dict)
+    pyre_object::w_module_new_aliasing_dict("", pyre_object::gc_roots::shadow_stack_get(dict_slot))
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053

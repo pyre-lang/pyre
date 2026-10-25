@@ -2098,12 +2098,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     let stderr = make_std_stream("<stderr>", 2);
     let stderr_slot = roots.pin_roots(&[stderr]);
     let stdin = make_std_stream("<stdin>", 0);
+    let stdin_slot = roots.pin_roots(&[stdin]);
     module_ns_store(roots.get(ns_slot), "stdout", roots.get(stdout_slot));
     module_ns_store(roots.get(ns_slot), "stderr", roots.get(stderr_slot));
-    module_ns_store(roots.get(ns_slot), "stdin", stdin);
+    module_ns_store(roots.get(ns_slot), "stdin", roots.get(stdin_slot));
     module_ns_store(roots.get(ns_slot), "__stdout__", roots.get(stdout_slot));
     module_ns_store(roots.get(ns_slot), "__stderr__", roots.get(stderr_slot));
-    module_ns_store(roots.get(ns_slot), "__stdin__", stdin);
+    module_ns_store(roots.get(ns_slot), "__stdin__", roots.get(stdin_slot));
     // `vm.py _getframe` (arguments) over `vm.py getframe` (the walk) —
     // see [`sys_getframe`] and [`getframe`], which keep upstream's split.
     module_ns_store(
@@ -2186,12 +2187,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `__majit_wrap_exc_info` rather than a closure so the tracer can descend
     // into it.
     let exc_info_fn = make_builtin_function_with_arity("exc_info", __majit_wrap_exc_info, 0);
-    module_ns_store(roots.get(ns_slot), "exc_info", exc_info_fn);
+    let exc_info_fn_slot = roots.pin_roots(&[exc_info_fn]);
+    module_ns_store(roots.get(ns_slot), "exc_info", roots.get(exc_info_fn_slot));
     // baseobjspace.py: register `space._code_of_sys_exc_info` so
     // `function.funccall_valuestack` can take the JIT direct path
     // (function.py:146-150). The builtin code pointer lives on the
     // `BuiltinCode` object backing `exc_info_fn`; `getcode` returns it.
-    let exc_info_code = unsafe { crate::getcode(exc_info_fn) };
+    let exc_info_code = unsafe { crate::getcode(roots.get(exc_info_fn_slot)) };
     crate::function::register_sys_exc_info_path(exc_info_code, exc_info_direct);
     // sys.flags — pypy/module/sys/app.py `class sysflags` with
     // `__metaclass__ = structseqtype`: an immutable tuple subclass whose
@@ -3991,12 +3993,30 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // restore them.
     let displayhook_fn =
         make_builtin_function_with_arity("displayhook", crate::builtins::sys_displayhook, 1);
-    module_ns_store(roots.get(ns_slot), "displayhook", displayhook_fn);
-    module_ns_store(roots.get(ns_slot), "__displayhook__", displayhook_fn);
+    let displayhook_fn_slot = roots.pin_roots(&[displayhook_fn]);
+    module_ns_store(
+        roots.get(ns_slot),
+        "displayhook",
+        roots.get(displayhook_fn_slot),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "__displayhook__",
+        roots.get(displayhook_fn_slot),
+    );
     let excepthook_fn =
         make_builtin_function_with_arity("excepthook", crate::builtins::sys_excepthook, 3);
-    module_ns_store(roots.get(ns_slot), "excepthook", excepthook_fn);
-    module_ns_store(roots.get(ns_slot), "__excepthook__", excepthook_fn);
+    let excepthook_fn_slot = roots.pin_roots(&[excepthook_fn]);
+    module_ns_store(
+        roots.get(ns_slot),
+        "excepthook",
+        roots.get(excepthook_fn_slot),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "__excepthook__",
+        roots.get(excepthook_fn_slot),
+    );
     // sys.breakpointhook — `app.py breakpointhook`, called by `breakpoint()`.
     // `__breakpointhook__` keeps the original so code can restore it.
     let breakpointhook_fn = make_builtin_function_passthrough0(
@@ -4004,15 +4024,33 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         sys_breakpointhook,
         sys_breakpointhook_args,
     );
-    module_ns_store(roots.get(ns_slot), "breakpointhook", breakpointhook_fn);
-    module_ns_store(roots.get(ns_slot), "__breakpointhook__", breakpointhook_fn);
+    let breakpointhook_fn_slot = roots.pin_roots(&[breakpointhook_fn]);
+    module_ns_store(
+        roots.get(ns_slot),
+        "breakpointhook",
+        roots.get(breakpointhook_fn_slot),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "__breakpointhook__",
+        roots.get(breakpointhook_fn_slot),
+    );
     // sys.unraisablehook(unraisable) — handles exceptions raised where they
     // cannot propagate (e.g. __del__).  Stored alongside the read-only
     // `__unraisablehook__` original so code can save and restore it.
     let unraisablehook_fn =
         make_builtin_function_with_arity("unraisablehook", sys_unraisablehook, 1);
-    module_ns_store(roots.get(ns_slot), "unraisablehook", unraisablehook_fn);
-    module_ns_store(roots.get(ns_slot), "__unraisablehook__", unraisablehook_fn);
+    let unraisablehook_fn_slot = roots.pin_roots(&[unraisablehook_fn]);
+    module_ns_store(
+        roots.get(ns_slot),
+        "unraisablehook",
+        roots.get(unraisablehook_fn_slot),
+    );
+    module_ns_store(
+        roots.get(ns_slot),
+        "__unraisablehook__",
+        roots.get(unraisablehook_fn_slot),
+    );
     // sys.path_hooks / path_importer_cache
     let path_hooks = w_list_new(vec![]);
     module_ns_store(roots.get(ns_slot), "path_hooks", path_hooks);

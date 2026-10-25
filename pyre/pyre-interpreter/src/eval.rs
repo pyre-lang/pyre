@@ -3290,7 +3290,7 @@ impl NamespaceOpcodeHandler for PyFrame {
         {
             return crate::lazyimport::maybe_reify_str(value, name, w_globals);
         }
-        let mut w_builtin = self.get_builtin();
+        let mut w_builtin = pyre_object::with_roots!(w_globals => self.get_builtin());
         if use_cache {
             let cache_hit: Option<PyObjectRef> = unsafe {
                 pyre_object::with_roots!(w_builtin, w_globals => load_global_via_cache(
@@ -3460,8 +3460,11 @@ pub unsafe fn store_name_value_w(
     let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(value);
     let w_locals = frame.get_or_create_w_locals();
+    let locals_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_locals);
     let w_name = roots.get(name_slot);
     let value = roots.get(value_slot);
+    let w_locals = roots.get(locals_slot);
     // The trace's own `box_str_constant` names the key, so it is the same
     // string object on every execution — `rstr.py ll_strhash`'s memo
     // makes it hashed once rather than once per store.
@@ -3586,9 +3589,9 @@ unsafe fn load_global_via_cache(
     use pyre_object::celldict::unwrap_cell;
     use pyre_object::dictmultiobject::{DictOperationGuard, W_ModuleDictObject};
     let module_guard = DictOperationGuard::new(w_module_dict, &[w_builtin, pycode]);
-    let w_module_dict = module_guard.root(0);
+    let mut w_module_dict = module_guard.root(0);
     let mut w_builtin = module_guard.root(1);
-    let pycode = module_guard.root(2);
+    let mut pycode = module_guard.root(2);
     // Body is a chain of unsafe-fn / raw-ptr ops on caller-supplied
     // PyObjectRefs; SAFETY contract is on the `unsafe fn` signature
     // (caller upholds w_module_dict / pycode / w_builtin validity).
@@ -3673,7 +3676,7 @@ unsafe fn load_global_via_cache(
             let w_space_builtin = if ec.is_null() {
                 pyre_object::PY_NULL
             } else {
-                (*ec).get_builtin()
+                pyre_object::with_roots!(w_builtin, w_module_dict, pycode => (*ec).get_builtin())
             };
             if !w_space_builtin.is_null() && pyre_object::is_module(w_space_builtin) {
                 pyre_object::w_module_get_w_dict(w_space_builtin)
