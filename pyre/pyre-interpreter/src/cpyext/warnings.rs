@@ -96,6 +96,12 @@ pub unsafe extern "C" fn PyErr_WarnExplicitObject(
     registry: *mut CPyObject,
 ) -> c_int {
     realize_all([category, message, filename, module, registry]);
+    // `_warnings.c warn_explicit`: `if (module == Py_None) return None`.
+    // A C NULL module still derives from the filename below.
+    let module = unsafe { pyobject::from_ref(module) };
+    if !module.is_null() && unsafe { pyre_object::is_none(module) } {
+        return 0;
+    }
     let Some(message) = super::object::argument(message) else {
         return -1;
     };
@@ -110,7 +116,7 @@ pub unsafe extern "C" fn PyErr_WarnExplicitObject(
         message,
         filename,
         lineno as i64,
-        unsafe { pyobject::from_ref(module) },
+        module,
         unsafe { pyobject::from_ref(registry) },
         PY_NULL,
         PY_NULL,

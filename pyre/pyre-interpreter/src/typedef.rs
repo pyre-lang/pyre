@@ -23713,7 +23713,8 @@ fn init_int_type(ns: PyObjectRef) {
             )
         )
     };
-    // intobject.py descr_repr / descr_str (`func_with_new_name(descr_repr, 'descr_str')`).
+    // intobject.py descr_repr. object.__str__ delegates virtually to this
+    // repr slot; the type dict has no `__str__` key.
     let int_to_text = |args: &[PyObjectRef]| {
         let obj = args[0];
         // Exact machine int: `intobject.py descr_repr` — `ll_int2dec` +
@@ -23729,13 +23730,6 @@ fn init_int_type(ns: PyObjectRef) {
             ns_slot,
             "__repr__",
             make_builtin_function_with_arity("__repr__", int_to_text, 1)
-        )
-    };
-    unsafe {
-        crate::__pyre_put_new!(
-            ns_slot,
-            "__str__",
-            make_builtin_function_with_arity("__str__", int_to_text, 1)
         )
     };
     unsafe {
