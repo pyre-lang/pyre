@@ -429,6 +429,75 @@ pub fn ReleaseMutex(mutex: PyObjectRef) -> Result<(), pyre_interpreter::PyError>
     Ok(())
 }
 
+// ── event log ──
+
+/// `_winapi.RegisterEventSource(unc_server_name, source_name, /)`
+///
+/// [3.15-spec] `lib_pypy/_winapi.py` has no event-log calls;
+/// `_winapi_RegisterEventSource_impl` at v3.15.0 registers the source and
+/// reports a failure through `PyErr_SetFromWindowsErr(0)`
+/// (`test_winapi.WinAPITests.test_event_source_registration`).
+#[pyre_interpreter::pyre_function]
+pub fn RegisterEventSource(
+    unc_server_name: PyObjectRef,
+    source_name: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let unc_server_name = wide_or_none(
+        unc_server_name,
+        WideArg::Numbered {
+            function: "RegisterEventSource",
+            position: 1,
+        },
+    )?;
+    let source_name = wide(
+        source_name,
+        WideArg::Numbered {
+            function: "RegisterEventSource",
+            position: 2,
+        },
+    )?;
+    host_winapi::register_event_source_w(unc_server_name.as_deref(), &source_name)
+        .map(w_handle)
+        .map_err(super::win32_err)
+}
+
+/// `_winapi.DeregisterEventSource(handle, /)` — [3.15-spec], as
+/// [`RegisterEventSource`].
+#[pyre_interpreter::pyre_function]
+pub fn DeregisterEventSource(handle: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let handle = handle_w(handle, IntArg::Only("DeregisterEventSource"))?;
+    host_winapi::deregister_event_source(handle).map_err(super::win32_err)
+}
+
+/// `_winapi.ReportEvent(handle, type, category, event_id, string, /)` —
+/// [3.15-spec], as [`RegisterEventSource`].  The one string is the only
+/// insertion `ReportEventW` receives.
+#[pyre_interpreter::pyre_function]
+pub fn ReportEvent(
+    handle: PyObjectRef,
+    event_type: PyCUShort,
+    category: PyCUShort,
+    event_id: PyCUInt,
+    string: PyObjectRef,
+) -> Result<(), pyre_interpreter::PyError> {
+    let handle = handle_w(
+        handle,
+        IntArg::At {
+            function: "ReportEvent",
+            position: 1,
+        },
+    )?;
+    let string = wide(
+        string,
+        WideArg::Numbered {
+            function: "ReportEvent",
+            position: 5,
+        },
+    )?;
+    host_winapi::report_event_w(handle, event_type, category, event_id, &string)
+        .map_err(super::win32_err)
+}
+
 // ── waiting ──
 
 /// The most handles a wait may name.  `MAXIMUM_WAIT_OBJECTS` is 64 and the
@@ -983,12 +1052,15 @@ pub fn install(ns: PyObjectRef) {
             CreateFileMapping,
             CreateJunction,
             CreateNamedPipe,
+            DeregisterEventSource,
             ExitProcess,
             GetACP,
             GetVersion,
             MapViewOfFile,
             OpenFileMapping,
             OpenProcess,
+            RegisterEventSource,
+            ReportEvent,
             SetNamedPipeHandleState,
             UnmapViewOfFile,
             VirtualQuerySize,

@@ -95,6 +95,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Devices_Bluetooth",
+    "Win32_System_Registry",
     "Win32_System_Threading",
 ] }
 # Builds the `WideCStr` key/value-name arguments the `rustpython_host_env::winreg`

@@ -448,6 +448,16 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
             flags.legacy_windows_stdio,
             "PYTHONLEGACYWINDOWSSTDIO",
         );
+        // `_PyPreConfig_Write` sets `LC_CTYPE` to the user preferred locale,
+        // so `locale.setlocale(locale.LC_CTYPE)` reports it (measured at
+        // v3.15.0: `Korean_Korea.949`, where this build reported `C`).
+        // PyPy's `app_main.py initstdio` makes the same
+        // `setlocale(LC_CTYPE, "")` call; the unix arm makes it from
+        // `locale_implies_utf8_mode`.
+        #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+        if LAUNCH_ENV.lock().is_none() {
+            let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
+        }
     }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
     flags.optimize = resolve_counter(&flags, flags.optimize, "PYTHONOPTIMIZE");

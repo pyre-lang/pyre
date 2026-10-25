@@ -681,6 +681,24 @@ macro_rules! win_const {
     (ERROR_SEM_TIMEOUT) => {
         121 as i64
     };
+    (EVENTLOG_SUCCESS) => {
+        0x0000 as i64
+    };
+    (EVENTLOG_AUDIT_FAILURE) => {
+        0x0010 as i64
+    };
+    (EVENTLOG_AUDIT_SUCCESS) => {
+        0x0008 as i64
+    };
+    (EVENTLOG_ERROR_TYPE) => {
+        0x0001 as i64
+    };
+    (EVENTLOG_INFORMATION_TYPE) => {
+        0x0004 as i64
+    };
+    (EVENTLOG_WARNING_TYPE) => {
+        0x0002 as i64
+    };
     (STD_INPUT_HANDLE) => {
         0xFFFF_FFF6u32 as i64
     };
@@ -1019,6 +1037,13 @@ pyre_interpreter::py_module! {
         "ERROR_PIPE_BUSY" => win_const!(ERROR_PIPE_BUSY),
         "ERROR_PIPE_CONNECTED" => win_const!(ERROR_PIPE_CONNECTED),
         "ERROR_SEM_TIMEOUT" => win_const!(ERROR_SEM_TIMEOUT),
+        // Event types `ReportEvent` takes (winnt.h).
+        "EVENTLOG_SUCCESS" => win_const!(EVENTLOG_SUCCESS),
+        "EVENTLOG_AUDIT_FAILURE" => win_const!(EVENTLOG_AUDIT_FAILURE),
+        "EVENTLOG_AUDIT_SUCCESS" => win_const!(EVENTLOG_AUDIT_SUCCESS),
+        "EVENTLOG_ERROR_TYPE" => win_const!(EVENTLOG_ERROR_TYPE),
+        "EVENTLOG_INFORMATION_TYPE" => win_const!(EVENTLOG_INFORMATION_TYPE),
+        "EVENTLOG_WARNING_TYPE" => win_const!(EVENTLOG_WARNING_TYPE),
         // `subprocess` imports these at module load (its Windows branch, taken
         // once `msvcrt` exists) — GetStdHandle ids, ShowWindow/STARTUPINFO
         // flags, and CreateProcess creation/priority flags (winbase.h,

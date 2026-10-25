@@ -50,6 +50,18 @@ impl W_HKEY {
         !self.hkey.is_null()
     }
 
+    /// [3.15-spec] `W_HKEY.typedef` has no comparison, so two keys compare by
+    /// identity; `PyHKEY_richcompare` at v3.15.0 compares two `PyHKEY`s by
+    /// handle value and answers `NotImplemented` for anything else or for an
+    /// ordering (`test_winreg.BaseWinregTests.test_hkey_comparison`).
+    fn __eq__(&self, w_other: PyObjectRef) -> PyObjectRef {
+        hkey_richcompare(self, w_other, true)
+    }
+
+    fn __ne__(&self, w_other: PyObjectRef) -> PyObjectRef {
+        hkey_richcompare(self, w_other, false)
+    }
+
     /// `W_HKEY.descr_handle_get` — the handle as the integer it points at.
     /// `PyHKEY_memberlist` reads the same field through a `Py_T_INT` member,
     /// which on a 64-bit host truncates it to the low word; the property
@@ -119,6 +131,14 @@ impl W_HKEY {
     pub fn _finalize_(&mut self) {
         let _ = close_key_obj(self as *mut Self as PyObjectRef);
     }
+}
+
+/// `PyHKEY_richcompare` for `Py_EQ` (`eq`) and `Py_NE`.
+fn hkey_richcompare(w_self: &W_HKEY, w_other: PyObjectRef, eq: bool) -> PyObjectRef {
+    let Some(other) = W_HKEY::from_obj(w_other) else {
+        return pyre_object::w_not_implemented();
+    };
+    pyre_object::w_bool_from((w_self.hkey == other.hkey) == eq)
 }
 
 /// The GC type `W_HKEY` registers, in `build_gc` order after the
@@ -1256,6 +1276,41 @@ fn delete_key(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyE
     check(unsafe { host_reg::delete_key(key, &sub_key) })
 }
 
+/// [3.15-spec] `interp_winreg.py` has no `DeleteTree`; `winreg_DeleteTree_impl`
+/// at v3.15.0 audits `winreg.DeleteTree` and calls `RegDeleteTreeW`, where a
+/// missing or `None` sub-key empties the key itself
+/// (`test_winreg.Win64WinregTests.test_delete_tree`).  `rustpython_host_env`
+/// wraps no `RegDeleteTreeW`, so the call goes through `windows-sys`.
+fn delete_tree(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    // `_PyArg_CheckPositional("DeleteTree", nargs, 1, 2)`.
+    let given = args.iter().filter(|value| !value.is_null()).count();
+    if given < 1 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "DeleteTree expected at least 1 argument, got {given}"
+        )));
+    }
+    if given > 2 {
+        return Err(pyre_interpreter::PyError::type_error(format!(
+            "DeleteTree expected at most 2 arguments, got {given}"
+        )));
+    }
+    let key = as_hkey(args[0], false)?;
+    let sub_key = match args.get(1).copied().filter(|value| !value.is_null()) {
+        Some(w_sub_key) => opt_text(w_sub_key, "DeleteTree", "2")?
+            .map(wide)
+            .transpose()?,
+        None => None,
+    };
+    audit_key(
+        "winreg.DeleteTree",
+        &[AuditArg::Key(key), audit_name(sub_key.as_deref())],
+    )?;
+    let sub_key_ptr = sub_key
+        .as_deref()
+        .map_or(core::ptr::null(), |name| name.as_ptr());
+    check(unsafe { windows_sys::Win32::System::Registry::RegDeleteTreeW(key, sub_key_ptr) })
+}
+
 fn delete_value(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     let pos = exact_args(args, "DeleteValue", 2)?;
     let key = as_hkey(pos[0], false)?;
@@ -1526,6 +1581,12 @@ pub fn install(ns: PyObjectRef) {
             delete_key,
             "($module, key, sub_key, /)",
             "Deletes the specified key.\n\n  key\n    An already open key, or any one of the predefined HKEY_* constants.\n  sub_key\n    A string that must be the name of a subkey of the key identified by\n    the key parameter. This value must not be None, and the key may not\n    have subkeys.\n\nThis method can not delete keys with subkeys.\n\nIf the function succeeds, the entire key, including all of its values,\nis removed.  If the function fails, an OSError exception is raised.",
+        ),
+        (
+            "DeleteTree",
+            delete_tree,
+            "($module, key, sub_key=None, /)",
+            "Deletes the specified key and all its subkeys and values recursively.\n\n  key\n    An already open key, or any one of the predefined HKEY_* constants.\n  sub_key\n    A string that names the subkey to delete. If None, deletes all subkeys\n    and values of the specified key.\n\nThis function deletes a key and all its descendants. If sub_key is None,\nall subkeys and values of the specified key are deleted.",
         ),
         (
             "DeleteValue",
