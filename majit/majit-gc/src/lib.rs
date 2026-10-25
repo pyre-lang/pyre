@@ -1,4 +1,4 @@
-pub use collector::{FinalizerDeque, HEAP_DUMP_EIO};
+pub use collector::{FinalizerDeque, FinalizerQueueTable, HEAP_DUMP_EIO};
 pub use gcreftracer::{GcTable, install_gc_table_walker};
 pub use header::{
     GC_FLAG_SHIFT, GC_HEADER_WORD_SIZE, GC_IMMORTAL_LEAF_HEADER, GC_TYPE_ID_BITS,
@@ -1268,6 +1268,15 @@ pub trait GcAllocator: Send {
     /// framework.py `gc_fq_register`: register `obj` with one translated
     /// finalizer handler.  Backends without finalizer queues ignore it.
     fn register_finalizer(&mut self, _fq_index: usize, _obj: GcRef) {}
+
+    /// The gctransformer's `finalizer_queue_indexes` / `finalizer_handlers`
+    /// for this collector's `gcdata`. `None` when this allocator has no
+    /// FinalizerQueue table.
+    fn finalizer_queue_table(
+        &self,
+    ) -> Option<std::sync::Arc<crate::collector::FinalizerQueueTable>> {
+        None
+    }
 
     /// incminimark.py `ignore_finalizer` / framework.py
     /// `gct_gc_ignore_finalizer`: mark `obj` so the finalizer queues skip it.
@@ -4560,21 +4569,49 @@ pub fn gc_remove_root(slot: *mut GcRef) -> bool {
 /// rgc.py `FinalizerQueue.register_finalizer` - routed to the active backend GC.
 pub type RegisterFinalizerFn = fn(fq_index: usize, obj: GcRef);
 
+/// Pointer to the active collector's `FinalizerQueueTable`. Null means fall
+/// through to the `gc_sync` singleton handle. The getter must not borrow the
+/// collector (`framework.py ll_next_dead` closes over its own `AddressDeque`).
+pub type ActiveFinalizerQueuesFn = fn() -> *const FinalizerQueueTable;
+
 global_hook!(static ACTIVE_REGISTER_FINALIZER: RegisterFinalizerFn);
+global_hook!(static ACTIVE_FINALIZER_QUEUES: ActiveFinalizerQueuesFn);
 
 /// Install the active backend's `gc_fq_register` trampoline. Pass `None` to
-/// clear. `get_finalizer_queue_index` / `gc_fq_next_dead` operate on the
-/// process-wide table (`framework.py get_finalizer_queue_index`) and do not
-/// go through a backend hook.
+/// clear. `get_finalizer_queue_index` / `gc_fq_next_dead` use
+/// [`set_active_finalizer_queue_table`] and never borrow the collector.
 pub fn set_active_finalizer_hooks(register: Option<RegisterFinalizerFn>) {
     ACTIVE_REGISTER_FINALIZER.set(register);
 }
 
+/// Install a getter for the active collector's `finalizer_handlers`. Pass
+/// `None` to clear. A getter that returns null falls through to the
+/// `gc_sync` singleton table handle.
+pub fn set_active_finalizer_queue_table(getter: Option<ActiveFinalizerQueuesFn>) {
+    ACTIVE_FINALIZER_QUEUES.set(getter);
+}
+
+fn active_finalizer_queues() -> Option<&'static FinalizerQueueTable> {
+    if let Some(getter) = ACTIVE_FINALIZER_QUEUES.get() {
+        let p = getter();
+        if !p.is_null() {
+            // SAFETY: the getter returns the table published next to the
+            // active collector (backend TLS `Arc` clone, or null to fall
+            // through). The `Arc` keeps the table alive for the collector's
+            // lifetime.
+            return Some(unsafe { &*p });
+        }
+    }
+    gc_sync::singleton_finalizer_queues()
+}
+
 /// framework.py `get_finalizer_queue_index` — allocate or reuse the handler
-/// index for this FinalizerQueue, identified by `tag.fq`. Process-wide table;
-/// never borrows the collector.
+/// index for this FinalizerQueue, identified by `tag.fq`. Operates on the
+/// active collector's table; never borrows the collector.
 pub fn gc_get_finalizer_queue_index(tag: FinalizerQueueTag) -> usize {
-    collector::get_finalizer_queue_index(tag)
+    active_finalizer_queues()
+        .expect("get_finalizer_queue_index requires an active collector")
+        .get_finalizer_queue_index(tag)
 }
 
 /// Register an object with an RPython-style finalizer queue on the active GC.
@@ -4675,13 +4712,14 @@ pub fn gc_ignore_finalizer(obj: GcRef) {
     gc_sync::gc_op(|gc| gc.ignore_finalizer(obj));
 }
 
-/// Pop one object from the process-wide finalizer death queue.
+/// Pop one object from the active collector's finalizer death queue.
 ///
 /// `framework.py gct_gc_fq_next_dead` is `direct_call(ll_next_dead)` where
 /// `ll_next_dead` closes over its own `AddressDeque` and never enters the
 /// collector.
 pub fn gc_fq_next_dead(fq_index: usize) -> Option<GcRef> {
-    collector::finalizer_deque(fq_index)
+    active_finalizer_queues()
+        .and_then(|table| table.finalizer_deque(fq_index))
         .and_then(|deque| deque.popleft())
         .map(GcRef)
 }

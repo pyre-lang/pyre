@@ -228,9 +228,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 let name = pyre_object::with_roots!(w_name => {
                     pyre_interpreter::baseobjspace::text0_w(w_name)
                 })?;
+                let ll_name = majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()))
+                    .map_err(|e| {
+                        crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+                    })?;
                 let pw = pyre_object::with_roots!(w_name => {
-                    let ll_name =
-                        majit_rlib::rffi::scoped_str2charp::new(Some(name.as_bytes()));
                     unsafe { ll::c_getpwnam(ll_name.buf) }
                 });
                 if pw.is_null() {

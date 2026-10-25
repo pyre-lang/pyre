@@ -116,8 +116,10 @@ pub mod host {
         #[cfg(all(unix, not(feature = "sandbox")))]
         pub fn var(key: &str) -> Result<String, std::env::VarError> {
             match majit_rlib::rposix_environ::getenv_llimpl(key.as_bytes()) {
-                None => Err(std::env::VarError::NotPresent),
-                Some(bytes) => String::from_utf8(bytes).map_err(|e| {
+                // `rposix_environ.py getenv_llimpl` lets `str2charp`'s MemoryError escape.
+                Err(_) => panic!("MemoryError while reading environment variable {key}"),
+                Ok(None) => Err(std::env::VarError::NotPresent),
+                Ok(Some(bytes)) => String::from_utf8(bytes).map_err(|e| {
                     use std::os::unix::ffi::OsStringExt;
                     std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(e.into_bytes()))
                 }),
@@ -3383,8 +3385,11 @@ fn compute_startup_path_config() -> StartupPathConfig {
 fn compute_startup_path_config() -> StartupPathConfig {
     use std::os::unix::ffi::OsStrExt;
     let executable = PathBuf::from("/bin/pyre");
-    let stdlib = crate::host_seam::getenv(b"PYRE_STDLIB")
-        .map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+    let stdlib = match crate::host_seam::getenv(b"PYRE_STDLIB") {
+        Ok(value) => value.map(|bytes| PathBuf::from(std::ffi::OsStr::from_bytes(&bytes))),
+        // `rposix_environ.py getenv_llimpl` lets `str2charp`'s MemoryError escape.
+        Err(_) => panic!("MemoryError while reading environment variable PYRE_STDLIB"),
+    };
     StartupPathConfig {
         base_executable: executable.clone(),
         prefix: PathBuf::from("/bin"),

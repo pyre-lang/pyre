@@ -36,17 +36,15 @@ pub struct OutOfRange {
 ///
 /// `track_allocation` is `lltype.malloc(..., track_allocation=...)`. Both arms
 /// allocate with `malloc`; the flag only selects the debug tracker upstream.
-pub fn str2charp(s: &[u8], track_allocation: bool) -> CCHARP {
+/// `lltype.malloc(..., flavor='raw')` raises `MemoryError`.
+pub fn str2charp(s: &[u8], track_allocation: bool) -> Result<CCHARP, MemoryError> {
     let _ = track_allocation;
     let bytes = s.len().checked_add(1).expect("str2charp length overflow");
     unsafe {
-        let array = raw_malloc_raise_null(bytes).cast::<super::CHAR>();
-        if array.is_null() {
-            return array;
-        }
+        let array = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
         copy_bytes(s.as_ptr(), array.cast(), s.len());
         *array.add(s.len()) = 0;
-        array
+        Ok(array)
     }
 }
 
@@ -135,8 +133,8 @@ pub unsafe fn constcharpsize2str(cp: CONST_CCHARP, size: usize) -> Vec<u8> {
 }
 
 /// `str2constcharp`. [`str2charp`] cast to `CONST_CCHARP`.
-pub fn str2constcharp(s: &[u8], track_allocation: bool) -> CONST_CCHARP {
-    cast::<CONST_CCHARP>(str2charp(s, track_allocation))
+pub fn str2constcharp(s: &[u8], track_allocation: bool) -> Result<CONST_CCHARP, MemoryError> {
+    Ok(cast::<CONST_CCHARP>(str2charp(s, track_allocation)?))
 }
 
 /// `rffi.get_nonmovingbuffer_ll` (`jit.dont_look_inside`).
@@ -151,29 +149,27 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> CONST_CCHARP {
 /// byte is left uninitialized; [`get_nonmovingbuffer_ll_final_null`] writes the
 /// NUL. The `llobj` place is `()` because the copy does not retain a GC string.
 #[majit_macros::dont_look_inside]
-pub fn get_nonmovingbuffer_ll(data: &[u8]) -> (CCHARP, (), u8) {
+pub fn get_nonmovingbuffer_ll(data: &[u8]) -> Result<(CCHARP, (), u8), MemoryError> {
     let count = data.len();
     // `count + (TYPEP is CCHARP)`: a byte string gets one extra byte.
     let bytes = count
         .checked_add(1)
         .expect("get_nonmovingbuffer_ll length overflow");
     unsafe {
-        let buf = raw_malloc_raise_null(bytes).cast::<super::CHAR>();
-        if buf.is_null() {
-            return (buf, (), FLAG_RAW_COPY);
-        }
+        let buf = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
         copy_bytes(data.as_ptr(), buf.cast(), count);
-        (buf, (), FLAG_RAW_COPY)
+        Ok((buf, (), FLAG_RAW_COPY))
     }
 }
 
 /// `rffi.get_nonmovingbuffer_ll_final_null` (`jit.dont_look_inside`). Writes
-/// the NUL at `len(data)`.
+/// the NUL at `len(data)` after a successful allocation (`rffi.py
+/// get_nonmovingbuffer_ll_final_null`).
 #[majit_macros::dont_look_inside]
-pub fn get_nonmovingbuffer_ll_final_null(data: &[u8]) -> (CCHARP, (), u8) {
-    let (buf, llobj, flag) = get_nonmovingbuffer_ll(data);
+pub fn get_nonmovingbuffer_ll_final_null(data: &[u8]) -> Result<(CCHARP, (), u8), MemoryError> {
+    let (buf, llobj, flag) = get_nonmovingbuffer_ll(data)?;
     unsafe { *buf.add(data.len()) = 0 };
-    (buf, llobj, flag)
+    Ok((buf, llobj, flag))
 }
 
 /// `rffi.free_nonmovingbuffer_ll` (`jit.dont_look_inside`).
@@ -277,22 +273,21 @@ pub unsafe fn keep_buffer_alive_until_here(_raw_buf: CCHARP, gc_buf: Vec<u8>, _c
 }
 
 /// `liststr2charpp`. NULL-terminated `char**`; each entry is a [`str2charp`].
-pub fn liststr2charpp(list: &[&[u8]]) -> super::CCHARPP {
+pub fn liststr2charpp(list: &[&[u8]]) -> Result<super::CCHARPP, MemoryError> {
     let n = list.len();
-    let bytes = n
-        .checked_add(1)
-        .and_then(|n| n.checked_mul(core::mem::size_of::<CCHARP>()))
-        .expect("liststr2charpp length overflow");
+    let n1 = n.checked_add(1).expect("liststr2charpp length overflow");
+    // `ovfcheck(itemsize * n)` in `transform.py _ll_compute_size` is MemoryError.
+    let bytes = n1
+        .checked_mul(core::mem::size_of::<CCHARP>())
+        .ok_or(MemoryError)?;
     unsafe {
-        let array = raw_malloc_raise_null(bytes).cast::<CCHARP>();
-        if array.is_null() {
-            return array;
-        }
+        let array = raw_malloc_or_memory_error(bytes)?.cast::<CCHARP>();
         for (i, item) in list.iter().enumerate() {
-            *array.add(i) = str2charp(item, true);
+            // `rffi.py liststr2charpp`: a raise from `str2charp` leaks earlier elements.
+            *array.add(i) = str2charp(item, true)?;
         }
         *array.add(n) = core::ptr::null_mut();
-        array
+        Ok(array)
     }
 }
 
@@ -385,18 +380,20 @@ pub unsafe fn wcharp2utf8n(w: CWCHARP, maxlen: usize) -> Result<(Vec<u8>, usize)
 /// walking the whole string. The check stays on outside tests too, because a
 /// short count would make the walk write past the block. `track_allocation`
 /// is the same debug-tracker flag as [`str2charp`].
-pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHARP {
+pub fn utf82wcharp(
+    utf8: &[u8],
+    utf8len: usize,
+    track_allocation: bool,
+) -> Result<CWCHARP, MemoryError> {
     let _ = track_allocation;
     assert_eq!(utf8len, codepoint_len(utf8));
     let chars = utf8len.checked_add(2).expect("utf82wcharp length overflow");
+    // `ovfcheck(itemsize * n)` in `transform.py _ll_compute_size` is MemoryError.
     let bytes = chars
         .checked_mul(core::mem::size_of::<Wchar>())
-        .expect("utf82wcharp size overflow");
+        .ok_or(MemoryError)?;
     unsafe {
-        let w = raw_malloc_raise_null(bytes).cast::<Wchar>();
-        if w.is_null() {
-            return w;
-        }
+        let w = raw_malloc_or_memory_error(bytes)?.cast::<Wchar>();
         let mut index = 0;
         let mut pos = 0;
         while let Some(ch) = next_codepoint(utf8, &mut pos) {
@@ -404,7 +401,7 @@ pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHA
             index += 1;
         }
         *w.add(index) = 0;
-        w
+        Ok(w)
     }
 }
 
@@ -413,7 +410,11 @@ pub fn utf82wcharp(utf8: &[u8], utf8len: usize, track_allocation: bool) -> CWCHA
 /// in the input pass through. `unilen` is accepted and unused, and the block
 /// holds `wlen + 3` units, where `wlen` counts the units written before the
 /// zero terminator.
-pub fn utf82wcharp_ex(utf8: &[u8], unilen: usize, track_allocation: bool) -> CWCHARP {
+pub fn utf82wcharp_ex(
+    utf8: &[u8],
+    unilen: usize,
+    track_allocation: bool,
+) -> Result<CWCHARP, MemoryError> {
     let _ = (unilen, track_allocation);
     let mut wlen: usize = 0;
     let mut pos = 0;
@@ -423,15 +424,13 @@ pub fn utf82wcharp_ex(utf8: &[u8], unilen: usize, track_allocation: bool) -> CWC
         }
         wlen += 1;
     }
-    let bytes = wlen
-        .checked_add(3)
-        .and_then(|n| n.checked_mul(core::mem::size_of::<Wchar>()))
-        .expect("utf82wcharp_ex size overflow");
+    let n = wlen.checked_add(3).expect("utf82wcharp_ex length overflow");
+    // `ovfcheck(itemsize * n)` in `transform.py _ll_compute_size` is MemoryError.
+    let bytes = n
+        .checked_mul(core::mem::size_of::<Wchar>())
+        .ok_or(MemoryError)?;
     unsafe {
-        let w = raw_malloc_raise_null(bytes).cast::<Wchar>();
-        if w.is_null() {
-            return w;
-        }
+        let w = raw_malloc_or_memory_error(bytes)?.cast::<Wchar>();
         let mut index = 0;
         let mut pos = 0;
         while let Some(ch) = next_codepoint(utf8, &mut pos) {
@@ -446,7 +445,7 @@ pub fn utf82wcharp_ex(utf8: &[u8], unilen: usize, track_allocation: bool) -> CWC
         }
         *w.add(index) = 0;
         assert_eq!(wlen, index);
-        w
+        Ok(w)
     }
 }
 
@@ -468,12 +467,12 @@ pub struct scoped_str2charp {
 }
 
 impl scoped_str2charp {
-    pub fn new(value: Option<&[u8]>) -> Self {
+    pub fn new(value: Option<&[u8]>) -> Result<Self, MemoryError> {
         let buf = match value {
-            Some(s) => str2charp(s, true),
+            Some(s) => str2charp(s, true)?,
             None => core::ptr::null_mut(),
         };
-        Self { buf }
+        Ok(Self { buf })
     }
 }
 
@@ -495,9 +494,9 @@ pub struct scoped_nonmovingbuffer {
 }
 
 impl scoped_nonmovingbuffer {
-    pub fn new(data: &[u8]) -> Self {
-        let (buf, llobj, flag) = get_nonmovingbuffer_ll(data);
-        Self { buf, llobj, flag }
+    pub fn new(data: &[u8]) -> Result<Self, MemoryError> {
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll(data)?;
+        Ok(Self { buf, llobj, flag })
     }
 }
 
@@ -519,9 +518,9 @@ pub struct scoped_view_charp {
 }
 
 impl scoped_view_charp {
-    pub fn new(data: &[u8]) -> Self {
-        let (buf, llobj, flag) = get_nonmovingbuffer_ll_final_null(data);
-        Self { buf, llobj, flag }
+    pub fn new(data: &[u8]) -> Result<Self, MemoryError> {
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll_final_null(data)?;
+        Ok(Self { buf, llobj, flag })
     }
 }
 
@@ -582,7 +581,7 @@ pub struct scoped_utf82wcharp {
 }
 
 impl scoped_utf82wcharp {
-    pub fn new(value: Option<&[u8]>, unicode_len: isize) -> Self {
+    pub fn new(value: Option<&[u8]>, unicode_len: isize) -> Result<Self, MemoryError> {
         let buf = match value {
             None => core::ptr::null_mut(),
             Some(utf8) => {
@@ -591,10 +590,10 @@ impl scoped_utf82wcharp {
                 } else {
                     unicode_len as usize
                 };
-                utf82wcharp(utf8, n, true)
+                utf82wcharp(utf8, n, true)?
             }
         };
-        Self { buf }
+        Ok(Self { buf })
     }
 }
 
@@ -695,16 +694,13 @@ unsafe fn copy_bytes(src: *const u8, dst: *mut u8, n: usize) {
     }
 }
 
-/// `lltype.malloc(..., flavor='raw')` / `lltype.free(..., flavor='raw')`:
-/// `malloc` / `free`. A zero-byte request still returns a unique block;
-/// `malloc(0)` is implementation-defined and a later `offset` on NULL is not.
-/// Allocation failure returns NULL; the caller raises MemoryError.
-fn raw_malloc_raise_null(size: usize) -> *mut u8 {
+/// `lltype.malloc(..., flavor='raw')` for helpers called from ordinary Rust.
+/// NULL from [`raw_malloc`] is [`MemoryError`]. Does not call
+/// `majit_gc::raise_memory_error` (`raw_malloc_memory_error` is the
+/// `extern "C"` `ll_raw_malloc_*` path).
+fn raw_malloc_or_memory_error(size: usize) -> Result<*mut u8, MemoryError> {
     let p = unsafe { raw_malloc(size) };
-    if p.is_null() {
-        majit_gc::raise_memory_error();
-    }
-    p
+    if p.is_null() { Err(MemoryError) } else { Ok(p) }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -772,17 +768,24 @@ unsafe fn raw_free(ptr: *mut u8) {
     unsafe { std::alloc::dealloc(base, layout) }
 }
 
+/// `framework.py raw_malloc_memory_pressure`: charge `sizehint`, `adr=NULL`.
+fn raw_malloc_fixedsize_memory_pressure(size: i64) {
+    majit_gc::add_memory_pressure(size as isize, majit_ir::GcRef::NULL);
+}
+
 /// Fixed-size `lltype.malloc(STRUCT, flavor='raw')`.
 ///
-/// `support.py build_ll_0_raw_malloc_fixedsize` bakes the STRUCT into a
-/// zero-argument `_ll_0_raw_malloc_fixedsize` (and `_zero` when `zero=True`).
-/// The size here is a constant argument; alignment stays inside `raw_malloc`.
-/// `GCTransformer` publishes the helper as one `Signed`.
+/// `support.py build_raw_malloc_fixedsize_builder` closes `zero` /
+/// `add_memory_pressure` / `track_allocation` into one helper per flag
+/// combination. The size is a constant argument; alignment stays inside
+/// `raw_malloc`. `GCTransformer` publishes the helper as one `Signed`.
 ///
 /// `size` and the address are `i64` words (`extern "C"`). A `usize` parameter
 /// is i32 on wasm32, and `call_indirect` requires this signature.
-#[inline(never)]
-pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
+fn raw_malloc_fixedsize_core(size: i64, zero: bool, add_memory_pressure: bool) -> i64 {
+    if add_memory_pressure {
+        raw_malloc_fixedsize_memory_pressure(size);
+    }
     let Ok(bytes) = usize::try_from(size) else {
         return raw_malloc_memory_error();
     };
@@ -790,7 +793,15 @@ pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
     if ptr.is_null() {
         return raw_malloc_memory_error();
     }
+    if zero && bytes > 0 {
+        unsafe { ptr.write_bytes(0, bytes) };
+    }
     ptr as usize as i64
+}
+
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
+    raw_malloc_fixedsize_core(size, false, false)
 }
 
 /// `zero=True` form of [`ll_raw_malloc_fixedsize`]. The block is cleared
@@ -798,17 +809,45 @@ pub extern "C" fn ll_raw_malloc_fixedsize(size: i64) -> i64 {
 /// and writes nothing. Same word ABI as [`ll_raw_malloc_fixedsize`].
 #[inline(never)]
 pub extern "C" fn ll_raw_malloc_fixedsize_zero(size: i64) -> i64 {
-    let Ok(bytes) = usize::try_from(size) else {
-        return raw_malloc_memory_error();
-    };
-    let ptr = unsafe { raw_malloc(bytes) };
-    if ptr.is_null() {
-        return raw_malloc_memory_error();
-    }
-    if bytes > 0 {
-        unsafe { ptr.write_bytes(0, bytes) };
-    }
-    ptr as usize as i64
+    raw_malloc_fixedsize_core(size, true, false)
+}
+
+/// `_rewrite_raw_malloc` `name += '_add_memory_pressure'`.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize_add_memory_pressure(size: i64) -> i64 {
+    raw_malloc_fixedsize_core(size, false, true)
+}
+
+/// `_rewrite_raw_malloc` `_zero` + `_add_memory_pressure`.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize_zero_add_memory_pressure(size: i64) -> i64 {
+    raw_malloc_fixedsize_core(size, true, true)
+}
+
+/// `_rewrite_raw_malloc` `name += '_no_track_allocation'`. The port does
+/// no leak tracking; the allocation is the same as the base helper.
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize_no_track_allocation(size: i64) -> i64 {
+    ll_raw_malloc_fixedsize(size)
+}
+
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize_zero_no_track_allocation(size: i64) -> i64 {
+    ll_raw_malloc_fixedsize_zero(size)
+}
+
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation(
+    size: i64,
+) -> i64 {
+    ll_raw_malloc_fixedsize_add_memory_pressure(size)
+}
+
+#[inline(never)]
+pub extern "C" fn ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation(
+    size: i64,
+) -> i64 {
+    ll_raw_malloc_fixedsize_zero_add_memory_pressure(size)
 }
 
 /// `transform.py _ll_compute_size`: `ovfcheck(itemsize * n)` then
@@ -1087,6 +1126,46 @@ publish_raw_varsize!(
     ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation,
     4
 );
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize,
+    ll_raw_malloc_fixedsize,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_zero,
+    ll_raw_malloc_fixedsize_zero,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_add_memory_pressure,
+    ll_raw_malloc_fixedsize_add_memory_pressure,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_zero_add_memory_pressure,
+    ll_raw_malloc_fixedsize_zero_add_memory_pressure,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_no_track_allocation,
+    ll_raw_malloc_fixedsize_no_track_allocation,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_zero_no_track_allocation,
+    ll_raw_malloc_fixedsize_zero_no_track_allocation,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation,
+    ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation,
+    1
+);
+publish_raw_varsize!(
+    __MAJIT_HELPER_FNADDR_ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation,
+    ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation,
+    1
+);
 
 #[cfg(target_arch = "wasm32")]
 #[ctor::ctor(unsafe)]
@@ -1166,6 +1245,54 @@ fn __majit_register_helper_fnaddr_ll_raw_malloc_varsize() {
     );
 }
 
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn __majit_register_helper_fnaddr_ll_raw_malloc_fixedsize() {
+    fn add(path: &'static str, addr: *const (), arity: u8) {
+        majit_ir::helper_fnaddr::register(path, addr, arity);
+    }
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize",
+        ll_raw_malloc_fixedsize as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero",
+        ll_raw_malloc_fixedsize_zero as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_add_memory_pressure",
+        ll_raw_malloc_fixedsize_add_memory_pressure as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_add_memory_pressure",
+        ll_raw_malloc_fixedsize_zero_add_memory_pressure as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_no_track_allocation",
+        ll_raw_malloc_fixedsize_no_track_allocation as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_no_track_allocation",
+        ll_raw_malloc_fixedsize_zero_no_track_allocation as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation",
+        ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation as *const (),
+        1,
+    );
+    add(
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation",
+        ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation as *const (),
+        1,
+    );
+}
+
 /// `lltype.free(ptr, flavor='raw')`. `jtransform.py rewrite_op_free`
 /// residualizes this as `raw_free`; the call cannot raise.
 /// `ptr` is an `i64` word; the body casts it to `usize`.
@@ -1179,12 +1306,15 @@ pub extern "C" fn ll_raw_free(ptr: i64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ll_raw_free, ll_raw_malloc_fixedsize, ll_raw_malloc_fixedsize_zero, ll_raw_malloc_varsize,
-        ll_raw_malloc_varsize_no_length, ll_raw_malloc_varsize_no_length_zero,
-        ll_raw_malloc_varsize_with_length, ll_raw_malloc_varsize_zero,
+        ll_raw_free, ll_raw_malloc_fixedsize, ll_raw_malloc_fixedsize_add_memory_pressure,
+        ll_raw_malloc_fixedsize_zero, ll_raw_malloc_fixedsize_zero_add_memory_pressure,
+        ll_raw_malloc_varsize, ll_raw_malloc_varsize_no_length,
+        ll_raw_malloc_varsize_no_length_zero, ll_raw_malloc_varsize_with_length,
+        ll_raw_malloc_varsize_zero,
     };
 
     static RAISE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PRESSURE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn fixedsize_roundtrip_zero_clears_and_free() {
@@ -1219,6 +1349,45 @@ mod tests {
         }
         ll_raw_free(odd);
         ll_raw_free(0);
+    }
+
+    /// `framework.py raw_malloc_memory_pressure(sizehint, adr)` charges
+    /// the allocation size. The `_zero` form still clears the block.
+    #[test]
+    fn raw_malloc_fixedsize_add_memory_pressure_charges_size() {
+        use std::sync::atomic::{AtomicIsize, Ordering};
+        static CHARGED: AtomicIsize = AtomicIsize::new(0);
+        fn hook(size: isize, _object: majit_ir::GcRef) {
+            CHARGED.fetch_add(size, Ordering::SeqCst);
+        }
+        let _guard = PRESSURE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        CHARGED.store(0, Ordering::SeqCst);
+        majit_gc::set_active_add_memory_pressure(Some(hook));
+        let ptr = ll_raw_malloc_fixedsize_add_memory_pressure(8);
+        majit_gc::set_active_add_memory_pressure(None);
+        assert_ne!(ptr, 0);
+        assert_eq!(CHARGED.load(Ordering::SeqCst), 8);
+        ll_raw_free(ptr);
+
+        CHARGED.store(0, Ordering::SeqCst);
+        majit_gc::set_active_add_memory_pressure(Some(hook));
+        let zeroed = ll_raw_malloc_fixedsize_zero_add_memory_pressure(8);
+        majit_gc::set_active_add_memory_pressure(None);
+        assert_ne!(zeroed, 0);
+        assert_eq!(CHARGED.load(Ordering::SeqCst), 8);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(zeroed as *const u8, 8);
+            assert!(bytes.iter().all(|b| *b == 0));
+        }
+        ll_raw_free(zeroed);
+
+        CHARGED.store(0, Ordering::SeqCst);
+        majit_gc::set_active_add_memory_pressure(Some(hook));
+        let plain = ll_raw_malloc_fixedsize(8);
+        majit_gc::set_active_add_memory_pressure(None);
+        assert_ne!(plain, 0);
+        assert_eq!(CHARGED.load(Ordering::SeqCst), 0);
+        ll_raw_free(plain);
     }
 
     /// `transform.py _ll_compute_size`: payload is `basesize + n * itemsize`.
@@ -1309,6 +1478,14 @@ mod tests {
         let mut published = Vec::new();
         majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
         for leaf in [
+            "ll_raw_malloc_fixedsize",
+            "ll_raw_malloc_fixedsize_zero",
+            "ll_raw_malloc_fixedsize_add_memory_pressure",
+            "ll_raw_malloc_fixedsize_zero_add_memory_pressure",
+            "ll_raw_malloc_fixedsize_no_track_allocation",
+            "ll_raw_malloc_fixedsize_zero_no_track_allocation",
+            "ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation",
+            "ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation",
             "ll_raw_malloc_varsize",
             "ll_raw_malloc_varsize_zero",
             "ll_raw_malloc_varsize_no_length",
@@ -1330,5 +1507,47 @@ mod tests {
             assert_eq!(layout.size() % super::RAW_MALLOC_ALIGN, 0);
             assert!(layout.size() >= super::RAW_MALLOC_ALIGN + size.max(1));
         }
+    }
+
+    /// Ordinary-Rust raw malloc returns `Err(MemoryError)` and does not
+    /// publish a pending exception (`raw_malloc_or_memory_error`).
+    #[test]
+    fn raw_malloc_or_memory_error_null_does_not_set_pending_exception() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        HITS.store(0, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(hook));
+        let result = super::raw_malloc_or_memory_error(usize::MAX);
+        majit_gc::set_active_raise_memory_error(None);
+        assert_eq!(result, Err(super::MemoryError));
+        assert_eq!(HITS.load(Ordering::SeqCst), 0);
+    }
+
+    /// `rffi.py liststr2charpp`: a failed element `str2charp` is MemoryError
+    /// and does not return a non-null outer array. The allocator cannot be
+    /// forced to fail for a live element here; the overflow of
+    /// `ovfcheck(itemsize * n)` on the outer array is the same error.
+    #[test]
+    fn liststr2charpp_size_overflow_is_memory_error() {
+        // `(n+1) * size_of::<CCHARP>()` overflows when n is this large.
+        // A real `&[&[u8]]` of that length cannot be built, so the
+        // `checked_mul` path is the one this test names.
+        let n = usize::MAX / core::mem::size_of::<super::CCHARP>();
+        assert!(
+            n.checked_add(1)
+                .and_then(|n1| n1.checked_mul(core::mem::size_of::<super::CCHARP>()))
+                .is_none()
+        );
+        // Empty and small lists still allocate.
+        let empty = super::liststr2charpp(&[]).unwrap();
+        unsafe { super::free_charpp(empty) };
+        let pp = super::liststr2charpp(&[b"one", b"two"]).unwrap();
+        let got = unsafe { super::charpp2liststr(pp) };
+        unsafe { super::free_charpp(pp) };
+        assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec()]);
     }
 }

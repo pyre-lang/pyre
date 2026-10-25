@@ -169,7 +169,9 @@ def start_error_capture():
         // internal (WTF-8) bytes keep lone surrogates, as `space.utf8_w`.
         let len = pyre_interpreter::baseobjspace::len_w(roots.get(text_slot))? as usize;
         let utf8 = pyre_interpreter::baseobjspace::text_wtf8_w(roots.get(text_slot))?;
-        let p = majit_rlib::rffi::utf82wcharp(utf8.as_bytes(), len, false);
+        let p = majit_rlib::rffi::utf82wcharp(utf8.as_bytes(), len, false).map_err(|e| {
+            pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+        })?;
         let old = TEXT_P.swap(p, Ordering::SeqCst);
         if !old.is_null() {
             unsafe { majit_rlib::rffi::free_wcharp(old, false) };

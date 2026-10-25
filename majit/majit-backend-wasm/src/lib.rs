@@ -1113,6 +1113,8 @@ extern "C" fn wasm_jit_read_real_errno(save_err: i64) -> i64 {
 /// `gc_box`.
 pub(crate) mod gc_box {
     use super::{GcAllocator, Ordering, RefCell};
+    use std::cell::Cell;
+    use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
     static NEXT_GC_BOX_GEN: AtomicU64 = AtomicU64::new(1);
@@ -1148,6 +1150,15 @@ pub(crate) mod gc_box {
         /// uninstalls when this still matches, so dropping an older
         /// backend cannot clear a newer one on the same thread.
         static WASM_ACTIVE_GC_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Clone of the boxed MiniMark's `finalizer_queues`, stored next to
+        /// (not inside the borrow of) `WASM_ACTIVE_GC` so
+        /// `get_finalizer_queue_index` / `ll_next_dead` need no `RefCell`
+        /// borrow. Follows this thread's boxed collector the same way
+        /// `WASM_ACTIVE_GC` does.
+        static WASM_ACTIVE_FINALIZER_QUEUES: RefCell<Option<Arc<majit_gc::FinalizerQueueTable>>> =
+            const { RefCell::new(None) };
+        static WASM_ACTIVE_FINALIZER_QUEUES_PTR: Cell<*const majit_gc::FinalizerQueueTable> =
+            const { Cell::new(std::ptr::null()) };
     }
 
     /// `&mut` access to this thread's GC box, for allocation, write barriers
@@ -1243,6 +1254,11 @@ pub(crate) mod gc_box {
     /// forgotten, not dropped: a dropped nursery's pages return to the OS
     /// and are reused while still referenced.
     pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) -> (u64, bool) {
+        let table = gc.finalizer_queue_table();
+        let ptr = table
+            .as_ref()
+            .map(|a| Arc::as_ptr(a))
+            .unwrap_or(std::ptr::null());
         let generation = NEXT_GC_BOX_GEN.fetch_add(1, Ordering::Relaxed);
         let installed = WASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
@@ -1256,6 +1272,10 @@ pub(crate) mod gc_box {
             WASM_ACTIVE_GC_GEN.with(|slot| slot.set(generation));
             installed
         });
+        WASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = table;
+        });
+        WASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(ptr));
         (generation, installed)
     }
 
@@ -1270,14 +1290,25 @@ pub(crate) mod gc_box {
     pub(crate) fn clear() -> bool {
         WASM_ACTIVE_GC_GEN.with(|slot| slot.set(0));
         WASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
-        WASM_ACTIVE_GC.with(|cell| {
+        let removed = WASM_ACTIVE_GC.with(|cell| {
             if let Some(gc) = cell.borrow_mut().0.take() {
                 std::mem::forget(gc);
                 true
             } else {
                 false
             }
-        })
+        });
+        WASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(std::ptr::null()));
+        WASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        removed
+    }
+
+    /// Pointer to this thread's boxed collector table, or null when there is
+    /// no box. Does not borrow `WASM_ACTIVE_GC`.
+    pub(super) fn finalizer_queues_ptr() -> *const majit_gc::FinalizerQueueTable {
+        WASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.get())
     }
 
     /// [`clear`] only when `generation` is still the live installation.
@@ -1410,6 +1441,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
         active_gc_minor_collections_since_major,
     ));
     majit_gc::set_active_finalizer_hooks(Some(wasm_register_finalizer));
+    majit_gc::set_active_finalizer_queue_table(Some(wasm_finalizer_queues));
+}
+
+fn wasm_finalizer_queues() -> *const majit_gc::FinalizerQueueTable {
+    gc_box::finalizer_queues_ptr()
 }
 
 /// Live per-thread wasm GC boxes. Root hooks are process-global, so they
@@ -8562,8 +8598,8 @@ mod tests {
 
     /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
     /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
-    /// the process-wide table (`framework.py get_finalizer_queue_index`) and
-    /// do not re-enter the boxed collector.
+    /// the boxed collector's table (`framework.py get_finalizer_queue_index`)
+    /// and do not re-enter the boxed collector.
     #[test]
     fn boxed_collector_next_dead_from_trigger_does_not_panic() {
         use std::sync::atomic::{AtomicUsize, Ordering};

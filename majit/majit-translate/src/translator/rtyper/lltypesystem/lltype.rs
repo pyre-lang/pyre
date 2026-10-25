@@ -22,11 +22,14 @@ use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
 
 use crate::annotator::model::KnownType;
-use crate::flowspace::model::{ConcretetypePlaceholder, ConstValue, GraphKey, GraphRef, Hlvalue};
+use crate::flowspace::model::{
+    ConcretetypePlaceholder, ConstValue, FunctionGraph, GraphKey, GraphRef, Hlvalue,
+};
 use crate::translator::rtyper::error::TyperError;
 
 thread_local! {
@@ -1126,6 +1129,24 @@ impl _func {
             graph,
             _callable,
             attrs,
+        }
+    }
+
+    /// Recover the `GraphRef` stored by [`functionptr_for_graph_with_type`]
+    /// as `GraphKey::of(graph).as_usize()`. The original `Rc` is kept alive
+    /// by `RPythonTyper.lowlevel_helper_graphs` / `translator.graphs`.
+    pub fn graph_ref(&self) -> Option<GraphRef> {
+        let raw = self.graph? as *const RefCell<FunctionGraph>;
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `graph` is `Rc::as_ptr` of a `GraphRef` that still lives
+        // in the helper-graph cache (or `translator.graphs`). Incrementing
+        // the strong count and rebuilding an `Rc` yields a new owner of
+        // that allocation (`llinterp.py` `fobj.graph`).
+        unsafe {
+            Rc::increment_strong_count(raw);
+            Some(Rc::from_raw(raw))
         }
     }
 }

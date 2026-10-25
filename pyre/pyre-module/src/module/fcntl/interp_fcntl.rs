@@ -342,7 +342,12 @@ fn fcntl(
             let data = arg_readbuf(w_arg, "fcntl")?;
             // `fcntl_fcntl_impl` stages a heap copy at the argument's
             // own length when it exceeds the 1024-byte floor.
-            let src = majit_rlib::rffi::scoped_str2charp::new(Some(data));
+            let src = majit_rlib::rffi::scoped_str2charp::new(Some(data)).map_err(|e| {
+                pyre_interpreter::error::get_converted_unexpected_exception(
+                    pyre_object::PY_NULL,
+                    &e,
+                )
+            })?;
             let total = ARG_BUFSZ.max(data.len()) + ARG_GUARD.len();
             let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(|e| {
                 pyre_interpreter::error::get_converted_unexpected_exception(
@@ -728,7 +733,9 @@ fn stage_ioctl(
     request: majit_rlib::rffi::UINT,
     arg: &[u8],
 ) -> Result<(i32, Vec<u8>, bool), pyre_interpreter::PyError> {
-    let ll_arg = FreeCharp(majit_rlib::rffi::str2charp(arg, true));
+    let ll_arg = FreeCharp(majit_rlib::rffi::str2charp(arg, true).map_err(|e| {
+        pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+    })?);
     let total = ARG_BUFSZ.max(arg.len()) + ARG_GUARD.len();
     let buf = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(|e| {
         pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)

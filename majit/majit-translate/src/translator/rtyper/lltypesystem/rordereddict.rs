@@ -22,13 +22,12 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::llinterp::eval_funcptr;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _ptr, _ptr_obj, Array, FuncType, GCREF, LowLevelType, LowLevelValue, MallocFlavor,
-    Ptr, PtrTarget, Struct, cast_opaque_ptr, functionptr, malloc,
+    _ptr, Array, FuncType, GCREF, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget,
+    Struct, cast_opaque_ptr, functionptr, malloc,
 };
-use crate::translator::rtyper::lltypesystem::rstr::{
-    ll_strhash_value, prebuilt_str_bytes_and_hash, sub_helper_funcptr_constant,
-};
+use crate::translator::rtyper::lltypesystem::rstr::sub_helper_funcptr_constant;
 use crate::translator::rtyper::rdict::{AbstractDictIteratorRepr, AbstractDictRepr};
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, gc_flavor_const, lowlevel_type_const,
@@ -10917,23 +10916,29 @@ fn custom_keyeq_deferred() -> TyperError {
     )
 }
 
-/// RPython `d.keyhash(key)` (`rordereddict.py`): the DICT adtmeth, either
-/// `ll_keyhash_custom` or the key repr's `get_ll_hash_function`. Host
-/// evaluation dispatches on the stored funcptr's `_name` (one evaluator
-/// per upstream function the port's reprs return). llinterp cannot run
-/// helper graphs here (`eval_graph` has no `getfield`/`direct_call`/float).
+/// RPython `d.keyhash(key)` (`rordereddict.py` `convert_const`): call the
+/// stored DICT adtmeth funcptr itself. A graph runs through
+/// `LLInterpreter.eval_graph`; a graphless funcptr goes through its
+/// `_callable` (`llinterp.py` `op_direct_call` / `perform_call`).
 fn ll_keyhash(d: &_ptr, key: &LowLevelValue) -> Result<i64, TyperError> {
     match dict_adtmeth(d, "keyhash") {
         Some(adt) if adtmeth_is_byte_str(&adt, b"ll_keyhash_custom") => {
             Err(custom_keyhash_deferred())
         }
         Some(adt) => {
-            let name = adtmeth_func_name(&adt).ok_or_else(|| {
+            let fp = adtmeth_funcptr(&adt).ok_or_else(|| {
                 TyperError::message(format!(
                     "d.keyhash: stored adtmeth is not a funcptr: {adt:?}"
                 ))
             })?;
-            host_eval_stored_keyhash(&name, key)
+            match eval_funcptr(&fp, std::slice::from_ref(key))
+                .map_err(|e| TyperError::message(e.message))?
+            {
+                LowLevelValue::Signed(n) => Ok(n),
+                other => Err(TyperError::message(format!(
+                    "d.keyhash: hash function returned {other:?}"
+                ))),
+            }
         }
         None => Err(TyperError::message(
             "d.keyhash: DICT has no keyhash adtmeth",
@@ -10941,360 +10946,10 @@ fn ll_keyhash(d: &_ptr, key: &LowLevelValue) -> Result<i64, TyperError> {
     }
 }
 
-fn adtmeth_func_name(value: &ConstValue) -> Option<String> {
+fn adtmeth_funcptr(value: &ConstValue) -> Option<_ptr> {
     match value {
-        ConstValue::LLPtr(p) => match p._obj0_value().ok().flatten()? {
-            _ptr_obj::Func(f) => Some(f._name),
-            _ => None,
-        },
-        ConstValue::ByteStr(s) => String::from_utf8(s.clone()).ok(),
+        ConstValue::LLPtr(p) => Some((**p).clone()),
         _ => None,
-    }
-}
-
-fn host_eval_stored_keyhash(fn_name: &str, key: &LowLevelValue) -> Result<i64, TyperError> {
-    if fn_name.starts_with("ll_hash_int") {
-        return host_hash_int(key);
-    }
-    if fn_name.starts_with("ll_tuple_hash_") {
-        return host_hash_tuple(key);
-    }
-    match fn_name {
-        "ll_strhash" => host_hash_str(key),
-        "ll_unicode_hash" => host_hash_unicode(key),
-        "_hash_float" => host_hash_float(key),
-        "ll_inst_hash" => host_hash_identity_ptr(key),
-        "ll_char_hash" | "ll_unichar_hash" => host_hash_int(key),
-        "ll_none_hash" | "ll_hash_void" => Ok(0),
-        "ll_addrhash" => host_hash_addr(key),
-        other => Err(TyperError::message(format!(
-            "d.keyhash: unknown stored hash function {other}"
-        ))),
-    }
-}
-
-fn host_hash_int(key: &LowLevelValue) -> Result<i64, TyperError> {
-    match key {
-        LowLevelValue::Signed(n) => Ok(*n),
-        LowLevelValue::Unsigned(n) => Ok(*n as i64),
-        LowLevelValue::Bool(b) => Ok(i64::from(*b)),
-        LowLevelValue::Char(c) => Ok(*c as i64),
-        LowLevelValue::UniChar(c) => Ok(*c as i64),
-        other => Err(TyperError::message(format!(
-            "ll_hash_int: unsupported key {other:?}"
-        ))),
-    }
-}
-
-fn host_hash_addr(key: &LowLevelValue) -> Result<i64, TyperError> {
-    match key {
-        LowLevelValue::Address(_address::Null) => Ok(0),
-        LowLevelValue::Address(_address::Fake(p)) => Ok(p._hashable_identity() as i64),
-        LowLevelValue::Address(_address::IntCast(n)) => Ok(*n),
-        other => Err(TyperError::message(format!(
-            "ll_addrhash: unsupported key {other:?}"
-        ))),
-    }
-}
-
-fn host_hash_identity_ptr(key: &LowLevelValue) -> Result<i64, TyperError> {
-    match key {
-        LowLevelValue::Ptr(p) => {
-            if !p.nonzero() {
-                Ok(0)
-            } else {
-                Ok(p._hashable_identity() as i64)
-            }
-        }
-        other => Err(TyperError::message(format!(
-            "ll_inst_hash: unsupported key {other:?}"
-        ))),
-    }
-}
-
-fn host_hash_str(key: &LowLevelValue) -> Result<i64, TyperError> {
-    let LowLevelValue::Ptr(p) = key else {
-        return Err(TyperError::message("ll_strhash: key is not a pointer"));
-    };
-    if !p.nonzero() {
-        return Ok(0);
-    }
-    let Some((bytes, stored)) = prebuilt_str_bytes_and_hash(p) else {
-        return Err(TyperError::message("ll_strhash: not a STR pointer"));
-    };
-    if stored != 0 {
-        return Ok(stored);
-    }
-    let h = ll_strhash_value(&bytes);
-    let mut p = p.clone();
-    p.setattr("hash", LowLevelValue::Signed(h))
-        .map_err(TyperError::message)?;
-    Ok(h)
-}
-
-/// `_hash_string` over UniChar ords, then `_ll_strhash`'s `0 → 29872897`
-/// fixup (`LLHelpers.ll_strhash` / `objectmodel._hash_string`). Siphash
-/// is a post-translation replacement and is not used here.
-fn hash_unichar_ords(chars: &[char]) -> i64 {
-    let Some(&first) = chars.first() else {
-        return -1;
-    };
-    let mut x = (first as i64) << 7;
-    for &c in chars {
-        x = 1000003i64.wrapping_mul(x) ^ (c as i64);
-    }
-    x ^= chars.len() as i64;
-    if x == 0 { 29872897 } else { x }
-}
-
-fn unicode_chars_and_stored_hash(p: &_ptr) -> Option<(Vec<char>, i64)> {
-    if !p.nonzero() {
-        return None;
-    }
-    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
-        return None;
-    };
-    if st.TYPE._name != "rpy_unicode" {
-        return None;
-    }
-    let fields = st._fields.lock();
-    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
-        return None;
-    };
-    let mut text = Vec::with_capacity(chars.getlength());
-    for i in 0..chars.getlength() {
-        match chars.getitem(i) {
-            Some(LowLevelValue::UniChar(c)) => text.push(c),
-            _ => return None,
-        }
-    }
-    let hash = match fields.iter().find(|(n, _)| n == "hash") {
-        Some((_, LowLevelValue::Signed(h))) => *h,
-        _ => 0,
-    };
-    Some((text, hash))
-}
-
-fn host_hash_unicode(key: &LowLevelValue) -> Result<i64, TyperError> {
-    let LowLevelValue::Ptr(p) = key else {
-        return Err(TyperError::message("ll_unicode_hash: key is not a pointer"));
-    };
-    if !p.nonzero() {
-        return Ok(0);
-    }
-    let Some((chars, stored)) = unicode_chars_and_stored_hash(p) else {
-        return Err(TyperError::message(
-            "ll_unicode_hash: not a UNICODE pointer",
-        ));
-    };
-    if stored != 0 {
-        return Ok(stored);
-    }
-    let h = hash_unichar_ords(&chars);
-    let mut p = p.clone();
-    p.setattr("hash", LowLevelValue::Signed(h))
-        .map_err(TyperError::message)?;
-    Ok(h)
-}
-
-/// `objectmodel._hash_float` (`rlib/objectmodel.py`).
-fn host_hash_float(key: &LowLevelValue) -> Result<i64, TyperError> {
-    let LowLevelValue::Float(bits) = key else {
-        return Err(TyperError::message(format!(
-            "_hash_float: unsupported key {key:?}"
-        )));
-    };
-    Ok(hash_float_value(f64::from_bits(*bits)))
-}
-
-const TAKE_NEXT: f64 = 2147483648.0; // 2**31
-
-fn hash_float_value(f: f64) -> i64 {
-    if !f.is_finite() {
-        if f.is_infinite() {
-            if f < 0.0 { -271828 } else { 314159 }
-        } else {
-            0
-        }
-    } else if f == 0.0 {
-        0
-    } else {
-        let (mut v, expo) = python_frexp(f);
-        v *= TAKE_NEXT;
-        let hipart = v as i64;
-        v = (v - hipart as f64) * TAKE_NEXT;
-        hipart + (v as i64) + ((expo as i64) << 15)
-    }
-}
-
-/// `math.frexp` used by `_hash_float`: mantissa in `[0.5, 1)` (or
-/// `(-1, -0.5]`), exponent such that `f == mant * 2**exp`.
-fn python_frexp(f: f64) -> (f64, i32) {
-    if f == 0.0 {
-        return (f, 0);
-    }
-    let bits = f.to_bits();
-    let sign = bits & (1u64 << 63);
-    let exp_raw = ((bits >> 52) & 0x7ff) as i32;
-    let mut frac = bits & ((1u64 << 52) - 1);
-    if exp_raw == 0 {
-        if frac == 0 {
-            return (f64::from_bits(sign), 0);
-        }
-        let mut e = -1022;
-        while frac < (1u64 << 52) {
-            frac <<= 1;
-            e -= 1;
-        }
-        frac &= (1u64 << 52) - 1;
-        let mant = f64::from_bits(sign | (1022u64 << 52) | frac);
-        (mant, e)
-    } else {
-        let mant = f64::from_bits(sign | (1022u64 << 52) | frac);
-        (mant, exp_raw - 1022)
-    }
-}
-
-fn host_hash_tuple(key: &LowLevelValue) -> Result<i64, TyperError> {
-    let LowLevelValue::Ptr(p) = key else {
-        return Err(TyperError::message("ll_tuple_hash: key is not a pointer"));
-    };
-    if !p.nonzero() {
-        return Ok(0);
-    }
-    // `gen_hash_function` (`rtuple.py`): `x = 0x345678`; per item
-    // `x = intmask((1000003 * x) ^ hash_func(item))`.
-    let mut x: i64 = 0x345678;
-    let mut i = 0usize;
-    loop {
-        match p.getattr(&format!("item{i}")) {
-            Ok(item) => {
-                let y = host_hash_tuple_item(&item)?;
-                x = 1000003i64.wrapping_mul(x) ^ y;
-                i += 1;
-            }
-            Err(_) => break,
-        }
-    }
-    Ok(x)
-}
-
-fn host_hash_tuple_item(item: &LowLevelValue) -> Result<i64, TyperError> {
-    match item {
-        LowLevelValue::Signed(_)
-        | LowLevelValue::Unsigned(_)
-        | LowLevelValue::Bool(_)
-        | LowLevelValue::Char(_)
-        | LowLevelValue::UniChar(_) => host_hash_int(item),
-        LowLevelValue::Float(_) => host_hash_float(item),
-        LowLevelValue::Address(_) => host_hash_addr(item),
-        LowLevelValue::Void => Ok(0),
-        LowLevelValue::Ptr(p) => {
-            if prebuilt_str_bytes_and_hash(p).is_some() {
-                host_hash_str(item)
-            } else if unicode_chars_and_stored_hash(p).is_some() {
-                host_hash_unicode(item)
-            } else if p.getattr("item0").is_ok() {
-                host_hash_tuple(item)
-            } else {
-                host_hash_identity_ptr(item)
-            }
-        }
-        other => Err(TyperError::message(format!(
-            "ll_tuple_hash: unsupported item {other:?}"
-        ))),
-    }
-}
-
-fn ll_streq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
-    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
-        return Ok(ll_direct_compare(a, b));
-    };
-    if s1 == s2 {
-        return Ok(true);
-    }
-    if !s1.nonzero() || !s2.nonzero() {
-        return Ok(false);
-    }
-    match (
-        prebuilt_str_bytes_and_hash(s1).map(|(b, _)| b),
-        prebuilt_str_bytes_and_hash(s2).map(|(b, _)| b),
-    ) {
-        (Some(a), Some(b)) => return Ok(a == b),
-        _ => {}
-    }
-    match (
-        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
-        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
-    ) {
-        (Some(a), Some(b)) => Ok(a == b),
-        _ => Ok(s1 == s2),
-    }
-}
-
-fn ll_unicode_eq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
-    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
-        return Ok(false);
-    };
-    if s1 == s2 {
-        return Ok(true);
-    }
-    if !s1.nonzero() || !s2.nonzero() {
-        return Ok(false);
-    }
-    match (
-        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
-        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
-    ) {
-        (Some(a), Some(b)) => Ok(a == b),
-        _ => Ok(false),
-    }
-}
-
-fn ll_tuple_eq_values(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
-    let (LowLevelValue::Ptr(p1), LowLevelValue::Ptr(p2)) = (a, b) else {
-        return Ok(false);
-    };
-    if p1 == p2 {
-        return Ok(true);
-    }
-    if !p1.nonzero() || !p2.nonzero() {
-        return Ok(false);
-    }
-    let mut i = 0usize;
-    loop {
-        let name = format!("item{i}");
-        match (p1.getattr(&name), p2.getattr(&name)) {
-            (Ok(left), Ok(right)) => {
-                if !host_item_eq(&left, &right)? {
-                    return Ok(false);
-                }
-                i += 1;
-            }
-            (Err(_), Err(_)) => return Ok(true),
-            _ => return Ok(false),
-        }
-    }
-}
-
-fn host_item_eq(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TyperError> {
-    match (a, b) {
-        (LowLevelValue::Ptr(p1), LowLevelValue::Ptr(p2)) => {
-            if prebuilt_str_bytes_and_hash(p1).is_some()
-                || prebuilt_str_bytes_and_hash(p2).is_some()
-            {
-                ll_streq_values(a, b)
-            } else if unicode_chars_and_stored_hash(p1).is_some()
-                || unicode_chars_and_stored_hash(p2).is_some()
-            {
-                ll_unicode_eq_values(a, b)
-            } else if p1.getattr("item0").is_ok() || p2.getattr("item0").is_ok() {
-                ll_tuple_eq_values(a, b)
-            } else {
-                Ok(p1 == p2)
-            }
-        }
-        _ => Ok(ll_direct_compare(a, b)),
     }
 }
 
@@ -11310,25 +10965,22 @@ fn ll_direct_compare(a: &LowLevelValue, b: &LowLevelValue) -> bool {
 }
 
 /// RPython `d.keyeq(checkingkey, key)` (`rordereddict.py`). `None` for
-/// identity keys; otherwise the stored `get_ll_eq_function` result.
+/// identity keys; otherwise the stored `get_ll_eq_function` funcptr.
 fn ll_keyeq(d: &_ptr, a: &LowLevelValue, b: &LowLevelValue) -> Result<Option<bool>, TyperError> {
     match dict_adtmeth(d, "keyeq") {
         Some(ConstValue::None) | None => Ok(None),
         Some(adt) if adtmeth_is_byte_str(&adt, b"ll_keyeq_custom") => Err(custom_keyeq_deferred()),
         Some(adt) => {
-            let name = adtmeth_func_name(&adt).ok_or_else(|| {
+            let fp = adtmeth_funcptr(&adt).ok_or_else(|| {
                 TyperError::message(format!("d.keyeq: stored adtmeth is not a funcptr: {adt:?}"))
             })?;
-            if name == "ll_streq" {
-                Ok(Some(ll_streq_values(a, b)?))
-            } else if name == "ll_unicode_eq" {
-                Ok(Some(ll_unicode_eq_values(a, b)?))
-            } else if name.starts_with("ll_tuple_eq_") {
-                Ok(Some(ll_tuple_eq_values(a, b)?))
-            } else {
-                Err(TyperError::message(format!(
-                    "d.keyeq: unknown stored eq function {name}"
-                )))
+            match eval_funcptr(&fp, &[a.clone(), b.clone()])
+                .map_err(|e| TyperError::message(e.message))?
+            {
+                LowLevelValue::Bool(eq) => Ok(Some(eq)),
+                other => Err(TyperError::message(format!(
+                    "d.keyeq: eq function returned {other:?}"
+                ))),
             }
         }
     }
@@ -12669,7 +12321,8 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::dictdef::DictDef;
     use crate::annotator::model::{SomeFloat, SomeInteger, SomeString, SomeTuple, SomeValue};
-    use crate::translator::rtyper::lltypesystem::lltype::FuncType;
+    use crate::translator::rtyper::llinterp::{hash_float_value, hash_unichar_ords, python_frexp};
+    use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, FuncType};
     use crate::translator::rtyper::lltypesystem::rstr::{UNICODE, ll_strhash_value, llstr};
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rfloat::float_repr;
@@ -17318,6 +16971,145 @@ mod tests {
         assert!(
             matches!(looked, LowLevelValue::Signed(7)),
             "equal UNICODE code points find the entry, got {looked:?}"
+        );
+    }
+
+    /// `math.frexp` subnormal path starts at `-1021` so the smallest
+    /// positive subnormal `2**-1074` is `(0.5, -1073)`.
+    ///
+    /// `objectmodel._hash_float` arithmetic:
+    /// `v, expo = (0.5, -1073)`; `v *= 2**31` → `1073741824`;
+    /// `hipart + int(v) + (expo << 15)`
+    /// = `1073741824 + 0 + (-1073 * 32768)` = `1038581760`.
+    #[test]
+    fn python_frexp_smallest_subnormal_matches_hash_float() {
+        let smallest = f64::from_bits(1);
+        let (mant, exp) = python_frexp(smallest);
+        assert_eq!(mant, 0.5);
+        assert_eq!(exp, -1073);
+        assert_eq!(hash_float_value(smallest), 1038581760);
+        let repr = float_signed_ordered_dict_repr();
+        let mut items = indexmap::IndexMap::new();
+        items.insert(ConstValue::float(smallest), ConstValue::Int(1));
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("subnormal dict");
+        let d = as_dict_ptr(&c).clone();
+        let got = ll_keyhash(&d, &LowLevelValue::Float(smallest.to_bits()))
+            .expect("hash smallest subnormal");
+        assert_eq!(got, 1038581760, "_hash_float(2**-1074)");
+    }
+
+    fn empty_tuple_signed_ordered_dict_repr() -> OrderedDictRepr {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let empty_tuple = Arc::new(TupleRepr::new(&rtyper, vec![]).expect("empty TupleRepr"));
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Tuple(SomeTuple::new(vec![])),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        OrderedDictRepr::new(
+            rtyper,
+            empty_tuple as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("empty-tuple keyed dict")
+    }
+
+    fn nested_empty_tuple_int_signed_ordered_dict_repr() -> (OrderedDictRepr, Arc<TupleRepr>) {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let empty_tuple = Arc::new(TupleRepr::new(&rtyper, vec![]).expect("empty TupleRepr"));
+        let nested = Arc::new(
+            TupleRepr::new(
+                &rtyper,
+                vec![empty_tuple as Arc<dyn Repr>, signed_repr() as Arc<dyn Repr>],
+            )
+            .expect("nested TupleRepr"),
+        );
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Tuple(SomeTuple::new(vec![
+                SomeValue::Tuple(SomeTuple::new(vec![])),
+                SomeValue::Integer(SomeInteger::default()),
+            ])),
+            SomeValue::Integer(SomeInteger::default()),
+            false,
+            false,
+            false,
+        );
+        let dict_repr = OrderedDictRepr::new(
+            rtyper,
+            nested.clone() as Arc<dyn Repr>,
+            signed_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("nested-tuple keyed dict");
+        (dict_repr, nested)
+    }
+
+    /// Empty-tuple keys use `gen_hash_function([])`, which returns the
+    /// seed `0x345678` with no item loop. Nested `((), 1)` mixes
+    /// `hash(()) = 0x345678` then `hash(1) = 1`:
+    /// `x = 0x345678`; `x = intmask((1000003 * x) ^ 0x345678)`;
+    /// `x = intmask((1000003 * x) ^ 1)`.
+    #[test]
+    fn convert_const_empty_and_nested_empty_tuple_keys() {
+        let repr = empty_tuple_signed_ordered_dict_repr();
+        let mut items = indexmap::IndexMap::new();
+        items.insert(ConstValue::Tuple(vec![]), ConstValue::Int(11));
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("empty-tuple dict");
+        let mut d = as_dict_ptr(&c).clone();
+        let h = ll_keyhash(&d, &LowLevelValue::Void).expect("hash ()");
+        assert_eq!(h, 0x345678, "gen_hash_function([]) returns the seed");
+        let got = ll_dict_getitem(&mut d, &LowLevelValue::Void).expect("lookup ()");
+        assert!(
+            matches!(got, LowLevelValue::Signed(11)),
+            "empty-tuple lookup, got {got:?}"
+        );
+
+        let (repr, tuple_repr) = nested_empty_tuple_int_signed_ordered_dict_repr();
+        let mut items = indexmap::IndexMap::new();
+        items.insert(
+            ConstValue::Tuple(vec![ConstValue::Tuple(vec![]), ConstValue::Int(1)]),
+            ConstValue::Int(22),
+        );
+        let c = repr
+            .convert_const(&ConstValue::Dict(Arc::new(items)))
+            .expect("nested tuple dict");
+        let mut d = as_dict_ptr(&c).clone();
+        let mut x: i64 = 0x345678;
+        x = 1000003i64.wrapping_mul(x) ^ 0x345678;
+        x = 1000003i64.wrapping_mul(x) ^ 1;
+        let key_const = tuple_repr
+            .convert_const(&ConstValue::Tuple(vec![
+                ConstValue::Tuple(vec![]),
+                ConstValue::Int(1),
+            ]))
+            .expect("nested key");
+        let key = crate::translator::rtyper::rclass::constant_to_lowlevel_value(&key_const)
+            .expect("nested key llvalue");
+        let h = ll_keyhash(&d, &key).expect("hash ((), 1)");
+        assert_eq!(h, x, "nested gen_hash_function mix");
+        let got = ll_dict_getitem(&mut d, &key).expect("lookup ((), 1)");
+        assert!(
+            matches!(got, LowLevelValue::Signed(22)),
+            "nested empty-tuple lookup, got {got:?}"
         );
     }
 

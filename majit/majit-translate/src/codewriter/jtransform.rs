@@ -5729,11 +5729,10 @@ impl<'a> Transformer<'a> {
     }
 
     /// `jtransform.py _rewrite_raw_malloc`: flavor raw of a fixed-size
-    /// struct is a residual direct call of `raw_malloc_fixedsize` (the
-    /// `_zero` helper when `zero=True`). `support.py
-    /// build_ll_0_raw_malloc_fixedsize` closes the STRUCT into a
-    /// zero-argument specialization; the size here is a constant
-    /// argument of `ll_raw_malloc_fixedsize`.
+    /// struct is a residual direct call of `raw_malloc_fixedsize` with
+    /// `_zero` / `_add_memory_pressure` / `_no_track_allocation` suffixes
+    /// (`support.py build_raw_malloc_fixedsize_builder`). The size here
+    /// is a constant argument of `ll_raw_malloc_fixedsize*`.
     ///
     /// `rewrite_op_malloc_varsize` passes the item count as
     /// `raw_malloc_varsize` (`[op.args[2]]`). `TYPE.OF == lltype.Char`
@@ -5807,11 +5806,7 @@ impl<'a> Transformer<'a> {
             op.result.is_some(),
             "raw malloc of {owner} has no result variable"
         );
-        let leaf = if zero {
-            "ll_raw_malloc_fixedsize_zero"
-        } else {
-            "ll_raw_malloc_fixedsize"
-        };
+        let leaf = raw_malloc_fixedsize_helper_leaf(zero, add_memory_pressure, track_allocation);
         let target = CallTarget::function_path(["majit_rlib", "rffi", leaf]);
         let size_var = self.fresh_synthetic_variable_typed(
             graph,
@@ -5874,11 +5869,16 @@ impl<'a> Transformer<'a> {
             "raw malloc of {owner} has no result variable"
         );
         // `_rewrite_raw_malloc`: suffix `_zero` / `_add_memory_pressure` /
-        // `_no_track_allocation`. `TYPE.OF == lltype.Char` on the
-        // `rffi.CCHARP.TO` shape (nolength `Array(Char)` without
-        // `extra_item_after_alloc`) keeps `OS_RAW_MALLOC_VARSIZE_CHAR`.
-        if raw_malloc_varsize_is_ccharp_to(op) {
-            let leaf = raw_malloc_varsize_char_leaf(zero, add_memory_pressure, track_allocation);
+        // `_no_track_allocation`. `TYPE.OF == lltype.Char` takes
+        // `OS_RAW_MALLOC_VARSIZE_CHAR` on a one-argument helper
+        // (`support.py build_raw_malloc_varsize_builder`). The
+        // `rffi.CCHARP.TO` shape (nolength, no extra item) is the CHAR
+        // leaf; a nolength extra-item Char array is the extra-item CHAR
+        // leaf (`llmemory.sizeof` n+1). A length-bearing Char array
+        // cannot close TYPE into a fixed 1-arg extern.
+        if let Some(leaf) =
+            raw_malloc_varsize_char_one_arg_leaf(op, zero, add_memory_pressure, track_allocation)
+        {
             let target = CallTarget::function_path(["majit_rlib", "lltypesystem", "rffi", leaf]);
             let call = SpaceOperation {
                 result: op.result.clone(),
@@ -5904,6 +5904,11 @@ impl<'a> Transformer<'a> {
                     panic!("raw malloc residual of {owner} did not rewrite to a direct call")
                 }
             };
+        }
+        if raw_malloc_varsize_of_is_char(op, owner) {
+            panic!(
+                "raw malloc of {owner}: OS_RAW_MALLOC_VARSIZE_CHAR needs a one-argument helper closed over TYPE (`support.py build_raw_malloc_varsize_builder`)"
+            );
         }
         // `transform.py gct_fv_raw_malloc_varsize` / `ll_malloc_varsize`
         // / `ll_malloc_varsize_no_length`.
@@ -16083,7 +16088,8 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
         "raw_malloc_varsize_char" => OopSpecIndex::RawMallocVarsizeChar,
         // `_rewrite_raw_malloc` appends `_zero` / `_add_memory_pressure`
         // / `_no_track_allocation` and still attaches
-        // `OS_RAW_MALLOC_VARSIZE_CHAR` when the ARRAY is `CCHARP.TO`.
+        // `OS_RAW_MALLOC_VARSIZE_CHAR` when `TYPE.OF == lltype.Char`
+        // on a one-argument helper.
         "raw_malloc_varsize_zero" => OopSpecIndex::RawMallocVarsizeChar,
         _ if base.starts_with("raw_malloc_varsize_char_")
             || base.starts_with("raw_malloc_varsize_zero_") =>
@@ -16097,24 +16103,45 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
     }
 }
 
-/// `jtransform.py _rewrite_raw_malloc`: `TYPE.OF == lltype.Char` on the
-/// `rffi.CCHARP.TO` shape — a nolength `Array(Char)` without
-/// `extra_item_after_alloc`. Every other `Array(Char)` takes the general
-/// varsize helper (`virtualize.py do_RAW_MALLOC_VARSIZE_CHAR`).
-fn raw_malloc_varsize_is_ccharp_to(op: &SpaceOperation) -> bool {
+/// One-argument CHAR leaf for `OS_RAW_MALLOC_VARSIZE_CHAR`.
+///
+/// `rffi.CCHARP.TO` (nolength, no extra item) is `raw_malloc_varsize_char`.
+/// A nolength extra-item Char array is the extra-item family
+/// (`llmemory.sizeof(TYPE, n)` with one extra item). Length-bearing
+/// Char arrays have no fixed 1-arg helper (`support.py
+/// build_raw_malloc_varsize_builder`).
+fn raw_malloc_varsize_char_one_arg_leaf(
+    op: &SpaceOperation,
+    zero: bool,
+    add_memory_pressure: bool,
+    track_allocation: bool,
+) -> Option<&'static str> {
     use crate::flowspace::model::ConstValue;
     use crate::translator::rtyper::lltypesystem::llmemory::extra_item_after_alloc;
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    let Some(arr) = raw_malloc_varsize_array(op) else {
-        return false;
-    };
+    let arr = raw_malloc_varsize_array(op)?;
     if !matches!(arr.OF, LowLevelType::Char) {
-        return false;
+        return None;
     }
     if !matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true))) {
-        return false;
+        return None;
     }
-    extra_item_after_alloc(&LowLevelType::Array(Box::new(arr))) == 0
+    let extra = extra_item_after_alloc(&LowLevelType::Array(Box::new(arr)));
+    if extra == 0 {
+        Some(raw_malloc_varsize_char_leaf(
+            zero,
+            add_memory_pressure,
+            track_allocation,
+        ))
+    } else if extra == 1 {
+        Some(raw_malloc_varsize_char_extra_item_leaf(
+            zero,
+            add_memory_pressure,
+            track_allocation,
+        ))
+    } else {
+        None
+    }
 }
 
 fn raw_malloc_varsize_char_leaf(
@@ -16131,6 +16158,51 @@ fn raw_malloc_varsize_char_leaf(
         (true, false, false) => "raw_malloc_varsize_zero_no_track_allocation",
         (false, true, false) => "raw_malloc_varsize_char_add_memory_pressure_no_track_allocation",
         (true, true, false) => "raw_malloc_varsize_zero_add_memory_pressure_no_track_allocation",
+    }
+}
+
+/// Extra-item CHAR family: same suffixes as [`raw_malloc_varsize_char_leaf`],
+/// allocating `n + 1` items.
+fn raw_malloc_varsize_char_extra_item_leaf(
+    zero: bool,
+    add_memory_pressure: bool,
+    track_allocation: bool,
+) -> &'static str {
+    match (zero, add_memory_pressure, track_allocation) {
+        (false, false, true) => "raw_malloc_varsize_char_extra_item",
+        (true, false, true) => "raw_malloc_varsize_zero_extra_item",
+        (false, true, true) => "raw_malloc_varsize_char_extra_item_add_memory_pressure",
+        (true, true, true) => "raw_malloc_varsize_zero_extra_item_add_memory_pressure",
+        (false, false, false) => "raw_malloc_varsize_char_extra_item_no_track_allocation",
+        (true, false, false) => "raw_malloc_varsize_zero_extra_item_no_track_allocation",
+        (false, true, false) => {
+            "raw_malloc_varsize_char_extra_item_add_memory_pressure_no_track_allocation"
+        }
+        (true, true, false) => {
+            "raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation"
+        }
+    }
+}
+
+/// `jtransform.py _rewrite_raw_malloc` + `support.py
+/// build_raw_malloc_fixedsize_builder`: suffix `_zero` /
+/// `_add_memory_pressure` / `_no_track_allocation`.
+fn raw_malloc_fixedsize_helper_leaf(
+    zero: bool,
+    add_memory_pressure: bool,
+    track_allocation: bool,
+) -> &'static str {
+    match (zero, add_memory_pressure, track_allocation) {
+        (false, false, true) => "ll_raw_malloc_fixedsize",
+        (true, false, true) => "ll_raw_malloc_fixedsize_zero",
+        (false, true, true) => "ll_raw_malloc_fixedsize_add_memory_pressure",
+        (true, true, true) => "ll_raw_malloc_fixedsize_zero_add_memory_pressure",
+        (false, false, false) => "ll_raw_malloc_fixedsize_no_track_allocation",
+        (true, false, false) => "ll_raw_malloc_fixedsize_zero_no_track_allocation",
+        (false, true, false) => "ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation",
+        (true, true, false) => {
+            "ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation"
+        }
     }
 }
 
@@ -16178,6 +16250,18 @@ fn raw_malloc_varsize_array(
         LowLevelType::Array(arr) => Some(*arr),
         _ => None,
     }
+}
+
+/// `jtransform.py _rewrite_raw_malloc`: `TYPE.OF == lltype.Char`.
+fn raw_malloc_varsize_of_is_char(op: &SpaceOperation, owner: &str) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if let Some(arr) = raw_malloc_varsize_array(op) {
+        return matches!(arr.OF, LowLevelType::Char);
+    }
+    matches!(
+        raw_malloc_varsize_of_from_owner(owner),
+        Some(LowLevelType::Char)
+    )
 }
 
 fn raw_malloc_varsize_of_from_owner(
@@ -29915,13 +29999,20 @@ mod tests {
         }))
     }
 
-    /// Length-bearing `Array(Char)` is not `CCHARP.TO`; it takes the
-    /// general varsize helper with a length header, not
-    /// `OS_RAW_MALLOC_VARSIZE_CHAR`.
+    /// Nolength `Array(Char)` with `extra_item_after_alloc=1` is the
+    /// 1-arg extra-item CHAR leaf (`llmemory.sizeof(TYPE, n)` is n+1)
+    /// with `OS_RAW_MALLOC_VARSIZE_CHAR`.
     #[test]
-    fn raw_malloc_varsize_length_bearing_char_does_not_take_char_oopspec() {
+    fn raw_malloc_varsize_extra_item_char_takes_one_arg_char_leaf() {
+        use crate::flowspace::model::ConstValue;
         use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
-        let arr = Array::new(LowLevelType::Char);
+        let arr = Array::with_hints(
+            LowLevelType::Char,
+            vec![
+                ("nolength".into(), ConstValue::Bool(true)),
+                ("extra_item_after_alloc".into(), ConstValue::Int(1)),
+            ],
+        );
         let (graph, n) = transform_raw_malloc_ex(
             "Array(Char)",
             false,
@@ -29935,39 +30026,38 @@ mod tests {
         let ops = &graph.block(graph.startblock).operations;
         let (path, descriptor, args_i) = raw_malloc_residual(ops);
         assert_eq!(
-            path, "majit_rlib::rffi::ll_raw_malloc_varsize_with_length",
-            "length-bearing Char is the 4-arg helper, got {path}"
+            path, "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char_extra_item",
+            "extra-item Char is the 1-arg extra-item CHAR leaf, got {path}"
         );
-        assert_ne!(
+        assert!(
+            helper_fnaddr_publishes(path) || path.ends_with("raw_malloc_varsize_char_extra_item"),
+            "extra-item residual {path} is the published helper"
+        );
+        assert_eq!(args_i, std::slice::from_ref(&n));
+        assert_eq!(
             descriptor.extra_info.oopspecindex,
             OopSpecIndex::RawMallocVarsizeChar
         );
-        let word = crate::layout::target_word_size() as i64;
-        let [n_arg, basesize_arg, itemsize_arg, lengthoffset_arg] = args_i else {
-            panic!(
-                "length-bearing residual takes n, basesize, itemsize, lengthoffset, got {args_i:?}"
-            );
-        };
-        assert_eq!(n_arg, &n);
-        assert!(
-            ops.iter().any(|op| {
-                op.result.as_ref() == Some(basesize_arg)
-                    && matches!(op.kind, OpKind::ConstInt(size) if size == word)
-            }),
-            "length-bearing basesize is WORD, ops {ops:?}"
-        );
-        assert!(
-            ops.iter().any(|op| {
-                op.result.as_ref() == Some(itemsize_arg) && matches!(op.kind, OpKind::ConstInt(1))
-            }),
-            "Char itemsize is 1, ops {ops:?}"
-        );
-        assert!(
-            ops.iter().any(|op| {
-                op.result.as_ref() == Some(lengthoffset_arg)
-                    && matches!(op.kind, OpKind::ConstInt(0))
-            }),
-            "ArrayLengthOffset is 0, ops {ops:?}"
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+    }
+
+    /// Length-bearing `Array(Char)` has TYPE-dependent basesize and
+    /// length offset; a fixed 1-arg extern cannot close over TYPE
+    /// (`support.py build_raw_malloc_varsize_builder`).
+    #[test]
+    #[should_panic(expected = "one-argument helper closed over TYPE")]
+    fn raw_malloc_varsize_length_bearing_char_needs_closed_over_helper() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let arr = Array::new(LowLevelType::Char);
+        let _ = transform_raw_malloc_ex(
+            "Array(Char)",
+            false,
+            true,
+            None,
+            Some(ptr_to_array(arr)),
+            true,
+            false,
+            Vec::new(),
         );
     }
 
@@ -30058,6 +30148,90 @@ mod tests {
             false,
             vec!["immortal".into()],
         );
+    }
+
+    /// `jtransform.py _rewrite_raw_malloc` + `support.py
+    /// build_raw_malloc_fixedsize_builder`: each flag combination selects
+    /// the matching helper path.
+    #[test]
+    fn raw_malloc_fixedsize_flag_combinations_select_helper() {
+        let owner = "Tuple<i64>";
+        let sid = majit_ir::descr::struct_id_for_name(owner).expect("Tuple<i64> shape id");
+        let layout = raw_tuple_i64_layout();
+        let cases: [(bool, bool, bool, &str); 8] = [
+            (false, false, true, "ll_raw_malloc_fixedsize"),
+            (true, false, true, "ll_raw_malloc_fixedsize_zero"),
+            (
+                false,
+                true,
+                true,
+                "ll_raw_malloc_fixedsize_add_memory_pressure",
+            ),
+            (
+                true,
+                true,
+                true,
+                "ll_raw_malloc_fixedsize_zero_add_memory_pressure",
+            ),
+            (
+                false,
+                false,
+                false,
+                "ll_raw_malloc_fixedsize_no_track_allocation",
+            ),
+            (
+                true,
+                false,
+                false,
+                "ll_raw_malloc_fixedsize_zero_no_track_allocation",
+            ),
+            (
+                false,
+                true,
+                false,
+                "ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation",
+            ),
+            (
+                true,
+                true,
+                false,
+                "ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation",
+            ),
+        ];
+        for (zero, add_memory_pressure, track_allocation, leaf) in cases {
+            let (graph, _) = transform_raw_malloc_ex(
+                owner,
+                zero,
+                false,
+                Some((sid, layout.clone())),
+                None,
+                track_allocation,
+                add_memory_pressure,
+                Vec::new(),
+            );
+            let ops = &graph.block(graph.startblock).operations;
+            let (path, descriptor, args_i) = raw_malloc_residual(ops);
+            let expected = format!("majit_rlib::rffi::{leaf}");
+            assert_eq!(
+                path, expected,
+                "zero={zero} add_memory_pressure={add_memory_pressure} \
+                 track_allocation={track_allocation} selected {path}"
+            );
+            assert!(
+                helper_fnaddr_publishes(path) || path.ends_with(leaf),
+                "fixed-size residual {path} is the published helper"
+            );
+            assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::None);
+            let [size] = args_i else {
+                panic!("fixed-size residual takes the layout size, got {args_i:?}");
+            };
+            assert!(
+                ops.iter().any(|op| {
+                    op.result.as_ref() == Some(size) && matches!(op.kind, OpKind::ConstInt(8))
+                }),
+                "layout.size 8 is the size argument, ops {ops:?}"
+            );
+        }
     }
 
     /// `jtransform.py test_raw_malloc_fixedsize`: `length: None` stays

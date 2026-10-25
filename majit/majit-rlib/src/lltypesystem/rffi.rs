@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
-use crate::rffi::{free_charp, str2charp};
+use crate::rffi::{MemoryError, free_charp, str2charp};
 
 /// Alignment of every block [`raw_malloc_varsize_char`] returns, and the
 /// header word [`raw_free`] reads the size back from.
@@ -113,6 +113,78 @@ pub fn raw_malloc_varsize_char_add_memory_pressure_no_track_allocation(size: usi
 #[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_zero_add_memory_pressure_no_track_allocation(size: usize) -> usize {
     raw_malloc_varsize_zero_add_memory_pressure(size)
+}
+
+/// `lltype.malloc` of a nolength `Array(Char)` with
+/// `extra_item_after_alloc=1`. `llmemory.sizeof(TYPE, n)` is `n + 1`
+/// items (`llmemory.py extra_item_after_alloc`). The extra item is
+/// closed over; the call is still `(n)` (`support.py
+/// build_raw_malloc_varsize_builder`).
+fn raw_malloc_varsize_char_extra_item_impl(
+    n: usize,
+    zero: bool,
+    add_memory_pressure: bool,
+) -> usize {
+    let Some(size) = n.checked_add(1) else {
+        return raw_malloc_char_memory_error();
+    };
+    raw_malloc_varsize_char_impl(size, zero, add_memory_pressure)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_extra_item(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_extra_item(n: usize) -> usize {
+    raw_malloc_varsize_char_extra_item_impl(n, false, false)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_extra_item(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_extra_item(n: usize) -> usize {
+    raw_malloc_varsize_char_extra_item_impl(n, true, false)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_extra_item_add_memory_pressure(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_extra_item_add_memory_pressure(n: usize) -> usize {
+    raw_malloc_varsize_char_extra_item_impl(n, false, true)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_extra_item_add_memory_pressure(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_extra_item_add_memory_pressure(n: usize) -> usize {
+    raw_malloc_varsize_char_extra_item_impl(n, true, true)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_extra_item_no_track_allocation(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_extra_item_no_track_allocation(n: usize) -> usize {
+    raw_malloc_varsize_char_extra_item(n)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_extra_item_no_track_allocation(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_extra_item_no_track_allocation(n: usize) -> usize {
+    raw_malloc_varsize_zero_extra_item(n)
+}
+
+#[majit_macros::oopspec(
+    "raw_malloc_varsize_char_extra_item_add_memory_pressure_no_track_allocation(n)"
+)]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_extra_item_add_memory_pressure_no_track_allocation(
+    n: usize,
+) -> usize {
+    raw_malloc_varsize_char_extra_item_add_memory_pressure(n)
+}
+
+#[majit_macros::oopspec(
+    "raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation(n)"
+)]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation(
+    n: usize,
+) -> usize {
+    raw_malloc_varsize_zero_extra_item_add_memory_pressure(n)
 }
 
 /// `lltype.free(ptr, flavor='raw')` — `support.py ll_raw_free`. Frees a block
@@ -238,25 +310,25 @@ static STR_FQ_FREE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 /// `_get_raw_address_buf_from_string` (`rffi.py`). Cache key is
 /// `objectmodel.compute_unique_id` via `majit_gc::gc_id_or_identityhash`.
-/// Returns `CCHARP` (`*mut u8`).
+/// Returns `CCHARP` (`*mut u8`). `str2charp` raises `MemoryError`.
 ///
 /// Upstream has no JIT hint; the only caller is `get_raw_address_of_string`.
 #[allow(non_snake_case)]
-pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
+pub fn _get_raw_address_buf_from_string(string: *mut u8) -> Result<*mut u8, MemoryError> {
     let key = majit_gc::gc_id_or_identityhash(string as usize);
     {
         let fq = _fq_addr_from_string.lock();
         if let Some(&ptr) = fq.raw_copies.get(&key) {
-            return ptr as *mut u8;
+            return Ok(ptr as *mut u8);
         }
     }
-    let ptr = unsafe { str2charp(str_as_bytes(string as *const u8), false) };
+    let ptr = unsafe { str2charp(str_as_bytes(string as *const u8), false)? };
     {
         let mut fq = _fq_addr_from_string.lock();
         fq.raw_copies.insert(key, ptr as usize);
     }
     _StrFinalizerQueue::register_finalizer(majit_ir::GcRef(string as usize));
-    ptr
+    Ok(ptr)
 }
 
 /// Residual `HELPER_FNADDRS` row (`rffi_expand` `helper_fnaddr_registration`).
@@ -306,7 +378,16 @@ pub fn get_raw_address_of_string(string: *mut u8) -> *mut u8 {
         let moved = majit_gc::gc_move_out_of_nursery(gcref);
         string = moved.0 as *mut u8;
         if majit_gc::can_move(moved) {
-            return _get_raw_address_buf_from_string(string);
+            return match _get_raw_address_buf_from_string(string) {
+                Ok(ptr) => ptr,
+                Err(MemoryError) => {
+                    // Residual `HELPER_FNADDRS` ABI is `CCHARP` with
+                    // `EF_CAN_RAISE`; pending exception + NULL is that
+                    // residual shape (`raw_malloc_memory_error`).
+                    majit_gc::raise_memory_error();
+                    core::ptr::null_mut()
+                }
+            };
         }
     }
     let data_start = unsafe { string.add(STR_CHARS_OFFSET) };
@@ -345,6 +426,51 @@ mod tests {
         raw_free(zeroed);
     }
 
+    /// `llmemory.sizeof(TYPE, n)` with `extra_item_after_alloc=1` is
+    /// `n + 1` items. The `_zero` form clears that many bytes.
+    #[test]
+    fn extra_item_char_allocates_n_plus_one() {
+        let n = 4;
+        let ptr = raw_malloc_varsize_char_extra_item(n);
+        assert_ne!(ptr, 0);
+        unsafe {
+            (ptr as *mut u8).add(n).write(0xAB);
+            assert_eq!((ptr as *const u8).add(n).read(), 0xAB);
+        }
+        raw_free(ptr);
+        let zeroed = raw_malloc_varsize_zero_extra_item(n);
+        assert_ne!(zeroed, 0);
+        unsafe {
+            let bytes = std::slice::from_raw_parts(zeroed as *const u8, n + 1);
+            assert!(bytes.iter().all(|b| *b == 0));
+        }
+        raw_free(zeroed);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn extra_item_char_helpers_are_published() {
+        let module = module_path!().trim_end_matches("::tests");
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        for leaf in [
+            "raw_malloc_varsize_char_extra_item",
+            "raw_malloc_varsize_zero_extra_item",
+            "raw_malloc_varsize_char_extra_item_add_memory_pressure",
+            "raw_malloc_varsize_zero_extra_item_add_memory_pressure",
+            "raw_malloc_varsize_char_extra_item_no_track_allocation",
+            "raw_malloc_varsize_zero_extra_item_no_track_allocation",
+            "raw_malloc_varsize_char_extra_item_add_memory_pressure_no_track_allocation",
+            "raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation",
+        ] {
+            let path = format!("{module}::{leaf}");
+            assert!(
+                published.contains(&path.as_str()),
+                "{path} is not published"
+            );
+        }
+    }
+
     fn alloc_fake_str(text: &[u8], extra_fill: u8) -> Vec<usize> {
         let nbytes = STR_CHARS_OFFSET + text.len() + 1;
         let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
@@ -380,8 +506,8 @@ mod tests {
         let text = b"cache-me";
         let mut storage = alloc_fake_str(text, 0xFF);
         let ptr = storage.as_mut_ptr() as *mut u8;
-        let first = _get_raw_address_buf_from_string(ptr);
-        let second = _get_raw_address_buf_from_string(ptr);
+        let first = _get_raw_address_buf_from_string(ptr).unwrap();
+        let second = _get_raw_address_buf_from_string(ptr).unwrap();
         assert_eq!(first, second);
         unsafe {
             assert_ne!(first, ptr.add(STR_CHARS_OFFSET));
@@ -430,7 +556,7 @@ mod tests {
             majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
             write_str_payload(root.0 as *mut u8, text);
 
-            let copy = _get_raw_address_buf_from_string(root.0 as *mut u8);
+            let copy = _get_raw_address_buf_from_string(root.0 as *mut u8).unwrap();
             let key = majit_gc::gc_id_or_identityhash(root.0);
             unsafe {
                 assert_ne!(copy, (root.0 as *mut u8).add(STR_CHARS_OFFSET));

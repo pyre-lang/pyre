@@ -1,6 +1,6 @@
 //! `framework.py ll_next_dead` pops from inside `execute_finalizers`' trigger.
-//! A separate integration-test process isolates the process-global STW
-//! singleton from collector-local unit tests.
+//! A separate integration-test process isolates the `gc_sync` singleton
+//! from collector-local unit tests.
 
 use majit_gc::{
     FinalizerQueueTag, GcAllocator, TypeInfo, collector::MiniMarkGC, gc_fq_next_dead, gc_sync,

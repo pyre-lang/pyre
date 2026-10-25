@@ -358,27 +358,27 @@ mod tests {
 
     #[test]
     fn str2charp_round_trip_and_embedded_nul() {
-        let owned = str2charp(b"hello", true);
+        let owned = str2charp(b"hello", true).unwrap();
         assert_eq!(unsafe { charp2str(owned) }, b"hello");
         unsafe { free_charp(owned, true) };
 
-        let untracked = str2charp(b"x", false);
+        let untracked = str2charp(b"x", false).unwrap();
         assert_eq!(unsafe { charp2str(untracked) }, b"x");
         unsafe { free_charp(untracked, false) };
 
         // The copy keeps the interior NUL; `charp2str` stops, `charpsize2str` does not.
-        let raw = str2charp(b"ab\0cd", true);
+        let raw = str2charp(b"ab\0cd", true).unwrap();
         assert_eq!(unsafe { charp2str(raw) }, b"ab");
         assert_eq!(unsafe { charpsize2str(raw, 5) }, b"ab\0cd");
         assert_eq!(unsafe { charp2strn(raw, 4) }, b"ab");
         assert_eq!(unsafe { charp2strn(raw, 1) }, b"a");
-        let whole = str2charp(b"abcdef", true);
+        let whole = str2charp(b"abcdef", true).unwrap();
         assert_eq!(unsafe { charp2strn(whole, 3) }, b"abc");
         assert_eq!(unsafe { charp2strn(whole, 100) }, b"abcdef");
         unsafe { free_charp(raw, true) };
         unsafe { free_charp(whole, true) };
 
-        let cp = str2constcharp(b"hi", true);
+        let cp = str2constcharp(b"hi", true).unwrap();
         assert_eq!(unsafe { constcharp2str(cp) }, b"hi");
         assert_eq!(unsafe { constcharpsize2str(cp, 2) }, b"hi");
         unsafe { free_charp(cast::<CCHARP>(cp), true) };
@@ -400,12 +400,12 @@ mod tests {
 
     #[test]
     fn liststr2charpp_round_trip() {
-        let pp = liststr2charpp(&[b"one", b"two", b""]);
+        let pp = liststr2charpp(&[b"one", b"two", b""]).unwrap();
         let got = unsafe { charpp2liststr(pp) };
         assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec(), b"".to_vec()]);
         unsafe { free_charpp(pp) };
 
-        let empty = liststr2charpp(&[]);
+        let empty = liststr2charpp(&[]).unwrap();
         assert!(unsafe { charpp2liststr(empty) }.is_empty());
         unsafe { free_charpp(empty) };
     }
@@ -424,21 +424,21 @@ mod tests {
         unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
         assert_eq!(staged.str(2).unwrap(), b"BB");
 
-        let view = scoped_view_charp::new(b"ab\0c");
+        let view = scoped_view_charp::new(b"ab\0c").unwrap();
         assert_eq!(view.flag, 0x06);
         assert_eq!(unsafe { charp2str(view.buf) }, b"ab");
         assert_eq!(unsafe { charpsize2str(view.buf, 4) }, b"ab\0c");
         drop(view);
 
-        let moving = scoped_nonmovingbuffer::new(b"xyz");
+        let moving = scoped_nonmovingbuffer::new(b"xyz").unwrap();
         assert_eq!(moving.flag, 0x06);
         assert_eq!(unsafe { charpsize2str(moving.buf, 3) }, b"xyz");
         drop(moving);
 
-        let none = scoped_str2charp::new(None);
+        let none = scoped_str2charp::new(None).unwrap();
         assert!(none.buf.is_null());
         drop(none);
-        let some = scoped_str2charp::new(Some(b"zz"));
+        let some = scoped_str2charp::new(Some(b"zz")).unwrap();
         assert_eq!(unsafe { charp2str(some.buf) }, b"zz");
         drop(some);
     }
@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(cast::<u64>(-1i8), u64::MAX);
         assert_eq!(cast::<i32>(65535u16), 65535i32);
 
-        let p = str2charp(b"z", true);
+        let p = str2charp(b"z", true).unwrap();
         let addr = cast::<usize>(p);
         assert_eq!(cast::<CCHARP>(addr), p);
         unsafe { free_charp(p, true) };
@@ -498,7 +498,7 @@ mod tests {
         let text = "hé你😀";
         let bytes = text.as_bytes();
         let n = text.chars().count();
-        let w = utf82wcharp(bytes, n, true);
+        let w = utf82wcharp(bytes, n, true).unwrap();
         let wide = unsafe { core::mem::size_of_val(&*w) } >= 4;
         let (back, count) = unsafe { wcharp2utf8(w).unwrap() };
         let (cut, cut_n) = unsafe { wcharp2utf8n(w, 3).unwrap() };
@@ -513,7 +513,7 @@ mod tests {
         }
 
         let with_nul = b"a\0b";
-        let w = utf82wcharp(with_nul, 3, true);
+        let w = utf82wcharp(with_nul, 3, true).unwrap();
         let (stopped, nzero) = unsafe { wcharp2utf8(w).unwrap() };
         let full = unsafe { wcharpsize2utf8(w, 3).unwrap() };
         unsafe { free_wcharp(w, true) };
@@ -521,19 +521,19 @@ mod tests {
         assert_eq!(full, b"a\0b");
 
         if wide {
-            let w = utf82wcharp(b"", 0, true);
+            let w = utf82wcharp(b"", 0, true).unwrap();
             unsafe { core::ptr::write(w.cast::<i32>(), 0x110000) };
             assert_eq!(unsafe { wcharpsize2utf8(w, 1) }.unwrap_err().code, 0x110000);
             unsafe { free_wcharp(w, true) };
         }
 
-        let scoped = scoped_utf82wcharp::new(Some(bytes), -1);
+        let scoped = scoped_utf82wcharp::new(Some(bytes), -1).unwrap();
         let (again, again_n) = unsafe { wcharp2utf8(scoped.buf).unwrap() };
         assert_eq!(again_n, n);
         if wide {
             assert_eq!(again, bytes);
         }
-        let absent = scoped_utf82wcharp::new(None, -1);
+        let absent = scoped_utf82wcharp::new(None, -1).unwrap();
         assert!(absent.buf.is_null());
     }
 
@@ -543,7 +543,7 @@ mod tests {
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0x11, 8);
             assert_eq!(charpsize2str(buf, 8), vec![0x11; 8]);
-            let src = str2charp(b"abcd", true);
+            let src = str2charp(b"abcd", true).unwrap();
             c_memcpy(cast::<VOIDP>(buf), cast::<CONST_VOIDP>(src), 4);
             assert_eq!(charpsize2str(buf, 8), b"abcd\x11\x11\x11\x11");
             free_charp(src, true);
@@ -554,7 +554,7 @@ mod tests {
     #[test]
     fn utf82wcharp_ex_writes_a_surrogate_pair_above_the_bmp() {
         let text = "a😀\u{ffff}";
-        let w = utf82wcharp_ex(text.as_bytes(), 3, true);
+        let w = utf82wcharp_ex(text.as_bytes(), 3, true).unwrap();
         let units: Vec<u32> = (0..5).map(|i| unsafe { *w.add(i) } as u32).collect();
         unsafe { free_wcharp(w, true) };
         assert_eq!(units, [0x61, 0xD83D, 0xDE00, 0xFFFF, 0]);

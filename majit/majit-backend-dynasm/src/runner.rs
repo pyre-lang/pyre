@@ -73,7 +73,8 @@ pub(crate) fn lookup_call_assembler_callee_locs(
 /// dependency, so the box is eliminated by the optimizer rather than by
 /// conditional compilation.
 mod gc_box {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
 
     thread_local! {
         /// llmodel.py self.gc_ll_descr — owned by the active dynasm
@@ -84,8 +85,17 @@ mod gc_box {
             const { RefCell::new(None) };
         /// Read-only mirror of the box address, for the queries that can fire
         /// while an in-progress allocation already holds the mutable borrow.
-        static DYNASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn majit_gc::GcAllocator>> =
-            const { std::cell::Cell::new(None) };
+        static DYNASM_ACTIVE_GC_RAW: Cell<Option<*mut dyn majit_gc::GcAllocator>> =
+            const { Cell::new(None) };
+        /// Clone of the boxed MiniMark's `finalizer_queues`, stored next to
+        /// (not inside the borrow of) `DYNASM_ACTIVE_GC` so
+        /// `get_finalizer_queue_index` / `ll_next_dead` need no `RefCell`
+        /// borrow. Follows this thread's boxed collector the same way
+        /// `DYNASM_ACTIVE_GC` does.
+        static DYNASM_ACTIVE_FINALIZER_QUEUES: RefCell<Option<Arc<majit_gc::FinalizerQueueTable>>> =
+            const { RefCell::new(None) };
+        static DYNASM_ACTIVE_FINALIZER_QUEUES_PTR: Cell<*const majit_gc::FinalizerQueueTable> =
+            const { Cell::new(std::ptr::null()) };
     }
 
     /// Apply `f` to this thread's GC box. `None` means there is no box, and
@@ -166,6 +176,11 @@ mod gc_box {
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
     pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) {
+        let table = gc.finalizer_queue_table();
+        let ptr = table
+            .as_ref()
+            .map(|a| Arc::as_ptr(a))
+            .unwrap_or(std::ptr::null());
         DYNASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             *guard = Some(gc);
@@ -174,6 +189,10 @@ mod gc_box {
                 .map(|g| g as *mut dyn majit_gc::GcAllocator);
             DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
         });
+        DYNASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = table;
+        });
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(ptr));
     }
 
     /// Drop this thread's box and clear the raw mirror.
@@ -185,6 +204,16 @@ mod gc_box {
             *cell.borrow_mut() = None;
         });
         DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(std::ptr::null()));
+        DYNASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    /// Pointer to this thread's boxed collector table, or null when there is
+    /// no box. Does not borrow `DYNASM_ACTIVE_GC`.
+    pub(super) fn finalizer_queues_ptr() -> *const majit_gc::FinalizerQueueTable {
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.get())
     }
 }
 
@@ -534,6 +563,11 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_writebarrier_before_copy(Some(dynasm_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
     majit_gc::set_active_finalizer_hooks(Some(dynasm_register_finalizer));
+    majit_gc::set_active_finalizer_queue_table(Some(dynasm_finalizer_queues));
+}
+
+fn dynasm_finalizer_queues() -> *const majit_gc::FinalizerQueueTable {
+    gc_box::finalizer_queues_ptr()
 }
 
 /// Install a GC allocator box into TLS and register all `set_active_*`
@@ -5185,8 +5219,8 @@ mod tests {
 
     /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
     /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
-    /// the process-wide table (`framework.py get_finalizer_queue_index`) and
-    /// do not re-enter the boxed collector.
+    /// the boxed collector's table (`framework.py get_finalizer_queue_index`)
+    /// and do not re-enter the boxed collector.
     #[test]
     fn boxed_collector_next_dead_from_trigger_does_not_panic() {
         use std::sync::atomic::AtomicUsize;

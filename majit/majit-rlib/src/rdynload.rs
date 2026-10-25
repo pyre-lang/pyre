@@ -162,22 +162,22 @@ fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// `rdynload._retry_as_ldscript`. The path is taken from `dlerror` as raw
 /// bytes. `os.open`/`read`/`close` errors escape as `Err(errno)`.
 #[cfg(target_os = "linux")]
-fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<DLLHANDLE, i32> {
+fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<Result<DLLHANDLE, i32>, rffi::MemoryError> {
     let mut parts = err.split(|&b| b == b':');
     let Some(fullpath) = parts.next() else {
-        return Ok(std::ptr::null_mut());
+        return Ok(Ok(std::ptr::null_mut()));
     };
     if parts.next().is_none() || parts.next().is_some() {
-        return Ok(std::ptr::null_mut());
+        return Ok(Ok(std::ptr::null_mut()));
     }
     let mut actual = Vec::new();
     let mut last_five = [b' '; 5];
     let mut state = 0i32;
-    let ll_path = rffi::scoped_str2charp::new(Some(fullpath));
+    let ll_path = rffi::scoped_str2charp::new(Some(fullpath))?;
     let ldscript =
         unsafe { crate::rposix::c_open(ll_path.buf.cast(), libc::O_RDONLY, 0o777 as libc::mode_t) };
     if ldscript < 0 {
-        return Err(crate::rposix::get_saved_errno());
+        return Ok(Err(crate::rposix::get_saved_errno()));
     }
     loop {
         let mut ch: u8 = 0;
@@ -185,7 +185,7 @@ fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<DLLHANDLE, i32> {
         if n < 0 {
             let errno = crate::rposix::get_saved_errno();
             unsafe { crate::rposix::c_close(ldscript) };
-            return Err(errno);
+            return Ok(Err(errno));
         }
         if n == 0 {
             break;
@@ -214,13 +214,13 @@ fn _retry_as_ldscript(err: &[u8], mode: INT) -> Result<DLLHANDLE, i32> {
         }
     }
     if unsafe { crate::rposix::c_close(ldscript) } < 0 {
-        return Err(crate::rposix::get_saved_errno());
+        return Ok(Err(crate::rposix::get_saved_errno()));
     }
     if !actual.is_empty() {
-        let a = rffi::scoped_str2charp::new(Some(&actual));
-        return Ok(unsafe { c_dlopen(a.buf, mode) });
+        let a = rffi::scoped_str2charp::new(Some(&actual))?;
+        return Ok(Ok(unsafe { c_dlopen(a.buf, mode) }));
     }
-    Ok(std::ptr::null_mut())
+    Ok(Ok(std::ptr::null_mut()))
 }
 
 /// `rdynload._dlopen_default_mode`.
@@ -233,29 +233,32 @@ pub fn _dlopen_default_mode() -> INT {
 
 /// `rdynload.dlopen`.
 #[cfg(unix)]
-pub fn dlopen(name: Option<&[u8]>, mut mode: INT) -> Result<DLLHANDLE, DLOpenError> {
+pub fn dlopen(
+    name: Option<&[u8]>,
+    mut mode: INT,
+) -> Result<Result<DLLHANDLE, DLOpenError>, rffi::MemoryError> {
     if mode == -1 {
         mode = _dlopen_default_mode();
     } else if (mode & (RTLD_LAZY | RTLD_NOW)) == 0 {
         mode |= RTLD_NOW;
     }
-    let ll_libname = rffi::scoped_str2charp::new(name);
+    let ll_libname = rffi::scoped_str2charp::new(name)?;
     let res = unsafe { c_dlopen(ll_libname.buf, mode) };
     if res.is_null() {
         let err = dlerror();
         #[cfg(target_os = "linux")]
         {
             if bytes_contains(&err, b"invalid ELF header") {
-                match _retry_as_ldscript(&err, mode) {
-                    Ok(retried) if !retried.is_null() => return Ok(retried),
-                    Ok(_) => return Err(DLOpenError::Message(err)),
-                    Err(errno) => return Err(DLOpenError::OsError(errno)),
+                match _retry_as_ldscript(&err, mode)? {
+                    Ok(retried) if !retried.is_null() => return Ok(Ok(retried)),
+                    Ok(_) => return Ok(Err(DLOpenError::Message(err))),
+                    Err(errno) => return Ok(Err(DLOpenError::OsError(errno))),
                 }
             }
         }
-        return Err(DLOpenError::Message(err));
+        return Ok(Err(DLOpenError::Message(err)));
     }
-    Ok(res)
+    Ok(Ok(res))
 }
 
 /// `rdynload.dlclose`.
@@ -266,13 +269,16 @@ pub unsafe fn dlclose(handle: DLLHANDLE) -> INT {
 
 /// `rdynload.dlsym`.
 #[cfg(unix)]
-pub fn dlsym(libhandle: DLLHANDLE, name: &[u8]) -> Result<VOIDP, Vec<u8>> {
-    let ll_name = rffi::scoped_str2charp::new(Some(name));
+pub fn dlsym(
+    libhandle: DLLHANDLE,
+    name: &[u8],
+) -> Result<Result<VOIDP, Vec<u8>>, rffi::MemoryError> {
+    let ll_name = rffi::scoped_str2charp::new(Some(name))?;
     let res = unsafe { c_dlsym(libhandle, ll_name.buf) };
     if res.is_null() {
-        Err(name.to_vec())
+        Ok(Err(name.to_vec()))
     } else {
-        Ok(res)
+        Ok(Ok(res))
     }
 }
 
@@ -302,21 +308,24 @@ pub fn _dlopen_default_mode() -> INT {
 
 /// `rdynload.dlopen` on Windows. `mode` is unused, but a consistent signature.
 #[cfg(windows)]
-pub fn dlopen(name: Option<&[u8]>, mode: INT) -> Result<DLLHANDLE, DLOpenError> {
+pub fn dlopen(
+    name: Option<&[u8]>,
+    mode: INT,
+) -> Result<Result<DLLHANDLE, DLOpenError>, rffi::MemoryError> {
     let _ = mode;
     let Some(name) = name.filter(|name| !name.is_empty()) else {
-        return Err(DLOpenError::Message(b"cannot use None".to_vec()));
+        return Ok(Err(DLOpenError::Message(b"cannot use None".to_vec())));
     };
     let res = {
-        let buf = rffi::scoped_utf82wcharp::new(Some(name), -1);
+        let buf = rffi::scoped_utf82wcharp::new(Some(name), -1)?;
         unsafe { crate::rwin32::LoadLibraryW(buf.buf) }
     };
     if res.is_null() {
         let err = crate::rwin32::GetLastError_saved();
         let (ustr, _lgt) = crate::rwin32::FormatErrorW(err);
-        return Err(DLOpenError::Message(ustr));
+        return Ok(Err(DLOpenError::Message(ustr)));
     }
-    Ok(res)
+    Ok(Ok(res))
 }
 
 /// `rdynload.dlopenex`. Don't display a message box when Python can't load
@@ -325,22 +334,22 @@ pub fn dlopen(name: Option<&[u8]>, mode: INT) -> Result<DLLHANDLE, DLOpenError> 
 pub fn dlopenex(
     name: Option<&[u8]>,
     flags: crate::rwin32::DWORD,
-) -> Result<DLLHANDLE, DLOpenError> {
+) -> Result<Result<DLLHANDLE, DLOpenError>, rffi::MemoryError> {
     let Some(name) = name.filter(|name| !name.is_empty()) else {
-        return Err(DLOpenError::Message(b"cannot use None".to_vec()));
+        return Ok(Err(DLOpenError::Message(b"cannot use None".to_vec())));
     };
     let old_mode = unsafe { crate::rwin32::SetErrorMode(crate::rwin32::SEM_FAILCRITICALERRORS) };
     let res = {
-        let buf = rffi::scoped_utf82wcharp::new(Some(name), -1);
+        let buf = rffi::scoped_utf82wcharp::new(Some(name), -1)?;
         unsafe { crate::rwin32::LoadLibraryExW(buf.buf, flags) }
     };
     unsafe { crate::rwin32::SetErrorMode(old_mode) };
     if res.is_null() {
         let err = crate::rwin32::GetLastError_saved();
         let (ustr, _lgt) = crate::rwin32::FormatErrorW(err);
-        return Err(DLOpenError::Message(ustr));
+        return Ok(Err(DLOpenError::Message(ustr)));
     }
-    Ok(res)
+    Ok(Ok(res))
 }
 
 /// `rdynload.dlclose` on Windows: `FreeLibrary`, `0` on success and `-1` on
@@ -353,13 +362,13 @@ pub unsafe fn dlclose(handle: DLLHANDLE) -> INT {
 
 /// `rdynload.dlsym` on Windows.
 #[cfg(windows)]
-pub fn dlsym(handle: DLLHANDLE, name: &[u8]) -> Result<VOIDP, Vec<u8>> {
-    let ll_name = rffi::scoped_str2charp::new(Some(name));
+pub fn dlsym(handle: DLLHANDLE, name: &[u8]) -> Result<Result<VOIDP, Vec<u8>>, rffi::MemoryError> {
+    let ll_name = rffi::scoped_str2charp::new(Some(name))?;
     let res = unsafe { crate::rwin32::GetProcAddress(handle, ll_name.buf) };
     if res.is_null() {
-        Err(name.to_vec())
+        Ok(Err(name.to_vec()))
     } else {
-        Ok(res)
+        Ok(Ok(res))
     }
 }
 
@@ -381,10 +390,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn dlopen_self_and_dlsym_malloc() {
-        let handle = super::dlopen(None, -1).expect("dlopen(None)");
-        let malloc = super::dlsym(handle, b"malloc").expect("dlsym malloc");
+        let handle = super::dlopen(None, -1)
+            .expect("dlopen MemoryError")
+            .expect("dlopen(None)");
+        let malloc = super::dlsym(handle, b"malloc")
+            .expect("dlsym MemoryError")
+            .expect("dlsym malloc");
         assert!(!malloc.is_null());
-        let missing = super::dlsym(handle, b"pyre_rdynload_no_such_symbol");
+        let missing =
+            super::dlsym(handle, b"pyre_rdynload_no_such_symbol").expect("dlsym MemoryError");
         assert!(missing.is_err());
         let rc = unsafe { super::dlclose(handle) };
         assert_eq!(rc, 0);
@@ -415,11 +429,19 @@ mod tests {
     #[test]
     fn loadlibrary_kernel32_and_getprocaddress() {
         assert_eq!(super::_dlopen_default_mode(), 0);
-        let handle = super::dlopen(Some(b"kernel32.dll"), -1).expect("dlopen kernel32");
-        let getpid = super::dlsym(handle, b"GetCurrentProcessId").expect("dlsym");
+        let handle = super::dlopen(Some(b"kernel32.dll"), -1)
+            .expect("dlopen MemoryError")
+            .expect("dlopen kernel32");
+        let getpid = super::dlsym(handle, b"GetCurrentProcessId")
+            .expect("dlsym MemoryError")
+            .expect("dlsym");
         let getpid: unsafe extern "system" fn() -> u32 = unsafe { core::mem::transmute(getpid) };
         assert_eq!(unsafe { getpid() }, std::process::id());
-        assert!(super::dlsym(handle, b"pyre_rdynload_no_such_symbol").is_err());
+        assert!(
+            super::dlsym(handle, b"pyre_rdynload_no_such_symbol")
+                .expect("dlsym MemoryError")
+                .is_err()
+        );
         let module = unsafe { super::GetModuleHandle(c"kernel32.dll".as_ptr().cast_mut().cast()) };
         assert_eq!(module, handle);
         assert_eq!(unsafe { super::dlclose(handle) }, 0);
@@ -429,11 +451,11 @@ mod tests {
     #[test]
     fn dlopen_reports_none_and_missing_library() {
         match super::dlopen(None, -1) {
-            Err(super::DLOpenError::Message(msg)) => assert_eq!(msg, b"cannot use None"),
+            Ok(Err(super::DLOpenError::Message(msg))) => assert_eq!(msg, b"cannot use None"),
             other => panic!("dlopen(None) = {other:?}"),
         }
         match super::dlopenex(Some(b"pyre_rdynload_no_such_library.dll"), 0) {
-            Err(super::DLOpenError::Message(msg)) => assert!(!msg.is_empty()),
+            Ok(Err(super::DLOpenError::Message(msg))) => assert!(!msg.is_empty()),
             other => panic!("dlopenex(missing) = {other:?}"),
         }
     }

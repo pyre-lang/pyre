@@ -5,6 +5,8 @@
 //! module keeps the upstream lltypesystem import path available.
 
 use crate::annotator::bookkeeper::Bookkeeper;
+use crate::annotator::specialize::memotable_for_args;
+use crate::flowspace::model::ConstValue;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{_ptr, LowLevelType, MallocFlavor, malloc};
 
@@ -82,27 +84,56 @@ pub fn ll_newlist_hint() -> Result<(), TyperError> {
     Err(lltypesystem_rlist_deferred("ll_newlist_hint"))
 }
 
+/// Identity stand-in for `_ll_prebuilt_empty_array`'s missing FunctionDesc.
+/// `memo()` keys `all_specializations` by `funcdesc as *const FunctionDesc as usize`.
+static LL_PREBUILT_EMPTY_ARRAY_FUNCDESC_KEY: u8 = 0;
+
+fn malloc_prebuilt_empty_array(args: &[ConstValue]) -> Result<ConstValue, String> {
+    let ty = match args.first() {
+        Some(ConstValue::LowLevelType(ty)) => (**ty).clone(),
+        other => {
+            return Err(format!(
+                "_ll_prebuilt_empty_array: expected LISTITEM type, got {other:?}"
+            ));
+        }
+    };
+    malloc(ty, Some(0), MallocFlavor::Gc, true).map(|ptr| ConstValue::LLPtr(Box::new(ptr)))
+}
+
 /// `rlist.py _ll_prebuilt_empty_array`: `@specialize.memo()` so a
 /// constant `LISTITEM` folds to one immortal `malloc(LISTITEM, 0)`.
-/// The memo is `Bookkeeper.memo_tables` (`specialize.py MemoTable`).
+///
+/// `memo()` needs a FunctionDesc whose `pyobj` is a user-function
+/// HostObject with `GraphFunc.host_call` so it can run `func(*args)`
+/// and return a SpecializeResult (annotation / dispatch graph). This
+/// helper is a builder-defined rtyper function: no pyobj, and the
+/// rtyper needs the immortal `_ptr`. Same map, same key kind, keyed by
+/// this helper's identity.
 pub fn _ll_prebuilt_empty_array(
     bookkeeper: &Bookkeeper,
     listitem: &LowLevelType,
 ) -> Result<_ptr, TyperError> {
-    {
-        let memo = bookkeeper.memo_tables.borrow();
-        if let Some((_, ptr)) = memo.iter().find(|(ty, _)| ty == listitem) {
-            return Ok(ptr.clone());
-        }
+    let funcdesc_key = std::ptr::addr_of!(LL_PREBUILT_EMPTY_ARRAY_FUNCDESC_KEY) as usize;
+    let args = vec![ConstValue::LowLevelType(Box::new(listitem.clone()))];
+    let memotable = memotable_for_args(
+        bookkeeper,
+        funcdesc_key,
+        "_ll_prebuilt_empty_array",
+        args.clone(),
+        malloc_prebuilt_empty_array,
+    )
+    .map_err(|e| {
+        TyperError::message(
+            e.msg
+                .unwrap_or_else(|| "_ll_prebuilt_empty_array memo failed".into()),
+        )
+    })?;
+    match memotable.borrow().table.get(&args) {
+        Some(ConstValue::LLPtr(ptr)) => Ok((**ptr).clone()),
+        other => Err(TyperError::message(format!(
+            "_ll_prebuilt_empty_array: MemoTable missing malloc(LISTITEM, 0), got {other:?}"
+        ))),
     }
-    let ptr =
-        malloc(listitem.clone(), Some(0), MallocFlavor::Gc, true).map_err(TyperError::message)?;
-    let mut memo = bookkeeper.memo_tables.borrow_mut();
-    if let Some((_, existing)) = memo.iter().find(|(ty, _)| ty == listitem) {
-        return Ok(existing.clone());
-    }
-    memo.push((listitem.clone(), ptr.clone()));
-    Ok(ptr)
 }
 
 /// `rlist.py _ll_new_empty_item_array`. `listitem` is `LIST.items.TO`.
@@ -250,6 +281,7 @@ mod tests {
         assert_eq!(empty_array_identity(&a), empty_array_identity(&b));
         assert_eq!(empty_array_identity(&a), empty_array_identity(&c));
         assert_ne!(empty_array_identity(&a), empty_array_identity(&d));
+        assert_eq!(bookkeeper.all_specializations.borrow().len(), 1);
     }
 
     /// Memo is per translation (`specialize.py MemoTable` on the
@@ -281,5 +313,7 @@ mod tests {
         let c = _ll_prebuilt_empty_array(&bk2, &signed_items).expect("rtyper2");
         assert_eq!(empty_array_identity(&a), empty_array_identity(&b));
         assert_ne!(empty_array_identity(&a), empty_array_identity(&c));
+        assert_eq!(bk1.all_specializations.borrow().len(), 1);
+        assert_eq!(bk2.all_specializations.borrow().len(), 1);
     }
 }

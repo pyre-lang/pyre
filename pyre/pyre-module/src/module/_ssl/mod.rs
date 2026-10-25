@@ -1156,14 +1156,22 @@ mod context_methods {
         fn set_default_verify_paths(&mut self) -> Result<(), pyre_interpreter::PyError> {
             // `SSL_CERT_FILE` and `SSL_CERT_DIR` name files, so their bytes
             // reach the host as a path for the same reason `fs_path`'s do.
-            let env_path = |name: &[u8]| {
-                pyre_interpreter::host_seam::getenv(name).map(|value| {
-                    std::path::PathBuf::from(pyre_interpreter::gateway::os_string_from_fs_bytes(
-                        &value,
-                    ))
-                })
-            };
-            let cert_file = env_path(b"SSL_CERT_FILE").filter(|path| path.is_file());
+            let env_path =
+                |name: &[u8]| -> Result<Option<std::path::PathBuf>, pyre_interpreter::PyError> {
+                    Ok(pyre_interpreter::host_seam::getenv(name)
+                        .map_err(|e| {
+                            pyre_interpreter::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            )
+                        })?
+                        .map(|value| {
+                            std::path::PathBuf::from(
+                                pyre_interpreter::gateway::os_string_from_fs_bytes(&value),
+                            )
+                        }))
+                };
+            let cert_file = env_path(b"SSL_CERT_FILE")?.filter(|path| path.is_file());
             match cert_file {
                 Some(path) => native_result(unsafe {
                     pyre_native::ssl::context_load_verify_file(self.backend, &path)
@@ -1175,7 +1183,7 @@ mod context_methods {
                 .map(|_| ())?,
             }
             let (_, default_dir) = pyre_native::ssl::default_verify_paths();
-            let cert_dir = env_path(b"SSL_CERT_DIR").unwrap_or_else(|| default_dir.into());
+            let cert_dir = env_path(b"SSL_CERT_DIR")?.unwrap_or_else(|| default_dir.into());
             if cert_dir.is_dir() {
                 // OpenSSL defers hashed directory loading until chain lookup,
                 // so it does not contribute to cert_store_stats here.

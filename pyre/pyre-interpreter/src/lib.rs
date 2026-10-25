@@ -100,9 +100,11 @@ pub mod host_seam {
     /// the unix seam hands back. A Windows value holding an unpaired surrogate
     /// keeps it as its WTF-8 encoding, so the caller that turns the bytes back
     /// into a platform string recovers the code units the host stored.
-    pub fn getenv(name: &[u8]) -> Option<Vec<u8>> {
-        let name = std::str::from_utf8(name).ok()?;
-        std::env::var_os(name).map(|value| crate::gateway::fsencode_os_str(&value))
+    pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, majit_rlib::rffi::MemoryError> {
+        let Ok(name) = std::str::from_utf8(name) else {
+            return Ok(None);
+        };
+        Ok(std::env::var_os(name).map(|value| crate::gateway::fsencode_os_str(&value)))
     }
 
     /// Emit bytes to the interpreter's stdout (fd 1).

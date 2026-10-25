@@ -21580,7 +21580,11 @@ pub const HASH_SEED_ERROR: &str =
 /// A digest taken before this runs pins a random secret and the variable is
 /// ignored from then on, so the launcher calls it before anything hashes.
 pub fn init_hash_secret_from_env() -> Result<(), &'static str> {
-    let value = crate::host_seam::getenv(b"PYTHONHASHSEED").unwrap_or_default();
+    let value = match crate::host_seam::getenv(b"PYTHONHASHSEED") {
+        Ok(value) => value.unwrap_or_default(),
+        // `rposix_environ.py getenv_llimpl` lets `str2charp`'s MemoryError escape.
+        Err(_) => return Err("MemoryError"),
+    };
     if value.is_empty() || value.as_slice() == b"random" {
         // Force the getrandom backend (and its optional `/dev/urandom`
         // fallback) to run before a sandbox seccomp filter is installed.

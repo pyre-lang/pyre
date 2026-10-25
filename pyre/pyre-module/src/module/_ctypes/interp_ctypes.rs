@@ -140,22 +140,28 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
             {
                 return Err(pyre_interpreter::PyError::value_error("embedded null byte"));
             }
-            let h = majit_rlib::rdynload::dlopen(name_bytes, mode).map_err(|e| match e {
-                majit_rlib::rdynload::DLOpenError::Message(err) => {
-                    let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
-                    match &name_owned {
-                        None => msg.push_str("None"),
-                        Some(name) => {
-                            msg.push_wtf8(&pyre_interpreter::gateway::fsdecode_os_str_wtf8(name))
+            let h = majit_rlib::rdynload::dlopen(name_bytes, mode)
+                .map_err(|e| {
+                    pyre_interpreter::error::get_converted_unexpected_exception(
+                        pyre_object::PY_NULL,
+                        &e,
+                    )
+                })?
+                .map_err(|e| match e {
+                    majit_rlib::rdynload::DLOpenError::Message(err) => {
+                        let mut msg = rustpython_wtf8::Wtf8Buf::from_string("dlopen(".to_string());
+                        match &name_owned {
+                            None => msg.push_str("None"),
+                            Some(name) => msg
+                                .push_wtf8(&pyre_interpreter::gateway::fsdecode_os_str_wtf8(name)),
                         }
+                        msg.push_str(&format!("): {}", String::from_utf8_lossy(&err)));
+                        pyre_interpreter::PyError::os_error(msg)
                     }
-                    msg.push_str(&format!("): {}", String::from_utf8_lossy(&err)));
-                    pyre_interpreter::PyError::os_error(msg)
-                }
-                majit_rlib::rdynload::DLOpenError::OsError(errno) => {
-                    pyre_interpreter::PyError::os_error_with_errno(errno, "")
-                }
-            })?;
+                    majit_rlib::rdynload::DLOpenError::OsError(errno) => {
+                        pyre_interpreter::PyError::os_error_with_errno(errno, "")
+                    }
+                })?;
             Ok(pyre_object::w_int_new(h as usize as i64))
         })
     );
@@ -186,9 +192,20 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                     }
                     pyre_interpreter::baseobjspace::str_utf8_w(w_name)?.to_string()
                 };
-                let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| {
-                    let LookupSymbolError::Load(msg) = e;
-                    pyre_interpreter::PyError::os_error(format!("dlsym({name}): {msg}"))
+                let addr = lookup_symbol(h, name.as_bytes()).map_err(|e| match e {
+                    LookupSymbolError::Load(msg) => {
+                        pyre_interpreter::PyError::os_error(format!("dlsym({name}): {msg}"))
+                    }
+                    LookupSymbolError::Memory(err) => {
+                        pyre_interpreter::error::get_converted_unexpected_exception(
+                            pyre_object::PY_NULL,
+                            &err,
+                        )
+                    }
+                    #[cfg(windows)]
+                    LookupSymbolError::LibraryNotFound | LookupSymbolError::LibraryClosed => {
+                        pyre_interpreter::PyError::os_error(format!("dlsym({name})"))
+                    }
                 })?;
                 Ok(pyre_object::w_int_new(addr as i64))
             },
@@ -536,11 +553,13 @@ pub(super) enum LookupSymbolError {
     #[cfg(windows)]
     LibraryClosed,
     Load(String),
+    Memory(majit_rlib::rffi::MemoryError),
 }
 
 #[cfg(all(unix, feature = "host_env"))]
 pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, LookupSymbolError> {
     majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol)
+        .map_err(LookupSymbolError::Memory)?
         .map(|address| address as usize)
         .map_err(|name| {
             LookupSymbolError::Load(format!(
@@ -563,6 +582,7 @@ pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, Looku
         ));
     }
     majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol)
+        .map_err(LookupSymbolError::Memory)?
         .map(|address| address as usize)
         .map_err(|name| {
             LookupSymbolError::Load(format!(
@@ -841,8 +861,7 @@ fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
                 // A bad address faults in the vtable read, the `AddRef` or
                 // the store; `seh::guard` turns that into the OSError the
                 // other raw-address readers raise.
-                let hr =
-                    super::seh::guard(|| host_ctypes::copy_com_pointer(source, destination));
+                let hr = super::seh::guard(|| host_ctypes::copy_com_pointer(source, destination));
                 drop(keepalive);
                 let hr = hr?;
                 Ok(pyre_object::w_int_new(hr as i64))

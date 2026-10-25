@@ -658,6 +658,9 @@ fn open_library(
         Some(pyre_interpreter::gateway::fsencode_bytes_w(w_filename)?)
     };
     majit_rlib::rdynload::dlopen(name.as_deref(), flags as majit_rlib::rdynload::INT)
+        .map_err(|e| {
+            pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+        })?
         .map(|handle| handle as usize)
         .map_err(|e| match e {
             majit_rlib::rdynload::DLOpenError::Message(msg) => PyError::os_error(format!(

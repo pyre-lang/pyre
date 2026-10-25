@@ -453,6 +453,11 @@ fn register_active_hooks(supports_guard_gc_type: bool) {
     ));
     majit_gc::set_active_write_barrier_managed(Some(gc_write_barrier_managed_via_active_runtime));
     majit_gc::set_active_finalizer_hooks(Some(register_finalizer_via_active_runtime));
+    majit_gc::set_active_finalizer_queue_table(Some(cranelift_finalizer_queues));
+}
+
+fn cranelift_finalizer_queues() -> *const majit_gc::FinalizerQueueTable {
+    gc_box::finalizer_queues_ptr()
 }
 
 /// Production path: register the `set_active_*` hooks WITHOUT storing a
@@ -1413,7 +1418,7 @@ fn op_is_dispatchable_label(op: &Op) -> bool {
 /// conditional compilation. Mirrors `majit-backend-dynasm/src/runner.rs`'s
 /// `gc_box`.
 mod gc_box {
-    use super::{Cell, GcAllocator, RefCell};
+    use super::{Arc, Cell, GcAllocator, RefCell};
 
     thread_local! {
         /// `llmodel.py:58` `self.gc_ll_descr = get_ll_description(...)` — owned
@@ -1427,6 +1432,15 @@ mod gc_box {
         /// while an in-progress allocation already holds the mutable borrow.
         static CRANELIFT_ACTIVE_GC_RAW: Cell<Option<*mut dyn GcAllocator>> =
             const { Cell::new(None) };
+        /// Clone of the boxed MiniMark's `finalizer_queues`, stored next to
+        /// (not inside the borrow of) `CRANELIFT_ACTIVE_GC` so
+        /// `get_finalizer_queue_index` / `ll_next_dead` need no `RefCell`
+        /// borrow. Follows this thread's boxed collector the same way
+        /// `CRANELIFT_ACTIVE_GC` does.
+        static CRANELIFT_ACTIVE_FINALIZER_QUEUES: RefCell<Option<Arc<majit_gc::FinalizerQueueTable>>> =
+            const { RefCell::new(None) };
+        static CRANELIFT_ACTIVE_FINALIZER_QUEUES_PTR: Cell<*const majit_gc::FinalizerQueueTable> =
+            const { Cell::new(std::ptr::null()) };
     }
 
     /// `&mut` access to this thread's GC box, for allocation and write
@@ -1495,6 +1509,11 @@ mod gc_box {
 
     /// Install or drop this thread's box, keeping the raw mirror in step.
     pub(super) fn store(gc: Option<Box<dyn GcAllocator>>) {
+        let table = gc.as_ref().and_then(|g| g.finalizer_queue_table());
+        let ptr = table
+            .as_ref()
+            .map(|a| Arc::as_ptr(a))
+            .unwrap_or(std::ptr::null());
         CRANELIFT_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             // Drop the previous allocator first so reentrant
@@ -1510,6 +1529,10 @@ mod gc_box {
             let raw = guard.as_deref_mut().map(|gc| gc as *mut dyn GcAllocator);
             CRANELIFT_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
         });
+        CRANELIFT_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = table;
+        });
+        CRANELIFT_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(ptr));
     }
 
     /// Backend-teardown counterpart of [`store`], tolerant of a thread whose
@@ -1519,6 +1542,16 @@ mod gc_box {
             *cell.borrow_mut() = None;
         });
         let _ = CRANELIFT_ACTIVE_GC_RAW.try_with(|raw_cell| raw_cell.set(None));
+        let _ = CRANELIFT_ACTIVE_FINALIZER_QUEUES_PTR.try_with(|cell| cell.set(std::ptr::null()));
+        let _ = CRANELIFT_ACTIVE_FINALIZER_QUEUES.try_with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    /// Pointer to this thread's boxed collector table, or null when there is
+    /// no box. Does not borrow `CRANELIFT_ACTIVE_GC`.
+    pub(super) fn finalizer_queues_ptr() -> *const majit_gc::FinalizerQueueTable {
+        CRANELIFT_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.get())
     }
 }
 
@@ -23943,8 +23976,8 @@ mod tests {
 
     /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
     /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
-    /// the process-wide table (`framework.py get_finalizer_queue_index`) and
-    /// do not re-enter the boxed collector.
+    /// the boxed collector's table (`framework.py get_finalizer_queue_index`)
+    /// and do not re-enter the boxed collector.
     #[test]
     fn boxed_collector_next_dead_from_trigger_does_not_panic() {
         static FQ: u8 = 0;

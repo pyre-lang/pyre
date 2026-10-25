@@ -108,17 +108,25 @@ pub(crate) fn drop_library(handle: usize) {
 pub(crate) fn drop_library(_handle: usize) {}
 
 /// `rdynload.dlsym`.
-pub(crate) fn dlsym(handle: usize, name: &str) -> Option<usize> {
+pub(crate) fn dlsym(handle: usize, name: &str) -> Result<Option<usize>, PyError> {
     #[cfg(any(unix, windows))]
     {
-        majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, name.as_bytes())
-            .ok()
-            .map(|address| address as usize)
+        Ok(
+            majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, name.as_bytes())
+                .map_err(|e| {
+                    pyre_interpreter::error::get_converted_unexpected_exception(
+                        pyre_object::PY_NULL,
+                        &e,
+                    )
+                })?
+                .ok()
+                .map(|address| address as usize),
+        )
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = (handle, name);
-        None
+        Ok(None)
     }
 }
 
@@ -141,7 +149,7 @@ fn load_function(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     // borrow a GC string across that call, and reload `w_ctype` from its root.
     let handle = lib.handle as usize;
     let lib_name = lib.name().to_owned();
-    let Some(address) = pyre_object::with_roots!(w_ctype => dlsym(handle, &name)) else {
+    let Some(address) = pyre_object::with_roots!(w_ctype => dlsym(handle, &name)?) else {
         return Err(PyError::attribute_error(format!(
             "function/symbol '{name}' not found in library '{lib_name}'"
         )));
@@ -191,7 +199,7 @@ fn variable_address(lib: &W_Library, name: &str) -> Result<*const u8, PyError> {
     let name = name.to_owned();
     let handle = lib.handle as usize;
     let lib_name = lib.name().to_owned();
-    dlsym(handle, &name)
+    dlsym(handle, &name)?
         .map(|address| address as *const u8)
         .ok_or_else(|| {
             PyError::key_error(format!(

@@ -188,7 +188,7 @@ pub use crate::host_seam_stub::stub;
 /// Unix builds still go through the same wrapper (the `ll_os.ll_os_getenv`
 /// trampoline under sandbox). A trampoline exception from `reraise_error`
 /// propagates.
-pub fn getenv(name: &[u8]) -> Option<Vec<u8>> {
+pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, majit_rlib::rffi::MemoryError> {
     majit_rlib::rposix_environ::getenv_llimpl(name)
 }
 
