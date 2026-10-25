@@ -15736,6 +15736,7 @@ fn effect_transduce_op(
                     base,
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 result,
             );
@@ -15753,6 +15754,7 @@ fn effect_transduce_op(
                     item_ty: effect_value_type_of(&result),
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
                 },
                 result,
@@ -15776,6 +15778,7 @@ fn effect_transduce_op(
                     item_ty,
                     array_type_id,
                     nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                 },
                 false,
             );

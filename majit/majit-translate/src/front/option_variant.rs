@@ -357,6 +357,7 @@ pub(crate) fn slice_len_op(
             base,
             array_type_id: Some(id.to_owned()),
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
         };
     } else {
         "__len"

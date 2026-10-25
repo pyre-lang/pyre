@@ -155,9 +155,10 @@ impl<'c> Lowerer<'c> {
             return Some(binding);
         }
         // Array element read on a local ref binding whose field is declared
-        // in `array_fields`: `<binding>.<field>[<idx>]` → getfield_gc_r for
-        // the buffer base, then getarrayitem_gc_i. Before the plain field
-        // read, which cannot match an `Index` shape anyway, and before
+        // in `array_fields`: headered → getfield_gc_r then getarrayitem_gc_*;
+        // headerless → getfield_gc_i then getarrayitem_raw_*
+        // (`rewrite_op_getarrayitem`). Before the plain field read, which
+        // cannot match an `Index` shape anyway, and before
         // `lower_state_array_read`, which is the `state.<array>` form.
         if let Some(binding) = self.lower_ref_binding_array_read(expr) {
             return Some(binding);

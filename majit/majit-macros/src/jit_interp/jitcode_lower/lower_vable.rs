@@ -2160,8 +2160,15 @@ impl<'c> Lowerer<'c> {
         })
     }
 
-    /// Emit the `getfield_gc_r` that loads the array's base pointer for a
+    /// Emit the field load that yields the array's base pointer for a
     /// shape [`Self::match_array_field_base`] already accepted.
+    ///
+    /// A headered field is `Ptr(GcArray)` / a header object, so
+    /// `rewrite_op_getfield` emits `getfield_gc_r` into the ref bank. A
+    /// headerless field is `Ptr(lltype.Array)` (`ARRAY._gckind == 'raw'`),
+    /// and `history.py` `getkind` of that Ptr is `'int'`, so the load is
+    /// `getfield_gc_i` into the int bank — the same bank
+    /// `getarrayitem_raw_*` reads (`rewrite_op_getarrayitem`).
     ///
     /// Shared by the element read and the element write so both take the
     /// buffer pointer through the SAME interned field descr — a store to the
@@ -2229,11 +2236,41 @@ impl<'c> Lowerer<'c> {
             .map(|config| config.prefix_field_entries_tokens(&struct_path))
             .unwrap_or_default();
         let buffer_reg = self.alloc_reg();
+        // Headered: GC pointer field (`getfield_gc_r`). Headerless: raw
+        // address integer (`getfield_gc_i`), matching `getkind` of
+        // `Ptr(Array)` with `_gckind == 'raw'`.
+        let buffer_is_gc = header.is_some();
+        let buffer_out = if buffer_is_gc {
+            Register::ref_(buffer_reg)
+        } else {
+            Register::int(buffer_reg)
+        };
+        let getfield = if buffer_is_gc {
+            quote! {
+                __builder.getfield_gc_r(
+                    #buffer_reg,
+                    #base_reg,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                    stringify!(#member),
+                );
+            }
+        } else {
+            quote! {
+                __builder.getfield_gc_i(
+                    #buffer_reg,
+                    #base_reg,
+                    ::core::mem::offset_of!(#struct_path, #member),
+                    #tid,
+                    stringify!(#member),
+                );
+            }
+        };
         self.emit_op(
             OpMeta::linear(
                 OpKind::Vable,
                 vec![Register::ref_(base_reg)],
-                vec![Register::ref_(buffer_reg)],
+                vec![buffer_out],
             ),
             quote! {
                 // The `int_fields` twin of this check lives in
@@ -2273,7 +2310,7 @@ impl<'c> Lowerer<'c> {
                     #headerless,
                     &[#(#prefix_fields,)* (
                         ::core::mem::offset_of!(#struct_path, #member),
-                        true,
+                        #buffer_is_gc,
                         stringify!(#member),
                         ::core::mem::size_of::<usize>(),
                         false,
@@ -2291,21 +2328,17 @@ impl<'c> Lowerer<'c> {
                         <#struct_path>::__MAJIT_IMMUTABLE_FIELDS
                     },
                 );
-                __builder.getfield_gc_r(
-                    #buffer_reg,
-                    #base_reg,
-                    ::core::mem::offset_of!(#struct_path, #member),
-                    #tid,
-                    stringify!(#member),
-                );
+                #getfield
             },
         );
         Some(buffer_reg)
     }
 
     /// Recognizes an array element READ on a local ref binding:
-    /// `<binding>.<array_field>[<int expr>]` → `getfield_gc_r` for the buffer
-    /// base followed by `getarrayitem_gc_i`.
+    /// `<binding>.<array_field>[<int expr>]`. A headered field is
+    /// `getfield_gc_r` then `getarrayitem_gc_*`; a headerless
+    /// `lltype.Array` field is `getfield_gc_i` then `getarrayitem_raw_*`
+    /// (`rewrite_op_getarrayitem` branches on `ARRAY._gckind`).
     ///
     /// This is the non-virtualizable counterpart of the `[..; virt]` element
     /// read: the loaded value is an ordinary trace value, so it does NOT ride
@@ -2337,37 +2370,56 @@ impl<'c> Lowerer<'c> {
         let index_reg = index.reg;
         let result_reg = self.alloc_reg();
         if element_is_float {
-            // `jtransform.py` `rewrite_op_getarrayitem`: `getkind(ARRAY.OF)`
-            // selects `getarrayitem_gc_f` for `lltype.Float`, including an
-            // element declared `Elem in Header`. `pure = '_pure'` when
-            // `ARRAY._immutable_field(None)`.
-            let item_pure = immutable_array_item_pure(&shape.struct_path, &shape.member);
+            // `rewrite_op_getarrayitem`: `getkind(ARRAY.OF)` selects
+            // `getarrayitem_{gckind}_f` for `lltype.Float`. A headered
+            // `GcArray` keeps `_pure` when `ARRAY._immutable_field(None)`;
+            // a raw `lltype.Array` strips it (`pure = ''`).
             let descr_tokens = float_array_descr_tokens(self.config, &header);
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::Vable,
-                    vec![Register::ref_(buffer_reg), Register::int(index_reg)],
-                    vec![Register::float(result_reg)],
-                ),
-                quote! {
-                    let __descr_idx = #descr_tokens;
-                    if #item_pure {
-                        __builder.getarrayitem_gc_f_pure(
-                            #result_reg as u16,
-                            #buffer_reg as u16,
-                            #index_reg as u16,
+            if header.is_some() {
+                let item_pure = immutable_array_item_pure(&shape.struct_path, &shape.member);
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                        vec![Register::float(result_reg)],
+                    ),
+                    quote! {
+                        let __descr_idx = #descr_tokens;
+                        if #item_pure {
+                            __builder.getarrayitem_gc_f_pure(
+                                #result_reg as u16,
+                                #buffer_reg as u16,
+                                #index_reg as u16,
+                                __descr_idx,
+                            );
+                        } else {
+                            __builder.getarrayitem_gc_f(
+                                #result_reg as u16,
+                                #buffer_reg as u16,
+                                #index_reg as u16,
+                                __descr_idx,
+                            );
+                        }
+                    },
+                );
+            } else {
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![Register::int(buffer_reg), Register::int(index_reg)],
+                        vec![Register::float(result_reg)],
+                    ),
+                    quote! {
+                        let __descr_idx = #descr_tokens;
+                        __builder.getarrayitem_raw_f(
+                            #result_reg,
+                            #buffer_reg,
+                            #index_reg,
                             __descr_idx,
                         );
-                    } else {
-                        __builder.getarrayitem_gc_f(
-                            #result_reg as u16,
-                            #buffer_reg as u16,
-                            #index_reg as u16,
-                            __descr_idx,
-                        );
-                    }
-                },
-            );
+                    },
+                );
+            }
             return Some(Binding {
                 reg: result_reg,
                 kind: BindingKind::Float,
@@ -2461,11 +2513,12 @@ impl<'c> Lowerer<'c> {
                 struct_type: None,
             });
         }
-        let item_pure = immutable_array_item_pure(&shape.struct_path, &shape.member);
+        // Headerless `lltype.Array`: `rewrite_op_getarrayitem` emits
+        // `getarrayitem_raw_i` and strips `_pure`.
         self.emit_op(
             OpMeta::linear(
                 OpKind::Vable,
-                vec![Register::ref_(buffer_reg), Register::int(index_reg)],
+                vec![Register::int(buffer_reg), Register::int(index_reg)],
                 vec![Register::int(result_reg)],
             ),
             quote! {
@@ -2479,23 +2532,12 @@ impl<'c> Lowerer<'c> {
                     // compile here rather than loading as a signed word.
                     (<#element_type>::MIN as i128) < 0,
                 );
-                // `rewrite_op_getarrayitem`: `pure = '_pure'` when
-                // `ARRAY._immutable_field(None)` (`_immutable_fields_ = ['x[*]']`).
-                if #item_pure {
-                    __builder.getarrayitem_gc_i_pure(
-                        #result_reg as u16,
-                        #buffer_reg as u16,
-                        #index_reg as u16,
-                        __descr_idx,
-                    );
-                } else {
-                    __builder.getarrayitem_gc_i(
-                        #result_reg as u16,
-                        #buffer_reg as u16,
-                        #index_reg as u16,
-                        __descr_idx,
-                    );
-                }
+                __builder.getarrayitem_raw_i(
+                    #result_reg,
+                    #buffer_reg,
+                    #index_reg,
+                    __descr_idx,
+                );
             },
         );
         Some(Binding {
@@ -2507,8 +2549,10 @@ impl<'c> Lowerer<'c> {
     }
 
     /// Recognizes an array element WRITE on a local ref binding:
-    /// `<binding>.<array_field>[<int expr>] = <int expr>` → `getfield_gc_r`
-    /// for the buffer base followed by `setarrayitem_gc_i`.
+    /// `<binding>.<array_field>[<int expr>] = <int expr>`. A headered
+    /// field is `getfield_gc_r` then `setarrayitem_gc_*`; a headerless
+    /// `lltype.Array` field is `getfield_gc_i` then `setarrayitem_raw_*`
+    /// (`rewrite_op_setarrayitem` interpolates `ARRAY._gckind`).
     ///
     /// Store counterpart of [`Self::lower_ref_binding_array_read`]; both take
     /// the element descr from `add_raw_int_array_descr_signed`, so the store
@@ -2554,26 +2598,49 @@ impl<'c> Lowerer<'c> {
         let value_reg = value.reg;
         if element_is_float {
             let descr_tokens = float_array_descr_tokens(self.config, &header);
-            self.emit_op(
-                OpMeta::linear(
-                    OpKind::Vable,
-                    vec![
-                        Register::ref_(buffer_reg),
-                        Register::int(index_reg),
-                        Register::float(value_reg),
-                    ],
-                    vec![],
-                ),
-                quote! {
-                    let __descr_idx = #descr_tokens;
-                    __builder.setarrayitem_gc_f(
-                        #buffer_reg as u16,
-                        #index_reg as u16,
-                        #value_reg as u16,
-                        __descr_idx,
-                    );
-                },
-            );
+            if header.is_some() {
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![
+                            Register::ref_(buffer_reg),
+                            Register::int(index_reg),
+                            Register::float(value_reg),
+                        ],
+                        vec![],
+                    ),
+                    quote! {
+                        let __descr_idx = #descr_tokens;
+                        __builder.setarrayitem_gc_f(
+                            #buffer_reg as u16,
+                            #index_reg as u16,
+                            #value_reg as u16,
+                            __descr_idx,
+                        );
+                    },
+                );
+            } else {
+                self.emit_op(
+                    OpMeta::linear(
+                        OpKind::Vable,
+                        vec![
+                            Register::int(buffer_reg),
+                            Register::int(index_reg),
+                            Register::float(value_reg),
+                        ],
+                        vec![],
+                    ),
+                    quote! {
+                        let __descr_idx = #descr_tokens;
+                        __builder.setarrayitem_raw_f(
+                            #buffer_reg,
+                            #index_reg,
+                            #value_reg,
+                            __descr_idx,
+                        );
+                    },
+                );
+            }
             return Some(());
         }
         if let Some(header) = header {
@@ -2637,7 +2704,7 @@ impl<'c> Lowerer<'c> {
             OpMeta::linear(
                 OpKind::Vable,
                 vec![
-                    Register::ref_(buffer_reg),
+                    Register::int(buffer_reg),
                     Register::int(index_reg),
                     Register::int(value_reg),
                 ],
@@ -2654,10 +2721,10 @@ impl<'c> Lowerer<'c> {
                     // compile here rather than loading as a signed word.
                     (<#element_type>::MIN as i128) < 0,
                 );
-                __builder.setarrayitem_gc_i(
-                    #buffer_reg as u16,
-                    #index_reg as u16,
-                    #value_reg as u16,
+                __builder.setarrayitem_raw_i(
+                    #buffer_reg,
+                    #index_reg,
+                    #value_reg,
                     __descr_idx,
                 );
             },
@@ -3404,11 +3471,11 @@ mod tests {
         );
     }
 
-    /// `int_fields` `=> f64` is `getfield_gc_f`; an `f64` array field is
-    /// `getarrayitem_gc_f` / `setarrayitem_gc_f` (`rewrite_op_getfield` /
-    /// `rewrite_op_setarrayitem` pick the kind from the field type).
+    /// `int_fields` `=> f64` is `getfield_gc_f`; a headerless `f64` array
+    /// field is `setarrayitem_raw_f` (`rewrite_op_setarrayitem` interpolates
+    /// `ARRAY._gckind`).
     #[test]
-    fn float_field_and_float_array_lower_to_gc_f() {
+    fn float_field_lowers_to_gc_f_and_headerless_array_to_raw_f() {
         let floatval = crate::jit_interp::IntFieldEntry {
             struct_type: syn::parse_quote!(Num),
             field: syn::parse_quote!(floatval),
@@ -3461,7 +3528,9 @@ mod tests {
             .map(ToString::to_string)
             .collect::<String>();
         assert!(emitted.contains("getfield_gc_f"), "{emitted}");
-        assert!(emitted.contains("setarrayitem_gc_f"), "{emitted}");
+        assert!(emitted.contains("getfield_gc_i"), "{emitted}");
+        assert!(emitted.contains("setarrayitem_raw_f"), "{emitted}");
+        assert!(!emitted.contains("setarrayitem_gc_f"), "{emitted}");
         assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
     }
 
@@ -3517,10 +3586,10 @@ mod tests {
         );
     }
 
-    /// Headerless immutable float item consults `immutable_array_item_pure`
-    /// and can emit `getarrayitem_gc_f_pure`.
+    /// Headerless `lltype.Array` of float is `getarrayitem_raw_f`;
+    /// `rewrite_op_getarrayitem` strips `_pure` when `_gckind != 'gc'`.
     #[test]
-    fn headerless_immutable_float_lowers_to_getarrayitem_gc_f_pure() {
+    fn headerless_immutable_float_lowers_to_getarrayitem_raw_f() {
         let data = crate::jit_interp::ArrayFieldEntry {
             struct_type: syn::parse_quote!(Col),
             field: syn::parse_quote!(data),
@@ -3554,7 +3623,10 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect::<String>();
-        assert!(emitted.contains("getarrayitem_gc_f_pure"), "{emitted}");
+        assert!(emitted.contains("getfield_gc_i"), "{emitted}");
+        assert!(emitted.contains("getarrayitem_raw_f"), "{emitted}");
+        assert!(!emitted.contains("getarrayitem_gc_f"), "{emitted}");
+        assert!(!emitted.contains("getarrayitem_gc_f_pure"), "{emitted}");
         assert!(emitted.contains("__MAJIT_IMMUTABLE_FIELDS"), "{emitted}");
         assert!(emitted.contains("add_raw_float_array_descr"), "{emitted}");
     }

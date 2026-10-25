@@ -992,6 +992,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             item_ty: ValueType::Int,
             array_type_id: None,
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
             pure: true,
         },
     });
@@ -1004,6 +1005,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             item_ty: ValueType::Int,
             array_type_id: None,
             nolength: false,
+            gckind: crate::model::ArrayGcKind::Gc,
             pure: true,
         },
     });

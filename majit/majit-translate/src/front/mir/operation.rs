@@ -837,6 +837,9 @@ impl<'a> Lowering<'a> {
                         nolength: crate::front::typestr::nolength_from_array_type_id(
                             alias.array_type_id.as_deref(),
                         ),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            alias.array_type_id.as_deref(),
+                        ),
                     }
                 } else if let Some(owner) = self.string_array_remove_owner() {
                     // Tail of RPython `ll_delitem_nonneg`: after
@@ -895,6 +898,9 @@ impl<'a> Lowering<'a> {
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                             STRING_GCREF_GCARRAY_TYPE_ID,
                         )),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
+                            STRING_GCREF_GCARRAY_TYPE_ID,
+                        )),
                     }
                 } else if let Some(local) = inner_local
                     && !self.index_elem_alias.contains_key(&local)
@@ -933,6 +939,9 @@ impl<'a> Lowering<'a> {
                         item_ty,
                         array_type_id: Some(array_type_id.clone()),
                         nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                            array_type_id.as_str(),
+                        )),
+                        gckind: crate::front::typestr::gckind_from_array_type_id(Some(
                             array_type_id.as_str(),
                         )),
                     }
@@ -1182,6 +1191,9 @@ impl<'a> Lowering<'a> {
                         index: idx_var,
                         value: value.clone(),
                         item_ty,
+                        gckind: crate::front::typestr::gckind_from_array_type_id(
+                            projection_array_type_id.as_deref(),
+                        ),
                         array_type_id: projection_array_type_id,
                         nolength: projection_array_nolength,
                     }
@@ -5800,6 +5812,9 @@ impl<'a> Lowering<'a> {
                                     &self.raw_alloc_flavor_structs,
                                 )
                             },
+                            gckind: crate::front::typestr::gckind_from_array_type_id(
+                                array_type_id.as_deref(),
+                            ),
                             array_type_id,
                             nolength,
                             pure: false,
@@ -6113,6 +6128,9 @@ impl<'a> Lowering<'a> {
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
+                            gckind: crate::front::typestr::gckind_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
                             pure: false,
                         },
                     });
@@ -6145,6 +6163,7 @@ impl<'a> Lowering<'a> {
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             nolength: false,
+                            gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
                         },
                     });

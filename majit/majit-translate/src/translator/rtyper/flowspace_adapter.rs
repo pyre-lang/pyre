@@ -12360,6 +12360,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
             },
         };
@@ -12384,6 +12385,7 @@ mod tests {
                 base: vars[1].clone(),
                 array_type_id: Some("[PyObjectRef]".to_string()),
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
         };
         let translated =
@@ -12442,6 +12444,7 @@ mod tests {
                 item_ty: ValueType::Int,
                 array_type_id: None,
                 nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())

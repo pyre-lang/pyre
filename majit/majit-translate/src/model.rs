@@ -962,6 +962,37 @@ impl FieldDescriptor {
     }
 }
 
+/// `ARRAY._gckind` (`lltype.Array` vs `lltype.GcArray`).
+///
+/// `jtransform.py` `rewrite_op_getarrayitem` / `rewrite_op_setarrayitem`
+/// pick `getarrayitem_{gckind}_*` / `setarrayitem_{gckind}_*` from this
+/// field, not from the base register bank. `rewrite_op_getarraysize`
+/// asserts `'gc'` and emits `arraylen_gc`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArrayGcKind {
+    /// `lltype.GcArray` — `getarrayitem_gc_*` / `setarrayitem_gc_*` /
+    /// `arraylen_gc`.
+    Gc,
+    /// `lltype.Array` / `rffi.CArray` — `getarrayitem_raw_*` /
+    /// `setarrayitem_raw_*`.
+    Raw,
+}
+
+impl ArrayGcKind {
+    /// `'gc'` / `'raw'`, the `ARRAY._gckind` spelling jtransform interpolates
+    /// into the opcode name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gc => "gc",
+            Self::Raw => "raw",
+        }
+    }
+
+    pub fn is_gc(self) -> bool {
+        matches!(self, Self::Gc)
+    }
+}
+
 /// `{vtable}` owner plus a `method_*` leaf, including a qualified
 /// `Trait::{vtable}.method_foo` spelling.
 pub fn is_vtable_method_slot_parts(owner: &str, field_name: &str) -> bool {
@@ -1283,6 +1314,10 @@ pub enum OpKind {
         /// length-prefixed shape) lays the length word at offset 0
         /// and items past it.
         nolength: bool,
+        /// `ARRAY._gckind`. Assembler emits `getarrayitem_{gckind}_*`
+        /// from this field (`rewrite_op_getarrayitem`), not from the
+        /// base register bank.
+        gckind: ArrayGcKind,
         /// RPython: the foldable/immutable element load
         /// `getarrayitem_gc_{i,r,f}_pure`.  `ll_getitem_foldable_nonneg`
         /// (rlist.py:721-724, `oopspec = 'list.getitem_foldable(l,
@@ -1292,7 +1327,9 @@ pub enum OpKind {
         /// when `not r_list.listitem.mutated`
         /// (lltypesystem/rlist.py).  `true` only for such a
         /// foldable/unmutated selection or an immutable container —
-        /// NEVER for a mutable list element.
+        /// NEVER for a mutable list element.  Raw arrays strip this
+        /// (`rewrite_op_getarrayitem`: `pure = ''` when
+        /// `ARRAY._gckind != 'gc'`).
         pure: bool,
     },
     /// `arraylen_gc(array, arraydescr)` — read a GcArray's length
@@ -1305,6 +1342,8 @@ pub enum OpKind {
         /// `ARRAY_INSIDE._hints.get('nolength', False)` (descr.py).
         /// `false` (length-prefixed) lays the length word at offset 0.
         nolength: bool,
+        /// `ARRAY._gckind`. `rewrite_op_getarraysize` asserts `'gc'`.
+        gckind: ArrayGcKind,
     },
     ArrayWrite {
         base: crate::flowspace::model::Variable,
@@ -1323,6 +1362,10 @@ pub enum OpKind {
         /// RPython: `ARRAY_INSIDE._hints.get('nolength', False)`
         /// (descr.py:359). See `ArrayRead::nolength`.
         nolength: bool,
+        /// `ARRAY._gckind`. Assembler emits `setarrayitem_{gckind}_*`
+        /// from this field (`rewrite_op_setarrayitem`), not from the
+        /// base register bank.
+        gckind: ArrayGcKind,
     },
     /// `raw_load_{i,f}` — one element read out of raw (non-GC) memory at a
     /// byte offset (`jtransform.py rewrite_op_raw_load`).  The

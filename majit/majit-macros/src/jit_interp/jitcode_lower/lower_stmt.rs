@@ -94,10 +94,10 @@ impl<'c> Lowerer<'c> {
             // rather than a machine-word twin of it.
             //
             // A pointer field stays a pointer field whichever map declares it.
-            // `ref_fields` names the pointee of a single-object link; an array
-            // declaration names the element type of a buffer the field points
-            // at.  Both read back through `getfield_gc_r`, and the array base's
-            // own layout registration describes the field as a pointer word.
+            // `ref_fields` names the pointee of a single-object link; a
+            // headered array declaration names a GC buffer pointer
+            // (`getfield_gc_r`). A headerless `lltype.Array` field is a raw
+            // address (`getkind` of that Ptr is `'int'`, so `getfield_gc_i`).
             // Asking only `ref_fields` here therefore describes the SAME member
             // as an eight-byte signed integer at a second producer, and
             // `get_field_descr` resolves that disagreement by keeping whichever
@@ -107,7 +107,7 @@ impl<'c> Lowerer<'c> {
             let member = syn::Member::Named(field.clone());
             let (is_ref, __fsize, __fsigned, __fcheck) = match config.array_fields.get(&key) {
                 Some((_, _, element_path)) => (
-                    true,
+                    config.array_headers.contains_key(&key),
                     quote! { ::core::mem::size_of::<usize>() },
                     quote! { false },
                     // The array base's witness, and it claims the same thing:
@@ -1474,8 +1474,8 @@ impl<'c> Lowerer<'c> {
             return Some(());
         }
         // Array element write on a local ref binding whose field is declared
-        // in `array_fields`: `<binding>.<field>[<idx>] = <expr>` →
-        // getfield_gc_r for the buffer base, then setarrayitem_gc_i.
+        // in `array_fields`: headered → getfield_gc_r then setarrayitem_gc_*;
+        // headerless → getfield_gc_i then setarrayitem_raw_*.
         if let Some(()) = self.lower_ref_binding_array_write(expr) {
             return Some(());
         }

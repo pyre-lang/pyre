@@ -1,9 +1,11 @@
-//! An array field is a POINTER field, and both producers that describe it have
-//! to say so.
+//! An array field is an INT field holding a raw buffer address, and both
+//! producers that describe it have to say so.
 //!
 //! Two places in the lowering register a description of the same member.  The
-//! array base read (`emit_array_field_base`) registers it as a pointer word:
-//! the field holds a buffer base, and the read is a `getfield_gc_r`.  A
+//! array base read (`emit_array_field_base`) registers it as an unsigned word:
+//! the field holds a buffer base, and the read is a `getfield_gc_i`
+//! (`history.py` `getkind`: a Ptr whose `TO._gckind == 'raw'` is kind `'int'`;
+//! `descr.py` `get_type_flag`: raw Ptr → FLAG_UNSIGNED).  A
 //! `residual_writes = { <ref>.<field> => [..] }` declaration — the FIELD form,
 //! no `[]` — rebuilds the same layout to mint the write set's descr.
 //!
@@ -12,8 +14,9 @@
 //! differently gets the cached descr back with only a collision counter to show
 //! for it.  So a write-set producer that asked the wrong map about the field's
 //! kind does not fail; it either loses silently, or wins and leaves every
-//! `getfield_gc_r` of that base carrying an Int-typed field descr.  Which of
-//! those happens is decided by the order the two producers were emitted in.
+//! `getfield_gc_i` of that base carrying a signed eight-byte integer descr.
+//! Which of those happens is decided by the order the two producers were
+//! emitted in.
 //!
 //! This fixture pins the write-set producer alone.  Nothing here reads
 //! `sel.data[i]`, so the array base producer never runs and the cache slot for
@@ -88,7 +91,7 @@ struct PointerFieldState {
         // `size` is here only so the scalar control below has a descr to read.
         // Naming a field in a write-set layout is what mints its descr, and
         // without one the control skips: it asserted nothing, which is the
-        // failure mode it exists to rule out for the pointer field.
+        // failure mode it exists to rule out for the array field.
         sel.data => [jit_scramble_pointer_field],
         sel.size => [jit_scramble_pointer_field],
         sel.generation => [jit_scramble_pointer_field],
@@ -146,44 +149,47 @@ fn cached_data_field() -> Option<(majit_ir::Type, usize, bool)> {
 }
 
 /// The subject: a write-set declaration naming an array field describes a
-/// pointer.
+/// raw buffer base address.
 ///
 /// Before this was fixed the write-set path asked only `ref_fields` whether the
 /// member is a pointer.  An array field is declared in `array_fields`, so the
 /// answer was no and the field went into the write set as an eight-byte SIGNED
 /// INTEGER — the undeclared-scalar default — for a member holding `*mut i64`.
+/// `history.py` `getkind` banks that Ptr as `'int'`; `descr.py` `get_type_flag`
+/// marks it FLAG_UNSIGNED, one target word wide. The sign and size assertions
+/// are what distinguish the raw-address descr from that default.
 #[test]
-fn a_write_set_declaration_over_an_array_field_describes_a_pointer() {
+fn a_write_set_declaration_over_an_array_field_describes_a_raw_address() {
     let _jc = build();
     let (field_type, field_size, is_signed) = cached_data_field()
         .expect("the fixture's `residual_writes` declaration must register `data`");
     assert_eq!(
         field_type,
-        majit_ir::Type::Ref,
-        "`sel.data` names the buffer BASE POINTER, so the write set's descr must \
-         be a Ref; an Int here is the undeclared-scalar default leaking into a \
-         pointer field, and `get_field_descr` will hand that descr to every \
-         `getfield_gc_r` of the same base that reaches the slot after it",
+        majit_ir::Type::Int,
+        "`sel.data` holds a raw buffer base address, so `history.py` `getkind` \
+         of that Ptr (`TO._gckind == 'raw'`) is kind 'int'; the write set's \
+         descr must be an Int",
     );
     assert_eq!(
         field_size,
         std::mem::size_of::<usize>(),
-        "a pointer field is one target word wide, not the eight bytes the \
-         integer default claims (they differ on wasm32)",
+        "a raw address is one target word wide, not the eight bytes the \
+         undeclared-scalar default claims (they differ on wasm32)",
     );
     assert!(
         !is_signed,
-        "a pointer is not a signed integer; the sign flag is part of what \
-         `describes_same_field` compares when a second producer arrives",
+        "`descr.py` `get_type_flag` marks a raw Ptr FLAG_UNSIGNED; the \
+         undeclared-scalar default is SIGNED, and the sign flag is part of \
+         what `describes_same_field` compares when a second producer arrives",
     );
 }
 
 /// The control, without which the assertion above cannot fail for the reason it
-/// names: a non-pointer field of the same struct must still be described as the
+/// names: a non-array field of the same struct must still be described as the
 /// scalar it is.
 ///
-/// A fix that made every write-set field a Ref would satisfy the subject and be
-/// exactly as wrong in the other direction.
+/// A fix that applied the raw-address descr to every write-set field would
+/// satisfy the subject and be exactly as wrong in the other direction.
 #[test]
 fn a_scalar_field_of_the_same_struct_is_still_a_scalar() {
     use majit_ir::descr::FieldDescr as _;
@@ -198,7 +204,7 @@ fn a_scalar_field_of_the_same_struct_is_still_a_scalar() {
     // Require the slot rather than skipping when it is absent. This test read
     // `if let Some(..)` and `size` was in no declaration, so the assertion below
     // never ran once — a control that does not execute rules nothing out, which
-    // is exactly what it was written to prevent for the pointer field. The
+    // is exactly what it was written to prevent for the array field. The
     // fixture now names `size` in its write set so the descr exists.
     let descr = size_field.expect(
         "`size` must be registered for this control to assert anything; the \
