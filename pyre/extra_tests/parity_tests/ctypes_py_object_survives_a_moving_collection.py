@@ -1,11 +1,8 @@
 # CPython-suite gap: test_ctypes never reads a py_object back after a
 # collection, so nothing there reaches a relocated target.
 # parity-tests reason: this guards a pyre/PyPy moving-GC allocation invariant.
-# pyre-check: pypy-diverges: its container slot is zero-based, so `.value` and `repr` of a
-# fresh py_object raise IndexError on an empty table and answer the first
-# stored object once one exists (measured on PyPy 7.3.20); CFuncPtr Python-callable
-# restype conversion failure returns None rather than 0; ArgumentError from
-# callback from_param is str(e) without the `argument i: ExcType: ` prefix
+# pyre-check: pypy-diverges: its container slot is zero-based, so `.value` and `repr` of a fresh py_object raise IndexError on an empty table and answer the first stored object once one exists (measured on PyPy 7.3.20); CFuncPtr.__call__ propagates KeyboardInterrupt and returns None on restype conversion failure rather than reporting both unraisable with the restype's zero value
+# ArgumentError from callback from_param is str(e) without the `argument i: ExcType: ` prefix
 # pypy binds _SimpleCData.__init__(value=), so c_int(value=3).value is 3 there; _SimpleCData ignores keywords
 # import ctypes builds byte-swapped simple types through a metaclass `__init__` whose `type` argument must survive the collecting `type.__call__`; callback ArgumentError message and result-conversion unraisable follow 3.15
 # parity-env: PYPY_GC_NURSERY=4096
@@ -384,6 +381,36 @@ def func():
 
 try:
     ctypes.CFUNCTYPE(ctypes.c_int)(func)()
+finally:
+    sys.unraisablehook = _prev_hook
+
+
+class X:
+    def __float__(self):
+        raise ValueError
+
+    def __index__(self):
+        raise ValueError
+
+
+def bad():
+    return X()
+
+
+def boom():
+    raise KeyboardInterrupt
+
+
+_prev_hook = sys.unraisablehook
+sys.unraisablehook = lambda u: print("  unraisable", type(u.exc_value).__name__, u.object)
+try:
+    for rt in (ctypes.c_int, ctypes.c_double, ctypes.c_char_p, ctypes.c_void_p, None):
+        for fn in (bad, boom):
+            F = ctypes.CFUNCTYPE(rt)
+            try:
+                print(getattr(rt, "__name__", rt), fn.__name__, "->", repr(F(fn)()))
+            except BaseException as e:
+                print(getattr(rt, "__name__", rt), fn.__name__, "raised", type(e).__name__)
 finally:
     sys.unraisablehook = _prev_hook
 
