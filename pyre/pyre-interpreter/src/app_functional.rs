@@ -164,12 +164,14 @@ pub(crate) fn install_applevel_builtins() {
     }
     // A worker thread's first EC registration reaches this again, and
     // `clone_for_thread` hands it the builtins dict the running threads
-    // share.  The delete below would leave a name unbound until the store,
-    // so a `LOAD_GLOBAL` crossing that window raises `NameError`.
-    // A binding that is already the published function needs neither.
-    let sorted_ok = crate::module_ns_get(builtins, "sorted").is_some_and(is_published_sorted);
-    let sum_ok = crate::module_ns_get(builtins, "sum").is_some_and(is_published_sum);
-    if sorted_ok && sum_ok {
+    // share.  MixedModule._load_lazily replaces only the lazy placeholder;
+    // a published function, a user replacement, or an absent name stay.
+    // No remaining placeholder needs neither delete nor store.
+    let sorted_placeholder = crate::module_ns_get(builtins, "sorted")
+        .is_some_and(|binding| is_placeholder(binding, "sorted"));
+    let sum_placeholder =
+        crate::module_ns_get(builtins, "sum").is_some_and(|binding| is_placeholder(binding, "sum"));
+    if !sorted_placeholder && !sum_placeholder {
         return;
     }
     // `typeobject.py write_cell`: overwriting the trampoline wraps the
@@ -181,11 +183,33 @@ pub(crate) fn install_applevel_builtins() {
     let _ = pyre_object::gc_roots::pin_root(handles[SORTED] as PyObjectRef);
     let sum_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(handles[SUM] as PyObjectRef);
-    if !sorted_ok {
+    if sorted_placeholder {
         publish_one(builtins, "sorted", sorted_slot, SIGS[SORTED], ctx);
     }
-    if !sum_ok {
+    if sum_placeholder {
         publish_one(builtins, "sum", sum_slot, SIGS[SUM], ctx);
+    }
+}
+
+/// True while `binding` is still the trampoline `builtins.rs` installed
+/// for `name`.  That object's `BuiltinCode.func` is
+/// [`__majit_wrap_builtin_sorted`] / [`__majit_wrap_builtin_sum`].
+/// `mixedmodule.py MixedModule._load_lazily` replaces only that placeholder.
+fn is_placeholder(binding: PyObjectRef, name: &str) -> bool {
+    let expected = match name {
+        "sorted" => __majit_wrap_builtin_sorted as crate::gateway::BuiltinCodeFn,
+        "sum" => __majit_wrap_builtin_sum as crate::gateway::BuiltinCodeFn,
+        _ => return false,
+    };
+    unsafe {
+        if binding.is_null() || !crate::is_function(binding) {
+            return false;
+        }
+        let code = crate::function_get_code(binding) as PyObjectRef;
+        if code.is_null() || !crate::gateway::is_builtin_code(code) {
+            return false;
+        }
+        crate::gateway::builtin_code_fn_eq(crate::gateway::builtin_code_get(code), expected)
     }
 }
 

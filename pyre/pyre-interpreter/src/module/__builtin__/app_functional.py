@@ -18,6 +18,10 @@ _SSIZE_MAX = 9223372036854775807
 _SSIZE_MIN = -9223372036854775808
 _POS_INF = float("inf")
 _NEG_INF = float("-inf")
+_INT_PHASE = 0
+_FLOAT_PHASE = 1
+_COMPLEX_PHASE = 2
+_GENERIC_PHASE = 3
 
 
 def sum(iterable, /, start=0):
@@ -46,7 +50,9 @@ empty, returns start."""
 def _cs_add(hi, lo, x):
     # cs_add: improved Kahan-Babuška / Neumaier compensation.
     t = hi + x
-    if abs(hi) >= abs(x):
+    # Magnitude via sign flip, not the builtin abs: same NaN and -0.0
+    # branches as abs(hi) >= abs(x).
+    if (hi if hi >= 0.0 else -hi) >= (x if x >= 0.0 else -x):
         lo += (hi - t) + x
     else:
         lo += (x - t) + hi
@@ -64,13 +70,32 @@ def _cs_to_double(hi, lo):
 def _regular_sum(sequence, start):
     # Default implementation for sum (no specialization)
     last = start
-    it = iter(sequence)
-
-    # builtin_sum_impl exact-int phase: PyLong_CheckExact total that still
-    # fits a pointer-sized signed word.  A bool start skips it
-    # (PyLong_CheckExact is false for bool).
+    hi = 0.0
+    lo = 0.0
+    re_hi = 0.0
+    re_lo = 0.0
+    im_hi = 0.0
+    im_lo = 0.0
     if type(last) is int and _SSIZE_MIN <= last <= _SSIZE_MAX:
-        for x in it:
+        phase = _INT_PHASE
+    elif type(last) is float:
+        phase = _FLOAT_PHASE
+        hi = last
+        lo = 0.0
+    elif type(last) is complex:
+        phase = _COMPLEX_PHASE
+        re_hi = last.real
+        re_lo = 0.0
+        im_hi = last.imag
+        im_lo = 0.0
+    else:
+        phase = _GENERIC_PHASE
+
+    for x in sequence:
+        if phase == _INT_PHASE:
+            # builtin_sum_impl exact-int phase: PyLong_CheckExact total that still
+            # fits a pointer-sized signed word.  A bool start skips it
+            # (PyLong_CheckExact is false for bool).
             tx = type(x)
             if tx is int or tx is bool:
                 nxt = last + x
@@ -80,61 +105,70 @@ def _regular_sum(sequence, start):
                 last = nxt
             else:
                 last = last + x
-            break
-        else:
-            return last
-
-    # builtin_sum_impl float phase: exact float total, Neumaier
-    # compensation.  Exact floats and any int (PyLong_Check, including
-    # bool and int subclasses) stay on the path; a float subclass leaves.
-    # int.__float__ is descr___float__ (payload only, no subclass __float__).
-    if type(last) is float:
-        hi = last
-        lo = 0.0
-        for x in it:
+            if type(last) is float:
+                phase = _FLOAT_PHASE
+                hi = last
+                lo = 0.0
+            elif type(last) is complex:
+                phase = _COMPLEX_PHASE
+                re_hi = last.real
+                re_lo = 0.0
+                im_hi = last.imag
+                im_lo = 0.0
+            else:
+                phase = _GENERIC_PHASE
+        elif phase == _FLOAT_PHASE:
+            # builtin_sum_impl float phase: exact float total, Neumaier
+            # compensation.  Exact floats and any int (PyLong_Check, including
+            # bool and int subclasses) stay on the path; a float subclass leaves.
+            # int.__float__ is descr___float__ (payload only, no subclass __float__).
             if type(x) is float:
                 value = x
-            elif isinstance(x, int):
+            elif issubclass(type(x), int):
                 value = int.__float__(x)
             else:
                 last = _cs_to_double(hi, lo) + x
-                break
+                if type(last) is complex:
+                    phase = _COMPLEX_PHASE
+                    re_hi = last.real
+                    re_lo = 0.0
+                    im_hi = last.imag
+                    im_lo = 0.0
+                else:
+                    phase = _GENERIC_PHASE
+                continue
             hi, lo = _cs_add(hi, lo, value)
-        else:
-            return _cs_to_double(hi, lo)
-
-    # builtin_sum_impl complex phase: independent compensated real and
-    # imag.  Exact complex, any int, and any float (PyFloat_Check,
-    # including subclasses) stay on the path.
-    if type(last) is complex:
-        re_hi = last.real
-        re_lo = 0.0
-        im_hi = last.imag
-        im_lo = 0.0
-        for x in it:
+        elif phase == _COMPLEX_PHASE:
+            # builtin_sum_impl complex phase: independent compensated real and
+            # imag.  Exact complex, any int, and any float (PyFloat_Check,
+            # including subclasses) stay on the path.
             if type(x) is complex:
                 re_hi, re_lo = _cs_add(re_hi, re_lo, x.real)
                 im_hi, im_lo = _cs_add(im_hi, im_lo, x.imag)
-            elif isinstance(x, int):
+            elif issubclass(type(x), int):
                 re_hi, re_lo = _cs_add(re_hi, re_lo, int.__float__(x))
-            elif isinstance(x, float):
-                re_hi, re_lo = _cs_add(re_hi, re_lo, x)
+            elif issubclass(type(x), float):
+                re_hi, re_lo = _cs_add(re_hi, re_lo, float.__float__(x))
             else:
                 last = complex(
                     _cs_to_double(re_hi, re_lo),
                     _cs_to_double(im_hi, im_lo),
                 ) + x
-                break
+                phase = _GENERIC_PHASE
         else:
-            return complex(
-                _cs_to_double(re_hi, re_lo),
-                _cs_to_double(im_hi, im_lo),
-            )
+            # Very intentionally *not* +=, that would have different semantics if
+            # start was a mutable type, such as a list
+            last = last + x
 
-    for x in it:
-        # Very intentionally *not* +=, that would have different semantics if
-        # start was a mutable type, such as a list
-        last = last + x
+    if phase == _INT_PHASE:
+        return last
+    if phase == _FLOAT_PHASE:
+        return _cs_to_double(hi, lo)
+    if phase == _COMPLEX_PHASE:
+        return complex(
+            _cs_to_double(re_hi, re_lo),
+            _cs_to_double(im_hi, im_lo),
+        )
     return last
 
 
