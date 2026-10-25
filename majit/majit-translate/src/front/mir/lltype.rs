@@ -5062,12 +5062,14 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
 
 /// Leaves of `owner.field` when that field is an inlined by-value struct.
 ///
-/// `None` keeps the existing one-word copy.  `Some` is declaration order
-/// through the inner struct's own descriptors (`owner_root` = the inner
+/// `None` keeps the existing one-word copy.  `Some` is the immediate
+/// inlined decl's `struct_copy_owner_keys` plus declaration-order leaves
+/// through that inner struct's own descriptors (`owner_root` = the inner
 /// struct), matching a nested `FieldRead` of `frame.ob_header.w_class`
 /// whose base is the outer object and whose descriptor belongs to
 /// `PyObject`.  `typeptr`-like header words are ordinary leaves: this is
-/// a copy of an existing value, not an allocation.
+/// a copy of an existing value, not an allocation. A deeper by-value
+/// sub-struct's leaves keep that sub-STRUCT's owner and a bare name.
 pub(in crate::front::mir) fn inline_struct_field_leaves(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -5075,7 +5077,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
     owner: &str,
     field_name: &str,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Option<Vec<(FieldDescriptor, ValueType)>> {
+) -> Option<crate::model::InlineStructExpansion> {
     let td = type_decl_by_owner_root(llbc, owner)?;
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return None;
@@ -5084,13 +5086,18 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
         .iter()
         .find(|f| f.name.as_deref() == Some(field_name))?;
     let nested = tyref_by_value_struct_decl(&field.ty, llbc)?;
-    Some(collect_by_value_struct_leaves(
-        nested,
-        llbc,
-        tombstoned,
-        gc_struct_ids,
-        16,
-        raw_alloc_flavor_structs,
+    let (owner_root, owner_id) = struct_copy_owner_keys(nested, tombstoned);
+    Some((
+        owner_root,
+        Some(owner_id),
+        collect_by_value_struct_leaves(
+            nested,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            16,
+            raw_alloc_flavor_structs,
+        ),
     ))
 }
 
