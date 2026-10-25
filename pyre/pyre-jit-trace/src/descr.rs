@@ -7271,7 +7271,7 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let int_field = |key, offset, size, signed, immutable| {
         (key, offset, size, Type::Int, signed, immutable, false)
     };
-    let watchers = std::mem::offset_of!(PyCode, w_globals_watchers);
+    let mutate_w_globals = std::mem::offset_of!(PyCode, mutate_w_globals);
     build_object_descr_group_with_def_path(
         std::mem::size_of::<PyCode>(),
         pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
@@ -7404,16 +7404,17 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(PyCode, loop_header_info),
                 false,
             ),
-            // Inlined `QuasiImmutField`: two raw host pointers
-            // (`get_type_flag` FLAG_UNSIGNED).
+            // Inlined `QuasiImmutField` for `rclass.py InstanceRepr._setup_repr`
+            // `mutate_w_globals` (`pycode.py` `"w_globals?"`): two raw host
+            // pointers (`get_type_flag` FLAG_UNSIGNED).
             word_int(
-                "w_globals_watchers.ptr",
-                watchers + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                "mutate_w_globals.ptr",
+                mutate_w_globals + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
                 false,
             ),
             word_int(
-                "w_globals_watchers.lock",
-                watchers + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET,
+                "mutate_w_globals.lock",
+                mutate_w_globals + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET,
                 false,
             ),
             int_field(
@@ -9237,7 +9238,7 @@ mod tests {
         // `kind` at listed 0 is reused inside the kind-0 STRUCT walk
         // (`heaptracker.py all_fielddescrs` / `get_fielddescr_index_in`),
         // where `kind` is listed after `w_class`, `size`, flattened
-        // `size_watchers`, `name`, and `name_position`. Mint the header
+        // `mutate_size`, `name`, and `name_position`. Mint the header
         // leaf whose listed index is 0.
         let group = majit_ir::descr::publish_borrowed_struct_layout(
             u32::MAX,
@@ -9753,8 +9754,8 @@ mod tests {
                 "PyCode.w_filename",
                 "PyCode.addr2line_memo",
                 "PyCode.loop_header_info",
-                "PyCode.w_globals_watchers.ptr",
-                "PyCode.w_globals_watchers.lock",
+                "PyCode.mutate_w_globals.ptr",
+                "PyCode.mutate_w_globals.lock",
                 "PyCode.jit_shape",
             ]
         );

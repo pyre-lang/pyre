@@ -2961,24 +2961,44 @@ where
         if struct_ptr == 0 {
             return TraceAction::Abort;
         }
-        let loaded = match mutatefielddescr.as_field_descr() {
-            Some(fd) => self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd),
-            None => return TraceAction::Abort,
+        let Some(fd) = mutatefielddescr.as_field_descr() else {
+            return TraceAction::Abort;
         };
-        // `pyjitpl.py execute_with_descr(GETFIELD_GC_R, mutatefielddescr, box)`:
-        // records and executes the load without consulting or populating
-        // the heapcache (`_opimpl_getfield_gc_any_pureornot` is the path
-        // that does).  Upstream's kind split still uses GETFIELD_GC_R on
-        // the float arm; the mutate field is a GCREF.
+        // `pyjitpl.py opimpl_jit_force_quasi_immutable`:
+        //   if mutatefielddescr.is_pointer_field(): GETFIELD_GC_R
+        //   elif mutatefielddescr.is_float_field(): GETFIELD_GC_R
+        //   else: GETFIELD_GC_I
+        // execute_with_descr records and executes the load without
+        // consulting or populating the heapcache
+        // (`_opimpl_getfield_gc_any_pureornot` is the path that does).
+        #[allow(clippy::if_same_then_else)]
+        let (opnum, resvalue, nonnull) = if fd.is_pointer_field() {
+            let loaded = self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd);
+            (
+                OpCode::GetfieldGcR,
+                Value::Ref(loaded),
+                loaded.as_usize() != 0,
+            )
+        } else if fd.is_float_field() {
+            let loaded = self.cpu.bh_getfield_gc_r(struct_ptr as usize, fd);
+            (
+                OpCode::GetfieldGcR,
+                Value::Ref(loaded),
+                loaded.as_usize() != 0,
+            )
+        } else {
+            let loaded = self.cpu.bh_getfield_gc_i(struct_ptr as usize, fd);
+            (OpCode::GetfieldGcI, Value::Int(loaded), loaded != 0)
+        };
         let mutatebox = ctx.execute_and_record(
             Some(self.cpu.as_ref()),
-            OpCode::GetfieldGcR,
+            opnum,
             Some(mutatefielddescr),
             &[struct_opref],
-            Some(Value::Ref(loaded)),
+            Some(resvalue),
             self.last_exception_value,
         );
-        if loaded.as_usize() != 0 {
+        if nonnull {
             crate::quasiimmut::do_force_quasi_immutable(struct_ptr, &mutate_bh);
             return TraceAction::SwitchToBlackhole(
                 crate::pyjitpl::SwitchToBlackhole::abort_force_quasiimmut(),

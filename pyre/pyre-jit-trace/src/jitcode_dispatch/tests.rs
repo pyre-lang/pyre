@@ -5142,6 +5142,41 @@ fn jit_force_quasi_immutable_declines_unobserved_mutate_value() {
     );
 }
 
+#[test]
+fn jit_force_quasi_immutable_int_kind_declines_unobserved_mutate_value() {
+    // Int-kind mutate descr (`FieldDescr::is_pointer_field` /
+    // `is_float_field` both false) records GETFIELD_GC_I. An unobserved
+    // value still declines rather than assuming null.
+    let byte = *insns_opname_to_byte()
+        .get("jit_force_quasi_immutable/rd")
+        .expect("`jit_force_quasi_immutable/rd` must be in insns table");
+    let code = [byte, 0x00, 0x00, 0x00];
+    let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
+        1,
+        16,
+        8,
+        majit_ir::Type::Int,
+        false,
+    ));
+    let descr_pool = vec![descr];
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r = [OpRef::input_arg_ref(0)];
+    let err = run_hint_step_with_descrs(&code, &mut tc, &mut regs_r, &mut [], &mut [], &descr_pool)
+        .expect_err("unobserved mutate value must not assume null");
+    let last = tc
+        .ops()
+        .last()
+        .expect("GETFIELD_GC_I is recorded before the decline");
+    assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
+    assert_eq!(
+        err,
+        DispatchError::ForceQuasiImmutableValueNotConcrete {
+            pc: 0,
+            value: last.pos().get(),
+        }
+    );
+}
+
 /// Production-like `sub_jitcode_lookup` that resolves `idx` against
 /// `crate::jitcode_runtime::all_jitcodes()`. Used by the end-to-end
 /// helper acceptance tests (`walk_return_value_helper_*`,
@@ -5175,6 +5210,100 @@ fn sub_jitcode_body_by_index_builds_w_list_append() {
     );
     // Out-of-range index resolves to None (RPython: ALL_JITCODES miss).
     assert!(super::sub_jitcode_body_by_index(usize::MAX).is_none());
+}
+
+#[test]
+fn module_dict_strategy_mutated_assembles_jit_force_quasi_immutable_llop() {
+    // `celldict.py ModuleDictStrategy.mutated` / `rclass.py
+    // InstanceRepr.hook_setfield`: the `version?` store is preceded by
+    // `jit_force_quasi_immutable(vinst, Const('mutate_version'))`.
+    // `jtransform.py rewrite_op_jit_force_quasi_immutable` turns that
+    // call into `-live-` + `jit_force_quasi_immutable`. Identity is the
+    // `#[jit_llop]` marker on the callee, so this graph must assemble
+    // that llop rather than look inside the native invalidation body.
+    let path = "celldict::ModuleDictStrategy::mutated";
+    let jc = crate::jitcode_runtime::pathed_jitcode(path)
+        .expect("ModuleDictStrategy.mutated must be a discovered jitcode");
+    let ops: Vec<_> = crate::jitcode_runtime::decoded_ops(&jc.code).collect();
+    let keys: Vec<&str> = ops.iter().map(|op| op.key).collect();
+    let force = ops
+        .windows(2)
+        .find(|pair| pair[0].key == "live/" && pair[1].key == "jit_force_quasi_immutable/rd")
+        .map(|pair| &pair[1])
+        .unwrap_or_else(|| {
+            panic!("{path} must assemble live/ then jit_force_quasi_immutable/rd; ops={keys:?}")
+        });
+    assert_eq!(
+        force.argcodes, "rd",
+        "{path} jit_force_quasi_immutable must be keyed /rd; ops={keys:?}"
+    );
+    let descr_idx = {
+        let lo = jc.code[force.pc + 2] as u16;
+        let hi = jc.code[force.pc + 3] as u16;
+        (lo | (hi << 8)) as usize
+    };
+    match crate::jitcode_runtime::get_descr_by_index(descr_idx) {
+        Some(majit_jitcode::jitcode::BhDescr::Field { name, owner, .. }) => {
+            assert_eq!(
+                name, "mutate_version",
+                "{path} force descr {descr_idx} must be mutate_version; owner={owner}"
+            );
+            assert_eq!(
+                owner, "celldict::ModuleDictStrategy",
+                "{path} force descr {descr_idx} must be owned by ModuleDictStrategy"
+            );
+        }
+        other => {
+            panic!("{path} force descr {descr_idx} must be Field mutate_version; got {other:?}")
+        }
+    }
+}
+
+#[test]
+fn assembled_w_ctype_mutate_size_quasi_descr_is_the_embedded_field() {
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_size` for `ctypeobj.py W_CType.size?`.
+    // Assembler `fielddescrof` must resolve that name to the embedded
+    // `QuasiImmutField` `rclass.py InstanceRepr._setup_repr` synthesizes.
+    // An offset-0 mint sends `get_current_qmut_instance` into the object
+    // header (`w_class` is the lock word).
+    let expected = pyre_module::module::_cffi_backend::ctypeobj::W_CTYPE_MUTATE_SIZE_OFFSET;
+    let mut seen = 0usize;
+    for jc in crate::jitcode_runtime::all_jitcodes() {
+        for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+            if op.key != "record_quasiimmut_field/rdd" {
+                continue;
+            }
+            if op.pc + 6 > jc.code.len() {
+                continue;
+            }
+            let mutate_idx = u16::from_le_bytes([jc.code[op.pc + 4], jc.code[op.pc + 5]]) as usize;
+            match crate::jitcode_runtime::get_descr_by_index(mutate_idx) {
+                Some(majit_jitcode::jitcode::BhDescr::Field {
+                    name,
+                    offset,
+                    owner,
+                    ..
+                }) if name == "mutate_size" => {
+                    seen += 1;
+                    assert_eq!(
+                        *offset, expected,
+                        "{} mutate_size offset {offset} owner={owner} (expected {expected})",
+                        jc.name
+                    );
+                    assert_ne!(*offset, 0);
+                    assert_ne!(*offset, pyre_object::pyobject::W_CLASS_OFFSET);
+                }
+                _ => {}
+            }
+        }
+    }
+    #[cfg(feature = "pyre-module")]
+    assert!(
+        seen > 0,
+        "product translation must assemble at least one W_CType.size? /rdd with mutate_size"
+    );
+    let _ = (seen, expected);
 }
 
 #[test]

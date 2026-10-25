@@ -11775,4 +11775,64 @@ mod tests {
             "null struct must not record GETFIELD or GUARD_ISNULL, got {opcodes:?}"
         );
     }
+
+    /// An int-kind mutate field records `GETFIELD_GC_I` + `GUARD_ISNULL` when
+    /// the loaded value is zero (`pyjitpl.py opimpl_jit_force_quasi_immutable`
+    /// else arm).
+    #[test]
+    fn jit_force_quasi_immutable_int_kind_zero_guards_isnull() {
+        const TYPE_ID: u64 = 0x5155_14_05;
+        let mut obj = [0u64, 0];
+        let ptr = obj.as_mut_ptr() as i64;
+        static FORCE_ADDR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        FORCE_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+        extern "C" fn force_hook(field_addr: i64) {
+            FORCE_ADDR.store(field_addr, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let mut asm = majit_jitcode::codewriter::assembler::Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        builder.register_struct_layout(
+            16,
+            TYPE_ID,
+            true,
+            false,
+            &[
+                (0, false, "value", 8, true, false),
+                (8, false, "mutate_value", 8, true, false),
+            ],
+            "value?",
+        );
+        builder.live(&mut asm, &[], &[0], &[]);
+        builder.jit_force_quasi_immutable(0, TYPE_ID, "mutate_value");
+        let jitcode = builder.finish();
+        number_the_descrs(&jitcode);
+
+        let hooks = crate::HostHooks {
+            force_quasi_immutable: Some(force_hook),
+            ..crate::HostHooks::default()
+        };
+        let opcodes = with_host_hooks(hooks, || {
+            let mut ctx = context_with_liveness(&[Type::Ref], &asm);
+            let struct_ref = ctx.const_ref(ptr);
+            let mut sym = DummySym;
+            let action = trace_jitcode_with_args(
+                &mut ctx,
+                &mut sym,
+                &jitcode,
+                0,
+                |_pc| 0,
+                &[(JitArgKind::Ref, struct_ref, ptr)],
+            );
+            assert!(matches!(action, TraceAction::Continue));
+            ctx.into_recorder()
+                .ops()
+                .iter()
+                .map(|op| op.opcode)
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(opcodes, vec![OpCode::GetfieldGcI, OpCode::GuardIsnull],);
+        assert_eq!(FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let _keep = &obj;
+    }
 }

@@ -12219,6 +12219,7 @@ fn walker_pin_type_version_tag<Sym: WalkSym>(
         ctx.trace_ctx,
         w_type_const,
         crate::descr::type_version_tag_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -12289,7 +12290,7 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     // There is no `can_move` gate on this pin (`rpython/jit` uses
     // `can_move` only in backend `convert_to_imm`).
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field, None);
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12363,6 +12364,7 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 ctx.trace_ctx,
                 type_const,
                 crate::descr::type_version_tag_descr(),
+                None,
             );
             let w_value = specialize::live_box_ref(ctx, value_const, w_value);
             let mapdict =
@@ -12385,6 +12387,7 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
                 ctx.trace_ctx,
                 value_const,
                 crate::descr::w_class_descr(),
+                None,
             );
             walker_flush_guard_not_invalidated(ctx, op_pc)
         }
@@ -12458,7 +12461,7 @@ fn walker_pin_function_quasi_field<Sym: WalkSym>(
     descr: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
     let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr, None);
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12489,6 +12492,7 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
         ctx.trace_ctx,
         strategy_const,
         crate::descr::module_dict_version_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     Ok(true)
@@ -12519,6 +12523,7 @@ fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::terminator_allow_unboxing_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -12548,6 +12553,7 @@ fn walker_pin_audit_hooks<Sym: WalkSym>(
         ctx.trace_ctx,
         owner,
         crate::descr::audit_holder_hooks_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -12561,7 +12567,12 @@ fn walker_pin_holder_attr<Sym: WalkSym>(
         return Ok(());
     }
     let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, crate::descr::holder_attr_descr());
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::holder_attr_descr(),
+        None,
+    );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12574,7 +12585,12 @@ fn walker_pin_holder_typ<Sym: WalkSym>(
         return Ok(());
     }
     let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, crate::descr::holder_typ_descr());
+    crate::state::record_quasiimmut_field(
+        ctx.trace_ctx,
+        owner,
+        crate::descr::holder_typ_descr(),
+        None,
+    );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -13980,7 +13996,7 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     // `jit.promote(self.w_tracefunc)`.  The `?` is the invalidation
     // half — `settrace` notifies, `GUARD_NOT_INVALIDATED` fails, and
     // the loop is not re-entered with the folded NULL.
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone());
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), None);
     if already {
         return Ok(());
     }
@@ -14030,6 +14046,7 @@ fn record_portal_profilefunc_guard<Sym: WalkSym>(
         ctx.trace_ctx,
         ec_box,
         crate::descr::ec_profilefunc_descr(),
+        None,
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
@@ -15058,23 +15075,45 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx.gen_store_back_in_vable(vable);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
-        // `jtransform.py rewrite_op_getfield` emits this ahead of a
-        // quasi-immutable getfield. Operand layout `rdd`: the struct, the
-        // field descr, and the mutate descr. The mutate descr is unused;
-        // `quasi_immut_descr` resolves the watcher from the field descr.
-        // The opcode has no result register.
+        // pyjitpl.py `opimpl_record_quasiimmut_field`:
+        //
+        // ```text
+        // if self.metainterp.heapcache.is_quasi_immut_known(fielddescr, box):
+        //     count; return
+        // descr = QuasiImmutDescr(cpu, box.getref_base(), fielddescr,
+        //                         mutatefielddescr)
+        // self.metainterp.heapcache.quasi_immut_now_known(fielddescr, box)
+        // self.metainterp.history.record1(rop.QUASIIMMUT_FIELD, box, None,
+        //                                 descr=descr)
+        // if self.metainterp.heapcache.need_guard_not_invalidated:
+        //     generate_guard(GUARD_NOT_INVALIDATED)
+        // self.metainterp.heapcache.need_guard_not_invalidated = False
+        // ```
+        //
+        // Operand layout `rdd`: the struct (1B at offset 0), the field
+        // descr (2B at offset 1), and the mutate descr (2B at offset 3).
+        // Operand 2 is the mutate descr the watcher comes from
+        // (`QuasiImmutDescr.__init__` / `get_current_qmut_instance`).
         "record_quasiimmut_field/rdd" => {
             let obj = read_ref_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
-            let _ = crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr);
+            let mutate = read_descr(code, op, 3, ctx)?;
+            crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr, Some(&mutate));
             walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // `pyjitpl.py opimpl_jit_force_quasi_immutable`:
         //
         // ```text
-        // mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
-        //                                     mutatefielddescr, box)
+        // if mutatefielddescr.is_pointer_field():
+        //     mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
+        //                                         mutatefielddescr, box)
+        // elif mutatefielddescr.is_float_field():
+        //     mutatebox = self.execute_with_descr(rop.GETFIELD_GC_R,
+        //                                         mutatefielddescr, box)
+        // else:
+        //     mutatebox = self.execute_with_descr(rop.GETFIELD_GC_I,
+        //                                         mutatefielddescr, box)
         // if mutatebox.nonnull():
         //     from rpython.jit.metainterp.quasiimmut import do_force_quasi_immutable
         //     do_force_quasi_immutable(self.metainterp.cpu, box.getref_base(),
@@ -15083,7 +15122,7 @@ fn handle<Sym: WalkSym>(
         // self.metainterp.generate_guard(rop.GUARD_ISNULL, mutatebox,
         //                                resumepc=orgpc)
         // ```
-        // `execute_with_descr` records and executes GETFIELD_GC_R; it does
+        // `execute_with_descr` records and executes the load; it does
         // not consult or populate the heapcache (unlike
         // `_opimpl_getfield_gc_any_pureornot`).
         // An unobserved mutate value declines (upstream `execute_with_descr`
@@ -15091,10 +15130,24 @@ fn handle<Sym: WalkSym>(
         "jit_force_quasi_immutable/rd" => {
             let obj = read_ref_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
+            let tp = {
+                let Some(fd) = descr.as_field_descr() else {
+                    panic!("jit_force_quasi_immutable/rd: descr.as_field_descr() is None");
+                };
+                #[allow(clippy::if_same_then_else)]
+                if fd.is_pointer_field() {
+                    majit_ir::Type::Ref
+                } else if fd.is_float_field() {
+                    majit_ir::Type::Ref
+                } else {
+                    majit_ir::Type::Int
+                }
+            };
             let mutatebox =
-                crate::state::execute_getfield_gc_r_uncached(ctx.trace_ctx, obj, descr.clone());
+                crate::state::execute_getfield_gc_uncached(ctx.trace_ctx, obj, descr.clone(), tp);
             let installed = match ctx.trace_ctx.box_value(mutatebox) {
                 Some(majit_ir::Value::Ref(r)) => r.0 != 0,
+                Some(majit_ir::Value::Int(i)) => i != 0,
                 _ => {
                     return Err(DispatchError::ForceQuasiImmutableValueNotConcrete {
                         pc: op.pc,
