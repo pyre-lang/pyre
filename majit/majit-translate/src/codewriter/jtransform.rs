@@ -1507,71 +1507,26 @@ fn split_args_by_kind(
     (ints, refs, floats, classes)
 }
 
-/// `jtransform.py _rewrite_cmp_ptrs` (`rewrite_op_ptr_eq` /
-/// `rewrite_op_ptr_ne`): a pointer compared against NULL is the unary
-/// `ptr_iszero` / `ptr_nonzero` test over the other operand, not a
-/// two-operand `ptr_eq`.  The frontend materialises NULL as a Variable
-/// defined by [`OpKind::ConstRefNull`], so the constant is found through
-/// [`renamed_constant_of`] (`isinstance(arg, Constant)` after
-/// `renamings_constants`).  The unary form is what `optimize_goto_if_not`
-/// fuses into `goto_if_not_ptr_iszero`, which the walker answers from the
-/// heap cache without recording once the nullity is known; `ptr_eq(x, NULL)`
-/// fused into `goto_if_not_ptr_eq` still recorded `ptr_eq` + `guard_false`
-/// per test.
-#[expect(
-    clippy::mutable_key_type,
-    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
-)]
-fn null_test_rewrite(
-    graph: &FunctionGraph,
-    op: &SpaceOperation,
-    eq: bool,
-    lhs: &crate::flowspace::model::Variable,
-    rhs: &crate::flowspace::model::Variable,
-    aliases: &std::collections::HashMap<
-        crate::flowspace::model::Variable,
-        crate::flowspace::model::Variable,
-    >,
-    constants: &std::collections::HashMap<
-        crate::flowspace::model::Variable,
-        crate::flowspace::model::Constant,
-    >,
-) -> Option<RewriteResult> {
-    let is_null_const = |variable: &crate::flowspace::model::Variable| {
-        renamed_constant_of(graph, variable, aliases, constants)
-            .is_some_and(|kind| kind.is_null_ref())
+/// RPython `rgc.lltype_is_gc(TP)`: `getattr(getattr(TP, "TO", None),
+/// "_gckind", "?") == 'gc'`.
+fn lltype_is_gc(tp: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+    let to = match tp {
+        LowLevelType::Ptr(ptr) => return ptr.TO._gckind() == GcKind::Gc,
+        LowLevelType::InteriorPtr(ptr) => ptr.TO.as_ref(),
+        _ => return false,
     };
-    let operand = if is_null_const(rhs) {
-        lhs
-    } else if is_null_const(lhs) {
-        rhs
-    } else {
-        return None;
-    };
-    Some(rewrite_ptr_null_equality(op, eq, operand))
-}
-
-/// `_rewrite_equality` / `rewrite_op_ptr_eq` unary form. The result is
-/// `lltype.Bool` so `optimize_goto_if_not` can fuse it (`rtype_is_None`,
-/// `ptr_iszero`).
-fn rewrite_ptr_null_equality(
-    op: &SpaceOperation,
-    eq: bool,
-    operand: &crate::flowspace::model::Variable,
-) -> RewriteResult {
-    if let Some(result) = &op.result {
-        result.set_concretetype(Some(
-            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
-        ));
+    match to {
+        LowLevelType::Func(_)
+        | LowLevelType::Struct(_)
+        | LowLevelType::Array(_)
+        | LowLevelType::FixedSizeArray(_)
+        | LowLevelType::Opaque(_)
+        | LowLevelType::ForwardReference(_)
+        | LowLevelType::Ptr(_)
+        | LowLevelType::InteriorPtr(_) => to._gckind() == GcKind::Gc,
+        _ => false,
     }
-    RewriteResult::Replace(vec![SpaceOperation {
-        result: op.result.clone(),
-        kind: OpKind::UnaryOp {
-            op: if eq { "ptr_iszero" } else { "ptr_nonzero" }.into(),
-            operand: operand.clone(),
-            result_ty: ValueType::Int,
-        },
-    }])
 }
 
 /// A flow-graph `Constant` (`jtransform.py` `isinstance(v, Constant)`).
@@ -1736,7 +1691,14 @@ fn follow_identity_producer(
     >,
 ) -> crate::flowspace::model::Variable {
     let mut cur = resolve_alias(var, aliases);
-    for _ in 0..32 {
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cur.id()) {
+            panic!(
+                "identity-op cycle in graph {} at variable {cur}",
+                graph.name
+            );
+        }
         let Some(src) = identity_operand(graph, &cur) else {
             break;
         };
@@ -1840,13 +1802,21 @@ fn is_renamed_falsy_constant(
 /// `jtransform.py Transformer.optimize_block.do_rename`:
 /// `value = lltype._cast_whatever(var.concretetype, value)` then
 /// `renamings_constants[var] = Constant(value, var.concretetype)`.
+/// `RuntimeError` skips the constants map (`except RuntimeError: return`).
 fn recast_renamed_constant(
     var: &crate::flowspace::model::Variable,
     c: crate::flowspace::model::Constant,
-) -> crate::flowspace::model::Constant {
-    match var.concretetype() {
-        Some(ct) => crate::flowspace::model::Constant::with_concretetype(c.value, ct),
-        None => c,
+) -> Option<crate::flowspace::model::Constant> {
+    use crate::translator::rtyper::lltypesystem::lltype::{_cast_whatever, CastWhateverError};
+    let Some(ct) = var.concretetype() else {
+        return Some(c);
+    };
+    match _cast_whatever(&ct, &c.value) {
+        Ok(value) => Some(crate::flowspace::model::Constant::with_concretetype(
+            value, ct,
+        )),
+        Err(CastWhateverError::RuntimeError(_)) => None,
+        Err(CastWhateverError::TypeError(msg)) => panic!("{msg}"),
     }
 }
 
@@ -3310,21 +3280,24 @@ impl<'a> Transformer<'a> {
                 // hold Const, and Call rewrite drops Const args
                 // (`call_arg_vars`).
                 if let Some(c) = self.renamings_constants.get(&v).cloned() {
-                    let recast = recast_renamed_constant(&var, c);
-                    self.renamings_constants.insert(var, recast);
+                    if let Some(recast) = recast_renamed_constant(&var, c) {
+                        self.renamings_constants.insert(var, recast);
+                    }
                     return;
                 }
                 let resolved = resolve_alias(&v, &self.aliases);
                 if let Some(c) = self.renamings_constants.get(&resolved).cloned() {
-                    let recast = recast_renamed_constant(&var, c);
-                    self.renamings_constants.insert(var, recast);
+                    if let Some(recast) = recast_renamed_constant(&var, c) {
+                        self.renamings_constants.insert(var, recast);
+                    }
                     return;
                 }
                 self.aliases.insert(var, resolved);
             }
             RenameTarget::Const(c) => {
-                let recast = recast_renamed_constant(&var, c);
-                self.renamings_constants.insert(var, recast);
+                if let Some(recast) = recast_renamed_constant(&var, c) {
+                    self.renamings_constants.insert(var, recast);
+                }
             }
         }
     }
@@ -3414,7 +3387,20 @@ impl<'a> Transformer<'a> {
                 }
                 RewriteResult::Constant(c) => {
                     if let Some(result) = op.result.clone() {
-                        self.do_rename(result, RenameTarget::Const(c));
+                        let is_void = FunctionGraph::concretetype_of(&result)
+                            == crate::model::ConcreteType::Void;
+                        if is_void {
+                            // `do_rename`: Void is `Constant(None, Void)`,
+                            // never `_cast_whatever`.
+                            self.do_rename(result, RenameTarget::Const(c));
+                        } else {
+                            let recast = recast_renamed_constant(&result, c.clone());
+                            let defining = recast.as_ref().unwrap_or(&c);
+                            new_ops.push(materialize_const_result(result.clone(), defining));
+                            if let Some(recast) = recast {
+                                self.do_rename(result, RenameTarget::Const(recast));
+                            }
+                        }
                     }
                 }
                 RewriteResult::Keep => {
@@ -3456,12 +3442,15 @@ impl<'a> Transformer<'a> {
                 |b| b,
             )
         };
-        // `_do_renaming_on_link`: only `link.args`.
+        // `_do_renaming_on_link(renamings, link)`: only `link.args`. A
+        // LinkArg can hold a Constant, so `renamings_constants` fills those
+        // slots. BinOp operands stay Variables defined by the Const* op a
+        // Constant rewrite emits.
         let remap_exit_arg = |arg: &LinkArg| {
-            remap_link_arg(arg, &no_aliases, Some((&self.renamings_constants, true)))
+            remap_link_arg(arg, &self.aliases, Some((&self.renamings_constants, true)))
         };
-        for exit in &mut exits {
-            for arg in &mut exit.args {
+        for link in &mut exits {
+            for arg in &mut link.args {
                 *arg = remap_exit_arg(arg);
             }
         }
@@ -4822,6 +4811,12 @@ impl<'a> Transformer<'a> {
                     crate::flowspace::model::ConstValue::Int(7),
                 ))
             }
+            #[cfg(test)]
+            OpKind::UnaryOp { op: unop_name, .. } if unop_name == "__test_fold_to_const_5" => {
+                RewriteResult::Constant(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Int(5),
+                ))
+            }
             OpKind::UnaryOp {
                 op: unop_name,
                 operand,
@@ -5535,54 +5530,15 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
-            // jtransform.py `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne`: the
-            // same `_rewrite_equality` fold over Ref operands, whose zero is
-            // the null pointer and whose unary tests are `ptr_iszero` /
-            // `ptr_nonzero`.  Upstream then runs the result through
-            // `_rewrite_cmp_ptrs`, which downgrades a non-GC pointer to
-            // `int_is_zero` / `int_is_true`; every Ref reaching pyre's
-            // codewriter is a GC ref (`GcKind` does not survive the MIR
-            // front end), so the GC branch is the only one, matching the
-            // binary `ptr_eq` / `ptr_ne` arm below.
-            OpKind::BinOp {
-                op: binop_name,
-                lhs,
-                rhs,
-                result_ty: _,
-            } if matches!(binop_name.as_str(), "eq" | "ne" | "is_")
-                && self.get_value_kind_var(lhs) == 'r'
-                && self.get_value_kind_var(rhs) == 'r'
-                && (is_renamed_falsy_constant(
-                    graph,
-                    lhs,
-                    &self.aliases,
-                    &self.renamings_constants,
-                ) || is_renamed_falsy_constant(
-                    graph,
-                    rhs,
-                    &self.aliases,
-                    &self.renamings_constants,
-                )) =>
-            {
-                let operand = if is_renamed_falsy_constant(
-                    graph,
-                    lhs,
-                    &self.aliases,
-                    &self.renamings_constants,
-                ) {
-                    rhs
-                } else {
-                    lhs
-                };
-                rewrite_ptr_null_equality(op, binop_name != "ne", operand)
-            }
             // `pairtype(AbstractStringRepr, AbstractStringRepr).rtype_eq`
             // (`rstr.py`): `hop.gendirectcall(ll_streq, v_str1, v_str2)`;
             // `rtype_ne` is the same call followed by `bool_not`.  The
             // front-end keeps value `==` on strings as `eq` / `ne` and spells
             // pointer identity `is_`, so an `eq` / `ne` over two Ref operands
             // one of which is an rstr `STR` is the string comparison, not
-            // `ptr_eq`.  It lowers to the registered `jit_ll_streq` host extern
+            // `ptr_eq`.  A falsy operand (`s == NULL`) is `_rewrite_equality`
+            // on `ptr_eq`, so this arm requires both sides non-falsy.
+            // It lowers to the registered `jit_ll_streq` host extern
             // (`pyre_object::lowlevel_string`, address in `jit_fnaddr.rs`),
             // whose operands are `STR` payloads like a `ConstStr`.
             OpKind::BinOp {
@@ -5590,7 +5546,20 @@ impl<'a> Transformer<'a> {
                 lhs,
                 rhs,
                 ..
-            } if self.is_string_equality(binop_name, lhs, rhs) => {
+            } if self.is_string_equality(binop_name, lhs, rhs)
+                && !is_renamed_falsy_constant(
+                    graph,
+                    lhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                )
+                && !is_renamed_falsy_constant(
+                    graph,
+                    rhs,
+                    &self.aliases,
+                    &self.renamings_constants,
+                ) =>
+            {
                 let target = CallTarget::function_path([self.config.str_eq_helper.as_str()]);
                 // `ll_streq` is `@jit.oopspec('stroruni.equal(s1, s2)')`, so
                 // the direct call goes through `_handle_stroruni_call`: the
@@ -5681,17 +5650,10 @@ impl<'a> Transformer<'a> {
                     ))
                 }
             }
-            // RPython `jtransform.py` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`
-            // + `_is_rclass_instance` → `instance_ptr_eq`/`instance_ptr_ne`.
-            // Pyre's front-end emits a unified `BinOp { op: "eq"/"ne" }`
-            // because Rust's `==`/`!=` is one AST node regardless of operand type;
-            // the jtransform layer is where RPython branches on operand kind.
-            // Both operands Ref → rewrite to `ptr_eq`/`ptr_ne`. Mixed/Int operands
-            // stay as `int_eq`/`int_ne`.  `rptr.py` `pairtype(PtrRepr, Repr).rtype_eq/ne`
-            // calls `hop.inputargs(r_ptr, r_ptr)` — both operands are already
-            // ptr-typed here, so there is no cast — and pyre's blackhole wires
-            // `bhimpl_ptr_eq` / `bhimpl_ptr_ne` at `bh_binop_r_to_i`, so the
-            // `ptr_eq/rr>i` opname dispatches without `cast_ptr_to_int`.
+            // RPython `jtransform.py` `rewrite_op_ptr_eq`/`rewrite_op_ptr_ne`:
+            // instance promotion, `_rewrite_equality`, `_rewrite_cmp_ptrs`.
+            // Front-end `eq`/`ne`/`is_` over two Refs is that path (`is_` is
+            // `rptr.py` `rtype_is_` → `ptr_eq`).
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
@@ -5701,83 +5663,32 @@ impl<'a> Transformer<'a> {
                 && self.get_value_kind_var(lhs) == 'r'
                 && self.get_value_kind_var(rhs) == 'r' =>
             {
-                // jtransform.py `rewrite_op_ptr_eq`: `_rewrite_equality`
-                // (NULL → `ptr_iszero`) then the rclass-instance promotion.
-                // `is_` is `rptr.py` `rtype_is_` → `ptr_eq`.
-                if let Some(rewritten) = null_test_rewrite(
-                    graph,
+                self.rewrite_op_ptr_eq_or_ne(
                     op,
+                    lhs,
+                    rhs,
+                    result_ty,
                     binop_name != "ne",
-                    lhs,
-                    rhs,
-                    &self.aliases,
-                    &self.renamings_constants,
-                ) {
-                    return rewritten;
-                }
-                // The comparison answers an integer, so the result banks as
-                // one; without the stamp it keeps the `'r'` kind the unified
-                // `BinOp` carried in and `op_kind_to_opname_with_kinds` spells
-                // an opname no blackhole handler registers.
-                self.stamp_value_kind(
+                    graph_name,
                     graph,
-                    op.result.clone(),
-                    crate::codewriter::type_state::ConcreteType::Signed,
-                );
-                let new_op = self.ptr_equality_opname(
-                    if binop_name == "ne" { "ne" } else { "eq" },
-                    lhs,
-                    rhs,
-                );
-                RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::BinOp {
-                        op: new_op.into(),
-                        lhs: lhs.clone(),
-                        rhs: rhs.clone(),
-                        result_ty: result_ty.clone(),
-                    },
-                }])
+                )
             }
             // Already-named `ptr_eq`/`ptr_ne` from rtyper `PtrRepr.rtype_eq`.
-            // `rewrite_op_ptr_eq`: `_rewrite_equality` (NULL → `ptr_iszero`)
-            // then the rclass-instance promotion.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 result_ty,
-            } if matches!(binop_name.as_str(), "ptr_eq" | "ptr_ne") => {
-                if let Some(rewritten) = null_test_rewrite(
-                    graph,
+            } if matches!(binop_name.as_str(), "ptr_eq" | "ptr_ne") => self
+                .rewrite_op_ptr_eq_or_ne(
                     op,
-                    binop_name != "ptr_ne",
                     lhs,
                     rhs,
-                    &self.aliases,
-                    &self.renamings_constants,
-                ) {
-                    return rewritten;
-                }
-                if self.is_rclass_instance(lhs) && self.is_rclass_instance(rhs) {
-                    let new_op = if binop_name == "ptr_eq" {
-                        "instance_ptr_eq"
-                    } else {
-                        "instance_ptr_ne"
-                    };
-                    RewriteResult::Replace(vec![SpaceOperation {
-                        result: op.result.clone(),
-                        kind: OpKind::BinOp {
-                            op: new_op.into(),
-                            lhs: lhs.clone(),
-                            rhs: rhs.clone(),
-                            result_ty: result_ty.clone(),
-                        },
-                    }])
-                } else {
-                    RewriteResult::Keep
-                }
-            }
+                    result_ty,
+                    binop_name != "ptr_ne",
+                    graph_name,
+                    graph,
+                ),
             // jtransform.py `_rewrite_cmp_ptrs`: non-GC ptr
             // equality becomes int_eq/int_ne.  Mixed i+r operands from
             // Pyre's unified BinOp need cast_ptr_to_int on the Ref side
@@ -6386,7 +6297,7 @@ impl<'a> Transformer<'a> {
             // of `optimize_goto_if_not`, is what lets the fusion see it: that
             // gate matches opnames, and `bool` is not one of them.  The result
             // is stamped with the `lltype.Bool` those two opnames return,
-            // exactly as `null_test_rewrite` stamps the same pair, so the
+            // exactly as `_rewrite_equality`'s unary ptr form stamps the same pair, so the
             // identity arm below and that gate's `concretetype` test each read
             // a witness rather than falling back on the exits.  That identity
             // arm is what fuses an `is_null` test -- its `ptr_iszero` result
@@ -7155,6 +7066,166 @@ impl<'a> Transformer<'a> {
         crate::translator::rtyper::lltypesystem::lltype::_castdepth(outside, object) >= 0
     }
 
+    /// RPython `Transformer._is_gc`: `rgc.lltype_is_gc(v.concretetype)`.
+    /// A missing concretetype keeps today's GC-ref behaviour (`ptr_*`).
+    fn is_gc(&self, var: &crate::flowspace::model::Variable) -> bool {
+        match var.concretetype() {
+            None => true,
+            Some(ct) => lltype_is_gc(&ct),
+        }
+    }
+
+    /// `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne`: instance promotion,
+    /// `_rewrite_equality`, `_rewrite_cmp_ptrs`.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Mirrors rewrite_op_ptr_eq / rewrite_op_ptr_ne operand, result, and graph"
+    )]
+    fn rewrite_op_ptr_eq_or_ne(
+        &mut self,
+        op: &SpaceOperation,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+        result_ty: &ValueType,
+        eq: bool,
+        graph_name: &str,
+        graph: &FunctionGraph,
+    ) -> RewriteResult {
+        self.stamp_value_kind(
+            graph,
+            op.result.clone(),
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let mut binop_name = if eq { "ptr_eq" } else { "ptr_ne" };
+        if self.is_rclass_instance(lhs) {
+            if self.is_rclass_instance(rhs) {
+                binop_name = if eq {
+                    "instance_ptr_eq"
+                } else {
+                    "instance_ptr_ne"
+                };
+            } else if rhs.concretetype().is_none()
+                || is_renamed_falsy_constant(graph, rhs, &self.aliases, &self.renamings_constants)
+            {
+                // `nullptr(OBJECTPTR)` is an rclass instance upstream
+                // (`_is_rclass_instance` reads `concretetype`, not the
+                // value). Pyre's `ConstRefNull` often has no cell; a
+                // missing type keeps today's `ptr_eq` and
+                // `_rewrite_equality` still folds it to `ptr_iszero`.
+            } else {
+                panic!(
+                    "graph {graph_name}: ptr equality of an rclass instance against a non-instance"
+                );
+            }
+        }
+        let unary_name = if eq { "ptr_iszero" } else { "ptr_nonzero" };
+        let after_eq =
+            self.rewrite_equality(graph, op, lhs, rhs, binop_name, unary_name, result_ty);
+        self.rewrite_cmp_ptrs(after_eq)
+    }
+
+    /// `Transformer._rewrite_equality`.
+    fn rewrite_equality(
+        &self,
+        graph: &FunctionGraph,
+        op: &SpaceOperation,
+        lhs: &crate::flowspace::model::Variable,
+        rhs: &crate::flowspace::model::Variable,
+        binop_name: &str,
+        unary_name: &str,
+        result_ty: &ValueType,
+    ) -> SpaceOperation {
+        let lhs_falsy =
+            is_renamed_falsy_constant(graph, lhs, &self.aliases, &self.renamings_constants);
+        let rhs_falsy =
+            is_renamed_falsy_constant(graph, rhs, &self.aliases, &self.renamings_constants);
+        if lhs_falsy || rhs_falsy {
+            let operand = if lhs_falsy { rhs } else { lhs };
+            if let Some(result) = &op.result {
+                result.set_concretetype(Some(
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+                ));
+            }
+            return SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::UnaryOp {
+                    op: unary_name.into(),
+                    operand: operand.clone(),
+                    result_ty: ValueType::Int,
+                },
+            };
+        }
+        // `_rewrite_equality` fallthrough is `_rewrite_symmetric`, which
+        // is not gated on the `rewrite_op_*` whitelist (`ptr_eq` is not
+        // in that set). Swap a constant left operand here.
+        let (lhs, rhs) =
+            if is_renamed_source_constant(graph, lhs, &self.aliases, &self.renamings_constants)
+                && !is_renamed_source_constant(graph, rhs, &self.aliases, &self.renamings_constants)
+            {
+                (rhs, lhs)
+            } else {
+                (lhs, rhs)
+            };
+        SpaceOperation {
+            result: op.result.clone(),
+            kind: OpKind::BinOp {
+                op: binop_name.into(),
+                lhs: lhs.clone(),
+                rhs: rhs.clone(),
+                result_ty: result_ty.clone(),
+            },
+        }
+    }
+
+    /// `Transformer._rewrite_cmp_ptrs`.
+    fn rewrite_cmp_ptrs(&self, op: SpaceOperation) -> RewriteResult {
+        let first = match &op.kind {
+            OpKind::BinOp { lhs, .. } => lhs,
+            OpKind::UnaryOp { operand, .. } => operand,
+            _ => return RewriteResult::Replace(vec![op]),
+        };
+        if self.is_gc(first) {
+            return RewriteResult::Replace(vec![op]);
+        }
+        let new_name = match &op.kind {
+            OpKind::BinOp { op: name, .. } | OpKind::UnaryOp { op: name, .. } => {
+                match name.as_str() {
+                    "ptr_eq" => "int_eq",
+                    "ptr_ne" => "int_ne",
+                    "ptr_iszero" => "int_is_zero",
+                    "ptr_nonzero" => "int_is_true",
+                    other => panic!("_rewrite_cmp_ptrs: unexpected opname {other}"),
+                }
+            }
+            _ => return RewriteResult::Replace(vec![op]),
+        };
+        let kind = match op.kind {
+            OpKind::BinOp {
+                lhs,
+                rhs,
+                result_ty,
+                ..
+            } => OpKind::BinOp {
+                op: new_name.into(),
+                lhs,
+                rhs,
+                result_ty,
+            },
+            OpKind::UnaryOp {
+                operand, result_ty, ..
+            } => OpKind::UnaryOp {
+                op: new_name.into(),
+                operand,
+                result_ty,
+            },
+            other => other,
+        };
+        RewriteResult::Replace(vec![SpaceOperation {
+            result: op.result,
+            kind,
+        }])
+    }
+
     /// Abort a leftover kind-`'r'` `str` / `add` that has no rstr `ll_str` /
     /// `ll_strconcat`. The original op is dropped so the assembler never
     /// names `int_str/r>r` or `int_add/rr>r`. `ConstRefNull` (`ref_copy`)
@@ -7366,25 +7437,6 @@ impl<'a> Transformer<'a> {
             },
         });
         ops
-    }
-
-    /// `rewrite_op_ptr_eq` / `rewrite_op_ptr_ne` opname after the
-    /// rclass-instance promotion.
-    fn ptr_equality_opname(
-        &self,
-        eq_or_ne: &str,
-        lhs: &crate::flowspace::model::Variable,
-        rhs: &crate::flowspace::model::Variable,
-    ) -> &'static str {
-        match (
-            eq_or_ne,
-            self.is_rclass_instance(lhs) && self.is_rclass_instance(rhs),
-        ) {
-            ("eq", true) => "instance_ptr_eq",
-            ("ne", true) => "instance_ptr_ne",
-            ("eq", false) => "ptr_eq",
-            _ => "ptr_ne",
-        }
     }
 
     fn get_value_type(&self, var: &crate::flowspace::model::Variable) -> Option<ValueType> {
@@ -13668,32 +13720,15 @@ impl<'a> Transformer<'a> {
                         jd.numreds = Some(reds_raw.len());
                     }
                 }
-                // jtransform.py:1699-1701 `assert isinstance(v,
-                // Variable), "Constant specified red in
-                // jit_merge_point()"` — a Constant passed as red is
-                // rejected.  front::mir materialises every Const
-                // operand into a fresh Variable (`emit_constant`), so
-                // the Constant-vs-Variable operand distinction is
-                // recovered by provenance: a red whose defining op is
-                // `Const*` (or the `__str_const` synthetic call) is
-                // the image of a source-level Constant red.  Const
-                // defining ops pass through jtransform unrewritten
-                // (`rewrite_operation` keeps them), so the scan is
-                // sound on the in-progress graph.  The graph-wide
-                // def-site scan equals the upstream call-operand
-                // boundary because graphs are single-assignment
-                // (`checkgraph`'s "duplicate variable" assert,
-                // flowspace/model.rs): a red holding a constant has
-                // its Const def as its ONLY def, and a red that merges
-                // a constant with other flow arrives as a fresh block
-                // inputarg whose id matches no Const def — exactly the
-                // cases upstream sees as Constant resp. Variable
-                // operands.  A constant value laundered through a
-                // value-copying op is not chased; upstream's
-                // `isinstance(v, Variable)` does not chase it either.
+                // `handle_jit_marker__jit_merge_point`: after
+                // `_do_renaming(renamings_constants)`, `isinstance(v,
+                // Variable)` rejects a red that is a Constant —
+                // including `a = same_as(ConstInt(7))`. `renamed_constant_of`
+                // is that predicate with the live maps.
                 for red in reds_raw {
                     assert!(
-                        !is_source_constant_variable(graph, red),
+                        renamed_constant_of(graph, red, &self.aliases, &self.renamings_constants,)
+                            .is_none(),
                         "Constant specified red in jit_merge_point()"
                     );
                 }
@@ -20473,6 +20508,7 @@ mod tests {
                 true,
             )
             .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&v1, ConcreteType::GcRef);
         let t = graph
             .push_op_var(
                 start,
@@ -20854,6 +20890,277 @@ mod tests {
                     OpKind::UnaryOp { op, .. } if op == "__test_fold_to_const_int"
                 )),
             "Constant return must drop the folding op from the emitted block"
+        );
+    }
+
+    /// `do_rename`: `_cast_whatever(Signed, True)` is `1`.
+    #[test]
+    fn do_rename_casts_bool_true_constant_to_signed_one() {
+        use crate::flowspace::model::{ConstValue, Constant, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let var = Variable::new();
+        var.set_concretetype(Some(LowLevelType::Signed));
+        transformer.do_rename(
+            var.clone(),
+            RenameTarget::Const(Constant::new(ConstValue::Bool(true))),
+        );
+        assert_eq!(
+            transformer.renamings_constants.get(&var).map(|c| &c.value),
+            Some(&ConstValue::Int(1)),
+            "Bool True renamed into Signed is 1"
+        );
+    }
+
+    /// `do_rename`: `_cast_whatever(Unsigned, -1)` is `r_uint` wrap.
+    #[test]
+    fn do_rename_casts_signed_minus_one_constant_to_unsigned_max() {
+        use crate::flowspace::model::{ConstValue, Constant, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let var = Variable::new();
+        var.set_concretetype(Some(LowLevelType::Unsigned));
+        transformer.do_rename(
+            var.clone(),
+            RenameTarget::Const(Constant::new(ConstValue::Int(-1))),
+        );
+        assert_eq!(
+            transformer.renamings_constants.get(&var).map(|c| &c.value),
+            Some(&ConstValue::UInt(u64::MAX)),
+            "Signed -1 renamed into Unsigned is u64::MAX"
+        );
+    }
+
+    fn assert_block_uses_are_defined(block: &crate::model::Block) {
+        use std::collections::HashSet;
+        let mut defined: HashSet<crate::flowspace::model::Variable> =
+            block.inputargs.iter().cloned().collect();
+        for op in &block.operations {
+            for var in crate::inline::op_variable_refs(&op.kind) {
+                assert!(
+                    defined.contains(&var),
+                    "use of {var:?} has no definition in the block; ops={:?} inputs={:?}",
+                    block.operations,
+                    block.inputargs
+                );
+            }
+            if let Some(result) = &op.result {
+                defined.insert(result.clone());
+            }
+        }
+        match &block.exitswitch {
+            Some(crate::model::ExitSwitch::Value(v)) => {
+                assert!(
+                    defined.contains(v),
+                    "exitswitch {v:?} is undefined; ops={:?}",
+                    block.operations
+                );
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for v in args {
+                    assert!(
+                        defined.contains(v),
+                        "fused exitswitch arg {v:?} is undefined; ops={:?}",
+                        block.operations
+                    );
+                }
+            }
+            Some(crate::model::ExitSwitch::LastException) | None => {}
+        }
+        for link in &block.exits {
+            for arg in &link.args {
+                if let LinkArg::Value(v) = arg {
+                    assert!(
+                        defined.contains(v),
+                        "link arg {v:?} is undefined; ops={:?}",
+                        block.operations
+                    );
+                }
+            }
+            for extra in [&link.last_exception, &link.last_exc_value] {
+                if let Some(LinkArg::Value(v)) = extra {
+                    assert!(
+                        defined.contains(v),
+                        "exc link arg {v:?} is undefined; ops={:?}",
+                        block.operations
+                    );
+                }
+            }
+        }
+    }
+
+    /// A `RewriteResult::Constant` that feeds `int_add` and an outgoing
+    /// link leaves no undefined use; the link carries the constant.
+    #[test]
+    fn optimize_block_constant_result_defines_binop_and_link() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::flowspace::model::ConstValue;
+        use crate::model::Link;
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("const_feeds_add_and_link");
+        let start = graph.startblock;
+        let x = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::Signed);
+        let folded = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "__test_fold_to_const_5".into(),
+                    operand: x.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&folded, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                start,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: x,
+                    rhs: folded.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        let (extra, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(extra, None);
+        graph.set_control_flow_metadata(
+            start,
+            None,
+            vec![Link::from_variables(
+                &graph,
+                vec![folded.clone()],
+                extra,
+                None,
+            )],
+        );
+        let exceptblock = graph.exceptblock;
+        transformer.optimize_block(&mut graph, start.0, "const_feeds_add_and_link", exceptblock);
+
+        assert_block_uses_are_defined(&graph.blocks[start.0]);
+        let block = &graph.blocks[start.0];
+        assert!(
+            block.operations.iter().any(|op| {
+                matches!((&op.kind, &op.result), (OpKind::ConstInt(5), Some(r)) if r == &folded)
+            }),
+            "Constant rewrite must emit ConstInt(5) defining the result: {:?}",
+            block.operations
+        );
+        assert!(
+            block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { lhs, rhs, .. } if lhs == &folded || rhs == &folded
+            )),
+            "int_add must keep the Const*-defined operand: {:?}",
+            block.operations
+        );
+        assert!(
+            block.exits.iter().any(|link| {
+                link.args.iter().any(|arg| match arg {
+                    LinkArg::Const(c) => c.value == ConstValue::Int(5),
+                    _ => false,
+                })
+            }),
+            "outgoing link must carry the constant: {:?}",
+            block.exits
+        );
+    }
+
+    /// Same Constant rewrite as an exitswitch: the switch variable is defined.
+    #[test]
+    fn optimize_block_constant_result_defines_exitswitch() {
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::model::{ExitCase, ExitSwitch, Link};
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("const_feeds_exitswitch");
+        let start = graph.startblock;
+        let x = graph
+            .push_op_var(
+                start,
+                OpKind::Input {
+                    name: "x".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::Signed);
+        let folded = graph
+            .push_op_var(
+                start,
+                OpKind::UnaryOp {
+                    op: "__test_fold_to_const_5".into(),
+                    operand: x.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&folded, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                start,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs: x,
+                    rhs: folded.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        let if_true = graph.create_block();
+        let if_false = graph.create_block();
+        graph.set_return(if_true, None);
+        graph.set_return(if_false, None);
+        graph.set_control_flow_metadata(
+            start,
+            Some(ExitSwitch::Value(folded.clone())),
+            vec![
+                Link::from_variables(&graph, vec![], if_true, Some(ExitCase::Bool(true))),
+                Link::from_variables(&graph, vec![], if_false, Some(ExitCase::Bool(false))),
+            ],
+        );
+        let exceptblock = graph.exceptblock;
+        transformer.optimize_block(&mut graph, start.0, "const_feeds_exitswitch", exceptblock);
+
+        assert_block_uses_are_defined(&graph.blocks[start.0]);
+        match &graph.blocks[start.0].exitswitch {
+            Some(ExitSwitch::Value(var)) => {
+                assert_eq!(var, &folded, "exitswitch stays the Const*-defined variable")
+            }
+            other => panic!("expected Value exitswitch, got {other:?}"),
+        }
+        assert!(
+            graph.blocks[start.0].operations.iter().any(|op| {
+                matches!((&op.kind, &op.result), (OpKind::ConstInt(5), Some(r)) if r == &folded)
+            }),
+            "exitswitch producer must be defined: {:?}",
+            graph.blocks[start.0].operations
         );
     }
 
@@ -26661,64 +26968,6 @@ mod tests {
         );
     }
 
-    fn assert_block_uses_are_defined(block: &crate::model::Block) {
-        use std::collections::HashSet;
-        let mut defined: HashSet<crate::flowspace::model::Variable> =
-            block.inputargs.iter().cloned().collect();
-        for op in &block.operations {
-            for var in crate::inline::op_variable_refs(&op.kind) {
-                assert!(
-                    defined.contains(&var),
-                    "use of {var:?} has no definition in the block; ops={:?} inputs={:?}",
-                    block.operations,
-                    block.inputargs
-                );
-            }
-            if let Some(result) = &op.result {
-                defined.insert(result.clone());
-            }
-        }
-        match &block.exitswitch {
-            Some(crate::model::ExitSwitch::Value(v)) => {
-                assert!(
-                    defined.contains(v),
-                    "exitswitch {v:?} is undefined; ops={:?}",
-                    block.operations
-                );
-            }
-            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
-                for v in args {
-                    assert!(
-                        defined.contains(v),
-                        "fused exitswitch arg {v:?} is undefined; ops={:?}",
-                        block.operations
-                    );
-                }
-            }
-            Some(crate::model::ExitSwitch::LastException) | None => {}
-        }
-        for link in &block.exits {
-            for arg in &link.args {
-                if let LinkArg::Value(v) = arg {
-                    assert!(
-                        defined.contains(v),
-                        "link arg {v:?} is undefined; ops={:?}",
-                        block.operations
-                    );
-                }
-            }
-            for extra in [&link.last_exception, &link.last_exc_value] {
-                if let Some(LinkArg::Value(v)) = extra {
-                    assert!(
-                        defined.contains(v),
-                        "exc link arg {v:?} is undefined; ops={:?}",
-                        block.operations
-                    );
-                }
-            }
-        }
-    }
-
     #[test]
     fn transform_graph_record_exact_value_helper_result_later_uses_are_defined() {
         let mut graph = FunctionGraph::new("record_exact_value_helper_later_use");
@@ -28981,6 +29230,61 @@ mod tests {
             kind: OpKind::ConstInt(7),
         });
         let args_vars = vec![receiver_var, g1_var, red_var];
+        let _ = transformer.try_handle_jit_marker(
+            JitMarkerKey::JitMergePoint,
+            &args_vars,
+            None,
+            &graph,
+        );
+    }
+
+    /// `c = ConstInt(7); a = same_as(c)` as red is a Constant after
+    /// `renamings_constants` (`handle_jit_marker__jit_merge_point`).
+    #[test]
+    #[should_panic(expected = "Constant specified red in jit_merge_point()")]
+    fn try_handle_jit_marker_rejects_same_as_constant_red() {
+        use crate::codewriter::call::CallControl;
+        use crate::codewriter::type_state::ConcreteType;
+        use crate::parse::CallPath;
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["test", "portal"]),
+            vec!["green1".into()],
+            vec!["red1".into()],
+            Vec::new(),
+            Vec::new(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            CallPath::from_segments(["test", "portal"]),
+        );
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0));
+
+        let mut graph = crate::model::FunctionGraph::new("same_as_constant_red_fixture");
+        let receiver_var = graph.alloc_value_var();
+        let g1_var = graph.alloc_value_var();
+        FunctionGraph::set_concretetype_of_inline(&g1_var, ConcreteType::Signed);
+        let c = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(7), true)
+            .unwrap();
+        let a = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: c,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&a, ConcreteType::Signed);
+        let args_vars = vec![receiver_var, g1_var, a];
         let _ = transformer.try_handle_jit_marker(
             JitMarkerKey::JitMergePoint,
             &args_vars,
@@ -38862,7 +39166,7 @@ mod tests {
                     OpKind::BinOp {
                         op: "eq".into(),
                         lhs: x.clone(),
-                        rhs: v1,
+                        rhs: v1.clone(),
                         result_ty: ValueType::Bool,
                     },
                     true,
@@ -38870,6 +39174,7 @@ mod tests {
                 .unwrap();
             graph.set_return(graph.startblock, Some(result));
             FunctionGraph::set_concretetype_of_inline(&x, ConcreteType::GcRef);
+            FunctionGraph::set_concretetype_of_inline(&v1, ConcreteType::GcRef);
             let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
             let ops = &transformed.graph.block(graph.startblock).operations;
             assert_eq!(
@@ -39224,6 +39529,306 @@ mod tests {
             assert_eq!(
                 op, "instance_ptr_eq",
                 "OBJECTPTR-stamped refs are rclass instances: {ops:?}"
+            );
+        }
+
+        fn transform_named_ptr_eq(
+            op: &str,
+            lhs_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+            rhs_kind: OpKind,
+            rhs_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+            graph_name: &str,
+        ) -> (Vec<crate::model::SpaceOperation>, Variable) {
+            let mut graph = FunctionGraph::new(graph_name);
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            lhs.set_concretetype(Some(lhs_ty));
+            let rhs = graph.push_op_var(graph.startblock, rhs_kind, true).unwrap();
+            rhs.set_concretetype(Some(rhs_ty));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: op.into(),
+                        lhs: lhs.clone(),
+                        rhs,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            (
+                transformed.graph.block(graph.startblock).operations.clone(),
+                lhs,
+            )
+        }
+
+        #[test]
+        fn ptr_eq_of_instance_against_untyped_null_becomes_ptr_iszero() {
+            use crate::translator::rtyper::rclass::OBJECTPTR;
+            let mut graph = FunctionGraph::new("instance_vs_untyped_null");
+            let x = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            x.set_concretetype(Some(OBJECTPTR.clone()));
+            let null = graph
+                .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+                .unwrap();
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs: x.clone(),
+                        rhs: null,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert_eq!(
+                unary_op(ops),
+                Some(("ptr_iszero".to_string(), x)),
+                "`ptr_eq(instance, ConstRefNull)` folds; untyped nullptr is not a typed non-instance: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn ptr_eq_of_raw_ptr_against_null_becomes_int_is_zero() {
+            use crate::translator::rtyper::rclass::NONGCOBJECTPTR;
+            let ty = NONGCOBJECTPTR.clone();
+            let (ops, x) = transform_named_ptr_eq(
+                "ptr_eq",
+                ty.clone(),
+                OpKind::ConstRefNull,
+                ty,
+                "raw_ptr_eq_null",
+            );
+            assert_eq!(
+                unary_op(&ops),
+                Some(("int_is_zero".to_string(), x)),
+                "`ptr_eq(raw, NULL)` must become int_is_zero: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn ptr_ne_of_two_raw_ptrs_becomes_int_ne() {
+            use crate::translator::rtyper::rclass::NONGCOBJECTPTR;
+            let ty = NONGCOBJECTPTR.clone();
+            let mut graph = FunctionGraph::new("raw_ptr_ne");
+            let a = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let b = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            a.set_concretetype(Some(ty.clone()));
+            b.set_concretetype(Some(ty));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_ne".into(),
+                        lhs: a,
+                        rhs: b,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            let (op, _, _) = binary_op(ops).expect("the compare must survive");
+            assert_eq!(
+                op, "int_ne",
+                "`ptr_ne(raw_a, raw_b)` must become int_ne: {ops:?}"
+            );
+        }
+
+        #[test]
+        fn ptr_eq_of_two_gc_ptrs_stays_ptr_eq() {
+            use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+            let ty = GCREF.clone();
+            let mut graph = FunctionGraph::new("gc_ptr_eq");
+            let a = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let b = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            a.set_concretetype(Some(ty.clone()));
+            b.set_concretetype(Some(ty));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs: a,
+                        rhs: b,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            let (op, _, _) = binary_op(ops).expect("the compare must survive");
+            assert_eq!(op, "ptr_eq", "`ptr_eq(gc_a, gc_b)` stays ptr_eq: {ops:?}");
+        }
+
+        #[test]
+        #[should_panic(expected = "instance_vs_noninstance_ptr_eq")]
+        fn ptr_eq_of_instance_against_non_instance_panics() {
+            use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+            use crate::translator::rtyper::rclass::OBJECTPTR;
+            let mut graph = FunctionGraph::new("instance_vs_noninstance_ptr_eq");
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            lhs.set_concretetype(Some(OBJECTPTR.clone()));
+            rhs.set_concretetype(Some(GCREF.clone()));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let _ = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        }
+
+        #[test]
+        fn forty_same_as_from_null_still_folds_ptr_eq_to_ptr_iszero() {
+            use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+            let mut graph = FunctionGraph::new("identity_chain_40");
+            let x = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "x".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            x.set_concretetype(Some(GCREF.clone()));
+            let mut cur = graph
+                .push_op_var(graph.startblock, OpKind::ConstRefNull, true)
+                .unwrap();
+            for _ in 0..40 {
+                cur = graph
+                    .push_op_var(
+                        graph.startblock,
+                        OpKind::UnaryOp {
+                            op: "same_as".into(),
+                            operand: cur,
+                            result_ty: ValueType::Ref(None),
+                        },
+                        true,
+                    )
+                    .unwrap();
+            }
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs: x.clone(),
+                        rhs: cur,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            assert_eq!(
+                unary_op(ops),
+                Some(("ptr_iszero".to_string(), x)),
+                "`ptr_eq(x, v40)` of a 40-long same_as(NULL) chain must fold: {ops:?}"
             );
         }
     }

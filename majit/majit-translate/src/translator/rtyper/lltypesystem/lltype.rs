@@ -177,16 +177,8 @@ pub fn ann_typeOf() -> Result<(), TyperError> {
     Err(deferred("ann_typeOf"))
 }
 
-pub fn cast_primitive() -> Result<(), TyperError> {
-    Err(deferred("cast_primitive"))
-}
-
 pub fn ann_cast_primitive() -> Result<(), TyperError> {
     Err(deferred("ann_cast_primitive"))
-}
-
-pub fn _cast_whatever() -> Result<(), TyperError> {
-    Err(deferred("_cast_whatever"))
 }
 
 /// RPython `lltype._castdepth(outside, inside)` — signed parent-chain
@@ -415,6 +407,19 @@ impl LowLevelType {
                 | LowLevelType::Char
                 | LowLevelType::UniChar
                 | LowLevelType::Address
+        )
+    }
+
+    /// RPython `isinstance(self, Number)` — the `build_number` primitives.
+    pub fn is_number(&self) -> bool {
+        matches!(
+            self,
+            LowLevelType::Signed
+                | LowLevelType::Unsigned
+                | LowLevelType::SignedLongLong
+                | LowLevelType::SignedLongLongLong
+                | LowLevelType::UnsignedLongLong
+                | LowLevelType::UnsignedLongLongLong
         )
     }
 
@@ -5440,6 +5445,304 @@ pub fn cast_int_to_ptr(PTRTYPE: &Ptr, oddint: i64) -> Result<_ptr, String> {
     ))
 }
 
+/// RPython `TypeError` / `RuntimeError` from `cast_primitive` and
+/// `_cast_whatever`. `optimize_block.do_rename` swallows `RuntimeError`
+/// and lets `TypeError` propagate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CastWhateverError {
+    TypeError(String),
+    RuntimeError(String),
+}
+
+impl CastWhateverError {
+    fn type_error(msg: impl Into<String>) -> Self {
+        Self::TypeError(msg.into())
+    }
+
+    fn from_cast_string(msg: String) -> Self {
+        if msg.contains("DelayedPointer") {
+            Self::RuntimeError(msg)
+        } else {
+            Self::TypeError(msg)
+        }
+    }
+}
+
+/// RPython `lltype.typeOf` for a flow-graph `Constant.value`.
+pub fn typeOf_const(value: &ConstValue) -> Result<LowLevelType, CastWhateverError> {
+    match value {
+        ConstValue::Int(_) | ConstValue::AddressOffset(_) | ConstValue::InheritanceId { .. } => {
+            Ok(LowLevelType::Signed)
+        }
+        ConstValue::UInt(_) => Ok(LowLevelType::Unsigned),
+        ConstValue::Int128(_) => Ok(LowLevelType::SignedLongLongLong),
+        ConstValue::UInt128(_) => Ok(LowLevelType::UnsignedLongLongLong),
+        ConstValue::Bool(_) => Ok(LowLevelType::Bool),
+        ConstValue::Float(_) => Ok(LowLevelType::Float),
+        ConstValue::ByteStr(bytes) => {
+            if bytes.len() == 1 {
+                Ok(LowLevelType::Char)
+            } else {
+                Err(CastWhateverError::type_error("typeOf('str object')"))
+            }
+        }
+        ConstValue::UniStr(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(_), None) => Ok(LowLevelType::UniChar),
+                _ => Err(CastWhateverError::type_error("typeOf('unicode object')")),
+            }
+        }
+        ConstValue::None => Ok(LowLevelType::Void),
+        ConstValue::LLPtr(ptr) => Ok(LowLevelType::Ptr(Box::new(ptr._TYPE.clone()))),
+        ConstValue::LLAddress(_) => Ok(LowLevelType::Address),
+        other => Err(CastWhateverError::type_error(format!(
+            "typeOf('{} object')",
+            const_value_type_name(other)
+        ))),
+    }
+}
+
+fn const_value_type_name(value: &ConstValue) -> &'static str {
+    match value {
+        ConstValue::Placeholder => "Placeholder",
+        ConstValue::Atom(_) => "Atom",
+        ConstValue::Dict(_) => "dict",
+        ConstValue::Tuple(_) => "tuple",
+        ConstValue::List(_) => "list",
+        ConstValue::Code(_) => "code",
+        ConstValue::Function(_) => "function",
+        ConstValue::Graphs(_) => "list",
+        ConstValue::LowLevelType(_) => "LowLevelType",
+        ConstValue::HostObject(_) => "object",
+        ConstValue::SpecTag(_) => "SpecTag",
+        ConstValue::Opaque(_) | ConstValue::Repr(_) => "object",
+        _ => "object",
+    }
+}
+
+fn const_as_i128(value: &ConstValue) -> Result<i128, CastWhateverError> {
+    match value {
+        ConstValue::Bool(true) => Ok(1),
+        ConstValue::Bool(false) => Ok(0),
+        ConstValue::Int(n) => Ok(*n as i128),
+        ConstValue::UInt(n) => Ok(*n as i128),
+        ConstValue::Int128(n) => Ok(*n),
+        ConstValue::UInt128(n) => Ok(*n as i128),
+        ConstValue::Float(bits) => Ok(f64::from_bits(*bits) as i128),
+        ConstValue::ByteStr(bytes) if bytes.len() == 1 => Ok(bytes[0] as i128),
+        ConstValue::UniStr(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => Ok(u32::from(ch) as i128),
+                _ => Err(CastWhateverError::type_error("unsupported cast")),
+            }
+        }
+        _ => Err(CastWhateverError::type_error("unsupported cast")),
+    }
+}
+
+fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
+    match value {
+        ConstValue::Float(bits) => Ok(f64::from_bits(*bits)),
+        ConstValue::Bool(true) => Ok(1.0),
+        ConstValue::Bool(false) => Ok(0.0),
+        ConstValue::Int(n) => Ok(*n as f64),
+        ConstValue::UInt(n) => Ok(*n as f64),
+        ConstValue::Int128(n) => Ok(*n as f64),
+        ConstValue::UInt128(n) => Ok(*n as f64),
+        ConstValue::ByteStr(bytes) if bytes.len() == 1 => Ok(bytes[0] as f64),
+        ConstValue::UniStr(s) => {
+            let mut chars = s.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) => Ok(u32::from(ch) as f64),
+                _ => Err(CastWhateverError::type_error("unsupported cast")),
+            }
+        }
+        _ => Err(CastWhateverError::type_error("unsupported cast")),
+    }
+}
+
+fn number_cast(tgt: &LowLevelType, value: &ConstValue) -> Result<ConstValue, CastWhateverError> {
+    let n = const_as_i128(value)?;
+    match tgt {
+        // `Number._cast` for Signed is `intmask`.
+        LowLevelType::Signed | LowLevelType::SignedLongLong => Ok(ConstValue::Int(n as i64)),
+        // `Unsigned = build_number("Unsigned", r_uint)`: wrap to word bits.
+        LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => Ok(ConstValue::UInt(n as u64)),
+        LowLevelType::SignedLongLongLong => Ok(ConstValue::Int128(n)),
+        LowLevelType::UnsignedLongLongLong => Ok(ConstValue::UInt128(n as u128)),
+        _ => Err(CastWhateverError::type_error("unsupported cast")),
+    }
+}
+
+/// RPython `lltype.cast_primitive(TGT, value)`.
+pub fn cast_primitive(
+    tgt: &LowLevelType,
+    value: &ConstValue,
+) -> Result<ConstValue, CastWhateverError> {
+    let orig = typeOf_const(value)?;
+    if !tgt.is_primitive() || !orig.is_primitive() {
+        return Err(CastWhateverError::type_error(
+            "can only primitive to primitive",
+        ));
+    }
+    if orig == *tgt {
+        return Ok(value.clone());
+    }
+    let mut work = value.clone();
+    if orig == LowLevelType::Char || orig == LowLevelType::UniChar {
+        work = ConstValue::Int(const_as_i128(&work)? as i64);
+    } else if orig == LowLevelType::Float {
+        if matches!(tgt, LowLevelType::SingleFloat | LowLevelType::LongFloat) {
+            return Err(CastWhateverError::type_error("unsupported cast"));
+        }
+        work = ConstValue::Int128(const_as_i128(&work)?);
+    }
+    // `_to_primitive = {Char: chr, UniChar: unichr, Float: float, Bool: bool}`
+    match tgt {
+        LowLevelType::Char => {
+            let n = const_as_i128(&work)?;
+            if !(0..=255).contains(&n) {
+                return Err(CastWhateverError::type_error("unsupported cast"));
+            }
+            return Ok(ConstValue::ByteStr(vec![n as u8]));
+        }
+        LowLevelType::UniChar => {
+            let n = const_as_i128(&work)?;
+            let ch = u32::try_from(n)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| CastWhateverError::type_error("unsupported cast"))?;
+            return Ok(ConstValue::UniStr(ch.to_string()));
+        }
+        LowLevelType::Float => {
+            return Ok(ConstValue::float(const_as_f64(&work)?));
+        }
+        LowLevelType::Bool => {
+            let truthy = work
+                .truthy()
+                .ok_or_else(|| CastWhateverError::type_error("unsupported cast"))?;
+            return Ok(ConstValue::Bool(truthy));
+        }
+        _ => {}
+    }
+    if tgt.is_number() {
+        return number_cast(tgt, &work);
+    }
+    if orig == LowLevelType::SingleFloat && *tgt == LowLevelType::Float {
+        return Ok(ConstValue::float(const_as_f64(&work)?));
+    }
+    if orig == LowLevelType::LongFloat && *tgt == LowLevelType::Float {
+        return Ok(ConstValue::float(const_as_f64(&work)?));
+    }
+    Err(CastWhateverError::type_error("unsupported cast"))
+}
+
+fn dont_know_how_to_cast(orig: &LowLevelType, tgt: &LowLevelType) -> CastWhateverError {
+    CastWhateverError::type_error(format!("don't know how to cast from {orig:?} to {tgt:?}"))
+}
+
+fn ptr_cast_value(
+    tgt: &Ptr,
+    orig: &Ptr,
+    value: &ConstValue,
+) -> Result<ConstValue, CastWhateverError> {
+    let ConstValue::LLPtr(ptr) = value else {
+        return Err(dont_know_how_to_cast(
+            &LowLevelType::Ptr(Box::new(orig.clone())),
+            &LowLevelType::Ptr(Box::new(tgt.clone())),
+        ));
+    };
+    let orig_opaque = matches!(orig.TO, PtrTarget::Opaque(_));
+    let tgt_opaque = matches!(tgt.TO, PtrTarget::Opaque(_));
+    let casted = if orig_opaque || tgt_opaque {
+        cast_opaque_ptr(tgt, ptr)
+    } else {
+        cast_pointer(tgt, ptr)
+    }
+    .map_err(CastWhateverError::from_cast_string)?;
+    Ok(ConstValue::LLPtr(Box::new(casted)))
+}
+
+/// RPython `lltype._cast_whatever(TGT, value)`. Branch order matches
+/// `_cast_whatever`: same type, Primitive→Primitive, Ptr→Ptr (opaque vs
+/// `cast_pointer`), Address→Ptr, VOIDP+Unsigned, Signed→Ptr, Ptr→Address,
+/// raw Ptr→Signed, then TypeError.
+pub fn _cast_whatever(
+    tgt: &LowLevelType,
+    value: &ConstValue,
+) -> Result<ConstValue, CastWhateverError> {
+    let orig = typeOf_const(value)?;
+    if orig == *tgt {
+        return Ok(value.clone());
+    }
+    // `isinstance(TGT, Primitive) and isinstance(ORIG, Primitive)`.
+    // `llmemory.Address` is not a Primitive.
+    if tgt.is_primitive()
+        && orig.is_primitive()
+        && *tgt != LowLevelType::Address
+        && orig != LowLevelType::Address
+    {
+        return cast_primitive(tgt, value);
+    } else if let LowLevelType::Ptr(tgt_ptr) = tgt {
+        if let LowLevelType::Ptr(orig_ptr) = &orig {
+            return ptr_cast_value(tgt_ptr, orig_ptr, value);
+        } else if orig == LowLevelType::Address {
+            let ConstValue::LLAddress(addr) = value else {
+                return Err(dont_know_how_to_cast(&orig, tgt));
+            };
+            let casted = match addr {
+                _address::Null => nullptr(tgt_ptr.TO.clone().into())
+                    .map_err(CastWhateverError::from_cast_string)?,
+                _address::Fake(ptr) => {
+                    let orig_ptr = &ptr._TYPE;
+                    let orig_opaque = matches!(orig_ptr.TO, PtrTarget::Opaque(_));
+                    let tgt_opaque = matches!(tgt_ptr.TO, PtrTarget::Opaque(_));
+                    if orig_opaque || tgt_opaque {
+                        cast_opaque_ptr(tgt_ptr, ptr)
+                    } else {
+                        cast_pointer(tgt_ptr, ptr)
+                    }
+                    .map_err(CastWhateverError::from_cast_string)?
+                }
+                _address::IntCast(_) => return Err(dont_know_how_to_cast(&orig, tgt)),
+            };
+            return Ok(ConstValue::LLPtr(Box::new(casted)));
+        } else if orig == LowLevelType::Signed {
+            let n = const_as_i128(value)? as i64;
+            let casted =
+                cast_int_to_ptr(tgt_ptr, n).map_err(CastWhateverError::from_cast_string)?;
+            return Ok(ConstValue::LLPtr(Box::new(casted)));
+        }
+        // `TGT == rffi.VOIDP and ORIG == Unsigned` needs `rffi`; omitted
+        // here so that path raises the same TypeError as the fallthrough.
+    } else if *tgt == LowLevelType::Address {
+        if let LowLevelType::Ptr(_) = &orig {
+            let ConstValue::LLPtr(ptr) = value else {
+                return Err(dont_know_how_to_cast(&orig, tgt));
+            };
+            let addr = if ptr.nonzero() {
+                _address::Fake(Box::new((**ptr).clone()))
+            } else {
+                _address::Null
+            };
+            return Ok(ConstValue::LLAddress(addr));
+        }
+    } else if *tgt == LowLevelType::Signed {
+        if let LowLevelType::Ptr(orig_ptr) = &orig
+            && orig_ptr.TO._gckind() == GcKind::Raw
+        {
+            let ConstValue::LLPtr(ptr) = value else {
+                return Err(dont_know_how_to_cast(&orig, tgt));
+            };
+            let n = cast_ptr_to_int(ptr).map_err(CastWhateverError::from_cast_string)?;
+            return Ok(ConstValue::Int(n));
+        }
+    }
+    Err(dont_know_how_to_cast(&orig, tgt))
+}
+
 /// RPython `cast_pointer(PTRTYPE, ptr)` (`lltype.py`):
 ///
 /// ```python
@@ -9086,9 +9389,9 @@ mod tests {
 
     #[test]
     fn deferred_lltype_helpers_name_the_original_surface() {
-        let err = cast_primitive().expect_err("cast_primitive lowering is deferred");
+        let err = ann_cast_primitive().expect_err("ann_cast_primitive lowering is deferred");
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("cast_primitive"));
+        assert!(err.to_string().contains("ann_cast_primitive"));
 
         let err = ann_runtime_type_info().expect_err("runtime analyzer is deferred");
         assert!(err.is_missing_rtype_operation());
@@ -9097,6 +9400,20 @@ mod tests {
         let err = dissect_ll_instance().expect_err("dissection helper is deferred");
         assert!(err.is_missing_rtype_operation());
         assert!(err.to_string().contains("dissect_ll_instance"));
+    }
+
+    #[test]
+    fn cast_whatever_bool_true_to_signed_is_one() {
+        let got = _cast_whatever(&LowLevelType::Signed, &ConstValue::Bool(true))
+            .expect("Bool → Signed is cast_primitive");
+        assert_eq!(got, ConstValue::Int(1));
+    }
+
+    #[test]
+    fn cast_whatever_signed_minus_one_to_unsigned_is_u64_max() {
+        let got = _cast_whatever(&LowLevelType::Unsigned, &ConstValue::Int(-1))
+            .expect("Signed → Unsigned is r_uint wrap");
+        assert_eq!(got, ConstValue::UInt(u64::MAX));
     }
 
     #[test]
