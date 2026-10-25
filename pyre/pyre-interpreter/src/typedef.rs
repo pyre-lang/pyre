@@ -68,7 +68,10 @@ mod typedef_identity_tests {
                 let after =
                     w_dict_getitem_str(gc_roots::shadow_stack_get(ns_slot), "field").unwrap();
                 assert_eq!(after, gc_roots::shadow_stack_get(bound_slot));
-                assert!(w_getset_get_objclass(super::dict_descr()).is_null());
+                assert!(std::ptr::eq(
+                    w_getset_get_objclass(super::dict_descr()),
+                    super::w_object()
+                ));
             }
         }
     }
@@ -14661,9 +14664,9 @@ fn init_getset_descriptor_type(ns: PyObjectRef) {
             )
         )
     };
-    // CPython 3.14 `PyGetSetDescr_Type.tp_repr` renders
-    // `<attribute 'name' of 'Owner' objects>`. PyPy's GetSetProperty typedef
-    // has no explicit repr; this is the selected 3.14 surface.
+    // `descrobject.c getset_repr` via `descr_repr`: `<attribute 'name'>`
+    // when the owner is `object`, otherwise
+    // `<attribute 'name' of 'Owner' objects>`.
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -14880,7 +14883,24 @@ unsafe fn descriptor_owner_qualname(owner: PyObjectRef) -> String {
     unsafe { pyre_object::w_type_get_qualname(owner) }.to_string()
 }
 
-/// CPython 3.14 getset descriptor repr, shared with `display::py_repr` because
+/// `descrobject.c descr_repr`.
+///
+/// Drops the `of 'X' objects` suffix when the owner is `object`
+/// (`d_type == &PyBaseObject_Type`).
+pub(crate) fn descr_repr_text(kind: &str, name: &str, owner: PyObjectRef) -> String {
+    if !owner.is_null() && std::ptr::eq(owner, w_object()) {
+        format!("<{kind} '{name}'>")
+    } else {
+        let owner_name = if owner.is_null() {
+            "?"
+        } else {
+            unsafe { pyre_object::w_type_get_name(owner) }
+        };
+        format!("<{kind} '{name}' of '{owner_name}' objects>")
+    }
+}
+
+/// `descrobject.c getset_repr`, shared with `display::py_repr` because
 /// native GetSetProperty instances do not carry a heap-instance `w_class`.
 pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
     let name_obj = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
@@ -14890,12 +14910,7 @@ pub(crate) unsafe fn getset_descriptor_repr(descr: PyObjectRef) -> String {
         "<generic property>"
     };
     let owner = unsafe { getset_descriptor_owner(descr) };
-    let owner_name = if owner.is_null() {
-        "?"
-    } else {
-        unsafe { pyre_object::w_type_get_name(owner) }
-    };
-    format!("<attribute '{name}' of '{owner_name}' objects>")
+    descr_repr_text("attribute", name, owner)
 }
 
 /// `GetSetProperty(fget)` — read-only getset descriptor with no required class.
@@ -15423,6 +15438,19 @@ fn init_type_type(ns: PyObjectRef) {
                     if !pyre_object::is_str(args[1]) {
                         return Err(crate::PyError::type_error("attribute name must be string"));
                     }
+                    // type_setattro: `Py_TPFLAGS_IMMUTABLETYPE` is refused
+                    // before the metatype getset runs, so `del list.__doc__`
+                    // uses the set wording.  The flag lives on `W_TypeObject`.
+                    if pyre_object::is_type(args[0])
+                        && pyre_object::w_type_is_cpython_immutabletype(args[0])
+                    {
+                        let name = pyre_object::w_str_get_wtf8(args[1]);
+                        return Err(crate::PyError::type_error(format!(
+                            "cannot set {} attribute of immutable type '{}'",
+                            crate::display::format_wtf8_repr(name),
+                            pyre_object::w_type_get_name(args[0])
+                        )));
+                    }
                     let name = pyre_object::w_str_get_wtf8(args[1]);
                     match name.as_str() {
                         Ok(s) => crate::baseobjspace::object_delattr(args[0], s),
@@ -15818,12 +15846,10 @@ fn init_type_type(ns: PyObjectRef) {
                     "descriptor '__abstractmethods__' for 'type' objects doesn't apply",
                 ));
             }
-            if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
-                return Err(crate::PyError::type_error(format!(
-                    "cannot delete '__abstractmethods__' attribute of immutable type '{}'",
-                    unsafe { pyre_object::w_type_get_name(w_type) },
-                )));
-            }
+            // typeobject.py descr_del___abstractmethods__: pop the dict
+            // entry and clear the abstract flag.  Immutability is
+            // `type_setattro`'s check, so a direct `__delete__` on a
+            // static type still reaches this AttributeError miss.
             if crate::type_dict_delete(w_type, "__abstractmethods__") {
                 unsafe {
                     pyre_object::w_type_set_abstract(w_type, false);
@@ -15906,16 +15932,8 @@ fn init_type_type(ns: PyObjectRef) {
     );
     let type_params_setter_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(type_params_setter);
-    let type_params_deleter = make_builtin_function_with_arity(
-        "__type_params__",
-        |args| {
-            Err(crate::PyError::type_error(format!(
-                "cannot delete '__type_params__' attribute of immutable type '{}'",
-                unsafe { pyre_object::w_type_get_name(args[1]) },
-            )))
-        },
-        2,
-    );
+    let type_params_deleter =
+        make_builtin_function_with_arity("__type_params__", type_del_type_params, 2);
     let type_params_deleter_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(type_params_deleter);
     unsafe {
@@ -16574,31 +16592,37 @@ unsafe fn type_in_mro(w_base: PyObjectRef, w_type: PyObjectRef) -> bool {
 }
 
 /// `typeobject.c check_set_special_type_attr` — the shared guard the
-/// `__name__` / `__qualname__` / `__module__` / `__bases__` setters run
-/// before touching the type.  A static type carries
-/// `Py_TPFLAGS_IMMUTABLETYPE`, so it refuses assignment *and* deletion under
-/// the "cannot set" wording; a heap type only refuses the deletion (a null
-/// `w_value`).
+/// `__name__` / `__qualname__` / `__module__` / `__bases__` / `__doc__` /
+/// `__type_params__` setters run before touching the type.  A null `w_value`
+/// is a delete and is refused for every type; a non-null store is refused
+/// only when the type carries `Py_TPFLAGS_IMMUTABLETYPE`.  `type_setattro`
+/// still reports the immutable-type wording first on `del` of a static type,
+/// because it checks that flag before the getset runs.
 fn check_set_special_type_attr(
     w_type: PyObjectRef,
     w_value: PyObjectRef,
     name: &str,
 ) -> Result<(), crate::PyError> {
-    let immutable = unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) };
-    if !immutable && !w_value.is_null() {
-        return Ok(());
-    }
-    let verb = if immutable { "set" } else { "delete" };
     let type_name = unsafe { pyre_object::w_type_get_name(w_type) };
-    Err(crate::PyError::type_error(crate::display::wtf8_format!(
-        "cannot ",
-        verb,
-        " '",
-        name,
-        "' attribute of immutable type '",
-        type_name,
-        "'"
-    )))
+    if w_value.is_null() {
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "cannot delete '",
+            name,
+            "' attribute of type '",
+            type_name,
+            "'"
+        )));
+    }
+    if unsafe { pyre_object::w_type_is_cpython_immutabletype(w_type) } {
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            "cannot set '",
+            name,
+            "' attribute of immutable type '",
+            type_name,
+            "'"
+        )));
+    }
+    Ok(())
 }
 
 /// The `fdel` half of the special type getsets: deletion is never allowed,
@@ -16675,6 +16699,10 @@ fn type_del_module(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
 
 fn type_del_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     special_type_attr_delete(args, "__bases__")
+}
+
+fn type_del_type_params(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    special_type_attr_delete(args, "__type_params__")
 }
 
 /// `type.__bases__` setter (typeobject.py:1064-1105 `descr_set__bases__`).
@@ -19965,9 +19993,8 @@ fn init_method_descriptor_type(ns: PyObjectRef) {
                     let descr = method_descriptor_receiver(args[0], "__repr__")?;
                     let name = crate::function::function_get_name(descr).to_string();
                     let owner = crate::function::fget_func_objclass(descr)?;
-                    let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new_managed(&format!(
-                        "<method '{name}' of '{owner_name}' objects>"
+                    Ok(pyre_object::w_str_new_managed(&descr_repr_text(
+                        "method", &name, owner,
                     )))
                 },
                 1,
@@ -20113,9 +20140,8 @@ fn init_classmethod_descriptor_type(ns: PyObjectRef) {
                     let function = classmethod_descriptor_function(args[0], "__repr__")?;
                     let name = crate::function::function_get_name(function).to_string();
                     let owner = crate::function::fget_func_objclass(function)?;
-                    let owner_name = pyre_object::w_type_get_name(owner);
-                    Ok(pyre_object::w_str_new_managed(&format!(
-                        "<method '{name}' of '{owner_name}' objects>"
+                    Ok(pyre_object::w_str_new_managed(&descr_repr_text(
+                        "method", &name, owner,
                     )))
                 },
                 1,
@@ -20965,18 +20991,12 @@ fn init_member_descriptor_type(ns: PyObjectRef) {
     };
 }
 
-/// CPython 3.14 `member_get_qualname` / `member_repr` surface shared by the
-/// registered `__repr__` method and `display::py_repr`'s native descriptor
-/// dispatch.
+/// `descrobject.c member_repr` surface shared by the registered `__repr__`
+/// method and `display::py_repr`'s native descriptor dispatch.
 pub(crate) unsafe fn member_descriptor_repr(member: PyObjectRef) -> String {
     let name = unsafe { pyre_object::w_member_get_name(member) };
     let owner = unsafe { pyre_object::w_member_get_cls(member) };
-    let owner_name = if owner.is_null() {
-        "?"
-    } else {
-        unsafe { pyre_object::w_type_get_name(owner) }
-    };
-    format!("<member '{name}' of '{owner_name}' objects>")
+    descr_repr_text("member", name, owner)
 }
 
 /// CPython 3.14 `cell_new`, matching PyPy `descr_new_cell` except that the
@@ -21331,63 +21351,33 @@ fn staticmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, cra
     Ok(obj)
 }
 
-/// `function.py` `StaticMethod.descr_staticmethod__new__`: allocate through
-/// `allocate_instance`. An exact instance is the base layout; a subclass is
-/// `typedef.py` `_getusercls` (`StaticMethodUser`). `__init__` installs the
-/// callable.
-fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
-    let cls = args.first().copied().unwrap_or(PY_NULL);
-    let staticmethod_type = gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
-    check_user_subclass(staticmethod_type, cls)?;
-    let obj = pyre_object::function::StaticMethod::allocate_instance(
-        pyre_object::function::StaticMethod {
-            ob: pyre_object::PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
-            },
-            w_function: w_none(),
-            w_dict: PY_NULL,
-            w_function_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
-        },
-        cls,
-    );
-    // `allocate_instance` enqueues `maybe_register_finalizer` for a
-    // subclass (`objspace.py`). The exact layout returns from
-    // `allocate_stable` before that call.
-    if std::ptr::eq(
-        unsafe { (*obj).ob_type },
-        &pyre_object::function::STATICMETHOD_TYPE,
-    ) {
-        pyre_object::gc_hook::maybe_register_finalizer(obj);
-    }
-    Ok(obj)
-}
-
-/// function.py `StaticMethod.descr_init`, adjusted to CPython 3.14:
-/// `functools_wraps` copies the four presentation attributes while
-/// `__annotations__` and `__annotate__` remain lazy proxy descriptors.
-fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let positional = args;
-    let sm = staticmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
-    let function = positional.get(1).copied().filter(|w| !w.is_null());
-    let extra = positional
+/// `sm_new` / `cm_new` / `sm_init` / `cm_init` unpack: exactly one
+/// positional callable after the type or instance.
+fn wrapper_take_callable(args: &[PyObjectRef], kind: &str) -> Result<PyObjectRef, crate::PyError> {
+    let function = args.get(1).copied().filter(|w| !w.is_null());
+    let extra = args
         .get(2..)
         .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
     let supplied = usize::from(function.is_some()) + extra;
     if supplied != 1 {
         return Err(crate::PyError::type_error(format!(
-            "staticmethod expected 1 argument, got {supplied}"
+            "{kind} expected 1 argument, got {supplied}"
         )));
     }
-    let function = function.unwrap();
-    unsafe { pyre_object::function::w_staticmethod_set_func(sm, function) };
+    Ok(function.unwrap())
+}
+
+/// function.py `_copy_func_attrs` / `functools_wraps`: copy the four
+/// presentation attributes into the wrapper's instance dict.
+/// `__annotations__` and `__annotate__` stay lazy proxy descriptors.
+fn copy_func_attrs(w_dict: PyObjectRef, function: PyObjectRef) -> crate::PyResult {
     // The instance dict moves, the lookup runs Python once per name, and the
     // key string is allocated after the value arrives — so the dict, the
     // wrapped object and each fetched value are read back out of root slots at
     // the store rather than out of the locals that produced them.
     let roots = pyre_object::gc_roots::push_roots();
     let dict_slot = roots.base();
-    let _ = roots.pin_root(unsafe { pyre_object::function::w_staticmethod_getdict(sm) });
+    let _ = roots.pin_root(w_dict);
     let function_slot = dict_slot + 1;
     let _ = roots.pin_root(function);
     for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
@@ -21408,6 +21398,90 @@ fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
         }
     }
     Ok(w_none())
+}
+
+/// `sm_set_callable`: store the callable and run `functools_wraps`, skipping
+/// when `sm_init` repeats the callable `sm_new` already stored.
+fn staticmethod_set_callable(sm: PyObjectRef, function: PyObjectRef) -> crate::PyResult {
+    let current = unsafe { pyre_object::function::w_staticmethod_get_func(sm) };
+    if std::ptr::eq(current, function) {
+        return Ok(w_none());
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let sm_slot = roots.base();
+    let _ = roots.pin_root(sm);
+    let function_slot = sm_slot + 1;
+    let _ = roots.pin_root(function);
+    unsafe {
+        pyre_object::function::w_staticmethod_set_func(
+            roots.get(sm_slot),
+            roots.get(function_slot),
+        );
+    }
+    let dict = unsafe { pyre_object::function::w_staticmethod_getdict(roots.get(sm_slot)) };
+    copy_func_attrs(dict, roots.get(function_slot))
+}
+
+/// `function.py` `StaticMethod.descr_staticmethod__new__` plus `sm_new`:
+/// allocate through `allocate_instance`, then `sm_set_callable`.  An exact
+/// instance is the base layout; a subclass is `typedef.py` `_getusercls`
+/// (`StaticMethodUser`).  `w_function` starts as `PY_NULL` so
+/// `staticmethod(None)` still copies attributes.
+fn staticmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
+    let cls = args.first().copied().unwrap_or(PY_NULL);
+    let staticmethod_type = gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
+    check_user_subclass(staticmethod_type, cls)?;
+    let function = wrapper_take_callable(args, "staticmethod")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.base();
+    let _ = roots.pin_root(cls);
+    let function_slot = cls_slot + 1;
+    let _ = roots.pin_root(function);
+    let obj = pyre_object::function::StaticMethod::allocate_instance(
+        pyre_object::function::StaticMethod {
+            ob: pyre_object::PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_function: PY_NULL,
+            w_dict: PY_NULL,
+            w_function_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
+        },
+        roots.get(cls_slot),
+    );
+    let obj_slot = function_slot + 1;
+    let _ = roots.pin_root(obj);
+    // `allocate_instance` enqueues `maybe_register_finalizer` for a
+    // subclass (`objspace.py`). The exact layout returns from
+    // `allocate_stable` before that call.
+    if std::ptr::eq(
+        unsafe { (*roots.get(obj_slot)).ob_type },
+        &pyre_object::function::STATICMETHOD_TYPE,
+    ) {
+        pyre_object::gc_hook::maybe_register_finalizer(roots.get(obj_slot));
+    }
+    staticmethod_set_callable(roots.get(obj_slot), roots.get(function_slot))?;
+    Ok(roots.get(obj_slot))
+}
+
+/// `PyStaticMethod_New`: the implicit `__new__` wrapper `type_new_staticmethod`
+/// installs goes through `sm_new` / `sm_set_callable`, not a bare allocate.
+pub(crate) fn staticmethod_from_function(func: PyObjectRef) -> crate::PyResult {
+    let cls = gettypeobject(&pyre_object::function::STATICMETHOD_TYPE);
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.base();
+    let _ = roots.pin_root(cls);
+    let func_slot = cls_slot + 1;
+    let _ = roots.pin_root(func);
+    staticmethod_descr_new(&[roots.get(cls_slot), roots.get(func_slot)])
+}
+
+/// function.py `StaticMethod.descr_init` / `sm_init`: `sm_set_callable`
+/// skips the copy when `__new__` already stored the same callable.
+fn staticmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let sm = staticmethod_require(args.first().copied().unwrap_or(PY_NULL), "__init__")?;
+    let function = wrapper_take_callable(args, "staticmethod")?;
+    staticmethod_set_callable(sm, function)
 }
 
 /// function.py `descr_staticmethod_get`.
@@ -21965,80 +22039,86 @@ fn classmethod_require(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crat
     Ok(obj)
 }
 
-/// `function.py` `ClassMethod.descr_classmethod__new__`: allocate through
-/// `allocate_instance`. An exact instance is the base layout; a subclass is
-/// `typedef.py` `_getusercls` (`ClassMethodUser`). `__init__` installs the
-/// callable.
+/// `cm_set_callable`: store the callable and run `functools_wraps`, skipping
+/// when `cm_init` repeats the callable `cm_new` already stored.
+fn classmethod_set_callable(cm: PyObjectRef, function: PyObjectRef) -> crate::PyResult {
+    let current = unsafe { pyre_object::function::w_classmethod_get_func(cm) };
+    if std::ptr::eq(current, function) {
+        return Ok(w_none());
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let cm_slot = roots.base();
+    let _ = roots.pin_root(cm);
+    let function_slot = cm_slot + 1;
+    let _ = roots.pin_root(function);
+    unsafe {
+        pyre_object::function::w_classmethod_set_func(roots.get(cm_slot), roots.get(function_slot));
+    }
+    let dict = unsafe { pyre_object::function::w_classmethod_getdict(roots.get(cm_slot)) };
+    copy_func_attrs(dict, roots.get(function_slot))
+}
+
+/// `function.py` `ClassMethod.descr_classmethod__new__` plus `cm_new`:
+/// allocate through `allocate_instance`, then `cm_set_callable`.  An exact
+/// instance is the base layout; a subclass is `typedef.py` `_getusercls`
+/// (`ClassMethodUser`).  `w_function` starts as `PY_NULL` so
+/// `classmethod(None)` still copies attributes.
 fn classmethod_descr_new(args: &[PyObjectRef]) -> crate::PyResult {
     let cls = args.first().copied().unwrap_or(PY_NULL);
     let classmethod_type = gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
     check_user_subclass(classmethod_type, cls)?;
+    let function = wrapper_take_callable(args, "classmethod")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = roots.base();
+    let _ = roots.pin_root(cls);
+    let function_slot = cls_slot + 1;
+    let _ = roots.pin_root(function);
     let obj = pyre_object::function::ClassMethod::allocate_instance(
         pyre_object::function::ClassMethod {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
-            w_function: w_none(),
+            w_function: PY_NULL,
             w_dict: PY_NULL,
             w_function_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
         },
-        cls,
+        roots.get(cls_slot),
     );
+    let obj_slot = function_slot + 1;
+    let _ = roots.pin_root(obj);
     // `allocate_instance` enqueues `maybe_register_finalizer` for a
     // subclass (`objspace.py`). The exact layout returns from
     // `allocate_stable` before that call.
     if std::ptr::eq(
-        unsafe { (*obj).ob_type },
+        unsafe { (*roots.get(obj_slot)).ob_type },
         &pyre_object::function::CLASSMETHOD_TYPE,
     ) {
-        pyre_object::gc_hook::maybe_register_finalizer(obj);
+        pyre_object::gc_hook::maybe_register_finalizer(roots.get(obj_slot));
     }
-    Ok(obj)
+    classmethod_set_callable(roots.get(obj_slot), roots.get(function_slot))?;
+    Ok(roots.get(obj_slot))
 }
 
-/// function.py `ClassMethod.descr_init`, adjusted to CPython 3.14's
-/// `functools_wraps`: copy the four eager presentation attributes while the
-/// two annotation attributes remain lazy proxy descriptors.
-fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let positional = args;
-    let cm = classmethod_require(positional.first().copied().unwrap_or(PY_NULL), "__init__")?;
-    let function = positional.get(1).copied().filter(|w| !w.is_null());
-    let extra = positional
-        .get(2..)
-        .map_or(0, |rest| rest.iter().filter(|w| !w.is_null()).count());
-    let supplied = usize::from(function.is_some()) + extra;
-    if supplied != 1 {
-        return Err(crate::PyError::type_error(format!(
-            "classmethod expected 1 argument, got {supplied}"
-        )));
-    }
-    let function = function.unwrap();
-    unsafe { pyre_object::function::w_classmethod_set_func(cm, function) };
-    // The `staticmethod.__init__` bracket, for the same reasons.
+/// `PyClassMethod_New`: the implicit `__init_subclass__` /
+/// `__class_getitem__` wrappers `type_new_classmethod` installs go through
+/// `cm_new` / `cm_set_callable`, not a bare allocate.
+pub(crate) fn classmethod_from_function(func: PyObjectRef) -> crate::PyResult {
+    let cls = gettypeobject(&pyre_object::function::CLASSMETHOD_TYPE);
     let roots = pyre_object::gc_roots::push_roots();
-    let dict_slot = roots.base();
-    let _ = roots.pin_root(unsafe { pyre_object::function::w_classmethod_getdict(cm) });
-    let function_slot = dict_slot + 1;
-    let _ = roots.pin_root(function);
-    for name in ["__module__", "__name__", "__qualname__", "__doc__"] {
-        match crate::baseobjspace::getattr_str(roots.get(function_slot), name) {
-            Ok(value) => {
-                let value_roots = pyre_object::gc_roots::push_roots();
-                let value_slot = value_roots.base();
-                let _ = value_roots.pin_root(value);
-                let key = pyre_object::intern_str_value(name);
-                crate::baseobjspace::setitem(
-                    roots.get(dict_slot),
-                    key,
-                    value_roots.get(value_slot),
-                )?;
-            }
-            Err(err) if err.kind == crate::PyErrorKind::AttributeError => {}
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(w_none())
+    let cls_slot = roots.base();
+    let _ = roots.pin_root(cls);
+    let func_slot = cls_slot + 1;
+    let _ = roots.pin_root(func);
+    classmethod_descr_new(&[roots.get(cls_slot), roots.get(func_slot)])
+}
+
+/// function.py `ClassMethod.descr_init` / `cm_init`: `cm_set_callable`
+/// skips the copy when `__new__` already stored the same callable.
+fn classmethod_descr_init(args: &[PyObjectRef]) -> crate::PyResult {
+    let cm = classmethod_require(args.first().copied().unwrap_or(PY_NULL), "__init__")?;
+    let function = wrapper_take_callable(args, "classmethod")?;
+    classmethod_set_callable(cm, function)
 }
 
 /// function.py `descr_classmethod_get`. Python 3.14's `cm_descr_get`
@@ -38995,19 +39075,40 @@ fn root_cached_object(obj: pyre_object::PyObjectRef) -> Box<usize> {
     slot
 }
 
-/// typedef.py dict_descr.
+/// Stamp `__objclass__` as `object` on a process-global getset.
+///
+/// `type_add_common_descriptor` builds the shared `__dict__` /
+/// `__weakref__` descriptors with `PyDescr_NewGetSet(&PyBaseObject_Type, ...)`,
+/// so a class dict does not keep the class alive through the descriptor.
+fn bind_common_getset_to_object(descr: pyre_object::PyObjectRef) {
+    let w_object = w_object();
+    // `dict_descr` / `weakref_descr` cache the descriptor in a `OnceLock`,
+    // so the first call stamps `__objclass__` for the process.  `object`
+    // is created and `set_w_object` runs before any later type that
+    // installs these getsets (`init_typeobjects`).
+    assert!(
+        !w_object.is_null(),
+        "dict_descr/weakref_descr OnceLock caches __objclass__ on first call; \
+         object must already exist (set_w_object before dict_descr/weakref_descr)"
+    );
+    unsafe { pyre_object::typedef::w_getset_set_objclass(descr, w_object) };
+}
+
+/// typedef.py dict_descr, bound to `object`.
 ///
 /// ```python
 /// dict_descr = GetSetProperty(descr_get_dict, descr_set_dict, descr_del_dict,
 ///                             doc="dictionary for instance variables (if defined)")
 /// dict_descr.name = '__dict__'
 /// ```
+///
+/// Heap classes store this same object (`type_add_common_descriptor`).
 pub fn dict_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
-    // The template lives only in this cache. A moving or sweeping collection
-    // would recycle the address, and `copy_for_type` would then hand the
-    // recycled block out as `__dict__`. Keep one rooted slot for the
-    // collector, the `intern_exact_str` idiom.
+    // The descriptor lives only in this cache. A moving or sweeping
+    // collection would recycle the address, and `create_dict_slot` would
+    // then install the recycled block as `__dict__`. Keep one rooted slot
+    // for the collector, the `intern_exact_str` idiom.
     static CACHED: OnceLock<Box<usize>> = OnceLock::new();
     let slot = CACHED.get_or_init(|| {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -39029,24 +39130,31 @@ pub fn dict_descr() -> pyre_object::PyObjectRef {
         // `"__dict__"` instead of the `"<generic property>"` sentinel.
         // The earlier setattr fix-up was masked by the new read-only
         // `__name__` getset and silently failed.
-        root_cached_object(make_getset_property_named_doc(
+        let descr = make_getset_property_named_doc(
             fget,
             fset,
             fdel,
             "dictionary for instance variables",
             "__dict__",
-        ))
+        );
+        let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        bind_common_getset_to_object(pyre_object::gc_roots::shadow_stack_get(descr_slot));
+        root_cached_object(pyre_object::gc_roots::shadow_stack_get(descr_slot))
     });
     **slot as pyre_object::PyObjectRef
 }
 
-/// typedef.py weakref_descr.
+/// typedef.py weakref_descr, bound to `object`.
 ///
 /// ```python
 /// weakref_descr = GetSetProperty(descr_get_weakref,
 ///                     doc="list of weak references to the object (if defined)")
 /// weakref_descr.name = '__weakref__'
 /// ```
+///
+/// Classes that get `__weakref__` store this same object
+/// (`type_add_common_descriptor`).
 pub fn weakref_descr() -> pyre_object::PyObjectRef {
     use std::sync::OnceLock;
     static CACHED: OnceLock<Box<usize>> = OnceLock::new();
@@ -39057,13 +39165,17 @@ pub fn weakref_descr() -> pyre_object::PyObjectRef {
         let _ = pyre_object::gc_roots::pin_root(fget);
         // typedef.py `weakref_descr.name = '__weakref__'` —
         // see `dict_descr` for the parity rationale.
-        root_cached_object(make_getset_property_named_doc(
+        let descr = make_getset_property_named_doc(
             pyre_object::gc_roots::shadow_stack_get(fget_slot),
             pyre_object::PY_NULL,
             pyre_object::PY_NULL,
             "list of weak references to the object",
             "__weakref__",
-        ))
+        );
+        let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        bind_common_getset_to_object(pyre_object::gc_roots::shadow_stack_get(descr_slot));
+        root_cached_object(pyre_object::gc_roots::shadow_stack_get(descr_slot))
     });
     **slot as pyre_object::PyObjectRef
 }
@@ -39266,28 +39378,22 @@ pub(crate) fn copy_for_type(
     }
 }
 
-/// Public re-export of `copy_for_type` so that
-/// `objspace/std/typeobject.py::create_dict_slot`'s pyre equivalent in
-/// `call.rs` can call `copy_for_type(dict_descr(), w_self)` directly,
-/// matching PyPy's `dict_descr.copy_for_type(w_self)` shape.
-pub fn copy_descriptor_for_type(
-    descr: pyre_object::PyObjectRef,
-    w_objclass: pyre_object::PyObjectRef,
-) -> pyre_object::PyObjectRef {
-    copy_for_type(descr, w_objclass)
+fn object_has_no_slot(slot: &str) -> crate::PyError {
+    crate::PyError::attribute_error(format!("This object has no {slot}"))
 }
 
-/// typedef.py descr_get_dict.
+fn dict_not_writable(w_obj: pyre_object::PyObjectRef) -> crate::PyError {
+    let tp_name = crate::error::type_name_of(w_obj);
+    crate::PyError::attribute_error(format!(
+        "attribute '__dict__' of '{tp_name}' objects is not writable"
+    ))
+}
+
+/// typedef.py descr_get_dict / `subtype_dict`.
 ///
-/// ```python
-/// def descr_get_dict(space, w_obj):
-///     w_dict = w_obj.getdict(space)
-///     if w_dict is None:
-///         raise oefmt(space.w_TypeError,
-///                     "descriptor '__dict__' doesn't apply to '%T' objects",
-///                     w_obj)
-///     return w_dict
-/// ```
+/// A missing instance dict raises `AttributeError: This object has no
+/// __dict__` (`PyObject_GenericGetDict`). A type object is wrapped in a
+/// mappingproxy (`type_dict`).
 ///
 /// In pyre the typecheck wrapper passes (closure, w_obj) — args[0] is
 /// the descriptor `self` and args[1] is w_obj. There is no `space`
@@ -39299,28 +39405,41 @@ fn descr_get_dict(
     let mut w_obj = args[1];
     let w_dict = pyre_object::with_roots!(w_obj => crate::baseobjspace::getdict(w_obj))?;
     if w_dict.is_null() {
-        let tp_name = crate::error::type_name_of(w_obj);
-        return Err(crate::PyError::type_error(format!(
-            "descriptor '__dict__' doesn't apply to '{}' objects",
-            tp_name,
-        )));
+        return Err(object_has_no_slot("__dict__"));
+    }
+    if unsafe { pyre_object::is_type(w_obj) } {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let save = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict);
+        return Ok(pyre_object::w_dict_proxy_new(
+            pyre_object::gc_roots::shadow_stack_get(save),
+        ));
     }
     Ok(w_dict)
 }
 
-/// typedef.py descr_set_dict.
+/// typedef.py descr_set_dict / `subtype_setdict`.
 ///
-/// ```python
-/// def descr_set_dict(space, w_obj, w_dict):
-///     w_obj.setdict(space, w_dict)
-/// ```
+/// A type object's namespace is not writable through this descriptor.
+/// A missing instance dict raises `AttributeError: This object has no
+/// __dict__` (`_PyObject_SetDict`).
 fn descr_set_dict(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
     let w_dict = args[2];
-    crate::baseobjspace::setdict(w_obj, w_dict)?;
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return Err(dict_not_writable(w_obj));
+    }
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.pin_roots(&[w_obj, w_dict]);
+    let dict_slot = obj_slot + 1;
+    let existing = crate::baseobjspace::getdict(roots.get(obj_slot))?;
+    if existing.is_null() {
+        return Err(object_has_no_slot("__dict__"));
+    }
+    crate::baseobjspace::setdict(roots.get(obj_slot), roots.get(dict_slot))?;
     Ok(pyre_object::w_none())
 }
 
@@ -39335,12 +39454,14 @@ fn descr_del_dict(
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
-    // CPython 3.14 keeps BaseException.__dict__ non-deletable even when a
-    // regular heap base precedes BaseException in the MRO and contributes
-    // this generic descriptor.  PyPy permits the deletion, but 3.14 is the
-    // selected surface for this version difference.
+    // BaseException.__dict__ is non-deletable even when a regular heap
+    // base precedes BaseException in the MRO and contributes this
+    // generic descriptor.
     if unsafe { pyre_object::is_exception(w_obj) } {
         return Err(crate::PyError::type_error("__dict__ may not be deleted"));
+    }
+    if unsafe { pyre_object::is_type(w_obj) } {
+        return Err(dict_not_writable(w_obj));
     }
     // A `list` subclass instance is a real `W_ListObject` and moves, so the
     // receiver is pinned and the replacement mapping is built before the slot
@@ -39349,25 +39470,28 @@ fn descr_del_dict(
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = roots.base();
     let _ = roots.pin_root(w_obj);
+    let existing = crate::baseobjspace::getdict(roots.get(obj_slot))?;
+    if existing.is_null() {
+        return Err(object_has_no_slot("__dict__"));
+    }
     let w_dict = pyre_object::w_dict_new();
     crate::baseobjspace::setdict(roots.get(obj_slot), w_dict)?;
     Ok(pyre_object::w_none())
 }
 
-/// typedef.py descr_get_weakref.
+/// typedef.py descr_get_weakref / `subtype_getweakref`.
 ///
-/// ```python
-/// def descr_get_weakref(space, w_obj):
-///     lifeline = w_obj.getweakref()
-///     if lifeline is None:
-///         return space.w_None
-///     return lifeline.get_any_weakref(space)
-/// ```
+/// A type without a weakref slot raises `AttributeError: This object
+/// has no __weakref__`.
 fn descr_get_weakref(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _closure = args[0];
     let w_obj = args[1];
+    let w_type = crate::typedef::r#type(w_obj).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
+    if w_type.is_null() || !unsafe { pyre_object::w_type_get_weakrefable(w_type) } {
+        return Err(object_has_no_slot("__weakref__"));
+    }
     let lifeline = crate::baseobjspace::getweakref(w_obj);
     match lifeline {
         None => Ok(pyre_object::w_none()),
@@ -39419,6 +39543,53 @@ mod tests {
                 &INSTANCE_TYPE,
                 &INSTANCE_USER_TYPE
             ));
+        }
+    }
+
+    #[test]
+    fn heap_classes_share_the_dict_descriptor_bound_to_object() {
+        use pyre_object::*;
+
+        super::init_typeobjects();
+        let _roots = gc_roots::push_roots();
+        let object = super::w_object();
+        let shared = super::dict_descr();
+        unsafe {
+            assert!(std::ptr::eq(w_getset_get_objclass(shared), object));
+        }
+
+        let ns_a = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_dict_new());
+        let bases_a = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_tuple_new(vec![object]));
+        let first = gc_roots::pin_root(w_type_new(
+            "First",
+            gc_roots::shadow_stack_get(bases_a),
+            gc_roots::shadow_stack_get(ns_a) as pyre_object::gc_hook::GCREF,
+        ));
+        unsafe {
+            crate::call::create_all_slots(first, gc_roots::shadow_stack_get(bases_a)).unwrap();
+        }
+
+        let ns_b = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_dict_new());
+        let bases_b = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_tuple_new(vec![object]));
+        let second = gc_roots::pin_root(w_type_new(
+            "Second",
+            gc_roots::shadow_stack_get(bases_b),
+            gc_roots::shadow_stack_get(ns_b) as pyre_object::gc_hook::GCREF,
+        ));
+        unsafe {
+            crate::call::create_all_slots(second, gc_roots::shadow_stack_get(bases_b)).unwrap();
+        }
+
+        let first_dict = crate::type_dict_lookup(first, "__dict__").expect("__dict__");
+        let second_dict = crate::type_dict_lookup(second, "__dict__").expect("__dict__");
+        assert!(std::ptr::eq(first_dict, shared));
+        assert!(std::ptr::eq(second_dict, shared));
+        unsafe {
+            assert!(std::ptr::eq(w_getset_get_objclass(first_dict), object));
         }
     }
 
@@ -40255,6 +40426,11 @@ mod tests {
                 READY | MATCH_SELF | MAPPING,
             ),
             (
+                "frozendict",
+                crate::typedef::gettypeobject(&pyre_object::FROZENDICT_TYPE),
+                READY | MATCH_SELF | MAPPING,
+            ),
+            (
                 "set",
                 crate::typedef::gettypeobject(&pyre_object::setobject::SET_TYPE),
                 READY | MATCH_SELF,
@@ -40432,5 +40608,147 @@ mod tests {
         let err = crate::builtins::try_hash_value(one).unwrap_err();
         assert_eq!(err.kind, crate::PyErrorKind::TypeError);
         assert_eq!(err.message_text(), "unhashable type: 'cell'");
+    }
+
+    fn run_exec(source: &str) {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile_exec(source).expect("compile failed");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).unwrap_or_else(|err| {
+            panic!("{}", err.message_text());
+        });
+    }
+
+    /// `check_set_special_type_attr` / `type_setattro`: heap-type deletes
+    /// say "of type", a static type's `del` says "cannot set ... of
+    /// immutable type", and a getset `__delete__` still uses the delete
+    /// wording.
+    #[test]
+    fn test_special_type_attr_delete_messages() {
+        run_exec(
+            r#"
+class C:
+    pass
+class D(C):
+    pass
+class X:
+    "elephant"
+X.__doc__ = "banana"
+
+def expect(exc, text):
+    got = str(exc)
+    if text not in got:
+        raise AssertionError(repr(got))
+
+for name in ("__bases__", "__doc__", "__name__", "__qualname__", "__module__"):
+    try:
+        delattr(D, name)
+    except TypeError as e:
+        expect(e, "cannot delete '%s' attribute of type 'D'" % name)
+    else:
+        raise AssertionError("del D.%s succeeded" % name)
+
+try:
+    type(X).__dict__["__doc__"].__delete__(X)
+except TypeError as e:
+    expect(e, "cannot delete '__doc__' attribute of type 'X'")
+else:
+    raise AssertionError("X.__doc__ __delete__ succeeded")
+if X.__doc__ != "banana":
+    raise AssertionError(X.__doc__)
+
+try:
+    del list.__doc__
+except TypeError as e:
+    expect(e, "cannot set '__doc__' attribute of immutable type 'list'")
+else:
+    raise AssertionError("del list.__doc__ succeeded")
+
+try:
+    del int.__bases__
+except TypeError as e:
+    expect(e, "cannot set '__bases__' attribute of immutable type 'int'")
+else:
+    raise AssertionError("del int.__bases__ succeeded")
+
+try:
+    type.__dict__["__module__"].__delete__(D)
+except TypeError as e:
+    expect(e, "cannot delete '__module__' attribute of type 'D'")
+else:
+    raise AssertionError("D.__module__ __delete__ succeeded")
+
+try:
+    type.__dict__["__doc__"].__delete__(list)
+except TypeError as e:
+    expect(e, "cannot delete '__doc__' attribute of type 'list'")
+else:
+    raise AssertionError("list.__doc__ __delete__ succeeded")
+
+try:
+    del D.__annotate__
+except TypeError as e:
+    expect(e, "cannot delete __annotate__ attribute")
+else:
+    raise AssertionError("del D.__annotate__ succeeded")
+
+try:
+    del D.__mro__
+except AttributeError as e:
+    expect(e, "attribute '__mro__' of 'type' objects is not writable")
+else:
+    raise AssertionError("del D.__mro__ succeeded")
+"#,
+        );
+    }
+
+    /// `sm_new` / `cm_new` / `type_new_staticmethod` / `type_new_classmethod`:
+    /// implicit wrappers copy the function's presentation attributes, and a
+    /// subclass whose `__init__` is empty still has `__func__` from `__new__`.
+    #[test]
+    fn test_implicit_staticmethod_classmethod_copies_func_attrs() {
+        run_exec(
+            r#"
+class Spam:
+    def __new__(cls, x, y):
+        pass
+    def __init_subclass__(cls):
+        pass
+    def __class_getitem__(cls, x):
+        pass
+
+for n, kind in (
+    ("__new__", "staticmethod"),
+    ("__init_subclass__", "classmethod"),
+    ("__class_getitem__", "classmethod"),
+):
+    o = Spam.__dict__[n]
+    if type(o).__name__ != kind:
+        raise AssertionError((n, type(o).__name__))
+    if o.__name__ != n:
+        raise AssertionError((n, o.__name__))
+    if o.__qualname__ != "Spam." + n:
+        raise AssertionError(o.__qualname__)
+    if o.__module__ != "__main__":
+        raise AssertionError(o.__module__)
+    if o.__annotations__ != {}:
+        raise AssertionError(o.__annotations__)
+
+class MySM(staticmethod):
+    def __init__(self, *a):
+        pass
+
+def f():
+    pass
+
+sm = MySM(f)
+if sm.__func__ is not f:
+    raise AssertionError(sm.__func__)
+if not repr(sm).startswith("<staticmethod("):
+    raise AssertionError(repr(sm))
+if sm.__name__ != "f":
+    raise AssertionError(sm.__name__)
+"#,
+        );
     }
 }

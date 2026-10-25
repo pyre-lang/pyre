@@ -201,6 +201,24 @@ impl AstValidator {
         Ok(())
     }
 
+    /// `validate_import_names`: a non-empty alias list whose names cannot be
+    /// the `None`/`True`/`False` constants.
+    fn validate_import_names(
+        &self,
+        names: &[ast::Alias],
+        what: &str,
+        owner: &str,
+    ) -> ValidateResult {
+        self.validate_nonempty_seq(names.len(), what, owner)?;
+        for alias in names {
+            self.validate_name(&alias.name)?;
+            if let Some(asname) = &alias.asname {
+                self.validate_name(asname)?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_name(&self, name: &str) -> ValidateResult {
         if matches!(name, "None" | "True" | "False") {
             return Err(validation_error(format!(
@@ -313,11 +331,9 @@ impl AstValidator {
                     None => Ok(()),
                 }
             }
-            ast::Stmt::Import(node) => {
-                self.validate_nonempty_seq(node.names.len(), "names", "Import")
-            }
+            ast::Stmt::Import(node) => self.validate_import_names(&node.names, "names", "Import"),
             ast::Stmt::ImportFrom(node) => {
-                self.validate_nonempty_seq(node.names.len(), "names", "ImportFrom")
+                self.validate_import_names(&node.names, "names", "ImportFrom")
             }
             ast::Stmt::Global(node) => {
                 self.validate_nonempty_seq(node.names.len(), "names", "Global")
@@ -339,6 +355,7 @@ impl AstValidator {
             "FunctionDef"
         };
         self.validate_body(&node.body, owner)?;
+        self.validate_name(&node.name)?;
         self.validate_type_params(node.type_params.as_deref())?;
         self.visit_parameters(&node.parameters)?;
         self.validate_decorators(&node.decorator_list)?;
@@ -350,6 +367,7 @@ impl AstValidator {
 
     fn visit_class_def(&self, node: &ast::StmtClassDef) -> ValidateResult {
         self.validate_body(&node.body, "ClassDef")?;
+        self.validate_name(&node.name)?;
         self.validate_type_params(node.type_params.as_deref())?;
         if let Some(arguments) = node.arguments.as_deref() {
             self.validate_exprs(&arguments.args, ast::ExprContext::Load)?;
@@ -434,6 +452,11 @@ impl AstValidator {
             let ast::ExceptHandler::ExceptHandler(handler) = handler;
             if let Some(type_) = handler.type_.as_deref() {
                 self.validate_expr(type_, ast::ExprContext::Load)?;
+            }
+            if !node.is_star
+                && let Some(name) = &handler.name
+            {
+                self.validate_name(name)?;
             }
             self.validate_body(&handler.body, "ExceptHandler")?;
         }
@@ -1108,5 +1131,91 @@ mod tests {
         // Only the shape is checked here; the context the target carries is
         // not, so a `Store` name passes the walk.
         assert!(validate(named(name("x", ast::ExprContext::Store))).is_ok());
+    }
+
+    fn alias(name: &str, asname: Option<&str>) -> ast::Alias {
+        ast::Alias {
+            node_index: Default::default(),
+            range: Default::default(),
+            name: ast::Identifier::new(name, Default::default()),
+            asname: asname.map(|name| ast::Identifier::new(name, Default::default())),
+        }
+    }
+
+    #[test]
+    fn identifier_fields_reject_none_true_false() {
+        let forbidden = |name| format!("identifier field can't represent '{name}' constant");
+        for constant in ["None", "True", "False"] {
+            let function = vec![ast::Stmt::FunctionDef(ast::StmtFunctionDef {
+                node_index: Default::default(),
+                range: Default::default(),
+                is_async: false,
+                decorator_list: thin_vec::ThinVec::new(),
+                name: ast::Identifier::new(constant, Default::default()),
+                type_params: None,
+                parameters: Box::new(ast::Parameters::default()),
+                returns: None,
+                body: vec![pass()].into(),
+                runtime_decorator_list: None,
+                runtime_type_comment: None,
+                runtime_type_comment_bytes: None,
+                runtime_body: None,
+            })];
+            assert_eq!(message(validate(function)), forbidden(constant));
+
+            let class = vec![ast::Stmt::ClassDef(ast::StmtClassDef {
+                node_index: Default::default(),
+                range: Default::default(),
+                decorator_list: thin_vec::ThinVec::new(),
+                name: ast::Identifier::new(constant, Default::default()),
+                type_params: None,
+                arguments: None,
+                body: vec![pass()].into(),
+                runtime_decorator_list: None,
+                runtime_body: None,
+            })];
+            assert_eq!(message(validate(class)), forbidden(constant));
+
+            let import = vec![ast::Stmt::Import(ast::StmtImport {
+                node_index: Default::default(),
+                range: Default::default(),
+                names: vec![alias(constant, None)].into(),
+                is_lazy: false,
+            })];
+            assert_eq!(message(validate(import)), forbidden(constant));
+
+            let import_as = vec![ast::Stmt::Import(ast::StmtImport {
+                node_index: Default::default(),
+                range: Default::default(),
+                names: vec![alias("a", Some(constant))].into(),
+                is_lazy: false,
+            })];
+            assert_eq!(message(validate(import_as)), forbidden(constant));
+
+            let try_except = vec![ast::Stmt::Try(ast::StmtTry {
+                node_index: Default::default(),
+                range: Default::default(),
+                body: vec![pass()].into(),
+                handlers: vec![ast::ExceptHandler::ExceptHandler(
+                    ast::ExceptHandlerExceptHandler {
+                        range: Default::default(),
+                        node_index: Default::default(),
+                        type_: Some(Box::new(name("A", ast::ExprContext::Load))),
+                        name: Some(ast::Identifier::new(constant, Default::default())),
+                        body: vec![pass()].into(),
+                        runtime_body: None,
+                    },
+                )]
+                .into(),
+                orelse: Vec::new().into(),
+                finalbody: Vec::new().into(),
+                is_star: false,
+                runtime_body: None,
+                runtime_handlers: None,
+                runtime_orelse: None,
+                runtime_finalbody: None,
+            })];
+            assert_eq!(message(validate(try_except)), forbidden(constant));
+        }
     }
 }

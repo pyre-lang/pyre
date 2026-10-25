@@ -128,17 +128,18 @@ pyre-jit-trace = { version = "0.0.2", path = "pyre/pyre-jit-trace", default-feat
 # Then the 0.6.0 tag (b2626c56).
 # Then RustPython/RustPython 2ba57dae683: #9104 BUILD_LIST_FROM_ARG merged
 # (166 commits after b2626c56).
+# Then RustPython/RustPython e5554e23a: the 3.15 compiler (#9287, #9279, #9179, #9212, #9178, #9138, #9130).
 #
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
-ruff-text-size = { package = "rustpython-ruff_text_size", version = "0.16.10" }
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
+ruff-text-size = { package = "rustpython-ruff_text_size", git = "https://github.com/RustPython/ruff.git", rev = "9290a8849542134d83f77e9360e7f0b93897fd93" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "2ba57dae683bd6ea24eed6382d54d17d117ae30b" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "e5554e23abfbaee85508c32fc22e5074f88aebdd" }
 
 # majit JIT framework
 # Defaults off although that manifest declares none: backend selection there is

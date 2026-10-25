@@ -1079,16 +1079,14 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         } else if std::ptr::eq(tp, &crate::function::SLOT_WRAPPER_TYPE as *const PyType) {
             let name = function_get_name(obj()).to_string();
             let owner = crate::function::fget_func_objclass(obj())?;
-            let owner_name = pyre_object::w_type_get_name(owner);
-            format!("<slot wrapper '{name}' of '{owner_name}' objects>")
+            crate::typedef::descr_repr_text("slot wrapper", &name, owner)
         } else if std::ptr::eq(
             tp,
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const PyType,
         ) {
             let name = function_get_name(obj()).to_string();
             let owner = crate::function::fget_func_objclass(obj())?;
-            let owner_name = pyre_object::w_type_get_name(owner);
-            format!("<method '{name}' of '{owner_name}' objects>")
+            crate::typedef::descr_repr_text("method", &name, owner)
         } else if std::ptr::eq(tp, &BUILTIN_FUNCTION_TYPE as *const PyType) {
             // function.py BuiltinFunction.descr_function_repr.  Same text
             // the `__repr__` this type registers in `typedef.rs` produces;

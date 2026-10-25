@@ -41,8 +41,7 @@
     },
     "test.test_annotationlib": {
       "cranelift": "IMPORTERROR",
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: t-string repr keeps the closing brace layout (test_type_repr)"
+      "dynasm": "PASS"
     },
     "test.test_apple": {
       "cranelift": "PASS",
@@ -60,7 +59,7 @@
     },
     "test.test_ast": {
       "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 AST node and position changes"
+      "reason": "test_replace_non_str_kwarg (gh-144169): the call protocol rejects a non-str ** key (argument.py _do_combine_starstarargs_wrapped) before ast_type_replace formats it with %R"
     },
     "test.test_asyncgen": {
       "dynasm": "PASS"
@@ -124,7 +123,7 @@
       "reason": "CPython build metadata"
     },
     "test.test_builtin": {
-      "dynasm": "FAIL"
+      "dynasm": "PASS"
     },
     "test.test_bytecode_helper": {
       "dynasm": "SKIP",
@@ -180,9 +179,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_code": {
-      "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "test_code_richcompare_raise_exception needs a str-subclass co_name; PyPy keeps co_name an immutable str"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_code_module": {
       "cranelift": "PASS",
@@ -243,8 +241,7 @@
       "dynasm": "PASS"
     },
     "test.test_compile": {
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: compile() syntax warnings filtered by module (test_filter_syntax_warnings_by_module)"
+      "dynasm": "PASS"
     },
     "test.test_compileall": {
       "dynasm": "PASS"
@@ -314,9 +311,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_dataclasses": {
-      "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "test_original_class_is_gced needs the replaced slots class collected at once; the PyPy GC keeps it until a later collection"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_datetime": {
       "cranelift": "PASS",
@@ -354,7 +350,7 @@
     },
     "test.test_descr": {
       "dynasm": "FAIL",
-      "reason": "test_slots counts len(gc.get_objects()) across a loop; get_objects enumerates every app-level object the collector holds, ints included, so binding a fresh int moves the count"
+      "reason": "test_slots counts len(gc.get_objects()) across a loop; get_objects enumerates every app-level object the collector holds, ints included, so binding a fresh int moves the count. test_qualname expects complex.real to be a member_descriptor; PyPy's W_ComplexObject exposes it as a GetSetProperty (getset_descriptor). test_mutable_bases (gh-37817, 3.15) lets __bases__ assignment move between bases that differ only in __dict__/__weakref__ slots; pyre keeps PyPy's layout check, which refuses them as pypy3 does."
     },
     "test.test_descrtut": {
       "dynasm": "PASS"
@@ -364,7 +360,7 @@
     },
     "test.test_dict": {
       "dynasm": "FAIL",
-      "reason": "test_reversed_dict_after_clear_and_restore: RDict reversed iteration after clear"
+      "reason": "test_reversed_dict_after_clear_and_restore (3.15): reversed() bounded by dk_nentries; RDict compacts on delete (_ll_dict_del), so pyre yields ['k0'] as pypy3 does"
     },
     "test.test_dict_version": {
       "dynasm": "SKIP",
@@ -449,7 +445,7 @@
     },
     "test.test_exceptions": {
       "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 SyntaxError offsets for mapping patterns and encodings"
+      "reason": "3.15 SyntaxError text and offsets from the external RustPython parser: mapping-pattern **rest not last (offsets 18/36 vs 11/29) and test_encodings' unparenthesized generator argument reported as invalid syntax"
     },
     "test.test_extcall": {
       "dynasm": "FAIL"
@@ -653,7 +649,7 @@
     "test.test_inspect": {
       "cranelift": "FAIL",
       "dynasm": "FAIL",
-      "reason": "TestModuleCLI extension-module cases need a CPython C extension module"
+      "reason": "3.15 TestModuleCLI test_error_extension and test_get_cli_details_for_extension_module import _testcapi; pyre keeps lib_pypy's cpyext _testcapi off sys.path (importing.rs stdlib_at_prefix)"
     },
     "test.test_int": {
       "dynasm": "PASS"
@@ -858,8 +854,7 @@
       "dynasm": "FAIL"
     },
     "test.test_patma": {
-      "dynasm": "IMPORTERROR",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 pattern syntax (\"patterns may only match literals and attribute lookups\")"
+      "dynasm": "PASS"
     },
     "test.test_pdb": {
       "dynasm": "IMPORTERROR"
@@ -919,9 +914,8 @@
       "dynasm": "FAIL"
     },
     "test.test_positional_only_arg": {
-      "cranelift": "FAIL",
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 \"duplicate parameter\" SyntaxError wording"
+      "cranelift": "PASS",
+      "dynasm": "PASS"
     },
     "test.test_posix": {
       "dynasm": "FAIL"
@@ -1102,7 +1096,7 @@
     "test.test_ssl": {
       "cranelift": "FAIL",
       "dynasm": "FAIL",
-      "reason": "test_server_side_bad_params: rustls TLS 1.3 session snapshot gap"
+      "reason": "test_server_side_bad_params (gh-156793): SSLObject.session is None on the rustls-backed _ssl"
     },
     "test.test_stable_abi_ctypes": {
       "dynasm": "SKIP",
@@ -1162,7 +1156,7 @@
     },
     "test.test_symtable": {
       "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 symtable scopes"
+      "reason": "3.15 <genexpr> scope naming (test_class_get_methods and others); symbol table names come from the external RustPython symboltable"
     },
     "test.test_syntax": {
       "dynasm": "FAIL"
@@ -1264,8 +1258,7 @@
       "dynasm": "FAIL"
     },
     "test.test_tstring": {
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 t-string compilation"
+      "dynasm": "PASS"
     },
     "test.test_ttk": {
       "dynasm": "SKIP",
@@ -1310,8 +1303,7 @@
       "reason": "imports `_datetime`, an extension module PyPy does not provide"
     },
     "test.test_typing": {
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 __annotate__ parameter order (test_get_type_hints_order)"
+      "dynasm": "PASS"
     },
     "test.test_ucn": {
       "dynasm": "FAIL"
@@ -1346,8 +1338,7 @@
       "dynasm": "FAIL"
     },
     "test.test_unparse": {
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: 3.15 AST unparse changes"
+      "dynasm": "PASS"
     },
     "test.test_urllib": {
       "dynasm": "PASS"
@@ -1403,7 +1394,8 @@
       "dynasm": "IMPORTERROR"
     },
     "test.test_warnings": {
-      "dynasm": "FAIL"
+      "dynasm": "FAIL",
+      "reason": "PyWarningsDisplayTests.test_tracemalloc expects the unclosed-file ResourceWarning at the f = None line, which needs refcount finalization; the PyPy GC finalizes the file later (pypy3 emits no warning before exit)"
     },
     "test.test_wave": {
       "dynasm": "PASS"
@@ -1470,8 +1462,7 @@
       "dynasm": "PASS"
     },
     "test.test_zipfile": {
-      "dynasm": "FAIL",
-      "reason": "3.15 parser/compiler change in the external RustPython compiler: compile() syntax warnings filtered by module (test_write_filtered_python_package)"
+      "dynasm": "PASS"
     },
     "test.test_zipfile64": {
       "dynasm": "SKIP",

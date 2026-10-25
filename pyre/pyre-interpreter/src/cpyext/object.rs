@@ -324,8 +324,8 @@ pub unsafe extern "C" fn PyObject_GenericSetAttr(
 }
 
 /// `PyObject_GenericGetDict(object, context)` — the `__dict__` descriptor's
-/// getter (`typedef.py descr_get_dict`).  The `context` a getset
-/// closure would carry has nothing to say here.
+/// getter (`typedef.py descr_get_dict` / `subtype_dict`).  The `context` a
+/// getset closure would carry has nothing to say here.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyObject_GenericGetDict(
     object: *mut CPyObject,
@@ -336,10 +336,9 @@ pub unsafe extern "C" fn PyObject_GenericGetDict(
     };
     result(crate::baseobjspace::getdict(object).and_then(|w_dict| {
         if w_dict.is_null() {
-            return Err(crate::PyError::type_error(format!(
-                "descriptor '__dict__' doesn't apply to '{}' objects",
-                crate::type_methods::arg_type_name(object)
-            )));
+            return Err(crate::PyError::attribute_error(
+                "This object has no __dict__",
+            ));
         }
         Ok(w_dict)
     }))

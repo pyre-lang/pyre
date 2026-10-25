@@ -225,7 +225,9 @@ impl MappedObj {
     #[cfg(windows)]
     fn flush_range(&self, offset: usize, size: usize) -> std::io::Result<()> {
         match self {
-            Self::Mapped(m) => m.flush_range(offset, size),
+            // `MappedFile::flush_range` takes `flags`; 0 is `MS_SYNC` on unix
+            // and ignored on Windows.
+            Self::Mapped(m) => m.flush_range(offset, size, 0),
             Self::Named(m) => m.flush_range(offset, size),
         }
     }

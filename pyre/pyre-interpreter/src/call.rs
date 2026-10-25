@@ -6967,7 +6967,7 @@ fn build_class_inner(
         let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
         crate::builtins::type_new_set_hash_if_eq(class_dict);
         let class_dict = pyre_object::gc_roots::shadow_stack_get(dict_root);
-        crate::builtins::type_new_wrap_special_methods(class_dict);
+        crate::builtins::type_new_wrap_special_methods(class_dict)?;
         // `_PyDict_HasOnlyStringKeys(type->tp_dict)` decides the
         // `RuntimeWarning` reported below; reading the keys answers it
         // without hashing any of them.
@@ -7541,10 +7541,10 @@ pub unsafe fn create_all_slots(
     unsafe {
         use pyre_object::typeobject::{Layout, leak_layout};
 
-        // Heap types are nursery. Slot construction (`copy_for_type`,
-        // `w_member_new`, `type_dict_store`) collects, so the type, bases,
-        // and best base live in the shadow stack and every use after a
-        // collecting call reloads.
+        // Heap types are nursery. Slot construction (`w_member_new`,
+        // `type_dict_store`) collects, so the type, bases, and best base
+        // live in the shadow stack and every use after a collecting call
+        // reloads.
         let _slot_roots = pyre_object::gc_roots::push_roots();
         let type_slot = pyre_object::gc_roots::pin_roots(&[w_type, w_bases]);
         let bases_slot = type_slot + 1;
@@ -7789,21 +7789,17 @@ pub unsafe fn create_all_slots(
 
 /// objspace/std/typeobject.py create_dict_slot.
 ///
-/// ```python
-/// def create_dict_slot(w_self):
-///     if not w_self.hasdict:
-///         w_self.dict_w.setdefault('__dict__',
-///             dict_descr.copy_for_type(w_self))
-///         w_self.hasdict = True
-/// ```
+/// Stores the process-global `dict_descr` (`typedef.py`) bound to `object`,
+/// the same descriptor `type_add_common_descriptor` installs for every
+/// heap class that gets an instance `__dict__`. `setdefault` keeps a
+/// class-body assignment. Binding `__objclass__` to `object` means the
+/// class dict does not keep the class alive through the descriptor.
 unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
     unsafe {
         if !pyre_object::w_type_get_hasdict(w_type) {
             let _roots = pyre_object::gc_roots::push_roots();
             let save = pyre_object::gc_roots::pin_roots(&[w_type]);
-            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
-            let descr =
-                crate::typedef::copy_descriptor_for_type(crate::typedef::dict_descr(), w_type);
+            let descr = crate::typedef::dict_descr();
             let _ = pyre_object::gc_roots::pin_root(descr);
             let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
@@ -7818,21 +7814,16 @@ unsafe fn create_dict_slot(w_type: pyre_object::PyObjectRef) {
 
 /// objspace/std/typeobject.py create_weakref_slot.
 ///
-/// ```python
-/// def create_weakref_slot(w_self):
-///     if not w_self.weakrefable:
-///         w_self.dict_w.setdefault('__weakref__',
-///             weakref_descr.copy_for_type(w_self))
-///         w_self.weakrefable = True
-/// ```
+/// Stores the process-global `weakref_descr` (`typedef.py`) bound to
+/// `object`, the same descriptor `type_add_common_descriptor` installs
+/// for every class that gets `__weakref__`. `setdefault` keeps a
+/// class-body assignment.
 unsafe fn create_weakref_slot(w_type: pyre_object::PyObjectRef) {
     unsafe {
         if !pyre_object::w_type_get_weakrefable(w_type) {
             let _roots = pyre_object::gc_roots::push_roots();
             let save = pyre_object::gc_roots::pin_roots(&[w_type]);
-            let w_type = pyre_object::gc_roots::shadow_stack_get(save);
-            let descr =
-                crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), w_type);
+            let descr = crate::typedef::weakref_descr();
             let _ = pyre_object::gc_roots::pin_root(descr);
             let w_type = pyre_object::gc_roots::shadow_stack_get(save);
             let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);

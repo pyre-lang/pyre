@@ -757,6 +757,9 @@ pub struct PyCode {
     ///
     /// `PY_NULL` until first realized by [`w_code_name_obj`]; the storage,
     /// immortality and root-walk argument are `w_qualname`'s verbatim.
+    ///
+    /// `code.replace` / `code_new` store the passed `co_name` object (a str
+    /// subclass included).
     pub w_name: PyObjectRef,
     /// `pycode.py self.w_filename = space.newfilename(filename)` realized as
     /// one shared wrapped object.
@@ -904,9 +907,12 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
 /// first demand and retained on the code object.
 ///
 /// The counterpart of [`w_code_qualname_obj`], for the same reason and with the
-/// same lifetime argument: `function.py:51 self.name = forcename or
+/// same lifetime argument: `function.py self.name = forcename or
 /// code.co_name` and the `co_name` getter both hand out the code object's own
 /// string, so they name one immutable value.
+///
+/// `code.replace` / `code_new` store the passed `co_name` object (a str
+/// subclass included).
 ///
 /// # Safety
 /// `w_code` must point to a valid `PyCode`.
@@ -1907,10 +1913,11 @@ fn publish_code_slot_store(obj: PyObjectRef) {
     pyre_object::gc_roots::mark_prebuilt_roots_dirty();
 }
 
-/// `code_replace` and `unmarshal_pycode` both store a non-UTF-8 `co_name` /
-/// `co_qualname` on `PyCode.w_name` / `w_qualname` (`PyCode.__init__`'s
-/// `self.co_name = name`). `None` leaves the slot for `w_code_name_obj` to
-/// realize from the compiler `String`.
+/// `code_replace` / `code_new` / `unmarshal_pycode` store the original
+/// `co_name` / `co_qualname` objects on `PyCode.w_name` / `w_qualname`
+/// (`PyCode.__init__`'s `self.co_name = name`, beside `self.w_filename`).
+/// `None` leaves the slot for `w_code_name_obj` to realize from the compiler
+/// `String`.
 pub(crate) fn install_code_name_objects(
     mut code: PyObjectRef,
     name: Option<PyObjectRef>,
@@ -2332,6 +2339,10 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         code,
         first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
     );
+    // `PyCode.__init__` stores `self.co_name = name` beside
+    // `self.w_filename = space.newfilename(filename)`. Keep the constructor
+    // objects so `co_name` / `code_objects_equal` observe a str subclass.
+    let result = install_code_name_objects(result, Some(arg(12)), Some(arg(13)));
     let result_roots = pyre_object::gc_roots::push_roots();
     let result_slot = result_roots.pin_roots(&[result]);
     unsafe { set_filename_bytes(result_roots.get(result_slot), filename_bytes) };
@@ -3137,30 +3148,60 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
     // (and `self.co_qualname`). That field is `PyCode.w_name` /
     // `w_qualname` (`w_code_name_obj`). Every app-level reader uses it.
     // `CodeObject.obj_name` stays the compiler UTF-8 mirror JIT debug names
-    // read; a lone surrogate is not written into it.
-    // A lone-surrogate name is kept as a str object. `read_code_str` and the
-    // field parsers below allocate, so each surrogate is published with
-    // `pin_root` (`framework.py` `push_roots` writes that livevar) before the
-    // next parser runs, and read back from its slot afterwards.
+    // read; a lone surrogate is not written into it. The original `co_name`
+    // object is pinned across the parsers that allocate (`framework.py`
+    // `push_roots`) and installed on `w_name`.
     let _name_roots = pyre_object::gc_roots::push_roots();
     let mut name_slot: Option<usize> = None;
     let mut qual_slot: Option<usize> = None;
     if let Some(v) = get("co_name") {
-        if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
+        // Keep the object passed as `co_name` on `w_name`, including a str
+        // subclass (`w_filename` is the same companion). `obj_name` stays
+        // the unwrapped UTF-8 spelling JIT/traceback readers use.
+        if unsafe { pyre_object::is_str(v) } {
             let slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = _name_roots.pin_root(v);
             name_slot = Some(slot);
+            if unsafe { pyre_object::w_str_is_utf8(pyre_object::gc_roots::shadow_stack_get(slot)) }
+            {
+                code.obj_name = unsafe {
+                    read_code_str(pyre_object::gc_roots::shadow_stack_get(slot), "co_name")?
+                };
+            }
         } else {
             code.obj_name = unsafe { read_code_str(v, "co_name")? };
         }
+    } else {
+        let existing = unsafe { (*(w_self() as *const PyCode)).w_name };
+        if !existing.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _name_roots.pin_root(existing);
+            name_slot = Some(slot);
+        }
     }
+    // An omitted `co_qualname` keeps the receiver's object.
     if let Some(v) = get("co_qualname") {
-        if unsafe { pyre_object::is_str(v) } && unsafe { !pyre_object::w_str_is_utf8(v) } {
+        // Keep the object passed as `co_qualname` on `w_qualname`, including a
+        // str subclass. `qualname` stays the unwrapped UTF-8 spelling.
+        if unsafe { pyre_object::is_str(v) } {
             let slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = _name_roots.pin_root(v);
             qual_slot = Some(slot);
+            if unsafe { pyre_object::w_str_is_utf8(pyre_object::gc_roots::shadow_stack_get(slot)) }
+            {
+                code.qualname = unsafe {
+                    read_code_str(pyre_object::gc_roots::shadow_stack_get(slot), "co_qualname")?
+                };
+            }
         } else {
             code.qualname = unsafe { read_code_str(v, "co_qualname")? };
+        }
+    } else {
+        let existing = unsafe { (*(w_self() as *const PyCode)).w_qualname };
+        if !existing.is_null() {
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = _name_roots.pin_root(existing);
+            qual_slot = Some(slot);
         }
     }
     if let Some(v) = get("co_filename") {

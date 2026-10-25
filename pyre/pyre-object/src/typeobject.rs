@@ -1696,6 +1696,7 @@ pub unsafe fn w_type_has_match_self(w_type: PyObjectRef) -> bool {
         get_instantiate(&LIST_TYPE),
         get_instantiate(&TUPLE_TYPE),
         get_instantiate(&DICT_TYPE),
+        get_instantiate(&FROZENDICT_TYPE),
         get_instantiate(&crate::bytesobject::BYTES_TYPE),
         get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
         get_instantiate(&crate::setobject::SET_TYPE),

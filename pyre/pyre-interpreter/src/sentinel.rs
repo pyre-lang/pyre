@@ -119,6 +119,13 @@ fn sentinel_fset_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     Err(crate::PyError::attribute_error("readonly attribute"))
 }
 
+/// `PyMember_SetOne` `Py_READONLY`: set and delete share this text.
+/// GetSetProperty `__delete__` calls fdel as `[descr, obj]`, so this
+/// deleter is arity 2 (`sentinel_fset_name` is the arity-3 setter).
+fn sentinel_fdel_name(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error("readonly attribute"))
+}
+
 fn sentinel_fget_module(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let self_ = args.get(1).copied().unwrap_or(PY_NULL);
     if self_.is_null() || !unsafe { is_sentinel(self_) } {
@@ -126,7 +133,10 @@ fn sentinel_fget_module(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     }
     let module = unsafe { w_sentinel_get_module(self_) };
     if module.is_null() {
-        return Err(crate::PyError::attribute_error("__module__"));
+        // `member_get_object` for a NULL `Py_T_OBJECT_EX`.
+        return Err(crate::PyError::attribute_error(
+            "'sentinel' object has no attribute '__module__'",
+        ));
     }
     Ok(module)
 }
@@ -146,7 +156,13 @@ fn sentinel_fdel_module(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     if self_.is_null() || !unsafe { is_sentinel(self_) } {
         return Err(crate::PyError::attribute_error("__module__"));
     }
+    let module = unsafe { w_sentinel_get_module(self_) };
     unsafe { w_sentinel_set_module(self_, PY_NULL) };
+    if module.is_null() {
+        // `PyMember_SetOne` `Py_T_OBJECT_EX`: a second delete of an already
+        // cleared member raises `AttributeError` with the member name.
+        return Err(crate::PyError::attribute_error("__module__"));
+    }
     Ok(w_none())
 }
 
@@ -244,6 +260,9 @@ pub(crate) fn init_sentinel_type(ns: PyObjectRef) {
     let name_setter = crate::make_builtin_function_with_arity("__name__", sentinel_fset_name, 3);
     let name_setter_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(name_setter);
+    let name_deleter = crate::make_builtin_function_with_arity("__name__", sentinel_fdel_name, 2);
+    let name_deleter_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(name_deleter);
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
@@ -251,7 +270,7 @@ pub(crate) fn init_sentinel_type(ns: PyObjectRef) {
             make_getset_property_named(
                 gc_roots::shadow_stack_get(name_getter_slot),
                 gc_roots::shadow_stack_get(name_setter_slot),
-                gc_roots::shadow_stack_get(name_setter_slot),
+                gc_roots::shadow_stack_get(name_deleter_slot),
                 "__name__",
             )
         )
@@ -287,4 +306,64 @@ pub(crate) fn init_sentinel_type(ns: PyObjectRef) {
             w_str_new("Create a unique sentinel object with the given name.")
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyre_object::*;
+
+    fn make_sentinel() -> PyObjectRef {
+        crate::typedef::init_typeobjects();
+        let _roots = gc_roots::push_roots();
+        let cls_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(crate::typedef::gettypeobject(&SENTINEL_TYPE));
+        let name_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(w_str_new("MISSING"));
+        sentinel_descr_new(&[
+            gc_roots::shadow_stack_get(cls_slot),
+            gc_roots::shadow_stack_get(name_slot),
+            w_none(),
+        ])
+        .expect("sentinel('MISSING')")
+    }
+
+    #[test]
+    fn sentinel_name_is_readonly_and_module_is_object_ex() {
+        let _roots = gc_roots::push_roots();
+        let sent = make_sentinel();
+        let sent_slot = gc_roots::shadow_stack_len();
+        let _ = gc_roots::pin_root(sent);
+        let sent = || gc_roots::shadow_stack_get(sent_slot);
+        let name = crate::baseobjspace::getattr_str(sent(), "__name__").unwrap();
+        assert_eq!(unsafe { w_str_get_wtf8(name) }, "MISSING");
+
+        let err = crate::baseobjspace::setattr_str(sent(), "__name__", w_str_new("CHANGED"))
+            .expect_err("readonly __name__");
+        assert_eq!(err.kind, crate::PyErrorKind::AttributeError);
+        assert_eq!(err.message_text(), "readonly attribute");
+
+        let err = crate::baseobjspace::delattr_str(sent(), "__name__")
+            .expect_err("readonly __name__ delete");
+        assert_eq!(err.kind, crate::PyErrorKind::AttributeError);
+        assert_eq!(err.message_text(), "readonly attribute");
+
+        crate::baseobjspace::setattr_str(sent(), "__module__", w_str_new("changed")).unwrap();
+        let module = crate::baseobjspace::getattr_str(sent(), "__module__").unwrap();
+        assert_eq!(unsafe { w_str_get_wtf8(module) }, "changed");
+
+        crate::baseobjspace::delattr_str(sent(), "__module__").unwrap();
+        let err = crate::baseobjspace::getattr_str(sent(), "__module__")
+            .expect_err("cleared Py_T_OBJECT_EX");
+        assert_eq!(err.kind, crate::PyErrorKind::AttributeError);
+        assert_eq!(
+            err.message_text(),
+            "'sentinel' object has no attribute '__module__'"
+        );
+
+        let err = crate::baseobjspace::delattr_str(sent(), "__module__")
+            .expect_err("second delete of cleared member");
+        assert_eq!(err.kind, crate::PyErrorKind::AttributeError);
+        assert_eq!(err.message_text(), "__module__");
+    }
 }

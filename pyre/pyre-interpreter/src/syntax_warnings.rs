@@ -875,6 +875,7 @@ pub fn compile_ast_with_codegen_warnings(
     compile_ast_with_codegen_warnings_and_module(
         module,
         source_file,
+        None,
         source,
         filename,
         mode,
@@ -887,6 +888,7 @@ pub fn compile_ast_with_codegen_warnings(
 pub fn compile_ast_with_codegen_warnings_and_module(
     module: ast::Mod,
     source_file: rustpython_compiler::core::SourceFile,
+    locations: Option<rustpython_compiler_core::AstLocations>,
     source: &str,
     filename: &Wtf8,
     mode: Mode,
@@ -925,9 +927,12 @@ pub fn compile_ast_with_codegen_warnings_and_module(
             }
         })
     };
-    let result = rustpython_compiler::codegen::compile::compile_top_with_syntax_warning_handler(
-        module,
-        source_file,
+    let result = rustpython_compiler::codegen::compile::compile_ast_with_syntax_warning_handler(
+        rustpython_compiler::codegen::compile::AstInput {
+            ast: module,
+            source_file,
+            locations,
+        },
         mode,
         opts,
         Some(&mut handler),

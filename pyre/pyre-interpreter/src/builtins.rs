@@ -7258,12 +7258,15 @@ pub(crate) fn check_surrogate(w_name: PyObjectRef) -> Result<(), crate::PyError>
     Ok(())
 }
 
-/// `type_new_staticmethod` / `type_new_classmethod` (Objects/typeobject.c):
-/// a class body's plain-function `__new__` becomes a `staticmethod` and
+/// `type_new_staticmethod` / `type_new_classmethod`: a class body's
+/// plain-function `__new__` becomes a `staticmethod` and
 /// `__init_subclass__` / `__class_getitem__` become `classmethod`s, so that
 /// `cls.__dict__['__new__'].__func__` resolves and the descriptors bind with
-/// the right implicit first argument.
-pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
+/// the right implicit first argument.  The wrappers go through
+/// `PyStaticMethod_New` / `PyClassMethod_New` (`sm_set_callable` /
+/// `cm_set_callable`) so `functools_wraps` copies `__module__` / `__name__` /
+/// `__qualname__` / `__doc__`.
+pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) -> Result<(), crate::PyError> {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
@@ -7273,12 +7276,10 @@ pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
         && !unsafe { pyre_object::function::is_staticmethod(f) }
     {
         pyre_object::with_roots!(f => {
-            crate::__pyre_put_new!(
-                ns_slot,
-                "__new__",
-                pyre_object::function::w_staticmethod_new(f)
-            )
-        });
+            let wrapped = crate::typedef::staticmethod_from_function(f)?;
+            crate::__pyre_put_new!(ns_slot, "__new__", wrapped);
+            Ok::<(), crate::PyError>(())
+        })?;
     }
     for name in ["__init_subclass__", "__class_getitem__"] {
         if let Some(mut f) = unsafe {
@@ -7287,14 +7288,13 @@ pub(crate) fn type_new_wrap_special_methods(ns: PyObjectRef) {
             && !unsafe { pyre_object::function::is_classmethod(f) }
         {
             pyre_object::with_roots!(f => {
-                crate::__pyre_put_new!(
-                    ns_slot,
-                    name,
-                    pyre_object::function::w_classmethod_new(f)
-                )
-            });
+                let wrapped = crate::typedef::classmethod_from_function(f)?;
+                crate::__pyre_put_new!(ns_slot, name, wrapped);
+                Ok::<(), crate::PyError>(())
+            })?;
         }
     }
+    Ok(())
 }
 
 /// A class that supplies equality but no hash is explicitly unhashable.
@@ -7412,6 +7412,19 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
 /// `ensure_module_attr` reads `caller.get_w_globals()` with no extra force:
 /// `w_globals` is frame-invariant (`restore_resume_state_from` leaves it
 /// out) so the heap slot is already current.  A hand-placed
+/// `PyAnyDict_Check`: a dict (including a dict subclass) or a
+/// `frozendict` (including a subclass).
+fn py_any_dict_check(w_obj: PyObjectRef) -> bool {
+    if w_obj.is_null() {
+        return false;
+    }
+    unsafe {
+        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
+        crate::baseobjspace::isinstance_w(w_obj, w_dict_type)
+            || crate::type_methods::has_frozendict_backing(w_obj)
+    }
+}
+
 /// `jit_force_virtualizable` here aborted compiles that create a type
 /// (`ABORT_ESCAPE`) and scrambled virtual locals on loops that still compiled.
 #[inline(never)]
@@ -7435,8 +7448,9 @@ fn type_create_new_type(
         // getargs builds, so they say `type.__new__()` on every entry point —
         // a bare `type(...)` call, `type.__new__` invoked directly, and a
         // metaclass such as `ABCMeta`.  The `O!` checks are `PyObject_
-        // TypeCheck`, so a tuple subclass is an accepted `bases` and a dict
-        // subclass an accepted namespace; neither is silently coerced.
+        // TypeCheck`, so a tuple subclass is an accepted `bases`.  Argument
+        // 3 is `PyAnyDict_Check` (`type_new`): a dict or a frozendict,
+        // including subclasses; a mappingproxy is refused.
         if !unsafe { crate::baseobjspace::isinstance_str_w(name_obj) } {
             return Err(crate::PyError::type_error(format!(
                 "type.__new__() argument 1 must be str, not {}",
@@ -7449,10 +7463,9 @@ fn type_create_new_type(
                 crate::type_methods::clinic_arg_type_name(bases)
             )));
         }
-        let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-        if !unsafe { crate::baseobjspace::isinstance_w(w_namespace_dict, w_dict_type) } {
+        if !py_any_dict_check(w_namespace_dict) {
             return Err(crate::PyError::type_error(format!(
-                "type.__new__() argument 3 must be dict, not {}",
+                "type.__new__() argument 3 must be dict or frozendict, not {}",
                 crate::type_methods::clinic_arg_type_name(w_namespace_dict)
             )));
         }
@@ -7602,14 +7615,14 @@ fn type_create_new_type(
         // `__build_class__` case where the namespace is a W_ModuleDictObject
         // still walks correctly.
         //
-        // `type.__new__` accepts any `dict` subclass as the namespace
-        // (the check is `PyDict_Check`, not `PyDict_CheckExact`); resolve
-        // the dict backing so e.g. an `enum._EnumDict` class body is
-        // walked instead of dropped.
+        // `type.__new__` accepts any `dict` or `frozendict` subclass as the
+        // namespace (`PyAnyDict_Check`); resolve the dict backing so e.g. an
+        // `enum._EnumDict` class body is walked instead of dropped.  A
+        // frozendict copies into a mutable dict (`_PyDict_CopyAsDict`).
         //
-        // `type_new_init` opens with `PyDict_Copy(ctx->orig_dict)` and then
-        // mutates that one dict, so the scratch namespace is a clone rather
-        // than a per-key refill.  The clone carries each key's cached hash,
+        // `type_new_init` opens with `_PyDict_CopyAsDict(ctx->orig_dict)`
+        // and then mutates that one dict, so the scratch namespace is a clone
+        // rather than a per-key refill.  The clone carries each key's cached hash,
         // where a re-store would call `__hash__` again — running a
         // side-effecting one an extra time, and dropping the entry outright
         // once that `__hash__` starts raising, since the store surface cannot
@@ -7727,7 +7740,7 @@ fn type_create_new_type(
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
         type_new_set_hash_if_eq(class_ns);
         let class_ns = pyre_object::gc_roots::shadow_stack_get(class_ns_root);
-        type_new_wrap_special_methods(class_ns);
+        type_new_wrap_special_methods(class_ns)?;
 
         // typeobject.py:954 — `W_TypeObject.__init__` is the site that reads
         // the bases as `bases_w or [space.w_object]`, so the `(object,)`
@@ -11817,18 +11830,19 @@ pub fn new_exception_class(
     cls
 }
 
-/// The weakref half of `type_new_descriptors`: the class gets its own
-/// `__weakref__` descriptor only when the base it takes its layout from has no
-/// slot to inherit, which is why `_pickle.PickleError.__dict__` carries one and
-/// `_pickle.PicklingError.__dict__` does not.  The flag is set either way --
-/// it is what `getweakref` / `setweakref` read.
+/// The weakref half of `type_new_descriptors`: the class gets the shared
+/// `__weakref__` descriptor (`type_add_common_descriptor`) only when the
+/// base it takes its layout from has no slot to inherit, which is why
+/// `_pickle.PickleError.__dict__` carries one and `_pickle.PicklingError.__dict__`
+/// does not.  The flag is set either way -- it is what `getweakref` /
+/// `setweakref` read.
 fn add_weakref_slot(mut cls: PyObjectRef, base: PyObjectRef) {
     if !unsafe { pyre_object::w_type_get_weakrefable(base) } {
         let _roots = pyre_object::gc_roots::push_roots();
         let save = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
         cls = pyre_object::gc_roots::shadow_stack_get(save);
-        let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
+        let descr = crate::typedef::weakref_descr();
         let _ = pyre_object::gc_roots::pin_root(descr);
         cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
@@ -13651,12 +13665,13 @@ fn make_exception_group_type(
         // builtin exactly like `BaseExceptionGroup` beside it — immutable, and
         // carrying none of the heap-type flag bits. Its instances still take
         // the ordinary weakref slot; pyre constructs the type directly, so
-        // install the copied descriptor and flag explicitly.
+        // install the shared descriptor (`type_add_common_descriptor`) and
+        // flag explicitly.
         let _roots = pyre_object::gc_roots::push_roots();
         let save = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
         cls = pyre_object::gc_roots::shadow_stack_get(save);
-        let descr = crate::typedef::copy_descriptor_for_type(crate::typedef::weakref_descr(), cls);
+        let descr = crate::typedef::weakref_descr();
         let _ = pyre_object::gc_roots::pin_root(descr);
         cls = pyre_object::gc_roots::shadow_stack_get(save);
         let descr = pyre_object::gc_roots::shadow_stack_get(save + 1);
@@ -18596,7 +18611,19 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         .or(generator_span)
         .or(yield_span)
         .or(delimiter_span);
-    let ((lineno, byte_offset), diagnostic_end) = if let Some((start, end)) = diagnostic_span {
+    let eof_token = match &e {
+        crate::compile::CompileError::Parse(rustpython_compiler::ParseError {
+            eof_token: Some(eof_token),
+            ..
+        }) => Some(eof_token.as_ref()),
+        _ => None,
+    };
+    // `python_location` already reads `eof_token` for the start.  An
+    // `eof_token` span is the tokenizer's last line, so a diagnostic that
+    // scanned the whole source must not replace it.
+    let ((lineno, byte_offset), diagnostic_end) = if eof_token.is_none()
+        && let Some((start, end)) = diagnostic_span
+    {
         (
             source_byte_location(source, start),
             Some(source_byte_location(source, end)),
@@ -18608,24 +18635,30 @@ fn compile_err_to_syntax_error_maybe_incomplete(
     // compiler/symtable one retains the UTF-8 byte columns used by AST
     // locations (for example `return "ä"` ends at offset 12, not 11).  Neither
     // is converted here.  A span located above is a byte index into `source`
-    // whichever kind produced it, so only that one is.
+    // whichever kind produced it, so only that one is.  `EofToken::offset`
+    // is already a character column.
     let parser_error = matches!(&e, crate::compile::CompileError::Parse(_));
-    let offset = if parser_error && diagnostic_span.is_some() {
+    let offset = if parser_error && diagnostic_span.is_some() && eof_token.is_none() {
         syntax_error_character_offset(source, lineno, byte_offset)
     } else {
         byte_offset
     };
-    let mut error = if lineno == 0 {
+    let mut error = if lineno == 0 && eof_token.is_none() {
         crate::PyError::syntax_error(msg)
     } else {
-        let parser_end = diagnostic_end.or_else(|| e.python_end_location());
-        let (end_lineno, end_byte_offset) = parser_end
-            .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
-            .unwrap_or((lineno, byte_offset));
-        let mut end_offset = if parser_error && diagnostic_end.is_some() {
-            syntax_error_character_offset(source, end_lineno, end_byte_offset)
+        let (end_lineno, mut end_offset) = if let Some(eof_token) = eof_token {
+            (eof_token.lineno, eof_token.end_offset() as i64)
         } else {
-            end_byte_offset
+            let parser_end = diagnostic_end.or_else(|| e.python_end_location());
+            let (end_lineno, end_byte_offset) = parser_end
+                .or_else(|| codegen_statement_end(&e, source, lineno, byte_offset))
+                .unwrap_or((lineno, byte_offset));
+            let end_offset = if parser_error && diagnostic_end.is_some() {
+                syntax_error_character_offset(source, end_lineno, end_byte_offset)
+            } else {
+                end_byte_offset
+            };
+            (end_lineno, end_offset as i64)
         };
         // Tokenizer `_PyTokenizer_syntaxerror` diagnostics (`_syntaxerror_range`
         // with `col_offset = -1`) report an inclusive one-character span, so
@@ -18634,7 +18667,8 @@ fn compile_err_to_syntax_error_maybe_incomplete(
         // (#8983), which is exclusive.  Snap those tokenizer failures here;
         // `'1 = 1'` is a parser assignment diagnostic and stays exclusive
         // `(1, 1, 1, 2)`.
-        if parser_error
+        if eof_token.is_none()
+            && parser_error
             && (msg.starts_with("unmatched ")
                 || msg.starts_with("closing parenthesis ")
                 || msg.starts_with("invalid digit ")
@@ -18646,16 +18680,30 @@ fn compile_err_to_syntax_error_maybe_incomplete(
                         | "invalid binary literal"
                 ))
             && end_lineno == lineno
-            && end_offset == offset.saturating_add(1)
+            && end_offset == offset as i64 + 1
         {
-            end_offset = offset;
+            end_offset = offset as i64;
         }
         let filename = e.source_path().to_string();
         // Parser errors own their source text directly, keeping the trailing
         // newline like `e.text`.  Later compiler failures omit it for the
         // synthetic ``<string>`` input, while file compilation keeps the
         // decoded source line for the top-level error printer.
-        let text = if unterminated_fstring {
+        // `EofToken.line` is the tokenizer's last line, including the newline
+        // `translate_newlines` may have added; `python_end_location` does not
+        // consult it.
+        let mut eof_line = eof_token.map(|token| token.line.clone());
+        if msg.starts_with("unterminated triple-quoted")
+            && let Some(line) = eof_line.as_mut()
+            && line.ends_with('\n')
+        {
+            line.pop();
+        }
+        let text = if let Some(line) = eof_line.as_deref() {
+            Some(line)
+        } else if lineno == 0 {
+            None
+        } else if unterminated_fstring {
             source.lines().nth(lineno - 1)
         } else if matches!(&e, crate::compile::CompileError::Parse(_)) || filename != "<string>" {
             source.split_inclusive('\n').nth(lineno - 1)
@@ -18668,7 +18716,7 @@ fn compile_err_to_syntax_error_maybe_incomplete(
             lineno as i64,
             offset as i64,
             end_lineno as i64,
-            end_offset as i64,
+            end_offset,
             text,
         )
     };
@@ -19511,11 +19559,10 @@ fn builtin_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // own `opts` has been moved into by then.
         let retry_opts = opts.clone();
         let result = if func_type_mode && source_is_ast {
-            // PyPy `compiling.py` returns an AST input unchanged for
-            // ONLY_AST, including FunctionType.  At the pinned CPython 3.14.6,
-            // `PyAst_CheckMode` asserts because this path supplies func_type's
-            // mode 3 to its 0..=2 table, so there is no successful 3.14
-            // observable that displaces the PyPy owner path.
+            // `PyAst_CheckMode` mode 3: the root must be FunctionType.  The
+            // compiler AST has no FunctionType `Mod`, so a matching tree is
+            // returned unchanged after the check.
+            crate::module::_ast::convert::check_func_type_ast(reload(0))?;
             Ok(reload(0))
         } else if func_type_mode {
             crate::module::_ast::convert::parse_func_type_to_object(
@@ -19668,6 +19715,38 @@ fn builtin_eval(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     exec_or_eval(source, globals_arg, locals_arg, true, pyre_object::PY_NULL)
 }
 
+/// `_PyRun_String` reads `globals['__name__']` with
+/// `PyDict_GetItemStringRef` and passes that as the `module` of
+/// `_PyParser_ASTFromString`.  Missing key, NULL globals, or a mapping
+/// that is not a dict/frozendict yields NULL.
+fn exec_source_warning_module(globals_arg: PyObjectRef) -> PyObjectRef {
+    let w_globals = if globals_arg.is_null() || unsafe { is_none(globals_arg) } {
+        let ec = crate::call::getexecutioncontext();
+        if ec.is_null() {
+            return PY_NULL;
+        }
+        let frame = unsafe { (*ec).gettopframe_nohidden() };
+        if frame.is_null() {
+            return PY_NULL;
+        }
+        unsafe { (*frame).get_w_globals() }
+    } else {
+        globals_arg
+    };
+    if w_globals.is_null() || unsafe { is_none(w_globals) } || !py_any_dict_check(w_globals) {
+        return PY_NULL;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let g_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_globals);
+    let backing =
+        crate::type_methods::resolve_dict_backing(pyre_object::gc_roots::shadow_stack_get(g_slot));
+    if backing.is_null() {
+        return PY_NULL;
+    }
+    unsafe { w_dict_getitem_str(backing, "__name__") }.unwrap_or(PY_NULL)
+}
+
 pub fn exec_or_eval(
     source: PyObjectRef,
     globals_arg: PyObjectRef,
@@ -19734,7 +19813,11 @@ pub fn exec_or_eval(
             } else {
                 crate::compile::Mode::Exec
             };
-            let code = crate::syntax_warnings::compile_with_codegen_warnings(
+            let warning_module = exec_source_warning_module(reload_ns(1));
+            let _module_roots = pyre_object::gc_roots::push_roots();
+            let module_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(warning_module);
+            let code = crate::syntax_warnings::compile_with_codegen_warnings_and_module(
                 &source,
                 mode,
                 rustpython_wtf8::Wtf8::new("<string>"),
@@ -19745,6 +19828,7 @@ pub fn exec_or_eval(
                         as usize,
                     ..Default::default()
                 },
+                pyre_object::gc_roots::shadow_stack_get(module_slot),
             )
             .map_err(|error| match error {
                 crate::syntax_warnings::SourceCompileError::Compile(error) => {
@@ -19800,22 +19884,6 @@ pub fn exec_or_eval(
                 None => (*(*w_obj).ob_type).name.to_string(),
             }
         }
-    }
-
-    fn is_dict_w(w_obj: PyObjectRef) -> bool {
-        unsafe {
-            let w_dict_type = crate::typedef::gettypeobject(&pyre_object::pyobject::DICT_TYPE);
-            crate::baseobjspace::isinstance_w(w_obj, w_dict_type)
-        }
-    }
-
-    /// `PyAnyDict_Check`: a dict (including a dict subclass) or a
-    /// `frozendict` (including a subclass).  `pyopcode.py ensure_ns` tests
-    /// `isinstance_w(w_dict)` only; 3.15 admits frozendict as eval/exec
-    /// globals (`lib-python/3/test/test_builtin.py` `test_eval_frozendict`,
-    /// `test_exec_frozendict`).
-    fn is_any_dict_w(w_obj: PyObjectRef) -> bool {
-        is_dict_w(w_obj) || unsafe { crate::type_methods::has_frozendict_backing(w_obj) }
     }
 
     /// `PyEval_GetBuiltins()` — the value `exec`/`eval` plant under
@@ -19938,7 +20006,7 @@ pub fn exec_or_eval(
     //                       else TypeError "must be a mapping or None"
     // 3.15 `builtin_eval_impl` / `builtin_exec_impl` use `PyAnyDict_Check`,
     // so a frozendict is a valid globals mapping.
-    if !is_none_or_null(globals_arg) && !is_any_dict_w(globals_arg) {
+    if !is_none_or_null(globals_arg) && !py_any_dict_check(globals_arg) {
         // `builtin_eval_impl` splits on `PyMapping_Check`, so a mapping that
         // is merely not a dict is told how to pass it as the locals instead;
         // `builtin_exec_impl` names the type it got.
@@ -30953,6 +31021,160 @@ mod tests {
         assert_eq!(
             COMPILER_FLAGS, futures,
             "consts.py's CO_FUTURE_ bits are {futures:#x} and COMPILER_FLAGS is {COMPILER_FLAGS:#x}"
+        );
+    }
+
+    #[test]
+    fn py_any_dict_check_admits_dict_and_frozendict() {
+        crate::typedef::init_typeobjects();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+        let frozen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_frozendict_new());
+        let proxy_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_proxy_new(
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        ));
+        assert!(py_any_dict_check(pyre_object::gc_roots::shadow_stack_get(
+            dict_slot
+        )));
+        assert!(py_any_dict_check(pyre_object::gc_roots::shadow_stack_get(
+            frozen_slot
+        )));
+        assert!(!py_any_dict_check(pyre_object::gc_roots::shadow_stack_get(
+            proxy_slot
+        )));
+        assert!(!py_any_dict_check(w_int_new(1)));
+    }
+
+    #[test]
+    fn exec_source_warning_module_reads_globals_name() {
+        crate::typedef::init_typeobjects();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new("package.module"));
+        let globals_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+        unsafe {
+            w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(globals_slot),
+                "__name__",
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+            );
+        }
+        let got = exec_source_warning_module(pyre_object::gc_roots::shadow_stack_get(globals_slot));
+        assert!(unsafe { is_str(got) });
+        assert_eq!(unsafe { w_str_get_wtf8(got) }, "package.module");
+
+        let empty_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+        assert!(
+            exec_source_warning_module(pyre_object::gc_roots::shadow_stack_get(empty_slot))
+                .is_null()
+        );
+        assert!(exec_source_warning_module(w_none()).is_null());
+        assert!(exec_source_warning_module(w_int_new(1)).is_null());
+
+        let fd_src_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+        unsafe {
+            w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(fd_src_slot),
+                "__name__",
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+            );
+        }
+        let frozen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(unsafe {
+            w_frozendict_copy_from(pyre_object::gc_roots::shadow_stack_get(fd_src_slot))
+        });
+        let got = exec_source_warning_module(pyre_object::gc_roots::shadow_stack_get(frozen_slot));
+        assert_eq!(unsafe { w_str_get_wtf8(got) }, "package.module");
+    }
+
+    #[test]
+    fn type_new_accepts_frozendict_namespace() {
+        crate::typedef::init_typeobjects();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let src_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_new());
+        unsafe {
+            w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(src_slot),
+                "x",
+                w_int_new(4),
+            );
+            w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(src_slot),
+                "y",
+                w_int_new(2),
+            );
+        }
+        let frozen_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(unsafe {
+            w_frozendict_copy_from(pyre_object::gc_roots::shadow_stack_get(src_slot))
+        });
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new("A"));
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
+        let created = type_create_new_type(
+            &[
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                pyre_object::gc_roots::shadow_stack_get(frozen_slot),
+            ],
+            crate::typedef::w_type(),
+            None,
+        )
+        .expect("type() accepts a frozendict namespace");
+        let created_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(created);
+        let x = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(created_slot),
+            "x",
+        )
+        .unwrap();
+        assert_eq!(unsafe { w_int_get_value(x) }, 4);
+        let y = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(created_slot),
+            "y",
+        )
+        .unwrap();
+        assert_eq!(unsafe { w_int_get_value(y) }, 2);
+        let type_name = crate::baseobjspace::getattr_str(
+            pyre_object::gc_roots::shadow_stack_get(created_slot),
+            "__name__",
+        )
+        .unwrap();
+        assert_eq!(unsafe { w_str_get_wtf8(type_name) }, "A");
+    }
+
+    #[test]
+    fn type_new_rejects_mappingproxy_namespace() {
+        crate::typedef::init_typeobjects();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new("A"));
+        let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![]));
+        let proxy_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict_proxy_new(w_dict_new()));
+        let err = type_create_new_type(
+            &[
+                pyre_object::gc_roots::shadow_stack_get(name_slot),
+                pyre_object::gc_roots::shadow_stack_get(bases_slot),
+                pyre_object::gc_roots::shadow_stack_get(proxy_slot),
+            ],
+            crate::typedef::w_type(),
+            None,
+        )
+        .expect_err("mappingproxy is not a type namespace");
+        assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            err.message_text(),
+            "type.__new__() argument 3 must be dict or frozendict, not mappingproxy"
         );
     }
 }

@@ -380,9 +380,11 @@ fn write_object(
 
     let type_pos = out.len();
     let use_ref = refs.is_some() && !is_singleton(obj);
-    // CPython 3.14 `w_ref` marks only code and slice objects incomplete and
-    // clears that marker in `w_complete` after their contents are written.
-    let requires_completion = unsafe { crate::pycode::is_code(obj) || is_slice(obj) };
+    // `w_ref` marks code, slice, and frozendict incomplete and clears that
+    // marker in `w_complete` after their contents are written: the reader
+    // rebuilds them from their fields.
+    let requires_completion =
+        unsafe { crate::pycode::is_code(obj) || is_slice(obj) || is_frozendict(obj) };
     let ref_index = if use_ref {
         Some(refs.as_mut().unwrap().reserve(obj, requires_completion)?)
     } else {
@@ -505,8 +507,12 @@ fn write_object(
             for item in snapshot {
                 write_object(out, item.get(), refs, version, depth - 1)?;
             }
-        } else if !is_heap_type && is_dict(obj) {
-            out.write_u8(b'{');
+        } else if !is_heap_type && (is_dict(obj) || is_frozendict(obj)) {
+            let frozen = is_frozendict(obj);
+            if frozen && version < 6 {
+                return Err(PyError::value_error("unmarshallable object"));
+            }
+            out.write_u8(if frozen { b'}' } else { b'{' });
             let len = dictmultiobject::w_dict_len(obj);
             // A slot walk, not a positional one: a deleted entry leaves a
             // tombstone `_ll_dictnext` steps over.
@@ -1084,6 +1090,10 @@ impl wire::MarshalBag for PyreMarshalBag {
         Some(Rooted::new(w_dict_new()))
     }
 
+    fn freeze_dict(&self, source: Self::Value) -> Result<Rooted, wire::MarshalError> {
+        Ok(Rooted::new(unsafe { w_frozendict_copy_from(source.get()) }))
+    }
+
     fn insert_dict_item(
         &self,
         dict: &Rooted,
@@ -1270,7 +1280,11 @@ fn contains_code(obj: PyObjectRef, seen: &mut Vec<PyObjectRef>) -> bool {
         return false;
     }
     let is_container = unsafe {
-        is_tuple(obj) || is_list(obj) || is_dict(obj) || setobject::is_set_or_frozenset(obj)
+        is_tuple(obj)
+            || is_list(obj)
+            || is_dict(obj)
+            || is_frozendict(obj)
+            || setobject::is_set_or_frozenset(obj)
     };
     if !is_container {
         return false;
@@ -1285,7 +1299,7 @@ fn contains_code(obj: PyObjectRef, seen: &mut Vec<PyObjectRef>) -> bool {
             (0..w_list_len(obj)).any(|index| {
                 w_list_getitem(obj, index as i64).is_some_and(|item| contains_code(item, seen))
             })
-        } else if is_dict(obj) {
+        } else if is_dict(obj) || is_frozendict(obj) {
             dictmultiobject::w_dict_items(obj)
                 .into_iter()
                 .any(|(key, value)| contains_code(key, seen) || contains_code(value, seen))

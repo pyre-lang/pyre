@@ -54,6 +54,53 @@ fn ast_instance_type_name(object: PyObjectRef) -> &'static str {
     }
 }
 
+/// `%T` spelling of an AST instance (`type_fully_qualified_name` / `ast_type_init`).
+fn ast_percent_t(object: PyObjectRef) -> rustpython_wtf8::Wtf8Buf {
+    unsafe { crate::display::type_fully_qualified_name_of(object) }
+}
+
+/// ASDL sum types plus the `AST` root (`ast_state.abstract_types` / `ast_is_abstract`).
+fn is_abstract_node_name(name: &str) -> bool {
+    matches!(
+        name,
+        "AST"
+            | "mod"
+            | "stmt"
+            | "expr"
+            | "expr_context"
+            | "boolop"
+            | "operator"
+            | "unaryop"
+            | "cmpop"
+            | "excepthandler"
+            | "pattern"
+            | "type_ignore"
+            | "type_param"
+    )
+}
+
+/// Identity membership in the generated abstract set, not a subclass test.
+fn is_abstract_ast_type(cls: PyObjectRef) -> bool {
+    use std::sync::atomic::Ordering;
+    let ptr = AST_STATE.load(Ordering::Acquire);
+    if ptr.is_null() {
+        return false;
+    }
+    let (entries, len) = unsafe { ((*ptr).entries, (*ptr).len) };
+    for index in 0..len {
+        let (name, w_type) = unsafe { *entries.add(index) };
+        if is_abstract_node_name(name) && w_type == cls {
+            return true;
+        }
+    }
+    false
+}
+
+/// `_ast._is_abstract(cls)` (`ast_is_abstract`).
+fn ast_is_abstract(args: &[PyObjectRef]) -> crate::PyResult {
+    Ok(pyre_object::w_bool_from(is_abstract_ast_type(args[0])))
+}
+
 fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
     let name = unsafe { pyre_object::w_type_get_name(w_type) };
     if name == "AST" {
@@ -73,6 +120,49 @@ fn ast_fields_owner_name(w_type: PyObjectRef) -> String {
 
 fn ast_field_repr(field: PyObjectRef) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError> {
     unsafe { crate::display::py_repr_wtf8(field) }
+}
+
+/// `format_missing`: names in `_fields` order as a natural-language list.
+fn format_missing_fields<F>(
+    missing: PyObjectRef,
+    num_fields: usize,
+    mut field_at: F,
+) -> Result<rustpython_wtf8::Wtf8Buf, crate::PyError>
+where
+    F: FnMut(usize) -> PyObjectRef,
+{
+    // Set membership runs `__hash__`/`__eq__` and `ast_field_repr` runs
+    // `repr`; either may collect. Keep `missing` and each field in a root
+    // slot and reload after every such call.
+    let roots = pyre_object::gc_roots::push_roots();
+    let missing_slot = roots.base();
+    let _ = roots.pin_root(missing);
+    let mut names = Vec::new();
+    for index in 0..num_fields {
+        let field_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(field_at(index));
+        if crate::type_methods::set_contains_checked(roots.get(missing_slot), roots.get(field_slot))?
+        {
+            names.push(ast_field_repr(roots.get(field_slot))?);
+        }
+    }
+    let num_total = names.len();
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    for (index, name) in names.iter().enumerate() {
+        let num_left = num_total - index;
+        let suffix = if num_left == 1 {
+            ""
+        } else if num_total == 2 {
+            " and "
+        } else if num_left == 2 {
+            ", and "
+        } else {
+            ", "
+        };
+        out.push_wtf8(name);
+        out.push_str(suffix);
+    }
+    Ok(out)
 }
 
 fn ast_repr_type_name(object: PyObjectRef) -> String {
@@ -517,11 +607,10 @@ fn expr_context_type() -> PyObjectRef {
     }
 }
 
-/// [3.14-spec] PyPy `W_AST_init` only assigns supplied arguments.  The pinned
-/// `ASTConstructorTests` require CPython 3.14 `ast_type_init`'s observable
-/// missing-field defaults/deprecations and unexpected-keyword deprecation.
-/// Keep PyPy's generated-type owner and general object-space dispatch while
-/// porting that constructor decision tree here.
+/// PyPy `W_AST_init` only assigns supplied arguments.  The pinned
+/// `ASTConstructorTests` require `ast_type_init`'s missing-field defaults,
+/// required-argument TypeError, and unexpected-keyword TypeError.  Abstract
+/// instantiation still warns (`DeprecationWarning` until 3.20).
 fn ast_init_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
     let _roots = pyre_object::gc_roots::push_roots();
     let self_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -554,6 +643,13 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
     let zelf = || roots.get(positional_base);
     let w_type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(unsafe { crate::objspace::std::mapdict::instance_getclass(zelf()) });
+    if is_abstract_ast_type(roots.get(w_type_slot)) {
+        ast_warn(crate::display::wtf8_format!(
+            "Instantiating abstract AST node class ",
+            ast_percent_t(zelf()),
+            " is deprecated. This will become an error in Python 3.20"
+        ))?;
+    }
     let fields_obj = match crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_fields")?
     {
         Some(fields_obj) => fields_obj,
@@ -626,7 +722,7 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
                 )? {
                     let key_repr = ast_field_repr(roots.get(key_slot))?;
                     return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-                        ast_instance_type_name(zelf()),
+                        ast_percent_t(zelf()),
                         " got multiple values for argument ",
                         key_repr
                     )));
@@ -644,13 +740,11 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
                 };
                 if !crate::baseobjspace::contains(attributes, roots.get(key_slot))? {
                     let key_repr = ast_field_repr(roots.get(key_slot))?;
-                    ast_warn(crate::display::wtf8_format!(
-                        ast_instance_type_name(zelf()),
+                    return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                        ast_percent_t(zelf()),
                         ".__init__ got an unexpected keyword argument ",
-                        key_repr,
-                        ". Support for arbitrary keyword arguments is deprecated and will be ",
-                        "removed in Python 3.15."
-                    ))?;
+                        key_repr
+                    )));
                 }
             }
             crate::baseobjspace::setattr(zelf(), roots.get(key_slot), roots.get(value_slot))?;
@@ -663,8 +757,8 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
     let Some(field_types) =
         crate::baseobjspace::findattr_result(roots.get(w_type_slot), "_field_types")?
     else {
-        // CPython 3.14 `ast_type_init`: user AST subclasses without generated
-        // metadata keep the pre-3.13 behavior and leave omitted fields absent.
+        // `ast_type_init`: user AST subclasses without generated metadata
+        // leave omitted fields absent.
         return Ok(pyre_object::w_none());
     };
     let field_types_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -672,20 +766,21 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
     let remaining = unsafe { pyre_object::setobject::w_set_items(roots.get(remaining_slot)) };
     let remaining_base = roots.publish(&remaining);
     roots.normalize(remaining_base, remaining.len());
+    let missing_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_set_new());
     for index in 0..remaining.len() {
         let field_slot = remaining_base + index;
         let Some(field_type) =
             crate::baseobjspace::finditem(roots.get(field_types_slot), roots.get(field_slot))?
         else {
             let field_repr = ast_field_repr(roots.get(field_slot))?;
-            ast_warn(crate::display::wtf8_format!(
+            return Err(crate::PyError::type_error(crate::display::wtf8_format!(
                 "Field ",
                 field_repr,
                 " is missing from ",
-                ast_instance_type_name(zelf()),
-                "._field_types. This will become an error in Python 3.15."
-            ))?;
-            continue;
+                ast_percent_t(zelf()),
+                "._field_types"
+            )));
         };
         let field_type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = roots.pin_root(field_type);
@@ -699,23 +794,34 @@ fn ast_init_from(positional: &[PyObjectRef], kwargs: Option<PyObjectRef>) -> cra
         } else if crate::baseobjspace::is_w(roots.get(field_type_slot), expr_context_type()) {
             crate::baseobjspace::setattr(zelf(), roots.get(field_slot), load_singleton())?;
         } else {
-            let field_repr = ast_field_repr(roots.get(field_slot))?;
-            ast_warn(crate::display::wtf8_format!(
-                ast_instance_type_name(zelf()),
-                ".__init__ missing 1 required positional argument: ",
-                field_repr,
-                ". This will become an error in Python 3.15."
-            ))?;
+            crate::builtins::builtin_set_add_items(
+                roots.get(missing_slot),
+                &[roots.get(field_slot)],
+            )?;
         }
+    }
+    let missing_count = unsafe { pyre_object::setobject::w_set_len(roots.get(missing_slot)) };
+    if missing_count != 0 {
+        let names = format_missing_fields(roots.get(missing_slot), num_fields, |index| {
+            roots.get(fields_base + index)
+        })?;
+        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
+            ast_percent_t(zelf()),
+            ".__init__ missing ",
+            missing_count.to_string(),
+            " required positional argument",
+            if missing_count == 1 { "" } else { "s" },
+            ": ",
+            names
+        )));
     }
     Ok(pyre_object::w_none())
 }
 
-/// [3.14-spec] PyPy `W_AST` owns the node dictionary and generated `_fields`
-/// / `_attributes` sequences but predates `copy.replace`.  Port CPython 3.14
-/// `ast_type_replace` through those PyPy object-space surfaces: validate the
-/// declared names, copy only declared instance entries, overlay keywords, and
-/// invoke the live node type so subclass construction remains observable.
+/// PyPy `W_AST` owns the node dictionary and generated `_fields` /
+/// `_attributes` sequences but predates `copy.replace`.  `ast_type_replace`
+/// copies declared instance entries, overlays keywords, and invokes the live
+/// node type so missing/unknown names surface through `ast_type_init`.
 fn ast_replace_args(self_: PyObjectRef, args: &crate::argument::Arguments) -> crate::PyResult {
     if !args.arguments_w.is_empty() {
         return Err(crate::PyError::type_error(
@@ -787,17 +893,6 @@ fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::Py
     let attributes_base = roots.publish(&attributes);
     roots.normalize(attributes_base, attributes.len());
 
-    let expecting_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = roots.pin_root(pyre_object::w_set_new());
-    let mut declared = Vec::with_capacity(fields.len() + attributes.len());
-    for index in 0..fields.len() {
-        declared.push(roots.get(fields_base + index));
-    }
-    for index in 0..attributes.len() {
-        declared.push(roots.get(attributes_base + index));
-    }
-    crate::builtins::builtin_set_add_items(roots.get(expecting_slot), &declared)?;
-
     let keyword_entries = match kwargs_slot {
         Some(slot) => unsafe { pyre_object::w_dict_items(roots.get(slot)) },
         None => Vec::new(),
@@ -809,97 +904,6 @@ fn ast_replace_from(zelf: PyObjectRef, kwargs: Option<PyObjectRef>) -> crate::Py
     }
     let keyword_base = roots.publish(&keyword_objects);
     roots.normalize(keyword_base, keyword_objects.len());
-    for index in 0..keyword_entries.len() {
-        let key = roots.get(keyword_base + index * 2);
-        let value = roots.get(keyword_base + index * 2 + 1);
-        if !crate::type_methods::set_discard_checked(roots.get(expecting_slot), key)? {
-            // The discard hashes and compares the key through the Python
-            // protocol, so read it back rather than reusing the local.
-            let key_repr = ast_field_repr(roots.get(keyword_base + index * 2))?;
-            return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-                ast_instance_type_name(roots.get(zelf_slot)),
-                ".__replace__ got an unexpected keyword argument ",
-                key_repr,
-                "."
-            )));
-        }
-    }
-
-    if let Some(dict_slot) = dict_slot {
-        let dict_entries = unsafe { pyre_object::w_dict_items(roots.get(dict_slot)) };
-        let mut dict_keys = Vec::with_capacity(dict_entries.len());
-        for index in 0..dict_entries.len() {
-            dict_keys.push(dict_entries[index].0);
-        }
-        let dict_keys_base = roots.publish(&dict_keys);
-        roots.normalize(dict_keys_base, dict_keys.len());
-        for index in 0..dict_keys.len() {
-            crate::type_methods::set_discard_checked(
-                roots.get(expecting_slot),
-                roots.get(dict_keys_base + index),
-            )?;
-        }
-        for index in 0..attributes.len() {
-            crate::type_methods::set_discard_checked(
-                roots.get(expecting_slot),
-                roots.get(attributes_base + index),
-            )?;
-        }
-    }
-
-    if let Some(field_types) =
-        crate::baseobjspace::findattr_result(roots.get(type_slot), "_field_types")?
-    {
-        let field_types_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(field_types);
-        if unsafe { pyre_object::is_dict(roots.get(field_types_slot)) } {
-            let entries = unsafe { pyre_object::w_dict_items(roots.get(field_types_slot)) };
-            let mut entry_objects = Vec::with_capacity(entries.len() * 2);
-            for &(key, value) in &entries {
-                entry_objects.push(key);
-                entry_objects.push(value);
-            }
-            let entries_base = roots.publish(&entry_objects);
-            roots.normalize(entries_base, entry_objects.len());
-            for index in 0..entries.len() {
-                if unsafe { pyre_object::is_union(roots.get(entries_base + index * 2 + 1)) } {
-                    crate::type_methods::set_discard_checked(
-                        roots.get(expecting_slot),
-                        roots.get(entries_base + index * 2),
-                    )?;
-                }
-            }
-        }
-    }
-
-    let missing_count = unsafe { pyre_object::setobject::w_set_len(roots.get(expecting_slot)) };
-    if missing_count != 0 {
-        let missing = unsafe { pyre_object::setobject::w_set_items(roots.get(expecting_slot)) };
-        let missing_base = roots.publish(&missing);
-        roots.normalize(missing_base, missing.len());
-        let mut names = Vec::with_capacity(missing.len());
-        for index in 0..missing.len() {
-            names.push(ast_field_repr(roots.get(missing_base + index))?);
-        }
-        names.sort();
-        let mut joined = rustpython_wtf8::Wtf8Buf::new();
-        for index in 0..names.len() {
-            if index != 0 {
-                joined.push_str(", ");
-            }
-            joined.push_wtf8(&names[index]);
-        }
-        return Err(crate::PyError::type_error(crate::display::wtf8_format!(
-            ast_instance_type_name(roots.get(zelf_slot)),
-            ".__replace__ missing ",
-            missing_count.to_string(),
-            " keyword argument",
-            if missing_count == 1 { "" } else { "s" },
-            ": ",
-            joined,
-            "."
-        )));
-    }
 
     let payload_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(pyre_object::w_dict_new());
@@ -1133,7 +1137,7 @@ fn node_field_types(name: &str) -> &'static [&'static str] {
         "Dict" => &["expr*", "expr*"],
         "Set" => &["expr*"],
         "ListComp" | "SetComp" | "GeneratorExp" => &["expr", "comprehension*"],
-        "DictComp" => &["expr", "expr", "comprehension*"],
+        "DictComp" => &["expr", "expr?", "comprehension*"],
         "Await" | "YieldFrom" => &["expr"],
         "Yield" => &["expr?"],
         "Compare" => &["expr", "cmpop*", "expr*"],
@@ -1712,5 +1716,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     ] {
         crate::__pyre_put_new!(ns_slot, name, pyre_object::w_int_new(*value));
     }
+    crate::__pyre_put_new!(
+        ns_slot,
+        "_is_abstract",
+        crate::make_builtin_function_with_arity("_is_abstract", ast_is_abstract, 1)
+    );
     Ok(())
 }

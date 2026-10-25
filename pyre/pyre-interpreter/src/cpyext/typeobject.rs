@@ -2879,15 +2879,14 @@ fn defining_class(
     carrier_objclass(carrier)
 }
 
-/// `descrobject.c` spells each kind differently: `method`, `member` and
-/// `attribute` for the getset.
+/// `descrobject.c descr_repr` spells each kind differently: `method`,
+/// `member` and `attribute` for the getset.
 fn descr_repr(args: &[PyObjectRef], kind: &str) -> Result<PyObjectRef, crate::PyError> {
     let carrier = args[0];
-    let owner = owner_name(carrier);
-    Ok(pyre_object::w_str_new_managed(&format!(
-        "<{kind} '{}' of '{owner}' objects>",
-        descriptor_name(carrier)
-    )))
+    let owner = carrier_objclass(carrier).unwrap_or(PY_NULL);
+    Ok(pyre_object::w_str_new_managed(
+        &crate::typedef::descr_repr_text(kind, &descriptor_name(carrier), owner),
+    ))
 }
 
 /// The name of the type a descriptor was declared in, which is what its repr
