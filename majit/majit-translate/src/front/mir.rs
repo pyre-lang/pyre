@@ -2167,6 +2167,8 @@ impl DeclaredSpec {
             graph: lowered.lazy_graph().clone(),
             transform: crate::codewriter::call::GraphTransform {
                 return_type: lowered.return_type,
+                return_class_root: lowered.return_class_root,
+                return_can_be_none: lowered.return_can_be_none,
                 hints: lowered.hints,
             },
         }
@@ -2403,6 +2405,7 @@ pub(crate) struct SemanticFunctionHeader {
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
+    return_can_be_none: bool,
     self_ty_root: Option<String>,
     trait_impl_id: Option<u64>,
     trait_impl_identity: Option<String>,
@@ -2467,8 +2470,7 @@ impl SemanticFunctionHeader {
             .and_then(|p| p.rsplit("::").next())
             .map(str::to_string)
             .or_else(|| trait_default_owner_for_fundecl(fd, known_trait_names));
-        let gcref_result = gc_root_gcref_result_path(policy_fn_path);
-        let returns_objectptr = output_type_is_objectptr(&signature.output, llbc) && !gcref_result;
+        let returns_objectptr = output_type_is_objectptr(&signature.output, llbc);
         // `dont_look_inside` / `elidable` callees and every trait-method
         // member of an indirect-call row stamp FUNC.RESULT.
         // A `repr(transparent)` scalar wrapper is that word.
@@ -2495,20 +2497,14 @@ impl SemanticFunctionHeader {
                 hints.push("elidable".to_string());
             }
         }
-        let signature_token = if gcref_result {
-            Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
-        } else {
-            dont_look_inside_return_token(
-                &signature.output,
-                llbc,
-                error_carrier,
-                gc_struct_ids,
-                raw_alloc_flavor_structs,
-            )
-        };
+        let signature_token = dont_look_inside_return_token(
+            &signature.output,
+            llbc,
+            error_carrier,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         let residual_return_type = signature_token.clone();
-        let return_class_root =
-            dont_look_inside_return_class_root(&signature.output, llbc, error_carrier);
         let return_is_str = dont_look_inside_return_is_str(&signature.output, llbc, error_carrier);
         let return_container_root = dont_look_inside_return_container_root(
             &signature.output,
@@ -2525,7 +2521,7 @@ impl SemanticFunctionHeader {
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
-        let mut return_type = if gcref_result || stamp_return_token {
+        let return_type = if stamp_return_token {
             signature_token
         } else if signature_token.as_deref().is_some_and(scalar_result_token)
             && !output_is_raw_address_word(
@@ -2540,6 +2536,20 @@ impl SemanticFunctionHeader {
         } else {
             None
         };
+        let return_class_root = dont_look_inside_return_class_root(
+            &signature.output,
+            llbc,
+            error_carrier,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+        let return_can_be_none = dont_look_inside_return_can_be_none(
+            &signature.output,
+            llbc,
+            error_carrier,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         // The funcobj's own `_jit_*_` attributes: `graph.func` carries them
         // to `look_inside_graph` and the BFS, so the first registration
         // already sees `unroll_safe`. A spec copy misses `fn_path` in the
@@ -2558,22 +2568,6 @@ impl SemanticFunctionHeader {
                     hints.push(hint.clone());
                 }
             }
-            // A `dont_look_inside` callee returning `*mut PyObject`
-            // residualizes as an opaque call, and a `None` return type
-            // maps to `Void` in the cutover residual prefill — a
-            // miscompile for a callee the caller reads as a pointer.
-            // Stamp the object-pointer marker so the residual reports a
-            // `Ref` result. Gated on the hint so a non-opaque
-            // object-pointer-returning fn keeps `return_type == None` (the
-            // call-signature validator's TyRef-label-misclassify
-            // safeguard).
-            if return_type.is_none()
-                && returns_objectptr
-                && own.iter().any(|hint| hint == "dont_look_inside")
-            {
-                return_type =
-                    Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
-            }
         }
         SemanticFunctionHeader {
             name,
@@ -2582,6 +2576,7 @@ impl SemanticFunctionHeader {
             return_class_root,
             return_is_str,
             return_container_root,
+            return_can_be_none,
             self_ty_root,
             trait_impl_id,
             trait_impl_identity,
@@ -2636,10 +2631,12 @@ impl SemanticFunctionHeader {
             fun_decl_id: self.fun_decl_id,
             module: self.module.clone(),
             hints: self.hints.clone(),
+            return_type: self.return_type.clone(),
             residual_return_type: self.residual_return_type.clone(),
             return_class_root: self.return_class_root.clone(),
             return_is_str: self.return_is_str,
             return_container_root: self.return_container_root.clone(),
+            return_can_be_none: self.return_can_be_none,
         }
     }
 
@@ -2652,6 +2649,8 @@ impl SemanticFunctionHeader {
             name: self.name,
             graph,
             return_type: self.return_type,
+            return_class_root: self.return_class_root,
+            return_can_be_none: self.return_can_be_none,
             self_ty_root: self.self_ty_root,
             trait_impl_id: self.trait_impl_id,
             trait_impl_identity: self.trait_impl_identity,
@@ -2715,10 +2714,12 @@ pub(crate) struct GraphStamp {
     fun_decl_id: u64,
     module: Option<String>,
     hints: Vec<String>,
+    return_type: Option<String>,
     residual_return_type: Option<String>,
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
+    return_can_be_none: bool,
 }
 
 impl GraphStamp {
@@ -2734,10 +2735,14 @@ impl GraphStamp {
         if !self.hints.is_empty() {
             crate::front::llbc_hints::merge_hints_into_graph(&mut graph, &self.hints);
         }
+        if let Some(rt) = &self.return_type {
+            graph.return_type = Some(rt.clone());
+        }
         graph.residual_return_type = self.residual_return_type.clone();
         graph.return_class_root = self.return_class_root.clone();
         graph.return_is_str = self.return_is_str;
         graph.return_container_root = self.return_container_root.clone();
+        graph.return_can_be_none = self.return_can_be_none;
         graph
     }
 }
@@ -5559,6 +5564,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &fd.signature.output,
             llbc,
             static_addrs.error_carrier,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
+        lo.graph.return_can_be_none = dont_look_inside_return_can_be_none(
+            &fd.signature.output,
+            llbc,
+            static_addrs.error_carrier,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
         );
         lo.graph.return_is_str =
             dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);

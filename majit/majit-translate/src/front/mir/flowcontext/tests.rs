@@ -2659,7 +2659,7 @@ fn gcref_address_cast_store_keeps_gcref_pointer() {
 /// a residual `expect` method is `getattr("expect")` on the instance.
 #[test]
 fn random_rnd_expect_is_niche_guard() {
-    use crate::model::{CallTarget, OpKind};
+    use crate::model::{CallTarget, OpKind, ValueType};
 
     // `_random` lives in `pyre-module`, so its graphs are in that artefact.
     let path = crate::runtime_names::artifacts::MODULE_ULLBC;
@@ -2678,23 +2678,50 @@ fn random_rnd_expect_is_niche_guard() {
         {
             assert_ne!(name.as_str(), "expect", "rnd still calls expect");
         }
+        if let OpKind::FieldRead { field, .. } = &op.kind {
+            assert_ne!(
+                field.name.as_str(),
+                "__discriminant",
+                "niche Option<&mut Random> has no aggregate tag"
+            );
+        }
     }
-    // `remove_assertion_errors` drops the never-None arm and its `ne`,
-    // leaving the niche `null_mut` the guard compared against.
-    let saw_null = graph
-        .blocks
-        .iter()
-        .flat_map(|block| &block.operations)
-        .any(|op| {
-            matches!(
+    // The expect rewrite builds `not (opt is None)` (`rnone.py`
+    // `rtype_is_None`); `remove_assertion_errors` then drops the
+    // never-None arm, so the discriminant (and its `Constant(None)`)
+    // is dead. The surviving Some path is `from_obj` narrowed to
+    // Random. A GCREF `null_mut` operand is the collapse this
+    // producer no longer emits.
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(
                 &op.kind,
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.as_slice() == ["core", "ptr", "null_mut"]
-            )
-        });
-    assert!(saw_null, "niche Option::expect must build a null pointer");
+            )),
+        "niche Option::expect is rtype_is_None, not a GCREF null_mut operand"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    result_ty: ValueType::Ref(Some(root)),
+                    ..
+                } if segments.as_slice() == ["__cast_instance_intrinsic"]
+                    && root.as_str() == "module::_random::Random"
+            )),
+        "from_obj's Option<&mut Random> narrows to the Random instance"
+    );
 }
 
 #[test]

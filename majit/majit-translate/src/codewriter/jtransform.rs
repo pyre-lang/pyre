@@ -7153,17 +7153,23 @@ impl<'a> Transformer<'a> {
                 } else {
                     "instance_ptr_ne"
                 };
-            } else if rhs.concretetype().is_none() {
-                // Exempt only an untyped `ConstRefNull` (no concretetype).
-                // A null with an explicit non-instance pointer type such as
-                // `GCREF` still panics. `_rewrite_equality` folds the untyped
-                // null to `ptr_iszero`.
+            } else if rhs.concretetype().is_none()
+                && renamed_constant_of(graph, rhs, &self.aliases, &self.renamings_constants)
+                    .is_some_and(|kind| kind.is_null_ref())
+            {
+                // Skip the instance assert only for a renamed constant null
+                // (`renamed_constant_of` is a null ref) that has no
+                // concretetype. An untyped non-constant operand must hit
+                // the assert. `_rewrite_equality` folds the untyped null
+                // to `ptr_iszero`.
             } else {
                 panic!(
                     "graph {graph_name}: ptr equality of an rclass instance against a non-instance \
-                     (lhs={:?}, rhs={:?})",
+                     (lhs={:?} producer={}, rhs={:?} producer={})",
                     lhs.concretetype(),
-                    rhs.concretetype()
+                    describe_v_inst_producer(graph, &LinkArg::Value(lhs.clone())),
+                    rhs.concretetype(),
+                    describe_v_inst_producer(graph, &LinkArg::Value(rhs.clone())),
                 );
             }
         }
@@ -8042,10 +8048,19 @@ impl<'a> Transformer<'a> {
             crate::model::LinkArg::Value(var) => var.concretetype(),
             crate::model::LinkArg::Const(c) => c.concretetype.clone(),
         };
+        let v_inst_producer = describe_v_inst_producer(graph, &v_inst);
+        if inst_ct.as_ref() == Some(&*crate::translator::rtyper::rclass::OBJECTPTR) {
+            panic!(
+                "jit_force_quasi_immutable on {graph_name}: v_inst typed rclass.OBJECTPTR \
+                 (legacy Skip arm or a too-wide annotation); upstream types it from getinstancerepr(classdef); \
+                 v_inst_producer={v_inst_producer}"
+            );
+        }
         let owner = ptr_struct_owner_root(inst_ct.as_ref()).unwrap_or_else(|| {
             panic!(
                 "jit_force_quasi_immutable: v_inst has no STRUCT concretetype: \
-                 graph={graph_name} target={target} ct={inst_ct:?}"
+                 graph={graph_name} target={target} ct={inst_ct:?} \
+                 v_inst_producer={v_inst_producer}"
             )
         });
         let mutate_field = FieldDescriptor::new(fieldname, Some(owner));
@@ -16805,6 +16820,45 @@ pub(crate) fn is_jit_force_quasi_immutable_target(
 /// `stroruni_first_arg_kind` resolves `ForwardReference` the same way.
 /// The leaf is the `FieldDescriptor.owner_root` spelling
 /// `resolve_adt_field` uses (`name_path.rsplit("::")`).
+fn describe_v_inst_producer(graph: &FunctionGraph, v_inst: &LinkArg) -> String {
+    match v_inst {
+        LinkArg::Const(c) => format!("const ct={:?}", c.concretetype),
+        LinkArg::Value(var) => match defining_op(graph, var) {
+            None => {
+                if graph
+                    .blocks
+                    .iter()
+                    .any(|block| block.inputargs.iter().any(|input| input == var))
+                {
+                    format!("inputarg ct={:?}", var.concretetype())
+                } else {
+                    format!("no-def ct={:?}", var.concretetype())
+                }
+            }
+            Some(op) => match &op.kind {
+                OpKind::Call {
+                    target, result_ty, ..
+                } => format!(
+                    "Call target={target} result_ty={result_ty:?} dest_ct={:?}",
+                    var.concretetype()
+                ),
+                OpKind::Input {
+                    name,
+                    ty,
+                    class_root,
+                } => format!(
+                    "Input {name} ty={ty:?} class_root={class_root:?} dest_ct={:?}",
+                    var.concretetype()
+                ),
+                OpKind::UnaryOp { op, .. } => {
+                    format!("UnaryOp {op} dest_ct={:?}", var.concretetype())
+                }
+                kind => format!("{kind:?} dest_ct={:?}", var.concretetype()),
+            },
+        },
+    }
+}
+
 fn ptr_struct_owner_root(
     ct: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
 ) -> Option<String> {
@@ -26607,6 +26661,45 @@ mod tests {
         let mut graph = FunctionGraph::new("opaque_force");
         let inst = graph.alloc_value_var();
         inst.set_concretetype(Some(GCREF.clone()));
+        graph.push_inputarg_var(graph.startblock, inst.clone());
+        let path = crate::parse::CallPath::for_impl_method(
+            "function::Function",
+            "jit_force_quasi_immutable",
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: Some(path.clone()),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: vec![
+                    LinkArg::from(inst.clone()),
+                    LinkArg::Const(Constant::new(ConstValue::byte_str("mutate_code"))),
+                ],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let _ = transform_with_qi_llop(&graph, path);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "v_inst typed rclass.OBJECTPTR (legacy Skip arm or a too-wide annotation)"
+    )]
+    fn rewrite_op_jit_force_quasi_immutable_objectptr_v_inst_panics() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let mut graph = FunctionGraph::new("objectptr_force");
+        let inst = graph.alloc_value_var();
+        inst.set_concretetype(Some(OBJECTPTR.clone()));
         graph.push_inputarg_var(graph.startblock, inst.clone());
         let path = crate::parse::CallPath::for_impl_method(
             "function::Function",
@@ -39933,6 +40026,39 @@ mod tests {
             );
         }
 
+        #[test]
+        fn two_unproduced_objectptr_refs_is_become_instance_ptr_eq() {
+            use crate::translator::rtyper::rclass::OBJECTPTR;
+            let mut graph = FunctionGraph::new("two_unproduced_objectptr_is");
+            let bb = graph.startblock;
+            let lhs = graph.alloc_value_var();
+            let rhs = graph.alloc_value_var();
+            graph.block_mut(bb).inputargs.push(lhs.clone());
+            graph.block_mut(bb).inputargs.push(rhs.clone());
+            lhs.set_concretetype(Some(OBJECTPTR.clone()));
+            rhs.set_concretetype(Some(OBJECTPTR.clone()));
+            let result = graph
+                .push_op_var(
+                    bb,
+                    OpKind::BinOp {
+                        op: "is_".into(),
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(bb, Some(result));
+            let transformed = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+            let ops = &transformed.graph.block(graph.startblock).operations;
+            let (op, _, _) = binary_op(ops).expect("the compare must survive");
+            assert_eq!(
+                op, "instance_ptr_eq",
+                "no-def OBJECTPTR inputargs compared with is_ promote: {ops:?}"
+            );
+        }
+
         fn transform_named_ptr_eq(
             op: &str,
             lhs_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
@@ -39973,6 +40099,50 @@ mod tests {
                 transformed.graph.block(graph.startblock).operations.clone(),
                 lhs,
             )
+        }
+
+        #[test]
+        #[should_panic(expected = "instance_vs_untyped_nonconst_ptr_eq")]
+        fn ptr_eq_of_instance_against_untyped_non_constant_panics() {
+            use crate::translator::rtyper::rclass::OBJECTPTR;
+            let mut graph = FunctionGraph::new("instance_vs_untyped_nonconst_ptr_eq");
+            let lhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "a".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            let rhs = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "b".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            lhs.set_concretetype(Some(OBJECTPTR.clone()));
+            let result = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::BinOp {
+                        op: "ptr_eq".into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Bool,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(graph.startblock, Some(result));
+            let _ = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
         }
 
         #[test]

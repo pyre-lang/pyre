@@ -3266,36 +3266,6 @@ pub(in crate::front::mir) fn unit_tyref() -> TyRef {
         }
     }))
 }
-/// Root-stack operations whose PyObjectRef return is the physical spelling
-/// of `llmemory.GCREF`, not a W_Root instance.  Upstream's GC transformer
-/// gives such a helper call a GCREF result and casts it back to the concrete
-/// repr at the use site — `gct_weakref_create` (`framework.py`)
-/// does `genop("direct_call", ..., resulttype=llmemory.GCREF)` followed by
-/// `genop("cast_opaque_ptr", [v_result], resulttype=WEAKREFPTR)`.
-///
-/// `RootScope::get` is admitted alongside `shadow_stack_get`: its own source
-/// doc calls it "scope-local [`shadow_stack_get`] using the cached cell", and
-/// it is the read half of the `pin_root` write half stamped above.  Leaving
-/// it out publishes a root through the opaque slot and reads it back as a
-/// W_Root instance, re-creating on the read side exactly the StringRepr-meets-
-/// InstanceRepr union the write-side stamp exists to remove.  `get` is the
-/// only such leaf in `gc_roots`, so the match stays unambiguous.
-///
-/// `reload_top_root` answers the same kind of slot for the top entry, so it
-/// carries the stamp for the same reason.
-pub(in crate::front::mir) fn gc_root_gcref_result_path(name: &str) -> bool {
-    let segments: Vec<&str> = name.split("::").collect();
-    segments.contains(&"gc_roots")
-        && matches!(
-            segments.last(),
-            Some(&"pin_root")
-                | Some(&"shadow_stack_get")
-                | Some(&"get")
-                | Some(&"reload_top_root")
-                | Some(&"reload_top_root_at")
-        )
-}
-
 /// The scalar `TypedItemsBlock` accessor, kept separate from the object-array
 /// pair because its consumers must emit `GcArray(Signed|Float)` operations,
 /// never reference-array operations.

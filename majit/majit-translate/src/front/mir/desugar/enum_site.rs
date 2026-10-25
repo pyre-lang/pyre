@@ -377,48 +377,46 @@ impl<'a> Lowering<'a> {
         {
             return Some((root.clone(), ValueType::Ref(Some(root))));
         }
-        // `None` of a maybe-null `W_Root` is RPython's `None`, which unions
-        // into `SomeInstance(W_Root, can_be_none=True)` and keeps the class
-        // (`model.py` `unionof`).  The bare `null_mut()` is classdef-less, so
-        // a `return None` beside a `Some(w)` widened the whole return to the
-        // classdef-less top and carried it into every container the value
-        // reached.  Narrow the null to the `PyObject` pointee the payload
-        // (`NonNull<PyObject>`, `*mut PyObject`, `&PyObject`) names.
-        let pointee = rendered
-            .trim_end_matches('>')
-            .rsplit(['<', ' ', '&'])
-            .next()
-            .unwrap_or_default();
-        if pointee == "PyObject" || pointee.ends_with("::PyObject") {
-            return Some((W_ROOT_CLASS_ROOT.to_string(), ValueType::Ref(None)));
+        // `None` of a nullable instance is RPython's `None`, which unions
+        // into `SomeInstance(T, can_be_none=True)` and keeps the class
+        // (`model.py` `unionof`). The bare `null_mut()` is classdef-less.
+        // Narrow the null to the payload class (`rnone.py`
+        // `pairtype(NoneRepr, Repr).convert_from_to`).
+        if let Some(root) = self.option_payload_instance_class_root(option_ty) {
+            return Some((root.clone(), ValueType::Ref(Some(root))));
         }
         None
     }
 
-    /// `__pos_0` of an enum whose payload is a nullable `PyObject` pointer
-    /// (`Result<Option<*mut PyObject>, _>::Ok`, or `Result<*mut PyObject, _>`).
+    /// `__pos_0` of an enum whose payload is a nullable instance pointer
+    /// (`Result<Option<*mut T>, _>::Ok`, or `Result<*mut T, _>`).
     ///
     /// The niche `Option` is the pointer itself (`option_niche_null_cast`).
     /// A bare field read annotates as a classdef-less instance, and
-    /// `unionof` with the already-narrowed `PY_NULL` arm then drops the
-    /// `PyObject` class. The read wants the same
-    /// `__cast_instance_intrinsic` narrow onto [`W_ROOT_CLASS_ROOT`].
+    /// `unionof` with the already-narrowed null arm then drops the class.
+    /// The read wants the same `__cast_instance_intrinsic` narrow.
     pub(in crate::front::mir) fn enum_payload_is_nullable_instance_ptr(
         &self,
         place_ty: &TyRef,
     ) -> bool {
         if self
             .option_niche_null_cast(place_ty)
-            .is_some_and(|(root, _)| root == W_ROOT_CLASS_ROOT)
+            .is_some_and(|(root, ty)| {
+                matches!(ty, ValueType::Ref(Some(_)))
+                    && !root.starts_with("Vec<")
+                    && !root.starts_with("VecDeque<")
+            })
         {
             return true;
         }
-        tyref_node(place_ty, self.llbc)
-            .and_then(|node| strip_ty_wrappers(node, self.llbc))
-            .and_then(|node| {
-                raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
-            })
-            .is_some_and(|root| root == W_ROOT_CLASS_ROOT)
+        registered_gc_ptr_class_root_with(
+            place_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_some()
     }
 
     /// Resolve a destination `Option` into its `(option_owner, some_owner,

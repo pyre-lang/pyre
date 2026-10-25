@@ -2735,6 +2735,19 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     if let Some(root) = tyref_payload_enum_class_root_with(ty, llbc, tombstoned) {
         return ValueType::Ref(Some(root));
     }
+    // A `RawPtr` / `Ref` of a registered GC struct is `SomeInstance` of
+    // that classdef (`rclass.py` `getinstancerepr`). `ty_is_raw_address`
+    // already returned Int for a declared-Raw / primitive address. A
+    // class-root-less GC word (`GCREFOpaque`, `*mut u8`) stays `Ref(None)`.
+    if let Some(root) = registered_gc_ptr_class_root_with(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return ValueType::Ref(Some(root));
+    }
     ValueType::Ref(None)
 }
 
@@ -3986,9 +3999,6 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     // would name the payload's bank for a value that arrives as a
     // reference — the same disagreement in the other direction.
     //
-    // The `OBJECTPTR` carve-out below deliberately keeps reading the
-    // declared `output`: it decides the pointer's lowering, not its bank,
-    // and a `Result`-typed output has never taken it.
     let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
     } else {
@@ -4054,13 +4064,6 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
         ValueType::UInt128 => "u128",
         ValueType::Float => "f64",
         ValueType::SingleFloat => "f32",
-        // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
-        // caller reading the returned object's fields rtypes against the real
-        // struct; the generic `GCREF` `ref` token would erase that and stub
-        // the opaque callee with the wrong low-level pointer.
-        ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
-            return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
-        }
         // An rstr `STR` result is the `SomeString` its body produces, not
         // the classdef-less instance behind `ref`.
         ValueType::Str => crate::translator::rtyper::cutover::STR_RETURN_TYPE,
@@ -4101,6 +4104,8 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
@@ -4108,6 +4113,15 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
         None
     };
     let ty = payload.as_ref().unwrap_or(output);
+    if let Some(root) = registered_gc_ptr_class_root_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        return Some(root);
+    }
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
@@ -4131,6 +4145,31 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     }
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     Some(format!("{}{suffix}", td.item_meta.name_path()))
+}
+
+/// A residual returning `*mut` / `Ref` of a registered GC struct is a
+/// nullable instance (`rnone.py` `can_be_None`). A by-value ADT is not.
+pub(in crate::front::mir) fn dont_look_inside_return_can_be_none(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
+        crate::front::result_exc::tyref_result_ok(output, llbc)
+    } else {
+        None
+    };
+    let ty = payload.as_ref().unwrap_or(output);
+    registered_gc_ptr_class_root_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
 }
 
 /// Field-layout spelling of a `*mut Vec<T>` / `*mut VecDeque<T>` / `*mut [T]`
@@ -4456,6 +4495,15 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     // seeds `Ref(Some(root))` so the FORCE-attr / call-result narrow
     // intern the enum base instead of the classdef-less `Ref(None)` shell.
     if let Some(root) = tyref_payload_enum_class_root_with(ty, llbc, tombstoned) {
+        return ValueType::Ref(Some(root));
+    }
+    if let Some(root) = registered_gc_ptr_class_root_with(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return ValueType::Ref(Some(root));
     }
     // A raw `*u8` / `CCHARP` field stays `Ref(None)` here so FORCE is
@@ -5792,6 +5840,21 @@ pub(in crate::front::mir) fn tyref_transparent_inner_value_type(
             } else {
                 return None;
             };
+            // A transparent GC handle wrapping `*mut registered` keeps
+            // the wrapper class (`transparent_deref_target_class` above,
+            // or `Ref(None)` plus the Input class_root). Peeling the
+            // inner pointer would intern the handle as the payload.
+            if registered_gc_ptr_class_root_with(
+                &field.ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+            .is_some()
+            {
+                return None;
+            }
             Some(tyref_to_value_type_with(
                 &field.ty,
                 llbc,
@@ -6344,6 +6407,50 @@ pub(in crate::front::mir) fn split_struct_instantiation_suffix(
         return None;
     }
     Some(format!("<{}>", type_args.join(",")))
+}
+
+/// Class root of a `RawPtr` / `Ref` (one pointer word) whose pointee is
+/// a registered GC struct. `None` when `ty_is_raw_address` (declared-Raw
+/// / primitive address), the node is a flavor-raw identity pointer
+/// (`flavor_raw_pointer_class_root`: residual `raw:<owner>`, Signed
+/// getkind, `SomePtr`), the node is not a pointer (a by-value
+/// transparent handle keeps its own class), the pointee is a Raw
+/// struct (`&mut S` stays `Ref(None)` with `class_root` on the Input),
+/// or the pointee has no class root (`GCREFOpaque`, `*mut u8`). The
+/// spelling is the same `adt_node_class_root_with` produces
+/// (`"pyobject::PyObject"`), which `Bookkeeper::project_struct_field_type` /
+/// `lltype_for_named_ref` resolve to the classdef.
+pub(in crate::front::mir) fn registered_gc_ptr_class_root_with(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+        return None;
+    }
+    // Identity `*mut T` / `&T` / `Box` / `NonNull` of a harvested
+    // `_alloc_flavor_ = raw` ADT stays a front `Ref` so `crosses_raw_ref`
+    // does not emit `cast_ptr_to_int`. `ty_is_raw_address` therefore does
+    // not cover it (only Arc/Rc of flavor-raw). Residual FUNC.RESULT is
+    // `raw:<owner>` (`history.getkind` of a raw `Ptr` is int); it is never
+    // an rclass instance.
+    if flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs).is_some() {
+        return None;
+    }
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let node = type_node_peel_aliases(node, llbc)?;
+    if let Some(root) = raw_ptr_pointee_class_root_with(node, llbc, tombstoned) {
+        return Some(root);
+    }
+    let pointee = one_level_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_wrappers(pointee, llbc)?;
+    let sid = declared_adt_struct_id(pointee, llbc)?;
+    if !gc_struct_ids.contains(&sid) {
+        return None;
+    }
+    adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
 /// The pointee's monomorphic-ADT class root of an (already

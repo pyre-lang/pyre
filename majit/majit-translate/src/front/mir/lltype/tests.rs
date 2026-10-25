@@ -7714,8 +7714,8 @@ fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
     assert_eq!(signature.argnames.len(), 1);
     assert_eq!(
         token.as_deref(),
-        Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE),
-        "the declared PyObjectRef return keeps its typed object-pointer shell"
+        Some("ref"),
+        "a residual *mut registered-GC-struct return is the ref token; the class root is on the graph"
     );
 }
 
@@ -7786,7 +7786,7 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
     assert_eq!(signature.argnames.len(), 1);
     assert!(
         crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_some(),
-        "Option<PyObjectRef> residual must shell as one nullable GCREF word"
+        "Option<PyObjectRef> residual must shell as one nullable ref word"
     );
 }
 

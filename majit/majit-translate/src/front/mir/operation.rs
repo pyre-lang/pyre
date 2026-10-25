@@ -1460,10 +1460,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Re-express a GC-reference value at a statically-known RPython
-    /// instance boundary.  Rust raw pointers erase the pointee in
-    /// [`ValueType::Ref(None)`], while the corresponding RPython value keeps
-    /// its `SomeInstance(classdef)` (for example `PyObjectRef` is W_Root).
-    /// The marker is a same-bank identity and rtypes to `cast_opaque_ptr`.
+    /// instance boundary.  A `RawPtr` of a registered GC struct is
+    /// already `Ref(Some(root))` from [`tyref_to_value_type_with`];
+    /// this recast is a genuine downcast (or a GCREF word narrowed
+    /// onto a classdef).  The marker is a same-bank identity and rtypes
+    /// to `cast_opaque_ptr`.
     pub(in crate::front::mir) fn narrow_value_to_instance_root(
         &mut self,
         bb_id: BlockId,
@@ -3848,23 +3849,20 @@ impl<'a> Lowering<'a> {
             return None;
         }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
-            let result_owner = self
-                .cast_dest_layout_owner(dest_ty)
-                .filter(|owner| {
-                    !root.contains("::")
-                        && !root.contains('<')
-                        && owner.rsplit("::").next() == Some(root.as_str())
-                })
-                .unwrap_or_else(|| root.clone());
-            return Some(if result_owner == root {
-                crate::model::cast_instance_call(root, arg.clone())
-            } else {
-                crate::model::cast_instance_call_result(
-                    root,
-                    arg.clone(),
-                    ValueType::Ref(Some(result_owner)),
-                )
-            });
+            // ByteStr is the intern leaf (`Function`, `PyObject`):
+            // `bookkeeper.py` `getuniqueclassdef`, `stamp_named_ref_call_dests`.
+            // `result_ty` is the crate-relative layout owner when that path
+            // is longer (`function::Function`): `cast_instance_layout_owner`
+            // / `registered_struct_layout` (`heaptracker.py` `all_fielddescrs`).
+            let result_ty = match self.cast_dest_layout_owner(dest_ty) {
+                Some(owner) if owner != root => ValueType::Ref(Some(owner)),
+                _ => ValueType::Ref(Some(root.clone())),
+            };
+            return Some(crate::model::cast_instance_call_result(
+                root,
+                arg.clone(),
+                result_ty,
+            ));
         }
         if src_root.is_some_and(crate::annotator::bookkeeper::is_gcref_type_spelling) {
             let node = strip_ty_wrappers(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
@@ -3875,26 +3873,20 @@ impl<'a> Lowering<'a> {
         None
     }
 
-    /// Declaration path of `dest_ty`'s struct, reduced the way a
-    /// constructor owner is. `None` when the pointee is not a struct.
+    /// Crate-relative layout owner of `dest_ty` (`crate_relative_struct_owner`).
+    /// The intern leaf stays on the CAST ByteStr; this spelling is `result_ty`.
     pub(in crate::front::mir) fn cast_dest_layout_owner(&self, dest_ty: &TyRef) -> Option<String> {
-        let node = strip_ty_wrappers(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
-        let pointee = node
-            .as_object()
-            .and_then(|obj| obj.get("RawPtr"))
-            .and_then(|raw| raw.as_array())
-            .and_then(|raw| raw.first())
-            .and_then(|pointee| strip_ty_wrappers(pointee, self.llbc))
+        let node = strip_ty_indirections(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
+        let pointee = one_level_pointer_pointee(node, self.llbc)
+            .and_then(|p| strip_ty_indirections(p, self.llbc))
             .unwrap_or(node);
         let id = adt_node_def_id(pointee)?;
         let decl = self.llbc.type_by_id(id)?;
-        if !matches!(decl.kind, TypeDeclKind::Struct(_)) {
-            return None;
-        }
-        Some(crate::model::crate_relative_struct_owner(
+        let owner = crate::model::crate_relative_struct_owner(
             &decl.item_meta.name_path(),
             self.graph.name.split("::").next(),
-        ))
+        );
+        (!owner.is_empty()).then_some(owner)
     }
 
     /// Dest PTRTYPE for a raw overlay struct (`*const MapNodeAbstractAttribute`
@@ -5533,17 +5525,13 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok(self.emit_unit(self.emit_bb(mir_bb)));
                     }
-                    // Narrow a classdef-less raw-pointer-deref base to
+                    // Narrow a raw-pointer-deref base to
                     // `SomeInstance(<pointee root>)` before the field read.
-                    // A `(*p).field` where `p: *mut/*const <Struct>` deref's to
-                    // a value whose pointee class root `tyref_to_value_type`
-                    // erases to `Ref(None)`; when such a value arrives as a
-                    // callee-propagated argument (a non-parameter `PyObjectRef`
-                    // bound through `recursivecall`), the downstream getattr
-                    // blocks the annotator on a classdef-less instance. The
-                    // field's declaring struct is authoritative, so this is a
-                    // sound downcast — identity when the base already carries
-                    // the class — the same `__cast_instance_intrinsic` narrow the
+                    // A `(*p).field` where `p: *mut/*const <Struct>` now
+                    // carries `Ref(Some(pointee))` from `tyref_to_value_type`.
+                    // Recast only a genuine downcast; identity when the base
+                    // already names that class — the same
+                    // `__cast_instance_intrinsic` narrow the
                     // ptr-identity-cast arm applies before its own field reads.
                     let narrow_root: Option<String> = match &inner.kind {
                         PlaceKind::Projection(pre, ProjectionElem::Atom(s)) if s == "Deref" => {

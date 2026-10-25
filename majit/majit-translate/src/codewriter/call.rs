@@ -2304,6 +2304,8 @@ impl From<std::rc::Rc<FunctionGraph>> for GraphSource {
 #[derive(Clone, Debug, Default)]
 pub struct GraphTransform {
     pub return_type: Option<String>,
+    pub return_class_root: Option<String>,
+    pub return_can_be_none: bool,
     pub hints: Vec<String>,
 }
 
@@ -2311,6 +2313,12 @@ impl GraphTransform {
     fn apply(&self, graph: &mut FunctionGraph) {
         if let Some(rt) = &self.return_type {
             graph.return_type = Some(rt.clone());
+        }
+        if let Some(root) = &self.return_class_root {
+            graph.return_class_root = Some(root.clone());
+        }
+        if self.return_can_be_none {
+            graph.return_can_be_none = true;
         }
         crate::front::llbc_hints::merge_hints_into_graph(graph, &self.hints);
     }
@@ -2323,6 +2331,8 @@ struct FuncObjAttrs {
     func: crate::model::FuncEffects,
     hints: Vec<String>,
     return_type: Option<String>,
+    return_class_root: Option<String>,
+    return_can_be_none: bool,
 }
 
 /// A `func` attribute a decorator sets (`rlib/jit.py` `@elidable`,
@@ -2482,6 +2492,12 @@ impl FuncObjAttrs {
         if graph.return_type.is_none() {
             graph.return_type = self.return_type.clone();
         }
+        if graph.return_class_root.is_none() {
+            graph.return_class_root = self.return_class_root.clone();
+        }
+        if self.return_can_be_none {
+            graph.return_can_be_none = true;
+        }
     }
 }
 
@@ -2603,6 +2619,12 @@ impl<'a> AttrsMut<'a> {
                 if attrs.return_type.is_none() {
                     attrs.return_type = other.return_type.clone();
                 }
+                if attrs.return_class_root.is_none() {
+                    attrs.return_class_root = other.return_class_root.clone();
+                }
+                if other.return_can_be_none {
+                    attrs.return_can_be_none = true;
+                }
             }
         }
     }
@@ -2684,6 +2706,8 @@ impl StoreCore {
                     );
                     attrs.hints.splice(0..0, transform.hints);
                     attrs.return_type = transform.return_type;
+                    attrs.return_class_root = transform.return_class_root;
+                    attrs.return_can_be_none = transform.return_can_be_none;
                     std::rc::Rc::make_mut(slot).attrs_mut().fold(&attrs);
                 }
             }
@@ -2855,6 +2879,12 @@ impl StoreCore {
                 if existing.return_type.is_none() {
                     existing.return_type = graph.return_type.clone();
                 }
+                if existing.return_class_root.is_none() {
+                    existing.return_class_root = graph.return_class_root.clone();
+                }
+                if graph.return_can_be_none {
+                    existing.return_can_be_none = true;
+                }
                 if existing.fun_decl_id.is_none() {
                     existing.fun_decl_id = graph.fun_decl_id;
                 }
@@ -2906,6 +2936,8 @@ impl StoreCore {
                     func: func.unwrap_or_default(),
                     hints: transform.hints,
                     return_type: transform.return_type,
+                    return_class_root: transform.return_class_root,
+                    return_can_be_none: transform.return_can_be_none,
                 };
                 slot.attrs_mut().fold(&attrs);
             }
@@ -22209,6 +22241,7 @@ mod tests {
                 transform: GraphTransform {
                     return_type: Some("i64".to_string()),
                     hints: hints.clone(),
+                    ..Default::default()
                 },
             },
             hints.clone(),
@@ -22242,6 +22275,7 @@ mod tests {
                 transform: GraphTransform {
                     return_type: Some("i64".to_string()),
                     hints: hints.clone(),
+                    ..Default::default()
                 },
             },
             hints,
@@ -25265,6 +25299,7 @@ mod tests {
                 transform: GraphTransform {
                     return_type: Some("i64".to_string()),
                     hints: Vec::new(),
+                    ..Default::default()
                 },
             },
         );

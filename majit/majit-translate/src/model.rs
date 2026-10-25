@@ -8229,12 +8229,17 @@ pub struct FunctionGraph {
     /// free-function, trait-method, and inherent-method registration).
     pub return_type: Option<String>,
     /// Class key of the declared return value when it is a by-value ADT
-    /// (`core::option::Option<PyError>`, a named struct) — the
-    /// `SomeInstance` result a `_signature_` would declare.  `return_type`
-    /// only carries the residual-call register kind (`ref`), so a
-    /// `dont_look_inside` stub reads the class from here.  `None` for
-    /// scalar, pointer and unit returns.
+    /// (`core::option::Option<PyError>`, a named struct) or a pointer to a
+    /// registered GC struct — the `SomeInstance` result a `_signature_`
+    /// would declare.  `return_type` only carries the residual-call
+    /// register kind (`ref`), so a `dont_look_inside` stub reads the class
+    /// from here.  `None` for scalar, class-root-less pointer and unit
+    /// returns.
     pub return_class_root: Option<String>,
+    /// The declared return is a raw pointer / `Ref` of a registered GC
+    /// struct, so `SomeInstance.can_be_None` is true (`rnone.py`). False
+    /// for a by-value ADT.
+    pub return_can_be_none: bool,
     /// The declared return is a pointer to the low-level `STR` storage
     /// (`*mut Utf8Str` / rstr `rpy_string`) — the `SomeString` result a
     /// `_signature_` (`returns=types.str()`) would declare.  `return_type`
@@ -8415,6 +8420,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         notes: graph.notes.clone(),
         return_type: graph.return_type.clone(),
         return_class_root: graph.return_class_root.clone(),
+        return_can_be_none: graph.return_can_be_none,
         return_is_str: graph.return_is_str,
         return_container_root: graph.return_container_root.clone(),
         residual_return_type: graph.residual_return_type.clone(),
@@ -8463,6 +8469,20 @@ impl NicheIntNull {
             }
             Self::RawAddress(root) => graph.push_null_raw_ptr_with_spelling(block, root.as_deref()),
         }
+    }
+}
+
+/// `x is None` on a pointer repr is `ptr_iszero` (`rnone.py` `rtype_is_None`):
+/// the operand is `Constant(None)`, not a typed null. A string / list / u8
+/// window still needs `convert_const(None)` on that repr (`push_niche_null`).
+pub(crate) fn niche_is_none_uses_const_none(cast: Option<&(String, ValueType)>) -> bool {
+    match cast {
+        None => true,
+        Some((_, ValueType::Str | ValueType::Int)) => false,
+        Some((root, ValueType::Ref(_))) => {
+            !root.starts_with("Vec<") && !root.starts_with("VecDeque<")
+        }
+        Some(_) => false,
     }
 }
 
@@ -8537,6 +8557,7 @@ impl FunctionGraph {
             notes: Vec::new(),
             return_type: None,
             return_class_root: None,
+            return_can_be_none: false,
             return_is_str: false,
             return_container_root: None,
             residual_return_type: None,
@@ -8750,6 +8771,18 @@ impl FunctionGraph {
         res
     }
 
+    /// `Constant(None)` (`rmodel.py` `pairtype(Repr, VoidRepr)`). jtransform
+    /// erases the definition and folds `is_` to `ptr_iszero`
+    /// (`rnone.py` `rtype_is_None`).
+    pub fn push_const_none(&mut self, block: BlockId) -> crate::flowspace::model::Variable {
+        let res = self.alloc_value_var_with_type(ConcreteType::Void);
+        self.block_mut(block).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::ConstNone,
+        });
+        res
+    }
+
     /// One repr-adaptive source for every niche-Option null.
     ///
     /// Emits `core::ptr::null_mut()`, then, when `cast` is set, narrows that
@@ -8777,8 +8810,9 @@ impl FunctionGraph {
     /// be value inequality on a `StringRepr` / `ListRepr` payload
     /// (`rstr.py` / `rlist.py` `rtype_ne`), not a null test.  `int_null` is
     /// the int-bank null (`rnone.py` `rtype_is_None`; `null_fn` for
-    /// `Option<fn>`, `null_raw` for a raw-address niche). Every other niche
-    /// uses [`Self::push_niche_null`].
+    /// `Option<fn>`, `null_raw` for a raw-address niche). An instance-pointer
+    /// niche uses [`Self::push_const_none`] (`rtype_is_None` → `ptr_iszero`).
+    /// String / list / window niches use [`Self::push_niche_null`].
     pub fn push_niche_is_some(
         &mut self,
         block: BlockId,
@@ -8789,6 +8823,7 @@ impl FunctionGraph {
     ) {
         let nullc = match int_null {
             Some(int_null) => int_null.push(self, block),
+            None if niche_is_none_uses_const_none(cast) => self.push_const_none(block),
             None => self.push_niche_null(block, cast),
         };
         let is_none = self.alloc_value_var();

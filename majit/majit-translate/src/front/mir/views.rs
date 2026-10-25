@@ -829,6 +829,12 @@ impl<'a> Lowering<'a> {
                 let root = root.clone();
                 return self.cast_ref_word(mir_bb, value, &root);
             }
+            (ValueType::Ref(Some(from_root)), ValueType::Ref(Some(to_root)))
+                if from_root != to_root =>
+            {
+                let root = to_root.clone();
+                return self.cast_ref_word(mir_bb, value, &root);
+            }
             _ => return value,
         };
         self.emit_path_call(mir_bb, path, vec![value], to.clone())
@@ -843,9 +849,16 @@ impl<'a> Lowering<'a> {
         ty: &TyRef,
     ) -> ValueType {
         match item_ty {
-            ValueType::Ref(None) => {
-                ValueType::Ref(tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves))
-            }
+            ValueType::Ref(None) => ValueType::Ref(
+                registered_gc_ptr_class_root_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .or_else(|| tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)),
+            ),
             other => other,
         }
     }

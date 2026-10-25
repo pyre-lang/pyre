@@ -70,20 +70,10 @@ use crate::translator::rtyper::flowspace_adapter::{
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::translator::TranslationContext;
 
-/// The `graph.return_type` marker the front-end stamps on a
-/// `dont_look_inside` callee that returns `*mut PyObject` (a
-/// `PyObjectRef`).  `front::mir::output_type_is_objectptr` gates the
-/// stamp (`front::mir` `SemanticFunctionHeader::new`), so this string only ever
-/// labels a genuine object-pointer return; the residual prefill maps it
-/// to `OBJECTPTR` so the residualized constructor reports a `Ref` result
-/// rather than the `None`→`Void` default.  The literal doubles as the
-/// readable Rust return type.
-pub(crate) const OBJECTPTR_RETURN_TYPE: &str = "*mut PyObject";
-
 /// Residual FUNC.RESULT token for the opaque root-stack word used by
-/// RPython's GC transformer.  It is ref-kind like OBJECTPTR but retains the
-/// `Ptr(GcOpaque("GCREF"))` low-level identity required for
-/// `cast_opaque_ptr` back to StringRepr / InstanceRepr.
+/// RPython's GC transformer.  It is ref-kind like a classdef-less
+/// `ref` but retains the `Ptr(GcOpaque("GCREF"))` low-level identity
+/// required for `cast_opaque_ptr` back to StringRepr / InstanceRepr.
 pub(crate) const GCREF_RETURN_TYPE: &str = "gcref";
 
 /// Residual FUNC.RESULT token for an rstr `STR` result (`ValueType::Str`):
@@ -2364,15 +2354,28 @@ fn install_source_graph(
             .as_deref()
             .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
             .unwrap_or_else(|| key.clone());
-        let result_shell = raw_ptr_token_annotation(registry, graph.return_type.as_deref())
-            .or_else(|| {
-                residual_stub_result_shell(
-                    &semantic_key,
-                    graph.return_type.as_deref(),
-                    Some(registry.bookkeeper()),
-                )
-            })
-            .map(|shell| declared_return_annotation(registry, graph).unwrap_or(shell));
+        // Exception materialisers keep their `_signature_` instance
+        // (`residual_stub_result_shell`). Every other residual prefers
+        // `declared_return_annotation` when the graph carries a class
+        // root (`rlib/signature.py` `returns=types.instance(...)`), so
+        // a `ref` token with `return_class_root` is `SomeInstance`
+        // of that classdef rather than the classdef-less shell.
+        let result_shell = if is_exception_object_materializer(&semantic_key) {
+            residual_stub_result_shell(
+                &semantic_key,
+                graph.return_type.as_deref(),
+                Some(registry.bookkeeper()),
+            )
+        } else {
+            raw_ptr_token_annotation(registry, graph.return_type.as_deref())
+                .or_else(|| declared_return_annotation(registry, graph))
+                .or_else(|| {
+                    residual_return_annotation(
+                        graph.return_type.as_deref(),
+                        Some(registry.bookkeeper()),
+                    )
+                })
+        };
         if let Some(result_shell) = result_shell {
             let stub = build_stub_pygraph_with_result_shell(
                 graph.name.clone(),
@@ -3163,13 +3166,15 @@ pub(crate) fn default_someshell_for_lltype(
 /// lltype (`getkind` equals the legacy walker's
 /// `valuetype_to_concrete(result_ty)`).
 ///
-/// The `ref` token (a non-`*mut PyObject` heap result — e.g. a `*mut BigInt`,
-/// or the one-word success payload of a `Result<_, PyError>`) carries a
-/// classdef-less `SomeInstance` shell (`valuetype_to_someshell(Ref(None))`),
-/// NOT a `SomePtr(GCREF)`.  A residual result is an annotation-stage value;
-/// the annotation-stage projection of every `Ref` is the classdef-less
-/// `SomeInstance` (`annotation_state.rs` doc-table), with `SomePtr` reserved
-/// for a producer writing `Variable.annotation` at the rtyper stage.
+/// The `ref` token (a heap result — e.g. a `*mut BigInt`, a
+/// `*mut` registered GC struct whose class root is on the graph, or
+/// the one-word success payload of a `Result<_, PyError>`) carries a
+/// classdef-less `SomeInstance` shell (`valuetype_to_someshell(Ref(None))`)
+/// when this helper is consulted alone.  A residual result is an
+/// annotation-stage value; the annotation-stage projection of every
+/// unnamed `Ref` is the classdef-less `SomeInstance`
+/// (`annotation_state.rs` doc-table), with `SomePtr` reserved for a
+/// producer writing `Variable.annotation` at the rtyper stage.
 /// Emitting a `SomePtr(GCREF)` here made the result collide with the
 /// `SomeInstance(None)` an ordinary `Ref` merge partner carries (`_ptr ∪
 /// <other>` UnionError in `mergeinputargs`, the union has no `SomePtr ∪
@@ -3178,23 +3183,14 @@ pub(crate) fn default_someshell_for_lltype(
 /// [`register_foreign_opaque_method_externals`] path already gives a
 /// `BigInt`-returning method residual.  Both spellings rtype to `getkind =
 /// GcRef`, so the emitted `residual_call_*_r` opcode and C ABI are
-/// byte-identical.
+/// byte-identical.  A graph with `return_class_root` uses
+/// [`declared_return_annotation`] instead of this classdef-less shell.
 ///
 /// The `str` token (`STR_RETURN_TYPE`) is an rstr `STR` result — `ll_int2dec`,
 /// a `W_UnicodeObject._utf8` accessor — and carries the `SomeString` shell
 /// (`valuetype_to_someshell(Str)`), the annotation the callee body produces.
 /// Projected through `ref`, it met the `SomeString` of a `StringBuilder.build()`
 /// at the same `space.newutf8` argument as a `String ∪ Instance` UnionError.
-///
-/// The object-pointer marker (`OBJECTPTR_RETURN_TYPE`) is a `*mut PyObject` /
-/// `PyObjectRef` result. Annotation-stage that is `SomeInstance` of the
-/// PyObject classdef (`signature.py` `annotationoftype` of a user class,
-/// `bookkeeper.py` `getuniqueclassdef`; `extfunc.py` `register_external`
-/// takes a declared `SomeInstance` result). `llannotation.py`
-/// `lltype_to_annotation(OBJECTPTR)` is the rtyper-stage `SomePtr`; using it
-/// here made `mergeinputargs` raise `Instance(PyObject) ∪ Ptr(object)`
-/// against a tuple-field `PyObjectRef`. [`return_token_to_lltype`] still
-/// maps the token to `OBJECTPTR` for `FuncType.RESULT`.
 ///
 /// `i128` / `u128` are deliberately declined: they have no `getkind` at the
 /// codewriter boundary (`history.getkind` rejects `SignedLongLongLong`, 16
@@ -3232,12 +3228,10 @@ fn residual_return_annotation(
             &crate::model::ValueType::Str,
         );
     }
-    if token == Some(OBJECTPTR_RETURN_TYPE) {
-        return Some(object_pointer_annotation(bookkeeper));
-    }
     // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).
     // Each item is the residual token `dont_look_inside_return_token`
-    // stamps for that element (`Tuple<*mut PyObject,*mut PyObject>`).
+    // stamps for that element (`Tuple<ref,ref>`). This helper has no
+    // bookkeeper, so a `ref` item is the classdef-less `SomeInstance`.
     if let Some(inner) = token
         .and_then(|t| t.strip_prefix("Tuple<"))
         .and_then(|s| s.strip_suffix(">"))
@@ -3257,43 +3251,6 @@ fn residual_return_annotation(
         });
     }
     return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
-}
-
-/// Annotation-stage cell of a `*mut PyObject` / `PyObjectRef` residual.
-///
-/// `signature.py` `annotationoftype` of a user class is
-/// `SomeInstance(bookkeeper.getuniqueclassdef(t))`. The Input seed for the
-/// same pointee uses `getuniqueclassdef_for_struct_root` of that class
-/// root, so the residual intern must be that ClassDef — a classdef-less
-/// instance would widen it away, and `lltype_to_annotation(OBJECTPTR)` is
-/// `SomePtr` (`llannotation.py`), which has no union arm with
-/// `SomeInstance`.
-fn object_pointer_annotation(
-    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
-) -> crate::annotator::model::SomeValue {
-    if let Some(bk) = bookkeeper {
-        let root = OBJECTPTR_RETURN_TYPE
-            .strip_prefix("*mut ")
-            .unwrap_or("PyObject");
-        if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(root) {
-            return crate::annotator::model::SomeValue::Instance(
-                crate::annotator::model::SomeInstance::new(
-                    Some(classdef),
-                    false,
-                    std::collections::BTreeMap::new(),
-                ),
-            );
-        }
-        let projected = bk.project_struct_field_type("PyObjectRef");
-        if matches!(
-            &projected,
-            crate::annotator::model::SomeValue::Instance(inst) if inst.classdef.is_some()
-        ) {
-            return projected;
-        }
-    }
-    crate::codewriter::annotation_state::valuetype_to_someshell(&crate::model::ValueType::Ref(None))
-        .expect("Ref(None) shells to a definite SomeInstance")
 }
 
 /// Choose the annotation carried by a `dont_look_inside` stub's return link.
@@ -3321,9 +3278,11 @@ fn residual_stub_result_shell(
 /// a low-level `STR` pointer (`FunctionGraph::return_is_str`), `SomeList`
 /// for a pointer onto a Rust container (`FunctionGraph::return_container_root`,
 /// the `GcArray` a field of that type already projects), else
-/// `SomeInstance(classdef)` of a by-value ADT result
-/// (`FunctionGraph::return_class_root`), whose payload reads
-/// (`__discriminant`, `__pos_0`) the classdef-less shell cannot annotate.
+/// `SomeInstance(classdef)` of a by-value ADT result or of a
+/// pointer to a registered GC struct (`FunctionGraph::return_class_root`),
+/// whose payload reads (`__discriminant`, `__pos_0`) the classdef-less
+/// shell cannot annotate. A raw-pointer return is nullable
+/// (`FunctionGraph::return_can_be_none`).
 ///
 /// A one-word-item `Vec` residual is `SomeRustVec` (`project_rust_vec`).
 /// Its FUNC.RESULT token is `i64` (`history.getkind` of the raw header),
@@ -3371,7 +3330,7 @@ fn declared_return_annotation(
     Some(crate::annotator::model::SomeValue::Instance(
         crate::annotator::model::SomeInstance::new(
             Some(classdef),
-            false,
+            graph.return_can_be_none,
             std::collections::BTreeMap::new(),
         ),
     ))
@@ -3449,12 +3408,14 @@ fn raw_ptr_token_annotation(
 }
 
 /// Project a FUNC.RESULT token (the `return_type` string) to its
-/// `LowLevelType`.  `None`/`"()"` → `Void`; `"ref"` and the `*mut PyObject`
-/// token → `OBJECTPTR`; primitive tokens map directly; unrecognised → `None`
-/// (decline).  `i128`/`u128` have no token spelling here and so decline for
-/// the same `getkind`-at-the-codewriter reason [`residual_return_shell`]
-/// documents.  `raw:<owner>` admits as `Signed` (the pointer's `getkind`);
-/// the `SomePtr` shell is [`raw_ptr_token_annotation`].
+/// `LowLevelType`.  `None`/`"()"` → `Void`; `"ref"` → the classdef-less
+/// `OBJECTPTR` (the getkind-`r` shell; a named classdef is
+/// [`declared_return_annotation`]); primitive tokens map directly;
+/// unrecognised → `None` (decline).  `i128`/`u128` have no token spelling
+/// here and so decline for the same `getkind`-at-the-codewriter reason
+/// [`residual_return_shell`] documents.  `raw:<owner>` admits as `Signed`
+/// (the pointer's `getkind`); the `SomePtr` shell is
+/// [`raw_ptr_token_annotation`].
 fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
     match token {
         None | Some("()") => Some(LowLevelType::Void),
@@ -3473,9 +3434,6 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
         Some(s) if raw_owner_return_root(s).is_some() => Some(LowLevelType::Signed),
         Some("u64") => Some(LowLevelType::Unsigned),
         Some("f64") => Some(LowLevelType::Float),
-        Some(s) if s == OBJECTPTR_RETURN_TYPE => {
-            Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
-        }
         _ => None,
     }
 }
@@ -4678,6 +4636,7 @@ fn drive_lifted_subject(
             &mut value_to_var,
             &mut constant_hlvalues,
             &mut constant_concretetypes,
+            Some(&rtyper),
         );
     }
     Ok((
@@ -6131,9 +6090,46 @@ fn reconcile_elided_phi_inputargs(
     changed
 }
 
+/// `rclass.py getinstancerepr(rtyper, classdef)` `lowleveltype` for a
+/// named `Ref(Some(name))`.
+///
+/// `name` is resolved through `Bookkeeper::project_struct_field_type`
+/// so an alias (`PyObjectRef`, `*mut PyObject`, `NonNull<PyObject>`,
+/// `IdentityKey`) becomes the same `SomeInstance(classdef)` the
+/// struct-field projector already uses. A registered classdef is
+/// `getinstancerepr`; `Impossible` / a classdef-less instance is
+/// `llmemory.GCREF`, never `OBJECTPTR`. `getuniqueclassdef_for_struct_root`
+/// is not called on an unknown name (that would mint a shell).
+fn lltype_for_named_ref(
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+    name: &str,
+) -> LowLevelType {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+    use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+    use crate::translator::rtyper::rmodel::Repr;
+    let Some(rtyper) = rtyper else {
+        return GCREF.clone();
+    };
+    let Some(ann) = rtyper.annotator.upgrade() else {
+        return GCREF.clone();
+    };
+    let SomeValue::Instance(inst) = ann.bookkeeper.project_struct_field_type(name) else {
+        return GCREF.clone();
+    };
+    let Some(classdef) = inst.classdef.as_ref() else {
+        return GCREF.clone();
+    };
+    let repr = getinstancerepr(rtyper, Some(classdef), Flavor::Gc)
+        .unwrap_or_else(|e| panic!("lltype_for_named_ref: getinstancerepr({name}): {e}"));
+    Repr::setup(repr.as_ref())
+        .unwrap_or_else(|e| panic!("lltype_for_named_ref: InstanceRepr.setup({name}): {e}"));
+    repr.lowleveltype().clone()
+}
+
 /// Backfill the low-level type of a call-result Variable the real path
-/// left untyped, from the front-end `OpKind::Call { result_ty }` the
-/// call site declared.
+/// left untyped, the way `rtyper.py RPythonTyper.setconcretetype` does:
+/// `v.concretetype = self.bindingrepr(v).lowleveltype`.
 ///
 /// Charon does not monomorphize generics, so a call returning an erased
 /// associated type — `<E as SharedOpcodeHandler>::Value` for the
@@ -6147,9 +6143,15 @@ fn reconcile_elided_phi_inputargs(
 /// `legacy_resolve::infer_concrete_from_op` (`OpKind::Call { result_ty }
 /// => valuetype_to_concrete(result_ty)`), plus its final GcRef backfill.
 ///
-/// Mirror that single rule into the real path so the two converge: for a
-/// call result whose declared `result_ty` projects to `GcRef`, stamp the
-/// canonical `GCREF` pointer onto the twin.
+/// A twin with an annotator binding is typed through
+/// `RPythonTyper.setconcretetype` (`bindingrepr` → `getrepr` →
+/// `SomeInstance.rtyper_makerepr` → `getinstancerepr`). Only a
+/// variable with **no** binding may use the front-end `result_ty`:
+/// - `Ref(Some(name))`: `project_struct_field_type(name)` then
+///   `getinstancerepr` when that is `SomeInstance(classdef)`. An alias
+///   (`PyObjectRef`) resolves to the same classdef as the pointee.
+///   No classdef → `llmemory.GCREF`, never `OBJECTPTR`.
+/// - `Ref(None)` is `llmemory.GCREF` (`Ptr(Opaque)`).
 ///
 /// One equally erased scalar shape is admitted, but only at the producer
 /// which proves it: `front::option_closure_select` replaces
@@ -6180,8 +6182,11 @@ fn reconcile_elided_phi_inputargs(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTyped) {
-    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+fn backfill_untyped_call_results(
+    legacy: &LegacyGraph,
+    value_to_var: &LegacyToTyped,
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+) {
     for block in &legacy.blocks {
         for op in &block.operations {
             let crate::model::OpKind::Call {
@@ -6190,6 +6195,37 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
             else {
                 continue;
             };
+            let Some(legacy_result) = &op.result else {
+                continue;
+            };
+            let Some(typed) = value_to_var.get(legacy_result) else {
+                continue;
+            };
+            let twin_kind = typed
+                .concretetype()
+                .map(|lltype| lowleveltype_to_concrete(&lltype).unwrap_or(ConcreteType::Unknown));
+            if !matches!(twin_kind, None | Some(ConcreteType::Void)) {
+                continue;
+            }
+            if let Some(rtyper) = rtyper
+                && typed.annotation.borrow().is_some()
+            {
+                rtyper.setconcretetype(typed).unwrap_or_else(|e| {
+                    panic!("backfill_untyped_call_results: setconcretetype: {e}")
+                });
+                match rtyper.bindingrepr(&Hlvalue::Variable(typed.clone())) {
+                    Ok(repr) => {
+                        crate::translator::rtyper::rmodel::Repr::setup(repr.as_ref())
+                            .unwrap_or_else(|e| {
+                                panic!("backfill_untyped_call_results: Repr::setup: {e}")
+                            });
+                    }
+                    Err(e) => {
+                        panic!("backfill_untyped_call_results: bindingrepr: {e}")
+                    }
+                }
+                continue;
+            }
             let declared_kind = valuetype_to_concrete(result_ty);
             let closure_scalar_call = matches!(
                 target,
@@ -6202,28 +6238,84 @@ fn backfill_untyped_call_results(legacy: &LegacyGraph, value_to_var: &LegacyToTy
                         majit_charon_reader::ullbc::is_closure_leaf
                     )
             );
-            let declared_lltype = match declared_kind {
-                ConcreteType::GcRef => Some(GCREF.clone()),
-                ConcreteType::Signed | ConcreteType::Float if closure_scalar_call => {
-                    crate::model::concrete_to_canonical_lltype(declared_kind)
+            let declared_lltype = match result_ty {
+                crate::model::ValueType::Ref(Some(name)) if !name.is_empty() => {
+                    Some(lltype_for_named_ref(rtyper, name))
                 }
-                _ => None,
+                crate::model::ValueType::Ref(None) => {
+                    Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone())
+                }
+                crate::model::ValueType::Str | crate::model::ValueType::StringBuilder => {
+                    valuetype_to_lltype(result_ty)
+                }
+                _ => match declared_kind {
+                    ConcreteType::Signed | ConcreteType::Float if closure_scalar_call => {
+                        crate::model::concrete_to_canonical_lltype(declared_kind)
+                    }
+                    _ => None,
+                },
             };
             let Some(declared_lltype) = declared_lltype else {
                 continue;
             };
-            let Some(legacy_result) = &op.result else {
-                continue;
-            };
-            let Some(typed) = value_to_var.get(legacy_result) else {
-                continue;
-            };
-            let twin_kind = typed
-                .concretetype()
-                .map(|lltype| lowleveltype_to_concrete(&lltype).unwrap_or(ConcreteType::Unknown));
-            if matches!(twin_kind, None | Some(ConcreteType::Void)) {
-                typed.set_concretetype(Some(declared_lltype));
+            typed.set_concretetype(Some(declared_lltype));
+        }
+    }
+}
+
+/// Call / `same_as` dest whose front-end `result_ty` names a registered
+/// GC struct. Skip's `resolve_types` commits `GcRef` as
+/// `rclass.OBJECTPTR` (`concrete_to_canonical_lltype`); that is
+/// `getinstancerepr(None)`. `rtyper.py` `setconcretetype` uses
+/// `bindingrepr(v).lowleveltype`, and a named `SomeInstance` is
+/// `rclass.py` `getinstancerepr(classdef)`. The name is the Call dest's
+/// declared pointee, the same producer [`backfill_untyped_call_results`]
+/// reads when the dest is untyped.
+pub(crate) fn stamp_named_ref_call_dests(
+    graph: &LegacyGraph,
+    rtyper: &Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+) {
+    use crate::model::{OpKind, ValueType};
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+    use crate::translator::rtyper::rclass::OBJECTPTR;
+
+    fn named_ref(kind: &OpKind) -> Option<&str> {
+        if let Some(leaf) = crate::model::cast_instance_root(kind) {
+            if !leaf.is_empty() {
+                return Some(leaf);
             }
+        }
+        match kind {
+            OpKind::Call {
+                result_ty: ValueType::Ref(Some(name)),
+                ..
+            } if !name.is_empty() => Some(name.as_str()),
+            OpKind::UnaryOp {
+                op,
+                result_ty: ValueType::Ref(Some(name)),
+                ..
+            } if op == "same_as" && !name.is_empty() => Some(name.as_str()),
+            _ => None,
+        }
+    }
+
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(name) = named_ref(&op.kind) else {
+                continue;
+            };
+            let Some(dest) = &op.result else {
+                continue;
+            };
+            let ct = dest.concretetype();
+            if ct.as_ref().is_some_and(|ll| ll != &*OBJECTPTR) {
+                continue;
+            }
+            let lltype = lltype_for_named_ref(Some(rtyper), name);
+            if lltype == *GCREF {
+                continue;
+            }
+            dest.set_concretetype(Some(lltype));
         }
     }
 }
@@ -6241,8 +6333,9 @@ fn reconcile_projection_aliases(
     value_to_var: &mut LegacyToTyped,
     constants: &mut HashMap<Variable, Hlvalue>,
     constant_types: &mut HashMap<Variable, LowLevelType>,
+    rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
 ) {
-    backfill_untyped_call_results(legacy, value_to_var);
+    backfill_untyped_call_results(legacy, value_to_var, rtyper);
     loop {
         let hint_changed = reconcile_elided_hint_results(legacy, value_to_var);
         let phi_changed =
@@ -6358,11 +6451,13 @@ pub(crate) fn dual_gate_outcome_from_cache(
         };
     select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)
         .map_err(|e| e.to_string())?;
+    let rtyper = call_registry.session_if_started().map(|(_, rt)| rt);
     reconcile_projection_aliases(
         legacy,
         &mut value_to_var,
         &mut constant_values,
         &mut constants,
+        rtyper.as_ref(),
     );
 
     // Validate the cached lltypes project to concrete kinds (the Step-4 check
@@ -8034,7 +8129,7 @@ mod tests {
                     "handle_exception_with_context".into(),
                 ],
                 Signature::new(vec![], None, None),
-                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+                Some("ref".to_string()),
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let qualified_entry = registry
@@ -8101,7 +8196,7 @@ mod tests {
                     "handle_exception_with_context".into(),
                 ],
                 Signature::new(vec![], None, None),
-                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+                Some("ref".to_string()),
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let stub_entry = registry
@@ -8154,7 +8249,7 @@ mod tests {
         let stubs = vec![(
             vec!["other".into(), "f".into()],
             Signature::new(vec![], None, None),
-            Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            Some("ref".to_string()),
         )];
         populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
         let f_entry = registry
@@ -8320,7 +8415,7 @@ mod tests {
                     "_cached_lookup_where_name".into(),
                 ],
                 Signature::new(vec![], None, None),
-                Some(OBJECTPTR_RETURN_TYPE.to_string()),
+                Some("ref".to_string()),
             )];
             populate_call_registry_from_call_graphs(&graphs, &stubs, &[], &[], &registry).unwrap();
             let stripped =
@@ -8492,7 +8587,7 @@ mod tests {
         let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let graphs = crate::codewriter::call::GraphStore::default();
-        let token = format!("Tuple<{OBJECTPTR_RETURN_TYPE},{OBJECTPTR_RETURN_TYPE}>");
+        let token = "Tuple<ref,ref>".to_string();
         let stubs = vec![(
             vec![
                 "pyre_interpreter".into(),
@@ -8818,6 +8913,7 @@ mod tests {
             &mut variables,
             &mut HashMap::new(),
             &mut HashMap::new(),
+            None,
         );
         for alias in aliases {
             assert_eq!(variables.get(&alias), Some(&typed_source));
@@ -8948,7 +9044,7 @@ mod tests {
                     ),
                     result_ty.clone(),
                 );
-                backfill_untyped_call_results(&graph, &value_to_var);
+                backfill_untyped_call_results(&graph, &value_to_var, None);
                 assert_eq!(
                     kind_of_in(&value_to_var, &result),
                     expected,
@@ -8968,11 +9064,226 @@ mod tests {
             },
             ValueType::Int,
         );
-        backfill_untyped_call_results(&graph, &value_to_var);
+        backfill_untyped_call_results(&graph, &value_to_var, None);
         assert_eq!(
             kind_of_in(&value_to_var, &result),
             ConcreteType::Void,
             "an ordinary Signed/Void conflict must still reach the dual-gate divergence"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_stamps_gcref_for_unnamed_ref() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        for untyped_twin in [true, false] {
+            let (graph, result, value_to_var) = backfill_call_result_fixture(
+                crate::model::CallTarget::FunctionPath {
+                    segments: vec!["erased_gcref_call".to_string()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                ValueType::Ref(None),
+            );
+            if untyped_twin {
+                value_to_var
+                    .get(&result)
+                    .expect("twin")
+                    .set_concretetype(None);
+            }
+            backfill_untyped_call_results(&graph, &value_to_var, None);
+            assert_eq!(
+                value_to_var.get(&result).expect("twin").concretetype(),
+                Some(GCREF.clone()),
+                "untyped_twin={untyped_twin}: Ref(None) is llmemory.GCREF"
+            );
+        }
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_stamps_gcref_for_unregistered_named_ref() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["erased_named_ref_call".to_string()],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("NotARegisteredClass".to_string())),
+        );
+        value_to_var
+            .get(&result)
+            .expect("twin")
+            .set_concretetype(None);
+        backfill_untyped_call_results(&graph, &value_to_var, None);
+        assert_eq!(
+            value_to_var.get(&result).expect("twin").concretetype(),
+            Some(GCREF.clone()),
+            "unregistered named Ref is llmemory.GCREF, never OBJECTPTR"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_stamps_instancerepr_for_registered_named_ref() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "Function".to_string(),
+            vec![("w_qualname".to_string(), "PyObjectRef".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let function_cd = bk
+            .getuniqueclassdef_for_struct_root("Function")
+            .expect("Function classdef");
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["erased_function_ref".to_string()],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("Function".to_string())),
+        );
+        value_to_var
+            .get(&result)
+            .expect("twin")
+            .set_concretetype(None);
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        let expected =
+            getinstancerepr(&rtyper, Some(&function_cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            value_to_var.get(&result).expect("twin").concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "registered named Ref is getinstancerepr, never OBJECTPTR or GCREF"
+        );
+    }
+
+    fn root_instance_rtyper_with_classdef() -> (
+        CallRegistry,
+        Rc<crate::translator::rtyper::rtyper::RPythonTyper>,
+        Rc<std::cell::RefCell<crate::annotator::classdesc::ClassDef>>,
+    ) {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        let object_fields = vec![
+            ("ob_type".to_string(), "PyObjectRef".to_string()),
+            ("w_class".to_string(), "PyObjectRef".to_string()),
+        ];
+        fields
+            .fields
+            .insert("pyobject::PyObject".to_string(), object_fields.clone());
+        fields.fields.insert("PyObject".to_string(), object_fields);
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        let (_, rtyper) = registry.ensure_session().expect("session");
+        (registry, rtyper, classdef)
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_stamps_instancerepr_for_object_ref_alias() {
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let (_registry, rtyper, classdef) = root_instance_rtyper_with_classdef();
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["erased_object_ref".to_string()],
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("PyObjectRef".to_string())),
+        );
+        value_to_var
+            .get(&result)
+            .expect("twin")
+            .set_concretetype(None);
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        let expected =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            value_to_var.get(&result).expect("twin").concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "PyObjectRef alias is getinstancerepr(PyObject), never GCREF"
+        );
+    }
+
+    #[test]
+    fn stamp_named_ref_call_dests_replaces_skip_objectptr_with_instancerepr() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::legacy_annotator::annotate;
+        use crate::translator::rtyper::legacy_resolve::resolve_types;
+        use crate::translator::rtyper::rclass::{Flavor, OBJECTPTR, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "Function".to_string(),
+            vec![("w_qualname".to_string(), "PyObjectRef".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let function_cd = bk
+            .getuniqueclassdef_for_struct_root("Function")
+            .expect("Function classdef");
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let mut graph = LegacyGraph::new("function_get_qualname_obj_shaped");
+        let result = graph.alloc_value_var();
+        let layout_result = graph.alloc_value_var();
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::cast_instance_call("Function", Variable::new()),
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(crate::model::SpaceOperation {
+                result: Some(layout_result.clone()),
+                kind: crate::model::cast_instance_call_result(
+                    "Function",
+                    Variable::new(),
+                    ValueType::Ref(Some("function::Function".into())),
+                ),
+            });
+        annotate(&graph);
+        resolve_types(&graph, &std::collections::HashSet::new());
+        assert_eq!(
+            result.concretetype(),
+            Some(OBJECTPTR.clone()),
+            "Skip commits named Ref as classdef-less OBJECTPTR"
+        );
+        stamp_named_ref_call_dests(&graph, &rtyper);
+        let expected =
+            getinstancerepr(&rtyper, Some(&function_cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            result.concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "named Ref Call dest is getinstancerepr(Function), never OBJECTPTR"
+        );
+        assert_eq!(
+            layout_result.concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "CAST dest intern uses the ByteStr leaf when result_ty is the layout owner"
         );
     }
 
@@ -11680,7 +11991,7 @@ mod tests {
         let stubs = vec![(
             callee.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             Signature::new(vec!["kind".to_string()], None, None),
-            Some(OBJECTPTR_RETURN_TYPE.to_string()),
+            Some("ref".to_string()),
         )];
         let registry = std::rc::Rc::new(CallRegistry::new(std::rc::Rc::new(
             crate::annotator::bookkeeper::Bookkeeper::new(),
@@ -11748,7 +12059,7 @@ mod tests {
         let annotation = annotation.as_ref().expect("stub return is pre-annotated");
         assert!(
             matches!(&**annotation, SomeValue::Instance(_)),
-            "the object-pointer token must annotate as SomeInstance, got {annotation:?}"
+            "the ref token annotates as the classdef-less instance, got {annotation:?}"
         );
     }
 
@@ -12220,7 +12531,7 @@ mod tests {
     #[test]
     fn residual_return_shell_admits_objectptr_pair_tuple() {
         use crate::annotator::model::SomeValue;
-        let token = format!("Tuple<{OBJECTPTR_RETURN_TYPE},{OBJECTPTR_RETURN_TYPE}>");
+        let token = "Tuple<ref,ref>".to_string();
         let shell = residual_return_shell(Some(&token))
             .expect("a (PyObjectRef, PyObjectRef) residual is SomeTuple");
         let SomeValue::Tuple(tuple) = shell else {
@@ -12231,8 +12542,8 @@ mod tests {
             tuple
                 .items
                 .iter()
-                .all(|item| matches!(item, SomeValue::Instance(_))),
-            "each item is the PyObject instance shell, got {:?}",
+                .all(|item| matches!(item, SomeValue::Instance(inst) if inst.classdef.is_none())),
+            "each item is the classdef-less ref shell (no bookkeeper on residual_return_shell), got {:?}",
             tuple.items
         );
     }
@@ -12242,38 +12553,38 @@ mod tests {
         use crate::annotator::model::{SomeInstance, SomeValue, union};
 
         let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
-        let residual = residual_return_annotation(Some(OBJECTPTR_RETURN_TYPE), Some(&bk))
-            .expect("*mut PyObject residual is annotatable");
+        let residual = residual_return_annotation(Some("ref"), Some(&bk))
+            .expect("ref residual is annotatable");
         let SomeValue::Instance(residual_inst) = &residual else {
-            panic!("elidable *mut PyObject residual is SomeInstance, got {residual:?}");
+            panic!("elidable ref residual is SomeInstance, got {residual:?}");
         };
-        let residual_cd = residual_inst
-            .classdef
-            .as_ref()
-            .expect("SomeInstance(classdef PyObject)");
+        assert!(
+            residual_inst.classdef.is_none(),
+            "a ref token is the classdef-less SomeInstance, got {residual:?}"
+        );
         let input_cd = bk
             .getuniqueclassdef_for_struct_root("PyObject")
             .expect("PyObject Input class_root");
-        assert!(
-            Rc::ptr_eq(residual_cd, &input_cd),
-            "residual shares the Input PyObject ClassDef"
-        );
         let s_input = SomeValue::Instance(SomeInstance::new(
             Some(input_cd),
             false,
             std::collections::BTreeMap::new(),
         ));
         union(&residual, &s_input)
-            .expect("elidable *mut PyObject residual unions with a PyObject Input");
+            .expect("classdef-less ref residual unions with a PyObject Input");
 
-        let token = format!("Tuple<{OBJECTPTR_RETURN_TYPE},{OBJECTPTR_RETURN_TYPE}>");
+        let token = "Tuple<ref,ref>".to_string();
         let tuple = residual_return_annotation(Some(&token), Some(&bk))
-            .expect("(PyObjectRef, PyObjectRef) residual is annotatable");
+            .expect("(ref, ref) residual is annotatable");
         let SomeValue::Tuple(tuple) = tuple else {
             panic!("expected SomeTuple, got {tuple:?}");
         };
         assert_eq!(tuple.items.len(), 2);
         for item in &tuple.items {
+            assert!(
+                matches!(item, SomeValue::Instance(inst) if inst.classdef.is_none()),
+                "tuple items are classdef-less, got {item:?}"
+            );
             union(item, &s_input).expect("tuple item must union with a PyObject Input");
         }
     }
@@ -12329,7 +12640,7 @@ mod tests {
             "pyerror_index_error_to_exc_object",
         ] {
             let key = FunctionPathKey::from_segments(["pyre_interpreter", "error", name]);
-            let shell = residual_stub_result_shell(&key, Some(OBJECTPTR_RETURN_TYPE), None)
+            let shell = residual_stub_result_shell(&key, Some("ref"), None)
                 .expect("exception materializer must have a result shell");
             let SomeValue::Instance(instance) = shell else {
                 panic!("{name}: raw pointer ABI must not leak into annotation")
@@ -12339,12 +12650,13 @@ mod tests {
         }
 
         let ordinary_key = FunctionPathKey::from_segments(["other", "pyerror_to_exc_object"]);
-        let ordinary = residual_stub_result_shell(&ordinary_key, Some(OBJECTPTR_RETURN_TYPE), None)
+        let ordinary = residual_stub_result_shell(&ordinary_key, Some("ref"), None)
             .expect("ordinary object-pointer residual must have a result shell");
-        assert!(
-            matches!(ordinary, SomeValue::Instance(_)),
-            "ordinary object-pointer residuals are SomeInstance, got {ordinary:?}"
-        );
+        let SomeValue::Instance(instance) = ordinary else {
+            panic!("ordinary ref residual is the classdef-less SomeInstance, got {ordinary:?}");
+        };
+        assert!(instance.classdef.is_none());
+        assert!(!instance.can_be_none);
     }
 
     #[test]
@@ -12446,6 +12758,52 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn declared_return_annotation_registered_gc_ptr_is_nullable_instance() {
+        use crate::annotator::model::SomeValue;
+        use crate::translator::rtyper::rclass::{Flavor, OBJECTPTR, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let (registry, rtyper, _classdef) = root_instance_rtyper_with_classdef();
+        let mut graph = LegacyGraph::new("shadow_stack_get");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some("PyObject".into());
+        graph.return_can_be_none = true;
+        graph.push_hint("dont_look_inside");
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a *mut registered-GC-struct residual declares SomeInstance");
+        let SomeValue::Instance(inst) = &declared else {
+            panic!("expected SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "a raw pointer return is nullable (rnone.py can_be_None)"
+        );
+        let classdef = inst
+            .classdef
+            .clone()
+            .expect("registered GC struct has a classdef");
+
+        let var = Variable::new();
+        *var.annotation.borrow_mut() = Some(Rc::new(declared));
+        rtyper
+            .setconcretetype(&var)
+            .expect("setconcretetype from SomeInstance");
+        let expected =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            var.concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "setconcretetype is getinstancerepr(classdef), never OBJECTPTR"
+        );
+        assert_ne!(
+            var.concretetype(),
+            Some(OBJECTPTR.clone()),
+            "a pointer to a registered GC struct is never the classdef-less OBJECTPTR"
+        );
     }
 
     #[test]

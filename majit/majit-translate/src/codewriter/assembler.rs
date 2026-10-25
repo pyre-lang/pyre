@@ -620,6 +620,7 @@ impl AssemblerExt for Assembler {
             jit_merge_point_offset: None,
             alllabels: indexmap::IndexSet::new(),
             resulttypes: indexmap::IndexMap::new(),
+            var_producers: HashMap::new(),
         };
 
         // RPython assembler.py:41-44:
@@ -632,6 +633,15 @@ impl AssemblerExt for Assembler {
         // (insns_pos write) without aliasing the borrow used by the
         // write_insn loop.
         let ops = ssarepr.insns.clone();
+        for op in &ops {
+            if let FlatOp::Op(space_op) = op
+                && let Some(result) = &space_op.result
+            {
+                state
+                    .var_producers
+                    .insert(result.clone(), describe_space_op_producer(space_op));
+            }
+        }
         let debug_enabled = std::env::var("MAJIT_COVERAGE_PANIC").is_ok();
         for op in &ops {
             insns_pos.push(state.code.len());
@@ -2346,6 +2356,8 @@ impl AssemblerEncode for Assembler {
                     mutate_field,
                     Some(field),
                     "record_quasiimmut_field",
+                    self.current_graph_name.as_deref().unwrap_or("?"),
+                    &describe_v_inst_from_var(base, &state.var_producers),
                 );
                 for fd in [field, mutate_field] {
                     let descr_idx = self.emit_ready_descr(fielddescrof(
@@ -2395,6 +2407,8 @@ impl AssemblerEncode for Assembler {
                     mutate_field,
                     None,
                     "jit_force_quasi_immutable",
+                    self.current_graph_name.as_deref().unwrap_or("?"),
+                    &describe_v_inst_from_base(base, &state.var_producers),
                 );
                 let descr_idx = self.emit_ready_descr(fielddescrof(
                     mutate_field,
@@ -4882,6 +4896,13 @@ struct AssemblyState {
     /// RPython assembler.py:217-219: map from bytecode offset (after `->`)
     /// to result kind character. Recorded when encoding result registers.
     resulttypes: indexmap::IndexMap<usize, char>,
+    /// Result Variable → defining SpaceOperation summary, for mutate-field
+    /// panics that name the `v_inst` producer. Diagnostic only.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
+    var_producers: HashMap<crate::flowspace::model::Variable, String>,
 }
 
 impl AssemblyState {
@@ -5185,6 +5206,8 @@ fn require_mutate_field_resolved(
     mutate_field: &crate::model::FieldDescriptor,
     watched_field: Option<&crate::model::FieldDescriptor>,
     opname: &str,
+    graph_name: &str,
+    v_inst_producer: &str,
 ) {
     let Some(cc) = callcontrol else {
         return;
@@ -5203,9 +5226,52 @@ fn require_mutate_field_resolved(
         .unwrap_or("<unknown>");
     panic!(
         "{opname}: mutate descr `{owner}.{mutate_name}` is missing from the owner layout \
-         (watching `{watched}`); the hidden field must be named mutate_<name> \
+         (watching `{watched}`); graph={graph_name} v_inst_producer={v_inst_producer}; \
+         the hidden field must be named mutate_<name> \
          (rclass.py InstanceRepr._setup_repr)"
     );
+}
+
+fn describe_space_op_producer(op: &crate::model::SpaceOperation) -> String {
+    match &op.kind {
+        crate::model::OpKind::Call {
+            target, result_ty, ..
+        } => format!("Call target={target} result_ty={result_ty:?}"),
+        crate::model::OpKind::Input {
+            name,
+            ty,
+            class_root,
+        } => format!("Input {name} ty={ty:?} class_root={class_root:?}"),
+        kind => op_kind_to_opname(kind),
+    }
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn describe_v_inst_from_var(
+    var: &crate::flowspace::model::Variable,
+    producers: &HashMap<crate::flowspace::model::Variable, String>,
+) -> String {
+    match producers.get(var) {
+        Some(producer) => format!("{producer} dest_ct={:?}", var.concretetype()),
+        None => format!("no-def ct={:?}", var.concretetype()),
+    }
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn describe_v_inst_from_base(
+    base: &crate::model::LinkArg,
+    producers: &HashMap<crate::flowspace::model::Variable, String>,
+) -> String {
+    match base {
+        crate::model::LinkArg::Value(var) => describe_v_inst_from_var(var, producers),
+        crate::model::LinkArg::Const(c) => format!("const ct={:?}", c.concretetype),
+    }
 }
 
 /// Offset and size of a by-value substructure that has no flattened field
@@ -8369,6 +8435,7 @@ mod tests {
             jit_merge_point_offset: None,
             alllabels: indexmap::IndexSet::new(),
             resulttypes: indexmap::IndexMap::new(),
+            var_producers: HashMap::new(),
         }
     }
 

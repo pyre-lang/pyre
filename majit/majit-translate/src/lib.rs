@@ -773,12 +773,16 @@ pub fn analyze_multiple_pipeline_from_llbc_with_modules(
 fn lazy_graph_source(
     graph: &model::LazyGraph,
     return_type: &Option<String>,
+    return_class_root: &Option<String>,
+    return_can_be_none: bool,
     hints: &[String],
 ) -> call::GraphSource {
     call::GraphSource::Lazy {
         graph: graph.clone(),
         transform: call::GraphTransform {
             return_type: return_type.clone(),
+            return_class_root: return_class_root.clone(),
+            return_can_be_none,
             hints: hints.to_vec(),
         },
     }
@@ -1308,7 +1312,11 @@ fn resolved_trait_default_graph(
         ),
         None => (default_graph, default_return),
     };
-    lazy_graph_source(source, ret, &[])
+    let (class_root, can_be_none) = match devirt {
+        Some((_, info)) => (&info.return_class_root, info.return_can_be_none),
+        None => (&None, false),
+    };
+    lazy_graph_source(source, ret, class_root, can_be_none, &[])
 }
 
 /// Bind `[<Trait>, <method>]` for every trait default in `program`.
@@ -1815,7 +1823,13 @@ fn analyze_pipeline_from_module_paths(
             // codewriter signature validator reads `FUNC.RESULT`
             // directly off the callee graph (RPython
             // `funcptr._obj.TO.RESULT`).
-            let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &func.hints);
+            let graph = lazy_graph_source(
+                func.lazy_graph(),
+                &func.return_type,
+                &func.return_class_root,
+                func.return_can_be_none,
+                &func.hints,
+            );
             free_function_graphs[index] = Some(graph.clone());
             // Free function: register under every canonical alias
             // spelling computed by `free_function_alias_paths` — bare
@@ -2170,7 +2184,13 @@ fn analyze_pipeline_from_module_paths(
         let path = crate::parse::CallPath::from_segments(
             crate::front::mir::trait_impl_identity_path(owner, identity, &func.name),
         );
-        let graph = lazy_graph_source(func.lazy_graph(), &func.return_type, &[]);
+        let graph = lazy_graph_source(
+            func.lazy_graph(),
+            &func.return_type,
+            &func.return_class_root,
+            func.return_can_be_none,
+            &[],
+        );
         if func.hints.is_empty() {
             call_control.register_function_graph(path, graph);
         } else {
@@ -2306,7 +2326,7 @@ fn analyze_pipeline_from_module_paths(
                 // the JIT codewriter signature validator reads
                 // `FUNC.RESULT` directly off the callee graph
                 // (RPython `funcptr._obj.TO.RESULT`).
-                let graph = lazy_graph_source(graph, &method.return_type, &[]);
+                let graph = lazy_graph_source(graph, &method.return_type, &None, false, &[]);
                 call_control.register_trait_method(&method.name, trait_root, impl_type, graph);
                 // The pseudo-type path `[<default methods of Trait>, <method>]`
                 // is the base-class body.  `[<Trait>, <method>]` is bound by
@@ -2524,7 +2544,7 @@ fn analyze_pipeline_from_module_paths(
         // peek_at`), the two collide on the `(owner, name)` key and the
         // lookup resolves to `Err(())` (ambiguous), silently dropping the
         // single-impl devirtualization.  The carried graph is unambiguous.
-        let graph = lazy_graph_source(graph, return_type, &[]);
+        let graph = lazy_graph_source(graph, return_type, &None, false, &[]);
         let direct_path =
             crate::parse::CallPath::from_segments([trait_leaf.as_str(), method_name.as_str()]);
         call_control.register_function_graph(direct_path.clone(), graph);
@@ -2575,7 +2595,7 @@ fn analyze_pipeline_from_module_paths(
         // codewriter signature validator reads `FUNC.RESULT` directly off
         // the callee graph (`funcptr._obj.TO.RESULT`), matching the
         // free-function and trait-method registration paths above.
-        let graph = lazy_graph_source(graph, &method_info.return_type, &[]);
+        let graph = lazy_graph_source(graph, &method_info.return_type, &None, false, &[]);
         if method_info.hints.is_empty() {
             call_control.register_function_graph(path.clone(), graph);
         } else {

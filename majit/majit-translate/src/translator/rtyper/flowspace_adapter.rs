@@ -9982,6 +9982,201 @@ mod tests {
         );
     }
 
+    fn ptr_to_has_mutate_w_qualname(
+        ct: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> bool {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        let LowLevelType::Ptr(ptr) = ct else {
+            return false;
+        };
+        let resolved;
+        let body = match &ptr.TO {
+            PtrTarget::Struct(s) => s,
+            PtrTarget::ForwardReference(fwd) => {
+                resolved = fwd.resolved().expect("ForwardReference resolved");
+                match &resolved {
+                    LowLevelType::Struct(s) => s.as_ref(),
+                    other => panic!("expected Struct, got {other:?}"),
+                }
+            }
+            other => panic!("expected Struct TO, got {other:?}"),
+        };
+        body._flds.get("mutate_w_qualname").is_some()
+    }
+
+    /// Two Function-receiver graphs share `getinstancerepr(Function)`:
+    /// a `function_set_qualname`-shaped force on the input, and a
+    /// `function_get_qualname_obj`-shaped CAST from a `PyObjectRef`.
+    /// `rtyper.py RPythonTyper.setconcretetype` types both from
+    /// `rclass.py getinstancerepr`, cached in `rtyper.instance_reprs`.
+    #[test]
+    fn function_force_receivers_share_instancerepr_including_mutate_w_qualname() {
+        use crate::annotator::classdesc::Attribute;
+        use crate::annotator::model::SomeInteger;
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::{ConstValue, Constant, GraphFunc};
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::call_registry::FunctionPathKey;
+        use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        fields.fields.insert(
+            "PyObject".to_string(),
+            fields.fields["pyobject::PyObject"].clone(),
+        );
+        fields.fields.insert(
+            "Function".to_string(),
+            vec![
+                ("ob".to_string(), "pyobject::PyObject".to_string()),
+                ("w_qualname".to_string(), "PyObjectRef".to_string()),
+            ],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+
+        let function_cd = bk
+            .getuniqueclassdef_for_struct_root("Function")
+            .expect("Function classdef");
+        {
+            let mut cdef = function_cd.borrow_mut();
+            let attr = cdef
+                .attrs
+                .entry("w_qualname".to_string())
+                .or_insert_with(|| {
+                    let mut attr = Attribute::new("w_qualname");
+                    attr.s_value = SomeValue::Integer(SomeInteger::new(false, false));
+                    attr
+                });
+            attr.readonly = false;
+            if matches!(&attr.s_value, SomeValue::Impossible) {
+                attr.s_value = SomeValue::Integer(SomeInteger::new(false, false));
+            }
+            cdef.classdesc
+                .borrow_mut()
+                .immutable_fields
+                .insert("w_qualname?".to_string());
+        }
+
+        let path = crate::parse::CallPath::for_impl_method("Function", "jit_force_quasi_immutable");
+        let mut func = GraphFunc::new(
+            "jit_force_quasi_immutable",
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        func._jit_llop_ = Some("jit_force_quasi_immutable".into());
+        registry.get_or_register_with_func(
+            FunctionPathKey::from_segments(path.segments.iter().cloned()),
+            Signature::new(vec!["self".into(), "mutatefieldname".into()], None, None),
+            func,
+        );
+
+        let force_call = |receiver: crate::flowspace::model::Variable| OpKind::Call {
+            target: crate::model::CallTarget::Method {
+                name: "jit_force_quasi_immutable".to_string(),
+                receiver_root: Some("Function".to_string()),
+                resolved_path: Some(path.clone()),
+                fun_decl_id: None,
+                branch_payloads: None,
+            },
+            args: vec![
+                crate::model::LinkArg::from(receiver),
+                crate::model::LinkArg::from(ConstValue::byte_str("mutate_w_qualname")),
+            ],
+            result_ty: ValueType::Void,
+        };
+
+        let mut set_graph = LegacyGraph::new("function_set_qualname_shaped");
+        let set_entry = set_graph.startblock;
+        let set_obj = set_graph
+            .push_op_var(
+                set_entry,
+                OpKind::Input {
+                    name: "func".to_string(),
+                    ty: ValueType::Ref(Some("Function".to_string())),
+                    class_root: Some("Function".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        set_graph.push_inputarg_var(set_entry, set_obj.clone());
+        set_graph
+            .push_op_var(set_entry, force_call(set_obj.clone()), true)
+            .unwrap();
+        set_graph.set_return(set_entry, Some(set_obj.clone()));
+
+        let mut get_graph = LegacyGraph::new("function_get_qualname_obj_shaped");
+        let get_entry = get_graph.startblock;
+        let get_obj = get_graph
+            .push_op_var(
+                get_entry,
+                OpKind::Input {
+                    name: "obj".to_string(),
+                    ty: ValueType::Ref(Some("PyObject".to_string())),
+                    class_root: Some("PyObject".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        get_graph.push_inputarg_var(get_entry, get_obj.clone());
+        let cast_dest = get_graph
+            .push_op_var(
+                get_entry,
+                crate::model::cast_instance_call("Function", get_obj),
+                true,
+            )
+            .unwrap();
+        get_graph
+            .push_op_var(get_entry, force_call(cast_dest.clone()), true)
+            .unwrap();
+        get_graph.set_return(get_entry, Some(cast_dest.clone()));
+
+        let (set_map, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&set_graph, &registry)
+                .expect("function_set_qualname-shaped graph must rtype");
+        let (get_map, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&get_graph, &registry)
+                .expect("function_get_qualname_obj-shaped graph must rtype");
+
+        let (_, rtyper) = registry.ensure_session().expect("session after specialize");
+        let expected =
+            getinstancerepr(&rtyper, Some(&function_cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        let expected_ll = expected.lowleveltype().clone();
+
+        let set_ct = set_map
+            .get(&set_obj)
+            .expect("set v_inst twin")
+            .concretetype()
+            .expect("set v_inst typed");
+        let get_ct = get_map
+            .get(&cast_dest)
+            .expect("CAST dest twin")
+            .concretetype()
+            .expect("CAST dest typed");
+        assert_eq!(
+            set_ct, get_ct,
+            "both Function receivers share one InstanceRepr lowleveltype"
+        );
+        assert_eq!(
+            set_ct, expected_ll,
+            "v_inst.concretetype is getinstancerepr(Function, Gc).lowleveltype"
+        );
+        assert!(
+            ptr_to_has_mutate_w_qualname(&set_ct),
+            "InstanceRepr TO must carry mutate_w_qualname; ct={set_ct:?}"
+        );
+        assert!(
+            ptr_to_has_mutate_w_qualname(&expected_ll),
+            "getinstancerepr(Function) TO must carry mutate_w_qualname; ct={expected_ll:?}"
+        );
+    }
+
     /// The frontend cannot see the adapter's expansion: `lower_function`
     /// still contains the raw `alloc::vec::from_elem` call, while the
     /// flowspace graph must carry `newlist` + `mul` instead.  This real-LLBC
