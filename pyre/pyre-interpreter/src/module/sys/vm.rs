@@ -4499,16 +4499,13 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
 /// every other locale settles for the `strict` that
 /// `TextIOWrapper(errors=None)` takes.
 ///
-/// Windows answers yes outright. `initstdio` reaches that through UTF-8 mode,
-/// which PyPy runs the whole platform in -- `sys.flags.utf8_mode` reads 1 there
-/// -- and pyre does not, because 3.14 reports 0 unless `-X utf8` asked for it;
-/// `initconfig.c config_get_stdio_errors` states the same answer as its own
-/// `MS_WINDOWS` arm ("On Windows, always use surrogateescape by default", read
-/// at v3.14.6) instead of deriving it. Both upstreams therefore answer
-/// `surrogateescape` here, so this is not a spec split; only the route
-/// differs, and the route is what keeps `sys.flags.utf8_mode` at 0. The
-/// locale test could not stand in for it either: the MSVC runtime's `setlocale(LC_CTYPE, "")` reads the user's
-/// ANSI locale and ignores `LC_ALL`, so it never sees C there.
+/// Windows answers yes outright, `-X utf8=0` included:
+/// `initconfig.c config_get_stdio_errors` has its own `MS_WINDOWS` arm ("On
+/// Windows, always use surrogateescape by default", read at v3.15.0), and
+/// PyPy's `initstdio` reaches the same answer through the UTF-8 mode it runs
+/// the whole platform in. The locale test could not stand in for it: the MSVC
+/// runtime's `setlocale(LC_CTYPE, "")` reads the user's ANSI locale and
+/// ignores `LC_ALL`, so it never sees C there.
 fn locale_asks_for_surrogateescape() -> bool {
     #[cfg(windows)]
     {

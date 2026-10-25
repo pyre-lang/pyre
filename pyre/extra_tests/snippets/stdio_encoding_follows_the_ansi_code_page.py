@@ -8,10 +8,11 @@
 # `config_get_locale_encoding` answers the ANSI code page -- a script whose
 # output is piped into a Windows tool wrote bytes that tool cannot read.
 
-# pyre-check: pypy-diverges: pypy3 runs with `sys.flags.utf8_mode == 1`, so
-# its own answer is utf-8 by the rule below rather than in spite of it.
+# pyre-check: pypy-diverges: pypy3 always runs with `sys.flags.utf8_mode == 1`,
+# so it ignores `-X utf8=0` and answers utf-8 in the code-page case.
 
-"""A redirected standard stream opens with the locale's encoding."""
+"""Outside UTF-8 mode a redirected standard stream opens with the locale's
+encoding; 3.15 turns UTF-8 mode on by default (PEP 686)."""
 
 import locale
 import subprocess
@@ -50,7 +51,14 @@ def probe(*options, **env_overrides):
 # it.  `locale.getencoding()` is the same call, so the two must agree.
 code_page = locale.getencoding()
 
-stdout, stderr, stdin, out_errors, err_errors, utf8_mode = probe()
+# UTF-8 mode is the default, and it fixes every stream at utf-8 whatever the
+# code page is.
+stdout, stderr, stdin, out_errors, _, utf8_mode = probe()
+assert utf8_mode == "1", utf8_mode
+assert (stdout, stderr, stdin) == ("utf-8", "utf-8", "utf-8"), (stdout, stderr, stdin)
+assert out_errors == "surrogateescape", out_errors
+
+stdout, stderr, stdin, out_errors, err_errors, utf8_mode = probe("-X", "utf8=0")
 assert utf8_mode == "0", utf8_mode
 assert stdout == code_page, (stdout, code_page)
 assert stderr == code_page, (stderr, code_page)
@@ -60,11 +68,10 @@ assert stdin == code_page, (stdin, code_page)
 assert out_errors == "surrogateescape", out_errors
 assert err_errors == "backslashreplace", err_errors
 
-# utf-8 mode fixes every stream at utf-8, whatever the code page is.
-stdout, stderr, stdin, out_errors, _, utf8_mode = probe("-X", "utf8")
-assert utf8_mode == "1", utf8_mode
-assert (stdout, stderr, stdin) == ("utf-8", "utf-8", "utf-8"), (stdout, stderr, stdin)
-assert out_errors == "surrogateescape", out_errors
+# PYTHONUTF8=0 turns the mode off the same way.
+stdout, _, _, _, _, utf8_mode = probe(PYTHONUTF8="0")
+assert utf8_mode == "0", utf8_mode
+assert stdout == code_page, (stdout, code_page)
 
 # A named encoding wins over both, and naming one settles the error handler
 # at strict.
