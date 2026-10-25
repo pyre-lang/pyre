@@ -77,7 +77,7 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
     guard_words: &std::collections::HashSet<Variable>,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
 ) -> Result<(), LowerError> {
     // `GcRef(p as usize)` is a GCREF word (`ConstRefNull` for `GcRef::NULL`).
     // The element place type still peels to `usize`, so an `ArrayWrite`
@@ -248,7 +248,7 @@ pub(in crate::front::mir) fn simplify_lowered_graph_expanding(
 /// above must have replaced every one; a survivor is a front-end gap.
 pub(in crate::front::mir) fn refuse_inlined_struct_field_writes(
     graph: &FunctionGraph,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<crate::model::InlineStructExpansion>,
 ) -> Result<(), LowerError> {
     let malloc_args = crate::model::typed_malloc_arg_vars(graph);
     for block in &graph.blocks {

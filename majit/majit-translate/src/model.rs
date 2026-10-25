@@ -4311,10 +4311,18 @@ pub fn lower_struct_ptr_writes(
     lower_struct_ptr_writes_with(graph, struct_field_attrs, &|_, _| None)
 }
 
+/// Immediate inlined-struct owner (`struct_copy_owner_keys` of the field's
+/// own decl) plus the leaves `collect_by_value_struct_leaves` returns.
+pub(crate) type InlineStructExpansion = (
+    String,
+    Option<majit_ir::descr::StructId>,
+    Vec<(FieldDescriptor, ValueType)>,
+);
+
 pub(crate) fn lower_struct_ptr_writes_with(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<InlineStructExpansion>,
 ) -> usize {
     use crate::flowspace::model::Variable;
 
@@ -4578,7 +4586,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
                     match expand_inline_struct(&rewrite.owner, &field.name)
                         .zip(value.as_variable().cloned())
                     {
-                        Some((leaves, inner)) => {
+                        Some(((_, _, leaves), inner)) => {
                             for (leaf, leaf_ty) in leaves {
                                 let read = graph.alloc_value_var();
                                 replacement.push(SpaceOperation {
@@ -4616,6 +4624,7 @@ pub(crate) fn lower_struct_ptr_writes_with(
             FieldInit::Copy { source, fields } => {
                 for (field, ty) in fields {
                     let leaves = expand_inline_struct(&rewrite.owner, &field.name)
+                        .map(|(_, _, leaves)| leaves)
                         .unwrap_or_else(|| vec![(field, ty)]);
                     for (leaf, leaf_ty) in leaves {
                         let read = graph.alloc_value_var();
@@ -4700,7 +4709,7 @@ pub(crate) fn typed_malloc_arg_vars(graph: &FunctionGraph) -> std::collections::
 
 pub(crate) fn lower_inlined_struct_field_writes(
     graph: &mut FunctionGraph,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<InlineStructExpansion>,
 ) -> Result<usize, String> {
     struct Rewrite {
         block: usize,
@@ -4725,7 +4734,7 @@ pub(crate) fn lower_inlined_struct_field_writes(
             let Some(owner) = field.owner_root.as_deref() else {
                 continue;
             };
-            let Some(leaves) = expand_inline_struct(owner, &field.name) else {
+            let Some((_, _, leaves)) = expand_inline_struct(owner, &field.name) else {
                 continue;
             };
             let Some(source) = value.as_variable().cloned() else {
@@ -4828,7 +4837,7 @@ pub fn fuse_boxing_alloc(
 pub(crate) fn fuse_boxing_alloc_with(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<InlineStructExpansion>,
 ) -> usize {
     use crate::flowspace::model::Variable;
     // Gate names come from `crate::decline::gate` rather than being
@@ -4929,17 +4938,6 @@ pub(crate) fn fuse_boxing_alloc_with(
     // `STRUCT`. `malloc_typed(value)` instead recovers it from
     // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
     // a subclass there.
-    fn store_value(
-        graph: &FunctionGraph,
-        base: &Variable,
-        field_name: &str,
-        site: (usize, usize),
-    ) -> Option<Variable> {
-        unique_store(graph, base, field_name, site)?
-            .value
-            .as_variable()
-            .cloned()
-    }
     /// Whether the graph writes `base.field_name` at all, however many times.
     /// [`unique_store`] collapses "never written" and "written inconsistently"
     /// into one `None`; the malloc fork needs them apart, because a struct that
@@ -4974,19 +4972,39 @@ pub(crate) fn fuse_boxing_alloc_with(
         field: &'g FieldDescriptor,
         value: &'g LinkArg,
         ty: &'g ValueType,
+        /// Block index and op index of every reaching `FieldWrite`, in the
+        /// order found. Several copies of the same value keep every location
+        /// so a nested leaf is resolved at each copy, not only the first
+        /// (`BaseMallocRemover.flowin` keeps one flattened map per path).
+        locations: Vec<(usize, usize)>,
     }
     /// Forward walk from just after `start` looking for `goal`. A path dies
     /// when it executes a `barriers` op. True when some unkilled path hits
-    /// `goal`.
+    /// `goal`. `goal` may be `(block, ops_len)`, the block's exit.
     fn reaches_avoiding_barriers(
         graph: &FunctionGraph,
         start: (usize, usize),
         goal: (usize, usize),
         barriers: &[(usize, usize)],
     ) -> bool {
+        reaches_from(graph, start.0, start.1.saturating_add(1), goal, barriers)
+    }
+    /// True when some unkilled path from the first op of `from_block` hits
+    /// `goal`. `reaches_avoiding_barriers` starts *after* its `start` op, so
+    /// a successor's first op would be skipped if we reused it.
+    fn block_reaches(graph: &FunctionGraph, from_block: usize, goal: (usize, usize)) -> bool {
+        reaches_from(graph, from_block, 0, goal, &[])
+    }
+    fn reaches_from(
+        graph: &FunctionGraph,
+        start_block: usize,
+        first: usize,
+        goal: (usize, usize),
+        barriers: &[(usize, usize)],
+    ) -> bool {
         let n = graph.blocks.len();
         let mut seen_from_zero = vec![false; n];
-        let mut pending = vec![(start.0, start.1.saturating_add(1))];
+        let mut pending = vec![(start_block, first)];
         while let Some((block, first)) = pending.pop() {
             if block >= n {
                 continue;
@@ -5010,6 +5028,9 @@ pub(crate) fn fuse_boxing_alloc_with(
             }
             if killed {
                 continue;
+            }
+            if first <= ops_len && (block, ops_len) == goal {
+                return true;
             }
             pending.extend(
                 graph.blocks[block]
@@ -5089,7 +5110,221 @@ pub(crate) fn fuse_boxing_alloc_with(
             field: first.field,
             value: first.value,
             ty: first.ty,
+            locations: covering,
         })
+    }
+    /// One copy per path, each snapshot taken at its own copy
+    /// (`BaseMallocRemover.flowin`).
+    enum StoreAtEach<'g> {
+        Agreed(UniqueStore<'g>),
+        Missing,
+        Conflict,
+    }
+    fn unique_store_at_each<'g>(
+        graph: &'g FunctionGraph,
+        base: &Variable,
+        field_name: &str,
+        locations: &[(usize, usize)],
+    ) -> StoreAtEach<'g> {
+        let mut agreed: Option<UniqueStore<'g>> = None;
+        let mut concat: Vec<(usize, usize)> = Vec::new();
+        let mut saw_some = false;
+        let mut saw_none = false;
+        for &loc in locations {
+            match unique_store(graph, base, field_name, loc) {
+                Some(store) => {
+                    saw_some = true;
+                    if let Some(prev) = &agreed
+                        && (prev.value != store.value || prev.field != store.field)
+                    {
+                        return StoreAtEach::Conflict;
+                    }
+                    for loc in store.locations.iter().copied() {
+                        if !concat.iter().any(|&seen| seen == loc) {
+                            concat.push(loc);
+                        }
+                    }
+                    if agreed.is_none() {
+                        agreed = Some(store);
+                    }
+                }
+                None => saw_none = true,
+            }
+        }
+        if saw_some && saw_none {
+            StoreAtEach::Conflict
+        } else if let Some(mut store) = agreed {
+            store.locations = concat;
+            StoreAtEach::Agreed(store)
+        } else {
+            StoreAtEach::Missing
+        }
+    }
+    /// True when `nested` is used between a by-value copy into the outer
+    /// field and the allocation in a way that would make a later
+    /// `FieldRead` of a missing leaf observe a mutation.
+    /// `BaseMallocRemover._try_inline_malloc` checks every use of the
+    /// variable and returns False (leaves the malloc) for any use it
+    /// does not support. A `FieldRead` of the current name is allowed;
+    /// the reaching outer copies themselves are allowed. Any other
+    /// operand mention of `nested`, or of a `Link` inputarg alias of
+    /// it, on a path from a copy to the allocation, declines. A `Link`
+    /// that only carries the value onto a successor (`Block.inputargs`
+    /// rename) is the SSA name of that value, not a use.
+    fn nested_escapes_after_copy(
+        graph: &FunctionGraph,
+        nested: &Variable,
+        copy_locations: &[(usize, usize)],
+        site: (usize, usize),
+    ) -> bool {
+        copy_locations
+            .iter()
+            .any(|&loc| name_escapes_between(graph, nested, loc, site, copy_locations))
+    }
+    fn name_escapes_between(
+        graph: &FunctionGraph,
+        nested: &Variable,
+        start: (usize, usize),
+        site: (usize, usize),
+        copy_locations: &[(usize, usize)],
+    ) -> bool {
+        let n = graph.blocks.len();
+        let mut seen: Vec<(usize, Variable)> = Vec::new();
+        let mut pending = vec![(start.0, start.1.saturating_add(1), nested.clone())];
+        while let Some((block, first, current)) = pending.pop() {
+            if block >= n {
+                continue;
+            }
+            if first == 0 {
+                if seen.iter().any(|(b, v)| *b == block && v == &current) {
+                    continue;
+                }
+                seen.push((block, current.clone()));
+            }
+            let ops_len = graph.blocks[block].operations.len();
+            let mut hit_site = false;
+            for oi in first..ops_len {
+                if (block, oi) == site {
+                    hit_site = true;
+                    break;
+                }
+                if copy_locations.iter().any(|&loc| loc == (block, oi)) {
+                    continue;
+                }
+                let op = &graph.blocks[block].operations[oi];
+                if matches!(&op.kind, OpKind::FieldRead { base, .. } if base == &current) {
+                    continue;
+                }
+                if crate::inline::op_variable_refs(&op.kind)
+                    .iter()
+                    .any(|var| var == &current)
+                {
+                    return true;
+                }
+            }
+            if hit_site || (block, ops_len) == site {
+                continue;
+            }
+            for link in &graph.blocks[block].exits {
+                let target = link.target.0;
+                if target >= n || !block_reaches(graph, target, site) {
+                    continue;
+                }
+                for (slot, arg) in link.args.iter().enumerate() {
+                    if arg.as_variable() != Some(&current) {
+                        continue;
+                    }
+                    let alias = graph.blocks[target]
+                        .inputargs
+                        .get(slot)
+                        .cloned()
+                        .unwrap_or_else(|| current.clone());
+                    pending.push((target, 0, alias));
+                }
+            }
+        }
+        false
+    }
+    /// The lifetime of `root`: `root` plus every `Block.inputargs` it is renamed to through a
+    /// link arg, transitively (`BaseMallocRemover.compute_lifetimes`). True when some op
+    /// uses a lifetime variable other than as the `base` of a `FieldWrite` / `FieldRead`, and
+    /// `allowed(location, op)` does not accept it; also true when a lifetime variable is an
+    /// `exitswitch` or reaches `graph.returnblock` / `graph.exceptblock` inputargs
+    /// (`_try_inline_malloc` returns False for any unsupported use).
+    fn lifetime_has_unsupported_use(
+        graph: &FunctionGraph,
+        root: &Variable,
+        allowed: &dyn Fn((usize, usize), &OpKind) -> bool,
+    ) -> bool {
+        let mut lifetime = vec![root.clone()];
+        let mut worklist = vec![root.clone()];
+        while let Some(var) = worklist.pop() {
+            for block in &graph.blocks {
+                for link in &block.exits {
+                    for (slot, arg) in link.args.iter().enumerate() {
+                        if arg.as_variable() != Some(&var) {
+                            continue;
+                        }
+                        // Link args are renames, except a link into
+                        // `returnblock` / `exceptblock`, which is an escape.
+                        if link.target == graph.returnblock || link.target == graph.exceptblock {
+                            return true;
+                        }
+                        let Some(renamed) = graph
+                            .blocks
+                            .get(link.target.0)
+                            .and_then(|target| target.inputargs.get(slot))
+                        else {
+                            return true;
+                        };
+                        if !lifetime.contains(renamed) {
+                            lifetime.push(renamed.clone());
+                            worklist.push(renamed.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for terminal in [graph.returnblock, graph.exceptblock] {
+            if graph
+                .blocks
+                .get(terminal.0)
+                .is_some_and(|block| block.inputargs.iter().any(|arg| lifetime.contains(arg)))
+            {
+                return true;
+            }
+        }
+        for (block_idx, block) in graph.blocks.iter().enumerate() {
+            let switch_uses_lifetime = match &block.exitswitch {
+                Some(ExitSwitch::Value(sw)) => lifetime.contains(sw),
+                Some(ExitSwitch::Fused { args, .. }) => {
+                    args.iter().any(|arg| lifetime.contains(arg))
+                }
+                Some(ExitSwitch::LastException) | None => false,
+            };
+            if switch_uses_lifetime {
+                return true;
+            }
+            for (op_idx, op) in block.operations.iter().enumerate() {
+                for mentioned in crate::inline::op_variable_refs(&op.kind) {
+                    if !lifetime.contains(&mentioned) {
+                        continue;
+                    }
+                    let field_ok = match &op.kind {
+                        OpKind::FieldWrite { base, value, .. } => {
+                            base == &mentioned && value.as_variable() != Some(&mentioned)
+                        }
+                        OpKind::FieldRead { base, .. } => base == &mentioned,
+                        _ => false,
+                    };
+                    if field_ok || allowed((block_idx, op_idx), &op.kind) {
+                        continue;
+                    }
+                    return true;
+                }
+            }
+        }
+        false
     }
     /// Resolve `var` to producer variables through `Block.inputargs` phis.
     /// Stores name producers rather than phis, and every incoming root must
@@ -5216,6 +5451,35 @@ pub(crate) fn fuse_boxing_alloc_with(
                     return None;
                 }
                 found = Some((bi, oi, value));
+            }
+        }
+        found
+    }
+    /// Every `core::ptr::write` whose value is `alloc` (or a phi / cast of it).
+    /// `ptr_write_into` finds the unique write *into* an uninit box; this is
+    /// the same scan on the value operand — the GC-interp arm
+    /// `sink_fused_boxing_aggregates_at_raw_writes` rematerializes after fusion.
+    fn ptr_writes_of(graph: &FunctionGraph, alloc: &Variable) -> Vec<(usize, usize)> {
+        let mut found = Vec::new();
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } = &op.kind
+                else {
+                    continue;
+                };
+                if !is_core_ptr_write_path(segments, args) {
+                    continue;
+                }
+                let Some(value) = args[1].as_variable() else {
+                    continue;
+                };
+                if refers_to_alloc(graph, value, alloc, 8) {
+                    found.push((bi, oi));
+                }
             }
         }
         found
@@ -5373,26 +5637,30 @@ pub(crate) fn fuse_boxing_alloc_with(
             .map(|rows| rows.iter().any(|(name, _)| name == field_name))
     }
     /// The aggregates from `agg` down to the one that stores the header, each
-    /// paired with its struct owner.
+    /// paired with its struct owner and the locations at which that level's
+    /// fields are read.
     ///
     /// `heaptracker.py _has_gcstruct_a_vtable`: `while not
     /// GCSTRUCT._hints.get('typeptr'): _, GCSTRUCT = GCSTRUCT._first_struct()`.
     /// A level that writes `ob_header` / `ob` ends the chain; any other level
-    /// must hold exactly one constructed parent struct in field zero.  A
-    /// struct whose field-zero chain reaches no header is the chain of length
-    /// one, which leaves the plain `new` decision to `resolve_header_plan`.
+    /// must hold exactly one constructed parent struct in field zero.  The
+    /// copy into the child is where the parent's fields are read
+    /// (`BaseMallocRemover.flowin`).  A struct whose field-zero chain reaches
+    /// no header is the chain of length one, which leaves the plain `new`
+    /// decision to `resolve_header_plan`.
     fn first_struct_chain(
         graph: &FunctionGraph,
         agg: &Variable,
         owner: &str,
         site: (usize, usize),
         struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
-        expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
-    ) -> Vec<(Variable, String)> {
-        let own = || vec![(agg.clone(), owner.to_string())];
+        expand_inline_struct: &dyn Fn(&str, &str) -> Option<InlineStructExpansion>,
+    ) -> Vec<(Variable, String, Vec<(usize, usize)>)> {
+        let own = || vec![(agg.clone(), owner.to_string(), vec![site])];
         let mut chain = own();
         for _ in 0..8 {
-            let (level, level_owner) = chain.last().expect("chain starts non-empty");
+            let (level, level_owner, level_locations) =
+                chain.last().expect("chain starts non-empty");
             if any_store(graph, level, "ob_header") || any_store(graph, level, "ob") {
                 return chain;
             }
@@ -5406,9 +5674,14 @@ pub(crate) fn fuse_boxing_alloc_with(
             if expand_inline_struct(level_owner, first).is_none() {
                 return own();
             }
-            let Some(parent) = store_value(graph, level, first, site) else {
-                return own();
+            let parent = match unique_store_at_each(graph, level, first, level_locations) {
+                StoreAtEach::Agreed(store) => match store.value.as_variable() {
+                    Some(parent) => (parent.clone(), store.locations),
+                    None => return own(),
+                },
+                StoreAtEach::Missing | StoreAtEach::Conflict => return own(),
             };
+            let (parent, parent_locations) = parent;
             let mut roots = Vec::new();
             if !store_roots(graph, &parent, 8, &mut roots) {
                 return own();
@@ -5433,14 +5706,22 @@ pub(crate) fn fuse_boxing_alloc_with(
             let Some(parent_owner) = parent_owner else {
                 return own();
             };
-            chain.push((root.clone(), parent_owner));
+            chain.push((root.clone(), parent_owner, parent_locations));
         }
         own()
     }
     struct Payload {
         field: FieldDescriptor,
+        /// Ignored when `read_leaf` is set; the copy source lives there.
         value: LinkArg,
         ty: ValueType,
+        /// When set, the rewrite emits `FieldRead` of this inner leaf from
+        /// the nested aggregate first, then `FieldWrite` of `field` (the
+        /// dotted GC-owner name). `value` is unused. A by-value store of a
+        /// finished nested value (`IntArray::empty`) has no `FieldWrite`s
+        /// on that value in this graph; `lower_inlined_struct_field_writes`
+        /// copies those leaves the same way (`heaptracker.all_fielddescrs`).
+        read_leaf: Option<(Variable, FieldDescriptor)>,
     }
     /// What the fusion keeps of the cluster's `ob_header`.
     ///
@@ -5466,10 +5747,42 @@ pub(crate) fn fuse_boxing_alloc_with(
         vtable: Option<i64>,
         w_class: Option<Payload>,
     }
-    let resolve_header_plan = |graph: &FunctionGraph, agg: &Variable, site: (usize, usize)| {
-        let Some(header) = store_value(graph, agg, "ob_header", site)
-            .or_else(|| store_value(graph, agg, "ob", site))
-        else {
+    let resolve_header_plan = |graph: &FunctionGraph,
+                               agg: &Variable,
+                               locations: &[(usize, usize)]| {
+        // The header fields are read at the copy into the aggregate
+        // (`BaseMallocRemover.flowin_op`).
+        let store = match unique_store_at_each(graph, agg, "ob_header", locations) {
+            StoreAtEach::Agreed(store) => store,
+            StoreAtEach::Missing => match unique_store_at_each(graph, agg, "ob", locations) {
+                StoreAtEach::Agreed(store) => store,
+                StoreAtEach::Missing => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "no-unique-ob_header-store",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
+                StoreAtEach::Conflict => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "ob_header-copies-disagree",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
+            },
+            StoreAtEach::Conflict => {
+                crate::decline::record(
+                    VTABLE_GATE,
+                    "ob_header-copies-disagree",
+                    format_args!("{}", graph.name),
+                );
+                return None;
+            }
+        };
+        let Some(header) = store.value.as_variable().cloned() else {
             crate::decline::record(
                 VTABLE_GATE,
                 "no-unique-ob_header-store",
@@ -5477,6 +5790,7 @@ pub(crate) fn fuse_boxing_alloc_with(
             );
             return None;
         };
+        let header_locations = store.locations;
         let mut roots = Vec::new();
         if !store_roots(graph, &header, 8, &mut roots) {
             crate::decline::record(
@@ -5485,6 +5799,17 @@ pub(crate) fn fuse_boxing_alloc_with(
                 format_args!("{}", graph.name),
             );
             return None;
+        }
+        for root in &roots {
+            if lifetime_has_unsupported_use(graph, root, &|loc, _| header_locations.contains(&loc))
+            {
+                crate::decline::record(
+                    VTABLE_GATE,
+                    "header-lifetime-has-unsupported-use",
+                    format_args!("{}", graph.name),
+                );
+                return None;
+            }
         }
         // `None` until the first root is read; the inner `Option` is the
         // vtable when that root's type word is a constant and `None` when the
@@ -5526,7 +5851,18 @@ pub(crate) fn fuse_boxing_alloc_with(
                 );
                 return None;
             }
-            let type_store = unique_store(graph, root, "ob_type", site);
+            let type_store = match unique_store_at_each(graph, root, "ob_type", &header_locations) {
+                StoreAtEach::Agreed(store) => Some(store),
+                StoreAtEach::Missing => None,
+                StoreAtEach::Conflict => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "ob_type-copies-disagree",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
+            };
             let root_vtable = match type_store {
                 Some(store) if declares_type_word => {
                     let Some(vtable) = store
@@ -5593,8 +5929,8 @@ pub(crate) fn fuse_boxing_alloc_with(
                 );
                 return None;
             }
-            let store = match unique_store(graph, root, "w_class", site) {
-                Some(store) => {
+            let store = match unique_store_at_each(graph, root, "w_class", &header_locations) {
+                StoreAtEach::Agreed(store) => {
                     // With no vtable on the allocation there is nothing the
                     // class store could fold into, so it is always kept.
                     let folds = root_vtable.is_some_and(|root_vtable| {
@@ -5613,13 +5949,21 @@ pub(crate) fn fuse_boxing_alloc_with(
                 // keys on a field descriptor named `w_class`
                 // (`descr.rs FieldDescr::is_w_class`), which a struct that
                 // never declares the field cannot produce.
-                None if !declares_class_word => None,
+                StoreAtEach::Missing if !declares_class_word => None,
                 // A layout that declares `w_class` still needs a unique store
                 // proving that the vtable stands for that per-instance class.
-                None => {
+                StoreAtEach::Missing => {
                     crate::decline::record(
                         VTABLE_GATE,
                         "no-unique-w_class-store",
+                        format_args!("{}", graph.name),
+                    );
+                    return None;
+                }
+                StoreAtEach::Conflict => {
+                    crate::decline::record(
+                        VTABLE_GATE,
+                        "w_class-copies-disagree",
                         format_args!("{}", graph.name),
                     );
                     return None;
@@ -5673,9 +6017,12 @@ pub(crate) fn fuse_boxing_alloc_with(
         // `None` from there would be a bug in that invariant, not a refusal.
         Some(HeaderPlan {
             vtable: resolved?,
-            w_class: w_class
-                .flatten()
-                .map(|(field, value, ty)| Payload { field, value, ty }),
+            w_class: w_class.flatten().map(|(field, value, ty)| Payload {
+                field,
+                value,
+                ty,
+                read_leaf: None,
+            }),
         })
     };
 
@@ -5831,6 +6178,53 @@ pub(crate) fn fuse_boxing_alloc_with(
                 struct_field_attrs,
                 expand_inline_struct,
             );
+            // `_try_inline_malloc` accepts, inside the lifetime, exactly the
+            // operations the remover itself rewrites. Allowed locations are
+            // the `malloc_typed` / `assume_init` rewrite site, the cluster
+            // ops this pass consumes (`dead_ops`: the claimed `ptr::write`
+            // and `new_uninit`), and for a `malloc_typed` spelling the
+            // outbound `ptr::write`s of this aggregate that
+            // `sink_fused_boxing_aggregates_at_raw_writes` rematerializes
+            // (`ptr_writes_of`, the value-side of `ptr_write_into`). A
+            // `ptr::write` of the aggregate that cluster recognition did
+            // not claim stays unsupported. For a parent level, the copy
+            // store(s) `child.<field zero> = parent` are allowed too.
+            let rewrite_site = (rewrite_bi, rewrite_oi);
+            let mut cluster_rewrites = dead_ops.clone();
+            if !cluster_rewrites.contains(&rewrite_site) {
+                cluster_rewrites.push(rewrite_site);
+            }
+            if malloc_flavor.is_some() {
+                for loc in ptr_writes_of(graph, agg) {
+                    if cluster_rewrites.contains(&loc) {
+                        continue;
+                    }
+                    // A raw write that still reaches this cluster's rewrite
+                    // is an unclaimed use on the fused path. A write on
+                    // another arm is the GC-interp store
+                    // `sink_fused_boxing_aggregates_at_raw_writes`
+                    // rematerializes; the pass leaves it in place.
+                    if !reaches_avoiding_barriers(graph, loc, rewrite_site, &[]) {
+                        cluster_rewrites.push(loc);
+                    }
+                }
+            }
+            if chain
+                .iter()
+                .enumerate()
+                .any(|(depth, (level, _, locations))| {
+                    lifetime_has_unsupported_use(graph, level, &|loc, _| {
+                        cluster_rewrites.contains(&loc) || (depth > 0 && locations.contains(&loc))
+                    })
+                })
+            {
+                crate::decline::record(
+                    FUSE_GATE,
+                    "aggregate-lifetime-has-unsupported-use",
+                    format_args!("{owner} in {}", graph.name),
+                );
+                continue;
+            }
             // Resolve every payload field's store: `FieldWrite { base: %agg,
             // field.name == payload }`.  A malformed cluster missing any payload
             // store is left untouched so the annotate wall still flags it.
@@ -5845,7 +6239,9 @@ pub(crate) fn fuse_boxing_alloc_with(
             let mut payloads = Vec::new();
             let mut complete = true;
             let mut layout_known = true;
-            'levels: for (depth, (level, level_owner)) in chain.iter().enumerate().rev() {
+            'levels: for (depth, (level, level_owner, level_locations)) in
+                chain.iter().enumerate().rev()
+            {
                 let Some(fields) = payload_fields(level_owner, struct_field_attrs) else {
                     layout_known = false;
                     break;
@@ -5859,24 +6255,75 @@ pub(crate) fn fuse_boxing_alloc_with(
                     // (`zero_contents` recurses into an inlined STRUCT;
                     // `heaptracker.all_fielddescrs` numbers those leaves on
                     // the GC owner as dotted `int_items.block`). A missing or
-                    // conflicting by-value store, or a value that is not a
-                    // constructor of empty leaves, leaves `malloc_typed`
-                    // residual. Empty leaves stay zero-filled
-                    // (`clear_gc_fields`); live inner stores become payload
-                    // setfields of the fused object.
+                    // conflicting by-value store, or a non-variable nested
+                    // value, leaves `malloc_typed` residual. Empty constructor
+                    // leaves stay zero-filled (`clear_gc_fields`); live inner
+                    // stores become payload setfields of the fused object.
+                    // A finished nested value (`IntArray::empty`) has no
+                    // inner `FieldWrite`s in this graph, so each leaf is
+                    // `FieldRead` from that value — the same copy
+                    // `lower_inlined_struct_field_writes` emits.
+                    // Inner leaves are read at the outer by-value store, not
+                    // at the allocation: a later store to `nested.ptr` does
+                    // not change the copied value. `BaseMallocRemover.flowin_op`
+                    // processes field assignments in order and keeps the value
+                    // that belongs to each assignment.
                     let site = (rewrite_bi, rewrite_oi);
-                    if let Some(leaves) = expand_inline_struct(level_owner, field_name) {
-                        let Some(store) = unique_store(graph, level, field_name.as_str(), site)
-                        else {
-                            complete = false;
-                            break 'levels;
+                    if let Some((nested_owner, nested_owner_id, leaves)) =
+                        expand_inline_struct(level_owner, field_name)
+                    {
+                        // A deeper inlined struct is left residual because
+                        // `collect_by_value_struct_leaves` returns those leaves
+                        // with the sub-STRUCT's own declaring owner and a bare
+                        // name, without the intermediate path, so
+                        // `outer.payload.inner.x` would be spelled `payload.x`.
+                        // `heaptracker.all_fielddescrs` recurses keeping each
+                        // sub-STRUCT's own descrs;
+                        // `BaseMallocRemover._try_inline_malloc` returns False
+                        // for a shape it does not support.
+                        let dotted_prefix = format!("{field_name}.");
+                        let mut seen_write_names: Vec<String> = Vec::new();
+                        for (leaf, _) in &leaves {
+                            let owner_ok = leaf.owner_root.as_deref()
+                                == Some(nested_owner.as_str())
+                                && match (leaf.owner_id, nested_owner_id) {
+                                    (Some(leaf_id), Some(nested_id)) => leaf_id == nested_id,
+                                    _ => true,
+                                };
+                            if !owner_ok {
+                                complete = false;
+                                break 'levels;
+                            }
+                            let write_name = if leaf.name.starts_with(&dotted_prefix) {
+                                leaf.name.clone()
+                            } else {
+                                format!("{dotted_prefix}{}", leaf.name)
+                            };
+                            if seen_write_names.iter().any(|n| n == &write_name) {
+                                complete = false;
+                                break 'levels;
+                            }
+                            seen_write_names.push(write_name);
+                        }
+                        let store = match unique_store_at_each(
+                            graph,
+                            level,
+                            field_name.as_str(),
+                            level_locations,
+                        ) {
+                            StoreAtEach::Agreed(store) => store,
+                            StoreAtEach::Missing | StoreAtEach::Conflict => {
+                                complete = false;
+                                break 'levels;
+                            }
                         };
                         let Some(nested) = store.value.as_variable() else {
                             complete = false;
                             break 'levels;
                         };
                         let nested_is_ctor = is_synthetic_ctor_result(graph, nested);
-                        let mut saw_leaf = false;
+                        let mut missing_leaves = Vec::new();
+                        let mut explicit_leaf = false;
                         for (leaf, leaf_ty) in leaves {
                             let inner_name = leaf
                                 .name
@@ -5884,47 +6331,110 @@ pub(crate) fn fuse_boxing_alloc_with(
                                 .and_then(|rest| rest.strip_prefix('.'))
                                 .unwrap_or(leaf.name.as_str())
                                 .to_string();
-                            match unique_store(graph, nested, &inner_name, site) {
-                                Some(inner) => {
-                                    let field = if leaf.name.starts_with(&format!("{field_name}."))
-                                    {
-                                        leaf
-                                    } else {
-                                        FieldDescriptor::new(
-                                            format!("{field_name}.{}", leaf.name),
-                                            Some(level_owner.clone()),
-                                        )
-                                        .with_owner_id(
-                                            majit_ir::descr::struct_id_for_name(level_owner),
-                                        )
-                                    };
+                            let write_field = if leaf.name.starts_with(&dotted_prefix) {
+                                leaf.clone()
+                            } else {
+                                FieldDescriptor::new(
+                                    format!("{dotted_prefix}{}", leaf.name),
+                                    Some(level_owner.clone()),
+                                )
+                                .with_owner_id(majit_ir::descr::struct_id_for_name(level_owner))
+                            };
+                            match unique_store_at_each(graph, nested, &inner_name, &store.locations)
+                            {
+                                StoreAtEach::Agreed(inner) => {
+                                    explicit_leaf = true;
                                     payloads.push(Payload {
-                                        field,
+                                        field: write_field,
                                         value: inner.value.clone(),
                                         ty: leaf_ty,
+                                        read_leaf: None,
                                     });
-                                    saw_leaf = true;
                                 }
-                                None if any_store(graph, nested, &inner_name) => {
+                                StoreAtEach::Missing => {
+                                    if !any_store(graph, nested, &inner_name) {
+                                        missing_leaves.push((
+                                            write_field,
+                                            leaf,
+                                            leaf_ty,
+                                            inner_name,
+                                        ));
+                                    } else {
+                                        complete = false;
+                                        break 'levels;
+                                    }
+                                }
+                                StoreAtEach::Conflict => {
                                     complete = false;
                                     break 'levels;
                                 }
-                                None => {}
                             }
                         }
-                        if !saw_leaf && !nested_is_ctor {
+                        // The lifetime check is about leaf VALUES the pass
+                        // reuses statically. Apply it only when at least one
+                        // leaf takes its value from an explicit store
+                        // (`unique_store` / `unique_store_at_each`). When
+                        // every leaf is a `read_leaf` FieldRead at the copy,
+                        // skip: a getfield sees the value at that point
+                        // (`BaseMallocRemover.flowin_op`); uses after the
+                        // copy stay covered by `nested_escapes_after_copy`.
+                        if explicit_leaf
+                            && lifetime_has_unsupported_use(graph, nested, &|loc, _| {
+                                store.locations.contains(&loc)
+                            })
+                        {
+                            crate::decline::record(
+                                FUSE_GATE,
+                                "nested-lifetime-has-unsupported-use",
+                                format_args!("{owner} in {}", graph.name),
+                            );
                             complete = false;
                             break 'levels;
                         }
+                        if !nested_is_ctor {
+                            // BaseMallocRemover._try_inline_malloc checks every
+                            // use of the variable and returns False (leaves the
+                            // malloc) for any use it does not support.
+                            if !missing_leaves.is_empty()
+                                && nested_escapes_after_copy(graph, nested, &store.locations, site)
+                            {
+                                complete = false;
+                                break 'levels;
+                            }
+                            for (write_field, leaf, leaf_ty, inner_name) in missing_leaves {
+                                let read_leaf = if leaf.name == inner_name {
+                                    leaf
+                                } else {
+                                    FieldDescriptor::new(inner_name, leaf.owner_root.clone())
+                                        .with_owner_id(leaf.owner_id)
+                                };
+                                payloads.push(Payload {
+                                    field: write_field,
+                                    value: LinkArg::Value(nested.clone()),
+                                    ty: leaf_ty,
+                                    read_leaf: Some((nested.clone(), read_leaf)),
+                                });
+                            }
+                        }
                         continue;
                     }
-                    let found = unique_store(graph, level, field_name.as_str(), site)
-                        .map(|store| (store.field.clone(), store.value.clone()));
+                    let found = match unique_store_at_each(
+                        graph,
+                        level,
+                        field_name.as_str(),
+                        level_locations,
+                    ) {
+                        StoreAtEach::Agreed(store) => {
+                            Some((store.field.clone(), store.value.clone()))
+                        }
+                        StoreAtEach::Missing | StoreAtEach::Conflict => None,
+                    };
                     match found {
                         Some((field, value)) => payloads.push(Payload {
                             field,
                             value,
                             ty: payload_ty.clone(),
+                            read_leaf: None,
                         }),
                         None => {
                             complete = false;
@@ -5953,7 +6463,8 @@ pub(crate) fn fuse_boxing_alloc_with(
                 );
                 continue;
             }
-            let (header_agg, _) = chain.last().expect("the chain holds the aggregate itself");
+            let (header_agg, _, header_locations) =
+                chain.last().expect("the chain holds the aggregate itself");
             // Leave the cluster unfused when the `ob_header.ob_type` store
             // carries no resolvable constant type-pointer.  A `NewWithVtable`
             // requires a non-zero type pointer — a zero vtable would stamp a
@@ -5973,8 +6484,7 @@ pub(crate) fn fuse_boxing_alloc_with(
             // `model::resolve_header_plan` rows are where that is recorded,
             // and this row is the count of clusters the fuse gave up on for
             // any header reason at all.
-            let Some(header) = resolve_header_plan(graph, header_agg, (rewrite_bi, rewrite_oi))
-            else {
+            let Some(header) = resolve_header_plan(graph, header_agg, header_locations) else {
                 crate::decline::record(
                     FUSE_GATE,
                     "vtable-unresolved",
@@ -6022,7 +6532,41 @@ pub(crate) fn fuse_boxing_alloc_with(
     // can invert allocation order inside one block.
     sites.sort_by_key(|site| (site.block, site.op));
     while let Some(site) = sites.pop() {
-        let inserted = usize::from(site.w_class.is_some()) + site.payloads.len();
+        let mut extras = Vec::new();
+        for payload in site.w_class.into_iter().chain(site.payloads) {
+            if let Some((source, read_leaf)) = payload.read_leaf {
+                let read = graph.alloc_value_var();
+                extras.push(SpaceOperation {
+                    result: Some(read.clone()),
+                    kind: OpKind::FieldRead {
+                        base: source,
+                        field: read_leaf,
+                        ty: payload.ty.clone(),
+                        pure: false,
+                    },
+                });
+                extras.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: site.result.clone(),
+                        field: payload.field,
+                        value: LinkArg::Value(read),
+                        ty: payload.ty,
+                    },
+                });
+            } else {
+                extras.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: site.result.clone(),
+                        field: payload.field,
+                        value: payload.value,
+                        ty: payload.ty,
+                    },
+                });
+            }
+        }
+        let inserted = extras.len();
         {
             let block = &mut graph.blocks[site.block];
             block.operations[site.op] = SpaceOperation {
@@ -6043,20 +6587,10 @@ pub(crate) fn fuse_boxing_alloc_with(
             // Each is a plain `FieldWrite` the assembler lowers to its own
             // `setfield_gc`, which is the shape
             // `Transformer.rewrite_op_malloc` leaves every field the allocation
-            // itself does not carry.
-            for (k, payload) in site.w_class.into_iter().chain(site.payloads).enumerate() {
-                block.operations.insert(
-                    site.op + 1 + k,
-                    SpaceOperation {
-                        result: None,
-                        kind: OpKind::FieldWrite {
-                            base: site.result.clone(),
-                            field: payload.field,
-                            value: payload.value,
-                            ty: payload.ty,
-                        },
-                    },
-                );
+            // itself does not carry. A finished nested value is copied leaf
+            // by leaf (`FieldRead` then `FieldWrite`) first.
+            for (k, extra) in extras.into_iter().enumerate() {
+                block.operations.insert(site.op + 1 + k, extra);
             }
         }
         for remaining in &mut sites {
@@ -11858,10 +12392,14 @@ mod tests {
         };
         let expand = |owner: &str, field: &str| {
             (owner == "Outer" && field == "inner").then(|| {
-                vec![
-                    (inner_leaf("head"), ValueType::Ref(None)),
-                    (inner_leaf("meta"), ValueType::Ref(None)),
-                ]
+                (
+                    "Inner".to_string(),
+                    None,
+                    vec![
+                        (inner_leaf("head"), ValueType::Ref(None)),
+                        (inner_leaf("meta"), ValueType::Ref(None)),
+                    ],
+                )
             })
         };
         assert_eq!(lower_struct_ptr_writes_with(&mut graph, &attrs, &expand), 1);
@@ -11931,10 +12469,14 @@ mod tests {
         };
         let expand = |owner: &str, field: &str| {
             (owner == "Outer" && field == "inner").then(|| {
-                vec![
-                    (inner_leaf("head"), ValueType::Ref(None)),
-                    (inner_leaf("meta"), ValueType::Ref(None)),
-                ]
+                (
+                    "Inner".to_string(),
+                    None,
+                    vec![
+                        (inner_leaf("head"), ValueType::Ref(None)),
+                        (inner_leaf("meta"), ValueType::Ref(None)),
+                    ],
+                )
             })
         };
         assert_eq!(
@@ -13658,6 +14200,153 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_header_w_class_is_read_at_the_copy() {
+        // `h.w_class = K1; agg.ob_header = h; h.w_class = K2; malloc` snapshots
+        // the header at the copy (`BaseMallocRemover.flowin_op`). K1 is
+        // `get_instantiate` of another type, so the vtable cannot stand for it
+        // and the kept store must carry K1, never K2.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(args),
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn instantiate_of(graph: &mut FunctionGraph, blk: BlockId, addr: i64) -> Var {
+            let arg = graph
+                .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
+                .unwrap();
+            call(
+                graph,
+                blk,
+                &["runtime_object", "object_model", "get_instantiate"],
+                vec![arg],
+            )
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let ob_type = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
+            .unwrap();
+        let k1 = instantiate_of(&mut graph, entry, OTHER_TYPE_ADDR);
+        let k2 = instantiate_of(&mut graph, entry, FLOAT_TYPE_ADDR);
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        graph.push_op_var(entry, field(&header, "w_class", "PyObject", &k1), false);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", "W_FloatObject", &header),
+            false,
+        );
+        graph.push_op_var(entry, field(&header, "w_class", "PyObject", &k2), false);
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", "W_FloatObject", &payload),
+            false,
+        );
+        let ret = call(
+            &mut graph,
+            entry,
+            &[
+                crate::runtime_names::crates::OBJECT,
+                "lltype",
+                "malloc_typed",
+            ],
+            vec![agg],
+        );
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()), 1);
+        let result = match &graph.block(entry).operations.iter().find_map(|op| {
+            matches!(op.kind, OpKind::NewWithVtable { .. }).then(|| op.result.clone())
+        }) {
+            Some(Some(result)) => result.clone(),
+            _ => panic!("no NewWithVtable was emitted"),
+        };
+        let kept: Vec<_> = graph
+            .block(entry)
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &result && field.name == "w_class" => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kept,
+            vec![LinkArg::Value(k1)],
+            "the kept w_class must be the value stored before the header copy"
+        );
+        assert_ne!(
+            kept[0],
+            LinkArg::Value(k2),
+            "a w_class store after the copy must not become the fused payload"
+        );
+    }
+
+    #[test]
     fn fuse_boxing_alloc_resolves_an_aggregate_that_crosses_a_link() {
         // The *aggregate* crosses the boundary, not only its header.
         // `w_float_new` builds the whole `W_FloatObject` up front and then
@@ -13948,6 +14637,8 @@ mod tests {
         // A cluster built before a branch may be rewritten on one arm. Reaching
         // stores that disagree across paths must decline (`BaseMallocRemover.flowin`
         // keeps one value per path); redundant stores of the same value may still fuse.
+        // A rewrite of the header source after `agg.ob_header = h` does not
+        // change the copied header: `flowin_op` snapshots fields at the copy.
         type Var = crate::flowspace::model::Variable;
         const FLOAT_TYPE_ADDR: i64 = 4357049520;
         const OTHER_TYPE_ADDR: i64 = 4357049600;
@@ -14148,7 +14839,7 @@ mod tests {
             ("floatval rewritten on one arm", &payload_again, 0),
             ("floatval restored to the same value", &payload_same, 1),
             ("ob_header rewritten on one arm", &header_again, 0),
-            ("ob_type rewritten on one arm", &obtype_again, 0),
+            ("ob_type rewritten on one arm", &obtype_again, 1),
         ];
         for (row, rewrite, expected) in rows {
             let (mut graph, join) = cluster(rewrite);
@@ -14515,6 +15206,301 @@ mod tests {
     }
 
     #[test]
+    fn fuse_boxing_alloc_header_ob_type_is_read_at_the_copy() {
+        // `h.ob_type = T1; agg.ob_header = h; h.ob_type = T2; malloc` stamps
+        // `NewWithVtable` from T1, the value at the copy
+        // (`BaseMallocRemover.flowin_op`).
+        type Var = crate::flowspace::model::Variable;
+        const T1: i64 = 4357049520;
+        const T2: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(args),
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let t1 = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(T1), true)
+            .unwrap();
+        let t2 = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(T2), true)
+            .unwrap();
+        let instantiate_arg = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(T1), true)
+            .unwrap();
+        let w_class = call(
+            &mut graph,
+            entry,
+            &["runtime_object", "object_model", "get_instantiate"],
+            vec![instantiate_arg],
+        );
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(entry, field(&header, "ob_type", "PyObject", &t1), false);
+        graph.push_op_var(
+            entry,
+            field(&header, "w_class", "PyObject", &w_class),
+            false,
+        );
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", "W_FloatObject", &header),
+            false,
+        );
+        graph.push_op_var(entry, field(&header, "ob_type", "PyObject", &t2), false);
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", "W_FloatObject", &payload),
+            false,
+        );
+        let ret = call(
+            &mut graph,
+            entry,
+            &[
+                crate::runtime_names::crates::OBJECT,
+                "lltype",
+                "malloc_typed",
+            ],
+            vec![agg],
+        );
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()), 1);
+        let vtables: Vec<i64> = graph
+            .block(entry)
+            .operations
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::NewWithVtable { vtable, .. } => Some(*vtable),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            vtables,
+            vec![T1],
+            "the vtable must be the ob_type at the copy"
+        );
+        assert_ne!(
+            vtables[0], T2,
+            "an ob_type store after the copy must not stamp the vtable"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_header_copies_disagree_declines() {
+        // Two branches each copy `h` into `agg.ob_header`, one after
+        // `h.w_class = K1` and the other after `h.w_class = K2`. The copies
+        // snapshot different class words (`BaseMallocRemover.flowin`), so
+        // fusion must leave the residual allocation.
+        type Var = crate::flowspace::model::Variable;
+        const FLOAT_TYPE_ADDR: i64 = 4357049520;
+        const OTHER_TYPE_ADDR: i64 = 4357049600;
+
+        fn call(graph: &mut FunctionGraph, blk: BlockId, path: &[&str], args: Vec<Var>) -> Var {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.iter().map(|s| (*s).to_string()).collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(args),
+                        result_ty: ValueType::Ref(Some("object".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        }
+        fn instantiate_of(graph: &mut FunctionGraph, blk: BlockId, addr: i64) -> Var {
+            let arg = graph
+                .push_op_var(blk, OpKind::ConstRefAddr(addr), true)
+                .unwrap();
+            call(
+                graph,
+                blk,
+                &["runtime_object", "object_model", "get_instantiate"],
+                vec![arg],
+            )
+        }
+        fn field(base: &Var, name: &str, owner: &str, value: &Var) -> OpKind {
+            OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some(owner.into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty: ValueType::Ref(None),
+            }
+        }
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let ob_type = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(FLOAT_TYPE_ADDR), true)
+            .unwrap();
+        let k1 = instantiate_of(&mut graph, entry, OTHER_TYPE_ADDR);
+        let k2 = instantiate_of(&mut graph, entry, FLOAT_TYPE_ADDR);
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("PyObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("PyObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", "W_FloatObject", &payload),
+            false,
+        );
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (arm_a, _) = graph.create_block_with_arg_vars(0);
+        let (arm_b, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::from_variables(&graph, vec![], arm_a, Some(ExitCase::Bool(true))),
+                Link::from_variables(&graph, vec![], arm_b, Some(ExitCase::Bool(false))),
+            ],
+        );
+        graph.push_op_var(arm_a, field(&header, "w_class", "PyObject", &k1), false);
+        graph.push_op_var(
+            arm_a,
+            field(&agg, "ob_header", "W_FloatObject", &header),
+            false,
+        );
+        graph.push_op_var(arm_b, field(&header, "w_class", "PyObject", &k2), false);
+        graph.push_op_var(
+            arm_b,
+            field(&agg, "ob_header", "W_FloatObject", &header),
+            false,
+        );
+        let (join, _) = graph.create_block_with_arg_vars(0);
+        graph.set_goto(arm_a, join, vec![]);
+        graph.set_goto(arm_b, join, vec![]);
+        let ret = call(
+            &mut graph,
+            join,
+            &[
+                crate::runtime_names::crates::OBJECT,
+                "lltype",
+                "malloc_typed",
+            ],
+            vec![agg],
+        );
+        graph.set_return(join, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "disagreeing header copies must leave malloc residual"
+        );
+        let ops = &graph.block(join).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "no fused allocation when header copies disagree"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed")
+            )),
+            "malloc_typed must remain"
+        );
+    }
+
+    #[test]
     fn fuse_boxing_alloc_sweeps_nested_header_chain() {
         // Faithful `w_float_new` shape: the boxing struct's header is a nested
         // `PyObject` ctor whose `ob_type` is a `__cast_instance_intrinsic` pointer
@@ -14808,8 +15794,9 @@ mod tests {
             "a pointer field zero must not lend its header to the outer owner"
         );
 
-        let base_is_inlined =
-            |owner: &str, field: &str| (owner == "Derived" && field == "base").then(Vec::new);
+        let base_is_inlined = |owner: &str, field: &str| {
+            (owner == "Derived" && field == "base").then(|| ("Base".to_string(), None, Vec::new()))
+        };
         assert_eq!(
             fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
             1
@@ -14855,6 +15842,126 @@ mod tests {
             )),
             "every level of the dead aggregate chain must be swept: {:#?}",
             ops.iter().map(|o| &o.kind).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_first_struct_parent_field_is_read_at_the_copy() {
+        // `parent.x = A; child.base = parent; parent.x = B; malloc(child)`
+        // reads the parent at the copy into the child (`BaseMallocRemover.flowin`).
+        // The fused payload for `args` must be A, never B.
+        type Var = crate::flowspace::model::Variable;
+        let cast_instance = |to: &str, arg: &Var| crate::model::cast_instance_call(to, arg.clone());
+        let field = |base: &Var, name: &str, owner: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor::new(name, Some(owner.to_string())),
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let ctor = |name: &str| OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor(name),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Ref(Some(name.into())),
+        };
+        let mut attrs = numeric_boxing_attrs();
+        attrs.insert(
+            "Base".to_string(),
+            vec![
+                ("ob_header".to_string(), ValueType::Ref(None)),
+                ("args".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        attrs.insert(
+            "Derived".to_string(),
+            vec![
+                ("base".to_string(), ValueType::Ref(Some("Base".into()))),
+                ("extra".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let w_class = graph.alloc_value_var();
+        let args_a = graph.alloc_value_var();
+        let args_b = graph.alloc_value_var();
+        let extra = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![
+            w_class.clone(),
+            args_a.clone(),
+            args_b.clone(),
+            extra.clone(),
+        ];
+        let ty_addr = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(4357049520), true)
+            .unwrap();
+        let ob_type = graph
+            .push_op_var(entry, cast_instance("PyType", &ty_addr), true)
+            .unwrap();
+        let header = graph.push_op_var(entry, ctor("PyObject"), true).unwrap();
+        graph.push_op_var(
+            entry,
+            field(&header, "ob_type", "PyObject", &ob_type),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&header, "w_class", "PyObject", &w_class),
+            false,
+        );
+        let base = graph.push_op_var(entry, ctor("Base"), true).unwrap();
+        graph.push_op_var(entry, field(&base, "ob_header", "Base", &header), false);
+        graph.push_op_var(entry, field(&base, "args", "Base", &args_a), false);
+        let agg = graph.push_op_var(entry, ctor("Derived"), true).unwrap();
+        graph.push_op_var(entry, field(&agg, "base", "Derived", &base), false);
+        graph.push_op_var(entry, field(&base, "args", "Base", &args_b), false);
+        graph.push_op_var(entry, field(&agg, "extra", "Derived", &extra), false);
+        let raw = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("Derived".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(raw.clone()));
+
+        let base_is_inlined = |owner: &str, field: &str| {
+            (owner == "Derived" && field == "base").then(|| ("Base".to_string(), None, Vec::new()))
+        };
+        assert_eq!(
+            fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
+            1
+        );
+        prune_dead_boxing_remnants(&mut graph);
+
+        let ops = &graph.block(entry).operations;
+        let stores: Vec<(&str, Option<&str>, &LinkArg)> = ops
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &raw => {
+                    Some((field.name.as_str(), field.owner_root.as_deref(), value))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stores,
+            vec![
+                ("w_class", Some("PyObject"), &LinkArg::Value(w_class)),
+                ("args", Some("Base"), &LinkArg::Value(args_a)),
+                ("extra", Some("Derived"), &LinkArg::Value(extra)),
+            ],
         );
     }
 
@@ -15156,21 +16263,25 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some(vec![(
-                FieldDescriptor {
-                    name: "int_items.block".into(),
-                    owner_root: Some("W_ListObject".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                    inline_vec: false,
-                    vec_part: None,
-                    owner_declared_gc: None,
-                    host_index: None,
-                    scalar_word: None,
-                },
-                ValueType::Ref(None),
-            )])
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "W_ListObject".to_string(),
+                None,
+                vec![(
+                    FieldDescriptor {
+                        name: "int_items.block".into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Ref(None),
+                )],
+            ))
         };
         let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
@@ -15200,6 +16311,1478 @@ mod tests {
                 "strategy".to_string(),
             ],
             "inlined nested int_items must not become a payload store on the fused result"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_copies_finished_nested_struct_leaves() {
+        // Production `w_list_adopt_int_items` stores `IntArray::empty()`, a
+        // residual call, not a `SyntheticTransparentCtor`. There are no inner
+        // `FieldWrite`s on that result; `heaptracker.all_fielddescrs` still
+        // numbers the leaves, so fusion copies them as dotted payloads
+        // (`lower_inlined_struct_field_writes`).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "int_array".into(),
+                            "IntArray".into(),
+                            "empty".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let leaf = |name: &str| FieldDescriptor {
+            name: name.into(),
+            owner_root: Some("IntArray".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "IntArray".to_string(),
+                None,
+                vec![
+                    (leaf("block"), ValueType::Ref(None)),
+                    (leaf("len"), ValueType::Int),
+                ],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(fused, 1, "the list boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut writes: Vec<String> = Vec::new();
+        let mut reads: Vec<(String, crate::flowspace::model::Variable)> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            match &op.kind {
+                OpKind::FieldWrite { base, field, .. } if base == &ret => {
+                    writes.push(field.name.clone());
+                }
+                OpKind::FieldRead { base, field, .. } if base == &nested => {
+                    reads.push((field.name.clone(), base.clone()));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            writes,
+            vec![
+                "allocated".to_string(),
+                "items".to_string(),
+                "strategy".to_string(),
+                "int_items.block".to_string(),
+                "int_items.len".to_string(),
+            ],
+            "finished nested IntArray leaves must become dotted payload stores"
+        );
+        assert_eq!(
+            reads.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["block", "len"],
+            "each dotted payload is FieldRead from the empty() result"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_two_level_nested_struct_leaves() {
+        // `collect_by_value_struct_leaves` recurses into a by-value struct
+        // inside the nested field and returns those deeper leaves with the
+        // inner STRUCT's own owner and a bare name. `payload.inner.x` would
+        // be spelled `payload.x`; leave `malloc_typed` residual, matching
+        // `BaseMallocRemover._try_inline_malloc` declining a shape it does
+        // not support (`heaptracker.all_fielddescrs` keeps each sub-STRUCT's
+        // own descrs).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("Payload"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("Payload".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested),
+                ValueType::Ref(Some("Payload".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("Payload".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let inner_leaf = |name: &str| FieldDescriptor {
+            name: name.into(),
+            owner_root: Some("Inner".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "Payload".to_string(),
+                None,
+                vec![
+                    (inner_leaf("x"), ValueType::Int),
+                    (inner_leaf("y"), ValueType::Int),
+                ],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 0,
+            "a two-level nested struct must leave malloc_typed residual"
+        );
+        let ops = &graph.block(entry).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "no fused allocation for a two-level nested struct"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed_managed")
+            )),
+            "malloc_typed_managed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_nested_leaf_keeps_value_at_copy() {
+        // `nested.ptr = null; outer.nested = nested; nested.ptr = p;
+        // malloc_typed(outer)` copies the nested value at the outer store.
+        // The fused dotted leaf must be `null`, the value at that copy;
+        // a later store on `nested` does not rewrite the copied payload.
+        // `BaseMallocRemover.flowin_op` processes field assignments in order.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested_null = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let nested_later = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+            .unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let nested_field =
+            |name: &str, value: crate::flowspace::model::Variable| OpKind::FieldWrite {
+                base: nested.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(entry, nested_field("block", nested_null.clone()), false);
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        graph.push_op_var(entry, nested_field("block", nested_later.clone()), false);
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "W_ListObject".to_string(),
+                None,
+                vec![(
+                    FieldDescriptor {
+                        name: "int_items.block".into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Ref(None),
+                )],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(fused, 1, "the list boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut got: Vec<(String, Option<crate::flowspace::model::Variable>)> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &ret => {
+                    got.push((field.name.clone(), value.as_variable().cloned()));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["allocated", "items", "strategy", "int_items.block"],
+            "live nested int_items.block must become a payload store on the fused result"
+        );
+        assert_eq!(
+            got[3].1.as_ref(),
+            Some(&nested_null),
+            "the fused int_items.block must be the leaf stored before the by-value copy"
+        );
+        assert_ne!(
+            got[3].1.as_ref(),
+            Some(&nested_later),
+            "a store to nested.block after the copy must not become the fused payload"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_nested_leaf_declines_on_disagreeing_copy_paths() {
+        // Two branches each write a different constant into `nested.block`
+        // then copy the same `nested` into `outer.int_items`. Fusion must
+        // not pick the first copy's leaf for both paths;
+        // `BaseMallocRemover.flowin` keeps one flattened map per path.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested_a = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        let nested_b = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+            .unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let nested_field =
+            |name: &str, value: crate::flowspace::model::Variable| OpKind::FieldWrite {
+                base: nested.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            };
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (arm_a, _) = graph.create_block_with_arg_vars(0);
+        let (arm_b, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::from_variables(&graph, vec![], arm_a, Some(ExitCase::Bool(true))),
+                Link::from_variables(&graph, vec![], arm_b, Some(ExitCase::Bool(false))),
+            ],
+        );
+        graph.push_op_var(arm_a, nested_field("block", nested_a), false);
+        graph.push_op_var(
+            arm_a,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        graph.push_op_var(arm_b, nested_field("block", nested_b), false);
+        graph.push_op_var(
+            arm_b,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let (join, _) = graph.create_block_with_arg_vars(0);
+        graph.set_goto(arm_a, join, vec![]);
+        graph.set_goto(arm_b, join, vec![]);
+        let ret = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(join, Some(ret));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "W_ListObject".to_string(),
+                None,
+                vec![(
+                    FieldDescriptor {
+                        name: "int_items.block".into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Ref(None),
+                )],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 0,
+            "disagreeing nested leaves across copy paths must leave malloc residual"
+        );
+        let ops = &graph.block(join).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "no fused allocation when nested leaves disagree across copies"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed_managed")
+            )),
+            "malloc_typed_managed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_nested_leaf_agreeing_copy_paths_still_fuse() {
+        // Same diamond as the disagreeing-path decline, but both arms
+        // write the same nested.block value. Fusion keeps that value.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested_val = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let nested_field =
+            |name: &str, value: crate::flowspace::model::Variable| OpKind::FieldWrite {
+                base: nested.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value),
+                ty: ValueType::Ref(None),
+            };
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (arm_a, _) = graph.create_block_with_arg_vars(0);
+        let (arm_b, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::from_variables(&graph, vec![], arm_a, Some(ExitCase::Bool(true))),
+                Link::from_variables(&graph, vec![], arm_b, Some(ExitCase::Bool(false))),
+            ],
+        );
+        graph.push_op_var(arm_a, nested_field("block", nested_val.clone()), false);
+        graph.push_op_var(
+            arm_a,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        graph.push_op_var(arm_b, nested_field("block", nested_val.clone()), false);
+        graph.push_op_var(
+            arm_b,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let (join, _) = graph.create_block_with_arg_vars(0);
+        graph.set_goto(arm_a, join, vec![]);
+        graph.set_goto(arm_b, join, vec![]);
+        let ret = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(join, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "W_ListObject".to_string(),
+                None,
+                vec![(
+                    FieldDescriptor {
+                        name: "int_items.block".into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Ref(None),
+                )],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 1,
+            "agreeing nested leaves across copy paths must fuse"
+        );
+
+        let ops = &graph.block(join).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut got: Vec<(String, Option<crate::flowspace::model::Variable>)> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            match &op.kind {
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } if base == &ret => {
+                    got.push((field.name.clone(), value.as_variable().cloned()));
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["allocated", "items", "strategy", "int_items.block"],
+            "live nested int_items.block must become a payload store on the fused result"
+        );
+        assert_eq!(
+            got[3].1.as_ref(),
+            Some(&nested_val),
+            "the fused int_items.block must be the value both copies agree on"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_nested_read_back_declines_after_escaping_call() {
+        // `nested` comes from a non-ctor helper. After the by-value copy
+        // into `outer.int_items`, a residual call takes `nested`; a later
+        // `FieldRead` of a missing leaf would see that mutation.
+        // `BaseMallocRemover._try_inline_malloc` leaves the malloc for an
+        // unsupported use.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "int_array".into(),
+                            "IntArray".into(),
+                            "empty".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["helper".into(), "touch_nested".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![nested.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let leaf = |name: &str| FieldDescriptor {
+            name: name.into(),
+            owner_root: Some("IntArray".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "IntArray".to_string(),
+                None,
+                vec![
+                    (leaf("block"), ValueType::Ref(None)),
+                    (leaf("len"), ValueType::Int),
+                ],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 0,
+            "an escaping call of nested after the copy must leave malloc residual"
+        );
+        let ops = &graph.block(entry).operations;
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
+            "no fused allocation after nested escapes"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed_managed")
+            )),
+            "malloc_typed_managed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_nested_read_back_ignores_call_before_copy() {
+        // The same residual call as the escaping-call decline, but it
+        // runs before the by-value copy, so a read-back leaf still
+        // observes the copied value.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "int_array".into(),
+                            "IntArray".into(),
+                            "empty".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["helper".into(), "touch_nested".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![nested.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let leaf = |name: &str| FieldDescriptor {
+            name: name.into(),
+            owner_root: Some("IntArray".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "IntArray".to_string(),
+                None,
+                vec![
+                    (leaf("block"), ValueType::Ref(None)),
+                    (leaf("len"), ValueType::Int),
+                ],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 1,
+            "a call of nested before the copy must not block read-back fusion"
+        );
+
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut writes: Vec<String> = Vec::new();
+        let mut reads: Vec<String> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            match &op.kind {
+                OpKind::FieldWrite { base, field, .. } if base == &ret => {
+                    writes.push(field.name.clone());
+                }
+                OpKind::FieldRead { base, field, .. } if base == &nested => {
+                    reads.push(field.name.clone());
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            writes,
+            vec![
+                "allocated".to_string(),
+                "items".to_string(),
+                "strategy".to_string(),
+                "int_items.block".to_string(),
+                "int_items.len".to_string(),
+            ],
+            "finished nested IntArray leaves must become dotted payload stores"
+        );
+        assert_eq!(
+            reads.iter().map(String::as_str).collect::<Vec<_>>(),
+            vec!["block", "len"],
+            "each dotted payload is FieldRead from the empty() result"
         );
     }
 
@@ -15358,21 +17941,25 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some(vec![(
-                FieldDescriptor {
-                    name: "int_items.block".into(),
-                    owner_root: Some("W_ListObject".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                    inline_vec: false,
-                    vec_part: None,
-                    owner_declared_gc: None,
-                    host_index: None,
-                    scalar_word: None,
-                },
-                ValueType::Ref(None),
-            )])
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "W_ListObject".to_string(),
+                None,
+                vec![(
+                    FieldDescriptor {
+                        name: "int_items.block".into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Ref(None),
+                )],
+            ))
         };
         let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
@@ -16088,6 +18675,720 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_an_alias_write() {
+        // `a.x = 1; a.x = 2; alias = cast(a); alias.x = 3; malloc_typed(a)`:
+        // `unique_store` only reads FieldWrites whose `base` is `a`, so it
+        // would keep `x = 2`. The cast is a use `_try_inline_malloc` does
+        // not support (`BaseMallocRemover.compute_lifetimes`).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let first = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let second = graph
+            .push_op_var(entry, OpKind::ConstFloat(1.0f64.to_bits()), true)
+            .unwrap();
+        let third = graph
+            .push_op_var(entry, OpKind::ConstFloat(2.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(entry, field(&agg, "floatval", LinkArg::Value(first)), false);
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", LinkArg::Value(second)),
+            false,
+        );
+        let alias = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("W_FloatObject", agg.clone()),
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            field(&alias, "floatval", LinkArg::Value(third)),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "a cast alias of the aggregate must leave malloc residual"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_a_nested_source_passed_to_a_call() {
+        // Explicit `nested.<leaf>` stores, then a residual call taking
+        // `nested`, then `outer.<field> = nested`, then `malloc_typed(outer)`.
+        // `_try_inline_malloc` returns False for the call.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested_block = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+            .unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: nested.clone(),
+                field: FieldDescriptor {
+                    name: "block".into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(nested_block),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["helper".into(), "touch_nested".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![nested.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "W_ListObject".to_string(),
+                None,
+                vec![(
+                    FieldDescriptor {
+                        name: "int_items.block".into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Ref(None),
+                )],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 0,
+            "a residual call of the nested source must leave malloc residual"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_a_header_root_that_escapes() {
+        // The header ctor `h` is passed to a call before `agg.ob_header = h`.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let v = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["helper".into(), "touch_header".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![header.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(entry, field(&agg, "floatval", LinkArg::Value(v)), false);
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "a header passed to a call must leave malloc residual"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_an_unclaimed_ptr_write_of_the_aggregate() {
+        // An extra `core::ptr::write` taking the aggregate that is not the
+        // unique write `ptr_write_into` claims for an uninit cluster, and
+        // that still reaches `malloc_typed`, is a use `_try_inline_malloc`
+        // does not support.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let v = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(entry, field(&agg, "floatval", LinkArg::Value(v)), false);
+        let dest = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1000), true)
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::function_path(["core", "ptr", "write"]),
+                args: crate::model::call_args(vec![dest, agg.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "an unclaimed ptr::write of the aggregate must leave malloc residual"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must remain"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_explicit_nested_leaf_then_call() {
+        // Nested ctor with explicit leaf stores, then a call taking
+        // `nested`, then the outer copy, then `malloc_typed`. The pass
+        // reuses those stored leaf values statically, so the call is a
+        // use `_try_inline_malloc` does not support.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested_block = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x2000), true)
+            .unwrap();
+        let nested_len = graph.push_op_var(entry, OpKind::ConstInt(3), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("IntArray"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let nested_field =
+            |name: &str, value: &crate::flowspace::model::Variable, ty| OpKind::FieldWrite {
+                base: nested.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value.clone()),
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            nested_field("block", &nested_block, ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            nested_field("len", &nested_len, ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["helper".into(), "touch_nested".into()],
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![nested.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let leaf = |name: &str| FieldDescriptor {
+            name: name.into(),
+            owner_root: Some("IntArray".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some((
+                "IntArray".to_string(),
+                None,
+                vec![
+                    (leaf("block"), ValueType::Ref(None)),
+                    (leaf("len"), ValueType::Int),
+                ],
+            ))
+        };
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(
+            fused, 0,
+            "a call of a nested source with explicit leaf stores must leave malloc residual"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must remain"
+        );
     }
 
     #[test]
