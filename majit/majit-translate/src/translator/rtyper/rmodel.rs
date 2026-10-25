@@ -250,7 +250,11 @@ pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
 )]
 pub(crate) fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
     let flags = HashMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
-    HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags)).map(Hlvalue::Constant)
+    HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags)),
+    )
+    .map(Hlvalue::Constant)
 }
 
 fn rtype_ptr_comparison(r_ptr: &dyn Repr, hop: &HighLevelOp, opname: &str) -> RTypeResult {

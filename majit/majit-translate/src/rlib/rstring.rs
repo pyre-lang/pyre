@@ -10,6 +10,12 @@
 //!
 //! `@jit.elidable` stamps `_elidable_function_` on `_search_elidable`
 //! only. `@specialize` is not a JIT hint.
+//!
+//! `_search_normal` takes `value_can_be_none` for the caller's
+//! `SomeString.can_be_None`. `LLHelpers.ll_search` asserts first, so
+//! its `_search` / `_search_elidable` / `_search_normal` callees pass
+//! `false` and `transform_dead_code` (`transform.py`) cuts the raise
+//! link.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -28,7 +34,7 @@ use crate::model::{
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::lltypesystem::rstr::{
-    chars_array_ptr_lltype_from_strptr, sub_helper_funcptr_constant,
+    chars_array_ptr_lltype_from_strptr, close_assert_ptr_not_none, sub_helper_funcptr_constant,
 };
 use crate::translator::rtyper::rint::signed_repr;
 use crate::translator::rtyper::rlist::{
@@ -38,8 +44,8 @@ use crate::translator::rtyper::rlist::{
 };
 use crate::translator::rtyper::rmodel::{Repr, gc_flavor_const, lowlevel_type_const};
 use crate::translator::rtyper::rtyper::{
-    RPythonTyper, constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
-    void_field_const,
+    RPythonTyper, constant_with_lltype, exception_args, helper_pygraph_from_graph,
+    variable_with_lltype, void_field_const,
 };
 
 /// `rstring.py` `SEARCH_COUNT`.
@@ -685,28 +691,37 @@ fn funcptr_adaptive_find(rtyper: &RPythonTyper, kind: &StringKind) -> Result<Hlv
     )
 }
 
-fn funcptr_search_normal(rtyper: &RPythonTyper, kind: &StringKind) -> Result<Hlvalue, TyperError> {
-    funcptr_helper(
+fn funcptr_search_normal(
+    rtyper: &RPythonTyper,
+    kind: &StringKind,
+    value_can_be_none: bool,
+) -> Result<Hlvalue, TyperError> {
+    let ptr = kind.ptr_lltype.clone();
+    cached_helper_funcptr(
         rtyper,
         "_search_normal",
         search_args(kind),
         LowLevelType::Signed,
-        kind.ptr_lltype.clone(),
-        build_search_normal_helper_graph,
+        move |rtyper| {
+            build_search_normal_helper_graph(rtyper, "_search_normal", ptr, value_can_be_none)
+        },
     )
 }
 
 fn funcptr_search_elidable(
     rtyper: &RPythonTyper,
     kind: &StringKind,
+    value_can_be_none: bool,
 ) -> Result<Hlvalue, TyperError> {
-    funcptr_helper(
+    let ptr = kind.ptr_lltype.clone();
+    cached_helper_funcptr(
         rtyper,
         "_search_elidable",
         search_args(kind),
         LowLevelType::Signed,
-        kind.ptr_lltype.clone(),
-        build_search_elidable_helper_graph,
+        move |rtyper| {
+            build_search_elidable_helper_graph(rtyper, "_search_elidable", ptr, value_can_be_none)
+        },
     )
 }
 
@@ -4892,10 +4907,14 @@ fn emit_adaptive_switch_to_twoway(
 }
 
 /// `rstring.py` `_search` — translation-time `isinstance` dispatch.
+///
+/// `value_can_be_none` is the caller's `SomeString.can_be_None`, forwarded
+/// to `_search_elidable` / `_search_normal`.
 pub(crate) fn build_search_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4914,9 +4933,9 @@ pub(crate) fn build_search_helper_graph(
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
     let callee = if kind.is_unicode() {
-        funcptr_search_normal(rtyper, &kind)?
+        funcptr_search_normal(rtyper, &kind, value_can_be_none)?
     } else {
-        funcptr_search_elidable(rtyper, &kind)?
+        funcptr_search_elidable(rtyper, &kind, value_can_be_none)?
     };
     let res = emit_direct_call(
         &startblock,
@@ -4942,10 +4961,13 @@ pub(crate) fn build_search_helper_graph(
 
 /// `rstring.py` `_search_elidable`. `@jit.elidable` stamps
 /// `_elidable_function_`; the body is `direct_call _search_normal`.
+///
+/// `value_can_be_none` is forwarded to `_search_normal`.
 pub(crate) fn build_search_elidable_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4963,7 +4985,7 @@ pub(crate) fn build_search_elidable_helper_graph(
     let return_var = v("result", LowLevelType::Signed);
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
-    let callee = funcptr_search_normal(rtyper, &kind)?;
+    let callee = funcptr_search_normal(rtyper, &kind, value_can_be_none)?;
     let res = emit_direct_call(
         &startblock,
         callee,
@@ -4987,10 +5009,16 @@ pub(crate) fn build_search_elidable_helper_graph(
 }
 
 /// `rstring.py` `_search_normal`.
+///
+/// `assert value is not None` is emitted only when `value_can_be_none`.
+/// After `LLHelpers.ll_search` asserts, knowntypedata has
+/// `can_be_None=False`, so `transform_dead_code` (`transform.py`) cuts
+/// the raise link; that route passes `false`.
 pub(crate) fn build_search_normal_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype.clone())?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -5019,21 +5047,44 @@ pub(crate) fn build_search_normal_helper_graph(
             v("mode", LowLevelType::Signed),
         ]
     };
+    // `rstring.py` `_search_normal`: `assert value is not None`, cut
+    // when the caller annotation has `can_be_None=False`.
+    let body = if value_can_be_none {
+        let after_none = blk(voem());
+        close_assert_ptr_not_none(
+            &startblock,
+            &value,
+            vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
+            after_none.clone(),
+            graph.exceptblock.clone(),
+            exception_args("AssertionError")?,
+        );
+        after_none
+    } else {
+        startblock.clone()
+    };
     let clamp_s = blk(voem());
+    let an = block_vars(&body);
     let start_neg = emit_bin(
-        &startblock,
+        &body,
         "int_lt",
-        hl(&start),
+        hl(&an[2]),
         signed_const(0),
         "start_neg",
         LowLevelType::Bool,
     );
     branch(
-        &startblock,
+        &body,
         start_neg,
-        vec![hl(&value), hl(&other), signed_const(0), hl(&end), hl(&mode)],
+        vec![
+            hl(&an[0]),
+            hl(&an[1]),
+            signed_const(0),
+            hl(&an[3]),
+            hl(&an[4]),
+        ],
         clamp_s.clone(),
-        vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
+        vec![hl(&an[0]), hl(&an[1]), hl(&an[2]), hl(&an[3]), hl(&an[4])],
         clamp_s.clone(),
     );
 
@@ -6202,6 +6253,10 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
                 ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
                 ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
                 ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
+                ConstValue::ByteStr(bytes) => {
+                    let n = i64::from(bytes.first().copied().unwrap_or(0));
+                    (OpKind::ConstInt(n), LowLevelType::Signed)
+                }
                 other => {
                     panic!("effect_graph_from_search_helper: cannot materialise constant {other:?}")
                 }
@@ -6215,7 +6270,7 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
     }
 }
 
-fn search_callee_name(hlv: &Hlvalue) -> String {
+fn search_callee_funcptr(hlv: &Hlvalue) -> (String, Option<usize>) {
     use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
     let Hlvalue::Constant(c) = hlv else {
         panic!("effect_graph_from_search_helper: direct_call callee is not a constant");
@@ -6227,7 +6282,7 @@ fn search_callee_name(hlv: &Hlvalue) -> String {
         );
     };
     match ptr._obj0_value() {
-        Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+        Ok(Some(_ptr_obj::Func(func))) => (func._name.clone(), func.graph),
         other => {
             panic!("effect_graph_from_search_helper: direct_call callee is not a Func: {other:?}")
         }
@@ -6347,13 +6402,19 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
         }
         "direct_call" => {
-            let callee = search_callee_name(&op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[0]);
+            let result = search_expect_var(&op.result);
+            // `graphanalyze.py GraphAnalyzer.analyze`: a `direct_call`
+            // whose funcobj has a graph is followed; a graphless funcobj
+            // is `analyze_external_call`. The graphless callee reached
+            // here is the `majit_rlib::jit::isconstant` oopspec
+            // (`rlib/jit.py isconstant`); emit the ordinary Call so
+            // analyzers classify the builtin target.
             let target = CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()));
             let args: Vec<_> = op.args[1..]
                 .iter()
                 .map(|a| search_materialize(out, block, a))
                 .collect();
-            let result = search_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
                 OpKind::Call {
@@ -6362,6 +6423,26 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                     result_ty: search_value_type_of(&result),
                 },
                 result,
+            );
+        }
+        "jit_conditional_call" => {
+            // Same interpreter-facing Call `lower_graph` emits.
+            // Analyzers treat `oopspec("jit.conditional_call")` as a
+            // builtin; callee effects reach through the
+            // `we_are_jitted()`-false `direct_call`.
+            assert!(
+                op.args.len() >= 2,
+                "effect_graph_from_search_helper: jit_conditional_call needs cond and fnptr"
+            );
+            let cond = search_materialize(out, block, &op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[1]);
+            let extra_args: Vec<_> = op.args[2..]
+                .iter()
+                .map(|a| search_materialize(out, block, a))
+                .collect();
+            let result = search_expect_var(&op.result);
+            crate::codewriter::jtransform_opname::emit_conditional_call_oopspec(
+                out, block, cond, &callee, extra_args, result,
             );
         }
         "malloc" => {
@@ -6472,7 +6553,64 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 result,
             );
         }
-        other => panic!("effect_graph_from_search_helper: unsupported opname {other:?}"),
+        name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
+            // `effect_graph_from_rtyped_helper`: UnaryOp keeps the llop
+            // name so analyzers consult `ll_operations()`. Extra Variable
+            // operands stay materialised; Constant extras are already values.
+            let Some((last, rest)) = op.args.split_last() else {
+                panic!("effect_graph_from_search_helper: {name} has no operand");
+            };
+            for arg in rest {
+                if matches!(arg, Hlvalue::Variable(_)) {
+                    let _ = search_materialize(out, block, arg);
+                }
+            }
+            let operand = search_materialize(out, block, last);
+            let result = search_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty: search_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        other => {
+            // `graphanalyze.py GraphAnalyzer.analyze` follows only
+            // `direct_call` / `indirect_call`; every other llop is
+            // `analyze_simple_operation` with the `lloperation.py` flags.
+            // UnaryOp keeps the llop name so analyzers consult
+            // `ll_operations()`, matching `effect_graph_from_rtyped_helper`.
+            if other != "direct_call"
+                && other != "indirect_call"
+                && crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
+                    .contains_key(other)
+            {
+                let Some((last, rest)) = op.args.split_last() else {
+                    panic!("effect_graph_from_search_helper: {other} has no operand");
+                };
+                for arg in rest {
+                    if matches!(arg, Hlvalue::Variable(_)) {
+                        let _ = search_materialize(out, block, arg);
+                    }
+                }
+                let operand = search_materialize(out, block, last);
+                let result = search_expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::UnaryOp {
+                        op: other.to_string(),
+                        operand,
+                        result_ty: search_value_type_of(&result),
+                    },
+                    result,
+                );
+            } else {
+                panic!("effect_graph_from_search_helper: unsupported opname {other:?}")
+            }
+        }
     }
 }
 
@@ -6513,8 +6651,9 @@ mod tests {
         for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
             let ann = RPythonAnnotator::new(None, None, None, false);
             let rtyper = RPythonTyper::new(&ann);
-            let normal = build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone())
-                .expect("_search_normal");
+            let normal =
+                build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone(), false)
+                    .expect("_search_normal");
             let names = direct_call_names(&normal.graph.borrow());
             for expected in [
                 "_default_find",
@@ -6532,7 +6671,7 @@ mod tests {
             }
 
             let elidable =
-                build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone())
+                build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone(), false)
                     .expect("_search_elidable");
             assert!(elidable.func._elidable_function_);
             assert_eq!(
@@ -6541,7 +6680,7 @@ mod tests {
             );
 
             let search =
-                build_search_helper_graph(&rtyper, "_search", ptr.clone()).expect("_search");
+                build_search_helper_graph(&rtyper, "_search", ptr.clone(), false).expect("_search");
             let expected = if ptr == *STRPTR {
                 "_search_elidable"
             } else {
@@ -6605,6 +6744,45 @@ mod tests {
         }
     }
 
+    /// `_ll_list_resize_ge` effect graph keeps `direct_call` as `Call` and
+    /// `jit_conditional_call` as the `jit.conditional_call` oopspec Call.
+    /// Analyzers see those ops; there is no `same_as` stand-in and no
+    /// unary invented from the llop's first variable argument.
+    #[test]
+    fn ll_list_resize_ge_effect_graph_has_no_fabricated_ops() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        build_twoway_preprocess_helper_graph(&rtyper, "_twoway_preprocess", STRPTR.clone())
+            .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge");
+        let effect = effect_graph_from_search_helper(&ge.borrow());
+        for (_, op) in effect.iter_block_ops() {
+            match &op.kind {
+                OpKind::UnaryOp { op, .. } => {
+                    assert_ne!(op, "same_as", "no same_as stand-in: {op:?}");
+                    assert_ne!(
+                        op, "jit_conditional_call",
+                        "jit_conditional_call is the oopspec Call, not a unary"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            effect.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().is_some_and(|s| s
+                        == ["majit_rlib", "jit", "conditional_call3"])
+            )),
+            "effect graph has the jit.conditional_call oopspec Call"
+        );
+    }
+
     #[test]
     fn search_helper_graphs_pass_checkgraph() {
         for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
@@ -6660,22 +6838,84 @@ mod tests {
                 ),
                 (
                     "_search",
-                    build_search_helper_graph(&rtyper, "_search", ptr.clone()).expect("_search"),
+                    build_search_helper_graph(&rtyper, "_search", ptr.clone(), false)
+                        .expect("_search"),
                 ),
                 (
                     "_search_elidable",
-                    build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone())
-                        .expect("_search_elidable"),
+                    build_search_elidable_helper_graph(
+                        &rtyper,
+                        "_search_elidable",
+                        ptr.clone(),
+                        false,
+                    )
+                    .expect("_search_elidable"),
                 ),
                 (
                     "_search_normal",
-                    build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone())
+                    build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone(), false)
                         .expect("_search_normal"),
                 ),
             ];
             for (name, py) in graphs {
                 assert_eq!(py.graph.borrow().name, name);
                 checkgraph(&py.graph.borrow());
+            }
+        }
+    }
+
+    fn search_normal_has_assertionerror_path(graph: &FunctionGraph) -> bool {
+        let start = graph.startblock.borrow();
+        if !start
+            .operations
+            .first()
+            .is_some_and(|op| op.opname == "ptr_nonzero")
+        {
+            return false;
+        }
+        start.exits.iter().any(|link| {
+            let link = link.borrow();
+            let is_false = matches!(
+                &link.exitcase,
+                Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+            );
+            let to_except = link
+                .target
+                .as_ref()
+                .is_some_and(|target| Rc::ptr_eq(target, &graph.exceptblock));
+            let assertionerror = matches!(
+                link.args.first().and_then(|arg| arg.as_ref()),
+                Some(Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(obj),
+                    ..
+                })) if obj.qualname() == "AssertionError"
+            );
+            is_false && to_except && assertionerror
+        })
+    }
+
+    /// `_search_normal` (`rstring.py`): `assert value is not None` is
+    /// cut when the caller annotation has `can_be_None=False`
+    /// (`transform_dead_code`).
+    #[test]
+    fn search_normal_assert_follows_value_can_be_none() {
+        for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
+            for value_can_be_none in [true, false] {
+                let ann = RPythonAnnotator::new(None, None, None, false);
+                let rtyper = RPythonTyper::new(&ann);
+                let py = build_search_normal_helper_graph(
+                    &rtyper,
+                    "_search_normal",
+                    ptr.clone(),
+                    value_can_be_none,
+                )
+                .expect("_search_normal");
+                checkgraph(&py.graph.borrow());
+                assert_eq!(
+                    search_normal_has_assertionerror_path(&py.graph.borrow()),
+                    value_can_be_none,
+                    "value_can_be_none={value_can_be_none}"
+                );
             }
         }
     }
@@ -6859,7 +7099,7 @@ mod tests {
     fn search_normal_forward_dispatch_matches_upstream_thresholds() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let py = build_search_normal_helper_graph(&rtyper, "_search_normal", STRPTR.clone())
+        let py = build_search_normal_helper_graph(&rtyper, "_search_normal", STRPTR.clone(), false)
             .expect("_search_normal");
         let graph = py.graph.borrow();
         assert_eq!(

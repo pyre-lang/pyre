@@ -1440,9 +1440,9 @@ mod tests {
             ))))
         };
         let flavor_c = || {
-            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
+            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
                 std::collections::HashMap::new(),
-            )))
+            ))))
         };
         let int_c = |n: i64| Hlvalue::Constant(FlowConstant::new(ConstValue::Int(n)));
 
@@ -1510,9 +1510,9 @@ mod tests {
         let type_c = Hlvalue::Constant(FlowConstant::new(ConstValue::LowLevelType(Box::new(
             char_array,
         ))));
-        let flavor_c = Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
+        let flavor_c = Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
             std::collections::HashMap::new(),
-        )));
+        ))));
         let neg_len = Hlvalue::Constant(FlowConstant::new(ConstValue::Int(-1)));
 
         let arr = Variable::named("arr");

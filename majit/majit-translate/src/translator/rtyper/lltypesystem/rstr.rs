@@ -252,9 +252,8 @@ pub fn conststr(s: &str) -> Result<_ptr, String> {
 /// hash survive into the serialized jitcode.
 ///
 /// Returns `None` for null, a non-struct target, a missing/empty-typed
-/// `chars` field, or a non-`Char` element (a `Ptr(UNICODE)` container,
-/// whose `chars` are `UniChar`, is out of scope here — Unicode prebuilt
-/// constants are a separate lowering).
+/// `chars` field, or a non-`Char` element (a `Ptr(UNICODE)` container
+/// is [`prebuilt_unicode_bytes_and_hash`]).
 pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     if !p.nonzero() {
         return None;
@@ -262,6 +261,11 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
         return None;
     };
+    // Empty `chars` has no Char/UniChar items to inspect; the
+    // `GcStruct` name is `rpy_string` vs `rpy_unicode` (rstr.py).
+    if st.TYPE._name != "rpy_string" {
+        return None;
+    }
     let fields = st._fields.lock();
     // `chars` mirrors the read side of `llstr`'s per-index fill.
     let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
@@ -278,6 +282,43 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     }
     // `const_str_cache_llstr` precomputes and stores `hash` (rstr.py:199);
     // a bare `llstr` leaves the malloc-zeroed `0` (lazy not-computed).
+    let hash = match fields.iter().find(|(n, _)| n == "hash") {
+        Some((_, LowLevelValue::Signed(h))) => *h,
+        _ => ll_strhash_value(&bytes),
+    };
+    Some((bytes, hash))
+}
+
+/// Inverse of [`alloc_array_unicode`]: read back the UTF-8 payload and
+/// `hash`-slot value of a prebuilt `Ptr(UNICODE)` container.  Mirror of
+/// [`prebuilt_str_bytes_and_hash`] with `chars` as `UniChar` instead of
+/// `Char`; the codewriter routes the pair through `emit_str_const_r`
+/// with `as_unicode_object`.
+///
+/// Returns `None` for null, a non-struct target, a missing/empty-typed
+/// `chars` field, or a non-`UniChar` element (a `Ptr(STR)` container).
+pub(crate) fn prebuilt_unicode_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
+    if !p.nonzero() {
+        return None;
+    }
+    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
+        return None;
+    };
+    if st.TYPE._name != "rpy_unicode" {
+        return None;
+    }
+    let fields = st._fields.lock();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return None;
+    };
+    let mut text = String::new();
+    for i in 0..chars.getlength() {
+        match chars.getitem(i) {
+            Some(LowLevelValue::UniChar(c)) => text.push(c),
+            _ => return None,
+        }
+    }
+    let bytes = text.into_bytes();
     let hash = match fields.iter().find(|(n, _)| n == "hash") {
         Some((_, LowLevelValue::Signed(h))) => *h,
         _ => ll_strhash_value(&bytes),
@@ -9858,7 +9899,7 @@ pub(crate) fn build_ll_search_helper_graph(
 /// `assert p is not None` on a `Ptr(STR)` / `Ptr(UNICODE)`:
 /// `ptr_nonzero` then the False arm raises AssertionError
 /// (`LLHelpers.ll_search`; flowspace `assert` lowering).
-fn close_assert_ptr_not_none(
+pub(crate) fn close_assert_ptr_not_none(
     block: &BlockRef,
     ptr: &Variable,
     continue_args: Vec<Hlvalue>,
@@ -9962,11 +10003,14 @@ pub(crate) fn build_ll_search_helper_graph_on(
                 LowLevelType::Signed,
                 {
                     let ptr = ptr_lltype;
+                    // `LLHelpers.ll_search` already asserted; knowntypedata
+                    // has `can_be_None=False` (`transform_dead_code`).
                     move |rtyper| {
                         crate::rlib::rstring::build_search_normal_helper_graph(
                             rtyper,
                             "_search_normal",
                             ptr,
+                            false,
                         )
                     }
                 },
@@ -9982,11 +10026,14 @@ pub(crate) fn build_ll_search_helper_graph_on(
                 LowLevelType::Signed,
                 {
                     let ptr = ptr_lltype;
+                    // `LLHelpers.ll_search` already asserted; knowntypedata
+                    // has `can_be_None=False` (`transform_dead_code`).
                     move |rtyper| {
                         crate::rlib::rstring::build_search_elidable_helper_graph(
                             rtyper,
                             "_search_elidable",
                             ptr,
+                            false,
                         )
                     }
                 },
@@ -12778,6 +12825,30 @@ mod tests {
         );
         // A typed null `Ptr(STR)` is not a prebuilt string.
         assert_eq!(prebuilt_str_bytes_and_hash(&null_str_ptr()), None);
+    }
+
+    /// [`prebuilt_unicode_bytes_and_hash`] is the inverse of
+    /// [`alloc_array_unicode`]: UTF-8 bytes round-trip and the stored
+    /// `hash` slot is read back.
+    #[test]
+    fn prebuilt_unicode_bytes_and_hash_round_trips_alloc_array_unicode() {
+        let p = alloc_array_unicode("αβγ").expect("alloc_array_unicode");
+        let (got_bytes, got_hash) =
+            prebuilt_unicode_bytes_and_hash(&p).expect("prebuilt UNICODE must decode");
+        assert_eq!(got_bytes, "αβγ".as_bytes());
+        assert_eq!(got_hash, 0, "alloc_array_unicode leaves hash at 0");
+        let empty = alloc_array_unicode("").expect("empty unicode");
+        assert_eq!(
+            prebuilt_unicode_bytes_and_hash(&empty),
+            Some((Vec::new(), 0))
+        );
+        assert_eq!(prebuilt_str_bytes_and_hash(&empty), None);
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&null_str_ptr()), None);
+        let str_p = const_str_cache_llstr(b"hello").expect("cache llstr");
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&str_p), None);
+        let empty_str = const_str_cache_llstr(b"").expect("cache llstr empty");
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&empty_str), None);
+        assert_eq!(prebuilt_str_bytes_and_hash(&p), None);
     }
 
     /// `nullptr(self.lowleveltype.TO)` arm of
@@ -15996,9 +16067,11 @@ mod tests {
             names: &mut Vec<String>,
         ) {
             for func in direct_call_funcobjs(graph) {
-                let graph_id = func
-                    .graph
-                    .expect("HighLevelOp.gendirectcall funcptr carries graph");
+                // `call.py guess_call_kind`: a funcobj without a graph is
+                // residual (oopspec builtin included); follow regular calls.
+                let Some(graph_id) = func.graph else {
+                    continue;
+                };
                 names.push(func._name.clone());
                 let callee = graph_ref_for_funcptr_id(rtyper, graph_id).unwrap_or_else(|| {
                     panic!(

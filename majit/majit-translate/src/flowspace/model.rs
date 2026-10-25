@@ -1973,6 +1973,15 @@ impl HostEnv {
             "r_ordereddict",
             HostObject::new_builtin_callable("rpython.rlib.objectmodel.r_ordereddict"),
         );
+        // Host class objects for prebuilt `objectmodel.r_dict` /
+        // `_r_dictkey` instances (`objectmodel.py` class r_dict /
+        // class _r_dictkey). The callables above stay the
+        // `typer_for` / BUILTIN_ANALYZERS targets.
+        let r_dict_cls = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let r_dictkey_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
+        objectmodel.module_set("_r_dictkey", r_dictkey_cls.clone());
+        self.insert_builtin("rpython.rlib.objectmodel.r_dict", r_dict_cls);
+        self.insert_builtin("rpython.rlib.objectmodel._r_dictkey", r_dictkey_cls);
 
         // `rbuiltin.py typer_for(OrderedDict)` — `from collections import
         // OrderedDict`.  Qualname matches `BUILTIN_ANALYZERS`.
@@ -2858,8 +2867,10 @@ pub enum ConstValue {
     Float(u64),
     /// Python dict constant. Mirrors upstream `Constant(dict)` and is
     /// used both for `func.__globals__` and optimizer rewrites like
-    /// `transform_list_contains`.
-    Dict(HashMap<ConstValue, ConstValue>),
+    /// `transform_list_contains`. `Arc` is the shared handle for one
+    /// host dict object (`HostObject` identity); clones share the
+    /// allocation the way Python references share one dict.
+    Dict(Arc<HashMap<ConstValue, ConstValue>>),
     /// Python 2 byte string constant (`str`).
     ///
     /// RPython keeps the byte/unicode distinction in the concrete
@@ -3985,7 +3996,7 @@ impl ConstValue {
 
     pub fn dict_items(&self) -> Option<&HashMap<ConstValue, ConstValue>> {
         match self {
-            ConstValue::Dict(items) => Some(items),
+            ConstValue::Dict(items) => Some(items.as_ref()),
             _ => None,
         }
     }
@@ -7364,7 +7375,7 @@ mod tests {
     fn host_getattr_user_function_dunder_name_and_module_follow_python_surface() {
         let func = HostObject::new_user_function(GraphFunc::new(
             "pkg.module.demo",
-            Constant::new(ConstValue::Dict(HashMap::new())),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
         ));
         let out = host_getattr(&func, "__name__").expect("function.__name__");
         assert_eq!(out, ConstValue::byte_str("demo"));
@@ -7374,15 +7385,15 @@ mod tests {
 
     #[test]
     fn host_getattr_user_function_dunder_globals_returns_raw_dict() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
         let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
         let out = host_getattr(&func, "__globals__").expect("function.__globals__");
-        assert_eq!(out, ConstValue::Dict(HashMap::new()));
+        assert_eq!(out, ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
     }
 
     #[test]
     fn host_getattr_user_function_dunder_defaults_returns_none_when_absent() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
         let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
         let out = host_getattr(&func, "__defaults__").expect("function.__defaults__");
         assert_eq!(out, ConstValue::None);
@@ -7390,7 +7401,7 @@ mod tests {
 
     #[test]
     fn host_getattr_user_function_dunder_closure_returns_none_when_absent() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
         let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
         let out = host_getattr(&func, "__closure__").expect("function.__closure__");
         assert_eq!(out, ConstValue::None);
@@ -7398,7 +7409,7 @@ mod tests {
 
     #[test]
     fn host_getattr_user_function_dunder_defaults_and_closure_return_tuple_payloads() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
         let mut graph_func = GraphFunc::new("pkg.module.demo", globals);
         graph_func.defaults = vec![Constant::new(ConstValue::Int(7))];
         graph_func.closure = vec![Constant::new(ConstValue::byte_str("cell"))];
@@ -7458,7 +7469,7 @@ mod tests {
         // discriminated `RequiresFlowEvaluator` marker so callsites
         // (`call_freeze_method`, `host_descriptor_get` property.fget)
         // can fall back to their annotator-side routing.
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
         let gf = GraphFunc::new("pkg.user_fn", globals);
         let f = HostObject::new_user_function(gf);
         let err = f.call_host(&[]).unwrap_err();

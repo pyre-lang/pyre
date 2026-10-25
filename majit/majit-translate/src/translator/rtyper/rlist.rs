@@ -1462,8 +1462,9 @@ impl Repr for ListRepr {
                 // Mint the sub-helpers in dependency order so each is
                 // annotated before the helper that direct_calls it builds
                 // its graph (`sub_helper_funcptr_constant` needs the callee
-                // annotated): ll_arraycopy <- _ll_list_resize_ge, and
-                // ll_setitem_fast + _ll_list_resize_ge <- ll_append.
+                // annotated): ll_arraycopy <- _ll_list_resize_hint_really
+                // <- _ll_list_resize_ge, and ll_setitem_fast +
+                // _ll_list_resize_ge <- ll_append.
                 let arraycopy = {
                     let item = item_lltype.clone();
                     hop.rtyper.lowlevel_helper_function_with_builder(
@@ -1579,8 +1580,9 @@ impl Repr for ListRepr {
 
                 // Mint sub-helpers in dependency order (callee annotated
                 // before the helper that direct_calls it builds its graph):
-                // start=0 ll_arraycopy <- _ll_list_resize_ge (its grow copy);
-                // general ll_arraycopy + _ll_list_resize_ge <- ll_extend.
+                // start=0 ll_arraycopy <- _ll_list_resize_hint_really
+                // (grow copy) <- _ll_list_resize_ge; general ll_arraycopy
+                // + _ll_list_resize_ge <- ll_extend.
                 let arraycopy_grow = {
                     let item = item_lltype.clone();
                     hop.rtyper.lowlevel_helper_function_with_builder(
@@ -2686,9 +2688,9 @@ fn none_void_const() -> Hlvalue {
 }
 
 /// Synthesise `rgc.ll_arraycopy` (`rpython/rlib/rgc.py`), specialised
-/// to `source_start == dest_start == 0` (the only shape
-/// [`build_ll_list_resize_ge_helper_graph`] needs — a resize always copies
-/// the live prefix to offset 0 of a fresh array):
+/// to `source_start == dest_start == 0` (the shape
+/// [`build_ll_list_resize_hint_really_helper_graph`] uses for
+/// `rgc.ll_arraycopy(items, newitems, 0, 0, p)`):
 ///
 /// ```python
 /// def ll_arraycopy(source, dest, 0, 0, length):
@@ -2699,10 +2701,8 @@ fn none_void_const() -> Hlvalue {
 /// ```
 ///
 /// Three-block loop over bare `Ptr(GcArray(ITEM))` operands (mirrors the
-/// [`build_ll_reverse_helper_graph`] CFG shape). `length == 0` (the
-/// first append into an empty list) makes `int_lt(0, 0)` false, so the
-/// copy is a no-op — this is why the resize caller can drop upstream's
-/// `if before_len:` guard against copying the prebuilt-empty array.
+/// [`build_ll_reverse_helper_graph`] CFG shape). `length == 0` makes
+/// `int_lt(0, 0)` false, so the copy is a no-op.
 pub(crate) fn build_ll_arraycopy_helper_graph(
     name: &str,
     item_lltype: LowLevelType,
@@ -3351,44 +3351,899 @@ pub(crate) fn build_ll_arraymove_helper_graph(
     ))
 }
 
-/// Synthesise `_ll_list_resize_ge` fused with `_ll_list_resize_hint_really`
-/// (`lltypesystem/rlist.py` + `:200-239`), specialised to the
-/// grow-only `append` path (`overallocate=True`, `newsize > before_len > 0`
-/// or `before_len == 0`):
+/// Synthesise `_ll_list_resize_hint_really` (`lltypesystem/rlist.py`
+/// `_ll_list_resize_hint_really`). This graph is the original body.
+/// `look_inside_iff` (`rlib/jit.py`) wraps it: `unroll_safe(func)` then
+/// `specialize:call_location`.
 ///
 /// ```python
-/// def _ll_list_resize_ge(l, newsize):           # overallocate=True
-///     if len(l.items) < newsize:
-///         some = (3 if newsize < 9 else 6) + (newsize >> 3)
+/// def _ll_list_resize_hint_really(l, newsize, overallocate):
+///     if newsize <= 0:
+///         ll_assert(newsize == 0, "negative list length")
+///         l.length = 0
+///         l.items = _ll_new_empty_item_array(typeOf(l).TO)
+///         return
+///     elif overallocate:
+///         if newsize < 9:
+///             some = 3
+///         else:
+///             some = 6
+///         some += newsize >> 3
 ///         new_allocated = newsize + some
-///         newitems = malloc(LIST.items.TO, new_allocated)
-///         rgc.ll_arraycopy(l.items, newitems, 0, 0, l.length)
-///         l.items = newitems
-///     l.length = newsize
+///     else:
+///         new_allocated = newsize
+///     items = l.items
+///     newitems = malloc(typeOf(l).TO.items.TO, new_allocated)
+///     before_len = l.length
+///     if before_len:
+///         if before_len < newsize:
+///             p = before_len
+///         else:
+///             p = newsize
+///         rgc.ll_arraycopy(items, newitems, 0, 0, p)
+///     l.items = newitems
 /// ```
 ///
-/// Since `_ll_list_resize_ge` is only ever called with `newsize` larger
-/// than the current length, `before_len < newsize` always holds, so
-/// upstream's `p = min(before_len, newsize)` collapses to `before_len`
-/// and the `if before_len:` guard collapses (a `before_len == 0` copy is a
-/// no-op, see [`build_ll_arraycopy_helper_graph`]). The `newsize <= 0`
-/// (empty-array reset) and `overallocate=False` branches — reached only by
-/// `_ll_list_resize_le` / `_ll_list_resize` — are deferred.
-///
-/// CFG: start (capacity check) -> grow (overallocation `some` branch) ->
-/// alloc (malloc + arraycopy + `l.items = newitems`) -> tail
-/// (`l.length = newsize`); the no-grow start edge skips straight to tail.
-pub(crate) fn build_ll_list_resize_ge_helper_graph(
-    rtyper: &RPythonTyper,
+/// `_ll_new_empty_item_array` with `INITIAL_EMPTY_LIST_ALLOCATION == 0`
+/// is `malloc(LIST.items.TO, 0)`. `rgc.ll_arraycopy(..., 0, 0, p)` is
+/// the start=0 [`build_ll_arraycopy_helper_graph`] callee.
+pub(crate) fn build_ll_list_resize_hint_really_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
     item_lltype: LowLevelType,
-    arraycopy: &LowLevelFunction,
+    arraycopy_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
     use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
 
     let items_ptr = items_array_ptr_lltype(&item_lltype);
-    let arraycopy_const = sub_helper_funcptr_constant(rtyper, arraycopy)?;
+    let array_type = LowLevelType::Array(Box::new(Array::gc(item_lltype)));
+
+    let l_arg = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_arg = variable_with_lltype("newsize", LowLevelType::Signed);
+    let overallocate_arg = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(newsize_arg.clone()),
+        Hlvalue::Variable(overallocate_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let l_reset = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_reset = variable_with_lltype("newsize", LowLevelType::Signed);
+    let block_reset = Block::shared(vec![
+        Hlvalue::Variable(l_reset.clone()),
+        Hlvalue::Variable(newsize_reset.clone()),
+    ]);
+
+    let l_over = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_over = variable_with_lltype("newsize", LowLevelType::Signed);
+    let overallocate_over = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let block_over = Block::shared(vec![
+        Hlvalue::Variable(l_over.clone()),
+        Hlvalue::Variable(newsize_over.clone()),
+        Hlvalue::Variable(overallocate_over.clone()),
+    ]);
+
+    let l_some = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_some = variable_with_lltype("newsize", LowLevelType::Signed);
+    let block_some = Block::shared(vec![
+        Hlvalue::Variable(l_some.clone()),
+        Hlvalue::Variable(newsize_some.clone()),
+    ]);
+
+    let l_add = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_add = variable_with_lltype("newsize", LowLevelType::Signed);
+    let some_base = variable_with_lltype("some_base", LowLevelType::Signed);
+    let block_add = Block::shared(vec![
+        Hlvalue::Variable(l_add.clone()),
+        Hlvalue::Variable(newsize_add.clone()),
+        Hlvalue::Variable(some_base.clone()),
+    ]);
+
+    let l_malloc = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_malloc = variable_with_lltype("newsize", LowLevelType::Signed);
+    let new_allocated = variable_with_lltype("new_allocated", LowLevelType::Signed);
+    let block_malloc = Block::shared(vec![
+        Hlvalue::Variable(l_malloc.clone()),
+        Hlvalue::Variable(newsize_malloc.clone()),
+        Hlvalue::Variable(new_allocated.clone()),
+    ]);
+
+    let l_min = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_min = variable_with_lltype("newsize", LowLevelType::Signed);
+    let items_min = variable_with_lltype("items", items_ptr.clone());
+    let newitems_min = variable_with_lltype("newitems", items_ptr.clone());
+    let before_len_min = variable_with_lltype("before_len", LowLevelType::Signed);
+    let block_min = Block::shared(vec![
+        Hlvalue::Variable(l_min.clone()),
+        Hlvalue::Variable(newsize_min.clone()),
+        Hlvalue::Variable(items_min.clone()),
+        Hlvalue::Variable(newitems_min.clone()),
+        Hlvalue::Variable(before_len_min.clone()),
+    ]);
+
+    let l_copy = variable_with_lltype("l", ptr_lltype.clone());
+    let items_copy = variable_with_lltype("items", items_ptr.clone());
+    let newitems_copy = variable_with_lltype("newitems", items_ptr.clone());
+    let p_copy = variable_with_lltype("p", LowLevelType::Signed);
+    let block_copy = Block::shared(vec![
+        Hlvalue::Variable(l_copy.clone()),
+        Hlvalue::Variable(items_copy.clone()),
+        Hlvalue::Variable(newitems_copy.clone()),
+        Hlvalue::Variable(p_copy.clone()),
+    ]);
+
+    let l_set = variable_with_lltype("l", ptr_lltype.clone());
+    let newitems_set = variable_with_lltype("newitems", items_ptr.clone());
+    let block_set = Block::shared(vec![
+        Hlvalue::Variable(l_set.clone()),
+        Hlvalue::Variable(newitems_set.clone()),
+    ]);
+
+    // start: if newsize <= 0: reset; else overallocate dispatch.
+    let le0 = variable_with_lltype("le0", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_le",
+        vec![Hlvalue::Variable(newsize_arg.clone()), signed_const(0)],
+        Hlvalue::Variable(le0.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(le0));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg.clone()),
+                Hlvalue::Variable(newsize_arg.clone()),
+            ],
+            Some(block_reset.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg),
+                Hlvalue::Variable(newsize_arg),
+                Hlvalue::Variable(overallocate_arg),
+            ],
+            Some(block_over.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // reset: ll_assert(newsize == 0); l.length = 0; l.items = malloc(0).
+    let eq0 = variable_with_lltype("eq0", LowLevelType::Bool);
+    block_reset
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_eq",
+            vec![Hlvalue::Variable(newsize_reset), signed_const(0)],
+            Hlvalue::Variable(eq0.clone()),
+        ));
+    block_reset
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "debug_assert",
+            vec![
+                Hlvalue::Variable(eq0),
+                constant_with_lltype(
+                    ConstValue::byte_str("negative list length"),
+                    LowLevelType::Void,
+                ),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    block_reset
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(l_reset.clone()),
+                void_field_const("length"),
+                signed_const(0),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    let empty = variable_with_lltype("empty", items_ptr.clone());
+    block_reset
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(array_type.clone()),
+                gc_flavor_const()?,
+                signed_const(0),
+            ],
+            Hlvalue::Variable(empty.clone()),
+        ));
+    block_reset
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(l_reset),
+                void_field_const("items"),
+                Hlvalue::Variable(empty),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    block_reset.closeblock(vec![
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // elif overallocate: some-choice; else new_allocated = newsize.
+    block_over.borrow_mut().exitswitch = Some(Hlvalue::Variable(overallocate_over));
+    block_over.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_over.clone()),
+                Hlvalue::Variable(newsize_over.clone()),
+            ],
+            Some(block_some.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_over),
+                Hlvalue::Variable(newsize_over.clone()),
+                Hlvalue::Variable(newsize_over),
+            ],
+            Some(block_malloc.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // some = 3 if newsize < 9 else 6.
+    let small = variable_with_lltype("small", LowLevelType::Bool);
+    block_some.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![Hlvalue::Variable(newsize_some.clone()), signed_const(9)],
+        Hlvalue::Variable(small.clone()),
+    ));
+    block_some.borrow_mut().exitswitch = Some(Hlvalue::Variable(small));
+    block_some.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_some.clone()),
+                Hlvalue::Variable(newsize_some.clone()),
+                signed_const(3),
+            ],
+            Some(block_add.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_some),
+                Hlvalue::Variable(newsize_some),
+                signed_const(6),
+            ],
+            Some(block_add.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // some += newsize >> 3; new_allocated = newsize + some.
+    let shifted = variable_with_lltype("shifted", LowLevelType::Signed);
+    block_add.borrow_mut().operations.push(SpaceOperation::new(
+        "int_rshift",
+        vec![Hlvalue::Variable(newsize_add.clone()), signed_const(3)],
+        Hlvalue::Variable(shifted.clone()),
+    ));
+    let some = variable_with_lltype("some", LowLevelType::Signed);
+    block_add.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![Hlvalue::Variable(some_base), Hlvalue::Variable(shifted)],
+        Hlvalue::Variable(some.clone()),
+    ));
+    let new_allocated_add = variable_with_lltype("new_allocated", LowLevelType::Signed);
+    block_add.borrow_mut().operations.push(SpaceOperation::new(
+        "int_add",
+        vec![
+            Hlvalue::Variable(newsize_add.clone()),
+            Hlvalue::Variable(some),
+        ],
+        Hlvalue::Variable(new_allocated_add.clone()),
+    ));
+    block_add.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_add),
+                Hlvalue::Variable(newsize_add),
+                Hlvalue::Variable(new_allocated_add),
+            ],
+            Some(block_malloc.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // items = l.items; newitems = malloc(...); before_len = l.length.
+    let items = variable_with_lltype("items", items_ptr.clone());
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(l_malloc.clone()),
+                void_field_const("items"),
+            ],
+            Hlvalue::Variable(items.clone()),
+        ));
+    let newitems = variable_with_lltype("newitems", items_ptr);
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(array_type),
+                gc_flavor_const()?,
+                Hlvalue::Variable(new_allocated),
+            ],
+            Hlvalue::Variable(newitems.clone()),
+        ));
+    let before_len = variable_with_lltype("before_len", LowLevelType::Signed);
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(l_malloc.clone()),
+                void_field_const("length"),
+            ],
+            Hlvalue::Variable(before_len.clone()),
+        ));
+    let nonempty = variable_with_lltype("nonempty", LowLevelType::Bool);
+    block_malloc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "int_is_true",
+            vec![Hlvalue::Variable(before_len.clone())],
+            Hlvalue::Variable(nonempty.clone()),
+        ));
+    block_malloc.borrow_mut().exitswitch = Some(Hlvalue::Variable(nonempty));
+    block_malloc.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_malloc.clone()),
+                Hlvalue::Variable(newsize_malloc),
+                Hlvalue::Variable(items),
+                Hlvalue::Variable(newitems.clone()),
+                Hlvalue::Variable(before_len),
+            ],
+            Some(block_min.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l_malloc), Hlvalue::Variable(newitems)],
+            Some(block_set.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // p = before_len if before_len < newsize else newsize.
+    let lt = variable_with_lltype("lt", LowLevelType::Bool);
+    block_min.borrow_mut().operations.push(SpaceOperation::new(
+        "int_lt",
+        vec![
+            Hlvalue::Variable(before_len_min.clone()),
+            Hlvalue::Variable(newsize_min.clone()),
+        ],
+        Hlvalue::Variable(lt.clone()),
+    ));
+    block_min.borrow_mut().exitswitch = Some(Hlvalue::Variable(lt));
+    block_min.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_min.clone()),
+                Hlvalue::Variable(items_min.clone()),
+                Hlvalue::Variable(newitems_min.clone()),
+                Hlvalue::Variable(before_len_min),
+            ],
+            Some(block_copy.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_min),
+                Hlvalue::Variable(items_min),
+                Hlvalue::Variable(newitems_min),
+                Hlvalue::Variable(newsize_min),
+            ],
+            Some(block_copy.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // rgc.ll_arraycopy(items, newitems, 0, 0, p).
+    block_copy.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(arraycopy_fn),
+            Hlvalue::Variable(items_copy),
+            Hlvalue::Variable(newitems_copy.clone()),
+            Hlvalue::Variable(p_copy),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    block_copy.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(l_copy), Hlvalue::Variable(newitems_copy)],
+            Some(block_set.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // l.items = newitems.
+    block_set.borrow_mut().operations.push(SpaceOperation::new(
+        "setfield",
+        vec![
+            Hlvalue::Variable(l_set),
+            void_field_const("items"),
+            Hlvalue::Variable(newitems_set),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    block_set.closeblock(vec![
+        Link::new(
+            vec![none_void_const()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `look_inside_iff` (`rlib/jit.py`): `unroll_safe(func)` then
+    // `func._annspecialcase_ = "specialize:call_location"`.
+    func._jit_unroll_safe_ = true;
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "l".to_string(),
+            "newsize".to_string(),
+            "overallocate".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// `look_inside_iff`'s `@dont_look_inside` trampoline: one `direct_call`
+/// of the original `_ll_list_resize_hint_really` (`rlib/jit.py`
+/// `look_inside_iff`).
+fn build_ll_list_resize_hint_really_trampoline_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    orig_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let l_arg = variable_with_lltype("l", ptr_lltype);
+    let newsize_arg = variable_with_lltype("newsize", LowLevelType::Signed);
+    let overallocate_arg = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(newsize_arg.clone()),
+        Hlvalue::Variable(overallocate_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    let res = variable_with_lltype("result", LowLevelType::Void);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(orig_fn),
+            Hlvalue::Variable(l_arg),
+            Hlvalue::Variable(newsize_arg),
+            Hlvalue::Variable(overallocate_arg),
+        ],
+        Hlvalue::Variable(res.clone()),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `@dont_look_inside` (`rlib/jit.py` `look_inside_iff`); the trampoline
+    // also receives `specialize:call_location`.
+    func._jit_look_inside_ = Some(false);
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "l".to_string(),
+            "newsize".to_string(),
+            "overallocate".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// `rlib/jit.py look_inside_iff` wrapper around
+/// `_ll_list_resize_hint_really`:
+///
+/// ```python
+/// def f(l, newsize, overallocate):
+///     if not we_are_jitted() or (
+///         isconstant(len(l.items)) and isconstant(newsize)
+///     ):
+///         return orig(l, newsize, overallocate)
+///     else:
+///         return trampoline(l, newsize, overallocate)
+/// ```
+///
+/// `we_are_jitted` is the `SpecTag` exitswitch (true link first, matching
+/// [`build_ll_alloc_and_set_look_inside_iff_helper_graph`]). The predicate
+/// short-circuits: `isconstant(len(l.items))` false goes to the trampoline,
+/// true checks `isconstant(newsize)`.
+fn build_ll_list_resize_hint_really_look_inside_iff_helper_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    orig_fn: Constant,
+    trampoline_fn: Constant,
+    isconstant_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let l_arg = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_arg = variable_with_lltype("newsize", LowLevelType::Signed);
+    let overallocate_arg = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(newsize_arg.clone()),
+        Hlvalue::Variable(overallocate_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let orig_l = variable_with_lltype("l", ptr_lltype.clone());
+    let orig_newsize = variable_with_lltype("newsize", LowLevelType::Signed);
+    let orig_over = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let block_orig = Block::shared(vec![
+        Hlvalue::Variable(orig_l.clone()),
+        Hlvalue::Variable(orig_newsize.clone()),
+        Hlvalue::Variable(orig_over.clone()),
+    ]);
+    let orig_res = variable_with_lltype("result", LowLevelType::Void);
+    block_orig.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(orig_fn),
+            Hlvalue::Variable(orig_l),
+            Hlvalue::Variable(orig_newsize),
+            Hlvalue::Variable(orig_over),
+        ],
+        Hlvalue::Variable(orig_res.clone()),
+    ));
+    block_orig.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(orig_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let tr_l = variable_with_lltype("l", ptr_lltype.clone());
+    let tr_newsize = variable_with_lltype("newsize", LowLevelType::Signed);
+    let tr_over = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let block_tramp = Block::shared(vec![
+        Hlvalue::Variable(tr_l.clone()),
+        Hlvalue::Variable(tr_newsize.clone()),
+        Hlvalue::Variable(tr_over.clone()),
+    ]);
+    let tr_res = variable_with_lltype("result", LowLevelType::Void);
+    block_tramp
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(trampoline_fn),
+                Hlvalue::Variable(tr_l),
+                Hlvalue::Variable(tr_newsize),
+                Hlvalue::Variable(tr_over),
+            ],
+            Hlvalue::Variable(tr_res.clone()),
+        ));
+    block_tramp.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(tr_res)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let ns_l = variable_with_lltype("l", ptr_lltype.clone());
+    let ns_newsize = variable_with_lltype("newsize", LowLevelType::Signed);
+    let ns_over = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let block_ns = Block::shared(vec![
+        Hlvalue::Variable(ns_l.clone()),
+        Hlvalue::Variable(ns_newsize.clone()),
+        Hlvalue::Variable(ns_over.clone()),
+    ]);
+    let is_const_ns = variable_with_lltype("is_constant", LowLevelType::Bool);
+    block_ns.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isconstant_fn.clone()),
+            Hlvalue::Variable(ns_newsize.clone()),
+        ],
+        Hlvalue::Variable(is_const_ns.clone()),
+    ));
+    block_ns.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_const_ns));
+    block_ns.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(ns_l.clone()),
+                Hlvalue::Variable(ns_newsize.clone()),
+                Hlvalue::Variable(ns_over.clone()),
+            ],
+            Some(block_orig.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(ns_l),
+                Hlvalue::Variable(ns_newsize),
+                Hlvalue::Variable(ns_over),
+            ],
+            Some(block_tramp.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let pred_l = variable_with_lltype("l", ptr_lltype.clone());
+    let pred_newsize = variable_with_lltype("newsize", LowLevelType::Signed);
+    let pred_over = variable_with_lltype("overallocate", LowLevelType::Bool);
+    let block_pred = Block::shared(vec![
+        Hlvalue::Variable(pred_l.clone()),
+        Hlvalue::Variable(pred_newsize.clone()),
+        Hlvalue::Variable(pred_over.clone()),
+    ]);
+    let items = variable_with_lltype("items", items_ptr);
+    block_pred.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(pred_l.clone()), void_field_const("items")],
+        Hlvalue::Variable(items.clone()),
+    ));
+    let allocated = variable_with_lltype("allocated", LowLevelType::Signed);
+    block_pred.borrow_mut().operations.push(SpaceOperation::new(
+        "getarraysize",
+        vec![Hlvalue::Variable(items)],
+        Hlvalue::Variable(allocated.clone()),
+    ));
+    let is_const_len = variable_with_lltype("is_constant", LowLevelType::Bool);
+    block_pred.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isconstant_fn),
+            Hlvalue::Variable(allocated),
+        ],
+        Hlvalue::Variable(is_const_len.clone()),
+    ));
+    block_pred.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_const_len));
+    block_pred.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(pred_l.clone()),
+                Hlvalue::Variable(pred_newsize.clone()),
+                Hlvalue::Variable(pred_over.clone()),
+            ],
+            Some(block_ns),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(pred_l),
+                Hlvalue::Variable(pred_newsize),
+                Hlvalue::Variable(pred_over),
+            ],
+            Some(block_tramp),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg.clone()),
+                Hlvalue::Variable(newsize_arg.clone()),
+                Hlvalue::Variable(overallocate_arg.clone()),
+            ],
+            Some(block_pred),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_arg),
+                Hlvalue::Variable(newsize_arg),
+                Hlvalue::Variable(overallocate_arg),
+            ],
+            Some(block_orig),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec![
+            "l".to_string(),
+            "newsize".to_string(),
+            "overallocate".to_string(),
+        ],
+        func,
+    ))
+}
+
+/// Mint `_ll_list_resize_hint_really` through `look_inside_iff`
+/// (`rlib/jit.py`): original body, `dont_look_inside` trampoline,
+/// shared `isconstant` helper, and the wrapper. Returns the wrapper
+/// (the Python identifier after decoration) and the `isconstant` helper.
+fn mint_ll_list_resize_hint_really_family(
+    rtyper: &RPythonTyper,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    arraycopy: &LowLevelFunction,
+) -> Result<(LowLevelFunction, LowLevelFunction), TyperError> {
+    let hint_args = vec![ptr_lltype.clone(), LowLevelType::Signed, LowLevelType::Bool];
+    let orig = {
+        let ptr = ptr_lltype.clone();
+        let item = item_lltype.clone();
+        let arraycopy_fn = sub_helper_funcptr_constant(rtyper, arraycopy)?;
+        rtyper.lowlevel_helper_function_with_builder(
+            "_ll_list_resize_hint_really".to_string(),
+            hint_args.clone(),
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_list_resize_hint_really_helper_graph(
+                    "_ll_list_resize_hint_really",
+                    ptr,
+                    item,
+                    arraycopy_fn,
+                )
+            },
+        )?
+    };
+    let trampoline = {
+        let ptr = ptr_lltype.clone();
+        let orig_fn = sub_helper_funcptr_constant(rtyper, &orig)?;
+        rtyper.lowlevel_helper_function_with_builder(
+            "_ll_list_resize_hint_really_trampoline".to_string(),
+            hint_args.clone(),
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_list_resize_hint_really_trampoline_helper_graph(
+                    "_ll_list_resize_hint_really_trampoline",
+                    ptr,
+                    orig_fn,
+                )
+            },
+        )?
+    };
+    let isconstant = rtyper.lowlevel_helper_function_with_builder(
+        "_ll_alloc_and_set_isconstant".to_string(),
+        vec![LowLevelType::Signed],
+        LowLevelType::Bool,
+        |_r, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph("_ll_alloc_and_set_isconstant")
+        },
+    )?;
+    let orig_fn = sub_helper_funcptr_constant(rtyper, &orig)?;
+    let trampoline_fn = sub_helper_funcptr_constant(rtyper, &trampoline)?;
+    let isconstant_fn = sub_helper_funcptr_constant(rtyper, &isconstant)?;
+    let wrapper = {
+        let ptr = ptr_lltype;
+        let item = item_lltype;
+        rtyper.lowlevel_helper_function_with_builder(
+            "_ll_list_resize_hint_really_look_inside_iff".to_string(),
+            hint_args,
+            LowLevelType::Void,
+            move |_r, _a, _res| {
+                build_ll_list_resize_hint_really_look_inside_iff_helper_graph(
+                    "_ll_list_resize_hint_really_look_inside_iff",
+                    ptr,
+                    item,
+                    orig_fn,
+                    trampoline_fn,
+                    isconstant_fn,
+                )
+            },
+        )?
+    };
+    Ok((wrapper, isconstant))
+}
+
+/// Synthesise `_ll_list_resize_ge` (`lltypesystem/rlist.py`
+/// `_ll_list_resize_ge`):
+///
+/// ```python
+/// def _ll_list_resize_ge(l, newsize):
+///     cond = len(l.items) < newsize
+///     if jit.isconstant(len(l.items)) and jit.isconstant(newsize):
+///         if cond:
+///             _ll_list_resize_hint_really(l, newsize, True)
+///     else:
+///         jit.conditional_call(cond,
+///                              _ll_list_resize_hint_really, l, newsize, True)
+///     l.length = newsize
+/// ```
+///
+/// `jit.conditional_call` is `_always_inline_ = 'try'` (`jit.py
+/// conditional_call`), so the non-constant arm is the inlined
+/// `we_are_jitted()` switch: true → `jit_conditional_call`; false →
+/// `if cond: direct_call`. The constant-size arm `direct_call`s the
+/// same `_ll_list_resize_hint_really` (`look_inside_iff` wrapper).
+fn build_ll_list_resize_ge_graph(
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    hint_really_fn: Constant,
+    isconstant_fn: Constant,
+) -> Result<PyGraph, TyperError> {
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
 
     let l_arg = variable_with_lltype("l", ptr_lltype.clone());
     let newsize_arg = variable_with_lltype("newsize", LowLevelType::Signed);
@@ -3403,23 +4258,40 @@ pub(crate) fn build_ll_list_resize_ge_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // grow(l, newsize): chooses the overallocation `some` base.
-    let l_grow = variable_with_lltype("l", ptr_lltype.clone());
-    let newsize_grow = variable_with_lltype("newsize", LowLevelType::Signed);
-    let block_grow = Block::shared(vec![
-        Hlvalue::Variable(l_grow.clone()),
-        Hlvalue::Variable(newsize_grow.clone()),
+    let l_ns = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_ns = variable_with_lltype("newsize", LowLevelType::Signed);
+    let cond_ns = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_ns = Block::shared(vec![
+        Hlvalue::Variable(l_ns.clone()),
+        Hlvalue::Variable(newsize_ns.clone()),
+        Hlvalue::Variable(cond_ns.clone()),
     ]);
-    // alloc(l, newsize, some_base): malloc + copy + l.items = newitems.
-    let l_alloc = variable_with_lltype("l", ptr_lltype.clone());
-    let newsize_alloc = variable_with_lltype("newsize", LowLevelType::Signed);
-    let some_base = variable_with_lltype("some_base", LowLevelType::Signed);
-    let block_alloc = Block::shared(vec![
-        Hlvalue::Variable(l_alloc.clone()),
-        Hlvalue::Variable(newsize_alloc.clone()),
-        Hlvalue::Variable(some_base.clone()),
+
+    let l_const = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_const = variable_with_lltype("newsize", LowLevelType::Signed);
+    let cond_const = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_const = Block::shared(vec![
+        Hlvalue::Variable(l_const.clone()),
+        Hlvalue::Variable(newsize_const.clone()),
+        Hlvalue::Variable(cond_const.clone()),
     ]);
-    // tail(l, newsize): l.length = newsize.
+
+    let l_direct = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_direct = variable_with_lltype("newsize", LowLevelType::Signed);
+    let block_direct = Block::shared(vec![
+        Hlvalue::Variable(l_direct.clone()),
+        Hlvalue::Variable(newsize_direct.clone()),
+    ]);
+
+    let l_condcall = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_condcall = variable_with_lltype("newsize", LowLevelType::Signed);
+    let cond_condcall = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_condcall = Block::shared(vec![
+        Hlvalue::Variable(l_condcall.clone()),
+        Hlvalue::Variable(newsize_condcall.clone()),
+        Hlvalue::Variable(cond_condcall.clone()),
+    ]);
+
     let l_tail = variable_with_lltype("l", ptr_lltype.clone());
     let newsize_tail = variable_with_lltype("newsize", LowLevelType::Signed);
     let block_tail = Block::shared(vec![
@@ -3427,8 +4299,8 @@ pub(crate) fn build_ll_list_resize_ge_helper_graph(
         Hlvalue::Variable(newsize_tail.clone()),
     ]);
 
-    // startblock: cond = len(l.items) < newsize.
-    let items0 = variable_with_lltype("items", items_ptr.clone());
+    // cond = len(l.items) < newsize; isconstant(len(l.items)).
+    let items0 = variable_with_lltype("items", items_ptr);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
         vec![Hlvalue::Variable(l_arg.clone()), void_field_const("items")],
@@ -3440,175 +4312,256 @@ pub(crate) fn build_ll_list_resize_ge_helper_graph(
         vec![Hlvalue::Variable(items0)],
         Hlvalue::Variable(allocated.clone()),
     ));
-    let need_grow = variable_with_lltype("cond", LowLevelType::Bool);
+    let cond = variable_with_lltype("cond", LowLevelType::Bool);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "int_lt",
         vec![
-            Hlvalue::Variable(allocated),
+            Hlvalue::Variable(allocated.clone()),
             Hlvalue::Variable(newsize_arg.clone()),
         ],
-        Hlvalue::Variable(need_grow.clone()),
+        Hlvalue::Variable(cond.clone()),
     ));
-    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(need_grow));
+    let is_const_len = variable_with_lltype("is_constant", LowLevelType::Bool);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isconstant_fn.clone()),
+            Hlvalue::Variable(allocated),
+        ],
+        Hlvalue::Variable(is_const_len.clone()),
+    ));
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_const_len));
     startblock.closeblock(vec![
         Link::new(
             vec![
                 Hlvalue::Variable(l_arg.clone()),
                 Hlvalue::Variable(newsize_arg.clone()),
+                Hlvalue::Variable(cond.clone()),
             ],
-            Some(block_grow.clone()),
+            Some(block_ns.clone()),
             Some(bool_const(true)),
         )
         .into_ref(),
         Link::new(
-            vec![Hlvalue::Variable(l_arg), Hlvalue::Variable(newsize_arg)],
+            vec![
+                Hlvalue::Variable(l_arg),
+                Hlvalue::Variable(newsize_arg),
+                Hlvalue::Variable(cond),
+            ],
+            Some(block_condcall.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // isconstant(newsize).
+    let is_const_ns = variable_with_lltype("is_constant", LowLevelType::Bool);
+    block_ns.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(isconstant_fn),
+            Hlvalue::Variable(newsize_ns.clone()),
+        ],
+        Hlvalue::Variable(is_const_ns.clone()),
+    ));
+    block_ns.borrow_mut().exitswitch = Some(Hlvalue::Variable(is_const_ns));
+    block_ns.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_ns.clone()),
+                Hlvalue::Variable(newsize_ns.clone()),
+                Hlvalue::Variable(cond_ns.clone()),
+            ],
+            Some(block_const.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_ns),
+                Hlvalue::Variable(newsize_ns),
+                Hlvalue::Variable(cond_ns),
+            ],
+            Some(block_condcall.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    // if cond: _ll_list_resize_hint_really(l, newsize, True)
+    block_const.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond_const));
+    block_const.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_const.clone()),
+                Hlvalue::Variable(newsize_const.clone()),
+            ],
+            Some(block_direct.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(l_const), Hlvalue::Variable(newsize_const)],
             Some(block_tail.clone()),
             Some(bool_const(false)),
         )
         .into_ref(),
     ]);
 
-    // grow: some_base = 3 if newsize < 9 else 6.
-    let small = variable_with_lltype("small", LowLevelType::Bool);
-    block_grow.borrow_mut().operations.push(SpaceOperation::new(
-        "int_lt",
-        vec![Hlvalue::Variable(newsize_grow.clone()), signed_const(9)],
-        Hlvalue::Variable(small.clone()),
-    ));
-    block_grow.borrow_mut().exitswitch = Some(Hlvalue::Variable(small));
-    block_grow.closeblock(vec![
-        Link::new(
-            vec![
-                Hlvalue::Variable(l_grow.clone()),
-                Hlvalue::Variable(newsize_grow.clone()),
-                signed_const(3),
-            ],
-            Some(block_alloc.clone()),
-            Some(bool_const(true)),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                Hlvalue::Variable(l_grow),
-                Hlvalue::Variable(newsize_grow),
-                signed_const(6),
-            ],
-            Some(block_alloc.clone()),
-            Some(bool_const(false)),
-        )
-        .into_ref(),
-    ]);
-
-    // alloc: new_allocated = newsize + some_base + (newsize >> 3);
-    //      newitems = malloc(LIST.items.TO, new_allocated);
-    //      ll_arraycopy(l.items, newitems, l.length); l.items = newitems.
-    let shifted = variable_with_lltype("shifted", LowLevelType::Signed);
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_rshift",
-            vec![Hlvalue::Variable(newsize_alloc.clone()), signed_const(3)],
-            Hlvalue::Variable(shifted.clone()),
-        ));
-    let some = variable_with_lltype("some", LowLevelType::Signed);
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![Hlvalue::Variable(some_base), Hlvalue::Variable(shifted)],
-            Hlvalue::Variable(some.clone()),
-        ));
-    let new_allocated = variable_with_lltype("new_allocated", LowLevelType::Signed);
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "int_add",
-            vec![
-                Hlvalue::Variable(newsize_alloc.clone()),
-                Hlvalue::Variable(some),
-            ],
-            Hlvalue::Variable(new_allocated.clone()),
-        ));
-    let olditems = variable_with_lltype("items", items_ptr.clone());
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getfield",
-            vec![
-                Hlvalue::Variable(l_alloc.clone()),
-                void_field_const("items"),
-            ],
-            Hlvalue::Variable(olditems.clone()),
-        ));
-    let before_len = variable_with_lltype("before_len", LowLevelType::Signed);
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "getfield",
-            vec![
-                Hlvalue::Variable(l_alloc.clone()),
-                void_field_const("length"),
-            ],
-            Hlvalue::Variable(before_len.clone()),
-        ));
-    let newitems = variable_with_lltype("newitems", items_ptr.clone());
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "malloc_varsize",
-            vec![
-                lowlevel_type_const(LowLevelType::Array(Box::new(Array::gc(
-                    item_lltype.clone(),
-                )))),
-                gc_flavor_const()?,
-                Hlvalue::Variable(new_allocated),
-            ],
-            Hlvalue::Variable(newitems.clone()),
-        ));
-    let copy_void = variable_with_lltype("v", LowLevelType::Void);
-    block_alloc
+    block_direct
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
             "direct_call",
             vec![
-                Hlvalue::Constant(arraycopy_const),
-                Hlvalue::Variable(olditems),
-                Hlvalue::Variable(newitems.clone()),
-                Hlvalue::Variable(before_len),
+                Hlvalue::Constant(hint_really_fn.clone()),
+                Hlvalue::Variable(l_direct.clone()),
+                Hlvalue::Variable(newsize_direct.clone()),
+                bool_const(true),
             ],
-            Hlvalue::Variable(copy_void),
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
         ));
-    let set_items_void = variable_with_lltype("v", LowLevelType::Void);
-    block_alloc
-        .borrow_mut()
-        .operations
-        .push(SpaceOperation::new(
-            "setfield",
-            vec![
-                Hlvalue::Variable(l_alloc.clone()),
-                void_field_const("items"),
-                Hlvalue::Variable(newitems),
-            ],
-            Hlvalue::Variable(set_items_void),
-        ));
-    block_alloc.closeblock(vec![
+    block_direct.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(l_alloc), Hlvalue::Variable(newsize_alloc)],
+            vec![
+                Hlvalue::Variable(l_direct),
+                Hlvalue::Variable(newsize_direct),
+            ],
             Some(block_tail.clone()),
             None,
         )
         .into_ref(),
     ]);
 
-    // tail: l.length = newsize.
-    let set_len_void = variable_with_lltype("v", LowLevelType::Void);
+    // else: jit.conditional_call(cond, _ll_list_resize_hint_really, ...)
+    // `rlib/jit.py conditional_call` is always inlined, so this arm is
+    // the identity-bearing `we_are_jitted()` SpecTag exitswitch (true
+    // link first, matching `build_ll_alloc_and_set_helper_graph`):
+    // true → jit_conditional_call; false → if cond: direct_call.
+    let l_jit_cc = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_jit_cc = variable_with_lltype("newsize", LowLevelType::Signed);
+    let cond_jit_cc = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_jit_cc = Block::shared(vec![
+        Hlvalue::Variable(l_jit_cc.clone()),
+        Hlvalue::Variable(newsize_jit_cc.clone()),
+        Hlvalue::Variable(cond_jit_cc.clone()),
+    ]);
+    let l_interp_if = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_interp_if = variable_with_lltype("newsize", LowLevelType::Signed);
+    let cond_interp_if = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_interp_if = Block::shared(vec![
+        Hlvalue::Variable(l_interp_if.clone()),
+        Hlvalue::Variable(newsize_interp_if.clone()),
+        Hlvalue::Variable(cond_interp_if.clone()),
+    ]);
+    let l_interp_direct = variable_with_lltype("l", ptr_lltype.clone());
+    let newsize_interp_direct = variable_with_lltype("newsize", LowLevelType::Signed);
+    let block_interp_direct = Block::shared(vec![
+        Hlvalue::Variable(l_interp_direct.clone()),
+        Hlvalue::Variable(newsize_interp_direct.clone()),
+    ]);
+
+    block_condcall.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    block_condcall.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_condcall.clone()),
+                Hlvalue::Variable(newsize_condcall.clone()),
+                Hlvalue::Variable(cond_condcall.clone()),
+            ],
+            Some(block_jit_cc.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_condcall),
+                Hlvalue::Variable(newsize_condcall),
+                Hlvalue::Variable(cond_condcall),
+            ],
+            Some(block_interp_if.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    block_jit_cc
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "jit_conditional_call",
+            vec![
+                Hlvalue::Variable(cond_jit_cc),
+                Hlvalue::Constant(hint_really_fn.clone()),
+                Hlvalue::Variable(l_jit_cc.clone()),
+                Hlvalue::Variable(newsize_jit_cc.clone()),
+                bool_const(true),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    block_jit_cc.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_jit_cc),
+                Hlvalue::Variable(newsize_jit_cc),
+            ],
+            Some(block_tail.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    block_interp_if.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond_interp_if));
+    block_interp_if.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_interp_if.clone()),
+                Hlvalue::Variable(newsize_interp_if.clone()),
+            ],
+            Some(block_interp_direct.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_interp_if),
+                Hlvalue::Variable(newsize_interp_if),
+            ],
+            Some(block_tail.clone()),
+            Some(bool_const(false)),
+        )
+        .into_ref(),
+    ]);
+
+    block_interp_direct
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(hint_really_fn),
+                Hlvalue::Variable(l_interp_direct.clone()),
+                Hlvalue::Variable(newsize_interp_direct.clone()),
+                bool_const(true),
+            ],
+            Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+        ));
+    block_interp_direct.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(l_interp_direct),
+                Hlvalue::Variable(newsize_interp_direct),
+            ],
+            Some(block_tail.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // l.length = newsize.
     block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "setfield",
         vec![
@@ -3616,7 +4569,7 @@ pub(crate) fn build_ll_list_resize_ge_helper_graph(
             void_field_const("length"),
             Hlvalue::Variable(newsize_tail),
         ],
-        Hlvalue::Variable(set_len_void),
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
     ));
     block_tail.closeblock(vec![
         Link::new(
@@ -3637,6 +4590,29 @@ pub(crate) fn build_ll_list_resize_ge_helper_graph(
         vec!["l".to_string(), "newsize".to_string()],
         func,
     ))
+}
+
+/// Synthesise `_ll_list_resize_ge` (`lltypesystem/rlist.py`
+/// `_ll_list_resize_ge`) and mint the `look_inside_iff` family around
+/// `_ll_list_resize_hint_really`. The public graph is `_ll_list_resize_ge`;
+/// its constant-size arm `direct_call`s the wrapper and the residual arm
+/// inlines `conditional_call` of the same wrapper.
+pub(crate) fn build_ll_list_resize_ge_helper_graph(
+    rtyper: &RPythonTyper,
+    name: &str,
+    ptr_lltype: LowLevelType,
+    item_lltype: LowLevelType,
+    arraycopy: &LowLevelFunction,
+) -> Result<PyGraph, TyperError> {
+    let (wrapper, isconstant) = mint_ll_list_resize_hint_really_family(
+        rtyper,
+        ptr_lltype.clone(),
+        item_lltype.clone(),
+        arraycopy,
+    )?;
+    let hint_really_fn = sub_helper_funcptr_constant(rtyper, &wrapper)?;
+    let isconstant_fn = sub_helper_funcptr_constant(rtyper, &isconstant)?;
+    build_ll_list_resize_ge_graph(name, ptr_lltype, item_lltype, hint_really_fn, isconstant_fn)
 }
 
 /// Synthesise `ll_append` (`lltypesystem/rlist.py:588`):
@@ -9392,7 +10368,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::listdef::ListDef;
     use crate::annotator::model::{SomeInteger, SomeList, SomeValue};
-    use crate::flowspace::model::Variable;
+    use crate::flowspace::model::{Variable, checkgraph};
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rint::{IntegerRepr, signed_repr, unsigned_repr};
     use crate::translator::rtyper::rmodel::{inputconst, rtyper_makerepr};
@@ -12975,5 +13951,357 @@ mod tests {
             .collect();
         assert_eq!(start_ops, vec!["direct_call"]);
         assert_eq!(startblock.exits.len(), 1);
+    }
+
+    fn jit_conditional_call_callees(graph: &FunctionGraph) -> Vec<String> {
+        let mut out = Vec::new();
+        for block in graph.iterblocks() {
+            for op in &block.borrow().operations {
+                if op.opname != "jit_conditional_call" {
+                    continue;
+                }
+                if let Some(name) = op.args.get(1).and_then(direct_call_func_name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
+    /// `_ll_list_resize_hint_really` keeps the `newsize <= 0` reset, both
+    /// `overallocate` arms, and `p = min(before_len, newsize)` (`rlist.py`
+    /// `_ll_list_resize_hint_really`).
+    #[test]
+    fn build_ll_list_resize_hint_really_has_reset_and_overallocate_arms() {
+        let ptr = resized_list_lltype();
+        let helper = build_ll_list_resize_hint_really_helper_graph(
+            "_ll_list_resize_hint_really",
+            ptr,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_list_resize_hint_really_helper_graph");
+        assert_eq!(helper.func.name, "_ll_list_resize_hint_really");
+        assert!(
+            helper.func._jit_unroll_safe_,
+            "look_inside_iff marks the original unroll_safe"
+        );
+        assert_eq!(
+            helper.func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let inner = helper.graph.borrow();
+        checkgraph(&inner);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        assert_eq!(
+            count, 10,
+            "start/reset/over/some/add/malloc/min/copy/set/return"
+        );
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("int_le"), 1);
+        assert_eq!(n("debug_assert"), 1);
+        assert_eq!(n("malloc_varsize"), 2);
+        assert_eq!(n("int_is_true"), 1);
+        assert_eq!(n("direct_call"), 1);
+        assert_eq!(n("int_rshift"), 1);
+        let start = inner.startblock.borrow();
+        assert_eq!(start.inputargs.len(), 3);
+        assert_eq!(start.exits.len(), 2);
+    }
+
+    #[test]
+    fn build_ll_list_resize_hint_really_trampoline_is_dont_look_inside() {
+        let ptr = resized_list_lltype();
+        let helper = build_ll_list_resize_hint_really_trampoline_helper_graph(
+            "_ll_list_resize_hint_really_trampoline",
+            ptr,
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_list_resize_hint_really_trampoline_helper_graph");
+        assert_eq!(helper.func._jit_look_inside_, Some(false));
+        assert_eq!(
+            helper.func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let inner = helper.graph.borrow();
+        checkgraph(&inner);
+        let startblock = inner.startblock.borrow();
+        let start_ops: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(start_ops, vec!["direct_call"]);
+        assert_eq!(startblock.inputargs.len(), 3);
+        assert_eq!(startblock.exits.len(), 1);
+    }
+
+    #[test]
+    fn build_ll_list_resize_hint_really_look_inside_iff_branches_on_we_are_jitted() {
+        let ptr = resized_list_lltype();
+        let helper = build_ll_list_resize_hint_really_look_inside_iff_helper_graph(
+            "_ll_list_resize_hint_really_look_inside_iff",
+            ptr,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_list_resize_hint_really_look_inside_iff_helper_graph");
+        assert_eq!(
+            helper.func.annspecialcase, None,
+            "look_inside_iff wrapper f does not get call_location"
+        );
+        let inner = helper.graph.borrow();
+        // SpecTag `we_are_jitted` exitswitch (`rlib/jit.py look_inside_iff`);
+        // `checkgraph` rejects a Constant exitswitch outside canraise blocks.
+        let startblock = inner.startblock.borrow();
+        assert!(startblock.operations.is_empty());
+        assert_eq!(startblock.inputargs.len(), 3);
+        assert_eq!(startblock.exits.len(), 2);
+        let Some(Hlvalue::Constant(c)) = &startblock.exitswitch else {
+            panic!("exitswitch must be the we_are_jitted SpecTag constant");
+        };
+        assert!(matches!(c.value, ConstValue::SpecTag(_)));
+        drop(startblock);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, pred(len), pred(newsize), orig, tramp, returnblock.
+        assert_eq!(count, 6);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("direct_call"), 4);
+        assert_eq!(n("getfield"), 1);
+        assert_eq!(n("getarraysize"), 1);
+    }
+
+    /// `_ll_list_resize_ge` (`rlist.py` `_ll_list_resize_ge`): constant-size
+    /// arm `direct_call`s `_ll_list_resize_hint_really`; otherwise the
+    /// inlined `conditional_call` (`we_are_jitted` SpecTag); then
+    /// `setfield length`.
+    #[test]
+    fn build_ll_list_resize_ge_uses_isconstant_and_conditional_call() {
+        let ptr = resized_list_lltype();
+        let helper = build_ll_list_resize_ge_graph(
+            "_ll_list_resize_ge",
+            ptr,
+            LowLevelType::Signed,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+        )
+        .expect("build_ll_list_resize_ge_graph");
+        assert_eq!(helper.func.name, "_ll_list_resize_ge");
+        let inner = helper.graph.borrow();
+        // SpecTag `we_are_jitted` exitswitch (`rlib/jit.py conditional_call`);
+        // `checkgraph` rejects a Constant exitswitch outside canraise blocks.
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, isconstant(newsize), const-if, const-direct, we_are_jitted,
+        // jit_conditional_call, interp-if, interp-direct, tail, return.
+        assert_eq!(count, 10);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("jit_conditional_call"), 1);
+        assert_eq!(n("direct_call"), 4); // 2×isconstant + const arm + interp arm
+        assert_eq!(n("setfield"), 1);
+        assert_eq!(n("int_lt"), 1);
+        assert_eq!(n("getarraysize"), 1);
+        let start = inner.startblock.borrow();
+        let start_ops: Vec<&str> = start.operations.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(
+            start_ops,
+            vec!["getfield", "getarraysize", "int_lt", "direct_call"]
+        );
+        drop(start);
+        assert!(
+            inner.iterblocks().into_iter().any(|block| {
+                matches!(
+                    &block.borrow().exitswitch,
+                    Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::SpecTag(_))
+                )
+            }),
+            "conditional_call inlines the we_are_jitted SpecTag exitswitch"
+        );
+    }
+
+    /// Minting `_ll_list_resize_ge` registers the `look_inside_iff` family
+    /// and points both the constant `direct_call` and `jit_conditional_call`
+    /// at `_ll_list_resize_hint_really` (the wrapper after decoration).
+    #[test]
+    fn build_ll_list_resize_ge_mints_look_inside_iff_family() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = ListRepr::new(&rtyper, r_int).expect("ListRepr::new");
+        let ptr = repr.lowleveltype().clone();
+        let item = LowLevelType::Signed;
+        let items_ptr = items_array_ptr_lltype(&item);
+        let arraycopy = {
+            let item = item.clone();
+            rtyper
+                .lowlevel_helper_function_with_builder(
+                    "ll_arraycopy".to_string(),
+                    vec![items_ptr.clone(), items_ptr, LowLevelType::Signed],
+                    LowLevelType::Void,
+                    move |_r, _a, _res| {
+                        build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
+                    },
+                )
+                .expect("ll_arraycopy")
+        };
+        let helper = build_ll_list_resize_ge_helper_graph(
+            &rtyper,
+            "_ll_list_resize_ge",
+            ptr,
+            item,
+            &arraycopy,
+        )
+        .expect("build_ll_list_resize_ge_helper_graph");
+        // SpecTag `we_are_jitted` on the inlined `conditional_call` arm;
+        // `checkgraph` rejects a Constant exitswitch outside canraise blocks.
+        checkgraph(&arraycopy.graph.as_ref().unwrap().graph.borrow());
+
+        let graphs = ann.translator.graphs.borrow().clone();
+        let names: Vec<String> = graphs.iter().map(|g| g.borrow().name.clone()).collect();
+        for expected in [
+            "ll_arraycopy",
+            "_ll_list_resize_hint_really",
+            "_ll_list_resize_hint_really_trampoline",
+            "_ll_list_resize_hint_really_look_inside_iff",
+            "_ll_alloc_and_set_isconstant",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "family must mint `{expected}`, got {names:?}"
+            );
+        }
+        for name in [
+            "_ll_list_resize_hint_really",
+            "_ll_list_resize_hint_really_trampoline",
+        ] {
+            let graph = graphs
+                .iter()
+                .find(|g| g.borrow().name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            checkgraph(&graph.borrow());
+        }
+
+        let inner = helper.graph.borrow();
+        let cond_callees = jit_conditional_call_callees(&inner);
+        assert_eq!(
+            cond_callees,
+            vec!["_ll_list_resize_hint_really_look_inside_iff".to_string()],
+            "jit_conditional_call callee is the look_inside_iff wrapper of _ll_list_resize_hint_really"
+        );
+        let calls = direct_call_callees(&inner);
+        assert!(
+            calls
+                .iter()
+                .any(|(n, name)| *n == 4 && name == "_ll_list_resize_hint_really_look_inside_iff"),
+            "constant arm direct_call of _ll_list_resize_hint_really, got {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .filter(|(_, name)| name == "_ll_alloc_and_set_isconstant")
+                .count()
+                >= 2,
+            "isconstant(len(l.items)) and isconstant(newsize), got {calls:?}"
+        );
+
+        let orig = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_hint_really")
+            .expect("orig");
+        let orig_func = orig.borrow().func.clone().expect("orig GraphFunc");
+        assert!(orig_func._jit_unroll_safe_);
+        assert_eq!(
+            orig_func.annspecialcase.as_deref(),
+            Some("specialize:call_location")
+        );
+        let tramp = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_hint_really_trampoline")
+            .expect("trampoline");
+        let tramp_func = tramp.borrow().func.clone().expect("tramp GraphFunc");
+        assert_eq!(tramp_func._jit_look_inside_, Some(false));
+        let _keep = ann;
+    }
+
+    /// `ListRepr.rtype_method("append")` still mints `ll_append` through
+    /// `_ll_list_resize_ge`.
+    #[test]
+    fn resized_list_append_emits_direct_call_to_ll_append() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let list_repr: Arc<ListRepr> = Arc::new(
+            ListRepr::new(&rtyper, signed_repr() as Arc<dyn Repr>).expect("ListRepr::new"),
+        );
+        let list_lltype = list_repr.lowleveltype().clone();
+        let item_repr = list_repr.item_repr.clone();
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_list = Variable::new();
+        v_list.set_concretetype(Some(list_lltype));
+        let v_item = Variable::new();
+        v_item.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_list), Hlvalue::Variable(v_item)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                /* mutated */ true,
+                /* resized */ true,
+            ))),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(list_repr.clone() as Arc<dyn Repr>), Some(item_repr)]);
+
+        let result = list_repr
+            .rtype_method("append", &hop)
+            .unwrap_or_else(|err| panic!("list append: {err:?}"));
+        assert!(result.is_some());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr as direct_call arg 0");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_append"), "expected 'll_append' in {dbg}");
+        let graphs = ann.translator.graphs.borrow().clone();
+        let names: Vec<String> = graphs.iter().map(|g| g.borrow().name.clone()).collect();
+        for expected in [
+            "ll_append",
+            "_ll_list_resize_ge",
+            "_ll_list_resize_hint_really",
+            "_ll_list_resize_hint_really_look_inside_iff",
+            "ll_arraycopy",
+            "ll_setitem_fast",
+        ] {
+            assert!(
+                names.iter().any(|n| n == expected),
+                "append must mint `{expected}`, got {names:?}"
+            );
+        }
+        let _keep = ann;
     }
 }

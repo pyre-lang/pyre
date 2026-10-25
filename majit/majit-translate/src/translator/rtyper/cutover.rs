@@ -2981,7 +2981,7 @@ fn lift_callee_to_pygraph_with_func(
 fn source_graph_func(graph: &LegacyGraph) -> GraphFunc {
     let mut func = GraphFunc::new(
         graph.name.clone(),
-        Constant::new(ConstValue::Dict(HashMap::new())),
+        Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
     );
     func._always_inline_ = if graph.hints.iter().any(|h| h == "always_inline") {
         AlwaysInline::True
@@ -3085,7 +3085,7 @@ fn build_stub_pygraph_with_result_shell(
     let startblock = Block::shared(inputargs);
     let func = GraphFunc::new(
         name.clone(),
-        Constant::new(ConstValue::Dict(HashMap::new())),
+        Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
     );
     let mut graph_inner = crate::flowspace::model::FunctionGraph::new(name, startblock.clone());
     graph_inner.func = Some(func.clone());
@@ -3559,7 +3559,7 @@ pub(crate) fn register_unsafe_fn_stubs(
             .unwrap_or_else(|| {
                 GraphFunc::new(
                     segments.last().cloned().unwrap_or_default(),
-                    Constant::new(ConstValue::Dict(HashMap::new())),
+                    Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
                 )
             });
         let entry = registry.get_or_register_with_func(key, signature.clone(), graph_func);

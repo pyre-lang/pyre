@@ -2399,7 +2399,9 @@ impl<'a> ListComprehensionDetector<'a> {
             vec![
                 vlist.clone(),
                 iterable,
-                Hlvalue::Constant(Constant::new(ConstValue::Dict(hint_items))),
+                Hlvalue::Constant(Constant::new(ConstValue::Dict(std::sync::Arc::new(
+                    hint_items,
+                )))),
             ],
             hint_result.clone(),
         );
@@ -2452,7 +2454,9 @@ impl<'a> ListComprehensionDetector<'a> {
                     "hint",
                     vec![
                         vlist3,
-                        Hlvalue::Constant(Constant::new(ConstValue::Dict(hints))),
+                        Hlvalue::Constant(Constant::new(ConstValue::Dict(std::sync::Arc::new(
+                            hints,
+                        )))),
                     ],
                     vlist2,
                 );

@@ -895,8 +895,9 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     }
                 }
                 if all_constant {
-                    block.borrow_mut().operations[i].args[0] =
-                        Hlvalue::Constant(Constant::new(ConstValue::Dict(items)));
+                    block.borrow_mut().operations[i].args[0] = Hlvalue::Constant(Constant::new(
+                        ConstValue::Dict(std::sync::Arc::new(items)),
+                    ));
                     let s_dict = ann
                         .annotation(&block.borrow().operations[i].args[0])
                         .expect("transform_list_contains: dict annotation missing");

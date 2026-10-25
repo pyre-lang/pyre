@@ -166,7 +166,10 @@ mod tests {
         }
         let c_name =
             Constant::with_concretetype(ConstValue::byte_str("inst_x"), LowLevelType::Void);
-        let c_flags = Constant::with_concretetype(ConstValue::Dict(flags), LowLevelType::Void);
+        let c_flags = Constant::with_concretetype(
+            ConstValue::Dict(std::sync::Arc::new(flags)),
+            LowLevelType::Void,
+        );
         SpaceOperation::new(
             "jit_force_virtualizable",
             vec![

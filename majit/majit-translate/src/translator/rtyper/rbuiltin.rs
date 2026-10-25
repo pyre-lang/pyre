@@ -1668,7 +1668,10 @@ fn rtype_hint_with(hop: &HighLevelOp, pairs: &[(&str, bool)]) -> RTypeResult {
     for (key, value) in pairs {
         hints.insert(ConstValue::byte_str(*key), ConstValue::Bool(*value));
     }
-    let c_hint = Constant::with_concretetype(ConstValue::Dict(hints), LowLevelType::Void);
+    let c_hint = Constant::with_concretetype(
+        ConstValue::Dict(std::sync::Arc::new(hints)),
+        LowLevelType::Void,
+    );
     hop.exception_cannot_occur()?;
     Ok(hop.genop(
         "hint",
@@ -1736,7 +1739,7 @@ pub(super) fn rtype_jit_force_virtualizable(
         LowLevelType::Void,
     )));
     vlist.push(Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::Dict(std::collections::HashMap::new()),
+        ConstValue::Dict(std::sync::Arc::new(std::collections::HashMap::new())),
         LowLevelType::Void,
     )));
     // This is a call returning None, not an operation with an impossible
@@ -3931,7 +3934,10 @@ pub fn rtype_malloc(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RType
                 .to_string(),
         ));
     }
-    let cflags = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags_map))?;
+    let cflags = HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags_map)),
+    )?;
     vlist.push(Hlvalue::Constant(cflags));
 
     let nb_args = hop.nb_args();
@@ -4054,7 +4060,10 @@ pub fn rtype_free(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeRe
             }
         }
     }
-    let cflags = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags_map))?;
+    let cflags = HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags_map)),
+    )?;
     vlist.push(Hlvalue::Constant(cflags));
     hop.exception_cannot_occur()?;
     Ok(hop.genop("free", vlist, GenopResult::Void))
@@ -4113,7 +4122,10 @@ pub fn rtype_free_non_gc_object(
         ConstValue::ByteStr(b"flavor".to_vec()),
         ConstValue::ByteStr(flavor_str.as_bytes().to_vec()),
     );
-    let cflags = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags_map))?;
+    let cflags = HighLevelOp::inputconst(
+        &LowLevelType::Void,
+        &ConstValue::Dict(std::sync::Arc::new(flags_map)),
+    )?;
     Ok(hop.genop(
         "free",
         vec![vinst, Hlvalue::Constant(cflags)],

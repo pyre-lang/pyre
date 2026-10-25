@@ -193,7 +193,7 @@ mod tests {
         let mut graph = FunctionGraph::new(name, start);
         graph.func = Some(GraphFunc::new(
             name,
-            Constant::new(ConstValue::Dict(HashMap::new())),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new()))),
         ));
         Rc::new(RefCell::new(graph))
     }

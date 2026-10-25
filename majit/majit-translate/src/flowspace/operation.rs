@@ -3379,19 +3379,19 @@ mod tests {
             ),
             (
                 "globals",
-                ConstValue::Dict(HashMap::new()),
+                ConstValue::Dict(std::sync::Arc::new(HashMap::new())),
                 "__globals__",
-                ConstValue::Dict(HashMap::new()),
+                ConstValue::Dict(std::sync::Arc::new(HashMap::new())),
             ),
             (
                 "defaults",
-                ConstValue::Dict(HashMap::new()),
+                ConstValue::Dict(std::sync::Arc::new(HashMap::new())),
                 "__defaults__",
                 ConstValue::None,
             ),
             (
                 "closure",
-                ConstValue::Dict(HashMap::new()),
+                ConstValue::Dict(std::sync::Arc::new(HashMap::new())),
                 "__closure__",
                 ConstValue::None,
             ),
@@ -3413,7 +3413,7 @@ mod tests {
 
     #[test]
     fn getattr_constfold_function_carrier_dunder_defaults_and_closure_return_tuple_payloads() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())));
         let mut graph_func = crate::flowspace::model::GraphFunc::new("pkg.demo.user_fn", globals);
         graph_func.defaults = vec![Constant::new(ConstValue::Int(7))];
         graph_func.closure = vec![Constant::new(ConstValue::byte_str("cell"))];

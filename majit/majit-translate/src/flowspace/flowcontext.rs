@@ -303,7 +303,7 @@ fn is_host_class_named(w_value: &Hlvalue, name: &str) -> bool {
 }
 
 fn empty_globals_constant() -> Constant {
-    Constant::new(ConstValue::Dict(HashMap::new()))
+    Constant::new(ConstValue::Dict(std::sync::Arc::new(HashMap::new())))
 }
 
 fn null_value() -> Hlvalue {
@@ -3627,7 +3627,7 @@ mod test {
         let mut graph = FunctionGraph::new(host.co_name.clone(), startblock.clone());
         let mut func = GraphFunc::new(
             host.co_name.clone(),
-            Constant::new(ConstValue::Dict(globals)),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(globals))),
         );
         func.code = Some(Box::new(host.clone()));
         func.filename = Some(host.co_filename.clone());
