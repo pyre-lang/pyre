@@ -238,16 +238,18 @@ fn clear_shutdown_module_dict_pass(
             continue;
         }
         let mut d = *dict;
-        // Root the dict across the store and any collection it triggers.
+        // Classify `old` before the store because it is not rooted across it.
         // Do not root `old`: a pin would keep a finalizable value reachable
         // and move its `__del__` to a later sweep, after names this pass
-        // has already replaced.
+        // has already replaced. Root the dict across the store and any
+        // collection it triggers.
+        let delivers_none = release_delivers_no_finalizer(old);
         let did_sweep = pyre_object::with_roots!(d => {
             unsafe {
                 pyre_object::w_dict_setitem_wtf8(d, &name, pyre_object::w_none());
             }
             *released += 1;
-            if release_delivers_no_finalizer(old) {
+            if delivers_none {
                 false
             } else {
                 *swept += 1;

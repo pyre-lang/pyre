@@ -1444,9 +1444,23 @@ fn is_python_exception(error: &mut pyre_interpreter::PyError) -> bool {
     error_matches_class(error, "Exception")
 }
 
+/// [3.15-spec] `_CallPythonObject` reports any exception (`result == NULL`)
+/// unraisable; PyPy `CFuncPtr.__call__` catches `Exception` and handles
+/// `SystemExit` with `handle_system_exit`. Evidence: measured python3.15t
+/// v3.15.1 (KeyboardInterrupt, GeneratorExit, SystemExit -> unraisable,
+/// result 0) and v3.15.1 `Modules/_ctypes/callbacks.c` `_CallPythonObject`.
 fn is_callback_ignored_error(error: &mut pyre_interpreter::PyError) -> bool {
-    is_python_exception(error)
-        || error_matches_class(error, "SystemExit")
+    // Interpreter-internal kinds are not application-level exceptions even
+    // when `kind_to_exc_kind` maps them onto a `BaseException` subclass.
+    if matches!(
+        error.kind,
+        pyre_interpreter::PyErrorKind::TraceAbort
+            | pyre_interpreter::PyErrorKind::BytecodeCorruption
+            | pyre_interpreter::PyErrorKind::DescrMismatch
+    ) {
+        return false;
+    }
+    error_matches_class(error, "BaseException")
         || error.kind == pyre_interpreter::PyErrorKind::SystemExit
 }
 
@@ -1642,6 +1656,7 @@ fn convert_python_callback_result(
         Err(error) => {
             return ignore_result_conversion_error(
                 error,
+                pyre_object::gc_roots::shadow_stack_get(base),
                 pyre_object::gc_roots::shadow_stack_get(base + 2),
             );
         }
@@ -1652,9 +1667,11 @@ fn convert_python_callback_result(
         "value",
     ) {
         Ok(value) => Ok(value),
-        Err(error) => {
-            ignore_result_conversion_error(error, pyre_object::gc_roots::shadow_stack_get(base + 2))
-        }
+        Err(error) => ignore_result_conversion_error(
+            error,
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+        ),
     }
 }
 
@@ -1673,16 +1690,38 @@ fn callback_callable_repr(callable: PyObjectRef) -> rustpython_wtf8::Wtf8Buf {
     }
 }
 
+/// [3.15-spec] `_CallPythonObject` leaves the result memory as it was
+/// (measured: zero) when the callback raises or `setfunc` fails; PyPy
+/// `CFuncPtr.__call__` returns `None` (bare `return`) on a conversion
+/// failure and `0` on a call exception. Evidence: measured python3.15t
+/// v3.15.1 and v3.15.1 `Modules/_ctypes/callbacks.c` `_CallPythonObject`.
+fn ignored_callback_restype_value(
+    obj: PyObjectRef,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    let ret = resolve_restype(obj)?;
+    match ret {
+        Ret::Void => build_return_value(ret, CallValue::Void),
+        Ret::Pointer(_) => build_return_value(ret, CallValue::Pointer(0)),
+        Ret::Aggregate(_) => build_return_value(ret, CallValue::Aggregate(Vec::new())),
+        Ret::Code(code) => {
+            let n = cfield::simple_type_size(code.as_str()).unwrap_or(0);
+            build_return_value(ret, CallValue::Scalar(vec![0; n]))
+        }
+    }
+}
+
 fn ignore_result_conversion_error(
     mut error: pyre_interpreter::PyError,
+    obj: PyObjectRef,
     callable: PyObjectRef,
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     if !is_callback_ignored_error(&mut error) {
         return Err(error);
     }
     // [3.15-spec] restype conversion failure is unraisable
-    // (`test_callbacks.Callbacks.test_convert_result_error`); the value
-    // follows PyPy `CFuncPtr.__call__` (bare return). The where-string
+    // (`test_callbacks.Callbacks.test_convert_result_error`); the value is
+    // the restype decoded from a zero-filled result (measured) where PyPy
+    // `CFuncPtr.__call__` returns None (bare return). The where-string
     // goes through `write_callback_unraisable` ->
     // `write_unraisable_with_traceback(.., true, ..)`, i.e.
     // `interp_magic.write_unraisable`, which prefixes `"Exception ignored "`;
@@ -1693,7 +1732,8 @@ fn ignore_result_conversion_error(
     // (`interp_magic.write_unraisable` `with_traceback=True`).
     let roots = pyre_object::gc_roots::push_roots();
     let error_slot = error.pin(&roots);
-    let rendered = callback_callable_repr(callable);
+    let keep = pyre_object::gc_roots::pin_roots(&[obj, callable]);
+    let rendered = callback_callable_repr(pyre_object::gc_roots::shadow_stack_get(keep + 1));
     error.reload(&roots, error_slot);
     write_callback_unraisable(
         &mut error,
@@ -1702,7 +1742,7 @@ fn ignore_result_conversion_error(
             rendered
         ),
     );
-    Ok(pyre_object::w_none())
+    ignored_callback_restype_value(pyre_object::gc_roots::shadow_stack_get(keep))
 }
 
 fn ignore_python_callback_exception(
@@ -1863,9 +1903,12 @@ fn call_python_callback(
         ),
         Err(mut error) => {
             if is_callback_ignored_error(&mut error) {
-                return Ok(ignore_python_callback_exception(
+                let _ = ignore_python_callback_exception(
                     error,
                     pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                );
+                return ignored_callback_restype_value(pyre_object::gc_roots::shadow_stack_get(
+                    obj_slot,
                 ));
             }
             Err(error)
