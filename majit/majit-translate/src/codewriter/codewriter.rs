@@ -519,7 +519,11 @@ impl CodeWriter {
                 for var in graph.iter_variables() {
                     *var.annotation.borrow_mut() = None;
                 }
-                crate::translator::rtyper::legacy_annotator::annotate(graph);
+                let bookkeeper = callcontrol.bookkeeper();
+                crate::translator::rtyper::legacy_annotator::annotate_with_bookkeeper(
+                    graph,
+                    bookkeeper.as_ref(),
+                );
                 // `resolve_types` commits per-Variable concretetype
                 // cells at the resolver boundary.  Skip arm has no
                 // flowspace Variable surface — the legacy walker stays
@@ -781,7 +785,12 @@ impl CodeWriter {
         // type side-table survives the call.
         let post_result_types = crate::codewriter::transform_profile::time_phase(
             "step1b_authoritative_result_types",
-            || crate::codewriter::type_state::authoritative_result_types(&rewritten.graph),
+            || {
+                crate::codewriter::type_state::authoritative_result_types(
+                    &rewritten.graph,
+                    &callcontrol.raw_alloc_flavor_structs,
+                )
+            },
         );
         // `post_resolve` is intentionally empty here: jtransform now
         // writes resolved kinds straight to each backing
@@ -1102,7 +1111,12 @@ impl CodeWriter {
             });
         let post_result_types = crate::codewriter::transform_profile::time_phase(
             "step1b_authoritative_result_types",
-            || crate::codewriter::type_state::authoritative_result_types(&rewritten.graph),
+            || {
+                crate::codewriter::type_state::authoritative_result_types(
+                    &rewritten.graph,
+                    &callcontrol.raw_alloc_flavor_structs,
+                )
+            },
         );
         for (var, kind) in &post_result_types {
             if !matches!(kind, crate::model::ConcreteType::Unknown) {

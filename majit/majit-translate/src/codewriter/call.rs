@@ -8376,6 +8376,16 @@ impl CallControl {
                 | crate::model::ValueType::Bool
                 | crate::model::ValueType::Unsigned => 'i',
                 crate::model::ValueType::SingleFloat => 'S',
+                crate::model::ValueType::Ref(Some(name))
+                    if crate::front::llbc_hints::alloc_flavor_raw_contains(
+                        &self.raw_alloc_flavor_structs,
+                        name.as_str(),
+                    ) =>
+                {
+                    // `history.getkind` of a raw `Ptr` is int
+                    // (`rclass.py getgcflavor`). Front stays `Ref(Some(flavor))`.
+                    'i'
+                }
                 crate::model::ValueType::Ref(_)
                 | crate::model::ValueType::Str
                 | crate::model::ValueType::StringBuilder => 'r',
@@ -8613,6 +8623,11 @@ fn map_type_string_to_argclass(s: &str) -> char {
 }
 
 fn return_type_string_to_kind(s: &str) -> char {
+    // `dont_look_inside_return_token` stamps `raw:<owner>` for a
+    // pointer-to-Raw-T result. `history.getkind` of that pointer is int.
+    if s.starts_with("raw:") && s.len() > 4 {
+        return 'i';
+    }
     match s {
         "" | "()" => 'v',
         "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
@@ -8691,14 +8706,20 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
         .collect()
 }
 
-fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
+fn graph_non_void_arg_types(
+    graph: &FunctionGraph,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> Vec<Type> {
     graph_arg_types(graph)
         .iter()
-        .filter_map(calldescr_type_of_value_type)
+        .filter_map(|ty| calldescr_type_of_value_type(ty, raw_alloc_flavor_structs))
         .collect()
 }
 
-fn calldescr_type_of_value_type(ty: &crate::model::ValueType) -> Option<Type> {
+fn calldescr_type_of_value_type(
+    ty: &crate::model::ValueType,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> Option<Type> {
     match ty {
         // RPython `history.getkind(BOOL_TYPE)` returns `'int'`;
         // `CallControl.getcalldescr` records Bool in `FUNC.ARGS` under the
@@ -8710,6 +8731,16 @@ fn calldescr_type_of_value_type(ty: &crate::model::ValueType) -> Option<Type> {
         | crate::model::ValueType::Bool
         | crate::model::ValueType::Unsigned
         | crate::model::ValueType::SingleFloat => Some(Type::Int),
+        crate::model::ValueType::Ref(Some(name))
+            if crate::front::llbc_hints::alloc_flavor_raw_contains(
+                raw_alloc_flavor_structs,
+                name,
+            ) =>
+        {
+            // `history.getkind` of a raw `Ptr` is int (`rclass.py getgcflavor`).
+            // Front stays `Ref(Some(flavor))`.
+            Some(Type::Int)
+        }
         // `Str` / `StringBuilder` are GC pointers (`getkind` → `'ref'`).
         crate::model::ValueType::Ref(_)
         | crate::model::ValueType::Str
@@ -11272,7 +11303,8 @@ impl CallControl {
                 // encapsulates the convention so direct-call validation matches
                 // upstream's hard-fail semantics.
                 if let Some((_, graph)) = self.target_to_path_and_graph(target) {
-                    let expected_arg_types = graph_non_void_arg_types(&graph);
+                    let expected_arg_types =
+                        graph_non_void_arg_types(&graph, &self.raw_alloc_flavor_structs);
                     // call.py `getcalldescr`: NON_VOID_ARGS != FUNC.ARGS
                     // (voids dropped) raises. Kinds, not only arity.
                     if arg_types != expected_arg_types {
@@ -11312,7 +11344,8 @@ impl CallControl {
                     .flatten()
                     .find_map(|path| self.function_graphs.get(path).map(|g| (path, g)))
                 {
-                    let expected_arg_types = graph_non_void_arg_types(&witness_graph);
+                    let expected_arg_types =
+                        graph_non_void_arg_types(&witness_graph, &self.raw_alloc_flavor_structs);
                     if arg_types != expected_arg_types {
                         panic!(
                             "indirect_call in family including {witness_path:?}: \
@@ -13264,16 +13297,13 @@ pub(crate) fn get_type_flag(
         // descr.py get_type_flag: Ptr whose pointee has `_gckind == 'raw'` is
         // FLAG_UNSIGNED; history.getkind of that Ptr is "int". The pointee
         // is identified by the harvested `_alloc_flavor_<Struct> = "raw"`
-        // marker.
-        s if s
-            .strip_prefix("*const ")
-            .or_else(|| s.strip_prefix("*mut "))
-            .is_some_and(|pointee| {
-                crate::front::llbc_hints::alloc_flavor_raw_contains(
-                    raw_alloc_flavor_structs,
-                    pointee,
-                )
-            }) =>
+        // marker. One-word wrappers (`&T`, `Box<T>`, `Arc<T>`, `Rc<T>`,
+        // `NonNull<T>`, `AtomicPtr<T>`) peel to that pointee; a fat
+        // pointer stays on the two-word Ref arm below.
+        s if crate::front::llbc_hints::spelling_is_one_word_flavor_raw_ptr(
+            raw_alloc_flavor_structs,
+            s,
+        ) =>
         {
             (
                 ArrayFlag::Unsigned,
@@ -19296,6 +19326,59 @@ mod tests {
         );
     }
 
+    /// Residual `code_instructions_len(code: &CodeObject)`: front Input is
+    /// `Ref(Some("CodeObject"))`, `history.getkind` of that raw `Ptr` is
+    /// int. After `ptr.cast::<CodeObject>()` of `*const ()` narrows, the
+    /// actual is Signed. FUNC.ARGS `[Int]` matches actual `[Int]`.
+    #[test]
+    fn getcalldescr_flavor_raw_ref_input_agrees_with_narrowed_int_actual() {
+        let mut cc = CallControl::new();
+        cc.raw_alloc_flavor_structs.insert("CodeObject".to_string());
+        let path = CallPath::from_segments(["code_instructions_len"]);
+        let mut graph = FunctionGraph::new("code_instructions_len");
+        let arg = graph.alloc_value_var();
+        graph.push_inputarg_var(graph.startblock, arg.clone());
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "code".to_string(),
+                ty: ValueType::Ref(Some("CodeObject".to_string())),
+                class_root: Some("CodeObject".to_string()),
+            },
+            arg,
+        );
+        graph.set_return(graph.startblock, None);
+        cc.register_function_graph(path.clone(), graph);
+        assert_eq!(
+            cc.declared_non_void_arg_classes(&path).as_deref(),
+            Some("i"),
+            "flavor-raw Ref(Some(CodeObject)) FUNC.ARGS class is int"
+        );
+
+        let actual = crate::flowspace::model::Variable::new();
+        actual.set_concretetype(crate::model::concrete_to_canonical_lltype(
+            crate::model::ConcreteType::Signed,
+        ));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["code_instructions_len"]),
+                args: crate::model::call_args([actual]),
+                result_ty: ValueType::Unsigned,
+            },
+        };
+        let mut cache = AnalysisCache::default();
+        let _ = cc.getcalldescr(
+            &op,
+            vec![Type::Int],
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+    }
+
     /// `call.py getcalldescr` compares NON_VOID_ARGS against FUNC.ARGS
     /// with Void dropped independently. A Void actual against a Signed
     /// declared slot is `[] != [Signed]` and raises.
@@ -21892,10 +21975,17 @@ mod tests {
             "*const CodeObject",
             "*mut CodeObject",
             "AtomicPtr<QuasiImmut>",
+            "&CodeObject",
+            "&mut CodeObject",
+            "Box<CodeObject>",
+            "NonNull<CodeObject>",
+            "Arc<CellFamily>",
         ] {
             assert_eq!(get_type_flag(spelling, &raw), expected, "{spelling}");
             assert_eq!(get_type_flag(spelling, &empty), fallback, "{spelling}");
         }
+        assert_eq!(get_type_flag("&PyObject", &raw), fallback);
+        assert_eq!(get_type_flag("Box<PyObject>", &raw), fallback);
         assert_eq!(get_type_flag("AtomicPtr<PyObject>", &raw), fallback);
         assert_eq!(get_type_flag("AtomicPtr<PyObject>", &empty), fallback);
         // The flavor belongs to the ADT, so an instantiation and a

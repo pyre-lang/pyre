@@ -51,13 +51,14 @@ pub fn layout_for_word(word: usize) -> FatPtrLayout {
 ///
 /// A lifetime on the reference (`&'static dyn DictStrategy`) is the same
 /// two-word value: [`pointer_pointee`] strips it the way `spelling_is_fat_ptr`
-/// already does.
+/// already does. `Arc<dyn Trait>` / `Rc<dyn Trait>` are the same two-word
+/// fat value.
 pub fn spelling_is_dyn_fat_ptr(s: &str) -> bool {
     let s = s.trim();
     if s.starts_with("*const ") || s.starts_with("*mut ") {
         return false;
     }
-    if let Some(inner) = wrapper_inner(s, &["Box"]) {
+    if let Some(inner) = wrapper_inner(s, &["Box", "Arc", "Rc"]) {
         return spelling_is_dyn_trait_pointee(inner);
     }
     if pointer_pointee(s).is_some_and(spelling_is_dyn_trait_pointee) {
@@ -92,7 +93,7 @@ fn unsized_pointee(s: &str) -> Option<&str> {
     is_unsized_pointee(pointee).then_some(pointee)
 }
 
-fn wrapper_inner<'a>(s: &'a str, leaves: &[&str]) -> Option<&'a str> {
+pub(crate) fn wrapper_inner<'a>(s: &'a str, leaves: &[&str]) -> Option<&'a str> {
     let (head, rest) = s.split_once('<')?;
     if !rest.ends_with('>') {
         return None;
@@ -108,7 +109,11 @@ fn wrapper_inner<'a>(s: &'a str, leaves: &[&str]) -> Option<&'a str> {
     Some(inner.trim())
 }
 
-fn pointer_pointee(s: &str) -> Option<&str> {
+/// Pointee of a one-word pointer spelling: `*const T` / `*mut T` /
+/// `&mut T` / `&T` / `Box<T>` / `Arc<T>` / `Rc<T>` / `NonNull<T>` /
+/// `AtomicPtr<T>` (qualified paths included). Fat spellings still
+/// peel; the caller declines them with [`spelling_is_fat_ptr`].
+pub(crate) fn pointer_pointee(s: &str) -> Option<&str> {
     let s = s.trim();
     if let Some(rest) = s
         .strip_prefix("*const ")
@@ -131,7 +136,7 @@ fn pointer_pointee(s: &str) -> Option<&str> {
         }
         return Some(rest);
     }
-    wrapper_inner(s, &["Box", "NonNull"])
+    wrapper_inner(s, &["Box", "NonNull", "Arc", "Rc", "AtomicPtr"])
 }
 
 fn is_unsized_pointee(inner: &str) -> bool {

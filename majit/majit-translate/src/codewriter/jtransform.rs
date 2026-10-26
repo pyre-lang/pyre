@@ -3503,6 +3503,48 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// Front `Ref(Some(flavor))` is still a raw `Ptr` at `history.getkind`
+    /// (`rclass.py getgcflavor`). Residual/regular rewrite must not restamp
+    /// that dest as GcRef: a later elidable (`npure_cellvars`) then sees
+    /// actual Ref against FUNC.ARGS Int.
+    fn flavor_raw_ref_is_int_banked(&self, ty: &ValueType) -> bool {
+        match ty {
+            ValueType::Ref(Some(name)) => self.callcontrol.as_deref().is_some_and(|cc| {
+                crate::front::llbc_hints::alloc_flavor_raw_contains(
+                    &cc.raw_alloc_flavor_structs,
+                    name,
+                )
+            }),
+            _ => false,
+        }
+    }
+
+    /// `history.getkind` of a raw-flavor `Ptr` is `'int'` (`rclass.py
+    /// getgcflavor`). `rewrite_op_force_cast` sends int → raw-pointer
+    /// through `_int_to_int_cast`, a no-op for same-size words;
+    /// `rewrite_op_cast_ptr_to_int` returns None for a non-GC operand.
+    /// The result is the int word, not a `cast_int_to_ptr`.
+    fn cast_int_to_ptr_is_int_identity(
+        &self,
+        result_ty: &ValueType,
+        result: Option<&crate::flowspace::model::Variable>,
+    ) -> bool {
+        self.flavor_raw_ref_is_int_banked(result_ty)
+            || result.is_some_and(|r| self.get_value_kind_var(r) == 'i')
+    }
+
+    fn stamp_int_banked_cast_int_to_ptr_result(
+        &mut self,
+        graph: &FunctionGraph,
+        result: Option<crate::flowspace::model::Variable>,
+    ) {
+        self.stamp_value_kind(
+            graph,
+            result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+    }
+
     /// Stamp the synthetic kind from a `ValueType` source, skipping
     /// `ValueType::Unknown` so the fallback Unknown→Ref defaulting in
     /// `value_type_to_kind` does not clobber a real `concretetype`
@@ -3515,6 +3557,9 @@ impl<'a> Transformer<'a> {
     ) {
         let ty = match result_ty {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
+                crate::codewriter::type_state::ConcreteType::Signed
+            }
+            ValueType::Ref(_) if self.flavor_raw_ref_is_int_banked(result_ty) => {
                 crate::codewriter::type_state::ConcreteType::Signed
             }
             ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
@@ -3580,7 +3625,13 @@ impl<'a> Transformer<'a> {
             'v'
         } else {
             self.resolve_call_result_kind(result, result_ty)
-                .unwrap_or_else(|| value_type_to_kind(result_ty))
+                .unwrap_or_else(|| {
+                    if self.flavor_raw_ref_is_int_banked(result_ty) {
+                        'i'
+                    } else {
+                        value_type_to_kind(result_ty)
+                    }
+                })
         };
         let ir_type = match kind {
             'i' => majit_ir::value::Type::Int,
@@ -3815,14 +3866,19 @@ impl<'a> Transformer<'a> {
             // directly.  A bare `Call` to a hint-marker path is still
             // accepted (defensive / unit tests construct it) and classified
             // by name.
-            OpKind::Hint { value, kind } => {
-                self.rewrite_op_hint(op, *kind, std::slice::from_ref(value), "hint", graph_name)
-            }
+            OpKind::Hint { value, kind } => self.rewrite_op_hint(
+                op,
+                *kind,
+                std::slice::from_ref(value),
+                "hint",
+                graph_name,
+                graph,
+            ),
             OpKind::Call { target, args, .. } if classify_hint_target(target).is_some() => {
                 let kind = classify_hint_target(target).expect("guard checked Some");
                 let label = target.to_string();
                 let args = crate::model::call_arg_vars(args);
-                self.rewrite_op_hint(op, kind, &args, &label, graph_name)
+                self.rewrite_op_hint(op, kind, &args, &label, graph_name, graph)
             }
             // `jtransform.py rewrite_op_jit_force_virtualizable`: the
             // rtyper-injected op, not `hint(x, force_virtualizable=True)`.
@@ -3860,6 +3916,18 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
+            // `rewrite_op_force_cast` / `_int_to_int_cast`: int → raw-pointer
+            // is an int→int identity (`history.getkind` of the raw `Ptr`).
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                result_ty,
+            } if unop_name == "cast_int_to_ptr"
+                && self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) =>
+            {
+                self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                RewriteResult::Identity(operand.clone())
+            }
             // ── fold of the `_we_are_jitted` symbolic ──
             //
             // Inside the tracer / blackhole interpreter `we_are_jitted()`
@@ -3934,6 +4002,21 @@ impl<'a> Transformer<'a> {
                     .is_some_and(|result| self.get_value_kind_var(result) == 'r');
                 if ops.is_empty() && !result_is_ref {
                     RewriteResult::Keep
+                } else if result_is_ref
+                    && self.cast_int_to_ptr_is_int_identity(item_ty, op.result.as_ref())
+                {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                    ops.push(SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::RawLoad {
+                            base: addr,
+                            offset: offset.clone(),
+                            item_ty: ValueType::Int,
+                            itemsize: *itemsize,
+                            is_item_signed: *is_item_signed,
+                        },
+                    });
+                    RewriteResult::Replace(ops)
                 } else if result_is_ref {
                     let loaded = self.fresh_synthetic_variable_typed(
                         graph,
@@ -6648,6 +6731,7 @@ impl<'a> Transformer<'a> {
         args: &[crate::flowspace::model::Variable],
         label: &str,
         graph_name: &str,
+        graph: &FunctionGraph,
     ) -> RewriteResult {
         match hint_kind {
             crate::hints::HintKind::AccessDirectly
@@ -6725,7 +6809,7 @@ impl<'a> Transformer<'a> {
                 // `None` sentinel that aliases the result back to the input
                 // is realized in pyre by `self.aliases.insert(result, base)`
                 // before emitting the replacement ops.
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
             crate::hints::HintKind::PromoteString => {
                 // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
@@ -6748,7 +6832,7 @@ impl<'a> Transformer<'a> {
                 // names, sound for the rest).  `get_value_kind_var` reports
                 // `'r'` for the ref operand, so the shared helper emits
                 // `r_guard_value` directly.
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
             crate::hints::HintKind::PromoteUnicode => {
                 // `rpython/jit/codewriter/jtransform.py Transformer.rewrite_op_hint promote_unicode`:
@@ -6760,7 +6844,7 @@ impl<'a> Transformer<'a> {
                 // value-equality `str_guard_value` has no `W_UnicodeObject`
                 // counterpart, so the ref operand lowers through the shared
                 // `<kind>_guard_value` family to `r_guard_value`.
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
             crate::hints::HintKind::PromoteOrString => {
                 // `rpython/jit/codewriter/jtransform.py:599-606` —
@@ -6784,7 +6868,7 @@ impl<'a> Transformer<'a> {
                 // `<kind>_guard_value` per `jit.py` +
                 // `getkind(Ptr) == "ref"` (`rpython/jit/metainterp/
                 // history.py:64`).
-                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, args, label, graph_name, graph)
             }
         }
     }
@@ -6811,11 +6895,25 @@ impl<'a> Transformer<'a> {
         args: &[crate::flowspace::model::Variable],
         label: &str,
         graph_name: &str,
+        graph: &FunctionGraph,
     ) -> RewriteResult {
         let Some(arg) = args.first() else {
             return RewriteResult::Keep;
         };
         let base = resolve_alias(arg, &self.aliases);
+        // `rewrite_op_hint` / `handle_hint`: `'%s_guard_value' % getkind(v.concretetype)`.
+        // A flavor-raw `Ref(Some)` is int at `history.getkind`; stamp that
+        // bank onto the operand before reading the kind char so the
+        // register class and the opname share one cell.
+        let operand_ty = declared_value_type_of(graph, &base).or_else(|| match &op.kind {
+            OpKind::Call { result_ty, .. } => Some(result_ty.clone()),
+            _ => None,
+        });
+        if let Some(ty) = operand_ty.as_ref()
+            && self.flavor_raw_ref_is_int_banked(ty)
+        {
+            self.stamp_value_kind_from_value_type(graph, Some(base.clone()), ty);
+        }
         let kind_char = self.get_value_kind_var(&base);
         // jtransform.py:608 `op.args[0].concretetype is not lltype.Void`
         // guard — void args fall through the rewrite (caller may want
@@ -7661,6 +7759,22 @@ impl<'a> Transformer<'a> {
                 {
                     return None;
                 }
+                if self.cast_int_to_ptr_is_int_identity(&typed_item_ty, Some(result))
+                    || self.flavor_raw_ref_is_int_banked(item_ty)
+                {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, Some(result.clone()));
+                    return Some(RewriteResult::Replace(vec![SpaceOperation {
+                        result: Some(result.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: base.clone(),
+                            index: index.clone(),
+                            item_ty: ValueType::Int,
+                            array_type_id: array_type_id.clone(),
+                            nolength: *nolength,
+                            pure: false,
+                        },
+                    }]));
+                }
                 let word = graph.alloc_value_var_with_type(ConcreteType::Signed);
                 Some(RewriteResult::Replace(vec![
                     SpaceOperation {
@@ -8032,7 +8146,32 @@ impl<'a> Transformer<'a> {
             // transform's livevar reload (`rgc` rewrites the same box
             // in place) and folds the same way.
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
-                return RewriteResult::Identity(args[0].clone());
+                // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
+                // `__cast_instance_intrinsic` onto a flavor-raw ADT
+                // (`rclass.py getgcflavor`) has `history.getkind` int.
+                // A GC source (`*const ()`) is still ref; that crossing
+                // is `cast_ptr_to_int` (`lltype.py`), not `same_as`.
+                let src = resolve_alias(&args[0], &self.aliases);
+                if is_identity_cast_path(segments)
+                    && segments.last().map(String::as_str)
+                        == Some(crate::runtime_names::shims::CAST_INSTANCE)
+                    && let ValueType::Ref(Some(name)) = result_ty
+                    && self.callcontrol.as_deref().is_some_and(|cc| {
+                        crate::front::llbc_hints::alloc_flavor_raw_contains(
+                            &cc.raw_alloc_flavor_structs,
+                            name,
+                        )
+                    })
+                    && self.get_value_kind_var(&src) == 'r'
+                {
+                    self.stamp_value_kind(
+                        graph,
+                        op.result.clone(),
+                        crate::codewriter::type_state::ConcreteType::Signed,
+                    );
+                    return rewrite_as_unary_llop(op, &src, "cast_ptr_to_int", ValueType::Int);
+                }
+                return RewriteResult::Identity(src);
             }
             if is_lltype_cast_path(segments, "cast_ptr_to_int")
                 && args.len() == 1
@@ -8092,6 +8231,10 @@ impl<'a> Transformer<'a> {
                     return RewriteResult::Identity(src);
                 }
                 if self.get_value_kind_var(&arg) == 'i' {
+                    if self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) {
+                        self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                        return RewriteResult::Identity(arg);
+                    }
                     // Stamp the operand Signed so flatten emits
                     // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
                     // `/r>r` from an unstamped Unknown.
@@ -11171,7 +11314,19 @@ impl<'a> Transformer<'a> {
                     return None;
                 };
                 let items = header_load(graph, &mut ops, l, VEC_PTR_WORD, None);
+                let dest_ty = match &op.kind {
+                    OpKind::Call { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
+                        result_ty.clone()
+                    }
+                    _ => ValueType::Ref(None),
+                };
                 let (read_result, cast_result) = match kind {
+                    VecItemKind::Ref
+                        if self.cast_int_to_ptr_is_int_identity(&dest_ty, op.result.as_ref()) =>
+                    {
+                        self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                        (op.result.clone()?, None)
+                    }
                     VecItemKind::Ref => (
                         graph.alloc_value_var_with_type(ConcreteType::Signed),
                         op.result.clone(),
@@ -14819,6 +14974,43 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
         .and_then(crate::hints::classify_hint_segments)
 }
 
+/// Declared `ValueType` of the op that defines `var` (`Input.ty`,
+/// `FieldRead.ty`, `Call.result_ty`, …). `get_value_type` only sees the
+/// already-stamped `concretetype` cell and collapses every Ref to
+/// `Ref(None)`, so a flavor-raw `Ref(Some(CodeObject))` has to come
+/// from the producer op.
+fn declared_value_type_of(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<ValueType> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return declared_result_value_type(&op.kind);
+        }
+    }
+    None
+}
+
+fn declared_result_value_type(kind: &OpKind) -> Option<ValueType> {
+    match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. } => Some(ty.clone()),
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. }
+        | OpKind::RawLoad { item_ty, .. } => Some(item_ty.clone()),
+        OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. }
+        | OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
+        _ => None,
+    }
+}
+
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
 /// A method with the same name is not the rtyper primitive.
 ///
@@ -15673,6 +15865,12 @@ mod tests {
     use super::*;
     use crate::codewriter::type_state::ConcreteType;
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
+
+    fn register_codeobject_origin() -> parking_lot::MutexGuard<'static, ()> {
+        crate::test_support::register_struct_origins_serialized(std::collections::HashMap::from([
+            ("CodeObject".to_string(), "bytecode".to_string()),
+        ]))
+    }
 
     fn mark_fresh_virtualizable(variable: &crate::flowspace::model::Variable) {
         let mut flags = std::collections::BTreeMap::new();
@@ -28590,6 +28788,234 @@ mod tests {
         }
     }
 
+    /// `__cast_instance_intrinsic` onto a flavor-raw ADT from a GC
+    /// source is `cast_ptr_to_int` (`history.getkind` of the raw `Ptr`
+    /// is int; `rewrite_op_cast_pointer` aliases only same-bank).
+    #[test]
+    fn cast_instance_flavor_raw_of_gcref_is_cast_ptr_to_int() {
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("narrow_code");
+        let src = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]);
+        let dest_ty = ValueType::Ref(Some("CodeObject<ConstantData>".to_string()));
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: crate::model::cast_instance_call("CodeObject<ConstantData>", src.clone()),
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&src),
+            &dest_ty,
+            "narrow_code",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::UnaryOp { op, operand, result_ty },
+                        ..
+                    }] if op == "cast_ptr_to_int"
+                        && operand == &src
+                        && *result_ty == ValueType::Int
+                ));
+            }
+            RewriteResult::Identity(_) => panic!("expected cast_ptr_to_int, got Identity"),
+            RewriteResult::Keep => panic!("expected cast_ptr_to_int, got Keep"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed
+        );
+    }
+
+    /// Same-bank flavor-raw narrow stays `rewrite_op_cast_pointer`
+    /// (`same_as`): both `history.getkind`s are already int.
+    #[test]
+    fn cast_instance_flavor_raw_of_int_aliases() {
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("narrow_raw_code");
+        let src = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path([crate::runtime_names::shims::CAST_INSTANCE]);
+        let dest_ty = ValueType::Ref(Some("CodeObject".to_string()));
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: crate::model::cast_instance_call("CodeObject", src.clone()),
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&src),
+            &dest_ty,
+            "narrow_raw_code",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, src),
+            RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
+            RewriteResult::Keep => panic!("expected Identity, got Keep"),
+        }
+    }
+
+    /// Looked-inside `PyFrame::code` returns front `Ref(Some(CodeObject))`.
+    /// Residual/regular rewrite must stamp that dest Signed (`history.getkind`
+    /// of the raw `Ptr`) so a later `npure_cellvars` actual matches FUNC.ARGS.
+    #[test]
+    fn flavor_raw_ref_call_result_stamps_int_bank() {
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let path = crate::parse::CallPath::from_segments(["code"]);
+        let mut callee = FunctionGraph::new("code");
+        let recv = callee.alloc_value_var();
+        callee.push_inputarg_var(callee.startblock, recv.clone());
+        callee.push_op_with_result_var(
+            callee.startblock,
+            OpKind::Input {
+                name: "self".to_string(),
+                ty: ValueType::Ref(Some("PyFrame".to_string())),
+                class_root: Some("PyFrame".to_string()),
+            },
+            recv,
+        );
+        callee.set_return(callee.startblock, None);
+        cc.register_function_graph(path.clone(), callee);
+        cc.mark_elidable(path);
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("locals_plus_value");
+        let recv = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Unknown);
+        let target = CallTarget::function_path(["code"]);
+        let dest_ty = ValueType::Ref(Some("CodeObject".to_string()));
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![recv.clone()]),
+                result_ty: dest_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&recv),
+            &dest_ty,
+            "locals_plus_value",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(_) => {}
+            RewriteResult::Identity(_) => panic!("expected residual/regular rewrite, got Identity"),
+            RewriteResult::Keep => panic!("expected residual/regular rewrite, got Keep"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed,
+            "flavor-raw Ref(Some) call dest is int-banked"
+        );
+    }
+
+    /// `rewrite_op_hint` `promote=True`: `'%s_guard_value' % getkind(v.concretetype)`.
+    /// A `Ref(Some("CodeObject"))` whose harvested `_alloc_flavor_` is raw
+    /// is int (`history.getkind` of that `Ptr`). The operand cell is stamped
+    /// Signed by `rewrite_op_hint_guard_value_family` before the kind char is
+    /// chosen (`'%s_guard_value' % getkind(v.concretetype)`), and the
+    /// post-jtransform `authoritative_result_types` overlay keeps that bank,
+    /// so assemble emits `int_guard_value/i`.
+    #[test]
+    fn hint_promote_flavor_raw_codeobject_emits_int_guard_value_i() {
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::codewriter::type_state::authoritative_result_types;
+
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("promote_codeobject");
+        let code = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "code".into(),
+                    ty: ValueType::Ref(Some("CodeObject".into())),
+                    class_root: Some("CodeObject".into()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(graph.startblock, code.clone());
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Hint {
+                value: code.clone(),
+                kind: crate::hints::HintKind::Promote,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, Some(code.clone()));
+
+        let mut graph = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
+        let post_result = authoritative_result_types(&graph, &cc.raw_alloc_flavor_structs);
+        for (var, kind) in &post_result {
+            if !matches!(kind, ConcreteType::Unknown) {
+                FunctionGraph::set_concretetype_of_inline(var, *kind);
+            }
+        }
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+
+        let ops = &graph.block(graph.startblock).operations;
+        let guard = ops.iter().find_map(|op| match &op.kind {
+            OpKind::GuardValue {
+                value, kind_char, ..
+            } => Some((value.clone(), *kind_char)),
+            _ => None,
+        });
+        let (guarded, kind_char) = guard.expect("promote lowers to GuardValue");
+        assert_eq!(
+            kind_char, 'i',
+            "flavor-raw CodeObject promote is int_guard_value"
+        );
+        assert_eq!(guarded, code);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&code),
+            ConcreteType::Signed,
+            "operand cell stays Signed through post_result"
+        );
+
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.contains_key("int_guard_value/i"),
+            "expected int_guard_value/i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.contains_key("int_guard_value/r"),
+            "operand must be int-banked, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// A raw pointer is already kind `'int'` (`history.py getkind`).
     /// `rewrite_op_cast_ptr_to_int` returns None and aliases the operand.
     #[test]
@@ -28672,6 +29098,76 @@ mod tests {
                 _ => panic!("expected UnaryOp rewrite for {result_ty:?}"),
             }
         }
+    }
+
+    /// `rewrite_op_force_cast` / `_int_to_int_cast`: int → a flavor-raw
+    /// `Ptr` (`history.getkind` `'int'`) is an identity, not
+    /// `cast_int_to_ptr`.
+    #[test]
+    fn cast_int_to_ptr_flavor_raw_codeobject_is_int_identity() {
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut graph = FunctionGraph::new("cast_int_to_codeobject");
+        let n = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&n, ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, n.clone());
+        let dest_ty = ValueType::Ref(Some("CodeObject".into()));
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]),
+                    args: crate::model::call_args(vec![n.clone()]),
+                    result_ty: dest_ty,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => op != "cast_int_to_ptr",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => !is_lltype_cast_path(segments, "cast_int_to_ptr"),
+                _ => true,
+            }),
+            "no cast_int_to_ptr remains; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed,
+            "flavor-raw CodeObject dest is int-kind"
+        );
     }
 
     /// `Transformer._handle_str2unicode_call` records the Str2Unicode

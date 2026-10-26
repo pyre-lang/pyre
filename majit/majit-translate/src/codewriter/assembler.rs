@@ -1690,22 +1690,25 @@ impl AssemblerEncode for Assembler {
                 match dest.map(|(_, kc)| kc).unwrap_or('r') {
                     'i' => {
                         panic_if_gc_host_object_int_dest(obj, self, callcontrol);
-                        let bits = obj.identity_id() as i64;
-                        let (idx, src_argcode) = if let Some(name) = self.static_ref_by_addr(bits) {
+                        // `Assembler.emit_const` for an int-kind raw Ptr:
+                        // `see_raw_object`, `llmemory.cast_ptr_to_adr`, then
+                        // pool `adr2int`. A named host static is that
+                        // address; `ConstIRelocKind::StaticAddr` is the
+                        // load-time reloc. No static row means the
+                        // constant has no runtime counterpart.
+                        let named = self
+                            .static_ref_addr_by_name(obj.qualname())
+                            .map(|addr| (addr, obj.qualname().to_string()));
+                        let (idx, src_argcode) = if let Some((addr, name)) = named {
                             (
                                 self.emit_const_i_reloc(
-                                    bits,
-                                    ConstIRelocKind::StaticAddr {
-                                        name: name.to_string(),
-                                    },
+                                    addr,
+                                    ConstIRelocKind::StaticAddr { name },
                                     state,
                                 ),
                                 'i',
                             )
                         } else {
-                            // `emit_const` pools `cast_ptr_to_adr` of the
-                            // represented low-level object; `identity_id`
-                            // is the translator's own bookkeeping address.
                             panic!(
                                 "Assembler.emit_const: raw HostObject {} has no runtime \
                                  counterpart — graph {:?}",
@@ -8187,6 +8190,53 @@ mod tests {
             }
         );
         assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    fn const_ref_named_static_int_dest_uses_i_reloc() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let obj = HostObject::new_opaque("dictstrategy::EMPTY");
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRef(obj),
+        };
+        let mut asm = Assembler::new();
+        asm.intern_static_ref_addrs(&[("dictstrategy::EMPTY", 0x1000)]);
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "int_copy/i>i";
+        assert!(asm.insns.contains_key(key));
+        assert!(!asm.insns.contains_key("ref_copy/r>i"));
+        assert_eq!(state.constants_i, vec![0x1000]);
+        assert_eq!(state.reloc_consts_i.len(), 1);
+        assert_eq!(
+            state.reloc_consts_i[0].kind,
+            ConstIRelocKind::StaticAddr {
+                name: "dictstrategy::EMPTY".into()
+            }
+        );
+        assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "has no runtime counterpart")]
+    fn const_ref_unregistered_raw_host_object_int_dest_panics() {
+        use crate::model::{OpKind, SpaceOperation};
+
+        let (result, regallocs) = color_result(RegKind::Int, 0);
+        let obj = HostObject::new_opaque("unregistered::RAW");
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::ConstRef(obj),
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
     }
 
     #[test]

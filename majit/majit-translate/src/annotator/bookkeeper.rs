@@ -2843,6 +2843,43 @@ impl Bookkeeper {
         hit.cloned()
     }
 
+    /// `SomeInstance(classdef)` for a struct root already interned, present
+    /// in the field registry, or harvested `_alloc_flavor_ = raw`. Unknown
+    /// names stay unresolved so the classdef-less `Ref` fallback remains
+    /// (`valuetype_to_someshell`); `bookkeeper.py getuniqueclassdef` keys
+    /// identity on a live class object, not a fabricated bare name.
+    pub fn classdef_for_known_struct_root(
+        self: &Rc<Self>,
+        root: &str,
+    ) -> Option<Rc<RefCell<ClassDef>>> {
+        if !self.struct_root_is_known(root) {
+            return None;
+        }
+        self.getuniqueclassdef_for_struct_root(root).ok()
+    }
+
+    fn struct_root_is_known(&self, root: &str) -> bool {
+        let canonical = majit_ir::descr::canonical_struct_name(root);
+        {
+            let classes = self.struct_root_classes.borrow();
+            if classes.contains_key(root) || classes.contains_key(&canonical) {
+                return true;
+            }
+        }
+        {
+            let fields = self.struct_fields.borrow();
+            if let Some(reg) = fields.as_ref()
+                && (reg.fields.contains_key(root) || reg.fields.contains_key(canonical.as_str()))
+            {
+                return true;
+            }
+        }
+        crate::front::llbc_hints::alloc_flavor_raw_contains(
+            &self.raw_alloc_flavor_structs.borrow(),
+            root,
+        )
+    }
+
     /// Resolve a struct type-root name to its canonical, bookkeeper-
     /// REGISTERED `ClassDef`, with instance attributes projected from
     /// the threaded `StructFieldRegistry`.
@@ -4331,6 +4368,13 @@ impl Bookkeeper {
                     .collect();
                 return SomeValue::Tuple(super::model::SomeTuple::new(items));
             }
+        }
+        // `AtomicPtr<T>` is layout-identical `*mut T`
+        // (`llannotation.py lltype_to_annotation` keeps a pointer a
+        // pointer). Peeling to `T` would annotate `AtomicPtr<f64>` as a
+        // float.
+        if let Some(inner) = crate::fat_ptr_layout::wrapper_inner(stripped, &["AtomicPtr"]) {
+            return self.project_struct_field_type(&format!("*mut {inner}"));
         }
         for wrapper in [
             "Rc<",
@@ -6179,13 +6223,32 @@ impl Drop for PositionGuard {
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::annotator::model::{SomeChar, SomeFloat};
+    use crate::annotator::model::{SomeChar, SomeFloat, SomeValue};
     use crate::flowspace::model::GraphFunc;
     use rustpython_compiler::{Mode, compile as rp_compile};
     use rustpython_compiler_core::bytecode::ConstantData;
 
     fn bk() -> Rc<Bookkeeper> {
         Rc::new(Bookkeeper::new())
+    }
+
+    #[test]
+    fn atomic_ptr_projects_as_pointer_not_payload() {
+        let bk = bk();
+        assert!(
+            matches!(
+                bk.project_struct_field_type("AtomicPtr<f64>"),
+                SomeValue::Integer(_)
+            ),
+            "AtomicPtr<f64> is *mut f64 (`llannotation.py lltype_to_annotation`)"
+        );
+        assert!(
+            matches!(
+                bk.project_struct_field_type("std::sync::atomic::AtomicPtr<f64>"),
+                SomeValue::Integer(_)
+            ),
+            "qualified AtomicPtr<f64> is *mut f64"
+        );
     }
 
     fn compiled_graph_func(src: &str, defaults: Vec<Constant>) -> GraphFunc {

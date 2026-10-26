@@ -4615,10 +4615,14 @@ fn rtype_null_fn(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeRe
 }
 
 /// `core.ptr.null_raw` — `lltype.nullptr(T)` of a raw `Ptr` (`rptr.py`
-/// `PtrRepr`), or `llmemory.NULL` when the result is `Address`
-/// (`raddress.py` `AddressRepr`). A constant class-root argument is
-/// consumed at annotation (`raw_ptr_null_constant`); `r_result` already
-/// carries that `Ptr` / `Address`.
+/// `PtrRepr`), `lltype.nullptr(r_to.lowleveltype.TO)` of a flavor-raw
+/// `InstanceRepr` (`rclass.py` / `rpbc.py` None → instance conversion),
+/// or `llmemory.NULL` when the result is `Address` (`raddress.py`
+/// `AddressRepr`). A constant class-root argument is consumed at
+/// annotation (`raw_ptr_null_constant`); `r_result` already carries
+/// that `Ptr` / `InstanceRepr` / `Address`. The `Ptr` arm covers both
+/// `SomePtr(Ptr(Struct raw))` and a flavor-raw `InstanceRepr` whose
+/// `lowleveltype` is `Ptr` to a raw struct.
 fn rtype_null_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, nullptr};
@@ -5267,6 +5271,60 @@ mod tests {
         );
         let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
         HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops)
+    }
+
+    /// `rtype_null_raw` of a flavor-raw `InstanceRepr` is
+    /// `lltype.nullptr(r_to.lowleveltype.TO)` (`rclass.py` None →
+    /// instance conversion): an `LLPtr` null whose concretetype is a
+    /// `Ptr` to a raw struct.
+    #[test]
+    fn rtype_null_raw_of_flavor_raw_instance_is_null_ptr_to_raw_struct() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::SomeInstance;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, PtrTarget};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("pkg.RawC", None);
+        classdef
+            .borrow()
+            .classdesc
+            .borrow()
+            .pyobj
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let s_result = SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            true,
+            std::collections::BTreeMap::new(),
+        ));
+        let repr = hop.rtyper.getrepr(&s_result).expect("getrepr");
+        Repr::setup(repr.as_ref()).expect("setup flavor-raw InstanceRepr");
+        *hop.r_result.borrow_mut() = Some(repr);
+        let out = rtype_null_raw(&hop, &HashMap::new()).expect("rtype_null_raw");
+        let Some(Hlvalue::Constant(c)) = out else {
+            panic!("expected LLPtr constant, got {out:?}");
+        };
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr, got {:?}", c.value);
+        };
+        assert!(!ptr.nonzero(), "nullptr must be null");
+        let Some(LowLevelType::Ptr(ll_ptr)) = &c.concretetype else {
+            panic!("concretetype must be Ptr, got {:?}", c.concretetype);
+        };
+        let gckind = match &ll_ptr.TO {
+            PtrTarget::Struct(body) => body._gckind,
+            PtrTarget::ForwardReference(fwd) => {
+                let resolved = fwd.resolved().expect("object_type resolved");
+                let LowLevelType::Struct(body) = resolved else {
+                    panic!("expected raw Struct, got {resolved:?}");
+                };
+                body._gckind
+            }
+            other => panic!("expected Ptr to raw struct, got {other:?}"),
+        };
+        assert_eq!(gckind, GcKind::Raw);
     }
 
     /// `simple_call(get_raw_address_of_string, arg)` hop after

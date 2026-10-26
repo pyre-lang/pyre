@@ -494,6 +494,6 @@ fn pycode_code_ptr_is_raw_int_kind() {
     assert_eq!(
         FunctionGraph::concretetype_of(&filename_bytes_code_ptr),
         ConcreteType::GcRef,
-        "legacy resolve with an empty raw set leaves code_ptr as GcRef"
+        "empty harvest cannot int-bank at the legacy layer"
     );
 }

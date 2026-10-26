@@ -206,7 +206,14 @@ pub fn somevalue_to_valuetype(s: &SomeValue) -> ValueType {
         // collapsing it here would instead union Int with SingleFloat on the
         // next annotator pass and erase the binding as Unknown.
         SomeValue::SingleFloat(_) => ValueType::SingleFloat,
-        SomeValue::Instance(_) | SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
+        // Classed `SomeInstance` keeps the classdef name so
+        // `valuetype_to_concrete_for_legacy` can apply `rclass.py
+        // getgcflavor`. Classless is the root instance
+        // (`rclass.py getinstancerepr(None)`), flavor `'gc'`.
+        SomeValue::Instance(inst) => {
+            ValueType::Ref(inst.classdef.as_ref().map(|cd| cd.borrow().name.clone()))
+        }
+        SomeValue::Ptr(_) | SomeValue::PBC(_) => ValueType::Ref(None),
         // Keep the `StringBuilder` shell distinct across the roundtrip so
         // the rtyper picks `StringBuilderRepr` rather than the generic
         // `Ref` fallback (which would erase the builder method surface).

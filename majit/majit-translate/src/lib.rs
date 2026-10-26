@@ -257,6 +257,7 @@ fn build_semantic_program_via_active_frontend(
             let mut foreign_opaque_method_externals = Vec::new();
             let mut eval_hook_graphs = Vec::new();
             let mut declared_gc = front::mir::DeclaredGcFacts::default();
+            let mut raw_alloc_flavor_structs = std::collections::HashSet::new();
             // Root-stack effects, harvested in link order: each artefact is
             // analysed with the effects of the crates it depends on already
             // published, so a call into one of them reads that body's answer.
@@ -312,6 +313,11 @@ fn build_semantic_program_via_active_frontend(
                 discovered.extend(front::mir::discover_transparent_scalar_kinds(&llbc));
                 duplicate_leaf_facts.absorb(front::mir::DuplicateLeafFacts::discover(&llbc));
                 declared_gc.absorb(front::mir::harvest_declared_gc_facts(&llbc));
+                raw_alloc_flavor_structs.extend(
+                    front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                        &llbc,
+                    )),
+                );
                 let mut impl_folds = Vec::new();
                 for (path, op) in front::mir::discover_foldable_const_lits(&llbc) {
                     if path.contains('<') {
@@ -382,11 +388,13 @@ fn build_semantic_program_via_active_frontend(
                     &llbc,
                     &gc_struct_ids,
                     static_addrs.error_carrier,
+                    &raw_alloc_flavor_structs,
                 ));
                 unsafe_fn_stubs.extend(front::mir::collect_policy_opaque_fn_stubs_from_llbc(
                     &llbc,
                     &gc_struct_ids,
                     static_addrs.error_carrier,
+                    &raw_alloc_flavor_structs,
                 ));
                 foreign_opaque_method_externals
                     .extend(front::mir::collect_foreign_opaque_method_externals(&llbc));

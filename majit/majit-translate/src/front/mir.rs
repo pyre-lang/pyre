@@ -751,7 +751,13 @@ fn ref_enum_instantiation_of_adt(
     // Payload rows, not the `<…>` class suffix. The suffix stays the
     // rendered argument (`PyError`); a handle's row is `*mut` of its
     // `Deref::Target` class so the payload attr and the cast agree.
-    let args = render_adt_payload_type_args(adt, llbc, 0, gc_struct_ids);
+    let args = render_adt_payload_type_args(
+        adt,
+        llbc,
+        0,
+        gc_struct_ids,
+        &std::collections::HashSet::<String>::new(),
+    );
     Some(RefEnumInst {
         def_id,
         name_path,
@@ -864,6 +870,7 @@ fn substitute_field_type(
     args: &[String],
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
     if let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))
         && let Some(idx) = typevar_bound_index(node)
@@ -876,9 +883,13 @@ fn substitute_field_type(
     // A concrete payload that is itself the handle (a monomorphized
     // `Result::Err` field) has to name the same class the cast writes.
     // A type variable already carries that spelling in `args`.
-    if let Some(spelling) =
-        transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
-    {
+    if let Some(spelling) = transparent_handle_field_spelling(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return spelling;
     }
     tyref_to_ast_string(ty, llbc)
@@ -1003,7 +1014,13 @@ fn register_ref_enum_instantiation_rows(
             let mut registrable = true;
             for (i, f) in v.fields.iter().enumerate() {
                 let fname = field_decl_name(i, f);
-                let concrete = substitute_field_type(&f.ty, &inst.args, llbc, gc_struct_ids);
+                let concrete = substitute_field_type(
+                    &f.ty,
+                    &inst.args,
+                    llbc,
+                    gc_struct_ids,
+                    &std::collections::HashSet::<String>::new(),
+                );
                 let trimmed = concrete.trim();
                 // A sole pair-slice payload is its pointer and length words,
                 // under the same rule as a sole scalar.
@@ -1219,7 +1236,13 @@ fn register_ordereddict_i64_entry_rows(
         let mut concrete = true;
         for (index, field) in fields.iter().enumerate() {
             let fname = field_decl_name(index, field);
-            let concrete_ty = substitute_field_type(&field.ty, &args, llbc, gc_struct_ids);
+            let concrete_ty = substitute_field_type(
+                &field.ty,
+                &args,
+                llbc,
+                gc_struct_ids,
+                &std::collections::HashSet::<String>::new(),
+            );
             if concrete_ty.contains("??") {
                 concrete = false;
                 break;
@@ -2005,6 +2028,7 @@ impl<'l> CrateLowering<'l> {
             func_hints,
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
+            &self.state.raw_alloc_flavor_structs,
             &fn_path,
         )
     }
@@ -2028,6 +2052,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
             fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            &self.state.raw_alloc_flavor_structs,
         );
         pygraph_initial_block(
             &mut graph,
@@ -2042,7 +2067,9 @@ impl<'l> CrateLowering<'l> {
                 fd,
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
+                &self.state.raw_alloc_flavor_structs,
             ),
+            &self.state.raw_alloc_flavor_structs,
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -2061,8 +2088,8 @@ impl<'l> CrateLowering<'l> {
             struct_fields,
             tombstoned_leaves,
             gc_struct_ids,
-            raw_alloc_flavor_structs,
             immutable_fields,
+            raw_alloc_flavor_structs,
             dont_look_inside,
             spec,
             ..
@@ -2104,8 +2131,8 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
-            raw_alloc_flavor_structs,
             immutable_fields,
+            raw_alloc_flavor_structs,
             builder_mode,
             &accum,
             root_stack,
@@ -2203,6 +2230,7 @@ impl<'l> CrateLowering<'l> {
             func_hints,
             self.static_addrs.error_carrier,
             &self.state.gc_struct_ids,
+            &self.state.raw_alloc_flavor_structs,
             &policy_fn_path,
         );
         let segments = spec_segments(llbc, fd, &header.name);
@@ -2233,6 +2261,7 @@ impl<'l> CrateLowering<'l> {
             &self.state.tombstoned_leaves,
             &self.state.gc_struct_ids,
             fun_decl_is_dont_look_inside(fd, &self.state.dont_look_inside),
+            &self.state.raw_alloc_flavor_structs,
         );
         pygraph_initial_block(
             &mut graph,
@@ -2247,7 +2276,9 @@ impl<'l> CrateLowering<'l> {
                 fd,
                 &self.state.tombstoned_leaves,
                 &self.state.gc_struct_ids,
+                &self.state.raw_alloc_flavor_structs,
             ),
+            &self.state.raw_alloc_flavor_structs,
         );
         if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
@@ -2263,8 +2294,8 @@ impl<'l> CrateLowering<'l> {
             struct_fields,
             tombstoned_leaves,
             gc_struct_ids,
-            raw_alloc_flavor_structs,
             immutable_fields,
+            raw_alloc_flavor_structs,
             dont_look_inside,
             spec: spec_queue,
             skipped,
@@ -2294,8 +2325,8 @@ impl<'l> CrateLowering<'l> {
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
-            raw_alloc_flavor_structs,
             immutable_fields,
+            raw_alloc_flavor_structs,
             builder_mode,
             &accum,
             root_stack,
@@ -2626,6 +2657,7 @@ impl SemanticFunctionHeader {
         func_hints: &std::collections::HashMap<String, Vec<String>>,
         error_carrier: crate::ErrorCarrierSpec<'_>,
         gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+        raw_alloc_flavor_structs: &std::collections::HashSet<String>,
         policy_fn_path: &str,
     ) -> Self {
         let self_ty_root = impl_method_owner_for_fundecl(llbc, fd).map(|(owner, _)| owner);
@@ -2690,7 +2722,13 @@ impl SemanticFunctionHeader {
         let signature_token = if gcref_result {
             Some(crate::translator::rtyper::cutover::GCREF_RETURN_TYPE.to_string())
         } else {
-            dont_look_inside_return_token(&signature.output, llbc, error_carrier, gc_struct_ids)
+            dont_look_inside_return_token(
+                &signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
         };
         // `dont_look_inside_return_token` spells a raw address word as
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
@@ -2704,7 +2742,13 @@ impl SemanticFunctionHeader {
         let mut return_type = if gcref_result || stamp_return_token {
             signature_token
         } else if signature_token.as_deref().is_some_and(scalar_result_token)
-            && !output_is_raw_address_word(&signature.output, llbc, error_carrier, gc_struct_ids)
+            && !output_is_raw_address_word(
+                &signature.output,
+                llbc,
+                error_carrier,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
         {
             signature_token
         } else {
@@ -3301,6 +3345,7 @@ fn published_struct_field_layout(
     field_ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
     let leaf = type_path.rsplit("::").next().unwrap_or(type_path);
     let is_rbigint = type_path == "rbigint::RBigInt" || type_path.ends_with("::rbigint::RBigInt");
@@ -3314,7 +3359,7 @@ fn published_struct_field_layout(
         // `Ptr(GcArray(OBJECTPTR))`. `getitem` is `getarrayitem_gc`.
         "[*mut PyObject]".to_string()
     } else {
-        annotation_struct_field_type(field_ty, llbc, gc_struct_ids)
+        annotation_struct_field_type(field_ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
     }
 }
 
@@ -3327,12 +3372,13 @@ fn annotation_struct_field_type(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
     match tyref_rust_vec_item_kind(ty, llbc) {
         Some(majit_ir::rvec::VecItemKind::Int) => "*mut Vec<usize>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
-        None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids),
+        None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
     }
 }
 
@@ -3407,6 +3453,7 @@ fn register_type_alias_struct(
     llbc: &Llbc,
     target: &str,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
     exact_layouts: &mut std::collections::HashMap<
         majit_ir::descr::StructId,
@@ -3434,7 +3481,14 @@ fn register_type_alias_struct(
         .enumerate()
         .map(|(i, f)| {
             let fname = field_decl_name(i, f);
-            let field_ty = published_struct_field_layout(&name, &fname, &f.ty, llbc, gc_struct_ids);
+            let field_ty = published_struct_field_layout(
+                &name,
+                &fname,
+                &f.ty,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
             field_decl_row(i, f, field_ty)
         })
         .collect();
@@ -3490,7 +3544,13 @@ fn register_type_alias_struct(
         .enumerate()
         .map(|(i, f)| {
             let fname = field_decl_name(i, f);
-            let attr_ty = tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc, gc_struct_ids);
+            let attr_ty = tyref_to_attr_value_type_for_struct_field(
+                &f.ty,
+                td,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
             (fname, attr_ty)
         })
         .collect();
@@ -3553,6 +3613,10 @@ fn derive_program_metadata(
     std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
     std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
 ) {
+    let raw_alloc_flavor_structs =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    let raw_alloc_flavor_structs = &raw_alloc_flavor_structs;
+
     // Charon resolves layout per target; the LLBC carries a single
     // entry for the extraction target (build-script `TARGET`).  An
     // absent/non-matching target falls back to the sole entry inside
@@ -3616,6 +3680,7 @@ fn derive_program_metadata(
                     llbc,
                     no_tombstoned_leaves(),
                     gc_struct_ids,
+                    raw_alloc_flavor_structs,
                 );
                 let handle_field_index = handle_payload
                     .as_ref()
@@ -3626,6 +3691,7 @@ fn derive_program_metadata(
                         llbc,
                         no_tombstoned_leaves(),
                         gc_struct_ids,
+                        raw_alloc_flavor_structs,
                     )
                     .map(|root| ValueType::Ref(Some(root)))
                 });
@@ -3664,6 +3730,7 @@ fn derive_program_metadata(
                                 &f.ty,
                                 llbc,
                                 gc_struct_ids,
+                                raw_alloc_flavor_structs,
                             ),
                         };
                         let field_ty =
@@ -3773,6 +3840,7 @@ fn derive_program_metadata(
                                     td,
                                     llbc,
                                     gc_struct_ids,
+                                    raw_alloc_flavor_structs,
                                 )
                             })
                         } else {
@@ -3781,6 +3849,7 @@ fn derive_program_metadata(
                                 layout_td,
                                 llbc,
                                 gc_struct_ids,
+                                raw_alloc_flavor_structs,
                             )
                         };
                         vec![(
@@ -4119,17 +4188,28 @@ fn derive_program_metadata(
                                 ("u32".to_string(), ValueType::Int)
                             } else if tyref_is_type_parameter(&f.ty, llbc) {
                                 (
-                                    tyref_to_field_layout_string(&f.ty, llbc, gc_struct_ids),
+                                    tyref_to_field_layout_string(
+                                        &f.ty,
+                                        llbc,
+                                        gc_struct_ids,
+                                        raw_alloc_flavor_structs,
+                                    ),
                                     ValueType::Unknown,
                                 )
                             } else {
                                 (
-                                    annotation_struct_field_type(&f.ty, llbc, gc_struct_ids),
+                                    annotation_struct_field_type(
+                                        &f.ty,
+                                        llbc,
+                                        gc_struct_ids,
+                                        raw_alloc_flavor_structs,
+                                    ),
                                     tyref_to_attr_value_type_with(
                                         &f.ty,
                                         llbc,
                                         no_tombstoned_leaves(),
                                         gc_struct_ids,
+                                        raw_alloc_flavor_structs,
                                     ),
                                 )
                             };
@@ -4213,6 +4293,7 @@ fn derive_program_metadata(
                     llbc,
                     &target,
                     gc_struct_ids,
+                    raw_alloc_flavor_structs,
                     &mut struct_fields,
                     &mut exact_layouts,
                     &mut struct_ids,
@@ -5090,8 +5171,8 @@ pub fn lower_fun_decl_with_static_addrs(
             &context.dont_look_inside,
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
-            &context.raw_alloc_flavor_structs,
             &context.immutable_fields,
+            &context.raw_alloc_flavor_structs,
         )
     })
 }
@@ -5164,8 +5245,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Result<FunctionGraph, LowerError> {
     let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -5189,8 +5270,8 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         dont_look_inside,
         tombstoned_leaves,
         gc_struct_ids,
-        raw_alloc_flavor_structs,
         immutable_fields,
+        raw_alloc_flavor_structs,
         builder_mode,
         &accum,
         &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
@@ -5217,8 +5298,8 @@ fn lower_fat_dyn_callee(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<FunctionGraph> {
     if crate::front::dyn_fat::splice_in_progress(def_id) {
         return None;
@@ -5241,8 +5322,8 @@ fn lower_fat_dyn_callee(
         dont_look_inside,
         tombstoned_leaves,
         gc_struct_ids,
-        raw_alloc_flavor_structs,
         immutable_fields,
+        raw_alloc_flavor_structs,
     )
     .ok()
 }
@@ -5262,8 +5343,8 @@ fn splice_recorded_fat_dyn_returns(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) {
     let dyn_results = lo.dyn_return_calls.clone();
     let cache =
@@ -5285,8 +5366,8 @@ fn splice_recorded_fat_dyn_returns(
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
-            raw_alloc_flavor_structs,
             immutable_fields,
+            raw_alloc_flavor_structs,
         );
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
@@ -5468,8 +5549,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     dont_look_inside: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
     // When set, each strategy's `Lowering` is switched to builder form
     // ([`Lowering::enable_builder_mode`]) so a string accumulator
     // emits the `StringBuilder` markers instead of `ll_strconcat`.  The
@@ -5518,7 +5599,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             gc_struct_ids,
         );
         let expand_inline_struct = |owner: &str, field: &str| {
-            inline_struct_field_leaves(llbc, tombstoned_leaves, gc_struct_ids, owner, field)
+            inline_struct_field_leaves(
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+                owner,
+                field,
+                raw_alloc_flavor_structs,
+            )
         };
         // MIR framestate argument threading must finish before adding native
         // enum arms: its successor table names MIR blocks, not these new
@@ -6293,8 +6381,8 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
-            raw_alloc_flavor_structs,
             immutable_fields,
+            raw_alloc_flavor_structs,
         );
         // Field reads emitted while blocks were still being closed name a
         // base defined only in a predecessor. Thread once every edge exists.
@@ -6328,10 +6416,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             tombstoned_leaves,
             gc_struct_ids,
             immutable_fields,
+            raw_alloc_flavor_structs,
             accum,
             root_stack,
             self_dont_look_inside,
-            fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
+            fundecl_keeps_zst_self(
+                llbc,
+                fd,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ),
         )?;
         lo.struct_fields = Some(struct_fields);
         lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -6386,10 +6481,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         tombstoned_leaves,
         gc_struct_ids,
         immutable_fields,
+        raw_alloc_flavor_structs,
         accum,
         root_stack,
         self_dont_look_inside,
-        fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
+        fundecl_keeps_zst_self(
+            llbc,
+            fd,
+            tombstoned_leaves,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
     )?;
     lo.struct_fields = Some(struct_fields);
     lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -6430,10 +6532,17 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 tombstoned_leaves,
                 gc_struct_ids,
                 immutable_fields,
+                raw_alloc_flavor_structs,
                 accum,
                 root_stack,
                 self_dont_look_inside,
-                fundecl_keeps_zst_self(llbc, fd, tombstoned_leaves, gc_struct_ids),
+                fundecl_keeps_zst_self(
+                    llbc,
+                    fd,
+                    tombstoned_leaves,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                ),
             )?;
             lo.struct_fields = Some(struct_fields);
             lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -9428,6 +9537,7 @@ fn pygraph_initial_block(
     gc_mut_ref_params: &std::collections::HashSet<usize>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     keep_zst_self: bool,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<Option<Variable>> {
     let n_locals = locals.locals.len();
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
@@ -9471,7 +9581,13 @@ fn pygraph_initial_block(
         // (mirrors the `parse.rs` arg-binding path).
         graph.name_value_var(&var, name.clone());
         *slot = Some(var.clone());
-        let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves, gc_struct_ids);
+        let ty = tyref_to_value_type_with(
+            &local.ty,
+            llbc,
+            tombstoned_leaves,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         // A parameter with no runtime representation (`Arg<T>`'s
         // `PhantomData` marker is the case in point — rustc gives it no
         // ABI slot) has to read as `Void` here, matching upstream's
@@ -9527,7 +9643,13 @@ fn pygraph_initial_block(
         // residual exclusion: a cell parameter is the `MutRef<T>` the
         // caller passes, not `T`. Seeding `T` hoists `value` onto `T`'s class.
         let cell_root = if gc_mut_ref_params.contains(&i) {
-            tyref_gc_mut_ref_cell_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
+            tyref_gc_mut_ref_cell_root(
+                &local.ty,
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
         } else {
             None
         };
@@ -9561,6 +9683,21 @@ fn pygraph_initial_block(
             match &ty {
                 ValueType::Ref(_) => {
                     tyref_ref_param_class_root(&local.ty, llbc, tombstoned_leaves, generics)
+                        .or_else(|| {
+                            // `Box` / `NonNull` of a flavor-raw ADT is
+                            // `Ref(Some(root))` at the front; `tyref_ref_param_class_root`
+                            // declines the alloc wrapper. Name the pointee so
+                            // `derive_subject_inputcells` seeds `SomeInstance`.
+                            // `Arc` / `Rc` point at the refcount header, not `T`
+                            // (`deref_cast_root`).
+                            raw_address_owner_root(
+                                &local.ty,
+                                llbc,
+                                tombstoned_leaves,
+                                gc_struct_ids,
+                                raw_alloc_flavor_structs,
+                            )
+                        })
                 }
                 // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
                 // so it takes the non-`Ref` arm and would otherwise carry no
@@ -9600,6 +9737,7 @@ fn pygraph_initial_block(
                                 llbc,
                                 tombstoned_leaves,
                                 gc_struct_ids,
+                                raw_alloc_flavor_structs,
                             )
                         }
                     }),
@@ -9685,6 +9823,7 @@ impl<'a> Lowering<'a> {
         tombstoned_leaves: &'a std::collections::HashSet<String>,
         gc_struct_ids: &'a std::collections::HashSet<majit_ir::descr::StructId>,
         immutable_fields: &'a ImmutableFieldsTable,
+        raw_alloc_flavor_structs: &std::collections::HashSet<String>,
         accum: &AccumulatorFacts,
         root_stack: &RootStackAnalyzer<'_>,
         self_dont_look_inside: bool,
@@ -9696,6 +9835,7 @@ impl<'a> Lowering<'a> {
             tombstoned_leaves,
             gc_struct_ids,
             self_dont_look_inside,
+            raw_alloc_flavor_structs,
         );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
@@ -9753,7 +9893,13 @@ impl<'a> Lowering<'a> {
             if str_view_locals.get(i).copied().unwrap_or(false) {
                 stamp_as_rstr_str(&var);
             }
-            let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves, gc_struct_ids);
+            let ty = tyref_to_value_type_with(
+                &local.ty,
+                llbc,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            );
             // A parameter with no runtime representation (`Arg<T>`'s
             // `PhantomData` marker is the case in point — rustc gives it no
             // ABI slot) has to read as `Void` here, matching upstream's
@@ -9818,7 +9964,13 @@ impl<'a> Lowering<'a> {
             // Same membership as [`gc_mut_ref_param_locals`]: a cell
             // parameter is the `MutRef<T>` the caller passes, not `T`.
             let cell_root = if gc_mut_ref_params.contains(&i) {
-                tyref_gc_mut_ref_cell_root(&local.ty, llbc, tombstoned_leaves, gc_struct_ids)
+                tyref_gc_mut_ref_cell_root(
+                    &local.ty,
+                    llbc,
+                    tombstoned_leaves,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
             } else {
                 None
             };
@@ -9869,6 +10021,7 @@ impl<'a> Lowering<'a> {
                                     llbc,
                                     tombstoned_leaves,
                                     gc_struct_ids,
+                                    raw_alloc_flavor_structs,
                                 )
                             }
                         }),
@@ -10130,7 +10283,7 @@ impl<'a> Lowering<'a> {
             graph,
             llbc,
             struct_fields: None,
-            raw_alloc_flavor_structs: std::collections::HashSet::new(),
+            raw_alloc_flavor_structs: raw_alloc_flavor_structs.clone(),
             dont_look_inside,
             tombstoned_leaves,
             gc_struct_ids,
@@ -11738,6 +11891,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         Some((field, ty))
     }
@@ -11822,6 +11976,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         let res = self
             .graph
@@ -11974,6 +12129,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             decode_constant(self.llbc, value).ok()?,
         ) {
@@ -12175,6 +12331,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             );
             return self.pair_setitem(mir_bb, seq, &index_payload.clone(), value, &value_ty);
         }
@@ -12193,6 +12350,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     ),
                 },
             });
@@ -12592,6 +12750,7 @@ impl<'a> Lowering<'a> {
                                         self.llbc,
                                         self.tombstoned_leaves,
                                         self.gc_struct_ids,
+                                        &self.raw_alloc_flavor_structs,
                                     ),
                                 );
                             if let Some(dest) = interior_dest
@@ -12684,6 +12843,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     };
                     OpKind::ArrayWrite {
@@ -12805,6 +12965,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         )
     }
 
@@ -12813,7 +12974,13 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let ty = &self.body.locals.locals.get(local)?.ty;
-        tyref_gc_mut_ref_cell_root(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+        tyref_gc_mut_ref_cell_root(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
     }
 
     fn deref_cell_param_local(&self, place: &Place) -> Option<usize> {
@@ -12944,6 +13111,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     )
                     .or_else(|| {
                         if !tyref_is_type_var(ty, self.llbc) {
@@ -12958,6 +13126,7 @@ impl<'a> Lowering<'a> {
                                     self.llbc,
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
                                 )
                             })
                     });
@@ -14402,6 +14571,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         ))
     }
 
@@ -14539,7 +14709,13 @@ impl<'a> Lowering<'a> {
         if !self.ty_is_error_carrier(ty) {
             return None;
         }
-        transparent_deref_target_class(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+        transparent_deref_target_class(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
     }
 
     /// `PyError(ptr)` is one pointer word. The class is the handle's
@@ -14606,8 +14782,18 @@ impl<'a> Lowering<'a> {
                 // rtype_cast_ptr_to_int`); `rptr.py` has only eq/ne.
                 let lhs_kind = self.operand_value_kind(&lhs);
                 let rhs_kind = self.operand_value_kind(&rhs);
-                let lhs_raw_addr = operand_is_declared_raw(&lhs, self.llbc, self.gc_struct_ids);
-                let rhs_raw_addr = operand_is_declared_raw(&rhs, self.llbc, self.gc_struct_ids);
+                let lhs_raw_addr = operand_is_declared_raw(
+                    &lhs,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
+                let rhs_raw_addr = operand_is_declared_raw(
+                    &rhs,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
                 // Rust `==` / `!=` on raw pointers compares addresses: the
                 // flowspace `is_` (`rptr.py` `rtype_is_` → `ptr_eq`), not the
                 // value `eq` a string operand would dispatch to `ll_streq`.
@@ -14642,6 +14828,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     });
                 let result_ty = match scalar_ty {
@@ -14855,6 +15042,7 @@ impl<'a> Lowering<'a> {
                                     self.llbc,
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
                                 ))
                             }
                             Operand::Const(_) => None,
@@ -14888,6 +15076,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     );
                     // An integer cast to a narrower unsigned type keeps only
                     // the low bytes. The JIT carries every integer in one
@@ -15012,7 +15201,8 @@ impl<'a> Lowering<'a> {
                                 dest_ty,
                                 self.llbc,
                                 self.tombstoned_leaves,
-                                self.gc_struct_ids
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs
                             ),
                             ValueType::Int
                         )
@@ -15076,7 +15266,8 @@ impl<'a> Lowering<'a> {
                                 dest_ty,
                                 self.llbc,
                                 self.tombstoned_leaves,
-                                self.gc_struct_ids
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs
                             ),
                             ValueType::Unsigned
                         )
@@ -15090,9 +15281,12 @@ impl<'a> Lowering<'a> {
                         // that address to `Ptr(GCREF)`; record the source the
                         // same way the Ref arm does.
                         let source_is_raw_address = match &operand {
-                            Operand::Copy(place) | Operand::Move(place) => {
-                                ty_is_raw_address(&place.ty, self.llbc, self.gc_struct_ids)
-                            }
+                            Operand::Copy(place) | Operand::Move(place) => ty_is_raw_address(
+                                &place.ty,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            ),
                             Operand::Const(_) => false,
                         };
                         if source_is_raw_address {
@@ -15158,7 +15352,17 @@ impl<'a> Lowering<'a> {
                     // Fold the int→ptr half back to the original GC pointer
                     // so OptEarlyForce does not force_box a virtual
                     // W_IntObject (`jtransform.py rewrite_op_cast_opaque_ptr`).
+                    // A flavor-raw dest is int-banked (`rclass.py getgcflavor`);
+                    // folding would leave a GC `*const ()` actual against
+                    // FUNC.ARGS Int. Fall through to `ptr_cast_marker`.
                     if matches!(dst_kind, ValueType::Ref(_))
+                        && flavor_raw_pointer_class_root(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                        .is_none()
                         && let Some(orig) = self.cast_ptr_to_int_src.get(&arg).cloned()
                     {
                         return Ok((None, orig));
@@ -15259,6 +15463,7 @@ impl<'a> Lowering<'a> {
                                                 &operand,
                                                 self.llbc,
                                                 self.gc_struct_ids,
+                                                &self.raw_alloc_flavor_structs,
                                             ),
                                             dest_ty,
                                             &arg,
@@ -15317,6 +15522,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ) {
                     ValueType::Float => ValueType::Float,
                     ValueType::Unsigned => ValueType::Unsigned,
@@ -15455,7 +15661,12 @@ impl<'a> Lowering<'a> {
                 // Ref source may narrow or erase below.
                 let src_kind = self.operand_value_kind(&operand);
                 let src_root = self.operand_class_root(&operand);
-                let src_raw_addr = operand_is_declared_raw(&operand, self.llbc, self.gc_struct_ids);
+                let src_raw_addr = operand_is_declared_raw(
+                    &operand,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
                 let src_int = operand_tyref(&operand).and_then(|src| self.literal_int_width(src));
                 let dst_int = self.literal_int_width(&ty);
                 let v = self.resolve_operand(mir_bb, operand)?;
@@ -15467,12 +15678,21 @@ impl<'a> Lowering<'a> {
                 // A same-bank ptr→ptr cast keeps the i64 pointer carrier in
                 // place, so it would alias — but the pointee type it
                 // reinterprets to is load-bearing for the annotator, in both
-                // directions ([`Lowering::ptr_cast_marker`]).  Gate on the
-                // raw-pointer cast kind: `lltype.cast_pointer`
-                // (`lltype.py`) is pointer-to-pointer only, and
-                // int-to-pointer is the separate `cast_int_to_ptr`
-                // analyzer.
-                if cast_kind_is_raw_ptr(&kind)
+                // directions ([`Lowering::ptr_cast_marker`]). `lltype.cast_pointer`
+                // (`lltype.py`) is pointer-to-pointer. UnaryOp Cast already
+                // calls `ptr_cast_marker` without a Charon kind gate;
+                // `ptr_cast_marker` requires both sides Ref, so an int-to-ptr
+                // Scalar still falls through. A flavor-raw dest must reach
+                // the marker even when Charon spells the kind as something
+                // other than `RawPtr` (`*const () as *const CodeObject`).
+                let dest_flavor_raw = flavor_raw_pointer_class_root(
+                    &ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .is_some();
+                if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw)
                     && let Some((op, res)) = self
                         .ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
                         .or_else(|| {
@@ -15500,8 +15720,14 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 );
-                let dest_raw_addr = ty_is_raw_address(&ty, self.llbc, self.gc_struct_ids);
+                let dest_raw_addr = ty_is_raw_address(
+                    &ty,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                );
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
                     || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
                 if crosses_raw_ref
@@ -15529,6 +15755,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     {
                         self.graph.push_op_with_result_var(
@@ -16235,7 +16462,14 @@ impl<'a> Lowering<'a> {
         let PlaceKind::Projection(inner, ProjectionElem::Atom(elem)) = &place.kind else {
             return Ok(None);
         };
-        if elem != "Deref" || !ty_is_raw_address(&inner.ty, self.llbc, self.gc_struct_ids) {
+        if elem != "Deref"
+            || !ty_is_raw_address(
+                &inner.ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        {
             return Ok(None);
         }
         Ok(Some(self.resolve_place(mir_bb, (**inner).clone())?))
@@ -16254,7 +16488,12 @@ impl<'a> Lowering<'a> {
         let (base, extra_offset) = match &place.kind {
             PlaceKind::Projection(inner, ProjectionElem::Atom(elem))
                 if elem == "Deref"
-                    && ty_is_raw_address(&inner.ty, self.llbc, self.gc_struct_ids) =>
+                    && ty_is_raw_address(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ) =>
             {
                 (self.resolve_place(mir_bb, (**inner).clone())?, 0u64)
             }
@@ -17243,8 +17482,13 @@ impl<'a> Lowering<'a> {
         }
         let ty = ty?;
         raw_ptr_one_word_item_kind(ty, self.llbc)?;
-        let from =
-            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids);
+        let from = tyref_to_value_type_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
         Some(self.retype_word(mir_bb, value, &from, &ValueType::Unsigned))
     }
 
@@ -17377,6 +17621,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         let kind = match ty {
             ValueType::Unsigned => OpKind::ConstUInt(bits),
@@ -17730,6 +17975,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         )
         .ok_or_else(|| {
             LowerError::Unsupported(format!(
@@ -17800,6 +18046,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 )
             })
             .expect("raw array local has an array type");
@@ -17982,6 +18229,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     ),
                     &pointee,
                 ),
@@ -18126,6 +18374,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             &call.dest.ty,
         );
@@ -18687,6 +18936,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     });
                     let ptr = match ptr_ty {
@@ -18718,6 +18968,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     });
                     let ptr = match ptr_ty {
@@ -18858,6 +19109,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             ),
                         },
                     });
@@ -18948,6 +19200,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             )
                         })
                         .ok_or_else(|| {
@@ -18966,6 +19219,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                     )
                 }
@@ -18981,6 +19235,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                     )
                 }
@@ -19552,6 +19807,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             )),
             Operand::Const(_) => None,
         }
@@ -19766,7 +20022,8 @@ impl<'a> Lowering<'a> {
                     dest_ty,
                     self.llbc,
                     self.tombstoned_leaves,
-                    self.gc_struct_ids
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs
                 ),
                 ValueType::Ref(_)
             )
@@ -19818,6 +20075,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         )?;
         if src_root == Some(dest_root.as_str()) {
             return None;
@@ -19869,13 +20127,24 @@ impl<'a> Lowering<'a> {
 
     fn dest_is_plain_signed_int(&self, ty: &TyRef) -> bool {
         if tyref_is_raw_pointer(ty, self.llbc)
-            || ty_is_raw_address(ty, self.llbc, self.gc_struct_ids)
+            || ty_is_raw_address(
+                ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
             || raw_scalar_address_value_type(ty, self.llbc).is_some()
         {
             return false;
         }
         matches!(
-            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+            tyref_to_value_type_with(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs
+            ),
             ValueType::Int | ValueType::Int128
         )
     }
@@ -20055,13 +20324,24 @@ impl<'a> Lowering<'a> {
 
     fn dest_is_plain_unsigned(&self, ty: &TyRef) -> bool {
         if tyref_is_raw_pointer(ty, self.llbc)
-            || ty_is_raw_address(ty, self.llbc, self.gc_struct_ids)
+            || ty_is_raw_address(
+                ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
             || raw_scalar_address_value_type(ty, self.llbc).is_some()
         {
             return false;
         }
         matches!(
-            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+            tyref_to_value_type_with(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs
+            ),
             ValueType::Unsigned | ValueType::UInt128
         )
     }
@@ -21216,6 +21496,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             )
             .is_none()
     }
@@ -21342,6 +21623,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 )
                 .ok_or_else(|| {
                     LowerError::Unsupported(format!(
@@ -21354,6 +21636,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 )
             };
             let item_ty = self.with_item_class_root(item_ty, &place_ty);
@@ -21393,6 +21676,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ),
                 &place_ty,
             );
@@ -21417,6 +21701,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ),
                 &place_ty,
             );
@@ -21481,6 +21766,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     ),
                     &place_ty,
                 );
@@ -21597,6 +21883,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                         .is_some()
                     {
@@ -21779,6 +22066,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         );
                         let res = self
                             .graph
@@ -21854,6 +22142,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                     );
                     let res = self
@@ -22064,6 +22353,7 @@ impl<'a> Lowering<'a> {
                                     self.llbc,
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
                                 )
                             },
                             array_type_id,
@@ -22115,6 +22405,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     );
                     let res = self
                         .graph
@@ -22234,6 +22525,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         );
                         let res = self
                             .graph
@@ -22719,6 +23011,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                     }
                 });
@@ -22975,6 +23268,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         )
         .is_some()
         {
@@ -23210,7 +23504,13 @@ impl<'a> Lowering<'a> {
                         let field_ty = if inst_args.is_empty() {
                             tyref_to_ast_string(&f.ty, self.llbc)
                         } else {
-                            substitute_field_type(&f.ty, &inst_args, self.llbc, self.gc_struct_ids)
+                            substitute_field_type(
+                                &f.ty,
+                                &inst_args,
+                                self.llbc,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
                         };
                         (
                             f.name.clone().unwrap_or_else(|| {
@@ -23724,6 +24024,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ),
             },
         });
@@ -25307,6 +25608,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 )
             }) {
                 return Err(LowerError::Unsupported(format!(
@@ -25365,6 +25667,13 @@ impl<'a> Lowering<'a> {
             // constant message). Melt the format operands rustc evaluated
             // before `panic_fmt` / `assert_failed`.
             melt_abort_message_chain(&mut self.graph, bb_id);
+            return Ok(());
+        }
+        // `null_mut::<T>()` / `null::<T>()` of a Raw pointee is
+        // `lltype.nullptr(T)` (`null_raw`). The generic call-result
+        // `__cast_instance_intrinsic` tail below would recast a GC
+        // `null_mut` onto that root (`rtype_cast_instance_intrinsic`).
+        if self.try_lower_raw_adt_ptr_null(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
@@ -25475,6 +25784,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             )
         };
         // A typed `Ref(Some(root))` already carries the intern key
@@ -26804,6 +27114,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     })
                 {
@@ -27354,6 +27665,7 @@ impl<'a> Lowering<'a> {
                                 second_arg_ty.as_ref(),
                                 self.llbc,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             ) || index_mut_result_is_element(
                                 self.llbc, self.body, dest_local,
                             )))
@@ -27411,6 +27723,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     );
                     // The `pyre_`-fenced workspace arm has exactly three
                     // element banks — `FixedObjectArray`, `IntArray`,
@@ -27745,6 +28058,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             ),
                             array_type_id: None,
                             nolength: false,
@@ -28294,6 +28608,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             )
                         })
                         .unwrap_or(ValueType::Ref(None));
@@ -28606,6 +28921,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                         ValueType::Ref(_)
                     );
@@ -29213,6 +29529,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     });
                     let dst = tyref_to_value_type_with(
@@ -29220,6 +29537,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     );
                     if let Some(to_float) = host_longlong2float_llop(&path, src.as_ref(), &dst) {
                         return self.emit_float_bytes_llop(
@@ -29308,6 +29626,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             );
                             return self.emit_threadlocalref_get(
                                 mir_bb,
@@ -30094,6 +30413,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                         ValueType::Void
                     );
@@ -30417,6 +30737,7 @@ impl<'a> Lowering<'a> {
                                     self.llbc,
                                     self.tombstoned_leaves,
                                     self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
                                 )
                             })
                             .unwrap_or(ValueType::Unsigned);
@@ -31063,6 +31384,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             ),
                             ValueType::Str
                                 | ValueType::Int
@@ -31282,6 +31604,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     ) {
                         CallTarget::FunctionPath {
                             segments: path,
@@ -31425,6 +31748,7 @@ impl<'a> Lowering<'a> {
                             fd,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     {
                         self.keep_dyn_call_receiver(mir_bb, &mut args);
@@ -32001,7 +32325,8 @@ impl<'a> Lowering<'a> {
                         t,
                         self.llbc,
                         self.tombstoned_leaves,
-                        self.gc_struct_ids
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs
                     ),
                     ValueType::Int | ValueType::Unsigned
                 )
@@ -32395,6 +32720,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             ) == ValueType::Int
                         })
                 }
@@ -32410,6 +32736,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ) == ValueType::Int
                     }) && second_arg_ty.as_ref().is_some_and(|ty| {
                         tyref_to_value_type_with(
@@ -32417,6 +32744,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ) == ValueType::Int
                     })
                 }
@@ -32628,6 +32956,7 @@ impl<'a> Lowering<'a> {
                                 self.llbc,
                                 self.tombstoned_leaves,
                                 self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
                             )
                         })
                         .unwrap_or(ValueType::Ref(None))
@@ -32723,6 +33052,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     )
                 })
                 .unwrap_or(ValueType::Ref(None));
@@ -32789,6 +33119,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 );
                 let payload_class_root = enum_payload_instance_class_root(
                     &item_tyref,
@@ -32804,6 +33135,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 );
                 self.map_collect_sites
                     .push(crate::front::iter_adapter::MapCollectSite {
@@ -32831,6 +33163,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         let dest_is_bool = matches!(identity_dest_ty, ValueType::Bool);
         // A borrow carries no representation of its own here -- `Rvalue::Ref`
@@ -32846,12 +33179,14 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ),
                 None => tyref_to_value_type_with(
                     ty,
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ),
             };
             value_type_bank(&recv_ty) == value_type_bank(&identity_dest_ty)
@@ -34481,12 +34816,14 @@ impl<'a> Lowering<'a> {
                 // raw-pointer receiver. A function that takes the pointer is a
                 // `simple_call` of that constant (`rpbc.py` `FunctionsPBCRepr`
                 // → `direct_call`), pointer first — the `FunctionPath` route.
-                if fd
-                    .signature
-                    .inputs
-                    .first()
-                    .is_some_and(|ty| ty_is_raw_address(ty, self.llbc, self.gc_struct_ids))
-                {
+                if fd.signature.inputs.first().is_some_and(|ty| {
+                    ty_is_raw_address(
+                        ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                }) {
                     return None;
                 }
                 // `&mut self` of a GC handle occupies a MutRef cell
@@ -34502,6 +34839,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     )
                     .is_some()
                 }) {
@@ -34604,7 +34942,13 @@ impl<'a> Lowering<'a> {
     /// the front end.  Delegates to the free [`is_vec_index_regular`] so the
     /// same gate is shared with the deferred-write liveness pre-pass.
     fn is_vec_index_call(&self, reg: &RegularCall, index_ty: Option<&TyRef>) -> bool {
-        is_vec_index_regular_with_callsite(reg, index_ty, self.llbc, self.gc_struct_ids)
+        is_vec_index_regular_with_callsite(
+            reg,
+            index_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
     }
 
     /// `core::slice::index::SliceIndex<usize>::index(_mut)` — scalar slice
@@ -34627,15 +34971,27 @@ impl<'a> Lowering<'a> {
                 "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut"
             )
         });
-        let callsite_index_is_scalar = index_ty
-            .is_some_and(|ty| vec_index_type_is_scalar(ty, self.llbc, self.gc_struct_ids))
-            || reg
-                .generics
-                .get("types")
-                .and_then(serde_json::Value::as_array)
-                .and_then(|types| types.get(1))
-                .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
-                .is_some_and(|ty| vec_index_type_is_scalar(&ty, self.llbc, self.gc_struct_ids));
+        let callsite_index_is_scalar = index_ty.is_some_and(|ty| {
+            vec_index_type_is_scalar(
+                ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
+        }) || reg
+            .generics
+            .get("types")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|types| types.get(1))
+            .and_then(|ty| serde_json::from_value::<TyRef>(ty.clone()).ok())
+            .is_some_and(|ty| {
+                vec_index_type_is_scalar(
+                    &ty,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+            });
         is_index && callsite_index_is_scalar
     }
 
@@ -34654,7 +35010,14 @@ impl<'a> Lowering<'a> {
         let is_get = self.llbc.fn_by_id(*id).is_some_and(|fd| {
             crate::front::slice_get::is_slice_get_name_path(&fd.item_meta.name_path())
         });
-        is_get && callsite_or_generic_index_is_scalar(reg, index_ty, self.llbc, self.gc_struct_ids)
+        is_get
+            && callsite_or_generic_index_is_scalar(
+                reg,
+                index_ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
     }
 
     /// `true` when `reg` is `<[T]>::get_mut` (not `get`).  `get_mut` of a
@@ -34714,6 +35077,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         // Identity only for an object pointer or a scalar element spelling.
         // A fallback type string must not hand an inline aggregate or an
@@ -35164,7 +35528,13 @@ impl<'a> Lowering<'a> {
         }
         if !src_ty.is_some_and(|ty| {
             matches!(
-                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+                tyref_to_value_type_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs
+                ),
                 ValueType::Ref(_)
             )
         }) {
@@ -35402,6 +35772,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         );
                         let bb_id = self.emit_bb(mir_bb);
                         let fresh = self
@@ -35956,6 +36327,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     );
                     spans.push(MoveSpan {
                         offset,
@@ -36042,6 +36414,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         );
                         candidates.push(MoveSpan {
                             offset,
@@ -36159,6 +36532,7 @@ impl<'a> Lowering<'a> {
             self.tombstoned_leaves,
             self.gc_struct_ids,
             16,
+            &self.raw_alloc_flavor_structs,
         );
         let bb_id = self.emit_bb(mir_bb);
         for (leaf, leaf_ty) in leaves {
@@ -36356,6 +36730,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             MemSlot::Index(local) => self.index_elem_alias.get(local)?.item_ty.clone(),
         };
@@ -36506,7 +36881,13 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::sync::atomic::<Impl>::from_ptr"
-                && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
+                && tyref_atomic_inner_value_type(
+                    &fd.signature.output,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .is_some()
         })
     }
 
@@ -36545,7 +36926,13 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             fd.item_meta.name_path() == "core::sync::atomic::<Impl>::new"
-                && tyref_atomic_inner_value_type(&fd.signature.output, self.llbc).is_some()
+                && tyref_atomic_inner_value_type(
+                    &fd.signature.output,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .is_some()
         })
     }
 
@@ -37259,7 +37646,13 @@ impl<'a> Lowering<'a> {
             return true;
         }
         matches!(
-            tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+            tyref_to_value_type_with(
+                ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
             ValueType::Int | ValueType::Unsigned
         )
     }
@@ -37694,7 +38087,13 @@ impl<'a> Lowering<'a> {
         ) && args.len() == 2
         {
             let ptr_ty = arg_tys.first().and_then(Option::as_ref).map(|ty| {
-                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+                tyref_to_value_type_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
             });
             let ptr = match ptr_ty {
                 Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
@@ -37723,7 +38122,13 @@ impl<'a> Lowering<'a> {
         }
         if is_slice_from_ref_name(name) && args.len() == 1 {
             let ptr_ty = arg_tys.first().and_then(Option::as_ref).map(|ty| {
-                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+                tyref_to_value_type_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
             });
             let ptr = match ptr_ty {
                 Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
@@ -38721,6 +39126,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         self.emit_path_call(mir_bb, "list", vec![recv], result_ty)
     }
@@ -38742,6 +39148,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         let res = self
             .graph
@@ -38908,6 +39315,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         let res = self
             .graph
@@ -39043,6 +39451,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     )
                 })
                 .unwrap_or(ValueType::Ref(None));
@@ -39119,6 +39528,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 ),
             },
         });
@@ -39555,6 +39965,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         if matches!(value_ty, ValueType::Int)
             && (type_node_is_fn_ptr(node, self.llbc)
@@ -40081,9 +40492,21 @@ impl<'a> Lowering<'a> {
             && let Some((_, name, ty, _, _)) = self.resolve_adt_field(&base.ty, payload)
             && let Some(type_path) = self.field_decl_path(&base.ty)
         {
-            published_struct_field_layout(&type_path, &name, &ty, self.llbc, self.gc_struct_ids)
+            published_struct_field_layout(
+                &type_path,
+                &name,
+                &ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
         } else {
-            tyref_to_field_layout_string(&place.ty, self.llbc, self.gc_struct_ids)
+            tyref_to_field_layout_string(
+                &place.ty,
+                self.llbc,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            )
         };
         type_spelling_is_fixed_object_array(&spelling)
     }
@@ -40804,7 +41227,13 @@ impl<'a> Lowering<'a> {
         };
         let register_int = |ty: &TyRef| {
             matches!(
-                tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+                tyref_to_value_type_with(
+                    ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs
+                ),
                 ValueType::Int | ValueType::Unsigned
             )
         };
@@ -41735,6 +42164,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         ),
                     ))
                 })
@@ -41871,6 +42301,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         ))
     }
 
@@ -42029,6 +42460,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         // RPython has one string type. A rust-heap `String` payload still
         // paints `Ref` so `ll_strconcat` does not consume `{cap, ptr, len}`,
@@ -42640,12 +43072,14 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             err_payload_ty: tyref_enum_payload_value_type(
                 &err_ty,
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
         })
     }
@@ -43209,6 +43643,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             err: adt_variant_payload_type(
                 recv_ty,
@@ -43216,6 +43651,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             continue_ty: adt_variant_payload_type(
                 dest_ty,
@@ -43223,6 +43659,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             break_ty: adt_variant_payload_type(
                 dest_ty,
@@ -43230,6 +43667,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
         };
         OpKind::Call {
@@ -43290,12 +43728,14 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             tyref_enum_payload_value_type(
                 &err_tyref,
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             enum_payload_instance_class_root(&err_tyref, self.llbc, self.tombstoned_leaves),
         ))
@@ -43534,6 +43974,7 @@ impl<'a> Lowering<'a> {
                         self.llbc,
                         self.tombstoned_leaves,
                         self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
                     );
                     site.args_tuple_suffix =
                         crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
@@ -43547,6 +43988,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 );
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
@@ -43569,6 +44011,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 );
                 site.args_tuple_suffix =
                     crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
@@ -43673,6 +44116,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         let niche = self.tyref_is_niche_option_ptr(recv_ty);
         let scalar_kind = if niche {
@@ -43735,7 +44179,13 @@ impl<'a> Lowering<'a> {
         let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
         let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
             .map(|ty| {
-                tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
+                tyref_to_value_type_with(
+                    &ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                )
             })
             .unwrap_or(ValueType::Ref(None));
         Some(crate::front::result_exc::OptionOkOrElseTrySite {
@@ -43821,6 +44271,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 )
             },
             ok_class_root: enum_payload_instance_class_root(
@@ -43833,6 +44284,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             err_class_root: enum_payload_instance_class_root(
                 &recv_err,
@@ -43844,6 +44296,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             mapped_err_class_root: enum_payload_instance_class_root(
                 &dest_err,
@@ -43893,6 +44346,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             );
             if !matches!(
                 ty,
@@ -43907,6 +44361,7 @@ impl<'a> Lowering<'a> {
                     self.llbc,
                     self.tombstoned_leaves,
                     self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
                 )
             {
                 return None;
@@ -44077,6 +44532,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         // A constructor function item builds its aggregate in the arm; one
         // whose shape does not resolve declines the rewrite.
@@ -44106,6 +44562,7 @@ impl<'a> Lowering<'a> {
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
+                            &self.raw_alloc_flavor_structs,
                         )
                     })
                     .unwrap_or(ValueType::Ref(None));
@@ -44262,6 +44719,7 @@ impl<'a> Lowering<'a> {
                 self.llbc,
                 self.tombstoned_leaves,
                 self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
             ),
             ValueType::Int | ValueType::Unsigned
         )
@@ -44286,7 +44744,13 @@ impl<'a> Lowering<'a> {
         let seed = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
             .unwrap_or_else(|| option_ty.clone());
         Some(crate::model::NicheIntNull::RawAddress(
-            raw_address_owner_root(&seed, self.llbc, self.tombstoned_leaves, self.gc_struct_ids),
+            raw_address_owner_root(
+                &seed,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
         ))
     }
 
@@ -44999,6 +45463,7 @@ impl<'a> Lowering<'a> {
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
         );
         if crate::codewriter::minmax::minmax_value_ty(&result_ty).is_none() {
             return Ok(false);
@@ -45134,7 +45599,13 @@ impl<'a> Lowering<'a> {
         }
         let peeled = self.tyref_peel_ref_to_pointee(ty);
         let ty = peeled.as_ref().unwrap_or(ty);
-        match tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves, self.gc_struct_ids) {
+        match tyref_to_value_type_with(
+            ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
             ty @ (ValueType::Int | ValueType::Unsigned | ValueType::Float | ValueType::Bool) => {
                 Some(ty)
             }
@@ -45325,6 +45796,86 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// `core::ptr::null_mut::<T>()` / `null::<T>()` (and the `std::ptr`
+    /// re-exports) whose result is a pointer to a Raw ADT.
+    ///
+    /// Upstream writes that null as `lltype.nullptr(T)` of the raw
+    /// `Ptr` (`rbuiltin.py` `rtype_null_raw`, `annotator/builtin.rs`
+    /// `raw_ptr_null_constant`). A GC `null_mut` recast through
+    /// `__cast_instance_intrinsic` is a `Ptr(GcStruct)` that
+    /// `pairtype(GCRefRepr, Repr).convert_from_to` refuses.
+    ///
+    /// Raw is [`ty_is_raw_address`] / [`raw_address_owner_root`]
+    /// (`gc_struct_ids`). An `_alloc_flavor_ = raw` pointee that still
+    /// banks as `Ref` (Opaque host fields fail `adt_def_is_raw_storage`)
+    /// uses the same `null_raw` spelling; `raw_ptr_null_constant` then
+    /// annotates a nullable `SomeInstance` of that classdef
+    /// (`classdesc.get_param('_alloc_flavor_')`). `raw_struct_ptr_annotation`
+    /// is storage-raw only and does not accept a flavor-raw spelling.
+    /// A GC pointee returns `false` and keeps `null_mut`.
+    fn try_lower_raw_adt_ptr_null(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !call.args.is_empty() {
+            return Ok(false);
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !is_core_ptr_null_fun_path(&path) {
+            return Ok(false);
+        }
+        let Some(spelling) = self.raw_adt_ptr_null_spelling(&call.dest.ty) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self
+            .graph
+            .push_null_raw_ptr_with_spelling(bb_id, spelling.as_deref());
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// Class-root argument of `null_raw` (`lltype.nullptr(T)`), or `None`
+    /// to keep the GC `null_mut` lowering.
+    ///
+    /// Storage-raw pointees (`ty_is_raw_address`) use
+    /// [`raw_address_owner_root`]. Flavor-raw pointees
+    /// (`_alloc_flavor_ = raw`) use the class-root spelling
+    /// harvested into `raw_alloc_flavor_structs`. Annotation of that
+    /// spelling is `raw_ptr_null_constant`'s flavor-raw `SomeInstance`
+    /// arm; `raw_struct_ptr_annotation` does not accept it.
+    fn raw_adt_ptr_null_spelling(&self, dest_ty: &TyRef) -> Option<Option<String>> {
+        if ty_is_raw_address(
+            dest_ty,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            return Some(raw_address_owner_root(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ));
+        }
+        let node = tyref_node(dest_ty, self.llbc).and_then(|n| strip_ty_wrappers(n, self.llbc))?;
+        let root = raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)?;
+        crate::front::llbc_hints::alloc_flavor_raw_contains(&self.raw_alloc_flavor_structs, &root)
+            .then_some(Some(root))
     }
 
     /// `<*const T>::read` / `<*mut T>::read` of a one-word pointee is
@@ -46857,9 +47408,13 @@ impl<'a> Lowering<'a> {
         // `try_lower_usize_try_from` uses). Bool is the RPython BoolRepr
         // sibling: converting it to Unsigned emits `cast_bool_to_uint`
         // through the ordinary `r_uint` builtin (`rbool.py`).
-        let src_is_bool =
-            tyref_to_value_type_with(src, self.llbc, self.tombstoned_leaves, self.gc_struct_ids)
-                == ValueType::Bool;
+        let src_is_bool = tyref_to_value_type_with(
+            src,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) == ValueType::Bool;
         let src_is_small_uint = matches!(
             self.tyref_literal_uint_atom(src),
             Some("U8" | "U16" | "U32")
@@ -49969,9 +50524,17 @@ fn vec_index_regular_leaf_with_callsite(
     index_ty: Option<&TyRef>,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<&'static str> {
     let leaf = vec_index_regular_unchecked_leaf(reg, llbc)?;
-    callsite_or_generic_index_is_scalar(reg, index_ty, llbc, gc_struct_ids).then_some(leaf)
+    callsite_or_generic_index_is_scalar(
+        reg,
+        index_ty,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .then_some(leaf)
 }
 
 /// Whether either source Charon preserves proves an integer-bank index.
@@ -49985,6 +50548,7 @@ fn callsite_or_generic_index_is_scalar(
     index_ty: Option<&TyRef>,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let generic_index_is_scalar = reg
         .generics
@@ -49992,9 +50556,13 @@ fn callsite_or_generic_index_is_scalar(
         .and_then(serde_json::Value::as_array)
         .and_then(|tys| tys.get(1))
         .and_then(|t| serde_json::from_value::<TyRef>(t.clone()).ok())
-        .is_some_and(|t| vec_index_type_is_scalar(&t, llbc, gc_struct_ids));
+        .is_some_and(|t| {
+            vec_index_type_is_scalar(&t, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        });
     generic_index_is_scalar
-        || index_ty.is_some_and(|ty| vec_index_type_is_scalar(ty, llbc, gc_struct_ids))
+        || index_ty.is_some_and(|ty| {
+            vec_index_type_is_scalar(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        })
 }
 
 /// The Vec Index/IndexMut leaf before classifying its index argument.  Scalar
@@ -50087,12 +50655,19 @@ fn vec_index_type_is_scalar(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     // `tyref_to_value_type` re-harvests every `GcType` fact in the crate.
     // This predicate runs on every call while lowering, so reuse the set
     // the lowering already computed.
     matches!(
-        tyref_to_value_type_with(ty, llbc, no_tombstoned_leaves(), gc_struct_ids),
+        tyref_to_value_type_with(
+            ty,
+            llbc,
+            no_tombstoned_leaves(),
+            gc_struct_ids,
+            raw_alloc_flavor_structs
+        ),
         ValueType::Int | ValueType::Unsigned
     )
 }
@@ -50102,8 +50677,16 @@ fn is_vec_index_regular_with_callsite(
     index_ty: Option<&TyRef>,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
-    vec_index_regular_leaf_with_callsite(reg, index_ty, llbc, gc_struct_ids).is_some()
+    vec_index_regular_leaf_with_callsite(
+        reg,
+        index_ty,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
 }
 
 fn is_vec_index_mut_call(
@@ -50111,8 +50694,15 @@ fn is_vec_index_mut_call(
     index_ty: Option<&TyRef>,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
-    vec_index_regular_leaf_with_callsite(reg, index_ty, llbc, gc_struct_ids) == Some("index_mut")
+    vec_index_regular_leaf_with_callsite(
+        reg,
+        index_ty,
+        llbc,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) == Some("index_mut")
 }
 
 /// Blocks whose `from_raw_parts` is an rstr `STR` chars view, paired with
@@ -50453,6 +51043,14 @@ fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
         return None;
     };
     llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
+}
+
+/// `core::ptr::null_mut` / `null` and the `std::ptr` re-exports.
+fn is_core_ptr_null_fun_path(path: &str) -> bool {
+    matches!(
+        path,
+        "core::ptr::null_mut" | "core::ptr::null" | "std::ptr::null_mut" | "std::ptr::null"
+    )
 }
 
 /// `core::panicking::*` / `std::panicking::*` — a Rust abort, lowered
@@ -58866,6 +59464,7 @@ fn compute_index_write_extra_live(
                 call.args.get(1).and_then(operand_tyref),
                 llbc,
                 gc_struct_ids,
+                &std::collections::HashSet::<String>::new(),
             ) && index_mut_result_is_element(llbc, body, p as usize))
             || is_list_items_elem_ptr_add_parts(
                 reg,
@@ -59912,6 +60511,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<(
     Vec<String>,
     crate::flowspace::argument::Signature,
@@ -59923,6 +60523,7 @@ pub fn collect_unsafe_fn_stubs_from_llbc(
         error_carrier,
         |fd| fd.signature.is_unsafe,
         false,
+        raw_alloc_flavor_structs,
     )
 }
 
@@ -59955,6 +60556,7 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     error_carrier: crate::ErrorCarrierSpec<'_>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<(
     Vec<String>,
     crate::flowspace::argument::Signature,
@@ -59967,6 +60569,7 @@ pub(crate) fn collect_policy_opaque_fn_stubs_from_llbc(
         error_carrier,
         |fd| marked.contains(&strip_crate_prefix(&fd.item_meta.name_path())),
         true,
+        raw_alloc_flavor_structs,
     )
 }
 
@@ -63487,6 +64090,7 @@ fn output_is_raw_address_word(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     if output_is_raw_scalar_address(output, llbc, spec) {
         return true;
@@ -63497,7 +64101,7 @@ fn output_is_raw_address_word(
         None
     };
     let kind_src = payload.as_ref().unwrap_or(output);
-    ty_is_raw_address(kind_src, llbc, gc_struct_ids)
+    ty_is_raw_address(kind_src, llbc, gc_struct_ids, raw_alloc_flavor_structs)
 }
 
 /// `ty` itself is a Charon primitive scalar, not a pointer to one.
@@ -63513,6 +64117,7 @@ fn collect_fn_stubs_from_llbc_if(
     error_carrier: crate::ErrorCarrierSpec<'_>,
     include: impl Fn(&FunDecl) -> bool,
     admit_option_raw_adt_ptr: bool,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<(
     Vec<String>,
     crate::flowspace::argument::Signature,
@@ -63538,6 +64143,7 @@ fn collect_fn_stubs_from_llbc_if(
                 llbc,
                 no_tombstoned_leaves(),
                 gc_struct_ids,
+                raw_alloc_flavor_structs,
             )
             .is_none()
         {
@@ -63547,8 +64153,13 @@ fn collect_fn_stubs_from_llbc_if(
         // `Void`; a return type it cannot model still reaches this arm as
         // a token it declines, and the fn then keeps its original "not
         // registered" Skip.
-        let token =
-            dont_look_inside_return_token(&fd.signature.output, llbc, error_carrier, gc_struct_ids);
+        let token = dont_look_inside_return_token(
+            &fd.signature.output,
+            llbc,
+            error_carrier,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
         if crate::translator::rtyper::cutover::residual_return_shell(token.as_deref()).is_none() {
             continue;
         }
@@ -64027,6 +64638,7 @@ fn fundecl_keeps_zst_self(
     fd: &FunDecl,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     if trait_impl_trait_path_for_fundecl(llbc, fd).is_none() {
         return false;
@@ -64037,7 +64649,13 @@ fn fundecl_keeps_zst_self(
     let Some(local) = locals.locals.get(1) else {
         return false;
     };
-    let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned, gc_struct_ids);
+    let ty = tyref_to_value_type_with(
+        &local.ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    );
     matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc)
 }
 
@@ -65601,6 +66219,115 @@ fn one_level_pointer_pointee<'a>(
     None
 }
 
+/// Whether `node` names a harvested `_alloc_flavor_ = raw` ADT
+/// (`rclass.py getgcflavor`).
+fn flavor_raw_adt_node(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> bool {
+    if raw_alloc_flavor_structs.is_empty() {
+        return false;
+    }
+    let node = strip_ty_indirections(node, llbc).unwrap_or(node);
+    let Some(def_id) = adt_node_def_id(node) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    crate::front::llbc_hints::alloc_flavor_raw_contains(
+        raw_alloc_flavor_structs,
+        &td.item_meta.name_path(),
+    )
+}
+
+/// Pointee of one address word for class identity / layout / field access:
+/// `Ref` / `RawPtr` / thin `Box` / `NonNull` ([`one_level_pointer_pointee`]),
+/// or `AtomicPtr<T>` (layout-identical `*mut T`). A thin `Arc` / `Rc` word
+/// points at the refcount header (`ArcInner` / `RcBox`), not at `T`
+/// (`deref_cast_root`); [`one_word_pointer_bank_pointee`] peels those for
+/// the int/pointer bank only. A fat pointer (`&dyn`, `&[T]`, `&str`,
+/// `Box<dyn>`) is not one word.
+fn one_word_pointer_pointee<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    if let Some(pointee) = one_level_pointer_pointee(node, llbc) {
+        let peeled = type_node_peel_aliases(node, llbc).unwrap_or(node);
+        let is_borrow = peeled
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("Ref"));
+        if is_borrow && !json_ty_is_statically_sized(pointee, llbc) {
+            return None;
+        }
+        return Some(pointee);
+    }
+    let node = type_node_peel_aliases(node, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let leaf = match td.item_meta.template_name().next_back()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        _ => return None,
+    };
+    match leaf {
+        "Atomic" | "AtomicPtr" => {
+            if !td
+                .item_meta
+                .template_name()
+                .any(|s| matches!(s, NameSeg::Ident { ident: (id, _) } if id == "atomic"))
+            {
+                return None;
+            }
+            let arg = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
+                .get("types")?
+                .as_array()?
+                .first()?;
+            let arg = strip_ty_indirections(arg, llbc).unwrap_or(arg);
+            if leaf == "AtomicPtr" {
+                return json_ty_is_statically_sized(arg, llbc).then_some(arg);
+            }
+            arg.as_object()?.get("RawPtr")?.as_array()?.first()
+        }
+        _ => None,
+    }
+}
+
+/// Pointee of one address word for the int/pointer bank (`history.getkind`
+/// / `get_type_flag`). Same as [`one_word_pointer_pointee`], plus a thin
+/// `Arc` / `Rc` whose payload names the bank's flavor owner. The handle
+/// word is still one raw (non-GC) word.
+fn one_word_pointer_bank_pointee<'l>(
+    node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    if let Some(pointee) = one_word_pointer_pointee(node, llbc) {
+        return Some(pointee);
+    }
+    let node = type_node_peel_aliases(node, llbc)?;
+    let def_id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(def_id)?;
+    let leaf = match td.item_meta.template_name().next_back()? {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        _ => return None,
+    };
+    match leaf {
+        "Arc" | "Rc" => {
+            let path = td.item_meta.name_path();
+            if !(path.contains("::sync::") || path.contains("::rc::")) {
+                return None;
+            }
+            let inner = type_decl_ref_generics(node.as_object()?.get("Adt")?.as_object()?, llbc)?
+                .get("types")?
+                .as_array()?
+                .first()?;
+            let inner = strip_ty_indirections(inner, llbc).unwrap_or(inner);
+            json_ty_is_statically_sized(inner, llbc).then_some(inner)
+        }
+        _ => None,
+    }
+}
+
 /// Declared gckind of the struct or enum `ty` names, after one pointer peel.
 ///
 /// `None` when `ty` is not a struct or enum. A `GcType` seed is Gc. An owner
@@ -65884,28 +66611,34 @@ fn adt_path_is_gc_container(llbc: &Llbc, def_id: u64) -> bool {
         || path.ends_with("pyobject::PyObject")
 }
 
-/// Whether `ty` is one pointer word to a Raw struct or enum.
-///
-/// `history.getkind` classifies `Ptr(TO)` from `TO._gckind`
-/// (`rewrite_op_getfield`). Absence from [`DeclaredGcFacts::gc_struct_ids`]
-/// is Raw, and the word is an address.
+/// Whether an operand's type is one pointer word to a Raw struct or enum.
 fn operand_is_declared_raw(
     operand: &Operand,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     match operand {
         Operand::Copy(place) | Operand::Move(place) => {
-            ty_is_raw_address(&place.ty, llbc, gc_struct_ids)
+            ty_is_raw_address(&place.ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
         }
         Operand::Const(_) => false,
     }
 }
 
+/// Whether `ty` is one pointer word to a storage-raw struct or enum.
+///
+/// `history.getkind` classifies `Ptr(TO)` from `TO._gckind`
+/// (`rewrite_op_getfield`). Storage-raw (`declared_raw_adt_node`) answers
+/// true for a one-word pointer. A flavor-raw pointee (`rclass.py
+/// getgcflavor`) stays a front `Ref`: `crosses_raw_ref` must not emit
+/// `cast_ptr_to_int` for it. A borrow of a storage-raw struct that is
+/// not a raw enum stays `Ref` (`RootScope::get`).
 fn ty_is_raw_address(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| type_node_peel_aliases(node, llbc))
     else {
@@ -65914,26 +66647,35 @@ fn ty_is_raw_address(
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
         return true;
     }
-    // `NonNull<Raw>` / thin `Box<Raw>` is one address word. A `Ref` of a
-    // raw struct stays `Ref` (`RootScope::get`).
-    let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
-    if !is_borrow
-        && let Some(pointee) = one_level_pointer_pointee(node, llbc)
-        && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
-    {
-        return true;
-    }
-    // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-    // struct borrow stays `Ref`. Classifying it as an address makes
-    // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
-    // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
-    // `Rvalue::Ref` is the identity on that word, so the borrow is not
-    // an address (`rclass.py` has no `cast_pointer` of an int).
-    if is_borrow
-        && one_level_pointer_pointee(node, llbc)
-            .is_some_and(|pointee| borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids))
-    {
-        return true;
+    if let Some(pointee) = one_word_pointer_bank_pointee(node, llbc) {
+        let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
+        // Non-borrow one-word pointer to a storage-raw ADT (`Box` /
+        // `NonNull` / `Arc` of a C struct). A `Ref` of a raw struct
+        // stays `Ref` (`RootScope::get`).
+        if !is_borrow
+            && declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some()
+        {
+            return true;
+        }
+        // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
+        // struct borrow stays `Ref`. Classifying it as an address makes
+        // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
+        // A fieldless enum is the tag integer (`type_decl_is_fieldless_enum`);
+        // `Rvalue::Ref` is the identity on that word, so the borrow is not
+        // an address (`rclass.py` has no `cast_pointer` of an int).
+        if is_borrow && borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids) {
+            return true;
+        }
+        // Arc/Rc of a flavor-raw ADT: the handle word is one raw (non-GC)
+        // word (`history.getkind` int) and does not name T
+        // (`deref_cast_root`). Identity pointee stays None; bank peels
+        // to T. Box / NonNull / `&T` keep identity and stay off this arm.
+        if !is_borrow && one_word_pointer_pointee(node, llbc).is_none() {
+            let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+            if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
+                return true;
+            }
+        }
     }
     // Niche `Option<NonNull<Raw>>` / `Option<Box<Raw>>` aliases `Some(p)`
     // to the payload word. Classify the Option with that payload's bank.
@@ -65943,7 +66685,7 @@ fn ty_is_raw_address(
     if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
         && !tyref_is_raw_pointer(&payload, llbc)
     {
-        return ty_is_raw_address(&payload, llbc, gc_struct_ids);
+        return ty_is_raw_address(&payload, llbc, gc_struct_ids, raw_alloc_flavor_structs);
     }
     false
 }
@@ -65976,11 +66718,29 @@ fn raw_address_owner_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
-    let pointee = one_level_pointer_pointee(node, llbc)?;
-    let pointee = declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields())?;
+    let pointee = one_word_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+    let pointee = if declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields())
+        .is_some()
+        || flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs)
+    {
+        pointee
+    } else {
+        return None;
+    };
     let root = adt_node_class_root_with(pointee, llbc, tombstoned)?;
+    // A flavor-raw class intern's through `getuniqueclassdef` of the
+    // same leaf `tyref_class_root_with` paints (`rclass.py getgcflavor`).
+    // Named-ADT arguments (`CodeObject<ConstantData>`) are the omitted
+    // default of that one class (`struct_instantiation_suffix`); appending
+    // them here minted a second ClassDef and `mergeinputargs` could not
+    // unify the two.
+    if flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
+        return Some(root);
+    }
     // The class root collapses `Raw<f64>` to `Raw`. The seed still needs
     // the concrete arguments so a field spelled `T` becomes `f64`.
     if root.contains('<') {
@@ -65996,6 +66756,27 @@ fn raw_address_owner_root(
         return Some(root);
     }
     Some(format!("{root}<{}>", args.join(",")))
+}
+
+/// Class root of a one-word pointer to a harvested `_alloc_flavor_ = raw`
+/// ADT (`rclass.py getgcflavor`). The front stays `Ref(Some(root))`; the
+/// int bank is `history.getkind` of the raw `InstanceRepr`'s `Ptr`.
+fn flavor_raw_pointer_class_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
+    // Identity pointee: `&T` / `*T` / `Box` / `NonNull` / `AtomicPtr`.
+    // Arc / Rc stay off this root (`deref_cast_root`); their bank is
+    // [`ty_is_raw_address`] / [`one_word_pointer_bank_pointee`].
+    let pointee = one_word_pointer_pointee(node, llbc)?;
+    let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+    if !flavor_raw_adt_node(pointee, llbc, raw_alloc_flavor_structs) {
+        return None;
+    }
+    adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
 /// Whether a wrapper-stripped node is a `RawPtr` to a Raw struct or enum.
@@ -66020,6 +66801,7 @@ fn tyref_to_value_type_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     // The Value arm carries the body inline; primitives
     // typically land here.  The Deduplicated arm carries only an
@@ -66075,7 +66857,13 @@ fn tyref_to_value_type_with(
     // `record_branch_guard(_, truth, ..)` wanting `r`, and no kind for the
     // caller's variable satisfies both.
     if let Some(resolved) = trait_assoc_projection_target(value, llbc) {
-        return tyref_to_value_type_with(&resolved, llbc, tombstoned, gc_struct_ids);
+        return tyref_to_value_type_with(
+            &resolved,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
     }
     // A borrow hides the projection: `&Self::Anchor` is a `Ref` whose
     // pointee is the associated type.  `trait_assoc_projection_target`
@@ -66086,8 +66874,13 @@ fn tyref_to_value_type_with(
     // the one borrow the transparent peel already types as its field.
     if let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
         && let Some(resolved) = trait_assoc_projection_target(node, llbc)
-        && let Some(inner) =
-            tyref_transparent_inner_value_type(&resolved, llbc, tombstoned, gc_struct_ids)
+        && let Some(inner) = tyref_transparent_inner_value_type(
+            &resolved,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
     {
         return inner;
     }
@@ -66128,7 +66921,9 @@ fn tyref_to_value_type_with(
     // Non-`Literal` (ADT / pointer / tuple) shapes only. Atomic wrappers
     // type as their inner value, including signedness. Checked after the
     // cheap `Literal` fast-path so primitive operands never pay the lookup.
-    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+    if let Some(inner) =
+        tyref_atomic_inner_value_type(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+    {
         return inner;
     }
     // `rstring.py` `StringBuilder` is `SomeStringBuilder`, not the word its
@@ -66140,7 +66935,14 @@ fn tyref_to_value_type_with(
     // handle intern's as a subclass of `Deref::Target` (`error::PyError`
     // under `error::PyErrorObject`); painting the target made getattr of
     // the handle's `.0` / a `MutRef<Handle>.value` resolve on the payload.
-    if transparent_deref_target_class(ty, llbc, tombstoned, gc_struct_ids).is_some()
+    if transparent_deref_target_class(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
+    .is_some()
         && let Some(root) = tyref_node(ty, llbc)
             .and_then(|node| strip_ty_wrappers(node, llbc))
             .and_then(|node| adt_node_class_root_leaf(node, llbc, tombstoned))
@@ -66151,7 +66953,13 @@ fn tyref_to_value_type_with(
     // its field. Charon records the representation in `TypeDecl.layout`, so
     // preserve the field's register bank instead of treating the wrapper as
     // a GC reference.
-    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned, gc_struct_ids) {
+    if let Some(inner) = tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return inner;
     }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
@@ -66191,8 +66999,17 @@ fn tyref_to_value_type_with(
     if tyref_is_borrowed_fieldless_enum_free(ty, llbc) {
         return ValueType::Int;
     }
-    if ty_is_raw_address(ty, llbc, gc_struct_ids) {
+    if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return ValueType::Int;
+    }
+    // A one-word pointer to a flavor-raw ADT (`rclass.py getgcflavor`)
+    // stays `Ref(Some(root))` so the annotator seeds `SomeInstance`
+    // and `valuetype_to_concrete_for_legacy` can still map it to
+    // Signed. Storage-raw already returned Int above.
+    if let Some(root) =
+        flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs)
+    {
+        return ValueType::Ref(Some(root));
     }
     // A `str`/`Wtf8`/`Wtf8Buf` value is the single immutable rpy_string in
     // the value model (`tyref_is_string_value`). The exactly-one-raw-pointer
@@ -66245,7 +67062,15 @@ fn tyref_to_value_type_with(
 
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
-    tyref_to_value_type_with(ty, llbc, no_tombstoned_leaves(), &gc_struct_ids)
+    let raw_alloc_flavor_structs =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    tyref_to_value_type_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        &gc_struct_ids,
+        &raw_alloc_flavor_structs,
+    )
 }
 
 /// Register-bank kind of the value behind a Charon reference destination.
@@ -66259,11 +67084,18 @@ fn tyref_deref_value_type_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
         return ValueType::Ref(None);
     };
-    tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned, gc_struct_ids)
+    tyref_to_value_type_with(
+        &TyRef::Other(node.clone()),
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
 }
 
 /// Register-bank kind of an ADT field read.
@@ -66286,6 +67118,7 @@ fn adt_field_read_value_type(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
     // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
@@ -66297,9 +67130,21 @@ fn adt_field_read_value_type(
         return raw;
     }
     let declared = if container_is_enum {
-        tyref_enum_payload_value_type(place_ty, llbc, tombstoned, gc_struct_ids)
+        tyref_enum_payload_value_type(
+            place_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
     } else {
-        tyref_to_value_type_with(place_ty, llbc, tombstoned, gc_struct_ids)
+        tyref_to_value_type_with(
+            place_ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
     };
     match declared {
         ValueType::Ref(None) => {
@@ -66317,7 +67162,13 @@ fn adt_field_read_value_type(
             {
                 return ValueType::Int;
             }
-            tyref_to_value_type_with(field_ty, llbc, tombstoned, gc_struct_ids)
+            tyref_to_value_type_with(
+                field_ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
         }
         resolved => resolved,
     }
@@ -66335,6 +67186,7 @@ fn tuple_element_field_value_type(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc).or_else(|| {
         element_ty
@@ -66343,9 +67195,23 @@ fn tuple_element_field_value_type(
     }) {
         return raw;
     }
-    match tyref_to_value_type_with(place_ty, llbc, tombstoned, gc_struct_ids) {
+    match tyref_to_value_type_with(
+        place_ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         ValueType::Ref(None) => element_ty
-            .map(|ty| tyref_enum_payload_value_type(&ty, llbc, tombstoned, gc_struct_ids))
+            .map(|ty| {
+                tyref_enum_payload_value_type(
+                    &ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs,
+                )
+            })
             .unwrap_or(ValueType::Ref(None)),
         ty => ty,
     }
@@ -66457,18 +67323,29 @@ fn tyref_enum_payload_value_type(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
-        return tyref_to_value_type_with(&TyRef::Other(pointee), llbc, tombstoned, gc_struct_ids);
+        return tyref_to_value_type_with(
+            &TyRef::Other(pointee),
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
     }
     // A payload slot read straight out of `generics.types` may still carry
     // the `Value` / `Deduplicated` wrappers. [`tyref_to_value_type_with`]
     // follows those itself; stripping here keeps the node the peel above
     // already resolved.
     match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
-        Some(node) => {
-            tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned, gc_struct_ids)
-        }
+        Some(node) => tyref_to_value_type_with(
+            &TyRef::Other(node.clone()),
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        ),
         None => ValueType::Ref(None),
     }
 }
@@ -67183,6 +68060,7 @@ fn tuple_residual_return_token(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let stripped = TyRef::Other(node.clone());
@@ -67193,8 +68071,14 @@ fn tuple_residual_return_token(
     let mut idx = 0usize;
     while let Some(elem) = tyref_tuple_element(&stripped, idx, llbc) {
         items.push(
-            dont_look_inside_return_token(&elem, llbc, spec, gc_struct_ids)
-                .unwrap_or_else(|| "()".to_string()),
+            dont_look_inside_return_token(
+                &elem,
+                llbc,
+                spec,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+            .unwrap_or_else(|| "()".to_string()),
         );
         idx += 1;
     }
@@ -67225,6 +68109,7 @@ fn dont_look_inside_return_token(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     // A `Result<T, PyError>` callee is reached through the residual-call
     // ABI, which hands back the `Ok` payload and routes the error through
@@ -67271,42 +68156,72 @@ fn dont_look_inside_return_token(
     // collapses the ADT to `Ref` / `"ref"` — a two-word
     // `(PyObjectRef, PyObjectRef)` is not one GC word, and the collector
     // would skip that `"ref"` as multiword.
-    if let Some(token) = tuple_residual_return_token(kind_src, llbc, spec, gc_struct_ids) {
+    if let Some(token) = tuple_residual_return_token(
+        kind_src,
+        llbc,
+        spec,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return Some(token);
     }
-    let token =
-        match tyref_to_value_type_with(kind_src, llbc, no_tombstoned_leaves(), gc_struct_ids) {
-            ValueType::Bool => "bool",
-            ValueType::Int => {
-                // A pointer to a Raw owner is `ValueType::Int` (`ty_is_raw_address`)
-                // and still names that owner. The token stays in the int bank
-                // (`return_type_string_to_value_type`) while the stub shell is
-                // `SomePtr` of the raw struct.
-                if let Some(root) =
-                    raw_address_owner_root(kind_src, llbc, no_tombstoned_leaves(), gc_struct_ids)
-                {
-                    return Some(format!("raw:{root}"));
-                }
-                "i64"
+    let token = match tyref_to_value_type_with(
+        kind_src,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
+        ValueType::Bool => "bool",
+        ValueType::Int => {
+            // A storage-raw pointer is `ValueType::Int` (`ty_is_raw_address`)
+            // and still names that owner. The token stays in the int bank
+            // (`return_type_string_to_value_type`) while the stub shell is
+            // `SomePtr` of the raw struct.
+            if let Some(root) = raw_address_owner_root(
+                kind_src,
+                llbc,
+                no_tombstoned_leaves(),
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ) {
+                return Some(format!("raw:{root}"));
             }
-            ValueType::Unsigned => "u64",
-            ValueType::Int128 => "i128",
-            ValueType::UInt128 => "u128",
-            ValueType::Float => "f64",
-            ValueType::SingleFloat => "f32",
-            // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
-            // caller reading the returned object's fields rtypes against the real
-            // struct; the generic `GCREF` `ref` token would erase that and stub
-            // the opaque callee with the wrong low-level pointer.
-            ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
-                return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
+            "i64"
+        }
+        ValueType::Unsigned => "u64",
+        ValueType::Int128 => "i128",
+        ValueType::UInt128 => "u128",
+        ValueType::Float => "f64",
+        ValueType::SingleFloat => "f32",
+        // A `*mut PyObject` result keeps its typed `OBJECTPTR` lowering, so a
+        // caller reading the returned object's fields rtypes against the real
+        // struct; the generic `GCREF` `ref` token would erase that and stub
+        // the opaque callee with the wrong low-level pointer.
+        ValueType::Ref(_) if output_type_is_objectptr(output, llbc) => {
+            return Some(crate::translator::rtyper::cutover::OBJECTPTR_RETURN_TYPE.to_string());
+        }
+        // An rstr `STR` result is the `SomeString` its body produces, not
+        // the classdef-less instance behind `ref`.
+        ValueType::Str => crate::translator::rtyper::cutover::STR_RETURN_TYPE,
+        ValueType::Ref(_) => {
+            // Flavor-raw pointer: front stays `Ref(Some(flavor))` while
+            // `history.getkind` of the raw `Ptr` is int. Stamp `raw:<owner>`
+            // so residual FUNC.RESULT is Int and `raw_ptr_token_annotation`
+            // seeds `SomeInstance`.
+            if let Some(root) = flavor_raw_pointer_class_root(
+                kind_src,
+                llbc,
+                no_tombstoned_leaves(),
+                raw_alloc_flavor_structs,
+            ) {
+                return Some(format!("raw:{root}"));
             }
-            // An rstr `STR` result is the `SomeString` its body produces, not
-            // the classdef-less instance behind `ref`.
-            ValueType::Str => crate::translator::rtyper::cutover::STR_RETURN_TYPE,
-            ValueType::Ref(_) | ValueType::StringBuilder => "ref",
-            ValueType::Void | ValueType::State | ValueType::Unknown => return None,
-        };
+            "ref"
+        }
+        ValueType::StringBuilder => "ref",
+        ValueType::Void | ValueType::State | ValueType::Unknown => return None,
+    };
     Some(token.to_string())
 }
 
@@ -67387,7 +68302,12 @@ fn dont_look_inside_return_container_root(
     // `SomeInteger`. The `look_inside_iff` wrapper then merges that with
     // the inlined `_orig_` body's `SomeRustVec` (`ll_newlist` after
     // `l.length = n`).
-    let spelling = annotation_struct_field_type(ty, llbc, gc_struct_ids);
+    let spelling = annotation_struct_field_type(
+        ty,
+        llbc,
+        gc_struct_ids,
+        &std::collections::HashSet::<String>::new(),
+    );
     if majit_ir::descr::is_shared_u8_slice_spelling(&spelling)
         || majit_ir::descr::is_option_of_u8_window_spelling(&spelling)
     {
@@ -67575,7 +68495,15 @@ fn tyref_is_int_range_inclusive(ty: &TyRef, llbc: &Llbc) -> bool {
 #[cfg(test)]
 fn tyref_to_attr_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
     let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
-    tyref_to_attr_value_type_with(ty, llbc, no_tombstoned_leaves(), &gc_struct_ids)
+    let raw_alloc_flavor_structs =
+        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    tyref_to_attr_value_type_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        &gc_struct_ids,
+        &raw_alloc_flavor_structs,
+    )
 }
 
 fn tyref_to_attr_value_type_with(
@@ -67583,6 +68511,7 @@ fn tyref_to_attr_value_type_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     let Some(resolved) = tyref_node(ty, llbc) else {
         return ValueType::Ref(None);
@@ -67599,7 +68528,9 @@ fn tyref_to_attr_value_type_with(
     // signed/unsigned split is kept here (`AtomicUsize` → `Unsigned`) so
     // the per-field someshell matches the inner scalar.  Checked after
     // the cheap `Literal` fast-path so primitive fields never pay it.
-    if let Some(inner) = tyref_atomic_inner_value_type(ty, llbc) {
+    if let Some(inner) =
+        tyref_atomic_inner_value_type(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+    {
         return inner;
     }
     // Matching [`tyref_to_value_type`]: a `Vec` of one-word items is the
@@ -67617,11 +68548,26 @@ fn tyref_to_attr_value_type_with(
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
     }
-    if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned, gc_struct_ids) {
+    if let Some(inner) = tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return inner;
     }
-    if ty_is_raw_address(ty, llbc, gc_struct_ids) {
+    if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
         return ValueType::Int;
+    }
+    // Flavor-raw pointer field: front `Ref(Some(root))` so FORCE is a
+    // classdef-less Instance that Pass-2 replaces with
+    // `project_struct_field_type`'s `SomeInstance(pointee)`, and so
+    // `valuetype_to_concrete_for_legacy` sees `Ref(Some(flavor))` → Signed.
+    if let Some(root) =
+        flavor_raw_pointer_class_root(ty, llbc, tombstoned, raw_alloc_flavor_structs)
+    {
+        return ValueType::Ref(Some(root));
     }
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
     // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
@@ -67677,7 +68623,13 @@ fn tyref_to_attr_value_type_with(
     // `Ref(Some(root))` below colors the field Ref while the place is
     // Int, and the join copies Ref into an Int inputarg.
     if type_node_is_fn_ptr(value, llbc) || tyref_option_payload_is_fn_ptr(ty, llbc) {
-        return tyref_to_value_type_with(ty, llbc, tombstoned, gc_struct_ids);
+        return tyref_to_value_type_with(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        );
     }
     // `Option<NonZero*>` and a fieldless-enum niche are integers at every
     // value site. Seeding the field as `Ref(Some(root))` below makes the
@@ -67725,6 +68677,7 @@ fn tyref_to_attr_value_type_for_struct_field(
     owner: &TypeDecl,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
     if tyref_is_type_parameter(ty, llbc) {
         return ValueType::Unknown;
@@ -67734,7 +68687,13 @@ fn tyref_to_attr_value_type_for_struct_field(
     {
         return peeled;
     }
-    tyref_to_attr_value_type_with(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
+    tyref_to_attr_value_type_with(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )
 }
 
 /// The bare leaf name of `ty`'s named-ADT root, after stripping
@@ -67972,6 +68931,7 @@ fn collect_by_value_struct_leaves(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     depth: usize,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<(FieldDescriptor, ValueType)> {
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return Vec::new();
@@ -68010,6 +68970,7 @@ fn collect_by_value_struct_leaves(
                 tombstoned,
                 gc_struct_ids,
                 depth - 1,
+                raw_alloc_flavor_structs,
             ));
             continue;
         }
@@ -68018,7 +68979,13 @@ fn collect_by_value_struct_leaves(
                 .with_owner_id(Some(owner_id))
                 .with_base_is_deref(false)
                 .with_inline_vec(field_ty_is_inline_vec(&f.ty, llbc)),
-            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc, gc_struct_ids),
+            tyref_to_attr_value_type_for_struct_field(
+                &f.ty,
+                td,
+                llbc,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            ),
         ));
     }
     leaves
@@ -68038,6 +69005,7 @@ fn inline_struct_field_leaves(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     owner: &str,
     field_name: &str,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<Vec<(FieldDescriptor, ValueType)>> {
     let td = type_decl_by_owner_root(llbc, owner)?;
     let TypeDeclKind::Struct(fields) = &td.kind else {
@@ -68053,6 +69021,7 @@ fn inline_struct_field_leaves(
         tombstoned,
         gc_struct_ids,
         16,
+        raw_alloc_flavor_structs,
     ))
 }
 
@@ -68195,15 +69164,37 @@ fn tyref_ref_param_class_root(
 
 /// The inner [`ValueType`] of a `core::sync::atomic::Atomic<T>`
 /// (`Atomic<i64>` → `Int`, `Atomic<usize>` → `Unsigned`, `Atomic<bool>` →
-/// `Bool`, `Atomic<*mut T>` → `Ref(None)`), or `None` when `ty` is not a
-/// std atomic.  The atomic wrappers are layout-transparent over their
-/// inner scalar/pointer (asserted at pyobject.rs for the `PyType` vtable
-/// `subclassrange_*` / `instantiate` fields), and the upstream typeptr
-/// ranges are plain int fields, so a field of one types as that inner
-/// value and its `load`/`store` fold to it (`is_atomic_load`).
-fn tyref_atomic_inner_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+/// `Bool`, `Atomic<*mut T>` → `Int` when `T` is storage-raw,
+/// `Ref(Some(root))` when `T` is flavor-raw, else `Ref(None)`), or `None`
+/// when `ty` is not a std atomic.  The atomic wrappers are
+/// layout-transparent over their inner scalar/pointer (asserted at
+/// pyobject.rs for the `PyType` vtable `subclassrange_*` / `instantiate`
+/// fields), and the upstream typeptr ranges are plain int fields, so a
+/// field of one types as that inner value and its `load`/`store` fold to
+/// it (`is_atomic_load`).
+fn tyref_atomic_inner_value_type(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
     let arg = tyref_atomic_arg(ty, llbc)?.as_object()?;
     if arg.contains_key("RawPtr") {
+        // `Atomic<*mut T>` is layout-identical to `*mut T`. Storage-raw
+        // is an int word (`ty_is_raw_address`). Flavor-raw stays
+        // `Ref(Some(root))` (`rclass.py getgcflavor`); a GC pointee
+        // stays `Ref(None)`.
+        if ty_is_raw_address(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs) {
+            return Some(ValueType::Int);
+        }
+        if let Some(root) = flavor_raw_pointer_class_root(
+            ty,
+            llbc,
+            no_tombstoned_leaves(),
+            raw_alloc_flavor_structs,
+        ) {
+            return Some(ValueType::Ref(Some(root)));
+        }
         return Some(ValueType::Ref(None));
     }
     match arg.get("Scalar")? {
@@ -68391,12 +69382,19 @@ fn tyref_is_borrowed_transparent_scalar(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     if !output_type_is_ref(ty, llbc) {
         return false;
     }
     matches!(
-        tyref_transparent_inner_value_type(ty, llbc, tombstoned, gc_struct_ids),
+        tyref_transparent_inner_value_type(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs
+        ),
         Some(
             ValueType::Int
                 | ValueType::Unsigned
@@ -68504,6 +69502,7 @@ fn transparent_handle_has_deref_class(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     match &decl.kind {
         TypeDeclKind::Struct(fields) => {
@@ -68520,7 +69519,13 @@ fn transparent_handle_has_deref_class(
                 return false;
             }
             matches!(
-                tyref_to_value_type_with(&field.ty, llbc, tombstoned, gc_struct_ids),
+                tyref_to_value_type_with(
+                    &field.ty,
+                    llbc,
+                    tombstoned,
+                    gc_struct_ids,
+                    raw_alloc_flavor_structs
+                ),
                 ValueType::Ref(_)
             )
         }
@@ -68571,11 +69576,19 @@ fn transparent_deref_target_class(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let wrapper_id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(wrapper_id)?;
-    if !transparent_handle_has_deref_class(decl, wrapper_id, llbc, tombstoned, gc_struct_ids) {
+    if !transparent_handle_has_deref_class(
+        decl,
+        wrapper_id,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return None;
     }
     let trait_id = deref_trait_decl_id(llbc)?;
@@ -68652,14 +69665,27 @@ fn transparent_handle_field_spelling(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned, gc_struct_ids) {
+    if let Some(root) = transparent_deref_target_class(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return Some(format!("*mut {root}"));
     }
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.as_object()?.get("RawPtr")?.as_array()?.first()?;
     let pointee_ty = TyRef::Other(pointee.clone());
-    let root = transparent_deref_target_class(&pointee_ty, llbc, tombstoned, gc_struct_ids)?;
+    let root = transparent_deref_target_class(
+        &pointee_ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    )?;
     Some(format!("*mut {root}"))
 }
 
@@ -68668,6 +69694,7 @@ fn tyref_transparent_inner_value_type(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<ValueType> {
     // Peel the reference the way the atomic sibling does. A borrow of the
     // wrapper has to answer with the same bank as the wrapper itself:
@@ -68708,6 +69735,7 @@ fn tyref_transparent_inner_value_type(
                 llbc,
                 tombstoned,
                 gc_struct_ids,
+                raw_alloc_flavor_structs,
             ))
         }
         _ => None,
@@ -70611,14 +71639,28 @@ fn mut_ref_cell_root_of(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
     if !matches!(
-        tyref_to_value_type_with(pointee, llbc, tombstoned, gc_struct_ids),
+        tyref_to_value_type_with(
+            pointee,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs
+        ),
         ValueType::Ref(_)
     ) {
         return None;
     }
-    if !gc_ref_pointer(pointee, llbc, tombstoned, gc_struct_ids, 0) {
+    if !gc_ref_pointer(
+        pointee,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        0,
+        raw_alloc_flavor_structs,
+    ) {
         return None;
     }
     Some(format!("MutRef<{}>", tyref_to_ast_string(pointee, llbc)))
@@ -70630,6 +71672,7 @@ fn gc_ref_pointer(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     depth: usize,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     if depth > 4 {
         return false;
@@ -70642,7 +71685,13 @@ fn gc_ref_pointer(
             return false;
         };
         return matches!(
-            tyref_to_value_type_with(&target_ty, llbc, tombstoned, gc_struct_ids),
+            tyref_to_value_type_with(
+                &target_ty,
+                llbc,
+                tombstoned,
+                gc_struct_ids,
+                raw_alloc_flavor_structs
+            ),
             ValueType::Ref(_)
         );
     }
@@ -70665,7 +71714,16 @@ fn gc_ref_pointer(
     } else {
         None
     };
-    field.is_some_and(|field| gc_ref_pointer(&field.ty, llbc, tombstoned, gc_struct_ids, depth + 1))
+    field.is_some_and(|field| {
+        gc_ref_pointer(
+            &field.ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            depth + 1,
+            raw_alloc_flavor_structs,
+        )
+    })
 }
 
 fn pointer_target_json(
@@ -70701,9 +71759,17 @@ fn tyref_gc_mut_ref_cell_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<String> {
-    tyref_mut_ref_pointee(ty, llbc)
-        .and_then(|pointee| mut_ref_cell_root_of(&pointee, llbc, tombstoned, gc_struct_ids))
+    tyref_mut_ref_pointee(ty, llbc).and_then(|pointee| {
+        mut_ref_cell_root_of(
+            &pointee,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+    })
 }
 
 fn tyref_is_type_var(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -70733,6 +71799,7 @@ fn gc_mut_ref_param_locals(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     self_dont_look_inside: bool,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> std::collections::HashSet<usize> {
     // A `dont_look_inside` body is called through the same raw-word ABI
     // its residual callers use, so its parameters are not cells.
@@ -70745,7 +71812,15 @@ fn gc_mut_ref_param_locals(
         let Some(local) = locals.locals.get(index) else {
             continue;
         };
-        if tyref_gc_mut_ref_cell_root(&local.ty, llbc, tombstoned, gc_struct_ids).is_some() {
+        if tyref_gc_mut_ref_cell_root(
+            &local.ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs,
+        )
+        .is_some()
+        {
             params.insert(index);
         }
     }
@@ -71566,6 +72641,7 @@ fn tyref_to_field_layout_string(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
     // A borrow of a fieldless enum is the tag word
     // (`tyref_to_value_type` / `tyref_is_borrowed_fieldless_enum_free`).
@@ -71593,9 +72669,13 @@ fn tyref_to_field_layout_string(
     // Spell that pointer before the transparent-scalar arms: the bare
     // wrapper leaf would project as the wrapper's class, and the target's
     // own name would be laid out as the whole object.
-    if let Some(spelling) =
-        transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves(), gc_struct_ids)
-    {
+    if let Some(spelling) = transparent_handle_field_spelling(
+        ty,
+        llbc,
+        no_tombstoned_leaves(),
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) {
         return spelling;
     }
     // An atomic wrapper is layout-transparent over its inner scalar, and the
@@ -72462,6 +73542,7 @@ fn render_adt_payload_type_args(
     llbc: &Llbc,
     depth: usize,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
@@ -72481,6 +73562,7 @@ fn render_adt_payload_type_args(
                             llbc,
                             no_tombstoned_leaves(),
                             gc_struct_ids,
+                            raw_alloc_flavor_structs,
                         )
                         .unwrap_or(rendered),
                     )
@@ -73298,6 +74380,7 @@ fn scalar_inherent_method_path(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<Vec<String>> {
     let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
         return None;
@@ -73325,6 +74408,7 @@ fn scalar_inherent_method_path(
         tombstoned,
         gc_struct_ids,
         0,
+        raw_alloc_flavor_structs,
     ) {
         return None;
     }
@@ -79335,6 +80419,7 @@ fn adt_variant_payload_type(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<ValueType> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))?;
     let def_id = adt_node_def_id(node)?;
@@ -79354,7 +80439,13 @@ fn adt_variant_payload_type(
     {
         return None;
     }
-    let value = tyref_enum_payload_value_type(&concrete, llbc, tombstoned, gc_struct_ids);
+    let value = tyref_enum_payload_value_type(
+        &concrete,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    );
     if value == ValueType::Void {
         None
     } else {
@@ -80424,6 +81515,7 @@ fn tyref_ref_pointee_value_type(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<ValueType> {
     let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let pointee = node.get("Ref")?.as_array()?.get(1)?;
@@ -80432,6 +81524,7 @@ fn tyref_ref_pointee_value_type(
         llbc,
         tombstoned,
         gc_struct_ids,
+        raw_alloc_flavor_structs,
     ))
 }
 
@@ -82186,9 +83279,16 @@ fn to_string_receiver_is_float(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> bool {
     matches!(
-        tyref_deref_value_type_with(ty, llbc, tombstoned, gc_struct_ids),
+        tyref_deref_value_type_with(
+            ty,
+            llbc,
+            tombstoned,
+            gc_struct_ids,
+            raw_alloc_flavor_structs
+        ),
         crate::model::ValueType::Float | crate::model::ValueType::SingleFloat
     )
 }
@@ -84747,8 +85847,8 @@ mod tests {
             &context.dont_look_inside,
             &context.tombstoned_leaves,
             &context.gc_struct_ids,
-            &context.raw_alloc_flavor_structs,
             &context.immutable_fields,
+            &context.raw_alloc_flavor_structs,
             accum.has_builder,
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
@@ -85318,7 +86418,8 @@ mod tests {
                 &borrowed,
                 &llbc,
                 super::no_tombstoned_leaves(),
-                &gc
+                &gc,
+                &std::collections::HashSet::<String>::new()
             ),
             Some(ValueType::Int)
         );
@@ -85632,6 +86733,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             err: super::adt_variant_payload_type(
                 &result_ty,
@@ -85639,6 +86741,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             continue_ty: super::adt_variant_payload_type(
                 &flow_ty,
@@ -85646,6 +86749,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             break_ty: super::adt_variant_payload_type(
                 &flow_ty,
@@ -85653,6 +86757,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
         };
         assert_eq!(payloads.ok, Some(ValueType::Int));
@@ -85690,6 +86795,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             err: super::adt_variant_payload_type(
                 &result_ty,
@@ -85697,6 +86803,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             continue_ty: super::adt_variant_payload_type(
                 &flow_ty,
@@ -85704,6 +86811,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             break_ty: super::adt_variant_payload_type(
                 &flow_ty,
@@ -85711,6 +86819,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
         };
         assert_eq!(payloads.ok, Some(ValueType::Int));
@@ -85764,6 +86873,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             err: super::adt_variant_payload_type(
                 &result_ty,
@@ -85771,6 +86881,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             continue_ty: super::adt_variant_payload_type(
                 &flow_ty,
@@ -85778,6 +86889,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
             break_ty: super::adt_variant_payload_type(
                 &flow_ty,
@@ -85785,6 +86897,7 @@ mod tests {
                 &llbc,
                 &tombstoned,
                 &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new(),
             ),
         };
         assert_eq!(payloads.ok, None);
@@ -87772,6 +88885,7 @@ mod tests {
                 &llbc,
                 crate::ErrorCarrierSpec::default(),
                 &empty_gc,
+                &std::collections::HashSet::<String>::new(),
             )
             .as_deref(),
             Some("Tuple<i64,bool>"),
@@ -87850,6 +88964,7 @@ mod tests {
                 &empty_hints,
                 spec,
                 &empty_gc,
+                &std::collections::HashSet::<String>::new(),
                 &format!(
                     "fixture::{}",
                     fd.item_meta.name_path().rsplit("::").next().unwrap()
@@ -87859,8 +88974,14 @@ mod tests {
 
         let ptr_fd = llbc.fn_by_id(0).expect("get_raw_owner");
         assert_eq!(
-            dont_look_inside_return_token(&ptr_fd.signature.output, &llbc, spec, &empty_gc)
-                .as_deref(),
+            dont_look_inside_return_token(
+                &ptr_fd.signature.output,
+                &llbc,
+                spec,
+                &empty_gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .as_deref(),
             Some("raw:Owner"),
             "declared-Raw ADT pointer stays an int-bank residual token"
         );
@@ -87878,14 +88999,558 @@ mod tests {
 
         let i64_fd = llbc.fn_by_id(1).expect("returns_i64");
         assert_eq!(
-            dont_look_inside_return_token(&i64_fd.signature.output, &llbc, spec, &empty_gc)
-                .as_deref(),
+            dont_look_inside_return_token(
+                &i64_fd.signature.output,
+                &llbc,
+                spec,
+                &empty_gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .as_deref(),
             Some("i64")
         );
         assert_eq!(
             header_of(i64_fd).return_type.as_deref(),
             Some("i64"),
             "a machine i64 result still stamps FUNC.RESULT"
+        );
+    }
+
+    /// A one-word pointer to a harvested `_alloc_flavor_ = raw` ADT is
+    /// front `Ref(Some(root))` so the annotator seeds `SomeInstance`.
+    /// The int bank is `get_type_flag` / `valuetype_to_concrete_for_legacy`
+    /// (`history.getkind` of a raw `Ptr`). Storage-raw classification stays
+    /// false: a `Vec` field fails `adt_def_is_raw_storage`. An empty
+    /// flavor set keeps the residual token as `ref`.
+    #[test]
+    fn flavor_raw_struct_borrow_is_int_banked_with_class_root() {
+        let span = fixture_span();
+        let vec_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let owner = struct_decl(
+            0,
+            ident_path(&["fixture", "RawFlavorStruct"]),
+            serde_json::json!([{
+                "name": "items",
+                "ty": vec_ty,
+                "attr_info": null
+            }]),
+            false,
+        );
+        let vec_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": fixture_item_meta(ident_path(&["alloc", "vec", "Vec"])),
+            "kind": "Opaque"
+        });
+        let ref_ty = serde_json::json!({
+            "Ref": [
+                "Erased",
+                {"Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [], "types": [],
+                        "const_generics": [], "trait_refs": []
+                    },
+                    "builtin": null
+                }},
+                "Shared"
+            ]
+        });
+        let unit_ty = serde_json::json!({
+            "Adt": {"builtin": "Tuple", "generics": {"types": []}}
+        });
+        let flavor_global = serde_json::json!({
+            "def_id": 0,
+            "item_meta": fixture_item_meta(
+                ident_path(&["fixture", "_alloc_flavor_RawFlavorStruct"])
+            ),
+            "global_kind": "NamedConst",
+            "value": {"Value": [1, [{"Str": "raw"}, {"Ref": [
+                "Erased",
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Shared"
+            ]}]]}
+        });
+        let inspect = serde_json::json!({
+            "def_id": 0,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", "inspect"])),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_ty],
+                "output": unit_ty
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": unit_ty},
+                        {"index": 1, "name": "subject", "span": span, "ty": ref_ty}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let get_ptr = serde_json::json!({
+            "def_id": 1,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", "get_ptr"])),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": ref_ty
+            },
+            "body": "Opaque"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [owner, vec_decl],
+                "fun_decls": [inspect, get_ptr],
+                "global_decls": [flavor_global],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let harvested = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+            std::slice::from_ref(&llbc),
+        );
+        assert!(
+            harvested.iter().any(|s| s.contains("RawFlavorStruct")),
+            "harvested flavor set: {harvested:?}"
+        );
+        let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+            std::collections::HashSet::new();
+        let inspect_fd = llbc.fn_by_id(0).expect("inspect");
+        let param_ty = &inspect_fd.signature.inputs[0];
+        assert!(
+            !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &harvested),
+            "flavor-raw &RawFlavorStruct is not storage-raw; ty_is_raw_address stays false"
+        );
+        assert!(
+            !super::ty_is_raw_address(param_ty, &llbc, &empty_gc, &empty),
+            "empty flavor set keeps ty_is_raw_address false"
+        );
+        let harvested_vt = super::tyref_to_value_type_with(
+            param_ty,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            &empty_gc,
+            &harvested,
+        );
+        assert!(
+            matches!(
+                &harvested_vt,
+                ValueType::Ref(Some(root)) if root.contains("RawFlavorStruct")
+            ),
+            "flavor-raw &RawFlavorStruct is front Ref(Some(root)), got {harvested_vt:?}"
+        );
+        let empty_vt = super::tyref_to_value_type_with(
+            param_ty,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            &empty_gc,
+            &empty,
+        );
+        assert!(
+            matches!(empty_vt, ValueType::Ref(_)),
+            "empty flavor set keeps the front type Ref, got {empty_vt:?}"
+        );
+        let word = crate::layout::target_word_size();
+        let owner = harvested
+            .iter()
+            .find(|s| s.contains("RawFlavorStruct"))
+            .expect("harvested intern key");
+        let spelling = format!("&{owner}");
+        let (flag, bank, size) = crate::codewriter::call::get_type_flag(&spelling, &harvested);
+        assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(bank, majit_ir::value::Type::Int);
+        assert_eq!(size, word);
+        let (empty_flag, empty_bank, _) = crate::codewriter::call::get_type_flag(&spelling, &empty);
+        assert_eq!(empty_flag, majit_ir::descr::ArrayFlag::Pointer);
+        assert_eq!(empty_bank, majit_ir::value::Type::Ref);
+        let spec = crate::ErrorCarrierSpec::default();
+        let get_ptr_fd = llbc.fn_by_id(1).expect("get_ptr");
+        let harvested_token = dont_look_inside_return_token(
+            &get_ptr_fd.signature.output,
+            &llbc,
+            spec,
+            &empty_gc,
+            &harvested,
+        );
+        assert!(
+            harvested_token
+                .as_deref()
+                .is_some_and(|t| t.contains("RawFlavorStruct") && t.starts_with("raw:")),
+            "residual FUNC.RESULT of &RawFlavorStruct is raw:<owner>, got {harvested_token:?}"
+        );
+        assert_eq!(
+            dont_look_inside_return_token(
+                &get_ptr_fd.signature.output,
+                &llbc,
+                spec,
+                &empty_gc,
+                &empty,
+            )
+            .as_deref(),
+            Some("ref"),
+            "empty flavor set keeps the residual token as ref"
+        );
+        let graph = super::lower_function(&llbc, "inspect").expect("lower inspect");
+        let input = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Input {
+                    name,
+                    ty,
+                    class_root,
+                } if name == "subject" => Some((ty.clone(), class_root.clone())),
+                _ => None,
+            })
+            .expect("inspect parameter Input");
+        assert!(
+            matches!(
+                &input.0,
+                ValueType::Ref(Some(root)) if root.contains("RawFlavorStruct")
+            ),
+            "flavor-raw &RawFlavorStruct parameter is Ref(Some(root)), got {:?}",
+            input.0
+        );
+        let root = input.1.expect("Ref parameter carries the class root");
+        assert!(
+            root.contains("RawFlavorStruct"),
+            "class root names RawFlavorStruct, got {root}"
+        );
+        let input_var = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if name == "subject" => op.result.clone(),
+                _ => None,
+            })
+            .expect("inspect parameter result");
+        crate::translator::rtyper::legacy_annotator::annotate(&graph);
+        crate::translator::rtyper::legacy_resolve::resolve_types(&graph, &harvested);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&input_var),
+            crate::model::ConcreteType::Signed,
+            "valuetype_to_concrete_for_legacy(Ref(Some(flavor))) is Signed"
+        );
+        for var in graph.iter_variables() {
+            *var.annotation.borrow_mut() = None;
+            *var.concretetype.borrow_mut() = None;
+        }
+        crate::translator::rtyper::legacy_annotator::annotate(&graph);
+        crate::translator::rtyper::legacy_resolve::resolve_types(&graph, &empty);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&input_var),
+            crate::model::ConcreteType::GcRef,
+            "empty flavor set cannot int-bank at the legacy layer"
+        );
+    }
+
+    /// Named-ADT arguments stay the omitted-default spelling of one class
+    /// (`struct_instantiation_suffix`). `raw_address_owner_root` must not
+    /// append them: `CodeObject<ConstantData>` and `CodeObject` intern as
+    /// two ClassDefs and `mergeinputargs` cannot unify them.
+    #[test]
+    fn flavor_raw_generic_named_arg_keeps_unsuffixed_class_root() {
+        let span = fixture_span();
+        let owner = struct_decl(
+            0,
+            ident_path(&["fixture", "RawFlavorStruct"]),
+            empty_fields(),
+            false,
+        );
+        let named_arg = struct_decl(
+            1,
+            ident_path(&["fixture", "NamedArg"]),
+            empty_fields(),
+            false,
+        );
+        let named_arg_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [], "types": [],
+                    "const_generics": [], "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let ref_ty = serde_json::json!({
+            "Ref": [
+                "Erased",
+                {"Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [named_arg_ty],
+                        "const_generics": [],
+                        "trait_refs": []
+                    },
+                    "builtin": null
+                }},
+                "Shared"
+            ]
+        });
+        let flavor_global = serde_json::json!({
+            "def_id": 0,
+            "item_meta": fixture_item_meta(
+                ident_path(&["fixture", "_alloc_flavor_RawFlavorStruct"])
+            ),
+            "global_kind": "NamedConst",
+            "value": {"Value": [1, [{"Str": "raw"}, {"Ref": [
+                "Erased",
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Shared"
+            ]}]]}
+        });
+        let inspect = serde_json::json!({
+            "def_id": 0,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", "inspect"])),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_ty],
+                "output": {"Adt": {"builtin": "Tuple", "generics": {"types": []}}}
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 1,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": {"Adt": {"builtin": "Tuple", "generics": {"types": []}}}},
+                        {"index": 1, "name": "subject", "span": span, "ty": ref_ty}
+                    ]
+                },
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [owner, named_arg],
+                "fun_decls": [inspect],
+                "global_decls": [flavor_global],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let harvested = crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+            std::slice::from_ref(&llbc),
+        );
+        let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
+            std::collections::HashSet::new();
+        let inspect_fd = llbc.fn_by_id(0).expect("inspect");
+        let param_ty = &inspect_fd.signature.inputs[0];
+        let class_root =
+            super::tyref_class_root_with(param_ty, &llbc, super::no_tombstoned_leaves())
+                .expect("pointee class root");
+        assert!(
+            !class_root.contains('<'),
+            "tyref_class_root_with stays unsuffixed for a named-ADT arg, got {class_root}"
+        );
+        let vt = super::tyref_to_value_type_with(
+            param_ty,
+            &llbc,
+            super::no_tombstoned_leaves(),
+            &empty_gc,
+            &harvested,
+        );
+        match vt {
+            ValueType::Ref(Some(root)) => {
+                assert_eq!(
+                    root, class_root,
+                    "flavor-raw front Ref root must match tyref_class_root_with"
+                );
+                assert!(
+                    !root.contains('<'),
+                    "flavor-raw pointer does not intern a suffixed ClassDef, got {root}"
+                );
+            }
+            other => panic!("expected Ref(Some(unsuffixed root)), got {other:?}"),
+        }
+    }
+
+    /// `*const () as *const Flavor` (`PyFrame::code`) must emit
+    /// `__cast_instance_intrinsic` so rewrite can `cast_ptr_to_int`.
+    /// UnaryOp `CastKind::RawPtr` is the Charon spelling; an Rvalue::Cast
+    /// whose kind is not the `RawPtr` atom still reaches the marker when
+    /// the dest is flavor-raw.
+    #[test]
+    fn flavor_raw_ptr_narrow_from_unit_emits_cast_instance() {
+        let span = fixture_span();
+        let vec_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [{"Scalar": {"Integer": {"Unsigned": "Usize"}}}],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let owner = struct_decl(
+            0,
+            ident_path(&["fixture", "RawFlavorStruct"]),
+            serde_json::json!([{
+                "name": "items",
+                "ty": vec_ty,
+                "attr_info": null
+            }]),
+            false,
+        );
+        let vec_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": fixture_item_meta(ident_path(&["alloc", "vec", "Vec"])),
+            "kind": "Opaque"
+        });
+        let unit_ty = serde_json::json!({
+            "Adt": {"builtin": "Tuple", "generics": {"types": []}}
+        });
+        let src_ty = serde_json::json!({"RawPtr": [unit_ty, "Const"]});
+        let dest_ty = serde_json::json!({
+            "RawPtr": [{
+                "Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [], "types": [],
+                        "const_generics": [], "trait_refs": []
+                    },
+                    "builtin": null
+                }
+            }, "Const"]
+        });
+        let flavor_global = serde_json::json!({
+            "def_id": 0,
+            "item_meta": fixture_item_meta(
+                ident_path(&["fixture", "_alloc_flavor_RawFlavorStruct"])
+            ),
+            "global_kind": "NamedConst",
+            "value": {"Value": [1, [{"Str": "raw"}, {"Ref": [
+                "Erased",
+                {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+                "Shared"
+            ]}]]}
+        });
+        let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+        let unary = serde_json::json!({
+            "def_id": 0,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", "unary_narrow"])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            {"UnaryOp": [
+                                {"Cast": {"RawPtr": [src_ty.clone(), dest_ty.clone()]}},
+                                {"Move": place(1, &src_ty)}
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let rvalue = serde_json::json!({
+            "def_id": 1,
+            "item_meta": fixture_item_meta(ident_path(&["fixture", "rvalue_narrow"])),
+            "signature": {
+                "is_unsafe": true,
+                "inputs": [src_ty.clone()],
+                "output": dest_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": dest_ty.clone()},
+                    {"index": 1, "name": "p", "span": span, "ty": src_ty.clone()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span,
+                        "kind": {"Assign": [
+                            place(0, &dest_ty),
+                            {"Cast": [
+                                "PtrToPtr",
+                                {"Move": place(1, &src_ty)},
+                                dest_ty.clone()
+                            ]}
+                        ]}
+                    }],
+                    "terminator": {"span": span, "kind": "Return"}
+                }]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [owner, vec_decl],
+                "fun_decls": [unary, rvalue],
+                "global_decls": [flavor_global],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let has_cast_instance = |graph: &crate::model::FunctionGraph| {
+            graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    crate::model::cast_instance_root(&op.kind)
+                        .is_some_and(|root| root.contains("RawFlavorStruct"))
+                })
+            })
+        };
+        let unary_graph = super::lower_function(&llbc, "unary_narrow").expect("lower unary_narrow");
+        assert!(
+            has_cast_instance(&unary_graph),
+            "UnaryOp Cast RawPtr onto flavor-raw dest emits CAST_INSTANCE"
+        );
+        let rvalue_graph =
+            super::lower_function(&llbc, "rvalue_narrow").expect("lower rvalue_narrow");
+        assert!(
+            has_cast_instance(&rvalue_graph),
+            "Rvalue::Cast PtrToPtr onto flavor-raw dest emits CAST_INSTANCE"
         );
     }
 
@@ -93463,6 +95128,7 @@ mod tests {
                 &tombstoned_leaves,
                 &gc_struct_ids_llbc,
                 super::no_immutable_fields(),
+                &std::collections::HashSet::<String>::new(),
                 &accum,
                 &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
                 false,
@@ -93837,7 +95503,8 @@ mod tests {
                 &code_ty,
                 &llbc,
                 &tombstoned,
-                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids()
+                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new()
             ),
             ValueType::Ref(Some("module::struct::Code".to_string()))
         );
@@ -94128,11 +95795,21 @@ mod tests {
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
 
         assert_eq!(
-            super::tyref_to_field_layout_string(&shared, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &shared,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "&i64"
         );
         assert_eq!(
-            super::tyref_to_field_layout_string(&mutable, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &mutable,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "&mut i64"
         );
     }
@@ -97101,7 +98778,13 @@ mod tests {
         let tomb = std::collections::HashSet::new();
         let gc = std::collections::HashSet::new();
         assert!(!matches!(
-            super::tyref_to_value_type_with(&shared, &llbc, &tomb, &gc),
+            super::tyref_to_value_type_with(
+                &shared,
+                &llbc,
+                &tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new(),
+            ),
             ValueType::Str
         ));
         let option_shared = TyRef::Other(option_adt_node(1, window_shared_slice()));
@@ -97123,7 +98806,13 @@ mod tests {
             &llbc
         ));
         assert!(!matches!(
-            super::tyref_to_value_type_with(&option_shared, &llbc, &tomb, &gc),
+            super::tyref_to_value_type_with(
+                &option_shared,
+                &llbc,
+                &tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new(),
+            ),
             ValueType::Str
         ));
         assert!(!super::dont_look_inside_return_is_str(
@@ -103811,7 +105500,12 @@ mod tests {
         // The payload row is one pointer to the Deref target. A bare
         // `PyErrorObject` would be laid out as the whole object.
         assert_eq!(
-            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "*mut PyErrorObject"
         );
         // A captured `&PyError` keeps the handle class, not the payload
@@ -103822,7 +105516,12 @@ mod tests {
         }))
         .expect("shared-borrow TyRef parses");
         assert_eq!(
-            super::tyref_to_field_layout_string(&shared, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &shared,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "&PyError"
         );
         let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
@@ -103834,7 +105533,12 @@ mod tests {
             Some("PyError")
         );
         assert_eq!(
-            super::tyref_to_field_layout_string(&ptr, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &ptr,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "*mut PyErrorObject"
         );
 
@@ -103850,7 +105554,12 @@ mod tests {
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
         assert_handle_class(&llbc, &ty, Some("PyError"));
         assert_eq!(
-            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "PyError"
         );
 
@@ -103868,7 +105577,12 @@ mod tests {
         assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
         assert_handle_class(&llbc, &ty, Some("Word"));
         assert_eq!(
-            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "i64"
         );
 
@@ -104044,7 +105758,12 @@ mod tests {
         );
         assert_handle_class(&llbc, &ty, Some("PyError"));
         assert_eq!(
-            super::tyref_to_field_layout_string(&ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "*mut PyErrorObject"
         );
 
@@ -104502,7 +106221,12 @@ mod tests {
             serde_json::json!([{"Scalar": {"Integer": {"Unsigned": "Usize"}}}]),
         );
         assert_eq!(
-            super::tyref_to_field_layout_string(&usize_ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &usize_ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "usize"
         );
         assert_eq!(
@@ -104518,7 +106242,12 @@ mod tests {
             1,
             serde_json::json!([{"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]}]),
         );
-        let ptr_str = super::tyref_to_field_layout_string(&ptr_ty, &llbc, &gc_struct_ids);
+        let ptr_str = super::tyref_to_field_layout_string(
+            &ptr_ty,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new(),
+        );
         assert_eq!(ptr_str, "*mut u8");
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str, &std::collections::HashSet::new()).1,
@@ -104584,7 +106313,12 @@ mod tests {
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
 
         assert_eq!(
-            super::tyref_to_field_layout_string(&enum_ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &enum_ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "u8"
         );
         assert_eq!(
@@ -104773,11 +106507,21 @@ mod tests {
         let env = llbc.type_by_id(2).expect("closure env");
 
         assert!(
-            !super::ty_is_raw_address(&borrowed_ty, &llbc, &gc_struct_ids),
+            !super::ty_is_raw_address(
+                &borrowed_ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "a borrow of a fieldless enum is the tag integer, not a raw address"
         );
         assert_eq!(
-            super::tyref_to_field_layout_string(&borrowed_ty, &llbc, &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &borrowed_ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "u8",
             "a borrow of a fieldless enum is the discriminant scalar"
         );
@@ -104787,7 +106531,13 @@ mod tests {
             "FORCE must seed Integer for a captured &E tag"
         );
         assert_eq!(
-            tyref_to_attr_value_type_for_struct_field(&borrowed_ty, env, &llbc, &gc_struct_ids),
+            tyref_to_attr_value_type_for_struct_field(
+                &borrowed_ty,
+                env,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             ValueType::Int,
             "closure-env FORCE rows match the Int-banked capture"
         );
@@ -104985,7 +106735,12 @@ mod tests {
         );
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbcs[1]).gc_struct_ids();
         assert_eq!(
-            super::tyref_to_field_layout_string(&linked_ty, &llbcs[1], &gc_struct_ids),
+            super::tyref_to_field_layout_string(
+                &linked_ty,
+                &llbcs[1],
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "i64"
         );
     }
@@ -107315,14 +109070,20 @@ mod tests {
         );
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         assert!(
-            super::vec_index_type_is_scalar(&usize_ty, &llbc, &gc_struct_ids),
+            super::vec_index_type_is_scalar(
+                &usize_ty,
+                &llbc,
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
+            ),
             "Vec index fold must accept a usize index"
         );
         assert!(
             super::vec_index_type_is_scalar(
                 &ty(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
                 &llbc,
-                &gc_struct_ids
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
             ),
             "Vec index fold must accept a signed index"
         );
@@ -107330,7 +109091,8 @@ mod tests {
             !super::vec_index_type_is_scalar(
                 &ty(serde_json::json!({ "Adt": { "id": 7  } })),
                 &llbc,
-                &gc_struct_ids
+                &gc_struct_ids,
+                &std::collections::HashSet::<String>::new()
             ),
             "a Range index types as Ref and must stay rejected"
         );
@@ -107827,7 +109589,8 @@ mod tests {
                 false,
                 &llbc,
                 no_tombstoned_leaves(),
-                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids()
+                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new()
             ),
             ValueType::Ref(None),
             "an ordinary struct's &u8 field is a stored pointer"
@@ -107840,7 +109603,8 @@ mod tests {
                 true,
                 &llbc,
                 no_tombstoned_leaves(),
-                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids()
+                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new()
             ),
             ValueType::Unsigned,
             "a closure-env &usize capture is the usize"
@@ -107857,7 +109621,8 @@ mod tests {
                 &ref_u8,
                 ordinary,
                 &llbc,
-                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids()
+                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new()
             ),
             ValueType::Ref(None),
             "FORCE-attr rows for an ordinary struct stay Ref"
@@ -107867,7 +109632,8 @@ mod tests {
                 &ref_usize,
                 env,
                 &llbc,
-                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids()
+                &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
+                &std::collections::HashSet::<String>::new()
             ),
             ValueType::Unsigned,
             "FORCE-attr rows for a closure-env capture match the Int-banked getfield"
@@ -107926,6 +109692,7 @@ mod tests {
             &tombstoned_leaves,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -108009,6 +109776,7 @@ mod tests {
             &tombstoned_leaves,
             &gc_struct_ids,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -108078,6 +109846,7 @@ mod tests {
             &tombstoned_leaves,
             &gc_struct_ids,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -109224,6 +110993,7 @@ mod tests {
             &tombstoned,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -109312,6 +111082,7 @@ mod tests {
             &tombstoned,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -109852,6 +111623,7 @@ mod tests {
             &tombstoned,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -109926,6 +111698,7 @@ mod tests {
             &tombstoned,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -110062,6 +111835,7 @@ mod tests {
             &cross,
             &gc_struct_ids_a,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum_a,
             &super::RootStackAnalyzer::new(&a, &super::RootStackState::new(&a)),
             false,
@@ -110107,6 +111881,7 @@ mod tests {
             &cross,
             &gc_struct_ids_b,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum_b,
             &super::RootStackAnalyzer::new(&b, &super::RootStackState::new(&b)),
             false,
@@ -114774,6 +116549,102 @@ mod tests {
         (nulls, transparent_ctors)
     }
 
+    /// `std::ptr::null_mut::<RawStruct>()` of a declared-Raw ADT is
+    /// `lltype.nullptr(T)` (`null_raw`) with T's class root, and must
+    /// not recast that null through `__cast_instance_intrinsic`.
+    #[test]
+    fn null_mut_of_raw_struct_is_null_raw_without_cast() {
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt);
+        let caller = interior_caller(
+            "null_raw_ptr",
+            0,
+            vec![],
+            ptr.clone(),
+            vec![interior_local(0, None, &ptr)],
+            vec![
+                interior_bb(
+                    vec![],
+                    interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+                ),
+                interior_bb(vec![], interior_unwind()),
+                interior_bb(vec![], interior_return()),
+            ],
+        );
+        let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+        let llbc = llbc_with_types(
+            "fixture",
+            vec![interior_struct(
+                0,
+                &["fixture", "RawStruct"],
+                &[("word", interior_i64())],
+                8,
+                &[0],
+                false,
+            )],
+            vec![caller, null_mut],
+        );
+        let graph = lower_interior(&llbc, "null_raw_ptr");
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .collect();
+        let null_raw = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_raw"
+                )
+            })
+            .unwrap_or_else(|| panic!("expected core::ptr::null_raw; ops={ops:?}"));
+        match &null_raw.kind {
+            OpKind::Call {
+                args, result_ty, ..
+            } => {
+                assert_eq!(result_ty, &crate::model::ValueType::Int);
+                match args.as_slice() {
+                    [LinkArg::Const(c)] => {
+                        assert_eq!(
+                            c.value.as_pystr(),
+                            Some("RawStruct"),
+                            "null_raw must carry T's class-root spelling"
+                        );
+                    }
+                    other => panic!("expected one class-root spelling, got {other:?}"),
+                }
+            }
+            other => panic!("expected null_raw call, got {other:?}"),
+        }
+        let null_raw_var = null_raw
+            .result
+            .as_ref()
+            .expect("null_raw produces a result");
+        assert!(
+            ops.iter()
+                .all(|op| crate::model::cast_instance_of(&op.kind, null_raw_var).is_none()),
+            "null_raw must not be followed by __cast_instance_intrinsic; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| {
+                !matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.as_slice()
+                        == ["core", "ptr", "null_mut"]
+                        || segments.as_slice() == ["std", "ptr", "null_mut"]
+                        || segments.as_slice() == ["core", "ptr", "null"]
+                        || segments.as_slice() == ["std", "ptr", "null"]
+                )
+            }),
+            "raw-pointee null_mut must not remain as a GC null; ops={ops:?}"
+        );
+    }
+
     #[test]
     fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
         use crate::model::OpKind;
@@ -115759,6 +117630,7 @@ mod tests {
             &tombstoned,
             &gc_struct_ids_llbc,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -116530,17 +118402,51 @@ mod tests {
         let gc = std::collections::HashSet::new();
         let i64 = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let i64_ty: TyRef = serde_json::from_value(i64.clone()).unwrap();
-        assert!(super::mut_ref_cell_root_of(&i64_ty, &llbc, tomb, &gc).is_none());
+        assert!(
+            super::mut_ref_cell_root_of(
+                &i64_ty,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .is_none()
+        );
         let raw_i64: TyRef =
             serde_json::from_value(serde_json::json!({"RawPtr": [i64, "Mut"]})).unwrap();
-        assert!(super::mut_ref_cell_root_of(&raw_i64, &llbc, tomb, &gc).is_none());
+        assert!(
+            super::mut_ref_cell_root_of(
+                &raw_i64,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .is_none()
+        );
         let obj = serde_json::json!({"Adt": {"id": 7}});
         let obj_ty: TyRef = serde_json::from_value(obj.clone()).unwrap();
-        assert!(super::mut_ref_cell_root_of(&obj_ty, &llbc, tomb, &gc).is_none());
+        assert!(
+            super::mut_ref_cell_root_of(
+                &obj_ty,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .is_none()
+        );
         let raw_obj: TyRef =
             serde_json::from_value(serde_json::json!({"RawPtr": [obj, "Mut"]})).unwrap();
         assert_eq!(
-            super::mut_ref_cell_root_of(&raw_obj, &llbc, tomb, &gc).as_deref(),
+            super::mut_ref_cell_root_of(
+                &raw_obj,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .as_deref(),
             Some("MutRef<*mut ??adt#7>")
         );
     }
@@ -116574,8 +118480,14 @@ mod tests {
             }))
             .unwrap();
         let pointee_ty: TyRef = serde_json::from_value(pointee).unwrap();
-        let root = super::mut_ref_cell_root_of(&pointee_ty, &llbc, tomb, &gc_struct_ids)
-            .expect("raw GC pointer behind &mut is a cell");
+        let root = super::mut_ref_cell_root_of(
+            &pointee_ty,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new(),
+        )
+        .expect("raw GC pointer behind &mut is a cell");
         let slot = |graph: &FunctionGraph| {
             graph
                 .block(graph.startblock)
@@ -116586,7 +118498,14 @@ mod tests {
                 .clone()
         };
 
-        let cells = super::gc_mut_ref_param_locals(&locals, &llbc, tomb, &gc_struct_ids, false);
+        let cells = super::gc_mut_ref_param_locals(
+            &locals,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            false,
+            &std::collections::HashSet::<String>::new(),
+        );
         assert!(cells.contains(&1));
         let mut graph = FunctionGraph::new("c::holder");
         super::pygraph_initial_block(
@@ -116598,6 +118517,7 @@ mod tests {
             &cells,
             &gc_struct_ids,
             false,
+            &std::collections::HashSet::<String>::new(),
         );
         let OpKind::Input { ty, class_root, .. } = &slot(&graph).kind else {
             panic!("slot op is an input");
@@ -116605,7 +118525,14 @@ mod tests {
         assert_eq!(class_root.as_deref(), Some(root.as_str()));
         assert_eq!(ty, &ValueType::Ref(Some(root)));
 
-        let residual = super::gc_mut_ref_param_locals(&locals, &llbc, tomb, &gc_struct_ids, true);
+        let residual = super::gc_mut_ref_param_locals(
+            &locals,
+            &llbc,
+            tomb,
+            &gc_struct_ids,
+            true,
+            &std::collections::HashSet::<String>::new(),
+        );
         assert!(residual.is_empty());
         let mut residual_graph = FunctionGraph::new("c::holder");
         super::pygraph_initial_block(
@@ -116617,6 +118544,7 @@ mod tests {
             &residual,
             &gc_struct_ids,
             false,
+            &std::collections::HashSet::<String>::new(),
         );
         let OpKind::Input { class_root, .. } = &slot(&residual_graph).kind else {
             panic!("slot op is an input");
@@ -116726,6 +118654,7 @@ mod tests {
             &tombstoned_leaves,
             &gc_struct_ids,
             super::no_immutable_fields(),
+            &std::collections::HashSet::<String>::new(),
             &accum,
             &super::RootStackAnalyzer::new(&llbc, &super::RootStackState::new(&llbc)),
             false,
@@ -117141,11 +119070,25 @@ mod tests {
         let tomb = no_tombstoned_leaves();
         let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         assert!(
-            super::mut_ref_cell_root_of(&handle, &llbc, tomb, &gc).is_some(),
+            super::mut_ref_cell_root_of(
+                &handle,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .is_some(),
             "Handle behind &mut is a cell pointee"
         );
         assert!(
-            super::tyref_gc_mut_ref_cell_root(&mut_ty, &llbc, tomb, &gc).is_some(),
+            super::tyref_gc_mut_ref_cell_root(
+                &mut_ty,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            )
+            .is_some(),
             "&mut Handle is a cell parameter"
         );
         let graph = super::lower_function(&llbc, "caller").expect("lower caller");
@@ -117699,7 +119642,15 @@ mod tests {
         let llbc = empty_llbc();
         let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let tomb = super::no_tombstoned_leaves();
-        let is_float = |ty: &TyRef| super::to_string_receiver_is_float(ty, &llbc, tomb, &gc);
+        let is_float = |ty: &TyRef| {
+            super::to_string_receiver_is_float(
+                ty,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new(),
+            )
+        };
         let ty = |value: serde_json::Value| -> TyRef { serde_json::from_value(value).unwrap() };
         assert!(is_float(&ty(
             serde_json::json!({"Scalar": {"Float": "F64"}})
@@ -124003,6 +125954,7 @@ mod tests {
             &llbc,
             &gc_struct_ids,
             crate::ErrorCarrierSpec::default(),
+            &std::collections::HashSet::<String>::new(),
         );
         let expected = [
             "pyre_object",
@@ -124039,6 +125991,7 @@ mod tests {
             &llbc,
             &gc_struct_ids,
             crate::ErrorCarrierSpec::default(),
+            &std::collections::HashSet::<String>::new(),
         );
         let expected = ["pyre_interpreter", "typedef", "call_getset_fget_direct"];
         let (_, signature, token) = specs
@@ -124080,6 +126033,7 @@ mod tests {
             &llbc,
             &gc_struct_ids,
             crate::ErrorCarrierSpec::default(),
+            &std::collections::HashSet::<String>::new(),
         );
         let expected = ["pyre_interpreter", "call", "metaclass_call_override"];
         let (_, signature, token) = specs
@@ -126478,11 +128432,22 @@ mod tests {
         }))
         .expect("raw ptr TyRef");
         assert!(
-            !super::ty_is_raw_address(&raw_ptr, &llbc, &gc),
+            !super::ty_is_raw_address(
+                &raw_ptr,
+                &llbc,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            ),
             "*mut Header is Ptr(GC)"
         );
         assert!(matches!(
-            super::tyref_to_value_type_with(&raw_ptr, &llbc, tomb, &gc),
+            super::tyref_to_value_type_with(
+                &raw_ptr,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            ),
             ValueType::Ref(_)
         ));
         let alias = serde_json::from_value::<super::TyRef>(serde_json::json!({
@@ -126490,21 +128455,43 @@ mod tests {
         }))
         .expect("alias TyRef");
         assert!(
-            !super::ty_is_raw_address(&alias, &llbc, &gc),
+            !super::ty_is_raw_address(
+                &alias,
+                &llbc,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            ),
             "HeaderRef alias peels to *mut Header"
         );
         assert!(matches!(
-            super::tyref_to_value_type_with(&alias, &llbc, tomb, &gc),
+            super::tyref_to_value_type_with(
+                &alias,
+                &llbc,
+                tomb,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            ),
             ValueType::Ref(_)
         ));
         let handle = serde_json::from_value::<super::TyRef>(serde_json::json!({
             "Value": [4, adt(4)]
         }))
         .expect("handle TyRef");
-        assert!(!super::ty_is_raw_address(&handle, &llbc, &gc));
+        assert!(!super::ty_is_raw_address(
+            &handle,
+            &llbc,
+            &gc,
+            &std::collections::HashSet::<String>::new()
+        ));
         assert!(
             matches!(
-                super::tyref_to_value_type_with(&handle, &llbc, tomb, &gc),
+                super::tyref_to_value_type_with(
+                    &handle,
+                    &llbc,
+                    tomb,
+                    &gc,
+                    &std::collections::HashSet::<String>::new()
+                ),
                 ValueType::Ref(_)
             ),
             "transparent handle over the GC pointer is Ref, not Int"
@@ -126605,7 +128592,12 @@ mod tests {
         }))
         .expect("GcEntries ptr TyRef");
         assert!(
-            !super::ty_is_raw_address(&gc_ptr, &llbc, &gc),
+            !super::ty_is_raw_address(
+                &gc_ptr,
+                &llbc,
+                &gc,
+                &std::collections::HashSet::<String>::new()
+            ),
             "*mut GcEntries is a GC ref"
         );
         assert!(
@@ -126614,7 +128606,8 @@ mod tests {
                     &gc_ptr,
                     &llbc,
                     &std::collections::HashSet::new(),
-                    &gc
+                    &gc,
+                    &std::collections::HashSet::<String>::new()
                 ),
                 ValueType::Ref(_)
             ),

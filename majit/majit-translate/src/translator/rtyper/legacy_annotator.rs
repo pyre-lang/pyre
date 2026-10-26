@@ -21,7 +21,8 @@
 
 use std::rc::Rc;
 
-use crate::annotator::model::SomeValue;
+use crate::annotator::bookkeeper::Bookkeeper;
+use crate::annotator::model::{SomeInstance, SomeValue};
 use crate::codewriter::annotation_state::{somevalue_to_valuetype, valuetype_to_someshell};
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
@@ -37,6 +38,14 @@ use crate::model::{FunctionGraph, Link, LinkArg, OpKind, ValueType};
 /// `somevalue_to_valuetype(&var.annotation.borrow())`
 /// (production).
 pub fn annotate(graph: &FunctionGraph) {
+    annotate_with_bookkeeper(graph, None);
+}
+
+/// Like [`annotate`], attaching a classed `SomeInstance` when a declared
+/// `Ref(Some(root))` resolves through the per-translation bookkeeper
+/// (`bookkeeper.py getuniqueclassdef`). `rclass.py getgcflavor` reads
+/// `_alloc_flavor_` off that classdef.
+pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bookkeeper>>) {
     // RPython parity: `annrpython.py:RPythonAnnotator.complete()`
     // (`annrpython.py typeof([v_last_exc_value])`) writes
     // exceptblock annotations only when a `follow_raise_link` actually
@@ -86,10 +95,11 @@ pub fn annotate(graph: &FunctionGraph) {
                         }
                         _ => infer_op_type(&op.kind),
                     };
+                    let inferred = declared_ref_valuetype(inferred, bookkeeper);
                     let current = read_binding(result);
                     let merged = union_type(&current, &inferred);
                     if merged != current {
-                        setbinding(result, merged);
+                        setbinding_with(result, merged, bookkeeper);
                         changed = true;
                     }
                 }
@@ -101,9 +111,9 @@ pub fn annotate(graph: &FunctionGraph) {
             // `link.args[i]` annotation into `link.target.inputargs[i]`.
             for link in &block.exits {
                 let link_changed = if link_is_raise_like(link) {
-                    follow_raise_link(graph, link)
+                    follow_raise_link(graph, link, bookkeeper)
                 } else {
-                    follow_link(graph, link)
+                    follow_link(graph, link, bookkeeper)
                 };
                 changed |= link_changed;
             }
@@ -150,7 +160,20 @@ fn read_binding_some(var: &Variable) -> Option<Rc<SomeValue>> {
 /// clears any stale shell so the downstream rtyper fails fast at
 /// `bindingrepr` instead of silently bridging to `GcRef`.
 pub(crate) fn setbinding(var: &Variable, ty: ValueType) {
-    if let Some(shell) = valuetype_to_someshell(&ty) {
+    setbinding_with(var, ty, None);
+}
+
+fn setbinding_with(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) {
+    let shell = match &ty {
+        ValueType::Ref(Some(root)) => bookkeeper
+            .and_then(|bk| bk.classdef_for_known_struct_root(root))
+            .map(|classdef| {
+                SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()))
+            })
+            .or_else(|| valuetype_to_someshell(&ty)),
+        _ => valuetype_to_someshell(&ty),
+    };
+    if let Some(shell) = shell {
         let new_val = Rc::new(shell);
         let mut slot = var.annotation.borrow_mut();
         if let Some(existing) = slot.as_ref() {
@@ -169,26 +192,47 @@ pub(crate) fn setbinding(var: &Variable, ty: ValueType) {
     }
 }
 
+/// Rewrite a declared `Ref(Some(root))` to the interned classdef name so
+/// fixpoint rounds compare equal (`somevalue_to_valuetype` emits that
+/// name). `rclass.py getgcflavor` keys off the classdef, not the front
+/// leaf spelling.
+fn declared_ref_valuetype(ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> ValueType {
+    match &ty {
+        ValueType::Ref(Some(root)) => {
+            if let Some(cd) = bookkeeper.and_then(|bk| bk.classdef_for_known_struct_root(root)) {
+                ValueType::Ref(Some(cd.borrow().name.clone()))
+            } else {
+                ty
+            }
+        }
+        _ => ty,
+    }
+}
+
 fn link_is_raise_like(link: &Link) -> bool {
     link.last_exception.is_some() && link.last_exc_value.is_some()
 }
 
-fn follow_link(graph: &FunctionGraph, link: &Link) -> bool {
+fn follow_link(graph: &FunctionGraph, link: &Link, bookkeeper: Option<&Rc<Bookkeeper>>) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
     for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
-        changed |= merge_value_type(dst, link_arg_type(src));
+        changed |= merge_value_type(dst, link_arg_type(src), bookkeeper);
     }
     changed
 }
 
-fn follow_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
+fn follow_raise_link(
+    graph: &FunctionGraph,
+    link: &Link,
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+) -> bool {
     let mut changed = false;
     if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_variable()) {
-        changed |= merge_value_type(value, ValueType::Ref(None));
+        changed |= merge_value_type(value, ValueType::Ref(None), bookkeeper);
     }
     if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_variable()) {
-        changed |= merge_value_type(value, ValueType::Int);
+        changed |= merge_value_type(value, ValueType::Int, bookkeeper);
     }
 
     let target_block = graph.block(link.target);
@@ -200,7 +244,7 @@ fn follow_raise_link(graph: &FunctionGraph, link: &Link) -> bool {
         } else {
             link_arg_type(src)
         };
-        changed |= merge_value_type(dst, src_ty);
+        changed |= merge_value_type(dst, src_ty, bookkeeper);
     }
     changed
 }
@@ -212,11 +256,16 @@ fn link_arg_type(src: &LinkArg) -> ValueType {
     }
 }
 
-fn merge_value_type(dst: &Variable, src_ty: ValueType) -> bool {
+fn merge_value_type(
+    dst: &Variable,
+    src_ty: ValueType,
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+) -> bool {
+    let src_ty = declared_ref_valuetype(src_ty, bookkeeper);
     let current = read_binding(dst);
     let merged = union_type(&current, &src_ty);
     if merged != current {
-        setbinding(dst, merged);
+        setbinding_with(dst, merged, bookkeeper);
         true
     } else {
         false

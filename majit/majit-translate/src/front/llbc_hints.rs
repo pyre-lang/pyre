@@ -438,18 +438,33 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
     );
 }
 
-/// Peel a `*const T` / `*mut T` / `&mut T` / `&T` spelling to `T`.
+/// Peel a one-word pointer spelling to its pointee.
 ///
-/// `ValueType::Ref(Some(name))` may carry the pointer form the front
-/// renders, or the pointee intern path; both name the same raw identity.
+/// `*const T` / `*mut T` / `&mut T` / `&T` / `Box<T>` / `Arc<T>` /
+/// `Rc<T>` / `NonNull<T>` / `AtomicPtr<T>` (qualified paths included).
+/// A fat pointer (`Box<dyn Trait>`, `&[T]`, `&str`, `Arc<dyn Trait>`)
+/// is left whole: it is two words, not a raw address.
+/// `history.getkind` / `descr.py get_type_flag` classify `Ptr` from
+/// `TO._gckind`, so the flavor matcher has to name `T`.
 fn peel_pointer_spelling(path: &str) -> &str {
     let path = path.trim();
-    path.strip_prefix("*const ")
-        .or_else(|| path.strip_prefix("*mut "))
-        .or_else(|| path.strip_prefix("&mut "))
-        .or_else(|| path.strip_prefix('&'))
-        .map(str::trim)
-        .unwrap_or(path)
+    if crate::fat_ptr_layout::spelling_is_fat_ptr(path) {
+        return path;
+    }
+    crate::fat_ptr_layout::pointer_pointee(path).unwrap_or(path)
+}
+
+/// Whether `spelling` is one pointer word whose pointee is a harvested
+/// `_alloc_flavor_ = raw` identity. Fat pointers stay off this arm.
+pub(crate) fn spelling_is_one_word_flavor_raw_ptr(raw: &HashSet<String>, spelling: &str) -> bool {
+    if crate::fat_ptr_layout::spelling_is_fat_ptr(spelling) {
+        return false;
+    }
+    let peeled = peel_pointer_spelling(spelling);
+    if peeled == spelling.trim() {
+        return false;
+    }
+    alloc_flavor_raw_contains(raw, spelling)
 }
 
 /// Whether `path` is a harvested `_alloc_flavor_ = raw` identity.
@@ -458,9 +473,13 @@ fn peel_pointer_spelling(path: &str) -> &str {
 /// (`canonical_struct_name` of the struct), a crate-prefixed TypeDecl
 /// path the front paints on `ValueType::Ref(Some(..))`, or a `*const` /
 /// `*mut` / `&` spelling of either. The harvested set stores the
-/// crate-stripped intern key; a bare leaf does not match a different
-/// module path. `rclass.py getgcflavor` / `classdesc.py ClassDesc.get_param`
-/// read `_alloc_flavor_` off that classdesc.
+/// crate-stripped intern key; a qualified path in another module does
+/// not match. A bare leaf matches when [`majit_ir::descr::canonical_struct_name`]
+/// qualifies it through `STRUCT_ORIGIN_REGISTRY` (unique among all
+/// known struct keys). A tombstoned or unregistered leaf does not
+/// guess from the raw subset. `rclass.py getgcflavor` /
+/// `classdesc.py ClassDesc.get_param` read `_alloc_flavor_` off that
+/// classdesc.
 pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bool {
     if raw.is_empty() {
         return false;
@@ -823,7 +842,7 @@ fn decode_bool_const(llbc: &Llbc, value: &serde_json::Value) -> Option<bool> {
 mod tests {
     use super::{decode_str_const, marker_path_to_fn_path, parse_immutable_entry_list};
     use crate::model::ImmutableRank;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn memo_marker_recovers_its_function_attribute_and_owner() {
@@ -1131,6 +1150,14 @@ mod tests {
 
     #[test]
     fn alloc_flavor_raw_identity_does_not_match_another_module_leaf() {
+        // Hold the origin-registry lock from the start so leftover
+        // CodeObject origins from sibling tests cannot qualify a bare
+        // leaf. Tombstone until the unique-leaf case below
+        // (`canonical_struct_name` of an empty module path stays the leaf).
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "CodeObject".to_string(),
+            String::new(),
+        )]));
         let raw = HashSet::from(["bytecode::CodeObject".to_string()]);
         assert!(super::alloc_flavor_raw_contains(
             &raw,
@@ -1148,6 +1175,63 @@ mod tests {
             &raw,
             "&bytecode::CodeObject"
         ));
+        for spelling in [
+            "&mut bytecode::CodeObject",
+            "Box<bytecode::CodeObject>",
+            "NonNull<bytecode::CodeObject>",
+            "Arc<bytecode::CodeObject>",
+            "Rc<bytecode::CodeObject>",
+            "AtomicPtr<bytecode::CodeObject>",
+            "alloc::boxed::Box<bytecode::CodeObject>",
+            "alloc::sync::Arc<bytecode::CodeObject>",
+            "core::ptr::non_null::NonNull<bytecode::CodeObject>",
+            "std::sync::atomic::AtomicPtr<bytecode::CodeObject>",
+        ] {
+            assert!(
+                super::alloc_flavor_raw_contains(&raw, spelling),
+                "{spelling}"
+            );
+            assert!(
+                super::spelling_is_one_word_flavor_raw_ptr(&raw, spelling),
+                "{spelling}"
+            );
+        }
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(
+            &raw,
+            "bytecode::CodeObject"
+        ));
+        assert!(!super::alloc_flavor_raw_contains(
+            &raw,
+            "Box<dyn bytecode::CodeObject>"
+        ));
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(
+            &raw,
+            "Box<dyn Trait>"
+        ));
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&[u8]"));
+        assert!(!super::spelling_is_one_word_flavor_raw_ptr(&raw, "&str"));
         assert!(!super::alloc_flavor_raw_contains(&raw, "other::CodeObject"));
+        // A bare leaf does not guess from the raw-key subset.
+        assert!(!super::alloc_flavor_raw_contains(&raw, "CodeObject"));
+        majit_ir::descr::register_struct_origins(HashMap::from([(
+            "CodeObject".to_string(),
+            "bytecode".to_string(),
+        )]));
+        assert!(super::alloc_flavor_raw_contains(&raw, "CodeObject"));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "CodeObject<ConstantData>"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "&CodeObject<ConstantData>"
+        ));
+        majit_ir::descr::register_struct_origins(HashMap::from([(
+            "Node".to_string(),
+            String::new(),
+        )]));
+        let raw_node = HashSet::from(["a::Node".to_string()]);
+        assert!(super::alloc_flavor_raw_contains(&raw_node, "a::Node"));
+        assert!(!super::alloc_flavor_raw_contains(&raw_node, "Node"));
     }
 }

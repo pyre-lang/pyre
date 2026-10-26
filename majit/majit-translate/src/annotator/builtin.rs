@@ -1719,10 +1719,16 @@ fn fn_null_constant(
 }
 
 /// Null of a raw-address niche — `lltype.nullptr(T)` as `SomePtr` of
-/// that raw `Struct` (`rnone.py` `rtype_is_None` → `ptr_iszero`), or
-/// `llmemory.NULL` as `SomeAddress` (`int_is_zero`) when the payload
-/// has no named pointee. A `null_fn` empty `FuncType` does not union
-/// with `Ptr(Struct)` (`llannotation.py` `pairtype(SomePtr, SomePtr)`).
+/// that raw `Struct` (`rnone.py` `rtype_is_None` → `ptr_iszero`) when
+/// the spelling is a storage-raw owner (`raw_struct_ptr_annotation`),
+/// a nullable `SomeInstance` of a flavor-raw class when the spelling
+/// names a class whose `classdesc.get_param('_alloc_flavor_')` is
+/// `'raw'` (`rclass.py` `getgcflavor`; `None` converted to an
+/// `InstanceRepr` is `nullptr(r_to.lowleveltype.TO)` for any flavor),
+/// or `llmemory.NULL` as `SomeAddress` (`int_is_zero`) when the
+/// payload has no named pointee. A `null_fn` empty `FuncType` does
+/// not union with `Ptr(Struct)` (`llannotation.py`
+/// `pairtype(SomePtr, SomePtr)`).
 fn raw_ptr_null_constant(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -1747,11 +1753,33 @@ fn raw_ptr_null_constant(
                     "ptr::null_raw() type argument must be a constant string",
                 ));
             };
-            bk.raw_struct_ptr_annotation(spelling).ok_or_else(|| {
-                AnnotatorError::new(format!(
-                    "ptr::null_raw() type argument is not a raw pointer: {spelling}"
-                ))
-            })
+            if let Some(ann) = bk.raw_struct_ptr_annotation(spelling) {
+                return Ok(ann);
+            }
+            // Flavor-raw: intern the class root and read
+            // `classdesc.get_param('_alloc_flavor_')`. Stamp keys that
+            // param from `raw_alloc_flavor_structs` the same way
+            // `Bookkeeper::stamp_raw_alloc_flavor` does.
+            if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(spelling) {
+                let alloc_flavor = {
+                    let classdesc = classdef.borrow().classdesc.clone();
+                    classdesc.borrow().get_param(
+                        "_alloc_flavor_",
+                        Some(ConstValue::byte_str("gc")),
+                        true,
+                    )
+                };
+                if alloc_flavor.as_text() == Some("raw") {
+                    return Ok(SomeValue::Instance(super::model::SomeInstance::new(
+                        Some(classdef),
+                        true,
+                        std::collections::BTreeMap::new(),
+                    )));
+                }
+            }
+            Err(AnnotatorError::new(format!(
+                "ptr::null_raw() type argument is not a raw pointer: {spelling}"
+            )))
         }
         _ => Err(AnnotatorError::new(
             "ptr::null_raw() takes an optional raw-pointer type argument",
@@ -3482,6 +3510,51 @@ mod tests {
         assert!(
             matches!(merged, SomeValue::Ptr(_)),
             "typed null_raw must stay SomePtr, got {merged:?}"
+        );
+    }
+
+    /// `lltype.nullptr(T)` of a flavor-raw class (`_alloc_flavor_ = raw`)
+    /// is a nullable `SomeInstance` of that classdef, not `SomePtr`.
+    /// `raw_struct_ptr_annotation` is storage-raw only.
+    #[test]
+    fn typed_null_raw_of_flavor_raw_class_is_nullable_instance() {
+        use crate::flowspace::model::{ConstValue, Constant};
+
+        let bk = bk();
+        bk.set_raw_alloc_flavor_structs(std::collections::HashSet::from(["FlavorRaw".to_string()]));
+        assert!(
+            bk.raw_struct_ptr_annotation("FlavorRaw").is_none(),
+            "flavor-raw is not a storage-raw owner"
+        );
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("FlavorRaw")
+            .expect("flavor-raw classdef");
+        let alloc_flavor = {
+            let classdesc = classdef.borrow().classdesc.clone();
+            classdesc
+                .borrow()
+                .get_param("_alloc_flavor_", Some(ConstValue::byte_str("gc")), true)
+        };
+        assert_eq!(
+            alloc_flavor.as_text(),
+            Some("raw"),
+            "stamp_raw_alloc_flavor writes classdesc.get_param('_alloc_flavor_')"
+        );
+        let mut s_ty = crate::annotator::model::s_str0();
+        s_ty.set_const_box(Constant::new(ConstValue::byte_str("FlavorRaw")));
+        let s_null = raw_ptr_null_constant(&bk, &[Some(s_ty)], &std::collections::HashMap::new())
+            .expect("typed null_raw of flavor-raw class");
+        let SomeValue::Instance(inst) = &s_null else {
+            panic!("null_raw of a flavor-raw class must be SomeInstance, got {s_null:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "None converted to InstanceRepr is nullable"
+        );
+        let inst_classdef = inst.classdef.as_ref().expect("classdef");
+        assert!(
+            Rc::ptr_eq(inst_classdef, &classdef),
+            "null instance must be the interned flavor-raw classdef"
         );
     }
 

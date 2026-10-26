@@ -28,9 +28,11 @@
 use std::collections::HashSet;
 
 use crate::codewriter::annotation_state::somevalue_to_valuetype;
-use crate::codewriter::type_state::{ConcreteType, kind_char_to_concrete, valuetype_to_concrete};
+use crate::codewriter::type_state::{
+    ConcreteType, kind_char_to_concrete, valuetype_to_concrete_for_legacy,
+};
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind, ValueType};
+use crate::model::{CallTarget, FunctionGraph, Link, LinkArg, OpKind};
 use crate::translator::rtyper::rint::signed_repr;
 use crate::translator::rtyper::rmodel::inputconst;
 
@@ -71,6 +73,9 @@ pub fn resolve_types(graph: &FunctionGraph, raw_alloc_flavor_structs: &HashSet<S
     // outputs always produce a concrete kind, so every populated cell
     // commits a real
     // `FunctionGraph::set_concretetype_of_inline` write.
+    // `rtyper.py setup_block_entry` always takes the inputarg repr from
+    // its annotation (`rclass.py getinstancerepr`); a classless
+    // `SomeInstance` is the root instance, flavor `'gc'`.
     for var in graph.iter_variables() {
         if exceptblock_inputargs.contains(&var) {
             continue;
@@ -616,26 +621,12 @@ fn maybe_seed_concrete_type(dst: &Variable, src_ty: ConcreteType) -> bool {
     }
 }
 
-/// `history.py getkind` of a `Ptr` whose `TO._gckind` is raw is `'int'`.
-/// `rclass.py getgcflavor` / `getinstancerepr` give a raw `InstanceRepr`
-/// for a class with `_alloc_flavor_ = "raw"`, so a `*const` / `&` value
-/// whose `ValueType::Ref(Some(name))` names that struct is `Signed`.
-fn valuetype_to_concrete_for_legacy(
-    vt: &ValueType,
-    raw_alloc_flavor_structs: &HashSet<String>,
-) -> ConcreteType {
-    if let ValueType::Ref(Some(name)) = vt
-        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
-    {
-        return ConcreteType::Signed;
-    }
-    valuetype_to_concrete(vt)
-}
-
 /// A FieldRead of a raw pointer is often `Ref(None)`; the following
 /// `__cast_instance_intrinsic` carries `Ref(Some(intern_key))`.
-/// `history.py getkind` of that raw `Ptr` is `'int'`, so the source
-/// shares the Signed bank with the cast result (`rclass.py getgcflavor`).
+/// `history.py getkind` of that raw `Ptr` is `'int'`. An untyped
+/// source shares the dest bank. A GC source (`*const ()` from
+/// `w_code_get_ptr`) stays Ref: `rewrite_op_direct_call` emits
+/// `cast_ptr_to_int` for that crossing (`lltype.py`).
 fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<String>) {
     let OpKind::Call {
         target,
@@ -658,11 +649,8 @@ fn seed_raw_ptr_cast_source(kind: &OpKind, raw_alloc_flavor_structs: &HashSet<St
     let Some(src) = args.first().and_then(LinkArg::as_variable) else {
         return;
     };
-    match FunctionGraph::concretetype_of(src) {
-        ConcreteType::GcRef | ConcreteType::Unknown => {
-            FunctionGraph::set_concretetype_of_inline(src, ConcreteType::Signed);
-        }
-        _ => {}
+    if FunctionGraph::concretetype_of(src) == ConcreteType::Unknown {
+        FunctionGraph::set_concretetype_of_inline(src, ConcreteType::Signed);
     }
 }
 
@@ -792,10 +780,12 @@ fn infer_concrete_from_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::annotator::model::{SomeInstance, SomeValue};
     use crate::model::{
-        ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
+        CallTarget, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, ValueType, exception_exitcase,
     };
     use crate::translator::rtyper::legacy_annotator as annotate;
+    use std::rc::Rc;
 
     #[test]
     fn resolves_int_types() {
@@ -851,6 +841,54 @@ mod tests {
             FunctionGraph::concretetype_of(&phi_var),
             ConcreteType::Signed
         );
+    }
+
+    #[test]
+    fn instance_phi_resolves_from_classdef_flavor() {
+        use crate::annotator::classdesc::ClassDef;
+
+        fn build(name: &str) -> (FunctionGraph, crate::flowspace::model::Variable) {
+            let mut graph = FunctionGraph::new(name);
+            let entry = graph.startblock;
+            let call_var = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::function_path(["frame", "code"]),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some("CodeObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            let (target, phi_args) = graph.create_block_with_arg_vars(1);
+            let phi_var = phi_args[0].clone();
+            graph.set_goto(entry, target, vec![call_var.clone()]);
+            graph.set_return(target, Some(phi_var.clone()));
+            (graph, phi_var)
+        }
+
+        let raw = HashSet::from(["bytecode::CodeObject".to_string()]);
+        let (graph, phi) = build("classed_raw_phi");
+        let classdef = ClassDef::new_standalone("bytecode::CodeObject", None);
+        let classed = Rc::new(SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            Default::default(),
+        )));
+        *phi.annotation.borrow_mut() = Some(classed);
+        resolve_types(&graph, &raw);
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::Signed);
+
+        let (graph, phi) = build("classless_phi");
+        let classless = Rc::new(SomeValue::Instance(SomeInstance::new(
+            None,
+            false,
+            Default::default(),
+        )));
+        *phi.annotation.borrow_mut() = Some(classless);
+        resolve_types(&graph, &raw);
+        assert_eq!(FunctionGraph::concretetype_of(&phi), ConcreteType::GcRef);
     }
 
     #[test]

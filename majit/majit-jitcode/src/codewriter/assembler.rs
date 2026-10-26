@@ -352,6 +352,15 @@ impl Assembler {
             .map(|(_, name)| name.as_str())
     }
 
+    /// The address [`Self::intern_static_ref_addrs`] recorded for `name`.
+    /// Duplicate names keep the first address.
+    pub fn static_ref_addr_by_name(&self, name: &str) -> Option<i64> {
+        self.static_ref_by_addr
+            .iter()
+            .find(|(_, existing)| existing == name)
+            .map(|(addr, _)| *addr)
+    }
+
     /// Wire spelling of a `new_with_vtable` type word.
     ///
     /// `Some((sentinel, name))` when `addr` was recorded by

@@ -90,6 +90,10 @@ pub(crate) fn apply_from_flowspace_constants(
 /// = Bool` lifts to LL `Signed` for the codewriter; the legacy resolver
 /// followed the same collapse and the post-jtransform projection
 /// matches it.
+///
+/// A one-word `Ref(Some(name))` whose `name` is harvested `_alloc_flavor_
+/// = "raw"` is `Signed` at [`valuetype_to_concrete_for_legacy`]:
+/// `history.getkind` of that raw `Ptr` is `'int'` (`rclass.py getgcflavor`).
 pub(crate) fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
     match vt {
         // `Unsigned` shares the `Signed` ConcreteType — the codewriter
@@ -106,6 +110,22 @@ pub(crate) fn valuetype_to_concrete(vt: &ValueType) -> ConcreteType {
         | ValueType::UInt128
         | ValueType::SingleFloat => ConcreteType::Unknown,
     }
+}
+
+/// `history.py getkind` of a `Ptr` whose `TO._gckind` is raw is `'int'`.
+/// `rclass.py getgcflavor` / `getinstancerepr` give a raw `InstanceRepr`
+/// for a class with `_alloc_flavor_ = "raw"`, so a `*const` / `&` value
+/// whose `ValueType::Ref(Some(name))` names that struct is `Signed`.
+pub(crate) fn valuetype_to_concrete_for_legacy(
+    vt: &ValueType,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> ConcreteType {
+    if let ValueType::Ref(Some(name)) = vt
+        && crate::front::llbc_hints::alloc_flavor_raw_contains(raw_alloc_flavor_structs, name)
+    {
+        return ConcreteType::Signed;
+    }
+    valuetype_to_concrete(vt)
 }
 
 /// `result_kind: char` → `ConcreteType` projection used by jtransform
@@ -134,7 +154,17 @@ fn concrete_if_known(concrete: ConcreteType) -> Option<ConcreteType> {
 /// kinds because the rewriter declares them at lowering time, so this
 /// projection wins over `original` operand inferences in
 /// [`merge_synth_kinds`]'s precedence chain.
-pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<ConcreteType> {
+///
+/// `raw_alloc_flavor_structs` is the harvested `_alloc_flavor_ = "raw"`
+/// set: a `Ref(Some(name))` in that set is `Signed` (`history.getkind`
+/// of the raw `Ptr`), matching [`valuetype_to_concrete_for_legacy`]
+/// and `Transformer::flavor_raw_ref_is_int_banked`. A flavor-blind
+/// `valuetype_to_concrete` overlay would restamp that cell `GcRef` and
+/// freeze an `int_guard_value` against a Ref register.
+pub(crate) fn authoritative_result_type_from_op(
+    kind: &OpKind,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> Option<ConcreteType> {
     match kind {
         OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } => Some(ConcreteType::Signed),
         OpKind::ConstUInt(_) => Some(ConcreteType::Signed),
@@ -145,9 +175,15 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
         OpKind::ConstSymbolic { .. } => Some(ConcreteType::Signed),
         OpKind::ConstFloat(_) => Some(ConcreteType::Float),
         OpKind::ConstStr(_) | OpKind::ConstInternedStr(_) => Some(ConcreteType::GcRef),
-        OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete(ty)),
+        OpKind::Input { ty, .. } => concrete_if_known(valuetype_to_concrete_for_legacy(
+            ty,
+            raw_alloc_flavor_structs,
+        )),
         OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
-            concrete_if_known(valuetype_to_concrete(ty))
+            concrete_if_known(valuetype_to_concrete_for_legacy(
+                ty,
+                raw_alloc_flavor_structs,
+            ))
         }
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
@@ -155,12 +191,18 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
         // `raw_load_i/f` answers the element kind its descr names, the
         // same projection the GC array reads use.
         | OpKind::RawLoad { item_ty, .. } => {
-            concrete_if_known(valuetype_to_concrete(item_ty))
+            concrete_if_known(valuetype_to_concrete_for_legacy(
+                item_ty,
+                raw_alloc_flavor_structs,
+            ))
         }
         OpKind::Call { result_ty, .. }
         | OpKind::IndirectCall { result_ty, .. }
         | OpKind::BinOp { result_ty, .. }
-        | OpKind::UnaryOp { result_ty, .. } => concrete_if_known(valuetype_to_concrete(result_ty)),
+        | OpKind::UnaryOp { result_ty, .. } => concrete_if_known(valuetype_to_concrete_for_legacy(
+            result_ty,
+            raw_alloc_flavor_structs,
+        )),
         OpKind::CallElidable { result_kind, .. }
         | OpKind::CallResidual { result_kind, .. }
         | OpKind::CallMayForce { result_kind, .. }
@@ -186,14 +228,19 @@ pub(crate) fn authoritative_result_type_from_op(kind: &OpKind) -> Option<Concret
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Variable, ConcreteType> {
+pub(crate) fn authoritative_result_types(
+    graph: &FunctionGraph,
+    raw_alloc_flavor_structs: &HashSet<String>,
+) -> HashMap<Variable, ConcreteType> {
     let mut result = HashMap::new();
     for block in &graph.blocks {
         for op in &block.operations {
             let Some(var) = op.result.as_ref() else {
                 continue;
             };
-            if let Some(concrete) = authoritative_result_type_from_op(&op.kind) {
+            if let Some(concrete) =
+                authoritative_result_type_from_op(&op.kind, raw_alloc_flavor_structs)
+            {
                 result.insert(var.clone(), concrete);
             }
         }
@@ -1844,15 +1891,40 @@ mod tests {
             array_itemsize: 8,
             array_is_signed: false,
         };
+        let empty = HashSet::new();
         assert_eq!(
-            authoritative_result_type_from_op(&arraylen),
+            authoritative_result_type_from_op(&arraylen, &empty),
             Some(ConcreteType::Signed),
             "arraylen_gc/rd>i returns a length, never the array"
         );
         assert_eq!(
-            authoritative_result_type_from_op(&vable),
+            authoritative_result_type_from_op(&vable, &empty),
             Some(ConcreteType::Signed),
             "arraylen_vable/rdd>i returns a length"
+        );
+    }
+
+    #[test]
+    fn flavor_raw_ref_input_projects_signed() {
+        let _origins = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::from([("CodeObject".to_string(), "bytecode".to_string())]),
+        );
+        let mut raw = HashSet::new();
+        raw.insert("bytecode::CodeObject".to_string());
+        let op = OpKind::Input {
+            name: "code".into(),
+            ty: ValueType::Ref(Some("CodeObject".into())),
+            class_root: Some("CodeObject".into()),
+        };
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &raw),
+            Some(ConcreteType::Signed),
+            "history.getkind of a raw Ptr is int"
+        );
+        assert_eq!(
+            authoritative_result_type_from_op(&op, &HashSet::new()),
+            Some(ConcreteType::GcRef),
+            "without the harvested raw set the front Ref stays GcRef"
         );
     }
 

@@ -5442,11 +5442,13 @@ pub(crate) fn derive_subject_inputcells(
                     bookkeeper.is_some(),
                 );
             }
-            // An `Int` input whose `class_root` names a Raw owner is the
-            // address of that struct (`Ptr` of a raw `Struct`,
-            // `history.getkind`). Fieldless enums are also `Int` and carry
-            // a class root; `raw_struct_ptr_annotation` leaves those as the
-            // integer shell.
+            // An `Int` input whose `class_root` names a storage-raw owner
+            // is the address of that struct (`Ptr` of a raw `Struct`,
+            // `history.getkind`). Seed `SomePtr`. Flavor-raw pointers stay
+            // `Ref` at the front and take the `Ref` arm above
+            // (`rclass.py getgcflavor`). Fieldless enums are also `Int`
+            // and carry a class root; the storage-raw predicate does not
+            // match, so they stay the integer shell.
             if matches!(ty, crate::model::ValueType::Int)
                 && let Some(root) = class_root.as_deref()
                 && let Some(bk) = bookkeeper
