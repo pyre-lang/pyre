@@ -1292,11 +1292,6 @@ impl BlackholeInterpreter {
         self.next_u8()
     }
 
-    #[allow(dead_code)]
-    fn next_u16(&mut self) -> u16 {
-        jitcode::read_u16(&self.jitcode.code, &mut self.position)
-    }
-
     fn peek_u16_at(&self, pos: usize) -> Option<u16> {
         let code = &self.jitcode.code;
         if pos + 1 >= code.len() {
@@ -1365,37 +1360,31 @@ impl BlackholeInterpreter {
     /// bug — a list built against a different register allocation — into a
     /// call made with a zero argument.
     fn _get_list_of_values_i_into(&mut self, values: &mut Vec<i64>) {
-        let length = self.next_u8() as usize;
-        values.clear();
-        values.reserve(length);
-        for _ in 0..length {
-            let index = self.next_reg() as usize;
-            if crate::bh_debug_enabled() {
-                eprintln!("[bh-getlist] i{index} -> {}", self.registers_i[index]);
-            }
-            values.push(self.registers_i[index]);
-        }
+        get_list_of_values_into(
+            &self.jitcode.code,
+            &mut self.position,
+            &self.registers_i,
+            values,
+        );
     }
 
     /// blackhole.py _get_list_of_values(self, code, position, 'R')
     fn _get_list_of_values_r_into(&mut self, values: &mut Vec<i64>) {
-        let length = self.next_u8() as usize;
-        values.clear();
-        values.reserve(length);
-        for _ in 0..length {
-            let index = self.next_reg() as usize;
-            values.push(self.registers_r[index]);
-        }
+        get_list_of_values_into(
+            &self.jitcode.code,
+            &mut self.position,
+            &self.registers_r,
+            values,
+        );
     }
 
     fn _get_list_of_values_f_into(&mut self, values: &mut Vec<i64>) {
-        let length = self.next_u8() as usize;
-        values.clear();
-        values.reserve(length);
-        for _ in 0..length {
-            let index = self.next_reg() as usize;
-            values.push(self.registers_f[index]);
-        }
+        get_list_of_values_into(
+            &self.jitcode.code,
+            &mut self.position,
+            &self.registers_f,
+            values,
+        );
     }
 
     /// blackhole.py `bhimpl_jit_merge_point`. Decodes
@@ -10243,6 +10232,27 @@ fn handler_setinteriorfield_gc_i(
 /// I/F items are `Signed`; R items are `GCREF`.
 type BhArgList = crate::opencoder::FixedSignedList;
 type ListRootGuard = crate::opencoder::ListRootGuard;
+
+/// blackhole.py `@arguments` decode of an `'I'` / `'R'` / `'F'` operand:
+/// `length = ord(code[position])`, then `registers[ord(code[position + i])]`
+/// for each `i`, then `position += length`.
+#[inline]
+fn get_list_of_values_into(
+    code: &[u8],
+    position: &mut usize,
+    registers: &[i64],
+    values: &mut Vec<i64>,
+) {
+    let start = *position + 1;
+    let end = start + code[*position] as usize;
+    values.clear();
+    values.extend(
+        code[start..end]
+            .iter()
+            .map(|&index| registers[index as usize]),
+    );
+    *position = end;
+}
 
 #[cfg(test)]
 fn read_list_from_regs(regs: &[i64], code: &[u8], pos: usize, gc_ptrs: bool) -> (BhArgList, usize) {

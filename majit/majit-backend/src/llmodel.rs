@@ -116,12 +116,13 @@ pub unsafe fn get_int_value_direct(ptr: *const JitFrame, slot: usize) -> isize {
 /// hits this instead of matching [`FailArgSource`] per TAGBOX slot.
 #[inline(always)]
 pub unsafe fn get_int_value_at(deadframe: i64, locs: &[u16], index: usize) -> i64 {
-    let ptr = deadframe as *const JitFrame;
+    let ptr = deadframe as *mut JitFrame;
+    // `ResumeDataDirectReader::bind_deadframe_root` registers the reader's
+    // `deadframe` field, so a collection rewrites it in place; the frame a
+    // guard failure returned carries no `jf_forward` link.
+    debug_assert_eq!(unsafe { JitFrame::resolve(ptr) }, ptr);
     match decode_rd_loc_slot_from_locs(locs, index) {
-        Some(slot) => {
-            let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
-            unsafe { get_int_value_direct(ptr, slot) as i64 }
-        }
+        Some(slot) => unsafe { get_int_value_direct(ptr as *const JitFrame, slot) as i64 },
         None => 0,
     }
 }

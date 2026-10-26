@@ -3866,6 +3866,107 @@ impl ResumeDataLoopMemo {
         Ok(())
     }
 
+    /// `resume.py ResumeDataLoopMemo._number_boxes(self, iter, iterator, numb_state)`.
+    ///
+    /// `get_box` is `SnapshotIterator.get` / `TraceIterator._untag` for one
+    /// tagged snapshot word. Each box is numbered before the next word is
+    /// decoded — the same order `number` walks `vable_array` / `vref_array`
+    /// / `iter_array(snapshot)`.
+    fn _number_boxes_from_tagged<'c, I, F>(
+        &mut self,
+        iterator: I,
+        get_box: &mut F,
+        numb_state: &mut NumberingState,
+        env: &dyn BoxEnv,
+    ) -> Result<(), TagOverflow>
+    where
+        I: IntoIterator<Item = i64>,
+        F: FnMut(i64) -> (SnapshotBox, Option<&'c Operand>),
+    {
+        for item in iterator {
+            let (snapshot_box, cached) = get_box(item);
+            self._number_one(snapshot_box, cached, numb_state, env)?;
+        }
+        Ok(())
+    }
+
+    /// `resume.py ResumeDataLoopMemo.number(self, position, trace, ...)`.
+    ///
+    /// Walks `SnapshotIterator` in place: `vable_array`, `vref_array`, then
+    /// each `framestack` snapshot (`unpack_jitcode_pc` then `iter_array`).
+    /// Does not copy `framestack` / headers / per-frame iterators into
+    /// `SmallVec`s — those copies existed only so `number_sections` could
+    /// be fed closures after a first walk.
+    pub(crate) fn number_from_snapshot_iter<'c, F>(
+        &mut self,
+        snapshot_iter: &crate::opencoder::SnapshotIterator<'_>,
+        mut get_box: F,
+        env: &dyn BoxEnv,
+        minimum_virtualizable_size: i64,
+    ) -> Result<NumberingState, TagOverflow>
+    where
+        F: FnMut(i64) -> (SnapshotBox, Option<&'c Operand>),
+    {
+        // `NumberingState(snapshot_iter.size)` (`resume.py`).
+        let size_hint = snapshot_iter.size.max(0) as usize + 1;
+        let mut writer = majit_ir::resumecode::Writer {
+            current: std::mem::take(&mut self.writer_scratch),
+        };
+        writer.current.clear();
+        writer.current.reserve(size_hint);
+        let mut numb_state = NumberingState {
+            writer,
+            liveboxes: self.take_livebox_map(),
+            num_boxes: 0,
+            num_virtuals: 0,
+        };
+
+        // resume.py number: patch later
+        numb_state.append_int(0); // slot 0: size of resume section
+        numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
+
+        let array_iter = snapshot_iter.iter_vable_array();
+        if minimum_virtualizable_size != -1 {
+            // it's > and not >=, because the virtualizable itself is one entry
+            // in the array too
+            assert!(
+                array_iter.total_length > minimum_virtualizable_size,
+                "vable_array length {} not > minimum_virtualizable_size {}",
+                array_iter.total_length,
+                minimum_virtualizable_size
+            );
+        }
+        numb_state.append_int(array_iter.total_length);
+        self._number_boxes_from_tagged(array_iter, &mut get_box, &mut numb_state, env)?;
+
+        let array_iter = snapshot_iter.iter_vref_array();
+        let n = array_iter.total_length;
+        debug_assert!(n & 1 == 0, "vref_array length must be even");
+        numb_state.append_int(n >> 1);
+        self._number_boxes_from_tagged(array_iter, &mut get_box, &mut numb_state, env)?;
+
+        // resume.py: `for snapshot in snapshot_iter.framestack`. Index so
+        // `unpack_jitcode_pc` / `iter_array` can borrow `snapshot_iter`
+        // after copying the `usize` offset out of `framestack`.
+        for i in 0..snapshot_iter.framestack.len() {
+            let snapshot = snapshot_iter.framestack[i];
+            let (jitcode_index, pc) = snapshot_iter.unpack_jitcode_pc(snapshot);
+            numb_state.append_int(
+                crate::recorder::Trace::decode_jitcode_index(jitcode_index) as i32 as i64,
+            );
+            numb_state.append_int(pc as i32 as i64);
+            self._number_boxes_from_tagged(
+                snapshot_iter.iter_array(snapshot),
+                &mut get_box,
+                &mut numb_state,
+                env,
+            )?;
+        }
+
+        numb_state.patch_current_size(0);
+        Ok(numb_state)
+    }
+
     /// `ResumeDataLoopMemo.number` section order, fed one box at a time.
     ///
     /// `vable_len` / `vref_len` are the array lengths (`vref_len` is the

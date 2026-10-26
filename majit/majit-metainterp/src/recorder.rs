@@ -712,78 +712,44 @@ impl Trace {
             .as_ref()
             .expect("number_byte_snapshot requires TraceRecordBuffer");
         let it = SnapshotIterator::new(&trb._snapshot_data, &trb._snapshot_array_data, offset);
-
-        let vable_len = it.iter_vable_array().total_length;
-        let vref_len = it.iter_vref_array().total_length;
-        // Copy the frame offsets out of `framestack` before calling back into
-        // `it`: the iterator borrow and `iter_array` cannot overlap.
-        let snaps: SmallVec<[usize; 16]> = it.framestack.iter().copied().collect();
-        let mut headers: SmallVec<[(i32, i32, usize); 16]> = SmallVec::new();
-        for &snap in snaps.iter() {
-            let nboxes = it.iter_array(snap).len();
-            let (jc, pc) = it.unpack_jitcode_pc(snap);
-            headers.push((Self::decode_jitcode_index(jc) as i32, pc as i32, nboxes));
+        if majit_gc::diag_p92_enabled() {
+            let vable_len = it.iter_vable_array().total_length;
+            let vref_len = it.iter_vref_array().total_length;
+            let mut headers: SmallVec<[(i32, i32, usize); 16]> = SmallVec::new();
+            for i in 0..it.framestack.len() {
+                let snap = it.framestack[i];
+                let nboxes = it.iter_array(snap).len();
+                let (jc, pc) = it.unpack_jitcode_pc(snap);
+                headers.push((Self::decode_jitcode_index(jc) as i32, pc as i32, nboxes));
+            }
+            if headers.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
+                let arrs: SmallVec<[(usize, i64, i64); 16]> = (0..it.framestack.len())
+                    .map(|i| {
+                        let snap = it.framestack[i];
+                        let arr =
+                            crate::opencoder::varint_only_decode(&trb._snapshot_data, snap, 2);
+                        let n = if arr == 0 {
+                            0
+                        } else {
+                            crate::opencoder::varint_only_decode(
+                                &trb._snapshot_array_data,
+                                arr as usize,
+                                0,
+                            )
+                        };
+                        (snap, arr, n)
+                    })
+                    .collect();
+                eprintln!(
+                    "P92_NUMB_HEADERS resume_pos={resume_pos} headers={headers:?} \
+                     arrs={arrs:?} vable_len={vable_len} vref_len={vref_len}"
+                );
+                crate::opencoder::p92_dump_enc_log();
+            }
         }
-        if majit_gc::diag_p92_enabled() && headers.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-            let arrs: SmallVec<[(usize, i64, i64); 16]> = snaps
-                .iter()
-                .map(|&snap| {
-                    let arr = crate::opencoder::varint_only_decode(&trb._snapshot_data, snap, 2);
-                    let n = if arr == 0 {
-                        0
-                    } else {
-                        crate::opencoder::varint_only_decode(
-                            &trb._snapshot_array_data,
-                            arr as usize,
-                            0,
-                        )
-                    };
-                    (snap, arr, n)
-                })
-                .collect();
-            eprintln!(
-                "P92_NUMB_HEADERS resume_pos={resume_pos} headers={headers:?} \
-                 arrs={arrs:?} vable_len={vable_len} vref_len={vref_len}"
-            );
-            crate::opencoder::p92_dump_enc_log();
-        }
-
-        let mut vable = it.iter_vable_array();
-        let mut vref = it.iter_vref_array();
-        let mut frame_iters: SmallVec<[_; 16]> = SmallVec::new();
-        for &snap in &snaps {
-            frame_iters.push(it.iter_array(snap));
-        }
-        let mut frame_i = 0usize;
-        memo.number_sections(
-            vable_len,
-            || {
-                snapshot_box_from_tagged(
-                    vable.next().expect("vable snapshot box"),
-                    inputargs,
-                    value_slots,
-                    trb,
-                    unique_cache,
-                )
-            },
-            vref_len,
-            || {
-                snapshot_box_from_tagged(
-                    vref.next().expect("vref snapshot box"),
-                    inputargs,
-                    value_slots,
-                    trb,
-                    unique_cache,
-                )
-            },
-            &headers,
-            || {
-                while frame_iters[frame_i].len() == 0 {
-                    frame_i += 1;
-                }
-                let tagged = frame_iters[frame_i].next().expect("frame snapshot box");
-                snapshot_box_from_tagged(tagged, inputargs, value_slots, trb, unique_cache)
-            },
+        memo.number_from_snapshot_iter(
+            &it,
+            |tagged| snapshot_box_from_tagged(tagged, inputargs, value_slots, trb, unique_cache),
             env,
             minimum_virtualizable_size,
         )
