@@ -634,10 +634,12 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
 /// materialized for a `new_array` / `new_array_clear` recorded in this
 /// trace, write the concrete element into it so a later BUILD_LIST /
 /// BUILD_TUPLE residual reads a complete block during the walk. If the
-/// element value (not a ref) or the index has no known concrete, the
-/// block cannot be completed, so revert the array to the no-concrete
-/// sentinel (`Ref(usize::MAX)`): the residual then declines and the void
-/// store aborts, exactly as without materialization.
+/// element value has no known concrete, or the value's bank disagrees
+/// with the block, the block cannot be completed, so revert the array
+/// to the no-concrete sentinel (`Ref(usize::MAX)`): the residual then
+/// declines and the void store aborts, exactly as without materialization.
+/// A `GcArray(Signed)` block stores the `i64` (`setarrayitem_gc_i`).
+/// Scalar items are not GC pointers, so that store is not a write barrier.
 ///
 /// A real heap array store — whose `array` operand is a `GetfieldGcR`
 /// load of a pre-existing container's items block — is left untouched,

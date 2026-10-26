@@ -5286,6 +5286,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         crate::pyframe::PyFrame::clear_references,
     );
 
+    // `signature.py` `find_w_argname` is `@jit.elidable`. `call.py`
+    // `getfunctionptr` publishes the real address so the tracer calls it
+    // and constant-folds the keyword index. Both CallPath spellings, as
+    // for `PyFrame::pop`: `gateway::Signature::find_w_argname` is the
+    // path `_match_keywords` records, and `Signature::find_w_argname`
+    // is the 2-segment `CallPath::for_impl_method` form. A missing entry
+    // leaves `symbolic_fnaddr_for_path`.
+    pa2!(
+        &mut entries,
+        "pyre_interpreter::gateway::Signature::find_w_argname",
+        "pyre_interpreter::Signature::find_w_argname",
+        crate::gateway::Signature::find_w_argname,
+    );
+
     // `stack_underflow_error` deliberately remains unpublished: its `&str`
     // argument is a two-word aggregate with no one-word residual-call ABI.
 

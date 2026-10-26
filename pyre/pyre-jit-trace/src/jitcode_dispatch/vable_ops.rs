@@ -232,6 +232,8 @@ mod frame_replacement_tests {
             parents: vec![InlineParentFrame {
                 jitcode_index: 0,
                 call_jitcode_pc: Some(0),
+                call_pc: Some(0),
+                resume_pc: None,
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
                 resume_coord: ParentResumeCoord::Backxlat(0),
@@ -395,6 +397,8 @@ mod frame_replacement_tests {
             parents: vec![InlineParentFrame {
                 jitcode_index: 0,
                 call_jitcode_pc: Some(0),
+                call_pc: Some(0),
+                resume_pc: None,
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
                 resume_coord: ParentResumeCoord::Backxlat(0),
@@ -1367,33 +1371,61 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // a loop-carried local read after a may-force op in the loop body has no
     // heapcache entry this pass, yet its recording-time concrete is known.
     let shadow_value = if matches!(shadow_value, Value::Void) {
-        let entry = ctx
-            .frame_state
-            .borrow()
-            .callee_shadow
-            .as_ref()
-            .and_then(|shadow| shadow.concrete.get(&index_value).copied())
-            .filter(|entry| entry.frame_reg == code[op.pc + 1] as u16);
-        let slot_opref = ctx
-            .frame_state
-            .borrow()
-            .callee_shadow
-            .as_ref()
-            .and_then(|shadow| shadow.opref.get(&index_value).copied());
-        // Prefer re-resolving the slot's SSA OpRef through the op-table (a
-        // GC-forwarded, rooted value channel) over the raw concrete copy the
-        // shadow holds: `CalleeLocalsShadow.concrete` is not visited by the
-        // trace-ref walker, so a Ref copy dangles if a minor collection moved a
-        // nursery object across the may-force residual. The op-table concrete IS
-        // forwarded. Fall back to the stored copy when the OpRef carries no live
-        // concrete (ints/floats are value copies of immutable payloads and are
-        // always safe). Only consult the OpRef when a frame-matched `concrete`
-        // entry exists, so the per-frame isolation the `frame_reg` filter gives
-        // `concrete` also bounds the OpRef re-resolution.
-        entry
-            .and_then(|_| slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref)))
-            .or_else(|| entry.map(|entry| entry.value))
-            .unwrap_or(Value::Void)
+        let frame_reg = code[op.pc + 1] as u16;
+        let (entry, slot_opref, live_frame) = {
+            let state = ctx.frame_state.borrow();
+            let shadow = state.callee_shadow.as_ref();
+            let entry = shadow
+                .and_then(|shadow| shadow.concrete.get(&index_value).copied())
+                .filter(|entry| entry.frame_reg == frame_reg);
+            let slot_opref = shadow.and_then(|shadow| shadow.opref.get(&index_value).copied());
+            // `do_residual_call` step 3 cleared `fold_frame_reg` after
+            // `materialize_published_callee_locals` or after
+            // `vrefs_after_residual_call` stopped this frame's vref. The
+            // shadow OpRef is still the pre-call value
+            // (`optimize_VIRTUAL_REF_FINISH` forced that virtual before
+            // `direct_call_may_force`); the live array is what the residual
+            // wrote, and this iteration must return that word. The vable
+            // operand has to be this shadow's frame: a read of another
+            // frame must not stamp this level's live slot.
+            let live_frame = shadow.and_then(|shadow| {
+                (shadow.frame_materialized
+                    && shadow.fold_frame_reg == u16::MAX
+                    && shadow.concrete_frame != 0
+                    && shadow.frame_box == vable)
+                    .then_some(shadow.concrete_frame)
+            });
+            (entry, slot_opref, live_frame)
+        };
+        let live = live_frame.and_then(|frame| {
+            let nlocals = active_frame_nlocals(ctx)?;
+            if index_value < 0 || index_value >= nlocals {
+                return None;
+            }
+            let raw = crate::state::concrete_stack_value(frame, index_value as usize)?;
+            if raw.is_null() {
+                return None;
+            }
+            Some(Value::Ref(majit_ir::GcRef(raw as usize)))
+        });
+        if let Some(live) = live {
+            live
+        } else {
+            // Prefer re-resolving the slot's SSA OpRef through the op-table (a
+            // GC-forwarded, rooted value channel) over the raw concrete copy the
+            // shadow holds: `CalleeLocalsShadow.concrete` is not visited by the
+            // trace-ref walker, so a Ref copy dangles if a minor collection moved a
+            // nursery object across the may-force residual. The op-table concrete IS
+            // forwarded. Fall back to the stored copy when the OpRef carries no live
+            // concrete (ints/floats are value copies of immutable payloads and are
+            // always safe). Only consult the OpRef when a frame-matched `concrete`
+            // entry exists, so the per-frame isolation the `frame_reg` filter gives
+            // `concrete` also bounds the OpRef re-resolution.
+            entry
+                .and_then(|_| slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref)))
+                .or_else(|| entry.map(|entry| entry.value))
+                .unwrap_or(Value::Void)
+        }
     } else {
         shadow_value
     };

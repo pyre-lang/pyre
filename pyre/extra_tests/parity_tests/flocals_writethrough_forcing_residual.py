@@ -14,11 +14,43 @@
 holds a boxed copy. ``adopt_residual_locals_writes`` must read the slot back for
 both the concretely called and later inlined recordings. The bound reaches both;
 the ``regresses-under`` arm proves the shape remains live.
+
+``callee_sorted`` is the inlined shape: its local ``x`` is folded, and
+``sorted``'s key writes that local through ``FrameLocalsProxy``. The forcing
+stores are recorded before ``CALL_MAY_FORCE`` (``vrefs_after_residual_call`` /
+``optimize_VIRTUAL_REF_FINISH``), so the compiled loop reloads ``x``.
+
+``callee_helper`` is that fold one frame out. ``helper_write`` is itself
+inlined, so ``sys._getframe(1)`` is the caller whose vref the call forced.
 """
 
 import sys
 
 ROUNDS = 4000
+
+
+def bump_callee_local(v):
+    frame = sys._getframe(1)
+    cur = frame.f_locals["x"]
+    frame.f_locals["x"] = cur + 1000
+    return v
+
+
+def callee_sorted(i):
+    x = i
+    sorted((0,), key=bump_callee_local)
+    return x
+
+
+def helper_write():
+    frame = sys._getframe(1)
+    frame.f_locals["x"] = frame.f_locals["x"] + 1000
+
+
+def callee_helper(i):
+    x = i
+    helper_write()
+    return x
 
 
 def run(rounds):
@@ -34,8 +66,32 @@ def run(rounds):
     return lost
 
 
+def run_inlined(rounds):
+    lost = []
+    for i in range(rounds):
+        got = callee_sorted(i)
+        if got != i + 1000:
+            lost.append((i, got))
+    return lost
+
+
+def run_helper(rounds):
+    lost = []
+    for i in range(rounds):
+        got = callee_helper(i)
+        if got != i + 1000:
+            lost.append((i, got))
+    return lost
+
+
 lost = run(ROUNDS)
 # Report a few, not all of them: a runtime without the write-through loses
 # every iteration, and the whole list buries the runner's output.
 assert not lost, f"{len(lost)} of {ROUNDS}, first: {lost[:4]}"
+
+lost_inlined = run_inlined(ROUNDS)
+assert not lost_inlined, f"inlined {len(lost_inlined)} of {ROUNDS}, first: {lost_inlined[:4]}"
+
+lost_helper = run_helper(ROUNDS)
+assert not lost_helper, f"helper {len(lost_helper)} of {ROUNDS}, first: {lost_helper[:4]}"
 print("OK")

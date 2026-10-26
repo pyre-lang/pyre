@@ -153,6 +153,44 @@ fn saturating_arith_knowntype(result_ty: &crate::model::ValueType) -> Option<&'s
     }
 }
 
+/// `alloc::slice::<Impl>::to_vec` — Rust `<[T]>::to_vec`.
+///
+/// Charon renders every slice impl as `<Impl>`, so every item type shares
+/// one MIR path. `extfunc.py register_external` declares one result
+/// annotation per external; a one-word `Vec<T>` is `RustVecRepr`
+/// (`rrustvec.rs rust_vec_lltype`) and its annotation is
+/// `Bookkeeper::project_rust_vec`. The front stamps that header on the
+/// call result (`front::mir stamp_rust_vec_header`). Insert the item-kind
+/// letter before the leaf, the way [`saturating_arith_registry_key`]
+/// inserts `specialize.py specialize_argtype`'s knowntype, so the MIR
+/// path — and the fnaddr it residualizes — stays the untyped spelling.
+pub(crate) fn is_alloc_slice_to_vec(segments: &[String]) -> bool {
+    matches!(
+        segments,
+        [a, b, c, d] if a == "alloc" && b == "slice" && c == "<Impl>" && d == "to_vec"
+    )
+}
+
+/// Registry key for a one-word `to_vec` result. `None` when `segments`
+/// is not `<[T]>::to_vec`, or when the result lltype is not a
+/// [`crate::translator::rtyper::rrustvec::rust_vec_lltype`] header (the
+/// untyped `GCREF` row stays the fallback).
+pub(crate) fn to_vec_registry_key(
+    segments: &[String],
+    result_concretetype: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+) -> Option<FunctionPathKey> {
+    if !is_alloc_slice_to_vec(segments) {
+        return None;
+    }
+    let kind = crate::translator::rtyper::rrustvec::rust_vec_item_kind(result_concretetype?)?;
+    let n = segments.len();
+    let mut keyed = Vec::with_capacity(n + 1);
+    keyed.extend_from_slice(&segments[..n - 1]);
+    keyed.push(kind.kind_char().to_string());
+    keyed.push(segments[n - 1].clone());
+    Some(FunctionPathKey::from_segments(keyed))
+}
+
 /// Whether `key` identifies one of the residual ABI shims that materialises the
 /// Python exception object carried by an `OperationError`.
 ///

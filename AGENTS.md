@@ -295,6 +295,15 @@ comment at the site citing both sides.
   `parity_tests/run.py` are cached at `<shared>/oracle-cache` (override with
   `PYRE_ORACLE_CACHE`; `PYRE_ORACLE_CACHE=off` disables). `--no-oracle-cache`
   refreshes entries without reading them.
+- A red `cargo test` job cancels the whole run. The
+  `Cancel the run (cargo test failed)` step in `pyre-ci.yml` calls
+  `gh run cancel`. Every other job then concludes `cancelled`, `gh pr checks`
+  lists them as `fail`, and `--log-failed` prints nothing. This is not a
+  manual cancel, and the cancelled legs say nothing about the tree. To find
+  the job that failed, run
+  `gh api repos/<owner>/<repo>/actions/runs/<id>/jobs` and look for a step
+  whose `conclusion` is `failure`. Read that job with
+  `gh run view <id> --log --job <job-id>`. Fix the failure, then push again.
 
 ## Iterate on the core; gate on the product
 

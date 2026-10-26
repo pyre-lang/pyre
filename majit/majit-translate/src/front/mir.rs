@@ -77,7 +77,9 @@
 //!     `Call(SyntheticTransparentCtor)` for later rewrites.
 //!   - `ShallowInitBox` — synthetic `Call(SyntheticTransparentCtor)`.
 //!   - `Repeat` / `Len` / `NullaryOp` — synthetic `Call(__array_repeat
-//!     / __len / __nullary_*)`.
+//!     / __len / __nullary_*)`. `new_array_clear` is produced later by
+//!     `do_fixed_newlist_clear`, after the rtyper, so a `[i64; N]`
+//!     repeat stays the `__array_repeat(fill, count)` call here.
 //!
 //! ### Terminators
 //!   - `Return` → `returnblock`.
@@ -1328,6 +1330,12 @@ impl PackedLocalRow {
         match self.bound.binary_search_by_key(&(slot as u32), |(i, _)| *i) {
             Ok(at) => self.bound[at].1 = var,
             Err(at) => self.bound.insert(at, (slot as u32, var)),
+        }
+    }
+
+    fn unset(&mut self, slot: usize) {
+        if let Ok(at) = self.bound.binary_search_by_key(&(slot as u32), |(i, _)| *i) {
+            self.bound.remove(at);
         }
     }
 }
@@ -3366,9 +3374,11 @@ fn published_struct_field_layout(
 
 /// Type string `Bookkeeper::project_struct_field_type` consumes for a
 /// declared field. A `Vec` of one-word items is a canonical header-pointer
-/// spelling `project_rust_vec` accepts; [`tyref_to_field_layout_string`]
-/// writes `isize`, which annotates as `SomeInteger` and then `len` of the
-/// field raises `'int' has no length`.
+/// spelling `project_rust_vec` accepts. An integer item keeps its own
+/// spelling (`usize` / `u64` versus `isize` / `i64`) so that projector can
+/// set `SomeInteger.unsigned`. [`tyref_to_field_layout_string`] writes
+/// `isize`, which annotates as `SomeInteger` and then `len` of the field
+/// raises `'int' has no length`.
 fn annotation_struct_field_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -3376,7 +3386,11 @@ fn annotation_struct_field_type(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
     match tyref_rust_vec_item_kind(ty, llbc) {
-        Some(majit_ir::rvec::VecItemKind::Int) => "*mut Vec<usize>".to_string(),
+        Some(majit_ir::rvec::VecItemKind::Int) => {
+            let item =
+                tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
+            format!("*mut Vec<{item}>")
+        }
         Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
         None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
@@ -8961,6 +8975,10 @@ struct IndexElemAlias {
     /// `ll_items` (`block`) for the `{ block, len }` wrapper. The write
     /// repeats that FieldRead off the remapped wrapper (`ll_setitem_fast`).
     items_owner: Option<&'static str>,
+    /// Write-only `index_mut`. `ll_setitem_fast` stores the item and does
+    /// not read the old one, so the local's Variable is not an element
+    /// value and `edge_args` does not pass it.
+    no_element: bool,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -9901,6 +9919,10 @@ impl<'a> Lowering<'a> {
         {
             let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
             let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            // `_handle_list_call` reads `args[0].concretetype`
+            // (`jtransform.py` `LIST = deref(args[0].concretetype)`).
+            // A one-word `Vec` parameter is `RustVecRepr.lowleveltype`.
+            stamp_rust_vec_header(&var, &local.ty, llbc);
             // Register a stable name so canonical comparison can spot
             // arg-renames.  Names live on the value via `name_value_var`
             // (mirrors the `parse.rs` arg-binding path).
@@ -10296,6 +10318,12 @@ impl<'a> Lowering<'a> {
                     continue;
                 }
                 let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                // Loop-header inputargs are these variables
+                // (`lower_framestate` Pass 0). `list.getitem` /
+                // `list.setitem` read `args[0].concretetype`.
+                if let Some(local) = body.locals.locals.get(local_idx) {
+                    stamp_rust_vec_header(&var, &local.ty, llbc);
+                }
                 graph.push_inputarg_var(bid, var.clone());
                 block_entry_local_var[row].set(local_idx, var);
             }
@@ -11248,6 +11276,11 @@ impl<'a> Lowering<'a> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
         let row = self.block_id.row(mir_bb);
         self.local_var = self.hydrate_words(self.block_entry_local_var[row].unpack());
+        // Framestate scrubs a write-only `index_mut` place (`ll_setitem_fast`
+        // has no loaded item), so the entry row hydrates it as `None`.
+        // Bind a fresh Variable with no element value so `mem_slot` still
+        // answers `MemSlot::Index`.
+        self.bind_unvalued_index_places();
         self.positional_aggregate_locals =
             self.block_entry_positional_aggregate_locals[row].clone();
         self.string_byte_view_locals = self.block_entry_string_byte_view_locals[row]
@@ -11885,6 +11918,7 @@ impl<'a> Lowering<'a> {
                 rust_vec: None,
                 list_root: None,
                 items_owner: None,
+                no_element: false,
             },
         );
         self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -15636,20 +15670,21 @@ impl<'a> Lowering<'a> {
                 self.mark_place_address_of(mir_bb, projection, before, &v);
                 Ok((None, v))
             }
-            // `Repeat(elem, ty, count)` — `[v; N]` literal. The decodable
-            // shape follows upstream `transform.py:36-50` and
-            // `rlist.py`: `newlist(fill)` followed by
-            // `mul(list, count)`, which the transform pass collapses to
-            // `alloc_and_set(count, fill)`.
+            // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
+            // decodable shape follows upstream `transform.py` and
+            // `rlist.py`: `newlist(fill)` followed by `mul(list, count)`,
+            // which the transform pass collapses to `alloc_and_set`.
+            // `do_fixed_newlist_clear`'s `new_array_clear` is that later
+            // pass, so the repeat reaches the rtyper as
+            // `__array_repeat(fill, count)`. The transparent `Array` ctor
+            // is not equivalent: `Repeat` carries one fill value and a
+            // count, not per-slot `__pos_N` writes.
             //
-            // `__array_repeat` remains deliberately unregistered for the
-            // fallback shape when Charon supplies a const-generic reference
-            // that cannot be decoded. In that case the old 1-arg call is
-            // preserved verbatim and the graph follows its existing legacy
-            // walker path. The transparent `Array` ctor is not equivalent:
-            // `Repeat` carries one fill value and a count, not per-slot
-            // `__pos_N` writes.
-            Rvalue::Repeat(elem, _ty, count, _) => {
+            // The result is the list object (`newlist` / `OpKind::NewList`
+            // is `ValueType::Ref`). `rtype_alloc_and_set` concretetypes
+            // that pointer `GcRef`. Declaring `Int` makes the legacy
+            // walker `Signed` on the same variable.
+            Rvalue::Repeat(elem, _elem_ty, count, _) => {
                 let arg = self.resolve_operand(mir_bb, elem)?;
                 let res = self
                     .graph
@@ -28088,12 +28123,24 @@ impl<'a> Lowering<'a> {
                                 .then(|| "PyObject".to_string())
                         })
                     };
+                    // `ll_setitem_fast` stores the item and does not read the
+                    // old one. A write-only `index_mut` emits no `list.getitem`
+                    // / `ArrayRead` and no element constant. The alias still
+                    // names the base and index for the later
+                    // `ll_vec_setitem_fast`. The fresh Variable keeps
+                    // `local_var` bound so `mem_slot` answers `MemSlot::Index`;
+                    // it is not the loaded item, and `edge_args` does not pass
+                    // it.
+                    let write_only = rust_vec_header.is_some()
+                        && add_dest_used_only_as_single_write_deref(
+                            self.llbc, self.body, dest_local,
+                        );
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let element_is_pointer_word = string_index_owner.is_none()
                         && self.var_tracks_pointer_word_array(&args[0]);
-                    if element_is_pointer_word || element_is_niche_option {
+                    if !write_only && (element_is_pointer_word || element_is_niche_option) {
                         self.pointer_word_vars.insert(res.clone());
                     }
                     let item_ty = if element_is_pointer_word || element_is_niche_option {
@@ -28122,36 +28169,38 @@ impl<'a> Lowering<'a> {
                         } else {
                             (array_base, item_ty, array_type_id)
                         };
-                    let read = match rust_vec_header {
-                        Some(kind) => OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: rust_vec_helper_segments(
-                                    majit_ir::rvec::VecOp::GetItem,
-                                    kind,
-                                ),
-                                fun_decl_id: None,
+                    if !write_only {
+                        let read = match rust_vec_header {
+                            Some(kind) => OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: rust_vec_helper_segments(
+                                        majit_ir::rvec::VecOp::GetItem,
+                                        kind,
+                                    ),
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![
+                                    array_base.clone(),
+                                    args[1].clone(),
+                                ]),
+                                result_ty: item_ty.clone(),
                             },
-                            args: crate::model::call_args(vec![
-                                array_base.clone(),
-                                args[1].clone(),
-                            ]),
-                            result_ty: item_ty.clone(),
-                        },
-                        None => OpKind::ArrayRead {
-                            base: array_base.clone(),
-                            index: args[1].clone(),
-                            item_ty: item_ty.clone(),
-                            array_type_id: array_type_id.clone(),
-                            nolength: crate::front::typestr::nolength_from_array_type_id(
-                                array_type_id.as_deref(),
-                            ),
-                            pure: false,
-                        },
-                    };
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: read,
-                    });
+                            None => OpKind::ArrayRead {
+                                base: array_base.clone(),
+                                index: args[1].clone(),
+                                item_ty: item_ty.clone(),
+                                array_type_id: array_type_id.clone(),
+                                nolength: crate::front::typestr::nolength_from_array_type_id(
+                                    array_type_id.as_deref(),
+                                ),
+                                pure: false,
+                            },
+                        };
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: read,
+                        });
+                    }
                     self.index_elem_alias.insert(
                         dest_local,
                         IndexElemAlias {
@@ -28164,13 +28213,17 @@ impl<'a> Lowering<'a> {
                             rust_vec: rust_vec_header,
                             list_root: None,
                             items_owner: string_index_owner,
+                            no_element: write_only,
                         },
                     );
                     // This intercept returns before the generic call-result
                     // tail below.  Repeat its registered-pointee narrow so
                     // `rlist.py:recast` exposes the concrete W_Root-equivalent
                     // repr after the GCREF-backed getarrayitem.
-                    if let Some(root) = item_narrow_root {
+                    if write_only {
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        self.drop_unvalued_index_local(dest_local);
+                    } else if let Some(root) = item_narrow_root {
                         let narrowed = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -28393,6 +28446,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root: None,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -28453,6 +28507,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -28513,6 +28568,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root: None,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -28586,6 +28642,7 @@ impl<'a> Lowering<'a> {
                             rust_vec: None,
                             list_root: None,
                             items_owner: None,
+                            no_element: false,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -30179,7 +30236,7 @@ impl<'a> Lowering<'a> {
                             }
                         } else {
                             OpKind::ArrayLen {
-                                base: args[0].clone(),
+                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
                                 nolength: false,
                             }
@@ -30263,7 +30320,7 @@ impl<'a> Lowering<'a> {
                             }
                         } else {
                             OpKind::ArrayLen {
-                                base: args[0].clone(),
+                                base: self.object_slice_arraylen_base(bb_id, &reg, args[0].clone()),
                                 array_type_id: self.slice_object_array_type_id(&reg),
                                 nolength: false,
                             }
@@ -30418,6 +30475,11 @@ impl<'a> Lowering<'a> {
                 // list annotation.  Same routing
                 // [`is_concrete_iter_constructor`] gives the container
                 // `iter`.
+                // `IntArray::len` / `FloatArray::len` are the same call:
+                // the receiver is the `{ block, len }` struct, so `__len`
+                // becomes `getattr("__len__")`. [`Self::is_container_len`]
+                // emits the `FieldRead` of `len` (`typed_array_len_owner`)
+                // instead of entering that body.
                 if args.len() == 1 && self.is_container_len(&reg) {
                     let res = self
                         .graph
@@ -32945,6 +33007,15 @@ impl<'a> Lowering<'a> {
             result_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
                 TO: PtrTarget::Struct(block),
             }))));
+        }
+        // `newlist_clear` forks on `op.result.concretetype`
+        // (`jtransform.py` `LIST = deref(op.result.concretetype)`).
+        // A `Vec` result is `RustVecRepr.lowleveltype`
+        // (`rrustvec.rs rust_vec_lltype`), kind `int`. Without that
+        // pointer the arm emits GC `new_array_clear`, whose result
+        // bank is `ref`.
+        if result_var.concretetype().is_none() {
+            stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
@@ -40612,14 +40683,17 @@ impl<'a> Lowering<'a> {
     /// The length-prefixed containers `IntArray` / `FloatArray`
     /// (`pyre-object/src/int_array.rs` / `float_array.rs`) expose the same
     /// inherent `len()` whose body reads the nested LIST `length` word
-    /// (`rlist.py` `("length", Signed)`).  Entering the body dead-ends at
-    /// `AtomicUsize::load`; recognising the call emits a `FieldRead` of
-    /// `len` (`jtransform.py` `_handle_list_call` `list.int_len`).
+    /// (`rlist.py` `("length", Signed)`).  The receiver is the
+    /// `{ block, len }` struct, not a `SomeList`, so the read is that
+    /// field ([`Self::typed_array_len_owner`]), not `ListRepr.rtype_len`.
+    /// Entering the body dead-ends at `AtomicUsize::load`; recognising
+    /// the call emits a `FieldRead` of `len`
+    /// (`jtransform.py` `_handle_list_call` `list.int_len`).
     ///
     /// `FixedObjectArray::len` is *not* here: it goes to [`OpKind::ArrayLen`]
     /// via [`Self::is_object_array_len`], because its receiver is the
     /// virtualizable array and a `__len` call would pass that array as a
-    /// call argument. `Vec::len` is included: `rlist.ll_length` reads
+    /// call argument. `Vec::len` stays here: `rlist.ll_length` reads
     /// `l.length`, and a field named `"len"` is not that attribute.
     ///
     /// The FunDecl path is the container (`alloc::vec::<Impl>::len` /
@@ -40844,6 +40918,24 @@ impl<'a> Lowering<'a> {
     /// ARRAY identity of a `<[T]>::len` / `is_empty` receiver whose `T` is
     /// an object pointer. Every other slice keeps the identity-less length
     /// read. The identity string itself comes from [`slice_array_type_id`].
+    /// `<[PyObject]>::len` / `is_empty` sees the list, so `len` is
+    /// `AbstractListRepr.rtype_len`. A classdef-less receiver takes
+    /// `len_SomeInstance`, which looks up `__len__`.
+    fn object_slice_arraylen_base(
+        &mut self,
+        bb_id: BlockId,
+        reg: &RegularCall,
+        base: Variable,
+    ) -> Variable {
+        if self.slice_object_array_type_id(reg).is_none() {
+            return base;
+        }
+        self.narrow_value_to_instance_root(bb_id, crate::model::LinkArg::Value(base), "[PyObject]")
+            .as_variable()
+            .expect("an object-pointer slice base stays a Variable")
+            .clone()
+    }
+
     fn slice_object_array_type_id(&self, reg: &RegularCall) -> Option<String> {
         self.slice_swap_elem_tyref(reg)
             .is_some_and(|ty| output_type_is_objectptr(&ty, self.llbc))
@@ -48645,7 +48737,88 @@ impl<'a> Lowering<'a> {
         Ok(())
     }
 
+    /// A write-only `index_mut` place has no loaded element
+    /// (`ll_setitem_fast`). After framestate scrubs the undefined
+    /// Variable, the block entry hydrates that local as `None`. Bind a
+    /// fresh Variable with no element value so `mem_slot` still answers
+    /// `MemSlot::Index`.
+    fn bind_unvalued_index_places(&mut self) {
+        let locals: Vec<usize> = self
+            .index_elem_alias
+            .iter()
+            .filter(|(_, alias)| alias.no_element)
+            .map(|(local, _)| *local)
+            .collect();
+        for local in locals {
+            if self
+                .local_var
+                .get(local)
+                .and_then(|slot| slot.as_ref())
+                .is_some()
+            {
+                continue;
+            }
+            if local >= self.local_var.len() {
+                continue;
+            }
+            let place = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.local_var[local] = Some(LocalValue::One(place));
+        }
+    }
+
+    /// Drop `local` from not-yet-lowered block inputargs.
+    ///
+    /// `ll_setitem_fast` does not produce an element value, so `edge_args`
+    /// must not pass one. A block that already uses the construction-time
+    /// inputarg keeps it: removing the defining inputarg would leave that
+    /// use undefined.
+    fn drop_unvalued_index_local(&mut self, local: usize) {
+        let targets: Vec<(usize, BlockId)> = self.block_id.iter_lowered().collect();
+        for (mir_bb, bid) in targets {
+            if mir_bb == 0 {
+                continue;
+            }
+            let row = self.block_id.row(mir_bb);
+            let (old_len, pos) = {
+                let Some(live) = self.block_live_in.get(row) else {
+                    continue;
+                };
+                if !live.contains(local) {
+                    continue;
+                }
+                let Some(pos) = live.iter().position(|idx| idx == local) else {
+                    continue;
+                };
+                (live.count(), pos)
+            };
+            let untouched = {
+                let block = self.graph.block(bid);
+                block.operations.is_empty()
+                    && block.exits.is_empty()
+                    && block.exitswitch.is_none()
+                    && block.inputargs.len() == old_len
+            };
+            if !untouched {
+                continue;
+            }
+            self.block_live_in[row].remove(local);
+            self.block_entry_local_var[row].unset(local);
+            self.graph.block_mut(bid).inputargs.remove(pos);
+            for pred in &mut self.graph.blocks {
+                for link in &mut pred.exits {
+                    if link.target == bid && link.args.len() == old_len {
+                        link.args.remove(pos);
+                    }
+                }
+            }
+        }
+    }
+
     fn edge_args(&mut self, from_bb: usize, target_bb: usize) -> Result<Vec<Variable>, LowerError> {
+        // A place `drop_unvalued_index_local` removed from `block_live_in`
+        // is absent here. `ll_setitem_fast` has no loaded item to pass.
         let local_indices = self.target_input_locals(target_bb)?;
         let mut converted_lens: Vec<(usize, Variable)> = Vec::new();
         let mut args = Vec::with_capacity(local_indices.len());
@@ -52870,6 +53043,15 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
 fn add_dest_used_only_as_single_deref(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
     let census = dest_deref_census(llbc, body, dest);
     census.defs == 1 && census.read_derefs + census.write_derefs == 1 && census.other == 0
+}
+
+/// `*dest = v` with no load of `*dest` and no escaping use.
+///
+/// `ll_setitem_fast` does not read the old item. The `index_mut` arm
+/// otherwise emits that read (`list.getitem`) before the store.
+fn add_dest_used_only_as_single_write_deref(llbc: &Llbc, body: &Unstructured, dest: usize) -> bool {
+    let census = dest_deref_census(llbc, body, dest);
+    census.defs == 1 && census.write_derefs == 1 && census.read_derefs == 0 && census.other == 0
 }
 
 /// `*p` read of an `.add` result, with no store and no escaping use.
@@ -68597,6 +68779,14 @@ fn dont_look_inside_return_class_root(
 /// `List ∪ Instance` is a phi `pairtype` never builds. The spelling is the
 /// same string `published_struct_field_layout` stores, so the stub and the
 /// field project one list.
+///
+/// A one-word `Vec<T>` is the raw `{ptr, len, cap}` header (`RustVecRepr`).
+/// [`tyref_to_field_layout_string`] spells that word `isize`, which this
+/// filter drops, so the `dont_look_inside` trampoline of `look_inside_iff`
+/// (`rlib/jit.py`) would annotate as `SomeInteger` while `func(...)`
+/// annotates as `SomeRustVec`. [`annotation_struct_field_type`] is the
+/// spelling `Bookkeeper::project_rust_vec` reads. The FUNC.RESULT token
+/// stays `i64`: `history.getkind` of the header is `int`.
 fn dont_look_inside_return_container_root(
     output: &TyRef,
     llbc: &Llbc,
@@ -78217,7 +78407,14 @@ fn rust_vec_header_allocated_in_graph_rec(
         } else if saw_alloc {
             Some(true)
         } else {
-            Some(false)
+            // Every incoming arm is a cycle (`None`). Caching `Some(false)`
+            // here makes the header that also carries `ll_vec_alloc_and_set`
+            // look unowned, so the drop never emits `free`. A loop-carried
+            // copy is that same raw pointer (`Block.inputargs`):
+            // `rtype_free_non_gc_object` emits `free` for the malloc, and
+            // `rewrite_op_free` turns flavor `raw` into `raw_free`. The
+            // cycle stays `None` (and is not cached) so the alloc arm decides.
+            None
         }
     };
 
@@ -81532,11 +81729,50 @@ fn tyref_ptr_pointee_is_vec(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|td| td.item_meta.name_path() == "alloc::vec::Vec")
 }
 
-/// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
-/// behind a borrow, or behind a raw pointer, all of which the translator
-/// represents as the address of the raw `{ptr, len, cap}` header
-/// (`RustVecRepr`).  `None` for every other type.
-fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+/// `Ptr(Struct(raw) "RustVec")` for `kind` (`rrustvec.rs rust_vec_lltype`).
+///
+/// An integer item's lltype follows the Rust spelling: `usize` / `u64` are
+/// `Unsigned` (`rint.py` `unsigned_repr`), `isize` / `i64` stay `Signed`.
+/// The register kind stays `Int` either way. No spelling keeps `Signed`.
+fn rust_vec_header_lltype(
+    kind: majit_ir::rvec::VecItemKind,
+    item_spelling: Option<&str>,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+    let item = match kind {
+        majit_ir::rvec::VecItemKind::Int => match item_spelling {
+            Some("usize" | "u64") => LowLevelType::Unsigned,
+            _ => LowLevelType::Signed,
+        },
+        majit_ir::rvec::VecItemKind::Float => LowLevelType::Float,
+        majit_ir::rvec::VecItemKind::Ref => {
+            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+        }
+    };
+    rust_vec_lltype(&item)
+}
+
+/// Stamp `rust_vec_lltype` on `var` when `ty` is a one-word `Vec`.
+///
+/// The lowering's `setconcretetype`: `tyref_rust_vec_item_kind` reads the
+/// LLBC `Vec` and the lltype is `RustVecRepr.lowleveltype`. The rtyper
+/// overwrites it from the annotation when the graph is specialized. A
+/// graph that skips specialization keeps this stamp.
+fn stamp_rust_vec_header(var: &crate::flowspace::model::Variable, ty: &TyRef, llbc: &Llbc) {
+    let Some(kind) = tyref_rust_vec_item_kind(ty, llbc) else {
+        return;
+    };
+    if var.concretetype().is_some() {
+        return;
+    }
+    let spelling = tyref_rust_vec_item_spelling(ty, llbc);
+    var.set_concretetype(Some(rust_vec_header_lltype(kind, spelling.as_deref())));
+}
+
+/// AST spelling of a one-word `alloc::vec::Vec<T>`, by value, behind a
+/// borrow, or behind a raw pointer. `None` when the items are not one word.
+fn tyref_one_word_vec_ast(ty: &TyRef, llbc: &Llbc) -> Option<String> {
     let mut node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     if let Some(pointee) = node
         .get("RawPtr")
@@ -81549,10 +81785,24 @@ fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::V
     if llbc.type_by_id(id)?.item_meta.name_path() != "alloc::vec::Vec" {
         return None;
     }
-    majit_ir::rvec::rust_vec_item_kind_for_spelling(
-        &charon_type_value_to_ast_string(node, llbc, 0),
-        crate::layout::target_word_size(),
-    )
+    let ast = charon_type_value_to_ast_string(node, llbc, 0);
+    majit_ir::rvec::rust_vec_item_kind_for_spelling(&ast, crate::layout::target_word_size())?;
+    Some(ast)
+}
+
+/// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
+/// behind a borrow, or behind a raw pointer, all of which the translator
+/// represents as the address of the raw `{ptr, len, cap}` header
+/// (`RustVecRepr`).  `None` for every other type.
+fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let ast = tyref_one_word_vec_ast(ty, llbc)?;
+    majit_ir::rvec::rust_vec_item_kind_for_spelling(&ast, crate::layout::target_word_size())
+}
+
+/// Item spelling of [`tyref_rust_vec_item_kind`]'s `Vec` (`usize`, `i64`, …).
+fn tyref_rust_vec_item_spelling(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let ast = tyref_one_word_vec_ast(ty, llbc)?;
+    majit_ir::rvec::vec_item_spelling(&ast).map(|item| item.trim().to_string())
 }
 
 /// `Vec<PyObjectRef>` / `Vec<*mut PyObject>`, by value or behind one
@@ -91681,6 +91931,134 @@ mod tests {
         assert!(
             !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
             "mixed phi must not free: {leaves:?}"
+        );
+    }
+
+    /// A loop-carried copy of an in-graph `ll_vec_alloc_and_set` header is
+    /// the same raw pointer. The latch is visited before the alloc arm, so
+    /// its phi is a cycle; that cycle must not count as a foreign owner.
+    /// `rtype_free_non_gc_object` still emits `free`, and `rewrite_op_free`
+    /// rewrites flavor `raw` to `raw_free`.
+    #[test]
+    fn rust_vec_drop_frees_loop_carried_header() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("loop_vec_drop");
+        // Latch first so the header's incoming walk sees the back edge
+        // before the allocating predecessor.
+        let latch_bb = graph.create_block();
+        let alloc_bb = graph.create_block();
+        let header_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+
+        let carried = Variable::new();
+        graph.block_mut(header_bb).inputargs = vec![carried.clone()];
+        let latch_h = Variable::new();
+        graph.block_mut(latch_bb).inputargs = vec![latch_h.clone()];
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+        graph.block_mut(latch_bb).exits = vec![
+            Link::from_variables(&graph, vec![latch_h.clone()], header_bb, None)
+                .with_prevblock(latch_bb),
+        ];
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], header_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(header_bb).exits = vec![
+            Link::from_variables(&graph, vec![carried.clone()], latch_bb, None)
+                .with_prevblock(header_bb),
+            Link::from_variables(&graph, vec![carried.clone()], drop_bb, None)
+                .with_prevblock(header_bb),
+        ];
+
+        assert!(rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(rust_vec_header_allocated_in_graph(&graph, &latch_h));
+        assert!(emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            leaves.iter().any(|leaf| leaf == "ll_vec_free_r"),
+            "loop-carried in-graph header must be freed: {leaves:?}"
+        );
+    }
+
+    /// A loop phi that also merges a call result is not wholly this
+    /// graph's malloc. `rewrite_op_free` must not run on that header.
+    #[test]
+    fn rust_vec_drop_does_not_free_loop_mixed_with_call_result() {
+        use super::{emit_rust_vec_drop_if_allocated, rust_vec_header_allocated_in_graph};
+        use crate::model::Link;
+        use majit_ir::rvec::VecItemKind;
+
+        let mut graph = FunctionGraph::new("loop_mixed_vec_drop");
+        let latch_bb = graph.create_block();
+        let alloc_bb = graph.create_block();
+        let call_bb = graph.create_block();
+        let header_bb = graph.create_block();
+        let drop_bb = graph.create_block();
+
+        let allocated = Variable::new();
+        graph
+            .block_mut(alloc_bb)
+            .operations
+            .push(vec_alloc_and_set_r(allocated.clone()));
+        let returned = Variable::new();
+        graph
+            .block_mut(call_bb)
+            .operations
+            .push(vec_call_result(returned.clone(), "returns_vec"));
+
+        let carried = Variable::new();
+        graph.block_mut(header_bb).inputargs = vec![carried.clone()];
+        let latch_h = Variable::new();
+        graph.block_mut(latch_bb).inputargs = vec![latch_h.clone()];
+        let drop_h = Variable::new();
+        graph.block_mut(drop_bb).inputargs = vec![drop_h.clone()];
+
+        graph.block_mut(latch_bb).exits = vec![
+            Link::from_variables(&graph, vec![latch_h.clone()], header_bb, None)
+                .with_prevblock(latch_bb),
+        ];
+        graph.block_mut(alloc_bb).exits = vec![
+            Link::from_variables(&graph, vec![allocated.clone()], header_bb, None)
+                .with_prevblock(alloc_bb),
+        ];
+        graph.block_mut(call_bb).exits = vec![
+            Link::from_variables(&graph, vec![returned.clone()], latch_bb, None)
+                .with_prevblock(call_bb),
+        ];
+        graph.block_mut(header_bb).exits = vec![
+            Link::from_variables(&graph, vec![carried.clone()], latch_bb, None)
+                .with_prevblock(header_bb),
+            Link::from_variables(&graph, vec![carried.clone()], drop_bb, None)
+                .with_prevblock(header_bb),
+        ];
+
+        assert!(!rust_vec_header_allocated_in_graph(&graph, &drop_h));
+        assert!(!emit_rust_vec_drop_if_allocated(
+            &mut graph,
+            drop_bb,
+            &drop_h,
+            VecItemKind::Ref,
+        ));
+        let leaves = graph_call_leaves(&graph);
+        assert!(
+            !leaves.iter().any(|leaf| leaf.starts_with("ll_vec_free")),
+            "loop mixed with a call result must not free: {leaves:?}"
         );
     }
 
@@ -111992,6 +112370,47 @@ mod tests {
         assert_cast_ptr_to_int_then_r_uint(&graph, "&mut Vec as *mut Vec as usize");
     }
 
+    /// `look_inside_iff` (`rlib/jit.py`) emits a `dont_look_inside` trampoline
+    /// that returns the same `Vec` as the original. Lowering records the
+    /// `*mut Vec<…>` container root `project_rust_vec` reads. The `i64`
+    /// FUNC.RESULT token is stamped later by `SemanticFunctionHeader` (`getkind`
+    /// of the raw header is `int`); the marker set is what makes that stamp
+    /// unconditional.
+    #[test]
+    fn look_inside_iff_vec_trampoline_records_rust_vec_root() {
+        let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+        let llbc = Llbc::load(path).expect("load majit-rlib LLBC");
+        let context = super::LowerContext::new(&llbc);
+        let opaque = super::dont_look_inside_set_of(&llbc);
+        for (name, root) in [
+            (
+                "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_r_trampoline",
+                "*mut Vec<*mut u8>",
+            ),
+            (
+                "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_i_trampoline",
+                "*mut Vec<usize>",
+            ),
+            (
+                "majit_rlib::lltypesystem::rvec::ll_vec_alloc_and_set_nonnull_f_trampoline",
+                "*mut Vec<f64>",
+            ),
+        ] {
+            let fd = llbc
+                .iter_local_fns()
+                .find(|fd| fd.item_meta.name_path() == name)
+                .unwrap_or_else(|| panic!("{name} in majit-rlib LLBC"));
+            let policy = super::strip_crate_prefix(name);
+            assert!(
+                opaque.contains(&policy),
+                "{policy} is the dont_look_inside trampoline"
+            );
+            let graph =
+                super::lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+            assert_eq!(graph.return_container_root.as_deref(), Some(root), "{name}");
+        }
+    }
+
     /// `*mut u8 as usize` is the type-erased address (`tyref_is_raw_byte_ptr`);
     /// it is not a Vec header and must not take the Int-banked pointer arm's
     /// predicate. The Ref → Unsigned sequence is unchanged.
@@ -127603,6 +128022,272 @@ mod tests {
         ]));
     }
 
+    /// `policy.py` `look_inside_graph` is false for `dont_look_inside` and
+    /// `elidable`, so the call is `jtransform.py` `handle_residual_call`
+    /// through `helper_return_to_i64` / `nullable_pointer_option`: one
+    /// pointer word. The declaration must be in the CallRegistry or the
+    /// caller's lift records "not registered in CallRegistry". Rust's own
+    /// `Option<*mut T>` is still two words (`ty_is_raw_address`), so the
+    /// `unsafe` collector keeps declining it, and a scalar pointee or a
+    /// `Vec` stays out of both.
+    #[test]
+    fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|segment| serde_json::json!({"Ident": [segment, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": false},
+                "is_local": true
+            })
+        };
+        let generics = || {
+            serde_json::json!({
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            })
+        };
+        let adt = |id: u64, args: Vec<serde_json::Value>| {
+            let mut g = generics();
+            g["types"] = serde_json::Value::Array(args);
+            serde_json::json!({"Adt": {"id": id, "generics": g}})
+        };
+        let raw_mut = |pointee: serde_json::Value| serde_json::json!({"RawPtr": [pointee, "Mut"]});
+        let option_of = |inner: serde_json::Value| adt(0, vec![inner]);
+        let result_of = |ok: serde_json::Value, err: serde_json::Value| adt(4, vec![ok, err]);
+        let nominal = adt(1, vec![]);
+        let sized = adt(2, vec![]);
+        let alias = adt(3, vec![]);
+        let host_error = adt(5, vec![]);
+        let vec_of_nominal = adt(6, vec![nominal.clone()]);
+        let open_ended = adt(7, vec![]);
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+
+        let fun = |id: u64, leaf: &str, output: serde_json::Value, is_unsafe: bool| {
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", "owner", leaf]),
+                "signature": {"is_unsafe": is_unsafe, "inputs": [], "output": output},
+                "body": "Opaque"
+            })
+        };
+        let look_inside_false = |id: u64, leaf: &str| {
+            let marker = format!("_jit_look_inside_{leaf}");
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", "owner", marker.as_str()]),
+                "global_kind": "NamedConst",
+                "value": [{"Bool": false}, {"Scalar": "Bool"}]
+            })
+        };
+        let elidable_marker = |id: u64, leaf: &str| {
+            let marker = format!("_elidable_function_{leaf}");
+            serde_json::json!({
+                "def_id": id,
+                "item_meta": item_meta(&["fixture", "owner", marker.as_str()]),
+                "global_kind": "NamedConst"
+            })
+        };
+        let ty =
+            |id: u64, path: &[&str], kind: serde_json::Value, layout: Option<serde_json::Value>| {
+                let mut decl = serde_json::json!({
+                    "def_id": id,
+                    "item_meta": item_meta(path),
+                    "kind": kind
+                });
+                if let Some(layout) = layout {
+                    decl["layout"] = layout;
+                }
+                decl
+            };
+
+        let direct = option_of(raw_mut(nominal.clone()));
+        let sized_option = option_of(raw_mut(sized));
+        let alias_option = option_of(alias);
+        let nested = option_of(raw_mut(raw_mut(nominal.clone())));
+        let result_option = result_of(direct.clone(), host_error.clone());
+        let scalar_option = option_of(raw_mut(u8_ty));
+        let unsized_option = option_of(raw_mut(open_ended));
+        let result_scalar = result_of(scalar_option.clone(), host_error);
+
+        let funs = vec![
+            fun(0, "word_result", i64_ty, false),
+            fun(1, "direct_nullable", direct, true),
+            fun(2, "sized_nullable", sized_option, false),
+            fun(3, "alias_nullable", alias_option, false),
+            fun(4, "nested_nullable", nested, false),
+            fun(5, "result_nullable", result_option, false),
+            fun(6, "elidable_nullable", option_of(raw_mut(nominal)), false),
+            fun(7, "scalar_option", scalar_option, true),
+            fun(8, "vec_return", vec_of_nominal, false),
+            fun(9, "unsized_option", unsized_option, false),
+            fun(10, "result_scalar", result_scalar, false),
+        ];
+        let globals = vec![
+            look_inside_false(0, "word_result"),
+            look_inside_false(1, "direct_nullable"),
+            look_inside_false(2, "sized_nullable"),
+            look_inside_false(3, "alias_nullable"),
+            look_inside_false(4, "nested_nullable"),
+            look_inside_false(5, "result_nullable"),
+            elidable_marker(6, "elidable_nullable"),
+            look_inside_false(7, "scalar_option"),
+            look_inside_false(8, "vec_return"),
+            look_inside_false(9, "unsized_option"),
+            look_inside_false(10, "result_scalar"),
+        ];
+        let types = vec![
+            ty(
+                0,
+                &["core", "option", "Option"],
+                serde_json::json!("Opaque"),
+                None,
+            ),
+            // A `Vec` field keeps the pointee off the raw-storage path
+            // (`adt_path_is_gc_container`), so `Option<PointerAlias>` stays
+            // the `ref` token instead of the raw-address `i64`.
+            ty(
+                1,
+                &["fixture", "Nominal"],
+                serde_json::json!({"Struct": [{
+                    "name": "items",
+                    "ty": adt(6, vec![serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})]),
+                    "attr_info": null
+                }]}),
+                None,
+            ),
+            ty(
+                2,
+                &["fixture", "Sized"],
+                serde_json::json!({"Struct": []}),
+                Some(serde_json::json!([{"key": "any", "value": {"size": 8}}])),
+            ),
+            ty(
+                3,
+                &["fixture", "PointerAlias"],
+                serde_json::json!({"Alias": {"RawPtr": [adt(1, vec![]), "Mut"]}}),
+                None,
+            ),
+            ty(
+                4,
+                &["core", "result", "Result"],
+                serde_json::json!("Opaque"),
+                None,
+            ),
+            ty(
+                5,
+                &["fixture", "HostError"],
+                serde_json::json!({"Struct": []}),
+                None,
+            ),
+            ty(
+                6,
+                &["alloc", "vec", "Vec"],
+                serde_json::json!({"Struct": []}),
+                None,
+            ),
+            ty(
+                7,
+                &["fixture", "Unsized"],
+                serde_json::json!({"Struct": []}),
+                Some(serde_json::json!([{"key": "any", "value": {}}])),
+            ),
+        ];
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": types,
+                "fun_decls": funs,
+                "global_decls": globals,
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("nullable-option fixture");
+        let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let carrier = crate::ErrorCarrierSpec {
+            carrier_path: "fixture::HostError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        };
+        let policy = super::collect_policy_opaque_fn_stubs_from_llbc(
+            &llbc,
+            &gc_struct_ids,
+            carrier,
+            &std::collections::HashSet::<String>::new(),
+        );
+        let unsafe_stubs = super::collect_unsafe_fn_stubs_from_llbc(
+            &llbc,
+            &gc_struct_ids,
+            carrier,
+            &std::collections::HashSet::<String>::new(),
+        );
+        fn leaf_of<'a>(
+            specs: &'a [(
+                Vec<String>,
+                crate::flowspace::argument::Signature,
+                Option<String>,
+            )],
+            leaf: &str,
+        ) -> Option<&'a (
+            Vec<String>,
+            crate::flowspace::argument::Signature,
+            Option<String>,
+        )> {
+            specs.iter().find(|(segments, _, _)| {
+                segments.len() == 3
+                    && segments[0] == "fixture"
+                    && segments[1] == "owner"
+                    && segments[2] == leaf
+            })
+        }
+        for leaf in [
+            "word_result",
+            "direct_nullable",
+            "sized_nullable",
+            "alias_nullable",
+            "nested_nullable",
+            "result_nullable",
+            "elidable_nullable",
+        ] {
+            let row = leaf_of(&policy, leaf).unwrap_or_else(|| panic!("{leaf} must be registered"));
+            let token = if leaf == "word_result" { "i64" } else { "ref" };
+            assert_eq!(row.2.as_deref(), Some(token), "{leaf}");
+        }
+        for leaf in [
+            "scalar_option",
+            "vec_return",
+            "unsized_option",
+            "result_scalar",
+        ] {
+            assert!(
+                leaf_of(&policy, leaf).is_none(),
+                "{leaf} is not a one-word nullable pointer"
+            );
+        }
+        assert!(
+            leaf_of(&unsafe_stubs, "direct_nullable").is_none(),
+            "an unsafe fn keeps Rust's two-word Option<*mut T> return"
+        );
+        assert!(leaf_of(&unsafe_stubs, "scalar_option").is_none());
+    }
+
     /// The elidable half of the same carrier, on the real declarations.
     /// `interp_exceptions::lookup_exc_class_for_kind` is `#[elidable]` and
     /// reads a process-global slot the MIR driver cannot lower, so it has no
@@ -127866,7 +128551,7 @@ mod tests {
     fn charpsize2str_cp_input_is_ccharp() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
         let graph = super::lower_function(&llbc, "charpsize2str").expect("lower charpsize2str");

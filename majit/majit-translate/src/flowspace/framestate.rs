@@ -367,6 +367,8 @@ pub fn union(w1: Option<&Hlvalue>, w2: Option<&Hlvalue>) -> Result<Option<Hlvalu
         (Some(a), Some(b)) if a == b => Ok(Some(a.clone())),
         (None, _) | (_, None) => Ok(None),
         (Some(Hlvalue::Variable(_)), _) | (_, Some(Hlvalue::Variable(_))) => {
+            // `Variable()` (framestate.py `union`): a fresh phi, no
+            // annotation and no concretetype.
             Ok(Some(Hlvalue::Variable(Variable::new())))
         }
         (Some(Hlvalue::Constant(c1)), Some(Hlvalue::Constant(c2))) => {

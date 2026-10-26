@@ -663,9 +663,9 @@ mod memo_proxy {
             Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
         }
 
-        /// `_pickle_UnpicklerMemoProxy_clear_impl` — `_Unpickler_MemoCleanup`
-        /// then `_Unpickler_NewMemo` of the same dense size. `memo_dict` is
-        /// not touched.
+        /// `_pickle_UnpicklerMemoProxy_clear_impl` — a fresh empty dense memo,
+        /// `memo_dict` set to `None`, `memo_len` (`memo_index`) reset to 0,
+        /// then `_Unpickler_MemoCleanup` installs the replacement.
         fn clear(&self) {
             let _roots = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(self.w_unpickler);
@@ -673,6 +673,13 @@ mod memo_proxy {
             let empty = pyre_object::listobject::w_list_new_empty();
             let _ = pyre_object::gc_roots::pin_root(empty);
             let empty_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+            // The list allocation may have moved the unpickler.
+            {
+                let me = super::cur(slot);
+                me.w_memo_dict = pyre_object::w_none();
+                me.memo_index = 0;
+                super::unpickler_write_barrier(me as *mut W_Unpickler as PyObjectRef);
+            }
             super::memo_replace_dense(slot, pyre_object::gc_roots::shadow_stack_get(empty_slot));
         }
     }
@@ -910,8 +917,9 @@ fn memo_get(slot: usize, i: i64) -> Result<PyObjectRef, PyError> {
     }
 }
 
-/// Replace the dense memo list. `w_memo_dict` is left as-is
-/// (`_Unpickler_MemoCleanup` does not `Py_CLEAR(memo_dict)`).
+/// Replace the dense memo list. `w_memo_dict` is left as-is:
+/// `_Unpickler_MemoCleanup` does not touch `memo_dict`. Callers that drop it
+/// (`_pickle_UnpicklerMemoProxy_clear_impl`, `Unpickler_clear`) do so themselves.
 fn memo_replace_dense(slot: usize, w_list: PyObjectRef) {
     let me = cur(slot);
     me.w_memo = w_list;

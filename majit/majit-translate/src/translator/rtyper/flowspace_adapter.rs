@@ -111,14 +111,16 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// identity (`flowspace/model.rs`). Identity correspondence is
 /// preserved out-of-band by [`LegacyToTyped`].
 /// The high-level operations one `ll_vec_*` helper call stands for:
-/// `newrustvec(kind[, hint])`, `len`, `getitem`, `setitem`, or a
+/// `newrustvec(ITEM[, hint])`, `len`, `getitem`, `setitem`, or a
 /// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items` /
-/// `extend_from_slice` / `extend` method.
+/// `extend_from_slice` / `extend` method. `ITEM` is a constant item
+/// lowleveltype (`lltype.py` `malloc` / `ann_malloc`).
 fn rust_vec_helper_ops(
     op: majit_ir::rvec::VecOp,
     kind: majit_ir::rvec::VecItemKind,
     arg_hls: Vec<Hlvalue>,
     result: Hlvalue,
+    legacy_result: Option<&Variable>,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
     use majit_ir::rvec::VecOp;
     let path = majit_ir::rvec::vec_helper_path(op, kind);
@@ -136,11 +138,11 @@ fn rust_vec_helper_ops(
     }
     let (opname, method) = match op {
         VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
-            let kind_letter = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                kind.kind_char().to_string(),
-            )));
+            let item = newrustvec_item_lltype(kind, legacy_result);
+            let item_const =
+                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item))));
             let mut args = Vec::with_capacity(arg_hls.len() + 1);
-            args.push(kind_letter);
+            args.push(item_const);
             args.extend(arg_hls);
             return Ok(vec![FlowspaceOp::new("newrustvec", args, result)]);
         }
@@ -173,6 +175,30 @@ fn rust_vec_helper_ops(
         ),
         FlowspaceOp::new(opname, call_args, result),
     ])
+}
+
+/// Item lowleveltype passed to `newrustvec`.
+///
+/// `lltype.py` `malloc` takes the type as a constant. The legacy result's
+/// stamped header (`rust_vec_item_lltype` of its concretetype) is that
+/// type when the front has written one. Otherwise the helper kind's
+/// default is `Signed`, `Float`, or `GCREF`.
+fn newrustvec_item_lltype(
+    kind: majit_ir::rvec::VecItemKind,
+    legacy_result: Option<&Variable>,
+) -> LowLevelType {
+    use crate::translator::rtyper::rrustvec::rust_vec_item_lltype;
+    use majit_ir::rvec::VecItemKind;
+    if let Some(header) = legacy_result.and_then(|var| var.concretetype())
+        && let Some(item) = rust_vec_item_lltype(&header)
+    {
+        return item.clone();
+    }
+    match kind {
+        VecItemKind::Int => LowLevelType::Signed,
+        VecItemKind::Float => LowLevelType::Float,
+        VecItemKind::Ref => crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+    }
 }
 
 fn seed_variable(legacy_var: &Variable) -> Variable {
@@ -2917,10 +2943,19 @@ pub fn translate_op(
                     // A call of an `ll_vec_*` helper is the `Vec` operation
                     // it lowers, seen at the high level so `RustVecRepr`
                     // chooses the helper again from the one table.
-                    if let Some((op, kind)) =
+                    if let Some((vec_op, kind)) =
                         majit_ir::rvec::vec_helper_for_path(&segments.join("::"))
                     {
-                        return rust_vec_helper_ops(op, kind, arg_hls, result);
+                        // The item lltype is an argument constant, read here
+                        // from the legacy result `stamp_rust_vec_header`
+                        // wrote. The annotator does not read concretetype.
+                        return rust_vec_helper_ops(
+                            vec_op,
+                            kind,
+                            arg_hls,
+                            result,
+                            op.result.as_ref(),
+                        );
                     }
                     // Front may leave a hint-marker as a Call (unit tests;
                     // `jtransform` classifies the same way). Virtualizable
@@ -3808,10 +3843,27 @@ pub fn translate_op(
                                 .to_string(),
                         ));
                     }
+                    // A one-word `<[T]>::to_vec` reads the header
+                    // `stamp_rust_vec_header` wrote and selects that
+                    // kind's `project_rust_vec` row (`to_vec_registry_key`).
+                    // Every other call leaves the path unkeyed.
+                    let stamped_to_vec =
+                        if crate::translator::rtyper::call_registry::is_alloc_slice_to_vec(segments)
+                        {
+                            op.result.as_ref().and_then(|var| var.concretetype())
+                        } else {
+                            None
+                        };
                     let key = crate::translator::rtyper::call_registry::saturating_arith_registry_key(
                         segments,
                         result_ty,
                     )
+                    .or_else(|| {
+                        crate::translator::rtyper::call_registry::to_vec_registry_key(
+                            segments,
+                            stamped_to_vec.as_ref(),
+                        )
+                    })
                     .unwrap_or_else(|| {
                         crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
                             segments.iter().cloned(),
@@ -10359,13 +10411,23 @@ mod tests {
                     VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
                         assert_eq!(translated.len(), 1);
                         assert_eq!(last.opname, "newrustvec");
-                        let Hlvalue::Constant(letter) = &last.args[0] else {
-                            panic!("{path}: kind letter must be a Constant");
+                        let Hlvalue::Constant(item) = &last.args[0] else {
+                            panic!("{path}: item lowleveltype must be a Constant");
                         };
-                        assert_eq!(
-                            letter.value.as_text(),
-                            Some(kind.kind_char().to_string().as_str())
-                        );
+                        let ConstValue::LowLevelType(ll) = &item.value else {
+                            panic!(
+                                "{path}: item must be a constant lowleveltype, got {:?}",
+                                item.value
+                            );
+                        };
+                        let expected = match kind {
+                            VecItemKind::Int => LowLevelType::Signed,
+                            VecItemKind::Float => LowLevelType::Float,
+                            VecItemKind::Ref => {
+                                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+                            }
+                        };
+                        assert_eq!(ll.as_ref(), &expected, "{path}");
                         assert_eq!(&last.args[1..], arg_hls.as_slice());
                     }
                     VecOp::Length | VecOp::GetItem | VecOp::SetItem => {
@@ -10406,6 +10468,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A stamped `RustVec` header on the legacy result is the `newrustvec`
+    /// item constant. The flow result keeps an empty concretetype: the
+    /// adapter reads the stamp and does not copy it.
+    #[test]
+    fn translate_op_newrustvec_reads_the_stamped_item_lltype() {
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        let legacy_result = vars[1].clone();
+        legacy_result.set_concretetype(Some(rust_vec_lltype(&LowLevelType::Unsigned)));
+        let flow_result = Variable::new();
+        let result_var = Hlvalue::Variable(flow_result.clone());
+        value_map.insert(legacy_result.clone(), result_var.clone());
+        let path = vec_helper_path(VecOp::NewEmpty, VecItemKind::Int);
+        let spaceop = SpaceOperation {
+            result: Some(legacy_result),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: path.split("::").map(String::from).collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&spaceop, &value_map, &empty_call_registry())
+            .unwrap_or_else(|err| panic!("{path} must lower: {err:?}"));
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "newrustvec");
+        let Hlvalue::Constant(item) = &translated[0].args[0] else {
+            panic!("item lowleveltype must be a Constant");
+        };
+        let ConstValue::LowLevelType(ll) = &item.value else {
+            panic!("item must be a constant lowleveltype, got {:?}", item.value);
+        };
+        assert_eq!(ll.as_ref(), &LowLevelType::Unsigned);
+        assert_eq!(flow_result.concretetype(), None);
+        assert_eq!(translated[0].result, result_var);
     }
 
     #[test]

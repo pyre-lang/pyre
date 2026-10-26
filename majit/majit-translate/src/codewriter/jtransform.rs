@@ -10417,9 +10417,10 @@ impl<'a> Transformer<'a> {
         } else {
             args.first().and_then(|v| v.concretetype())
         };
-        if let Some(kind) = list_ty
-            .as_ref()
-            .and_then(crate::translator::rtyper::rrustvec::rust_vec_item_kind)
+        if let Some(list_ty) = list_ty.as_ref()
+            && let Some(kind) = crate::translator::rtyper::rrustvec::rust_vec_item_kind(list_ty)
+            && let Some(item_ll) =
+                crate::translator::rtyper::rrustvec::rust_vec_item_lltype(list_ty)
         {
             return self._handle_raw_resizable_list_call(
                 oopspec_name,
@@ -10428,6 +10429,7 @@ impl<'a> Transformer<'a> {
                 graph,
                 graph_name,
                 kind,
+                item_ll,
             );
         }
         // jtransform.py `_handle_list_call`: `list.ll_arraymove` is an OS9
@@ -11471,18 +11473,23 @@ impl<'a> Transformer<'a> {
         graph: &mut crate::model::FunctionGraph,
         graph_name: &str,
         kind: majit_ir::rvec::VecItemKind,
+        item_ll: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
     ) -> Option<RewriteResult> {
         use crate::codewriter::type_state::ConcreteType;
         use majit_ir::rvec::{
-            VEC_BUF_ALLOC, VEC_BUF_ALLOC_CLEAR, VEC_CAP_WORD, VEC_HEADER_MALLOC, VEC_HEADER_WORDS,
-            VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind, vec_word_offset,
+            VEC_CAP_WORD, VEC_HEADER_MALLOC, VEC_HEADER_WORDS, VEC_LEN_WORD, VEC_PTR_WORD,
+            VecItemKind, vec_word_offset,
         };
         let word = crate::layout::target_word_size();
-        let (itemsize, itemalign) = kind.size_align(word);
         let item_ty = match kind {
             VecItemKind::Float => ValueType::Float,
             VecItemKind::Int | VecItemKind::Ref => ValueType::Int,
         };
+        // `cpu.arraydescrof(Array(ITEM))`. `ITEM` is the header's
+        // `rust_vec_item_lltype` (`ARRAY.OF`); `descr.py` `get_type_flag`
+        // reads its signedness and `sizeof` (`symbolic.get_array_token`).
+        // The item leaf takes the length, and multiplies by that size inside.
+        let array_type_id = Some(rust_vec_item_array_type_id(item_ll));
         let mut ops: Vec<SpaceOperation> = Vec::new();
         let const_int = raw_list_const_int;
         let header_load =
@@ -11552,7 +11559,7 @@ impl<'a> Transformer<'a> {
                         base: items,
                         index: index.clone(),
                         item_ty: item_ty.clone(),
-                        array_type_id: None,
+                        array_type_id: array_type_id.clone(),
                         nolength: true,
                         pure: false,
                     },
@@ -11596,7 +11603,7 @@ impl<'a> Transformer<'a> {
                         index: index.clone(),
                         value: crate::model::LinkArg::Value(value),
                         item_ty,
-                        array_type_id: None,
+                        array_type_id,
                         nolength: true,
                     },
                 });
@@ -11607,16 +11614,23 @@ impl<'a> Transformer<'a> {
             // words. `v_length = _get_initial_newlist_length(op, args)` —
             // the argument when present, else the constant 0.
             //
+            // The item buffer is one `(count) -> addr` leaf. `_rewrite_raw_malloc`
+            // passes only the length `n` (`raw_malloc_varsize`, args
+            // `[op.args[2]]`). A non-Char ARRAY — every `Vec` item array —
+            // goes through `rewrite_op_direct_call` with no oopspec. The leaf
+            // is `_ll_1_raw_malloc_varsize(n)` and overflow-checks
+            // `itemsize * n` inside (`gctransform.transform._ll_compute_size`).
+            // `newlist_clear` uses the zero-filling twin. The leaf's `Layout`
+            // is `RawVec`'s (`vec_item_malloc_path`): the byte size at the
+            // item alignment, and the dangling `align` address for a zero
+            // count.
+            //
             // `newlist` with no argument, or with a constant 0
-            // (`ll_vec_newemptylist_*`, oopspec `newlist(0)`), keeps the
-            // empty buffer: the dangling address `itemalign`, length 0.
-            // `newlist(length)` allocates `length` slots through the same
-            // opaque allocator as `newlist_hint` and stores that length in
-            // both the length and the capacity words.
-            // `newlist_clear(count)` allocates `count` zero-filled slots
-            // (`vec_buf_alloc_clear`, `raw_malloc(..., zero=True)`) and
-            // stores `count` in both words. A raw header never takes the
-            // GC `newlist_clear` arm.
+            // (`ll_vec_newemptylist_*`, oopspec `newlist(0)`), asks for zero
+            // items and gets that dangling address. `vec_buf_free` of a
+            // zero-slot buffer is a no-op, and it is tagged `OS_RAW_FREE`
+            // with the items pointer first. A raw header never takes the GC
+            // `newlist_clear` arm.
             "newlist" | "newlist_hint" | "newlist_clear" => {
                 let header = op.result.clone()?;
                 let size = const_int(graph, &mut ops, VEC_HEADER_WORDS * word);
@@ -11662,23 +11676,26 @@ impl<'a> Transformer<'a> {
                     && v_length
                         .as_ref()
                         .is_none_or(|length| raw_list_produced_const(graph, length) == Some(0));
+                let zero = oopspec_name == "newlist_clear";
                 let (items, length, capacity) = if empty_newlist {
+                    let n = const_int(graph, &mut ops, 0);
+                    let items =
+                        raw_list_item_malloc(self, graph, &mut ops, graph_name, kind, false, n);
                     (
-                        const_int(graph, &mut ops, itemalign),
+                        items,
                         const_int(graph, &mut ops, 0),
                         const_int(graph, &mut ops, 0),
                     )
                 } else if oopspec_name == "newlist_hint" {
                     let hint = v_length?;
-                    let items = raw_list_buf_alloc(
+                    let items = raw_list_item_malloc(
                         self,
                         graph,
                         &mut ops,
                         graph_name,
-                        VEC_BUF_ALLOC,
+                        kind,
+                        false,
                         hint.clone(),
-                        itemsize,
-                        itemalign,
                     );
                     (items, const_int(graph, &mut ops, 0), hint)
                 } else {
@@ -11687,20 +11704,14 @@ impl<'a> Transformer<'a> {
                         Some(length) => length,
                         None => const_int(graph, &mut ops, 0),
                     };
-                    let path = if oopspec_name == "newlist_clear" {
-                        VEC_BUF_ALLOC_CLEAR
-                    } else {
-                        VEC_BUF_ALLOC
-                    };
-                    let items = raw_list_buf_alloc(
+                    let items = raw_list_item_malloc(
                         self,
                         graph,
                         &mut ops,
                         graph_name,
-                        path,
+                        kind,
+                        zero,
                         n.clone(),
-                        itemsize,
-                        itemalign,
                     );
                     (items, n.clone(), n)
                 };
@@ -11708,13 +11719,13 @@ impl<'a> Transformer<'a> {
                 header_store(graph, &mut ops, &header, VEC_LEN_WORD, length);
                 header_store(graph, &mut ops, &header, VEC_CAP_WORD, capacity);
                 if oopspec_name == "newlist_hint" {
-                    "newlist_hint → raw_malloc_varsize_char + vec_buf_alloc + raw_store x3"
+                    "newlist_hint → raw_malloc_varsize_char + vec_item_malloc(n) + raw_store x3"
                 } else if empty_newlist {
-                    "newlist → raw_malloc_varsize_char + raw_store x3"
+                    "newlist → raw_malloc_varsize_char + vec_item_malloc(0) + raw_store x3"
                 } else if oopspec_name == "newlist_clear" {
-                    "newlist_clear → raw_malloc_varsize_char + vec_buf_alloc_clear + raw_store x3"
+                    "newlist_clear → raw_malloc_varsize_char + vec_item_malloc_zero(n) + raw_store x3"
                 } else {
-                    "newlist(length) → raw_malloc_varsize_char + vec_buf_alloc + raw_store x3"
+                    "newlist(length) → raw_malloc_varsize_char + vec_item_malloc(n) + raw_store x3"
                 }
             }
             _ => return None,
@@ -11772,32 +11783,6 @@ impl<'a> Transformer<'a> {
             Some(0),
         );
         Some(vec![field, array])
-    }
-
-    /// `rewrite_op_direct_call(op1)` on a call the rewrite itself built
-    /// (`jtransform.py _rewrite_raw_malloc` → `prepare_builtin_call`), as the
-    /// operations that replace it.
-    fn rewrite_synthesized_direct_call(
-        &mut self,
-        call: SpaceOperation,
-        args: &[crate::flowspace::model::Variable],
-        graph_name: &str,
-        graph: &mut crate::model::FunctionGraph,
-    ) -> Vec<SpaceOperation> {
-        let OpKind::Call {
-            target, result_ty, ..
-        } = &call.kind
-        else {
-            unreachable!("rewrite_synthesized_direct_call takes a Call");
-        };
-        let (target, result_ty) = (target.clone(), result_ty.clone());
-        match self.rewrite_op_direct_call(&call, &target, args, &result_ty, graph_name, graph) {
-            RewriteResult::Replace(ops) => ops,
-            RewriteResult::Keep => vec![call],
-            RewriteResult::Identity(_) => {
-                unreachable!("{target}: an allocator call is never an identity")
-            }
-        }
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.
@@ -15283,31 +15268,75 @@ fn raw_list_produced_const(
     })
 }
 
-/// `vec_buf_alloc` / `vec_buf_alloc_clear`: `(n, itemsize, align)` → buffer.
-fn raw_list_buf_alloc(
+/// ARRAY identity of a `RustVec` item buffer, from `ARRAY.OF`.
+///
+/// `descr.py` `get_type_flag` reads that element lltype, and `rint.py`
+/// `unsigned_repr` is what an unsigned item lowers to. `Signed` spells
+/// `Vec<isize>`, `Unsigned` spells `Vec<usize>`, `Float` spells `Vec<f64>`.
+/// A reference item is stored as an untraced word (`cast_ptr_to_int`), so
+/// that spelling stays `usize`. The identity is what lets `arraydescrof`
+/// read the flag and `sizeof(ARRAY.OF)`; without one, an int element is
+/// eight bytes wide.
+fn rust_vec_item_array_type_id(
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let spelling = match item {
+        LowLevelType::Signed => "isize",
+        LowLevelType::Unsigned => "usize",
+        LowLevelType::Float => "f64",
+        // `cast_ptr_to_int` stores the reference as a word. The buffer stays
+        // untraced, so the element is that word and not a GC pointer.
+        _ => "usize",
+    };
+    format!("Vec<{spelling}>")
+}
+
+/// Item buffer of a raw `Vec` header.
+///
+/// `jtransform.py _rewrite_raw_malloc` for a non-Char ARRAY: the only
+/// argument is the length (`_ll_1_raw_malloc_varsize(n)`), and the call is
+/// `rewrite_op_direct_call` — a plain residual, no oopspec. `zero` selects
+/// the zero-filling twin (`vec_item_malloc_path`). The leaf computes the
+/// byte size and checks overflow. Without a `CallControl` the call stays a
+/// plain `Call`, as `rewrite_op_direct_call` leaves it.
+fn raw_list_item_malloc(
     transformer: &mut Transformer<'_>,
     graph: &mut crate::model::FunctionGraph,
     ops: &mut Vec<SpaceOperation>,
     graph_name: &str,
-    path: &str,
-    n: crate::flowspace::model::Variable,
-    itemsize: usize,
-    itemalign: usize,
+    kind: majit_ir::rvec::VecItemKind,
+    zero: bool,
+    length: crate::flowspace::model::Variable,
 ) -> crate::flowspace::model::Variable {
-    let v_itemsize = raw_list_const_int(graph, ops, itemsize);
-    let v_itemalign = raw_list_const_int(graph, ops, itemalign);
+    let path = majit_ir::rvec::vec_item_malloc_path(kind, zero);
     let items =
         graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
-    let call_args = vec![n, v_itemsize, v_itemalign];
-    let alloc = SpaceOperation {
+    let target = crate::model::CallTarget::function_path(path.split("::"));
+    let malloc = SpaceOperation {
         result: Some(items.clone()),
         kind: crate::model::OpKind::Call {
-            target: crate::model::CallTarget::function_path(path.split("::")),
-            args: crate::model::call_args(call_args.clone()),
+            target: target.clone(),
+            args: crate::model::call_args(vec![length.clone()]),
             result_ty: crate::model::ValueType::Int,
         },
     };
-    ops.extend(transformer.rewrite_synthesized_direct_call(alloc, &call_args, graph_name, graph));
+    // `_rewrite_raw_malloc` non-Char: `return self.rewrite_op_direct_call(op1)`.
+    let rewritten = transformer.rewrite_op_direct_call(
+        &malloc,
+        &target,
+        std::slice::from_ref(&length),
+        &ValueType::Int,
+        graph_name,
+        graph,
+    );
+    match rewritten {
+        RewriteResult::Replace(rewritten) => ops.extend(rewritten),
+        RewriteResult::Keep => ops.push(malloc),
+        RewriteResult::Identity(_) => {
+            unreachable!("{path}: an allocator call is never an identity")
+        }
+    }
     items
 }
 
@@ -33407,15 +33436,22 @@ mod tests {
                 base,
                 index: read_index,
                 item_ty,
+                array_type_id,
                 nolength,
                 pure,
-                ..
             } = &body[1].kind
             else {
                 panic!("expected ArrayRead, got {:?}", body[1].kind);
             };
             assert_eq!(base, &items);
             assert_eq!(read_index, &index);
+            let header = l.concretetype().expect("rust vec header");
+            let item_ll = crate::translator::rtyper::rrustvec::rust_vec_item_lltype(&header)
+                .expect("item lltype");
+            assert_eq!(
+                array_type_id.as_deref(),
+                Some(rust_vec_item_array_type_id(item_ll).as_str())
+            );
             assert!(*nolength && !*pure);
             match kind {
                 VecItemKind::Float => assert_eq!(*item_ty, ValueType::Float),
@@ -33452,12 +33488,22 @@ mod tests {
                 .collect();
             let write = body.last().unwrap();
             let OpKind::ArrayWrite {
-                value, nolength, ..
+                value,
+                array_type_id,
+                nolength,
+                ..
             } = &write.kind
             else {
                 panic!("expected ArrayWrite, got {:?}", write.kind);
             };
             assert!(*nolength);
+            let header = l.concretetype().expect("rust vec header");
+            let item_ll = crate::translator::rtyper::rrustvec::rust_vec_item_lltype(&header)
+                .expect("item lltype");
+            assert_eq!(
+                array_type_id.as_deref(),
+                Some(rust_vec_item_array_type_id(item_ll).as_str())
+            );
             let crate::model::LinkArg::Value(value) = value else {
                 panic!("the stored item is a Variable");
             };
@@ -33474,14 +33520,106 @@ mod tests {
         }
     }
 
+    /// The item descr of `list.getitem` / `list.setitem` is `arraydescrof`
+    /// of `Array(ITEM)`. Its item size is `sizeof(ITEM)`
+    /// (`get_array_descr` / `symbolic.get_array_token`), which is the width
+    /// `VecItemKind::size_align` gives the allocation. `Signed` (`isize`)
+    /// sign-extends; `Unsigned` (`usize`) does not. An identity-less int
+    /// element stays eight bytes wide.
+    #[test]
+    fn handle_list_call_rust_vec_item_descr_matches_allocation() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::rvec::VecItemKind;
+        let word = crate::layout::target_word_size();
+        let cc = crate::codewriter::call::CallControl::new();
+        for kind in VecItemKind::ALL {
+            let (itemsize, _) = kind.size_align(word);
+            let item_ll = match kind {
+                VecItemKind::Int => LowLevelType::Signed,
+                VecItemKind::Float => LowLevelType::Float,
+                VecItemKind::Ref => GCREF.clone(),
+            };
+            let array_type_id = Some(rust_vec_item_array_type_id(&item_ll));
+            let item_ty = match kind {
+                VecItemKind::Float => ValueType::Float,
+                VecItemKind::Int | VecItemKind::Ref => ValueType::Int,
+            };
+            let ir_type = match item_ty {
+                ValueType::Float => majit_ir::value::Type::Float,
+                _ => majit_ir::value::Type::Int,
+            };
+            let descr = cc.arraydescrof_for_type(&item_ty, &array_type_id, ir_type, None);
+            let ad = descr
+                .as_array_descr()
+                .expect("arraydescrof_for_type must answer an ArrayDescr");
+            let elem = crate::codewriter::call::extract_element_type_from_str(
+                array_type_id.as_deref().unwrap(),
+            )
+            .unwrap_or_else(|| panic!("{array_type_id:?} names an element"));
+            let (flag, _, sizeof_item) =
+                crate::codewriter::call::get_type_flag(&elem, &std::collections::HashSet::new());
+            assert_eq!(ad.item_size(), itemsize, "{kind:?}");
+            assert_eq!(ad.item_size(), sizeof_item, "{kind:?}");
+            assert_eq!(ad.base_size(), 0, "{kind:?}");
+            assert!(ad.len_descr().is_none(), "{kind:?}");
+            assert_eq!(ad.is_item_signed(), flag == ArrayFlag::Signed, "{kind:?}");
+            assert!(!ad.is_array_of_pointers(), "{kind:?}");
+        }
+        let unnamed_descr =
+            cc.arraydescrof_for_type(&ValueType::Int, &None, majit_ir::value::Type::Int, None);
+        let unnamed = unnamed_descr
+            .as_array_descr()
+            .expect("identity-less int descr");
+        assert_eq!(unnamed.item_size(), 8);
+        assert!(!unnamed.is_item_signed());
+        let signed_id = Some(rust_vec_item_array_type_id(&LowLevelType::Signed));
+        let signed_descr = cc.arraydescrof_for_type(
+            &ValueType::Int,
+            &signed_id,
+            majit_ir::value::Type::Int,
+            None,
+        );
+        let signed = signed_descr.as_array_descr().expect("Signed item descr");
+        assert_eq!(signed.item_size(), word);
+        assert!(signed.is_item_signed());
+        let unsigned_header =
+            crate::translator::rtyper::rrustvec::rust_vec_lltype(&LowLevelType::Unsigned);
+        let unsigned_item =
+            crate::translator::rtyper::rrustvec::rust_vec_item_lltype(&unsigned_header)
+                .expect("usize item lltype");
+        let unsigned_id = Some(rust_vec_item_array_type_id(unsigned_item));
+        let unsigned_descr = cc.arraydescrof_for_type(
+            &ValueType::Int,
+            &unsigned_id,
+            majit_ir::value::Type::Int,
+            None,
+        );
+        let unsigned = unsigned_descr
+            .as_array_descr()
+            .expect("Unsigned item descr");
+        assert_eq!(unsigned.item_size(), word);
+        assert!(!unsigned.is_item_signed());
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("isize", &std::collections::HashSet::new()).2,
+            word,
+            "lltype.Signed strides by the target word"
+        );
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("i64", &std::collections::HashSet::new()).2,
+            8
+        );
+    }
+
     /// `newlist(0)` / `newlist_hint(n)` on a `RustVec` result allocate the
-    /// header through `raw_malloc_varsize_char` and store its three words;
-    /// the hinted form allocates the buffer through `vec_buf_alloc`.
+    /// header through `raw_malloc_varsize_char` and the item buffer through
+    /// `vec_item_malloc_path(kind, false)`. `newlist(0)` passes a zero item
+    /// count; `newlist_hint` passes the hint, the item count.
     #[test]
     fn handle_list_call_rust_vec_constructors_store_the_header() {
         use majit_ir::rvec::{
-            VEC_BUF_ALLOC, VEC_CAP_WORD, VEC_HEADER_MALLOC, VEC_HEADER_WORDS, VEC_LEN_WORD,
-            VEC_PTR_WORD, VecItemKind, vec_word_offset,
+            VEC_CAP_WORD, VEC_HEADER_MALLOC, VEC_HEADER_WORDS, VEC_LEN_WORD, VEC_PTR_WORD,
+            VecItemKind, vec_word_offset,
         };
         let word = crate::layout::target_word_size();
         let call_path = |op: &SpaceOperation| match &op.kind {
@@ -33492,7 +33630,6 @@ mod tests {
             _ => None,
         };
         for kind in VecItemKind::ALL {
-            let (itemsize, itemalign) = kind.size_align(word);
             for hinted in [false, true] {
                 let mut graph = FunctionGraph::new("raw_list_new");
                 let header = rust_vec_var(&mut graph, kind);
@@ -33518,9 +33655,11 @@ mod tests {
                 };
                 let malloc = ops
                     .iter()
-                    .find(|op| call_path(op).as_deref() == Some(VEC_HEADER_MALLOC))
+                    .find(|op| {
+                        call_path(op).as_deref() == Some(VEC_HEADER_MALLOC)
+                            && op.result.as_ref() == Some(&header)
+                    })
                     .expect("header malloc");
-                assert_eq!(malloc.result.as_ref(), Some(&header));
                 let OpKind::Call { args: margs, .. } = &malloc.kind else {
                     unreachable!()
                 };
@@ -33528,10 +33667,17 @@ mod tests {
                     panic!("raw_malloc_varsize_char takes the size");
                 };
                 assert_eq!(const_int_of(&ops, size), (VEC_HEADER_WORDS * word) as i64);
-                let buf_alloc = ops
+                let item_path = majit_ir::rvec::vec_item_malloc_path(kind, false);
+                let item_malloc = ops
                     .iter()
-                    .find(|op| call_path(op).as_deref() == Some(VEC_BUF_ALLOC));
-                assert_eq!(buf_alloc.is_some(), hinted);
+                    .find(|op| call_path(op).as_deref() == Some(item_path))
+                    .expect("item malloc");
+                let OpKind::Call { args: bargs, .. } = &item_malloc.kind else {
+                    unreachable!()
+                };
+                let [crate::model::LinkArg::Value(count)] = bargs.as_slice() else {
+                    panic!("vec_item_malloc takes the item count");
+                };
                 let stores: std::collections::BTreeMap<i64, crate::flowspace::model::Variable> =
                     ops.iter()
                         .filter_map(|op| match &op.kind {
@@ -33549,42 +33695,32 @@ mod tests {
                 assert_eq!(stores.len(), 3);
                 let at = |index| &stores[&(vec_word_offset(index, word) as i64)];
                 assert_eq!(const_int_of(&ops, at(VEC_LEN_WORD)), 0);
-                if let Some(buf_alloc) = buf_alloc {
-                    assert_eq!(at(VEC_PTR_WORD), buf_alloc.result.as_ref().unwrap());
+                assert_eq!(at(VEC_PTR_WORD), item_malloc.result.as_ref().unwrap());
+                if hinted {
+                    assert_eq!(count, &hint);
                     assert_eq!(at(VEC_CAP_WORD), &hint);
-                    let OpKind::Call { args: bargs, .. } = &buf_alloc.kind else {
-                        unreachable!()
-                    };
-                    let [
-                        crate::model::LinkArg::Value(n),
-                        crate::model::LinkArg::Value(size),
-                        crate::model::LinkArg::Value(align),
-                    ] = bargs.as_slice()
-                    else {
-                        panic!("vec_buf_alloc takes (allocated, itemsize, align)");
-                    };
-                    assert_eq!(n, &hint);
-                    assert_eq!(const_int_of(&ops, size), itemsize as i64);
-                    assert_eq!(const_int_of(&ops, align), itemalign as i64);
                 } else {
-                    assert_eq!(const_int_of(&ops, at(VEC_PTR_WORD)), itemalign as i64);
+                    assert_eq!(const_int_of(&ops, count), 0);
                     assert_eq!(const_int_of(&ops, at(VEC_CAP_WORD)), 0);
                 }
+                assert!(
+                    !ops.iter()
+                        .any(|op| call_path(op).as_deref() == Some(majit_ir::rvec::VEC_BUF_ALLOC))
+                );
             }
         }
     }
 
     /// `do_resizable_newlist`: `newlist(length)` stores `length` in both the
-    /// length and the capacity words and allocates that many slots through
-    /// `vec_buf_alloc`.
+    /// length and the capacity words and passes that count through
+    /// `vec_item_malloc_path(kind, false)`.
     #[test]
     fn handle_list_call_rust_vec_newlist_length_stores_the_length() {
         use majit_ir::rvec::{
-            VEC_BUF_ALLOC, VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind, vec_word_offset,
+            VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind, vec_word_offset,
         };
         let word = crate::layout::target_word_size();
         for kind in VecItemKind::ALL {
-            let (itemsize, itemalign) = kind.size_align(word);
             let mut graph = FunctionGraph::new("raw_list_newlist");
             let header = rust_vec_var(&mut graph, kind);
             let length = graph.alloc_value_var_with_type(ConcreteType::Signed);
@@ -33613,24 +33749,18 @@ mod tests {
                 } => Some(segments.join("::")),
                 _ => None,
             };
-            let buf_alloc = ops
+            let item_path = majit_ir::rvec::vec_item_malloc_path(kind, false);
+            let item_malloc = ops
                 .iter()
-                .find(|op| call_path(op).as_deref() == Some(VEC_BUF_ALLOC))
-                .expect("vec_buf_alloc");
-            let OpKind::Call { args: bargs, .. } = &buf_alloc.kind else {
+                .find(|op| call_path(op).as_deref() == Some(item_path))
+                .expect("item malloc");
+            let OpKind::Call { args: bargs, .. } = &item_malloc.kind else {
                 unreachable!()
             };
-            let [
-                crate::model::LinkArg::Value(n),
-                crate::model::LinkArg::Value(size),
-                crate::model::LinkArg::Value(align),
-            ] = bargs.as_slice()
-            else {
-                panic!("vec_buf_alloc takes (allocated, itemsize, align)");
+            let [crate::model::LinkArg::Value(count)] = bargs.as_slice() else {
+                panic!("vec_item_malloc takes the item count");
             };
-            assert_eq!(n, &length);
-            assert_eq!(const_int_of(&ops, size), itemsize as i64);
-            assert_eq!(const_int_of(&ops, align), itemalign as i64);
+            assert_eq!(count, &length);
             let stores: std::collections::BTreeMap<i64, crate::flowspace::model::Variable> = ops
                 .iter()
                 .filter_map(|op| match &op.kind {
@@ -33644,7 +33774,7 @@ mod tests {
                 })
                 .collect();
             let at = |index| &stores[&(vec_word_offset(index, word) as i64)];
-            assert_eq!(at(VEC_PTR_WORD), buf_alloc.result.as_ref().unwrap());
+            assert_eq!(at(VEC_PTR_WORD), item_malloc.result.as_ref().unwrap());
             assert_eq!(at(VEC_LEN_WORD), &length);
             assert_eq!(at(VEC_CAP_WORD), &length);
             assert!(
@@ -33660,12 +33790,13 @@ mod tests {
     }
 
     /// `do_resizable_newlist_clear`: `newlist_clear(count)` on a raw header
-    /// calls the zero-filling allocator and stores `count` as length and
-    /// capacity. It does not emit the GC `newlist_clear` op.
+    /// calls `vec_item_malloc_path(kind, true)` with the item count and
+    /// stores `count` as length and capacity. It does not emit the GC
+    /// `newlist_clear` op.
     #[test]
     fn handle_list_call_rust_vec_newlist_clear_zero_fills() {
         use majit_ir::rvec::{
-            VEC_BUF_ALLOC_CLEAR, VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind,
+            VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, VecItemKind, vec_item_malloc_path,
             vec_word_offset,
         };
         let word = crate::layout::target_word_size();
@@ -33698,21 +33829,22 @@ mod tests {
                 } => Some(segments.join("::")),
                 _ => None,
             };
-            let buf_alloc = ops
+            let item_path = vec_item_malloc_path(kind, true);
+            let item_malloc = ops
                 .iter()
-                .find(|op| call_path(op).as_deref() == Some(VEC_BUF_ALLOC_CLEAR))
-                .expect("vec_buf_alloc_clear");
-            let OpKind::Call { args: bargs, .. } = &buf_alloc.kind else {
+                .find(|op| call_path(op).as_deref() == Some(item_path))
+                .expect("vec_item_malloc zero");
+            let OpKind::Call { args: bargs, .. } = &item_malloc.kind else {
                 unreachable!()
             };
-            let [crate::model::LinkArg::Value(n), _, _] = bargs.as_slice() else {
-                panic!("vec_buf_alloc_clear takes (allocated, itemsize, align)");
+            let [crate::model::LinkArg::Value(n)] = bargs.as_slice() else {
+                panic!("vec_item_malloc takes the item count");
             };
             assert_eq!(n, &count);
-            assert!(
-                !ops.iter()
-                    .any(|op| call_path(op).as_deref() == Some(majit_ir::rvec::VEC_BUF_ALLOC))
-            );
+            assert!(!ops.iter().any(|op| {
+                call_path(op).as_deref() == Some(majit_ir::rvec::VEC_BUF_ALLOC)
+                    || call_path(op).as_deref() == Some(majit_ir::rvec::VEC_BUF_ALLOC_CLEAR)
+            }));
             let stores: std::collections::BTreeMap<i64, crate::flowspace::model::Variable> = ops
                 .iter()
                 .filter_map(|op| match &op.kind {
@@ -33726,7 +33858,7 @@ mod tests {
                 })
                 .collect();
             let at = |index| &stores[&(vec_word_offset(index, word) as i64)];
-            assert_eq!(at(VEC_PTR_WORD), buf_alloc.result.as_ref().unwrap());
+            assert_eq!(at(VEC_PTR_WORD), item_malloc.result.as_ref().unwrap());
             assert_eq!(at(VEC_LEN_WORD), &count);
             assert_eq!(at(VEC_CAP_WORD), &count);
             assert!(

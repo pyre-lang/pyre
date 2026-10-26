@@ -3054,6 +3054,13 @@ impl<S: JitState> JitDriver<S> {
         self.meta.is_tracing()
     }
 
+    /// `MetaInterp::trace_attempt_in_progress`: a trace attempt owns this
+    /// driver, including the window the recorder sits in `compile_tracing`.
+    #[inline]
+    pub fn trace_attempt_in_progress(&self) -> bool {
+        self.meta.trace_attempt_in_progress()
+    }
+
     /// warmstate.py `cell.flags & JC_TRACING` for this green key.
     ///
     /// `maybe_compile_and_run` skips only a cell that is already being
@@ -8668,6 +8675,11 @@ impl<S: JitState> JitDriver<S> {
             !self.is_tracing(),
             "force_start_tracing entered while a recording is live"
         );
+        // `is_tracing` misses a recorder parked in `compile_tracing`.
+        // `compile_and_run_once` is not re-entrant (`profiler.start_tracing`).
+        if self.meta.trace_attempt_in_progress() {
+            return;
+        }
         if !self.sync_before(state, &meta, vable) {
             return;
         }
@@ -8708,7 +8720,10 @@ impl<S: JitState> JitDriver<S> {
     /// Bypasses counter.tick() inside maybe_compile, allowing decay_counters()
     /// to be called before tracing starts.
     pub fn bound_reached(&mut self, green_key: u64, target_pc: usize, state: &mut S, env: &S::Env) {
-        if self.meta.is_tracing() {
+        // Before `sync_before`: a parked attempt must not retarget the
+        // virtualizable. `MetaInterp::bound_reached` declines the same way
+        // before `prepare_trace_start_runtime`.
+        if self.meta.trace_attempt_in_progress() {
             return;
         }
         self.take_single_pass_label_entry_dispatch_key_for_back_edge(green_key);

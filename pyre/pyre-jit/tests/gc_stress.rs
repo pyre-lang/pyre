@@ -958,6 +958,41 @@ assert result == 600, result
     );
 }
 
+/// `pyopcode.py` `FOR_ITER` absorbs `StopIteration`. A generator loop that
+/// yields from a nested generator must keep doing that after the loop is
+/// traced: the inner generator's return is exhaustion, not
+/// `RuntimeError("generator raised StopIteration")`.
+#[test]
+fn generator_for_iter_absorbs_inner_stopiteration() {
+    const PROGRAM: &str = r#"
+def inner():
+    yield 1
+    yield 2
+
+def outer():
+    for y in inner():
+        yield y
+
+def run():
+    n = 0
+    while n < 2000:
+        got = list(outer())
+        if got != [1, 2]:
+            return got
+        n = n + 1
+    return "OK"
+
+result = run()
+assert result == "OK", result
+"#;
+    run_on_worker(
+        PROGRAM,
+        "<generator_for_iter_absorbs_inner_stopiteration>",
+        "nested generator FOR_ITER absorption",
+        "generator FOR_ITER leaked StopIteration",
+    );
+}
+
 /// A `bytes` / `bytearray` object's `data` buffer is a GC-managed leaf storage
 /// box (off-GC storage): `bytes_object_custom_trace` /
 /// `bytearray_object_custom_trace` grey it through the `data` field slot, and
@@ -3072,6 +3107,211 @@ while j < 20:
         "rbigint_roots.py",
         "rbigint rooting checks",
         "an rbigint handle read a moved digit array",
+    );
+}
+
+/// A guard-resume bridge once answered `x << n` with a nursery word: the
+/// recycled block's bits, which `MAJIT_GC_NURSERY_POISON` fills with `0xAA`
+/// (`-6148914691236517206` as a signed field). Collecting on every allocation
+/// is what opens that window. The shift must stay the integer product.
+#[test]
+fn long_shift_identity_survives_poisoned_nursery() {
+    const CHILD: &str = "PYRE_LONG_SHIFT_POISON_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "long_shift_identity_survives_poisoned_nursery",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated long-shift nursery regression");
+        assert!(
+            output.status.success(),
+            "a shift read a recycled nursery word:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+poison = -6148914691236517206
+i = 0
+while i < 2000:
+    x = 123456789
+    n = (i % 20) + 1
+    y = x << n
+    assert y != poison, y
+    assert y == x * (1 << n), (y, n)
+    big = (1 << 100) + 3
+    z = big << 5
+    assert z != poison, z
+    assert (z >> 5) == big, z
+    i += 1
+"#,
+        "long_shift_poison.py",
+        "long shift under a poisoned nursery",
+        "x << n must not be a recycled nursery word",
+    );
+}
+
+/// `_match_signature` writes `space.newdict(kwargs=True)` into a `**kwargs`
+/// local even when the call passed no keywords. A positional call must see
+/// that empty dict, not the positional argument and not an unbound local.
+#[test]
+fn positional_call_binds_an_empty_varkeywords_dict() {
+    const CHILD: &str = "PYRE_VARKEYWORDS_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "positional_call_binds_an_empty_varkeywords_dict",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYRE_GC_STRESS_CHILD", "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .output()
+            .expect("run isolated varkeywords regression");
+        assert!(
+            output.status.success(),
+            "a positional call mis-bound **kwargs:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+def f(a, **k):
+    return a + len(k)
+
+def g(**k):
+    return len(k)
+
+i = 0
+total = 0
+while i < 300:
+    total = total + f(i)
+    assert g() == 0
+    i = i + 1
+assert total == 44850
+
+def named(a, **k):
+    return a + len(k)
+
+j = 0
+named_total = 0
+while j < 300:
+    named_total = named_total + named(a=j)
+    j = j + 1
+assert named_total == 44850
+
+def collected(a, **k):
+    return a + k["b"]
+
+c = 0
+collected_total = 0
+while c < 300:
+    collected_total = collected_total + collected(c, b=1)
+    c = c + 1
+assert collected_total == 45150
+
+def only(**k):
+    return k["b"]
+
+o = 0
+only_total = 0
+while o < 300:
+    only_total = only_total + only(b=1)
+    o = o + 1
+assert only_total == 300
+
+def positional_only(a):
+    return a
+
+raised = False
+try:
+    positional_only(b=1)
+except TypeError:
+    raised = True
+assert raised
+"#,
+        "varkeywords_positional.py",
+        "positional **kwargs binding",
+        "a positional call must bind an empty **kwargs dict",
+    );
+}
+
+/// `setup_context` reads `frame.last_instr`. A compiled caller keeps that
+/// coordinate in the virtualizable until the consumer forces it, so
+/// `warnings.warn(..., stacklevel=2)` reports the call in the loop.
+#[test]
+fn warning_stacklevel_reads_the_compiled_caller_line() {
+    run_on_worker(
+        r#"
+import warnings
+import pypyjit
+pypyjit.set_param("threshold=1,function_threshold=1")
+
+def leaf():
+    warnings.warn("hot-line", stacklevel=2)
+
+def main():
+    i = 0
+    while i < 80:
+        leaf()
+        i = i + 1
+
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    main()
+
+assert len(caught) == 80
+assert caught[-1].lineno == 12
+"#,
+        "warn_lineno.py",
+        "warning stacklevel lineno",
+        "a compiled caller warning did not report the call line",
+    );
+}
+
+/// `frame.__repr__` reads `last_instr` through `descr_repr`. A compiled
+/// caller keeps that coordinate in the virtualizable, so both `show()`
+/// calls in the loop name their own lines.
+#[test]
+fn frame_repr_reads_the_compiled_caller_line() {
+    run_on_worker(
+        r#"import sys
+import pypyjit
+pypyjit.set_param("threshold=1,function_threshold=1")
+
+def show():
+    text = repr(sys._getframe(1))
+    return int(text.split("line ", 1)[1].split(",", 1)[0])
+
+def main():
+    i = 0
+    seen = []
+    while i < 40:
+        seen.append(show())
+        seen.append(show())
+        i = i + 1
+    return seen
+
+got = main()
+assert got.count(13) == 40, got
+assert got.count(14) == 40, got
+"#,
+        "frame_repr_lineno.py",
+        "frame repr lineno",
+        "a compiled frame repr did not report the call lines",
     );
 }
 

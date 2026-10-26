@@ -5607,6 +5607,60 @@ mod tests {
         assert_eq!(result[3].opcode, OpCode::Jump);
     }
 
+    /// `OptHeap.force_lazy_sets_for_guard` must call
+    /// `ArrayCachedItem.force_lazy_set`, and that calls `invalidate` before
+    /// `put_field_back_to_info` restores only the writer.
+    ///
+    /// Shape from `test_optimizeheap.py` `test_setfield_of_same_type_clears`
+    /// (a store through another box of the same descr must not answer a
+    /// later load of the first) plus the guard flush in
+    /// `test_duplicate_setfield_residual_guard_1`. The prior load is what
+    /// `HeapOp.produce_op` leaves on the other array: a cached item the
+    /// guard has to drop.
+    ///
+    /// ```text
+    /// i0 = getarrayitem_gc_i(p_reader, 0)
+    /// setarrayitem_gc(p_writer, 0, i_new)
+    /// guard_true(i_cond)
+    /// i1 = getarrayitem_gc_i(p_reader, 0)   # must re-read
+    /// ```
+    #[test]
+    fn test_guard_flushed_setarrayitem_invalidates_other_array() {
+        let d = descr(0);
+        let reader = rooted_inputarg_operand(Type::Ref, 100);
+        let writer = rooted_inputarg_operand(Type::Ref, 200);
+        let new_val = rooted_inputarg_operand(Type::Int, 101);
+        let cond = rooted_inputarg_operand(Type::Int, 102);
+        let idx = Operand::const_from_value(majit_ir::Value::Int(0));
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::GetarrayitemGcI,
+                &[reader.clone(), idx.clone()],
+                d.clone(),
+            ),
+            Op::with_descr(
+                OpCode::SetarrayitemGc,
+                &[writer, idx.clone(), new_val],
+                d.clone(),
+            ),
+            Op::new(OpCode::GuardTrue, &[cond]),
+            Op::with_descr(OpCode::GetarrayitemGcI, &[reader, idx], d),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[101, 102]);
+        let gets = result
+            .iter()
+            .filter(|o| o.opcode == OpCode::GetarrayitemGcI)
+            .count();
+        assert_eq!(
+            gets,
+            2,
+            "a store through another array, flushed by a guard, must drop the \
+             cached item; emitted = {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>(),
+        );
+    }
+
     #[test]
     fn test_setfield_on_distinct_array_loads_forces_prior_lazy_set() {
         // Same shape as `test_setfield_different_objects`, but the two structs

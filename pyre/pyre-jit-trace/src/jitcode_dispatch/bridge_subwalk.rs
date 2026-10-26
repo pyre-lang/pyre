@@ -180,7 +180,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         walk_session.recording_jitcode_index = if sym.jitcode().is_null() {
             -1
         } else {
-            unsafe { (*sym.jitcode()).index as i32 }
+            unsafe { &*sym.jitcode() }.index as i32
         };
         walk_session.recording_opcode_position = position;
     }
@@ -877,6 +877,30 @@ fn capture_reconstructed_parent_blackhole(
     })
 }
 
+/// A paused operand-stack box. Null refs stay (`history.py` `CONST_NULL`).
+/// `GcRef::NO_CONCRETE` is not a box. An int, float, or void box is not an
+/// object pointer; the slot stays present and the box itself is copied onto
+/// `MIFrame.registers_{i,f,r}`.
+fn paused_stack_box(trace_ctx: &TraceCtx, opref: OpRef) -> Option<pyre_object::PyObjectRef> {
+    if opref.is_none() {
+        return None;
+    }
+    match trace_ctx.concrete_of_opref(opref) {
+        Some(majit_ir::Value::Ref(value)) if value != majit_ir::GcRef::NO_CONCRETE => {
+            Some(value.as_usize() as pyre_object::PyObjectRef)
+        }
+        Some(majit_ir::Value::Int(_))
+        | Some(majit_ir::Value::Float(_))
+        | Some(majit_ir::Value::Void) => Some(pyre_object::PY_NULL),
+        _ => None,
+    }
+}
+
+fn paused_register_bank(values: impl IntoIterator<Item = OpRef>) -> Option<RegisterBank> {
+    let bank = RegisterBank::new(values);
+    (!bank.is_empty()).then_some(bank)
+}
+
 pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     root_sym: &Sym,
     trace_ctx: &mut TraceCtx,
@@ -885,7 +909,7 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     if root_sym.jitcode().is_null() {
         return None;
     }
-    let jitcode_index = unsafe { (*root_sym.jitcode()).index as u32 };
+    let jitcode_index = unsafe { &*root_sym.jitcode() }.index as u32;
     // `root_pc` (`resume_data.frames[0].pc`) is already the post-call resume
     // point — the slot the inner frame's result lands in — so its Python
     // coordinate is a direct backtranslation (no `semantic_fallthrough_pc`).
@@ -993,19 +1017,47 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         _ => CallResultSlot::Unknown,
     };
 
+    // The paused root's operand stack, off the slot-indexed semantic mirror
+    // `setup_bridge_sym` decoded. Null refs and unboxed boxes stay. The
+    // result slot is still overwritten when the stack image is captured.
+    // `call_jitcode_pc` stays unset: the callee resumed mid-body, so
+    // re-running the root CALL is not a resume of this frame. `call_pc` is
+    // the opcode that ends at `MIFrame.pc`; `resume_pc` is that pc.
+    let stack_regs = root_sym.registers_r();
+    let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
+    let call_stack_overrides = (root_sym.nlocals()..stack_end)
+        .filter_map(|slot| {
+            let opref = stack_regs.get(slot)?;
+            paused_stack_box(trace_ctx, opref).map(|value| (slot, value))
+        })
+        .collect();
+    let call_pc = root_word.and_then(|resume| {
+        let code = unsafe { &*root_sym.jitcode() }
+            .payload
+            .jitcode
+            .code
+            .as_slice();
+        super::jitcode_op_ending_at(code, resume).map(|op| op.pc)
+    });
+
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_stack_overrides: Vec::new(),
+        call_pc,
+        resume_pc: root_word,
+        call_stack_overrides,
         blackhole,
         resume_coord: ParentResumeCoord::Backxlat(root_pc),
         // Parent-frame words are never branch-tagged; negative tags belong to
         // a branch guard's own top-frame word.
         resume_marker_jit_pc: root_word,
         boxes,
-        registers_r: None,
-        registers_i: None,
-        registers_f: None,
+        // Color-indexed banks (`consume_boxes`). All three carry the cleared
+        // result color (`MIFrame.get_list_of_active_boxes(in_a_call=True)`);
+        // null and non-ref boxes remain.
+        registers_r: paused_register_bank(regs_r.iter().copied()),
+        registers_i: paused_register_bank(regs_i.iter().copied()),
+        registers_f: paused_register_bank(regs_f.iter().copied()),
         frame_state: None,
         caller_py_pc: None,
         result_slot,
@@ -1030,9 +1082,9 @@ pub(crate) fn recipe_parent_frame_from_recipe(
         } else {
             return None;
         };
-    let call_jit_pc = crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
-        .find(|op| op.next_pc == entry && op.opname.starts_with("residual_call"))
-        .map(|op| op.pc);
+    // The recipe word is the post-call resume pc. The CALL is the opcode
+    // that ends there (`MIFrame.pc`); the opcode name is not consulted.
+    let call_pc = super::jitcode_op_ending_at(pjc.jitcode.code.as_slice(), entry).map(|op| op.pc);
     // `rebuild_from_resumedata` (`resume.py`) resumes the level at its encoded
     // pc (`setup_resume_at_op`) whichever call op it paused after.
     let resume_marker_jit_pc = pjc
@@ -1197,7 +1249,9 @@ pub(crate) fn recipe_parent_frame_from_recipe(
 
     Some(InlineParentFrame {
         jitcode_index: recipe.jitcode_index as u32,
-        call_jitcode_pc: call_jit_pc,
+        call_jitcode_pc: None,
+        call_pc,
+        resume_pc: Some(entry),
         call_stack_overrides: Vec::new(),
         blackhole,
         // The recipe's resolved word was `trivia_normalized_py_pc_for_jitcode_pc(jitcode_index,
@@ -1722,6 +1776,8 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             pending_tails.push(InlineParentFrame {
                 jitcode_index: parent_recipe.jitcode_index as u32,
                 call_jitcode_pc: None,
+                call_pc: None,
+                resume_pc: Some(resume_pc),
                 call_stack_overrides: Vec::new(),
                 blackhole: None,
                 resume_coord: ParentResumeCoord::Backxlat(resume_pc),
@@ -2250,6 +2306,17 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // this call replaced an inner frame's image with one rooted here.
             let already_latched = audit.then(abort_blackhole_latched);
             let accepted = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
+            // The carrier frame keeps locals in its shadow
+            // (`InlineConcreteFrameGuard` is not installed on this walk).
+            // `virtualizable.py write_boxes` publishes that region before the
+            // blackhole reads the live frame. The image stays latched either way.
+            if accepted {
+                let _ = flush_callee_locals_region(
+                    &sub_wc.frame_state,
+                    concrete_callee_frame as *mut pyre_interpreter::PyFrame,
+                    callee_pjc.metadata.portal_frame_reg,
+                );
+            }
             if let Some(already_latched) = already_latched {
                 eprintln!(
                     "[bridge-latch] outcome=err already_latched={already_latched} complete_image={} accepted={accepted} stop_pc={} error={error:?}",

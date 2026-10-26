@@ -9992,6 +9992,10 @@ fn live_concrete_addr(cache: &BridgeVirtualCache<'_>, vidx: usize, fallback: i64
     cache
         .get_concrete_ptr(vidx)
         .map(|gcref| gcref.0 as i64)
+        // `get_concrete_ptr` returns a stored `GcRef(0)` when the root is
+        // unpublished and the cache holds the null `bh_call_r` wrote
+        // (`BridgeVirtualCache::get_concrete_ptr`).
+        .filter(|&addr| addr != 0)
         .unwrap_or(fallback)
 }
 

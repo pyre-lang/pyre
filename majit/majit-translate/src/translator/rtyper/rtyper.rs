@@ -1804,7 +1804,9 @@ impl RPythonTyper {
         }
 
         // `block.operations[:] = newops` — replace in place, matching
-        // upstream's slice assignment.
+        // upstream's slice assignment. Upstream `specialize_block` then
+        // calls `insert_link_conversions` and lets the error leave
+        // `specialize` / `specialize_more_blocks` with no handler.
         let new_ops_vec = std::mem::take(&mut newops.borrow_mut().ops);
         block.borrow_mut().operations = new_ops_vec;
         block.borrow_mut().renamevariables(&varmapping);
@@ -2361,12 +2363,13 @@ impl RPythonTyper {
                     .ok_or_else(|| TyperError::message("raw_store: missing value repr"))?;
                 let v_value = hop.inputarg(&r_value, 2)?;
                 hop.exception_cannot_occur()?;
-                // `_LLOpEntry.specialize_call` passes
-                // `resulttype=hop.r_result.lowleveltype`. For Void that
-                // is still a typed result (`lltype_to_annotation(Void)`
-                // is `s_None`), so `genop` returns a Variable — not
-                // `resulttype=None`, which would hit
-                // `translate_no_return_value` and reject `s_None`.
+                // `Entry.specialize_call` passes
+                // `resulttype=hop.r_result.lowleveltype`.  For `raw_store`
+                // that type is `Void` (`lltype_to_annotation(Void)` is
+                // `s_None`), and `genop` then returns the result Variable.
+                // `resulttype=None` (`GenopResult::Void`) returns no
+                // Variable, and `translate_no_return_value` rejects every
+                // result that is not `s_ImpossibleValue`.
                 let result_lltype = hop
                     .r_result
                     .borrow()

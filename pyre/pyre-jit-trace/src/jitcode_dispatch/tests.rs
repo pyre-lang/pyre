@@ -26,6 +26,8 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
             resume_pc: 0,
@@ -130,6 +132,8 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let parent = |word: usize| InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
         call_stack_overrides: vec![(0, word as pyre_object::PyObjectRef)],
         blackhole: Some(InlineParentBlackhole {
             resume_pc: 0,
@@ -425,6 +429,8 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
     InlineParentFrame {
         jitcode_index: 0,
         call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
         call_stack_overrides: Vec::new(),
         blackhole: None,
         resume_coord: ParentResumeCoord::Backxlat(0),
@@ -1908,6 +1914,8 @@ fn portal_may_force_records_the_callee_execution_context() {
         vec![InlineParentFrame {
             jitcode_index: jitcode_index as u32,
             call_jitcode_pc: None,
+            call_pc: None,
+            resume_pc: None,
             call_stack_overrides: Vec::new(),
             blackhole: None,
             resume_coord: ParentResumeCoord::Backxlat(0),
@@ -12860,23 +12868,115 @@ fn residual_call_r_r_with_elidable_cannot_raise_records_callpurer_no_guard() {
 }
 
 // When the walk is the authoritative concrete leg,
-// `try_execute_residual_call_via_executor` runs a `CallMayForce*`
-// residual call concretely (RPython runs every residual_call during
-// tracing) and stamps the recorded result OpRef so a downstream
-// `goto_if_not` reads a concrete value.  Gated OFF by
-// `is_authoritative_executor` so arm/shadow/probe walks never
-// re-execute (which would double side effects / corrupt the live
-// heap `cut_trace` cannot roll back).
+// `try_execute_residual_call_via_executor_inner` runs the residual
+// concretely (`executor.execute_varargs`) and the `record_after_execute`
+// hook records the result. Gated OFF by `is_authoritative_executor` so
+// arm/shadow/probe walks never re-execute (which would double side
+// effects / corrupt the live heap `cut_trace` cannot roll back).
 extern "C" fn add2_for_walker_test(a: i64, b: i64) -> i64 {
     a.wrapping_add(b)
 }
 
+/// `execute_varargs` → `execute_and_record_varargs` for one ordinary residual.
+/// The hook is `record_ordinary_residual_after_execute` (`_record_helper_varargs`,
+/// then `record_result_of_call_pure` when a `CALL_PURE_*` returned a value).
+fn execute_ordinary_via_hook(
+    wc: &mut WalkContext<'_, '_, crate::state::PyreSym>,
+    call_opcode: majit_ir::OpCode,
+    allboxes: &[OpRef],
+    descr: &DescrRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+) -> Result<(ResidualExecOutcome, OpRef), DispatchError> {
+    let patch_pos = wc.trace_ctx.get_trace_position();
+    let ei = call_descr.get_extra_info().clone();
+    let descr = descr.clone();
+    let funcptr = allboxes[0];
+    let boxes = allboxes.to_vec();
+    let mut born = OpRef::NONE;
+    let exec = try_execute_residual_call_via_executor_inner(
+        wc,
+        call_opcode,
+        &boxes,
+        call_descr,
+        0,
+        None,
+        false,
+        Some(&mut |ctx, value| {
+            let (rec, _wb) = record_ordinary_residual_after_execute(
+                ctx,
+                call_opcode,
+                funcptr,
+                &boxes,
+                descr.clone(),
+                &ei,
+                patch_pos,
+                value,
+                false,
+                true,
+            );
+            born = rec;
+            Ok(rec)
+        }),
+    )?;
+    Ok((exec, born))
+}
+
+/// Forces callers record in the hook after `vrefs_after_residual_call`
+/// (`direct_call_may_force` / `history.record_nospec`). `record == false`
+/// passes no hook, so a decline or an escape records nothing here.
+fn execute_may_force_via_hook(
+    wc: &mut WalkContext<'_, '_, crate::state::PyreSym>,
+    allboxes: &[OpRef],
+    descr: &DescrRef,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    op_pc: usize,
+    record: bool,
+) -> Result<(ResidualExecOutcome, OpRef), DispatchError> {
+    let boxes = allboxes.to_vec();
+    let descr = descr.clone();
+    let mut born = OpRef::NONE;
+    let exec = if record {
+        try_execute_residual_call_via_executor_inner(
+            wc,
+            majit_ir::OpCode::CallMayForceI,
+            &boxes,
+            call_descr,
+            op_pc,
+            None,
+            false,
+            Some(&mut |ctx, value| {
+                let rec = ctx.trace_ctx.record_op_with_descr_value(
+                    majit_ir::OpCode::CallMayForceI,
+                    &boxes,
+                    descr.clone(),
+                    value,
+                );
+                born = rec;
+                Ok(rec)
+            }),
+        )?
+    } else {
+        try_execute_residual_call_via_executor_inner(
+            wc,
+            majit_ir::OpCode::CallMayForceI,
+            &boxes,
+            call_descr,
+            op_pc,
+            None,
+            false,
+            None,
+        )?
+    };
+    Ok((exec, born))
+}
+
 #[test]
 fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
-    // `MIFrame.execute_varargs` executes the CALL first and only then patches
-    // it to CALL_PURE / handles the possible exception (`pyjitpl.py`).  The
-    // `EF_ELIDABLE_OR_MEMORYERROR` bigint helpers use this exact shape: they
-    // must not be left recorded-only merely because their opcode is CallPureI.
+    // `MIFrame.execute_varargs` runs the helper first. Every argument is a
+    // `Const` and the call does not raise, so `record_result_of_call_pure`
+    // cuts the `CALL_PURE_I` back out and the result is the constant.
+    // `EF_ELIDABLE_OR_MEMORYERROR` still executes; it is not left recorded-only
+    // because the opcode is `CallPureI`.
     let mut tc = fresh_trace_ctx();
     let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
     let arg0 = tc.const_int(40);
@@ -12888,7 +12988,8 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         Type::Int,
         majit_ir::ExtraEffect::ElidableOrMemoryError,
     );
-    let recorded = tc.record_op_with_descr(majit_ir::OpCode::CallPureI, &allboxes, descr.clone());
+    let ops_before = tc.num_ops();
+    let call_descr = descr.as_call_descr().expect("CallPureI descr");
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -12932,20 +13033,23 @@ fn elidable_or_memoryerror_call_executes_and_stamps_its_result() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let result = try_execute_residual_call_via_executor(
+    let (result, born) = execute_ordinary_via_hook(
         &mut wc,
         majit_ir::OpCode::CallPureI,
         &allboxes,
-        descr.as_call_descr().expect("CallPureI descr"),
-        recorded,
-        0,
-        None,
-        false,
-    );
+        &descr,
+        call_descr,
+    )
+    .expect("the executor must not abort the walk");
     drop(wc);
 
-    assert_eq!(result, Ok(ResidualExecOutcome::Executed(Ok(42))));
-    assert_eq!(tc.box_value(recorded), Some(majit_ir::Value::Int(42)));
+    assert_eq!(result, ResidualExecOutcome::Executed(Ok(42)));
+    assert_eq!(born.inline_const_to_value(), Some(majit_ir::Value::Int(42)));
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
+        "all-const CALL_PURE_I is cut back out by record_result_of_call_pure",
+    );
 }
 
 extern "C" fn raising_add2_for_walker_test(_a: i64, _b: i64) -> i64 {
@@ -12953,11 +13057,11 @@ extern "C" fn raising_add2_for_walker_test(_a: i64, _b: i64) -> i64 {
     0
 }
 
-/// One `EF_ELIDABLE_CAN_RAISE` residual taken through the dispatchers'
-/// sequence: record, execute, `record_result_of_executed_pure_call`, then
-/// `exc = exc and not isinstance(op, Const)`.  Returns the result OpRef,
-/// whether `GUARD_NO_EXCEPTION` is still owed, the executor's outcome and how
-/// many ops the sequence left in the trace.
+/// One `EF_ELIDABLE_CAN_RAISE` residual taken through `execute_varargs`:
+/// the helper runs, then `_record_helper_varargs` and, when it did not
+/// raise, `record_result_of_call_pure`. `exc = exc and not isinstance(op, Const)`.
+/// Returns the result OpRef, whether `GUARD_NO_EXCEPTION` is still owed, the
+/// executor's outcome and how many ops the sequence left in the trace.
 fn run_elidable_can_raise_residual(
     tc: &mut TraceCtx,
     func: extern "C" fn(i64, i64) -> i64,
@@ -13021,41 +13125,9 @@ fn run_elidable_can_raise_residual(
         select_residual_call_opcode(call_descr.get_extra_info(), 'i', "test");
     assert_eq!(call_opcode, majit_ir::OpCode::CallPureI);
     assert!(can_raise, "EF_ELIDABLE_CAN_RAISE owes the exception check");
-    let patch_pos = wc.trace_ctx.get_trace_position();
-    let recorded = wc
-        .trace_ctx
-        .record_op_with_descr(call_opcode, &allboxes, descr.clone());
-    // The cannot-raise fast path leaves a can-raise callee to the executor.
-    let recorded = try_fold_pure_call_via_executor(
-        &mut wc,
-        call_opcode,
-        &allboxes,
-        call_descr,
-        descr.clone(),
-        patch_pos,
-        recorded,
-    );
-    let exec = try_execute_residual_call_via_executor(
-        &mut wc,
-        call_opcode,
-        &allboxes,
-        call_descr,
-        recorded,
-        0,
-        None,
-        false,
-    )
-    .expect("the executor must not abort the walk");
-    let result = record_result_of_executed_pure_call(
-        &mut wc,
-        call_opcode,
-        &allboxes,
-        call_descr,
-        descr.clone(),
-        patch_pos,
-        recorded,
-        exec,
-    );
+    let (exec, result) =
+        execute_ordinary_via_hook(&mut wc, call_opcode, &allboxes, &descr, call_descr)
+            .expect("the executor must not abort the walk");
     let can_raise = can_raise && result.inline_const_to_value().is_none();
     drop(wc);
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
@@ -13108,7 +13180,7 @@ fn elidable_can_raise_call_follows_record_result_of_call_pure() {
     assert_eq!(tc.opcode_of(result), Some(majit_ir::OpCode::CallPureI));
 }
 
-fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) {
+fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef) {
     let funcbox = tc.const_int(add2_for_walker_test as *const () as i64);
     let arg0 = tc.const_int(40);
     let arg1 = tc.const_int(2);
@@ -13119,15 +13191,13 @@ fn may_force_call_i_fixture(tc: &mut TraceCtx) -> ([OpRef; 3], DescrRef, OpRef) 
         Type::Int,
         majit_ir::ExtraEffect::CanRaise,
     );
-    let recorded =
-        tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
-    (allboxes, descr, recorded)
+    (allboxes, descr)
 }
 
 #[test]
 fn authoritative_walker_executes_may_force_call_and_stamps_result() {
     let mut tc = fresh_trace_ctx();
-    let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
+    let (allboxes, descr) = may_force_call_i_fixture(&mut tc);
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
@@ -13172,28 +13242,23 @@ fn authoritative_walker_executes_may_force_call_and_stamps_result() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let _ = try_execute_residual_call_via_executor(
-        &mut wc,
-        majit_ir::OpCode::CallMayForceI,
-        &allboxes,
-        call_descr,
-        recorded,
-        0,
-        None,
-        false,
-    );
+    let (_result, born) =
+        execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 0, true)
+            .expect("the executor must not abort the walk");
     drop(wc);
     assert_eq!(
-        tc.box_value(recorded),
+        tc.box_value(born),
         Some(majit_ir::Value::Int(42)),
-        "authoritative walker must execute add2_for_walker_test(40, 2) and stamp 42",
+        "authoritative walker must execute add2_for_walker_test(40, 2); the hook records 42",
     );
+    assert_eq!(tc.opcode_of(born), Some(majit_ir::OpCode::CallMayForceI));
 }
 
 #[test]
 fn non_authoritative_walker_does_not_execute_may_force_call() {
     let mut tc = fresh_trace_ctx();
-    let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
+    let (allboxes, descr) = may_force_call_i_fixture(&mut tc);
+    let ops_before = tc.num_ops();
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
@@ -13238,20 +13303,21 @@ fn non_authoritative_walker_does_not_execute_may_force_call() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let _ = try_execute_residual_call_via_executor(
-        &mut wc,
-        majit_ir::OpCode::CallMayForceI,
-        &allboxes,
-        call_descr,
-        recorded,
-        0,
-        None,
-        false,
-    );
+    let (result, born) =
+        execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 0, true)
+            .expect("a decline is an outcome, not a walk abort");
     drop(wc);
     assert_eq!(
-        tc.box_value(recorded),
-        None,
+        result,
+        ResidualExecOutcome::Declined(ResidualDecline::Symbolic)
+    );
+    assert!(
+        born.is_none(),
+        "non-authoritative walk must not run the record hook",
+    );
+    assert_eq!(
+        tc.num_ops(),
+        ops_before,
         "non-authoritative walk (arm/shadow/probe) must NOT execute the may-force call",
     );
 }
@@ -13272,8 +13338,6 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
     let funcbox = tc.const_int(raises_for_walker_test as *const () as i64);
     let allboxes = [funcbox];
     let descr = make_call_descr(6, vec![], Type::Int, majit_ir::ExtraEffect::CanRaise);
-    let recorded =
-        tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
@@ -13318,16 +13382,9 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let _ = try_execute_residual_call_via_executor(
-        &mut wc,
-        majit_ir::OpCode::CallMayForceI,
-        &allboxes,
-        call_descr,
-        recorded,
-        0,
-        None,
-        false,
-    );
+    let (_result, born) =
+        execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 0, true)
+            .expect("a raised residual is Executed(Err), not a walk abort");
     let captured_exc = wc.last_exc_value();
     let captured_concrete = wc.last_exc_value_concrete();
     let class_of_last_exc_is_const = wc.fbw_mode.class_of_last_exc_is_const;
@@ -13348,10 +13405,14 @@ fn authoritative_walker_transcribes_may_force_raise_to_last_exc() {
         "a residual exception has not had its class proven by a guard yet",
     );
     assert_eq!(
-        tc.box_value(recorded),
+        tc.opcode_of(born),
+        Some(majit_ir::OpCode::CallMayForceI),
+        "direct_call_may_force still records the call when the helper raises",
+    );
+    assert_eq!(
+        tc.box_value(born),
         None,
-        "the raising path does not stamp `recorded`; the exception routes \
-             via last_exc_value (only the normal-return path stamps a result)",
+        "a raised call is recorded with no value; record_result_of_call_pure is skipped",
     );
     assert_eq!(
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
@@ -13392,7 +13453,7 @@ fn may_force_with_active_vable_executes_and_clears_token() {
     let mut tc = fresh_trace_ctx();
     let mut vable_buf = vec![0u8; 65536];
     bind_fake_vable(&mut tc, &mut vable_buf);
-    let (allboxes, descr, recorded) = may_force_call_i_fixture(&mut tc);
+    let (allboxes, descr) = may_force_call_i_fixture(&mut tc);
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
@@ -13437,25 +13498,18 @@ fn may_force_with_active_vable_executes_and_clears_token() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let result = try_execute_residual_call_via_executor(
-        &mut wc,
-        majit_ir::OpCode::CallMayForceI,
-        &allboxes,
-        call_descr,
-        recorded,
-        0,
-        None,
-        false,
-    );
+    let (result, born) =
+        execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 0, true)
+            .expect("the executor must not abort the walk");
     drop(wc);
     assert!(
-        matches!(result, Ok(ResidualExecOutcome::Executed(Ok(_)))),
+        matches!(result, ResidualExecOutcome::Executed(Ok(_))),
         "non-forcing may-force call with active vable must execute normally",
     );
     assert_eq!(
-        tc.box_value(recorded),
+        tc.box_value(born),
         Some(majit_ir::Value::Int(42)),
-        "active-vable may-force call must execute and stamp the result",
+        "active-vable may-force call records the result from the hook",
     );
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let token = u64::from_le_bytes(
@@ -13500,8 +13554,6 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         Type::Int,
         majit_ir::ExtraEffect::CanRaise,
     );
-    let recorded =
-        tc.record_op_with_descr(majit_ir::OpCode::CallMayForceI, &allboxes, descr.clone());
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
     let call_descr = descr.as_call_descr().expect("CallI descr");
@@ -13546,16 +13598,7 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    let result = try_execute_residual_call_via_executor(
-        &mut wc,
-        majit_ir::OpCode::CallMayForceI,
-        &allboxes,
-        call_descr,
-        recorded,
-        7,
-        None,
-        false,
-    );
+    let result = execute_may_force_via_hook(&mut wc, &allboxes, &descr, call_descr, 7, false);
     drop(wc);
     assert!(
         matches!(
@@ -13564,6 +13607,343 @@ fn may_force_vable_escape_surfaces_typed_abort() {
         ),
         "a callee that forces the vable must surface VableEscapedDuringResidualCall, got {result:?}",
     );
+}
+
+/// Address of a `JitVirtualRef.virtual_token` the release-gil callee clears.
+static RELEASE_GIL_FORCED_VREF_TOKEN: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+extern "C" fn forces_folded_vref_for_release_gil(a: i64, b: i64) -> i64 {
+    let addr = RELEASE_GIL_FORCED_VREF_TOKEN.load(std::sync::atomic::Ordering::SeqCst);
+    if addr != 0 {
+        unsafe {
+            *(addr as *mut *mut u8) = std::ptr::null_mut();
+        }
+    }
+    a.wrapping_add(b)
+}
+
+/// `direct_call_release_gil` records `CALL_RELEASE_GIL_*` after
+/// `vrefs_after_residual_call`. A folded ancestor whose vref the callee
+/// forces spills `SETARRAYITEM_GC` (`optimize_VIRTUAL_REF_FINISH`) before
+/// that call.
+#[test]
+fn release_gil_forcing_stores_precede_call() {
+    let mut tc = fresh_trace_ctx();
+    let mut vable_buf = vec![0u8; 65536];
+    let ancestor_buf = vec![0u8; 65536];
+    bind_fake_vable(&mut tc, &mut vable_buf);
+    let frame_box = tc.const_ref(ancestor_buf.as_ptr() as i64);
+    let (_vref_op, vref_ptr) = tc.opimpl_virtual_ref(frame_box, ancestor_buf.as_ptr() as usize);
+    let token_addr = vref_ptr as usize
+        + std::mem::offset_of!(majit_metainterp::virtualref::JitVirtualRef, virtual_token);
+    RELEASE_GIL_FORCED_VREF_TOKEN.store(token_addr, std::sync::atomic::Ordering::SeqCst);
+    let slot = tc.const_int(7);
+    let mut shadow = CalleeLocalsShadow {
+        fold_frame_reg: 0,
+        frame_box,
+        concrete_frame: ancestor_buf.as_ptr() as usize,
+        ..Default::default()
+    };
+    shadow.set_opref(0, slot);
+    let parent_state = WalkFrameState::new(WalkFrameStateData {
+        callee_shadow: Some(shadow),
+        concrete_registers_r: Vec::new(),
+        outer_active_boxes: Vec::new(),
+        vstack_boxes: Vec::new(),
+        vstack_last_ref: OpRef::NONE,
+        vstack_reorder_saved: None,
+        ..Default::default()
+    });
+    let parent = InlineParentFrame {
+        jitcode_index: 0,
+        call_jitcode_pc: None,
+        call_pc: None,
+        resume_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(0),
+        resume_marker_jit_pc: None,
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: Some(parent_state),
+        caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
+    };
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let _inline = InlineFrameGuard::enter(&session, 1, false, vec![parent]);
+    let mut effect = majit_ir::EffectInfo::default();
+    effect.extraeffect = majit_ir::ExtraEffect::CanRaise;
+    effect.call_release_gil_target = (forces_folded_vref_for_release_gil as *const () as u64, 0);
+    let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
+        9101,
+        vec![Type::Int, Type::Int],
+        Type::Int,
+        false,
+        std::mem::size_of::<usize>(),
+        effect,
+    ));
+    let call_descr = descr.as_call_descr().expect("release-gil call descr");
+    let ei = call_descr.get_extra_info();
+    let funcbox = tc.const_int(forces_folded_vref_for_release_gil as *const () as i64);
+    let allboxes = [funcbox, tc.const_int(40), tc.const_int(2)];
+    let regs_i = vec![OpRef::NONE];
+    let regs_r: Vec<OpRef> = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let outcome = direct_call_release_gil(
+        &mut wc,
+        ei,
+        &allboxes,
+        descr.clone(),
+        call_descr,
+        'i',
+        0,
+        0,
+        1,
+        "release_gil_forced_shadow",
+    );
+    drop(wc);
+    let opcodes: Vec<_> = tc.ops().iter().map(|op| op.opcode).collect();
+    let call_idx = opcodes
+        .iter()
+        .position(|op| *op == majit_ir::OpCode::CallReleaseGilI)
+        .unwrap_or(usize::MAX);
+    let store_idx = opcodes
+        .iter()
+        .position(|op| *op == majit_ir::OpCode::SetarrayitemGc)
+        .unwrap_or(usize::MAX);
+    let finish_idx = opcodes
+        .iter()
+        .position(|op| *op == majit_ir::OpCode::VirtualRefFinish)
+        .unwrap_or(usize::MAX);
+    assert!(
+        finish_idx < store_idx && store_idx < call_idx,
+        "VIRTUAL_REF_FINISH then SETARRAYITEM_GC must precede CALL_RELEASE_GIL_I \
+         (direct_call_release_gil after vrefs_after_residual_call); \
+         outcome={outcome:?} finish={finish_idx} store={store_idx} call={call_idx} ops={opcodes:?}"
+    );
+}
+
+static CALL_I_DISPATCH_RUNS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static CALL_PURE_CONST_DISPATCH_RUNS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+static CALL_PURE_NONCONST_DISPATCH_RUNS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+extern "C" fn counted_add2_call_i(a: i64, b: i64) -> i64 {
+    CALL_I_DISPATCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    a.wrapping_add(b)
+}
+
+extern "C" fn counted_add2_call_pure_const(a: i64, b: i64) -> i64 {
+    CALL_PURE_CONST_DISPATCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    a.wrapping_add(b)
+}
+
+extern "C" fn counted_add2_call_pure_nonconst(a: i64, b: i64) -> i64 {
+    CALL_PURE_NONCONST_DISPATCH_RUNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    a.wrapping_add(b)
+}
+
+/// Drive `residual_call_ir_i/iIRd>i` through `step`. Two int args, empty ref
+/// list, descr 0, dst register 3. `nonconst_arg0` records an `IntAdd` and
+/// stamps 40 so the pure fold cannot treat every argument as a `Const`.
+fn drive_residual_call_ir_i(
+    func: extern "C" fn(i64, i64) -> i64,
+    extra: majit_ir::ExtraEffect,
+    nonconst_arg0: bool,
+) -> (TraceCtx, OpRef, usize) {
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(func as *const () as i64);
+    let arg0 = if nonconst_arg0 {
+        let box_ = dummy_int_add_box(&mut tc);
+        tc.set_opref_concrete(box_, majit_ir::Value::Int(40));
+        box_
+    } else {
+        tc.const_int(40)
+    };
+    let arg1 = tc.const_int(2);
+    let regs_i = [funcbox, arg0, arg1, OpRef::NONE];
+    let descr = make_call_descr(77, vec![Type::Int, Type::Int], Type::Int, extra);
+    let descr_pool = vec![descr];
+    let residual_byte = *insns_opname_to_byte()
+        .get("residual_call_ir_i/iIRd>i")
+        .expect("`residual_call_ir_i/iIRd>i` must be in the insns table");
+    // funcptr i0, i-list len 2 (i1, i2), r-list len 0, descr 0, dst i3.
+    let code = [residual_byte, 0, 2, 1, 2, 0, 0, 0, 3];
+    let ops_before = tc.num_ops();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let (outcome, next_pc) =
+        step(&code, 0, &mut wc).expect("residual_call_ir_i/iIRd>i must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, code.len());
+    let dst = wc.registers_i.get(3).expect("dst register");
+    // `wc` still holds `&mut tc`. Read the count through that borrow.
+    let new_ops = wc.trace_ctx.num_ops() - ops_before;
+    drop(wc);
+    (tc, dst, new_ops)
+}
+
+/// Plain `CALL_I` (`EF_CANNOT_RAISE`) through `do_residual_call` /
+/// `execute_and_record_varargs`. The helper runs once. The recorded op's
+/// FrontendOp value is 42: `record_op_with_descr_value` writes it when the
+/// hook records, and the Ok arm refreshes that same slot, so the two writes
+/// are not separable after the call returns.
+#[test]
+fn ordinary_call_i_executes_then_records_the_result() {
+    CALL_I_DISPATCH_RUNS.swap(0, std::sync::atomic::Ordering::SeqCst);
+    let (mut tc, dst, new_ops) = drive_residual_call_ir_i(
+        counted_add2_call_i,
+        majit_ir::ExtraEffect::CannotRaise,
+        false,
+    );
+    assert_eq!(
+        CALL_I_DISPATCH_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the helper runs once, inside execute_residual_call",
+    );
+    assert_eq!(new_ops, 1, "one CALL_I and no GUARD_NO_EXCEPTION");
+    let born = tc
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::CallI)
+        .expect("CALL_I")
+        .get_value();
+    assert_eq!(born, Some(majit_ir::Value::Int(42)));
+    assert_eq!(tc.box_value(dst), Some(majit_ir::Value::Int(42)));
+    let opcodes: Vec<_> = tc.ops().iter().map(|op| op.opcode).collect();
+    assert!(
+        opcodes.iter().all(|op| *op != majit_ir::OpCode::CallPureI),
+        "a non-elidable residual stays CALL_I, got {opcodes:?}",
+    );
+}
+
+/// Cannot-raise `CALL_PURE_I`, every argument a `Const`.
+/// `record_result_of_call_pure` cuts the call and the dst is the constant.
+/// That arm does not store `call_pure_results`. The field is `pub(crate)` on
+/// `TraceCtx` in majit-metainterp, so this crate cannot read it either way.
+#[test]
+fn call_pure_i_all_const_executes_once_and_cuts_the_call() {
+    CALL_PURE_CONST_DISPATCH_RUNS.swap(0, std::sync::atomic::Ordering::SeqCst);
+    let (mut tc, dst, new_ops) = drive_residual_call_ir_i(
+        counted_add2_call_pure_const,
+        majit_ir::ExtraEffect::ElidableCannotRaise,
+        false,
+    );
+    assert_eq!(
+        CALL_PURE_CONST_DISPATCH_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(new_ops, 0, "the CALL_PURE_I is cut back out");
+    let opcodes: Vec<_> = tc.ops().iter().map(|op| op.opcode).collect();
+    assert!(
+        opcodes
+            .iter()
+            .all(|op| { !matches!(op, majit_ir::OpCode::CallPureI | majit_ir::OpCode::CallI) }),
+        "no call op remains, got {opcodes:?}",
+    );
+    assert_eq!(dst.inline_const_to_value(), Some(majit_ir::Value::Int(42)));
+}
+
+/// Cannot-raise `CALL_PURE_I` with one non-`Const` argument. One `CALL_PURE_I`
+/// remains and carries 42. `record_result_of_call_pure` stores
+/// `call_pure_results` on this arm; the map is `pub(crate)` in
+/// majit-metainterp and has no getter this crate can call.
+#[test]
+fn call_pure_i_nonconst_records_one_call_with_the_result() {
+    CALL_PURE_NONCONST_DISPATCH_RUNS.swap(0, std::sync::atomic::Ordering::SeqCst);
+    let (mut tc, dst, new_ops) = drive_residual_call_ir_i(
+        counted_add2_call_pure_nonconst,
+        majit_ir::ExtraEffect::ElidableCannotRaise,
+        true,
+    );
+    assert_eq!(
+        CALL_PURE_NONCONST_DISPATCH_RUNS.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+    );
+    assert_eq!(new_ops, 1);
+    assert_eq!(dst.inline_const_to_value(), None);
+    assert_eq!(tc.box_value(dst), Some(majit_ir::Value::Int(42)));
+    assert_eq!(tc.opcode_of(dst), Some(majit_ir::OpCode::CallPureI));
+    let born = tc
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::CallPureI)
+        .expect("CALL_PURE_I")
+        .get_value();
+    assert_eq!(born, Some(majit_ir::Value::Int(42)));
 }
 
 /// A `jit.not_in_trace` callee that returns normally.
@@ -19126,6 +19506,179 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
 }
 
+/// `opimpl_loop_header` only stamps `seen_loop_header_for_jdindex`.
+/// A later Python-opcode boundary records `DEBUG_MERGE_POINT` and leaves
+/// the stamp set. `opimpl_jit_merge_point` is what consumes it and closes
+/// (`pyjitpl.py`), on the marker `handle_jit_marker__jit_merge_point`
+/// emits at the loop-header block.
+#[test]
+fn loop_header_stamp_is_consumed_by_jit_merge_point() {
+    use crate::state::PyreSym;
+
+    let lh_byte = *insns_opname_to_byte()
+        .get("loop_header/i")
+        .expect("`loop_header/i` must be in insns table");
+    let goto_byte = *insns_opname_to_byte()
+        .get("goto/L")
+        .expect("`goto/L` must be in insns table");
+    let jmp_byte = *insns_opname_to_byte()
+        .get("jit_merge_point/cIRFIRF")
+        .expect("`jit_merge_point/cIRFIRF` must be in insns table");
+    // loop_header/i (2) + goto/L (3) + jit_merge_point/cIRFIRF with empty reds.
+    // The goto is an exact `py_floor_by_jit_pc` key sitting between the stamp
+    // and the marker, so a hand close on the synthesized boundary would fire
+    // there.
+    let goto_pc = 2u32;
+    let merge_pc = 5usize;
+    let bytes = vec![
+        lh_byte,
+        0x02, // i2 = jdindex
+        goto_byte,
+        merge_pc as u8,
+        (merge_pc >> 8) as u8,
+        jmp_byte,
+        0x00, // c: jdindex
+        0x02,
+        0x00,
+        0x01, // gi: [i0 = next_instr, i1 = is_being_profiled]
+        0x01,
+        0x00, // gr: [r0 = pycode]
+        0x00, // gf
+        0x00, // ri
+        0x00, // rr
+        0x00, // rf
+    ];
+    let code_obj = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let w_code = pyre_interpreter::w_code_new(Box::into_raw(Box::new(code_obj)) as *const ());
+    let raw_code =
+        unsafe { pyre_interpreter::w_code_get_ptr(w_code) as *const pyre_interpreter::CodeObject };
+    pyre_interpreter::register_live_code_wrapper(raw_code as *const (), w_code);
+    assert!(
+        !pyre_interpreter::live_code_wrapper(raw_code as *const ()).is_null(),
+        "the synthesized boundary bails without a live code wrapper"
+    );
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("loop_header_merge_point");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: bytes,
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.built_as_portal = true;
+    // Offset 0 keeps `containing_py_pc_for_jitcode_pc` defined for the
+    // header byte. Offset 2 is the goto, the boundary between the stamp
+    // and the marker.
+    pyjit.metadata.py_floor_by_jit_pc = vec![(0, 0), (goto_pc, 9)];
+    let pyjit = std::sync::Arc::new(pyjit);
+    let installed =
+        crate::state::install_jitcode_for(w_code as *const (), std::sync::Arc::clone(&pyjit))
+            as *const crate::state::JitCode;
+    assert!(!installed.is_null());
+    let code = pyjit.jitcode.code.as_slice();
+
+    let pycode_ptr = 0x1_0000usize;
+    let green_key_typed = crate::driver::make_green_key_typed(pycode_ptr as *const (), 42, false);
+    let green_key = green_key_typed.get_uhash();
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
+    tc.set_green_key_values(green_key_typed.clone());
+    tc.seed_compile_and_run_once_merge_point();
+    assert!(
+        tc.has_merge_point_with_shape_assert(&green_key_typed, 0),
+        "seed must match the empty red list so the merge point closes"
+    );
+    let next_instr = tc.const_int(42);
+    let is_being_profiled = tc.const_int(0);
+    let jdindex = tc.const_int(0);
+    let pycode = tc.const_ref(pycode_ptr as i64);
+    let regs_i = [next_instr, is_being_profiled, jdindex];
+    let regs_r = [pycode];
+    let mut snapshot_sym = PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.jitcode = installed;
+    let mut fbw_mode = test_fbw_mode();
+    fbw_mode.snapshot_sym = &snapshot_sym;
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode,
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let ops_before_header = wc.trace_ctx.num_ops();
+    let (header, header_next) = step(code, 0, &mut wc).expect("loop_header must dispatch");
+    assert_eq!(header, DispatchOutcome::Continue);
+    assert_eq!(header_next, goto_pc as usize);
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
+    assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
+    assert!(
+        wc.trace_ctx.num_ops() > ops_before_header,
+        "the header byte is a floor key, so debug_merge_point must record"
+    );
+
+    let ops_before_boundary = wc.trace_ctx.num_ops();
+    let (boundary, boundary_next) =
+        step(code, goto_pc as usize, &mut wc).expect("floor boundary must dispatch");
+    assert_eq!(
+        boundary,
+        DispatchOutcome::Continue,
+        "a floor key between loop_header and jit_merge_point must not close"
+    );
+    assert_eq!(boundary_next, merge_pc);
+    assert_eq!(
+        wc.trace_ctx.seen_loop_header_for_jdindex, 0,
+        "only opimpl_jit_merge_point consumes the stamp"
+    );
+    assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
+    assert!(
+        wc.trace_ctx.num_ops() > ops_before_boundary,
+        "the boundary must be the synthesized debug_merge_point, not a missed floor"
+    );
+
+    let (closed, closed_next) = step(code, merge_pc, &mut wc).expect("jit_merge_point must close");
+    assert_eq!(closed_next, code.len());
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    match closed {
+        DispatchOutcome::CloseLoop {
+            jump_args,
+            loop_header_pc,
+            ..
+        } => {
+            assert_eq!(loop_header_pc, 42);
+            assert_eq!(jump_args.len(), 0);
+        }
+        other => panic!("expected CloseLoop from jit_merge_point, got {other:?}"),
+    }
+}
+
 #[test]
 fn jit_merge_point_int_form_resolves_jdindex_from_the_int_bank() {
     let byte = *insns_opname_to_byte()
@@ -19797,11 +20350,13 @@ fn ref_compare_same_box_fastpath_covers_the_instance_ptr_spellings() {
     }
 }
 
-// pyjitpl.py:2119-2121 concretely executes and stamps a Float `CALL_PURE`
-// like any other.  The funcbox is the callee's own address on every live
-// path — `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` and the LLBC path
-// bakes a plain `ConstInt` fnaddr — so `execute_pure_call` fetches the result
-// from the floating-point return register (`executor.py cpu.bh_call_f`).
+// `execute_varargs` concretely executes a Float `CALL_PURE` like any other,
+// then `record_result_of_call_pure` cuts an all-`Const` call back out.
+// The funcbox is the callee's own address on every live path —
+// `add_fn_ptr(ptr)` is `add_call_target(ptr, ptr)` and the LLBC path bakes
+// a plain `ConstInt` fnaddr — so `execute_residual_call` inside
+// `try_execute_residual_call_via_executor_inner` fetches the result from
+// the floating-point return register (`executor.py cpu.bh_call_f`).
 
 /// A real `f64`-returning callee with an integer parameter, i.e. the
 /// `jit_bigint_to_f64_or_inf` shape.  The integer return register is undefined
@@ -19882,37 +20437,25 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    // Record and fold one call at a time, as the dispatchers do: the fold
-    // cuts back to the position taken before the record, so a second op
-    // recorded in between would be cut away with it.
-    let float_pos = wc.trace_ctx.get_trace_position();
-    let recorded =
-        wc.trace_ctx
-            .record_op_with_descr(majit_ir::OpCode::CallPureF, &allboxes, descr.clone());
-    let folded_f = try_fold_pure_call_via_executor(
+    // Execute one call at a time, as the dispatchers do: `record_result_of_call_pure`
+    // cuts back to the position taken before that call is recorded, so a second
+    // op recorded in between would be cut away with it.
+    let (_exec_f, folded_f) = execute_ordinary_via_hook(
         &mut wc,
         majit_ir::OpCode::CallPureF,
         &allboxes,
+        &descr,
         call_descr,
-        descr.clone(),
-        float_pos,
-        recorded,
-    );
-    let int_pos = wc.trace_ctx.get_trace_position();
-    let int_recorded = wc.trace_ctx.record_op_with_descr(
-        majit_ir::OpCode::CallPureI,
-        &int_boxes,
-        int_descr.clone(),
-    );
-    let folded_i = try_fold_pure_call_via_executor(
+    )
+    .expect("the float residual must not abort the walk");
+    let (_exec_i, folded_i) = execute_ordinary_via_hook(
         &mut wc,
         majit_ir::OpCode::CallPureI,
         &int_boxes,
+        &int_descr,
         int_call_descr,
-        int_descr.clone(),
-        int_pos,
-        int_recorded,
-    );
+    )
+    .expect("the int residual must not abort the walk");
     drop(wc);
 
     // Every argbox is a `Const`, so `record_result_of_call_pure` takes the
@@ -19932,7 +20475,7 @@ fn walker_folds_a_float_result_pure_call_from_the_float_return_register() {
 }
 
 /// The checked-`PY_NULL` sentinel table is read by
-/// `try_execute_residual_call_via_executor` (which returns
+/// `try_execute_residual_call_via_executor_inner` (which returns
 /// `declined_symbolic` for a non-sentinel NULL Ref).  The executor arm is
 /// otherwise unreachable from a unit test, since it runs the residual
 /// concretely through the funcbox, so this pins the table itself.
