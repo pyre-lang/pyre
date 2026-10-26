@@ -124,7 +124,7 @@ def _regular_sum(sequence, start):
             # int.__float__ is descr___float__ (payload only, no subclass __float__).
             if type(x) is float:
                 value = x
-            elif issubclass(type(x), int):
+            elif type.__subclasscheck__(int, type(x)):
                 value = int.__float__(x)
             else:
                 last = _cs_to_double(hi, lo) + x
@@ -145,9 +145,9 @@ def _regular_sum(sequence, start):
             if type(x) is complex:
                 re_hi, re_lo = _cs_add(re_hi, re_lo, x.real)
                 im_hi, im_lo = _cs_add(im_hi, im_lo, x.imag)
-            elif issubclass(type(x), int):
+            elif type.__subclasscheck__(int, type(x)):
                 re_hi, re_lo = _cs_add(re_hi, re_lo, int.__float__(x))
-            elif issubclass(type(x), float):
+            elif type.__subclasscheck__(float, type(x)):
                 re_hi, re_lo = _cs_add(re_hi, re_lo, float.__float__(x))
             else:
                 last = complex(

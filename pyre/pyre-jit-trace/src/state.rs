@@ -9051,9 +9051,10 @@ fn reconstruct_inline_recipe(
     // its locals — NOT in the register section. Recover them into REGISTER-
     // SECTION slots so the bridge rebuilds the callee as a plain MIFrame
     // (resume.py newframe + reload, reading `registers_r`), convergent
-    // with the RPython frame shape and creating NO new vable. The color==
-    // semantic identity check below only accepts a register-section callee
-    // (locals at colors 0..nlocals), which this shape never satisfies.
+    // with the RPython frame shape and creating NO new vable. A register-
+    // section callee is rebuilt below from the resume stream inverted through
+    // `pcdep_entries`; this portal shape keeps locals in the `frame` red's
+    // array, so recover them from that array here.
     //
     // An `in_a_call` callee suspended at one of its own CALL sites carries a
     // pending result whose register was already dropped from the ref bank above
@@ -9068,7 +9069,13 @@ fn reconstruct_inline_recipe(
     let (pframe_reg, pec_reg) = portal_red_regs_at(frame.jitcode_index);
     let (pframe_reg, pec_reg) = (pframe_reg as u32, pec_reg as u32);
     let has_frame = reg_indices.ref_.contains(&pframe_reg);
-    let maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
+    let mut maps = bridge_semantic_maps_from_jitcode_pc(frame.jitcode_index, frame.pc);
+    // `assemble_bridge_inline_pending` reads the same recipe's map via
+    // `pcdep_trivia_at` (`pcdep_trivia_for_jitcode_pc`). At a loop-header
+    // `-live-` whose containing py is trivia (`ExtendedArg`), that twin holds
+    // `skip_python_trivia_forward`'s opcode map, which is the live color→slot
+    // inversion used below.
+    maps.pcdep_entries = pcdep_trivia_at(frame.jitcode_index, frame.pc).unwrap_or_default();
     // resume.py `rebuild_from_resumedata` / `consume_boxes` rebuilds
     // every paused frame and fills EVERY live register from the resume stream
     // with no shape classifier. Pyre recovers a portal callee's locals from the
@@ -9387,44 +9394,17 @@ fn reconstruct_inline_recipe(
         });
     }
 
-    // The recipe banks are written and read by the register COLOR reported in
-    // the liveness stream (`registers_r[reg_idx]` below), but every consumer
-    // indexes by the SEMANTIC `locals_cells_stack_w` slot: the retired MIFrame's
-    // `load_local_value` reads `registers_r[local_idx]` (trace_opcode.rs)
-    // and `stack_slot_reg_idx` reads `registers_r[nlocals + stack_idx]`
-    // (trace_opcode.rs), and `assemble_bridge_inline_pending` reads
-    // `concrete_r[k]` by semantic slot k. This recipe is therefore only valid
-    // when each live color equals the semantic slot it denotes (color ==
-    // semantic). Regalloc pins that identity at call-boundary resume pcs (a
-    // straight-line callee resumes after its CALL with locals at colors
-    // `0..nlocals`), but a MID-BODY resume — e.g. a guard fired inside a
-    // callee branch (`goto_if_not` target) — coalesces colors so the live
-    // stack value sits at a renamed color. #73: the per-PC `pcdep_entries`
-    // color→slot map is the authoritative inversion; when it is empty at this
-    // resume pc there is no per-pc map to faithfully rebuild the frame, so
-    // decline to the single-frame bridge (whose vable payload IS semantic-
-    // ordered) rather than rebuild the frame with mis-slotted boxes.
+    // resume.py rebuild_from_resumedata / _callback_r writes every live
+    // register by color (`_prepare_next_section` → `enumerate_vars` →
+    // `_callback_r`). An empty per-PC map declines: there is no inversion
+    // to place those colors into the slot-indexed recipe banks
+    // (`load_local_value` / `stack_slot_reg_idx` /
+    // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
+    // by `locals_cells_stack_w` slot). Otherwise every live color is placed
+    // by the `pcdep_entries` color → slot inversion below.
     if maps.pcdep_entries.is_empty() {
         crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
         return None;
-    }
-    for &color in &reg_indices.ref_ {
-        match semantic_ref_slot_for_reg_color(
-            nlocals,
-            stack_only,
-            &maps.pcdep_entries,
-            color as usize,
-        ) {
-            // color == semantic slot: the recipe's color-indexed fill is
-            // also the correct semantic fill.
-            Some(semantic_idx) if semantic_idx == color as usize => {}
-            // A live color whose semantic slot differs (or is unmappable):
-            // the color-indexed recipe would mis-slot it. Decline.
-            _ => {
-                crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
-                return None;
-            }
-        }
     }
 
     // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
@@ -9475,9 +9455,9 @@ fn reconstruct_inline_recipe(
     // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
     // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
     // mirror. `maps.pcdep_entries` is the per-PC `(color, slot)` map (non-empty
-    // — the identity gate above declined otherwise): each decoded color is
+    // — the empty-map decline above returned otherwise): each decoded color is
     // placed at the semantic slot it denotes at this resume pc, so a borrowed
-    // local on the operand stack lands at its stack slot, not its color.
+    // local on the operand stack lands at its stack slot.
     let mut registers_r = vec![OpRef::NONE; valuestackdepth];
     let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
     for &(bank, color, slot) in &maps.pcdep_entries {

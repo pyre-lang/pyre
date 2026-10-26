@@ -6,9 +6,9 @@
 //! typed fields, `pyre_object::interp_sre`).
 
 use crate::{
-    Signature, make_builtin_function, make_builtin_function_with_arity,
-    make_builtin_function_with_signature, make_module_builtin_function_with_arity,
-    make_module_builtin_function_with_arity_and_sig,
+    Signature, make_builtin_function, make_builtin_function_passthrough1,
+    make_builtin_function_with_arity, make_builtin_function_with_signature,
+    make_module_builtin_function_with_arity, make_module_builtin_function_with_arity_and_sig,
 };
 use pyre_object::interp_sre::{
     W_SRE_Match, W_SRE_Pattern, W_SRE_Scanner, W_SRE_Template, is_sre_match, is_sre_pattern,
@@ -754,39 +754,55 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
+    // interp2app `W_SRE_Scanner.iter_w` / `next_w` are self-only;
+    // `BuiltinCode` arity refuses a surplus positional before the body
+    // (`gateway.py`).  `__iter__` / `__next__` are slot wrappers, so the
+    // refusal is `expected 0 arguments, got N`.
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "__iter__",
-            make_builtin_function("__iter__", sre_scanner_iter)
+            make_builtin_function_with_arity("__iter__", sre_scanner_iter, 1)
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "__next__",
-            make_builtin_function("__next__", sre_scanner_next_w)
+            make_builtin_function_with_arity("__next__", sre_scanner_next_w, 1)
         )
     };
+    // `_sre_SRE_Scanner_prefixmatch` / `_sre_SRE_Scanner_search`
+    // (`clinic/sre.c.h`): self-only METH_FASTCALL|METH_KEYWORDS.  `match`
+    // reuses the prefixmatch parser (`scanner_methods`), so a surplus
+    // positional or keyword reports `prefixmatch() takes no arguments`.
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "prefixmatch",
-            make_builtin_function("prefixmatch", sre_scanner_match)
+            make_builtin_function_passthrough1(
+                "prefixmatch",
+                sre_scanner_match,
+                sre_scanner_match_args,
+            )
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "match",
-            make_builtin_function("match", sre_scanner_match)
+            make_builtin_function_passthrough1("match", sre_scanner_match, sre_scanner_match_args)
         )
     };
     unsafe {
         crate::__pyre_put_new!(
             ns_slot,
             "search",
-            make_builtin_function("search", sre_scanner_search)
+            make_builtin_function_passthrough1(
+                "search",
+                sre_scanner_search,
+                sre_scanner_search_args,
+            )
         )
     };
     // interp_sre.py:955 `pattern = interp_attrproperty_w('srepat', ...)`.
@@ -799,7 +815,9 @@ pub(crate) fn init_sre_scanner_type(ns: PyObjectRef) {
                     Some(obj) if unsafe { is_sre_scanner(obj) } => {
                         Ok(unsafe { (*(obj as *const W_SRE_Scanner)).w_srepat })
                     }
-                    other => crate::gateway::receiver_mismatch("_sre.SRE_Scanner", "pattern", other),
+                    other => {
+                        crate::gateway::receiver_mismatch("_sre.SRE_Scanner", "pattern", other)
+                    }
                 }
             },
             2,
@@ -2925,16 +2943,24 @@ fn sre_pattern_copy(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
 
 // ── SRE_Scanner (finditer iterator) ───────────────────────────────────
 
+/// Typed scanner receiver, or the unbound-descriptor TypeError.
+fn sre_scanner_self_obj(
+    obj: PyObjectRef,
+    name: &'static str,
+) -> Result<PyObjectRef, crate::PyError> {
+    let receiver = if obj.is_null() { None } else { Some(obj) };
+    match receiver {
+        Some(obj) if unsafe { is_sre_scanner(obj) } => Ok(obj),
+        other => crate::gateway::receiver_mismatch("_sre.SRE_Scanner", name, other),
+    }
+}
+
 /// `args[0]` as the typed scanner receiver.
 fn sre_scanner_self(
     args: &[PyObjectRef],
     name: &'static str,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let receiver = args.first().copied().filter(|r| !r.is_null());
-    match receiver {
-        Some(obj) if unsafe { is_sre_scanner(obj) } => Ok(obj),
-        other => crate::gateway::receiver_mismatch("_sre.SRE_Scanner", name, other),
-    }
+    sre_scanner_self_obj(args.first().copied().unwrap_or(pyre_object::PY_NULL), name)
 }
 
 /// `W_SRE_Scanner.getmatch` (interp_sre.py) — advance the scanner
@@ -3030,25 +3056,81 @@ pub fn sre_scanner_next(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError>
 }
 
 /// `iter_w` (interp_sre.py) — returns self.
+/// Surplus positionals are refused by `BuiltinCode` arity (`with_arity(1)`),
+/// which for a slot wrapper is `expected 0 arguments, got N`.
 fn sre_scanner_iter(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     sre_scanner_self(args, "__iter__")
 }
 
 fn sre_scanner_next_w(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = sre_scanner_self(args, "__next__")?;
-    sre_scanner_next(self_)
+    sre_scanner_next(sre_scanner_self(args, "__next__")?)
 }
 
 /// `match_w` (interp_sre.py) — anchored match at the current
 /// position; returns None when exhausted instead of raising.
+///
+/// `_sre_SRE_Scanner_prefixmatch`: `match` reuses this body
+/// (`scanner_methods`), so a surplus positional or keyword reports
+/// `prefixmatch() takes no arguments`.
 fn sre_scanner_match(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = sre_scanner_self(args, "match")?;
-    Ok(sre_scanner_step(self_, true)?.unwrap_or_else(w_none))
+    sre_scanner_clinic(
+        sre_scanner_self(args, "match")?,
+        args.len().saturating_sub(1),
+        false,
+        "prefixmatch",
+        true,
+    )
+}
+
+fn sre_scanner_match_args(
+    w_self: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    sre_scanner_clinic(
+        sre_scanner_self_obj(w_self, "match")?,
+        args.arguments_w.len(),
+        crate::builtins::arguments_has_keywords(args),
+        "prefixmatch",
+        true,
+    )
 }
 
 /// `search_w` (interp_sre.py) — search from the current position;
 /// returns None when exhausted instead of raising.
 fn sre_scanner_search(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let self_ = sre_scanner_self(args, "search")?;
-    Ok(sre_scanner_step(self_, false)?.unwrap_or_else(w_none))
+    sre_scanner_clinic(
+        sre_scanner_self(args, "search")?,
+        args.len().saturating_sub(1),
+        false,
+        "search",
+        false,
+    )
+}
+
+fn sre_scanner_search_args(
+    w_self: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, crate::PyError> {
+    sre_scanner_clinic(
+        sre_scanner_self_obj(w_self, "search")?,
+        args.arguments_w.len(),
+        crate::builtins::arguments_has_keywords(args),
+        "search",
+        false,
+    )
+}
+
+/// Receiver first (`descr_check` / `builtin_code_check_receiver`), then the
+/// clinic no-parameter refusal (`_sre_SRE_Scanner_prefixmatch`).
+fn sre_scanner_clinic(
+    self_: PyObjectRef,
+    extra_pos: usize,
+    has_keywords: bool,
+    clinic_name: &'static str,
+    anchored: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    if has_keywords || extra_pos != 0 {
+        return crate::gateway::method_takes_no_arguments(clinic_name);
+    }
+    Ok(sre_scanner_step(self_, anchored)?.unwrap_or_else(w_none))
 }

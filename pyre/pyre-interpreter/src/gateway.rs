@@ -712,6 +712,17 @@ pub fn method_noarg_failure(
     )
 }
 
+/// Surplus-argument refusal whose message is `{name}() takes no arguments`
+/// with no `(N given)` tail.  `_PyArg_NoPositional` and clinic no-parameter
+/// METH_FASTCALL wrappers share this wording; extra positionals and extra
+/// keywords are the same error (`_sre_SRE_Scanner_prefixmatch`).
+#[majit_macros::dont_look_inside]
+pub fn method_takes_no_arguments(name: &str) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::type_error(format!(
+        "{name}() takes no arguments"
+    )))
+}
+
 /// Cold `_PyArg_CheckPositional` exact-count failure.
 ///
 /// The wording [`arity_mismatch`] gives a fixed-arity builtin of two or more
