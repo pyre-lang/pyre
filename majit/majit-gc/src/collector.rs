@@ -303,11 +303,11 @@ pub struct GcConfig {
     /// incminimark.py:275: card_page_indices (0 disables card marking).
     /// Must be a power of two.
     pub card_page_indices: u32,
-    /// gc/base.py `post_setup` — `PYPY_GC_DEBUG`, the level the collector's
-    /// own self-checks are gated on. 0 is off; 1 installs the rotating
-    /// nurseries; 2 additionally runs `debug_check_consistency` after every
-    /// minor collection.
-    pub debug: u8,
+    /// gc/base.py `post_setup` — `PYPY_GC_DEBUG` from signed `read_from_env`.
+    /// 0 is off; a negative value is still truthy (`if self.DEBUG`). 1
+    /// installs the rotating nurseries; 2 additionally runs
+    /// `debug_check_consistency` after every minor collection (`DEBUG >= 2`).
+    pub debug: isize,
     /// incminimark.py `gc_nursery_debug` — `PYPY_GC_NURSERY_DEBUG`. Fill the
     /// recycled nursery with garbage rather than zeroes, and rotate the arena
     /// when the debug ring is installed.
@@ -401,17 +401,57 @@ fn read_float_and_factor_from_env(varname: &str) -> Option<(f64, f64)> {
     Some((parsed, factor))
 }
 
-/// env.py `read_from_env` / `read_uint_from_env`: `value * factor` as an
-/// integer byte count. `None` (unset / unparseable / non-positive) lets callers
-/// fall back to the default, mirroring PyPy's `if x > 0` guards. PyPy's
-/// `read_uint_from_env` r_uint-wraps a negative product to a huge positive; pyre
-/// treats non-positive as unset, differing only on nonsensical negative input.
-/// A non-finite product is treated as unset too: `int(inf)`/`r_uint(inf)` raise
-/// upstream, so we fall back to the default instead of a `usize::MAX` byte count.
+/// env.py `read_from_env`: `int(value * factor)`. Unset / unparseable is 0.
+/// A non-finite product raises in `int(inf)` upstream; return 0 so setup
+/// falls back to the default instead of aborting.
+fn read_from_env(varname: &str) -> isize {
+    let (value, factor) = match read_float_and_factor_from_env(varname) {
+        Some(pair) => pair,
+        None => return 0,
+    };
+    let product = value * factor;
+    if !product.is_finite() {
+        return 0;
+    }
+    product as isize
+}
+
+/// `unsigned_int.__new__` on a float: `long(val) & MASK`; `f` must be finite.
+fn r_uint_from_float(f: f64) -> usize {
+    let t = f.trunc();
+    if t == 0.0 {
+        return 0;
+    }
+    // IEEE-754 normal: value is `m * 2**(e - 1075)` with the implicit 1 in `m`.
+    let bits = t.abs().to_bits();
+    let e = ((bits >> 52) & 0x7ff) as i32;
+    let m = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
+    let mag = if e - 1075 >= 64 {
+        0
+    } else if e - 1075 >= 0 {
+        m << ((e - 1075) as u32)
+    } else {
+        m >> ((1075 - e) as u32)
+    };
+    let mag = if t < 0.0 { mag.wrapping_neg() } else { mag };
+    mag as usize
+}
+
+/// env.py `read_uint_from_env`: `r_uint(value * factor)`.
+/// `unsigned_int.__new__` does `long(val) & MASK`, so a finite product is
+/// reduced exactly modulo 2**N (no saturation). `None` is the `r_uint(0)`
+/// unset / unparseable / zero case callers treat as "use the default"
+/// (`if x > 0`).
+/// A non-finite product raises upstream; return `None` (the default) rather
+/// than `usize::MAX`.
 fn read_uint_from_env(varname: &str) -> Option<usize> {
     let (value, factor) = read_float_and_factor_from_env(varname)?;
-    let bytes = value * factor;
-    (bytes.is_finite() && bytes > 0.0).then_some(bytes as usize)
+    let product = value * factor;
+    if !product.is_finite() {
+        return None;
+    }
+    let wrapped = r_uint_from_float(product);
+    (wrapped > 0).then_some(wrapped)
 }
 
 /// incminimark.py:516-528 `PYPY_GC_MAX_PINNED`.  Unlike the byte-sized GC
@@ -713,7 +753,12 @@ pub(crate) const LARGE_OBJECT_THRESHOLD: usize = (16384 + 512) * std::mem::size_
 fn default_nursery_size() -> (usize, Option<usize>) {
     // estimate_best_nursery_size never returns <= 0 (its floor is the 4MB
     // unknown-cache fallback), so the final `defaultsize` arm is unreachable.
-    let newsize = read_uint_from_env("PYPY_GC_NURSERY").unwrap_or_else(estimate_best_nursery_size);
+    let requested = read_from_env("PYPY_GC_NURSERY");
+    let newsize = if requested <= 0 {
+        estimate_best_nursery_size()
+    } else {
+        requested as usize
+    };
     let minsize = 2 * LARGE_OBJECT_THRESHOLD;
     if newsize < minsize {
         (minsize, Some(newsize & !(std::mem::size_of::<usize>() - 1)))
@@ -816,10 +861,8 @@ impl Default for GcConfig {
             debug_tiny_nursery,
             large_object_threshold: LARGE_OBJECT_THRESHOLD,
             card_page_indices: 128,
-            debug: read_uint_from_env("PYPY_GC_DEBUG")
-                .unwrap_or(0)
-                .min(u8::MAX as usize) as u8,
-            gc_nursery_debug: read_uint_from_env("PYPY_GC_NURSERY_DEBUG").is_some_and(|v| v != 0),
+            debug: read_from_env("PYPY_GC_DEBUG"),
+            gc_nursery_debug: read_uint_from_env("PYPY_GC_NURSERY_DEBUG").is_some_and(|v| v > 0),
             taggedpointers: false,
         }
     }
@@ -11652,6 +11695,103 @@ mod tests {
 
         majit_ir::environ::install(Vec::new());
         assert_eq!(read_uint_from_env(absent), None);
+    }
+
+    /// env.py `test_read_from_env`: signed `int(value * factor)` versus
+    /// wrapping `r_uint(value * factor)`, including the suffixes and the
+    /// unparseable cases. The name is not in [`GC_ENV_NAMES`], so a
+    /// concurrently built collector cannot see this table.
+    #[test]
+    fn read_from_env_signed_and_uint_wrap() {
+        let _guard = SUPPLIED_ENV_TEST_LOCK.lock();
+        let name = "MAJIT_TEST_READ_FROM_ENV";
+        majit_ir::environ::install(Vec::new());
+
+        assert_eq!(read_from_env(name), 0);
+        assert_eq!(read_uint_from_env(name), None);
+
+        set_supplied_env(vec![(name.to_string(), String::new())]);
+        assert_eq!(read_from_env(name), 0);
+        assert_eq!(read_uint_from_env(name), None);
+
+        set_supplied_env(vec![(name.to_string(), "???".to_string())]);
+        assert_eq!(read_from_env(name), 0);
+        assert_eq!(read_uint_from_env(name), None);
+
+        set_supplied_env(vec![(name.to_string(), "1".to_string())]);
+        assert_eq!(read_from_env(name), 1);
+        assert_eq!(read_uint_from_env(name), Some(1));
+
+        set_supplied_env(vec![(name.to_string(), "12345678".to_string())]);
+        assert_eq!(read_from_env(name), 12345678);
+        assert_eq!(read_uint_from_env(name), Some(12345678));
+
+        set_supplied_env(vec![(name.to_string(), "1234B".to_string())]);
+        assert_eq!(read_from_env(name), 1234);
+        assert_eq!(read_uint_from_env(name), Some(1234));
+
+        set_supplied_env(vec![(name.to_string(), "1.5Kb".to_string())]);
+        assert_eq!(read_from_env(name), 1536);
+        assert_eq!(read_uint_from_env(name), Some(1536));
+
+        set_supplied_env(vec![(name.to_string(), "1.5mB".to_string())]);
+        assert_eq!(read_from_env(name), (1.5 * 1024.0 * 1024.0) as isize);
+        assert_eq!(
+            read_uint_from_env(name),
+            Some((1.5 * 1024.0 * 1024.0) as usize)
+        );
+
+        set_supplied_env(vec![(name.to_string(), "1.5g".to_string())]);
+        assert_eq!(
+            read_from_env(name),
+            (1.5 * 1024.0 * 1024.0 * 1024.0) as isize
+        );
+        assert_eq!(
+            read_uint_from_env(name),
+            Some((1.5 * 1024.0 * 1024.0 * 1024.0) as usize)
+        );
+
+        // `read_from_env` keeps the sign; `read_uint_from_env` wraps (`r_uint`).
+        set_supplied_env(vec![(name.to_string(), "-1".to_string())]);
+        assert_eq!(read_from_env(name), -1);
+        assert_eq!(read_uint_from_env(name), Some(usize::MAX));
+
+        // `_read_float_and_factor_from_env`: suffix is the last raw character,
+        // so a trailing space selects factor 1 and `float("1k ")` fails.
+        set_supplied_env(vec![(name.to_string(), "1k ".to_string())]);
+        assert_eq!(read_from_env(name), 0);
+        assert_eq!(read_uint_from_env(name), None);
+
+        majit_ir::environ::install(Vec::new());
+    }
+
+    /// `unsigned_int.__new__` on a finite float: `long(val) & MASK`.
+    #[test]
+    fn r_uint_from_float_truncates_and_wraps() {
+        assert_eq!(r_uint_from_float(0.0), 0);
+        assert_eq!(r_uint_from_float(5.9), 5);
+        assert_eq!(r_uint_from_float(-1.0), usize::MAX);
+        assert_eq!(r_uint_from_float(-0.5), 0);
+        assert_eq!(r_uint_from_float(4096.0), 4096);
+        // Huge power-of-two multiple: the significand sits well above bit 63.
+        assert_eq!(r_uint_from_float(1e300), 0);
+    }
+
+    /// Magnitude at and above 2**63 / 2**64, reduced modulo 2**64.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn r_uint_from_float_mod_2_64() {
+        assert_eq!(r_uint_from_float(18446744073709551616.0), 0);
+        assert_eq!(r_uint_from_float(-18446744073709551616.0), 0);
+        assert_eq!(r_uint_from_float(18446744073709551616.0 * 3.0), 0);
+        assert_eq!(r_uint_from_float(9223372036854775808.0), 1usize << 63);
+        assert_eq!(r_uint_from_float(-9223372036854775808.0), 1usize << 63);
+        // 2**65 + 2**23 is exact in f64 (ULP at 2**65 is 2**13; 2**23 is a
+        // multiple of that). `long` of that value mod 2**64 is 2**23.
+        assert_eq!(
+            r_uint_from_float(36893488147419103232.0 + 2048.0 * 4096.0),
+            2048 * 4096
+        );
     }
 
     /// Presence matches `var_os.is_some()`: an empty supplied value still
