@@ -638,12 +638,9 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // compiled against and never mutated afterwards still holds one, so without
     // this the box outlives the only pointer to it.  `name?` is the same
     // shape: `descr_set__name__` is the only writer, and a type compiled
-    // against and never renamed still holds the instance.  `flag_cpython_immutabletype?`
-    // is the Freeze/construction twin: a type compiled against and never
-    // frozen still holds the instance.
+    // against and never renamed still holds the instance.
     unsafe { (*t).quasi_immut_watchers.reclaim() };
     unsafe { (*t).w_name_watchers.reclaim() };
-    unsafe { (*t).mutate_flag_cpython_immutabletype.reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` / `w_fdel?` instances on sweep.

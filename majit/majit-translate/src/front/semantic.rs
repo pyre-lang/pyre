@@ -648,6 +648,35 @@ impl StructFieldRegistry {
             .map(|_| key)
     }
 
+    /// Registered owner key for `owner`, for intern identity.
+    ///
+    /// Dual-published variant keys (`result::Result::Ok` and the FieldRead
+    /// leaf `Result::Ok`) share one declaration. [`Self::lookup_fields`]
+    /// prefers an exact map hit, which keeps those keys distinct;
+    /// [`Self::unique_suffix_owner_key`] is the unique path-suffix match
+    /// that names one intern key. Tried first so
+    /// `Bookkeeper.getuniqueclassdef_for_struct_root` of the qualified
+    /// template spelling returns the same ClassDef as the leaf dest
+    /// (`bookkeeper.py` `getuniqueclassdef` is one class object). An
+    /// exact or canonical-leaf hit is the fallback when no unique suffix
+    /// exists (`a::Result::Ok` beside `b::Result::Ok`).
+    pub(crate) fn registered_owner_key(&self, owner: &str) -> Option<String> {
+        let stripped = majit_ir::descr::strip_generic_args(owner);
+        let owner = stripped.as_ref();
+        if let Some(key) = self.unique_suffix_owner_key(owner) {
+            return Some(key.to_string());
+        }
+        if self.fields.get(owner).is_some() {
+            return Some(owner.to_string());
+        }
+        let receiver_leaf = owner.rsplit("::").next().unwrap_or(owner);
+        let canonical = majit_ir::descr::canonical_struct_name(receiver_leaf);
+        if canonical != receiver_leaf && self.fields.get(&canonical).is_some() {
+            return Some(canonical);
+        }
+        None
+    }
+
     /// A payload variant under this enum base. A fieldless enum has none,
     /// so its value stays an integer; a payload enum's address is a pointer
     /// (`rclass.py` variant subclass under the discriminant-only base).

@@ -1899,6 +1899,46 @@ fn ll_arraymove_intrinsic(
     Ok(s_none())
 }
 
+/// ClassDef interned for the unsuffixed template of an instantiated
+/// variant, when that template is a registered owner.
+///
+/// `strip_generic_args` keeps the `::variant` tail
+/// (`result::Result<i32,PyError>::Ok` → `result::Result::Ok`).
+/// [`crate::front::StructFieldRegistry::registered_owner_key`] is the
+/// registry lookup that maps a dual-published qualified spelling onto
+/// the FieldRead leaf (`Result::Ok`);
+/// [`Bookkeeper::getuniqueclassdef_for_struct_root`] interns that key.
+/// None when the template is not a registered owner — does not mint a
+/// ClassDef for an unknown spelling.
+fn registered_template_classdef(
+    bk: &Rc<Bookkeeper>,
+    instantiated_name: &str,
+) -> Option<Rc<RefCell<ClassDef>>> {
+    if !instantiated_name.contains('<') {
+        return None;
+    }
+    let template = majit_ir::descr::strip_generic_args(instantiated_name);
+    if template.as_ref() == instantiated_name {
+        return None;
+    }
+    let (parent, variant) = template.rsplit_once("::")?;
+    if variant.is_empty() {
+        return None;
+    }
+    let key = {
+        let guard = bk.struct_fields.borrow();
+        let reg = guard.as_ref()?;
+        // A generic enum (`result::Result<i32,E>`) strips to
+        // `result::Result`; `rsplit_once` then yields `("result", "Result")`.
+        // The parent of a variant template is a registered enum base.
+        if reg.enum_base_registry_key(parent).is_none() && !reg.is_enum_base(parent) {
+            return None;
+        }
+        reg.registered_owner_key(template.as_ref())?
+    };
+    bk.getuniqueclassdef_for_struct_root(&key).ok()
+}
+
 /// Analyzer for `__cast_instance_intrinsic` — the front-end pointer-downcast
 /// narrow (#298).  `front::mir` aliases the classdef-less pointer for a
 /// same-bank `obj as *const RegisteredStruct` cast, so a field read on
@@ -1927,41 +1967,6 @@ fn ll_arraymove_intrinsic(
 /// is narrowed to the root's projected annotation instead — carrying the
 /// operand's nullability, since `cast_opaque_ptr` answers
 /// `nullptr(PTRTYPE.TO)` for a null (`lltype.py`).
-/// `(enum_leaf, variant_leaf)` of a variant spelling after stripping
-/// generic arguments and crate/module prefixes.
-///
-/// `result::Result<i32,PyError>::Ok` and `Result::Ok` both yield
-/// `("Result", "Ok")`.  A non-variant spelling (`Result<i32,PyError>`,
-/// `Result`) has no `::variant` tail and returns `None`.
-fn enum_variant_identity(name: &str) -> Option<(String, String)> {
-    let stripped = majit_ir::descr::strip_generic_args(name);
-    let normalized = stripped.replace('.', "::");
-    let (parent, variant) = normalized.rsplit_once("::")?;
-    if variant.is_empty() {
-        return None;
-    }
-    let enum_leaf = parent.rsplit("::").next()?.to_string();
-    if enum_leaf.is_empty() {
-        return None;
-    }
-    Some((enum_leaf, variant.to_string()))
-}
-
-/// True when `operand_name` is a monomorphized spelling of the same
-/// enum variant as unsuffixed `root`.
-fn instantiated_enum_variant_of(operand_name: &str, root: &str) -> bool {
-    if !operand_name.contains('<') || root.contains('<') {
-        return false;
-    }
-    match (
-        enum_variant_identity(operand_name),
-        enum_variant_identity(root),
-    ) {
-        (Some(op), Some(dest)) => op == dest,
-        _ => false,
-    }
-}
-
 fn cast_instance_intrinsic(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -2243,18 +2248,20 @@ fn cast_instance_intrinsic(
     // `resolve_adt_field` uses the enum leaf when the place carries no
     // instantiation suffix.  The operand is the per-instantiation
     // variant the constructor interned (`result::Result<i32,PyError>::Ok`).
-    // RPython `bookkeeper.py` `getuniqueclassdef` is one class object
-    // per variant; the template and the instantiation are that one
-    // variant.  Returning the template ClassDef makes
-    // `SomeInstance.getattr("__pos_0")` read the `??TypeVar` row
+    // RPython `bookkeeper.py` `getuniqueclassdef` / `getdesc` and
+    // `rclass.py` `InstanceRepr.convert_from_to` work on class-object
+    // identity, never on leaf names.  Returning the template ClassDef
+    // makes `SomeInstance.getattr("__pos_0")` read the `??TypeVar` row
     // (`s_ImpossibleValue`), `consider_op` raises `BlockedInference`
     // (`annrpython.py`), and `follow_link` never sees the success
-    // successor.  Keep the instantiation — the same preference
-    // `prefer_instantiated_variant` uses at a knowntypedata merge
-    // (`model.py` `merge_knowntypedata`).
+    // successor.  Keep the instantiation only when the operand's
+    // unsuffixed template interns as the same ClassDef as `root`
+    // (`registered_template_classdef`).
+    let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
     if let SomeValue::Instance(inst) = operand
         && let Some(cd) = inst.classdef.as_ref()
-        && instantiated_enum_variant_of(&cd.borrow().name, &root)
+        && let Some(template_cd) = registered_template_classdef(bk, &cd.borrow().name)
+        && std::rc::Rc::ptr_eq(&template_cd, &classdef)
     {
         return Ok(SomeValue::Instance(SomeInstance::new(
             inst.classdef.clone(),
@@ -2262,7 +2269,6 @@ fn cast_instance_intrinsic(
             inst.flags.clone(),
         )));
     }
-    let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
     let flags = match operand {
         SomeValue::Instance(inst)
             if inst
@@ -3784,17 +3790,111 @@ mod tests {
                 .as_ref()
                 .map(|cd| cd.borrow().name.clone())
         );
+        let dest_cd = bk
+            .getuniqueclassdef_for_struct_root("Result::Ok")
+            .expect("template Ok");
         assert!(
-            instantiated_enum_variant_of("result::Result<i32,PyError>::Ok", "Result::Ok"),
-            "spelling matcher must treat the template as the same variant"
+            !std::rc::Rc::ptr_eq(&ok_cd, &dest_cd),
+            "instantiation and template are distinct ClassDefs"
+        );
+        let template_cd = registered_template_classdef(&bk, &ok_cd.borrow().name)
+            .expect("template of instantiated Ok is registered");
+        assert!(
+            std::rc::Rc::ptr_eq(&template_cd, &dest_cd),
+            "template ClassDef must be the dest Result::Ok, got {:?}",
+            template_cd.borrow().name
         );
         assert!(
-            !instantiated_enum_variant_of("Result::Ok", "Result::Ok"),
+            registered_template_classdef(&bk, "Result::Ok").is_none(),
             "template-to-template is not an instantiated keep"
         );
         assert!(
-            !instantiated_enum_variant_of("result::Result<i32,PyError>", "Result::Ok"),
+            registered_template_classdef(&bk, "result::Result<i32,PyError>").is_none(),
             "enum instantiation is not the Ok variant"
+        );
+    }
+
+    /// `a::Result<i32,E>::Ok` and `b::Result::Ok` share `(Result, Ok)`
+    /// leaves and are both registered.  `bookkeeper.py` `getuniqueclassdef`
+    /// keys the class object, so the dest ClassDef is `b`'s declaration.
+    #[test]
+    fn cast_instance_uses_destination_when_result_ok_declarations_differ() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        let inst = "a::Result<i32,E>";
+        reg.fields.insert(
+            inst.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Ok"),
+            vec![("__pos_0".to_string(), "i32".to_string())],
+        );
+        reg.fields.insert(
+            "b::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "b::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant(inst, "Ok")
+            .expect("a::Result<i32,E>::Ok");
+        let dest_cd = bk
+            .getuniqueclassdef_for_struct_root("b::Result::Ok")
+            .expect("b::Result::Ok");
+        assert!(
+            !std::rc::Rc::ptr_eq(&ok_cd, &dest_cd),
+            "a and b Result::Ok must intern as distinct ClassDefs"
+        );
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let mut s_root = crate::annotator::model::s_str0();
+        s_root.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::byte_str("b::Result::Ok"),
+        ));
+        let out = cast_instance_intrinsic(&bk, &[Some(s_ok), Some(s_root)], &HashMap::new())
+            .expect("cast of a::Result Ok to b::Result::Ok");
+        let SomeValue::Instance(inst_out) = out else {
+            panic!("expected SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst_out
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| std::rc::Rc::ptr_eq(cd, &dest_cd)),
+            "cast must return b::Result::Ok, got {:?}",
+            inst_out
+                .classdef
+                .as_ref()
+                .map(|cd| cd.borrow().name.clone())
+        );
+        assert!(
+            inst_out
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| !std::rc::Rc::ptr_eq(cd, &ok_cd)),
+            "cast must not keep a::Result<i32,E>::Ok"
         );
     }
 

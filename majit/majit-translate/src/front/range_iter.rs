@@ -21,9 +21,13 @@
 //! segments end in `["RangeInclusive", "new"]`), then the same reflexive
 //! `into_iter` alias, then `<RangeInclusive<T> as Iterator>::next`.  RPython
 //! has no inclusive range, so the orthodox spelling is `range(a, b + 1)`
-//! (`builtin.builtin_range`).  A 64-bit inclusive upper bound is diverted
-//! only when it is a known constant strictly less than `i64::MAX`, so
-//! `b + 1` cannot overflow the Signed lowering.
+//! (`builtin.builtin_range`).  `rrange.py` (`rtype_builtin_range`,
+//! `ll_rangenext_up`) uses Signed endpoints, so a 64-bit inclusive range is
+//! diverted only when the rewrite cannot change emptiness or overflow
+//! Signed: wide signed (`I64`/`Isize`) when `hi` is a known constant
+//! strictly less than `i64::MAX`; wide unsigned (`U64`/`Usize`) when both
+//! `lo` and `hi` are integer constants whose unsigned values satisfy
+//! `lo <= i64::MAX` and `hi < i64::MAX`. Narrow (<= 32-bit) always fits.
 //!
 //! RPython models `range(a, b)` as a `SomeList` carrying `range_step`
 //! (`builtin.builtin_range`), whose `RangeRepr` `make_iterator_repr` yields
@@ -74,7 +78,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// `true` iff `segments` names `RangeInclusive::new`, including a
@@ -97,8 +101,9 @@ pub(crate) enum RangeSiteKind {
     Exclusive,
     /// `RangeInclusive::new(a, b)` call. `narrow` is true when the element
     /// integer type is narrower than 64 bits, so `b + 1` cannot overflow the
-    /// Signed lowering.
-    Inclusive { narrow: bool },
+    /// Signed lowering. `unsigned` is the element signedness recorded by
+    /// `front::mir` `int_range_head_narrow` (U8/U16/U32/U64/Usize).
+    Inclusive { narrow: bool, unsigned: bool },
 }
 
 /// A recognized int-range site captured during body lowering: either an
@@ -122,9 +127,9 @@ pub(crate) struct RangeNewSite {
 /// `front::iter_next` diamond (which runs immediately after) folds the loop.
 /// Fail-safe: a site that does not match the expected for-loop shape is left
 /// as the ordinary ctor + FieldWrite chain or `RangeInclusive::new` call
-/// (census Skip). A 64-bit inclusive upper bound is diverted only when it
-/// is a known constant strictly less than `i64::MAX`. Returns the number
-/// of range sites rewritten.
+/// (census Skip). A 64-bit inclusive range is diverted only when `hi + 1`
+/// cannot overflow Signed and unsigned values convert to Signed without
+/// changing order. Returns the number of range sites rewritten.
 pub(crate) fn rewire_range_iter_sites(
     graph: &mut FunctionGraph,
     range_sites: &[RangeNewSite],
@@ -248,8 +253,8 @@ fn rewire_one_range_iter_site(
     let iter_phi = (*iter_arg).clone();
     match kind {
         RangeSiteKind::Exclusive => rewire_exclusive_range_iter(graph, &name, &res)?,
-        RangeSiteKind::Inclusive { narrow } => {
-            rewire_inclusive_range_iter(graph, &name, &res, narrow)?
+        RangeSiteKind::Inclusive { narrow, unsigned } => {
+            rewire_inclusive_range_iter(graph, &name, &res, narrow, unsigned)?
         }
     }
     fix_iterator_phi_links(graph, flow, &res, &iter_phi);
@@ -325,6 +330,7 @@ fn rewire_inclusive_range_iter(
     name: &str,
     res: &Variable,
     narrow: bool,
+    unsigned: bool,
 ) -> Result<(), String> {
     let (cb, call_idx) = graph
         .blocks
@@ -352,12 +358,24 @@ fn rewire_inclusive_range_iter(
         }
     };
 
-    // Overflow gate before any mutation: a wide (64-bit) upper bound is
-    // diverted only when `hi` is a known constant `c < i64::MAX`.
-    if !narrow && !inclusive_hi_fits_signed(graph, &hi_arg) {
-        return Err(format!(
-            "{name}: 64-bit inclusive upper bound may overflow b+1"
-        ));
+    // Overflow / signedness gate before any mutation. Narrow (<= 32-bit
+    // signed or unsigned) always fits Signed and `hi + 1` cannot overflow.
+    // Wide signed (`I64`/`Isize`) keeps the existing `hi < i64::MAX`
+    // constant gate. Wide unsigned (`U64`/`Usize`) diverts only when both
+    // bounds are integer constants whose unsigned values satisfy
+    // `lo <= i64::MAX` and `hi < i64::MAX` (`ConstValue::UInt` /
+    // `OpKind::ConstUInt`, not `as_int()`'s bit reinterpretation).
+    if !narrow {
+        let fits = if unsigned {
+            inclusive_wide_unsigned_fits_signed(graph, &lo_arg, &hi_arg)
+        } else {
+            inclusive_hi_fits_signed(graph, &hi_arg)
+        };
+        if !fits {
+            return Err(format!(
+                "{name}: 64-bit inclusive upper bound may overflow b+1"
+            ));
+        }
     }
     inclusive_bound_ready(graph, &lo_arg, name)?;
     inclusive_bound_ready(graph, &hi_arg, name)?;
@@ -450,13 +468,38 @@ fn materialize_inclusive_bound(
 
 /// `true` when `hi` is a known integer constant strictly less than
 /// `i64::MAX` — a `LinkArg::Const`, or a Variable whose unique producer
-/// is `OpKind::ConstInt`.
+/// is `OpKind::ConstInt`. Wide signed (`I64`/`Isize`) overflow gate.
 fn inclusive_hi_fits_signed(graph: &FunctionGraph, hi: &LinkArg) -> bool {
     let c = match hi {
         LinkArg::Const(c) => c.value.as_int(),
         LinkArg::Value(v) => unique_const_int_producer(graph, v),
     };
     matches!(c, Some(n) if n < i64::MAX)
+}
+
+/// Wide unsigned (`U64`/`Usize`) overflow/signedness gate: both bounds
+/// must be integer constants whose unsigned magnitudes convert to Signed
+/// without changing order. `as_int()` reinterprets `UInt(1<<63)` as
+/// `i64::MIN` and `UInt(u64::MAX)` as `-1`, so read `ConstValue::UInt` /
+/// `OpKind::ConstUInt` only.
+fn inclusive_wide_unsigned_fits_signed(graph: &FunctionGraph, lo: &LinkArg, hi: &LinkArg) -> bool {
+    match (
+        inclusive_unsigned_const(graph, lo),
+        inclusive_unsigned_const(graph, hi),
+    ) {
+        (Some(lo), Some(hi)) => lo <= i64::MAX as u64 && hi < i64::MAX as u64,
+        _ => false,
+    }
+}
+
+fn inclusive_unsigned_const(graph: &FunctionGraph, arg: &LinkArg) -> Option<u64> {
+    match arg {
+        LinkArg::Const(c) => match &c.value {
+            ConstValue::UInt(n) => Some(*n),
+            _ => None,
+        },
+        LinkArg::Value(v) => unique_const_uint_producer(graph, v),
+    }
 }
 
 fn unique_const_int_producer(graph: &FunctionGraph, var: &Variable) -> Option<i64> {
@@ -470,6 +513,23 @@ fn unique_const_int_producer(graph: &FunctionGraph, var: &Variable) -> Option<i6
         }
         match &op.kind {
             OpKind::ConstInt(n) => found = Some(*n),
+            _ => return None,
+        }
+    }
+    found
+}
+
+fn unique_const_uint_producer(graph: &FunctionGraph, var: &Variable) -> Option<u64> {
+    let mut found = None;
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        if op.result.as_ref() != Some(var) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        match &op.kind {
+            OpKind::ConstUInt(n) => found = Some(*n),
             _ => return None,
         }
     }
@@ -955,23 +1015,42 @@ mod tests {
         hi_op: Option<OpKind>,
         new_target: CallTarget,
     ) -> (FunctionGraph, Variable, Variable, Variable) {
-        let mut g = FunctionGraph::new(name);
-        let n = g.startblock;
-        let lo = g.push_op_var(n, OpKind::ConstInt(0), true).unwrap();
-        let hi = match hi_op {
+        let (g, range, _lo, hi, opt) =
+            inclusive_range_forloop_bounds(name, Some(OpKind::ConstInt(0)), hi_op, new_target);
+        (g, range, hi, opt)
+    }
+
+    fn inclusive_bound_var(
+        g: &mut FunctionGraph,
+        n: crate::model::BlockId,
+        op: Option<OpKind>,
+    ) -> Variable {
+        match op {
             Some(kind) => g.push_op_var(n, kind, true).unwrap(),
             None => {
                 let v = g.alloc_value_var();
                 g.block_mut(n).inputargs.push(v.clone());
                 v
             }
-        };
+        }
+    }
+
+    fn inclusive_range_forloop_bounds(
+        name: &str,
+        lo_op: Option<OpKind>,
+        hi_op: Option<OpKind>,
+        new_target: CallTarget,
+    ) -> (FunctionGraph, Variable, Variable, Variable, Variable) {
+        let mut g = FunctionGraph::new(name);
+        let n = g.startblock;
+        let lo = inclusive_bound_var(&mut g, n, lo_op);
+        let hi = inclusive_bound_var(&mut g, n, hi_op);
         let range = g
             .push_op_var(
                 n,
                 OpKind::Call {
                     target: new_target,
-                    args: crate::model::call_args(vec![lo, hi.clone()]),
+                    args: crate::model::call_args(vec![lo.clone(), hi.clone()]),
                     result_ty: ValueType::Ref(Some("core::ops::range::RangeInclusive".into())),
                 },
                 true,
@@ -992,7 +1071,17 @@ mod tests {
             .unwrap();
         g.set_return(h, Some(opt.clone()));
         g.set_goto(n, h, vec![range.clone()]);
-        (g, range, hi, opt)
+        (g, range, lo, hi, opt)
+    }
+
+    fn wide_unsigned_site(range: Variable) -> RangeNewSite {
+        RangeNewSite {
+            result_var: range,
+            kind: RangeSiteKind::Inclusive {
+                narrow: false,
+                unsigned: true,
+            },
+        }
     }
 
     fn assert_inclusive_diverted(g: &FunctionGraph, hi: &Variable) {
@@ -1112,7 +1201,10 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range,
-                kind: RangeSiteKind::Inclusive { narrow: true },
+                kind: RangeSiteKind::Inclusive {
+                    narrow: true,
+                    unsigned: false,
+                },
             }],
             &[opt],
         );
@@ -1133,7 +1225,10 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range,
-                kind: RangeSiteKind::Inclusive { narrow: true },
+                kind: RangeSiteKind::Inclusive {
+                    narrow: true,
+                    unsigned: false,
+                },
             }],
             &[opt],
         );
@@ -1154,7 +1249,10 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range,
-                kind: RangeSiteKind::Inclusive { narrow: false },
+                kind: RangeSiteKind::Inclusive {
+                    narrow: false,
+                    unsigned: false,
+                },
             }],
             &[opt],
         );
@@ -1173,7 +1271,10 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range,
-                kind: RangeSiteKind::Inclusive { narrow: false },
+                kind: RangeSiteKind::Inclusive {
+                    narrow: false,
+                    unsigned: false,
+                },
             }],
             &[opt],
         );
@@ -1203,7 +1304,10 @@ mod tests {
             &mut g,
             &[RangeNewSite {
                 result_var: range,
-                kind: RangeSiteKind::Inclusive { narrow: false },
+                kind: RangeSiteKind::Inclusive {
+                    narrow: false,
+                    unsigned: false,
+                },
             }],
             &[opt],
         );
@@ -1216,6 +1320,81 @@ mod tests {
             1,
             "RangeInclusive::new call survives"
         );
+    }
+
+    fn assert_inclusive_not_diverted(g: &FunctionGraph) {
+        assert_eq!(
+            count_range_inclusive_new(g),
+            1,
+            "RangeInclusive::new call survives"
+        );
+        assert_eq!(
+            count_calls_ending(g, &[crate::runtime_names::shims::RANGE]),
+            0,
+            "no range() builtin emitted"
+        );
+    }
+
+    /// `(1u64 << 63)..=0` is empty in Rust. Reinterpreting lo as Signed
+    /// yields `range(i64::MIN, 1)`, which is non-empty.
+    #[test]
+    fn rewrite_inclusive_wide_unsigned_high_bit_lo_declines() {
+        let (mut g, range, _lo, _hi, opt) = inclusive_range_forloop_bounds(
+            "test_range_inclusive_wide_uint_high_bit",
+            Some(OpKind::ConstUInt(1u64 << 63)),
+            Some(OpKind::ConstUInt(0)),
+            inclusive_new_target(),
+        );
+        let rewritten = rewire_range_iter_sites(&mut g, &[wide_unsigned_site(range)], &[opt]);
+        assert_eq!(rewritten, 0, "wide unsigned (1u64<<63)..=0 must not divert");
+        assert_inclusive_not_diverted(&g);
+    }
+
+    /// `0..=u64::MAX` reads hi through `as_int()` as `-1` and would become
+    /// `range(0, 0)`. The unsigned magnitude does not fit Signed.
+    #[test]
+    fn rewrite_inclusive_wide_unsigned_max_hi_declines() {
+        let (mut g, range, _lo, _hi, opt) = inclusive_range_forloop_bounds(
+            "test_range_inclusive_wide_uint_max",
+            Some(OpKind::ConstUInt(0)),
+            Some(OpKind::ConstUInt(u64::MAX)),
+            inclusive_new_target(),
+        );
+        let rewritten = rewire_range_iter_sites(&mut g, &[wide_unsigned_site(range)], &[opt]);
+        assert_eq!(rewritten, 0, "wide unsigned 0..=u64::MAX must not divert");
+        assert_inclusive_not_diverted(&g);
+    }
+
+    /// A non-constant wide-unsigned `lo` may be `>= 2^63` at runtime.
+    #[test]
+    fn rewrite_inclusive_wide_unsigned_nonconstant_lo_declines() {
+        let (mut g, range, _lo, _hi, opt) = inclusive_range_forloop_bounds(
+            "test_range_inclusive_wide_uint_nonconst_lo",
+            None,
+            Some(OpKind::ConstUInt(10)),
+            inclusive_new_target(),
+        );
+        let rewritten = rewire_range_iter_sites(&mut g, &[wide_unsigned_site(range)], &[opt]);
+        assert_eq!(
+            rewritten, 0,
+            "wide unsigned inclusive range with non-constant lo must not divert"
+        );
+        assert_inclusive_not_diverted(&g);
+    }
+
+    /// Wide unsigned `0..=10` constants convert to Signed without changing
+    /// order, and `hi + 1` cannot overflow.
+    #[test]
+    fn rewrite_inclusive_wide_unsigned_small_const_is_diverted() {
+        let (mut g, range, _lo, hi, opt) = inclusive_range_forloop_bounds(
+            "test_range_inclusive_wide_uint_small",
+            Some(OpKind::ConstUInt(0)),
+            Some(OpKind::ConstUInt(10)),
+            inclusive_new_target(),
+        );
+        let rewritten = rewire_range_iter_sites(&mut g, &[wide_unsigned_site(range)], &[opt]);
+        assert_eq!(rewritten, 1, "wide unsigned 0..=10 const must divert");
+        assert_inclusive_diverted(&g, &hi);
     }
 
     /// The range value is threaded through TWO block hops (entry → mid →

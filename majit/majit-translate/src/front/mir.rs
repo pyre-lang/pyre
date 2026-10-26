@@ -23619,14 +23619,17 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Integer width class of the single type argument of `head` when `head`
-    /// names `type_path` (`core::ops::range::Range` / `RangeInclusive`) over an
-    /// integer scalar.  `Some(true)` = narrower than 64 bits.
+    /// Integer width/sign class of the single type argument of `head` when
+    /// `head` names `type_path` (`core::ops::range::Range` / `RangeInclusive`)
+    /// over an integer scalar.  `Some((narrow, unsigned))`: `narrow` is true
+    /// when the element is narrower than 64 bits; `unsigned` is true for an
+    /// unsigned integer element. Threaded to `RangeSiteKind::Inclusive` next
+    /// to `narrow`; do not re-derive signedness from path names later.
     fn int_range_head_narrow(
         &self,
         head: &serde_json::Map<String, serde_json::Value>,
         type_path: &str,
-    ) -> Option<bool> {
+    ) -> Option<(bool, bool)> {
         let is_match = type_decl_ref_adt_id(head)
             .and_then(|id| self.llbc.type_by_id(id))
             .is_some_and(|td| td.item_meta.name_path() == type_path);
@@ -23647,8 +23650,10 @@ impl<'a> Lowering<'a> {
             int.get("Signed").and_then(serde_json::Value::as_str),
             int.get("Unsigned").and_then(serde_json::Value::as_str),
         ) {
-            (Some("I8" | "I16" | "I32"), _) | (_, Some("U8" | "U16" | "U32")) => Some(true),
-            (Some("I64" | "Isize"), _) | (_, Some("U64" | "Usize")) => Some(false),
+            (Some("I8" | "I16" | "I32"), _) => Some((true, false)),
+            (_, Some("U8" | "U16" | "U32")) => Some((true, true)),
+            (Some("I64" | "Isize"), _) => Some((false, false)),
+            (_, Some("U64" | "Usize")) => Some((false, true)),
             _ => None,
         }
     }
@@ -33145,7 +33150,7 @@ impl<'a> Lowering<'a> {
         } = &op_kind
             && crate::front::range_iter::is_range_inclusive_new_segments(segments)
             && args.len() == 2
-            && let Some(narrow) = {
+            && let Some((narrow, unsigned)) = {
                 let body = match &call.dest.ty {
                     TyRef::Inline { value: (_, v) } | TyRef::Other(v) => Some(v),
                     TyRef::Dedup { id } => self.llbc.dedup_body(*id),
@@ -33160,7 +33165,7 @@ impl<'a> Lowering<'a> {
             self.range_iter_new_sites
                 .push(crate::front::range_iter::RangeNewSite {
                     result_var: result_var.clone(),
-                    kind: crate::front::range_iter::RangeSiteKind::Inclusive { narrow },
+                    kind: crate::front::range_iter::RangeSiteKind::Inclusive { narrow, unsigned },
                 });
         }
         // Capture `Map::collect` at the construction site, where the
