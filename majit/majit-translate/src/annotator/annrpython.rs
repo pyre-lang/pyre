@@ -2792,14 +2792,20 @@ impl RPythonAnnotator {
                         "int_between" if sp.args.len() == 3 => {
                             Some(SomeValue::Bool(super::model::SomeBool::new()))
                         }
-                        // `llop.raw_load` / `llop.raw_store`.
+                        // `llop.raw_load` / `llop.gc_load_indexed` /
+                        // `llop.raw_store`.
                         // `_LLOpEntry.compute_result_annotation`
                         // (`lloperation.py`) is
                         // `lltype_to_annotation(RESULTTYPE.const)`.
                         // RESULTTYPE is args[0]; `from_opname` has no
                         // `raw_load`, so bind it here. `raw_store`
                         // returns Void (`s_None`).
-                        "raw_load" if sp.args.len() == 3 => {
+                        "raw_load" | "gc_load_indexed"
+                            if matches!(
+                                (sp.opname.as_str(), sp.args.len()),
+                                ("raw_load", 3) | ("gc_load_indexed", 5)
+                            ) =>
+                        {
                             self.annotation(&sp.args[0]).and_then(|s| match s.const_() {
                                 Some(crate::flowspace::model::ConstValue::LowLevelType(ll)) => Some(
                                     crate::translator::rtyper::llannotation::lltype_to_annotation(

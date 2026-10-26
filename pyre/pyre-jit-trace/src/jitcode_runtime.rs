@@ -5105,7 +5105,6 @@ mod tests {
             "cond_call_value_ref_ext/P",
             "cond_call_void_ext/P",
             "gc_load_indexed_f/riiii>f",
-            "gc_load_indexed_i/riiii>i",
             "getlistitem_gc_f/ridd>f",
             "getlistitem_gc_i/ridd>i",
             "getlistitem_gc_r/ridd>r",

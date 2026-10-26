@@ -403,7 +403,10 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
     let marker_module = path_module(&marker_stripped);
     let mut candidates: Vec<(String, String)> = Vec::new();
     for td in llbc.iter_type_decls() {
-        if !matches!(&td.kind, TypeDeclKind::Struct(_)) {
+        // A Rust enum is the class hierarchy `rclass.py` flavors as one:
+        // its variants inherit `_alloc_flavor_` from the base
+        // (`ClassDesc.get_param` reads the attribute through the MRO).
+        if !matches!(&td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
             continue;
         }
         let td_path = td.item_meta.name_path();
@@ -433,7 +436,7 @@ fn resolve_alloc_flavor_raw_identity(llbc: &Llbc, marker_path: &str, struct_name
     let named: Vec<&str> = candidates.iter().map(|(_, path)| path.as_str()).collect();
     panic!(
         "_alloc_flavor_ marker `{marker_path}` does not resolve to a unique \
-         struct TypeDecl (candidates: {named:?}); this signals a marker \
+         struct or enum TypeDecl (candidates: {named:?}); this signals a marker \
          encoding/decoder drift"
     );
 }

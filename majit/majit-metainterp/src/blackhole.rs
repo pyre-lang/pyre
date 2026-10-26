@@ -11750,6 +11750,12 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "cast_ptr_to_int/r>i",
             majit_jitcode::insns::BC_CAST_PTR_TO_INT,
         ),
+        // `jtransform.py rewrite_op_gc_load_indexed` emits `riiii>i`, the
+        // operand shape `handler_gc_load_indexed_i` decodes.
+        (
+            "gc_load_indexed_i/riiii>i",
+            majit_jitcode::insns::BC_GC_LOAD_INDEXED_I,
+        ),
         // `rbuiltin.py rtype_cast_int_to_ptr` → `cast_int_to_ptr/i>r`.
         // Sibling of `cast_ptr_to_int/r>i`; `wire_bhimpl_handlers` already
         // has `handler_cast_int_to_ptr` (`blackhole.py bhimpl_cast_int_to_ptr`).

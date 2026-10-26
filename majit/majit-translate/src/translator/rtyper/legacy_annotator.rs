@@ -396,7 +396,9 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // graph that drops before `decompose_slice_args` consumes the
         // getslice `stop` operand (which discards it for `[start:]`).
         OpKind::ConstNone => ValueType::Void,
-        OpKind::RawLoad { item_ty, .. } => item_ty.clone(),
+        OpKind::RawLoad { item_ty, .. } | OpKind::GcLoadIndexed { item_ty, .. } => {
+            item_ty.clone()
+        }
         OpKind::RawStore { .. } => ValueType::Void,
         OpKind::FieldRead { ty, .. } => ty.clone(),
         OpKind::FieldWrite { .. } => ValueType::Void,

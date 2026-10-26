@@ -190,7 +190,8 @@ pub(crate) fn authoritative_result_type_from_op(
         | OpKind::VableArrayRead { item_ty, .. }
         // `raw_load_i/f` answers the element kind its descr names, the
         // same projection the GC array reads use.
-        | OpKind::RawLoad { item_ty, .. } => {
+        | OpKind::RawLoad { item_ty, .. }
+        | OpKind::GcLoadIndexed { item_ty, .. } => {
             concrete_if_known(valuetype_to_concrete_for_legacy(
                 item_ty,
                 raw_alloc_flavor_structs,

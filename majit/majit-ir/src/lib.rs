@@ -15,6 +15,7 @@ pub mod helper_fnaddr;
 pub mod indexmap_ext;
 pub mod intbound;
 pub mod jit;
+pub mod llop;
 pub mod op_descr;
 pub mod op_info;
 pub mod op_type_index;

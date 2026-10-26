@@ -12820,6 +12820,7 @@ impl<'a> Lowering<'a> {
                                     &field_base_ty,
                                     self.llbc,
                                     self.gc_struct_ids,
+                                    self.immutable_fields,
                                 ))
                                 .with_base_is_deref(true)
                                 .with_host_index(host_index);
@@ -12840,6 +12841,7 @@ impl<'a> Lowering<'a> {
                                         &field_base_ty,
                                         self.llbc,
                                         self.gc_struct_ids,
+                                        self.immutable_fields,
                                     ))
                                     .with_base_is_deref(base_is_deref)
                                     .with_host_index(host_index),
@@ -16496,7 +16498,12 @@ impl<'a> Lowering<'a> {
                         res,
                     ));
                 }
-                let disc_owner_gc = container_declared_gc(&place.ty, self.llbc, self.gc_struct_ids);
+                let disc_owner_gc = container_declared_gc(
+                    &place.ty,
+                    self.llbc,
+                    self.gc_struct_ids,
+                    self.immutable_fields,
+                );
                 let base = self.resolve_place(mir_bb, place)?;
                 Ok((
                     Some(OpKind::FieldRead {
@@ -22187,8 +22194,12 @@ impl<'a> Lowering<'a> {
                         });
                         return Ok(res);
                     }
-                    let owner_declared_gc =
-                        container_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
+                    let owner_declared_gc = container_declared_gc(
+                        &inner.ty,
+                        self.llbc,
+                        self.gc_struct_ids,
+                        self.immutable_fields,
+                    );
                     let base = self.resolve_place(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
@@ -31747,6 +31758,22 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                if regular_call_name_path(&reg, self.llbc).as_deref()
+                    == Some("majit_ir::llop::gc_load_indexed")
+                {
+                    let res = self.lower_llop_gc_load_indexed(
+                        mir_bb,
+                        bb_id,
+                        &args,
+                        &arg_operands,
+                        &call.dest.ty,
+                    )?;
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 let alias = if let Some(payload) =
                     self.expect_on_const_ok(&segments, &args, &arg_locals)
                 {
@@ -36881,6 +36908,64 @@ impl<'a> Lowering<'a> {
             return None;
         }
         Some((ValueType::Unsigned, size as usize, false))
+    }
+
+    /// `majit_ir::llop::gc_load_indexed::<T, _>(base, index, scale, base_ofs)`
+    /// is `llop.gc_load_indexed(T, base, index, scale, base_ofs)`. The item
+    /// is described from the destination type `T`; `scale` and `base_ofs`
+    /// must be literals (`rewrite_op_gc_load_indexed` raises
+    /// `NotImplementedError` otherwise), and `T` is not a GC reference.
+    fn lower_llop_gc_load_indexed(
+        &mut self,
+        mir_bb: usize,
+        bb_id: crate::model::BlockId,
+        args: &[Variable],
+        arg_operands: &[Operand],
+        dest_ty: &TyRef,
+    ) -> Result<Variable, LowerError> {
+        let ([base, index, ..], [_, _, Operand::Const(scale), Operand::Const(base_ofs)]) =
+            (args, arg_operands)
+        else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: gc_load_indexed: 'scale' and 'base_ofs' should be constants"
+            )));
+        };
+        let (Some(scale), Some(base_ofs)) = (
+            const_operand_index(self.llbc, scale),
+            const_operand_index(self.llbc, base_ofs),
+        ) else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: gc_load_indexed: 'scale' and 'base_ofs' should be constants"
+            )));
+        };
+        let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty) else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: gc_load_indexed: no item descr for the result type"
+            )));
+        };
+        let result_ct = match item_ty {
+            ValueType::Int | ValueType::Unsigned => crate::model::ConcreteType::Signed,
+            ValueType::Float => crate::model::ConcreteType::Float,
+            _ => {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: gc_load_indexed of a GC reference"
+                )));
+            }
+        };
+        let loaded = self.graph.alloc_value_var_with_type(result_ct);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::GcLoadIndexed {
+                base: base.clone(),
+                index: index.clone(),
+                scale: scale as i64,
+                base_ofs: base_ofs as i64,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+        });
+        Ok(loaded)
     }
 
     fn raw_word_descr(&self, ty: &TyRef) -> Option<(ValueType, usize, bool)> {
@@ -66836,13 +66921,17 @@ fn container_declared_gc(
     ty: &TyRef,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    immutable_fields: &ImmutableFieldsTable,
 ) -> Option<bool> {
     let node = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc))?;
     let pointee = one_level_pointer_pointee(node, llbc)
         .and_then(|pointee| strip_ty_indirections(pointee, llbc))
         .unwrap_or(node);
     declared_adt_struct_id(pointee, llbc)?;
-    if declared_raw_adt_node(pointee, llbc, gc_struct_ids, no_immutable_fields()).is_some() {
+    // The same raw-storage test as the dest overlay: a GC pointer field
+    // in `_immutable_fields_` is a pure raw word (`rewrite_op_getfield`
+    // refuses only a non-pure `getfield_raw_r`).
+    if declared_raw_adt_node(pointee, llbc, gc_struct_ids, immutable_fields).is_some() {
         return Some(false);
     }
     Some(true)

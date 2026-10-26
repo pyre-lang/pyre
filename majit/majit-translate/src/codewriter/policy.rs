@@ -560,6 +560,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::ArrayWrite { item_ty, .. }
         | OpKind::RawLoad { item_ty, .. }
         | OpKind::RawStore { item_ty, .. }
+        | OpKind::GcLoadIndexed { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::InteriorFieldWrite { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. }

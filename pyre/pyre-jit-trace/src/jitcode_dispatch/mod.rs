@@ -15451,6 +15451,63 @@ fn handle<Sym: WalkSym>(
             ctx.registers_f.set(dst, result);
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        // pyjitpl.py `opimpl_gc_load_indexed_i`:
+        //
+        //   return self.execute(rop.GC_LOAD_INDEXED_I, addrbox, indexbox,
+        //                       self._remove_symbolics(scalebox),
+        //                       self._remove_symbolics(baseofsbox), bytesbox)
+        //
+        // `execute` runs the load as it records it, as `raw_load_i` above
+        // does: with every operand concrete the word is read from the live
+        // object and stamped on the result box.
+        // Operand layout `riiii>i`: base, index, scale, base_ofs, bytes, dst.
+        "gc_load_indexed_i/riiii>i" => {
+            let base = read_ref_reg(code, op, 0, ctx)?;
+            let index = read_int_reg(code, op, 1, ctx)?;
+            let scale = read_int_reg(code, op, 2, ctx)?;
+            let base_ofs = read_int_reg(code, op, 3, ctx)?;
+            let bytes = read_int_reg(code, op, 4, ctx)?;
+            let concrete = match (
+                read_ref_reg_concrete(code, op, 0, ctx),
+                read_int_reg_concrete(code, op, 1, ctx),
+                read_int_reg_concrete(code, op, 2, ctx),
+                read_int_reg_concrete(code, op, 3, ctx),
+                read_int_reg_concrete(code, op, 4, ctx),
+            ) {
+                (
+                    ConcreteValue::Ref(b),
+                    ConcreteValue::Int(i),
+                    ConcreteValue::Int(s),
+                    ConcreteValue::Int(o),
+                    ConcreteValue::Int(n),
+                ) if !b.is_null() => {
+                    let offset = o.wrapping_add(s.wrapping_mul(i));
+                    let addr = (b as *const u8).wrapping_offset(offset as isize);
+                    // SAFETY: the walk is the execution, so `b` is the live
+                    // object the interpreter would read the item from.
+                    let value = unsafe { raw_load_int(addr, n.unsigned_abs() as usize, n < 0) };
+                    ConcreteValue::Int(value)
+                }
+                _ => ConcreteValue::Null,
+            };
+            ctx.trace_ctx
+                .profiler()
+                .count_ops(OpCode::GcLoadIndexedI, majit_metainterp::counters::OPS);
+            ctx.trace_ctx.profiler().count_ops(
+                OpCode::GcLoadIndexedI,
+                majit_metainterp::counters::RECORDED_OPS,
+            );
+            let result = ctx.trace_ctx.record_op(
+                OpCode::GcLoadIndexedI,
+                &[base, index, scale, base_ofs, bytes],
+            );
+            if let ConcreteValue::Int(value) = concrete {
+                ctx.trace_ctx.set_opref_concrete(result, Value::Int(value));
+            }
+            let dst = code[op.pc + 6] as usize;
+            write_int_reg(ctx, op.pc, dst, result, concrete)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // `_opimpl_raw_store` delegates to `execute_raw_store`:
         //
         //   self.execute_and_record(rop.RAW_STORE, arraydescr,
