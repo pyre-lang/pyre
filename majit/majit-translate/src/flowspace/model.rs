@@ -1974,13 +1974,21 @@ impl HostEnv {
             HostObject::new_builtin_callable("rpython.rlib.objectmodel.r_ordereddict"),
         );
         // Host class objects for prebuilt `objectmodel.r_dict` /
-        // `_r_dictkey` instances (`objectmodel.py` class r_dict /
-        // class _r_dictkey). The callables above stay the
-        // `typer_for` / BUILTIN_ANALYZERS targets.
+        // `r_ordereddict` / `_r_dictkey` instances (`objectmodel.py`
+        // class r_dict / class r_ordereddict(r_dict) / class _r_dictkey).
+        // The callables above stay the `typer_for` / BUILTIN_ANALYZERS
+        // targets. Annotator/rtyper classify instances by class identity
+        // (`bookkeeper.py immutablevalue`: `tp is r_dict`,
+        // `issubclass(tp, r_dict)`).
         let r_dict_cls = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let r_ordereddict_cls = HostObject::new_class(
+            "rpython.rlib.objectmodel.r_ordereddict",
+            vec![r_dict_cls.clone()],
+        );
         let r_dictkey_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
         objectmodel.module_set("_r_dictkey", r_dictkey_cls.clone());
         self.insert_builtin("rpython.rlib.objectmodel.r_dict", r_dict_cls);
+        self.insert_builtin("rpython.rlib.objectmodel.r_ordereddict", r_ordereddict_cls);
         self.insert_builtin("rpython.rlib.objectmodel._r_dictkey", r_dictkey_cls);
 
         // `rbuiltin.py typer_for(OrderedDict)` — `from collections import
@@ -6369,6 +6377,21 @@ mod tests {
         let dict = HOST_ENV.lookup_builtin("dict").expect("dict class");
         assert!(ordered_dict.is_class());
         assert!(ordered_dict.is_subclass_of(&dict));
+    }
+
+    #[test]
+    fn r_ordereddict_class_subclasses_r_dict() {
+        // `objectmodel.py` `class r_ordereddict(r_dict)`.
+        let r_dict = HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_dict")
+            .expect("r_dict class");
+        let r_ordereddict = HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_ordereddict")
+            .expect("r_ordereddict class");
+        assert!(r_dict.is_class());
+        assert!(r_ordereddict.is_class());
+        assert!(r_ordereddict.is_subclass_of(&r_dict));
+        assert_ne!(r_dict, r_ordereddict);
     }
 
     #[test]

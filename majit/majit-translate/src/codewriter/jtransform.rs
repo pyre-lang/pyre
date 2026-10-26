@@ -5871,11 +5871,8 @@ impl<'a> Transformer<'a> {
         // `_rewrite_raw_malloc`: suffix `_zero` / `_add_memory_pressure` /
         // `_no_track_allocation`. `TYPE.OF == lltype.Char` takes
         // `OS_RAW_MALLOC_VARSIZE_CHAR` on a one-argument helper
-        // (`support.py build_raw_malloc_varsize_builder`). The
-        // `rffi.CCHARP.TO` shape (nolength, no extra item) is the CHAR
-        // leaf; a nolength extra-item Char array is the extra-item CHAR
-        // leaf (`llmemory.sizeof` n+1). A length-bearing Char array
-        // cannot close TYPE into a fixed 1-arg extern.
+        // (`support.py build_raw_malloc_varsize_builder`) for every
+        // {nolength, length} × {extra item, none} combination.
         if let Some(leaf) =
             raw_malloc_varsize_char_one_arg_leaf(op, zero, add_memory_pressure, track_allocation)
         {
@@ -5904,11 +5901,6 @@ impl<'a> Transformer<'a> {
                     panic!("raw malloc residual of {owner} did not rewrite to a direct call")
                 }
             };
-        }
-        if raw_malloc_varsize_of_is_char(op, owner) {
-            panic!(
-                "raw malloc of {owner}: OS_RAW_MALLOC_VARSIZE_CHAR needs a one-argument helper closed over TYPE (`support.py build_raw_malloc_varsize_builder`)"
-            );
         }
         // `transform.py gct_fv_raw_malloc_varsize` / `ll_malloc_varsize`
         // / `ll_malloc_varsize_no_length`.
@@ -16105,11 +16097,11 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
 
 /// One-argument CHAR leaf for `OS_RAW_MALLOC_VARSIZE_CHAR`.
 ///
-/// `rffi.CCHARP.TO` (nolength, no extra item) is `raw_malloc_varsize_char`.
-/// A nolength extra-item Char array is the extra-item family
-/// (`llmemory.sizeof(TYPE, n)` with one extra item). Length-bearing
-/// Char arrays have no fixed 1-arg helper (`support.py
-/// build_raw_malloc_varsize_builder`).
+/// `jtransform.py _rewrite_raw_malloc`: `TYPE.OF == lltype.Char` takes
+/// the CHAR oopspec on a helper closed over TYPE (`support.py
+/// build_raw_malloc_varsize_builder`). Length-bearing `Array(Char)` is
+/// the same 1-arg family: basesize / itemsize / length offset are
+/// TYPE-independent (`sizeof(Signed)` / 1 / 0).
 fn raw_malloc_varsize_char_one_arg_leaf(
     op: &SpaceOperation,
     zero: bool,
@@ -16123,25 +16115,25 @@ fn raw_malloc_varsize_char_one_arg_leaf(
     if !matches!(arr.OF, LowLevelType::Char) {
         return None;
     }
-    if !matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true))) {
-        return None;
-    }
+    let nolength = matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true)));
     let extra = extra_item_after_alloc(&LowLevelType::Array(Box::new(arr)));
-    if extra == 0 {
-        Some(raw_malloc_varsize_char_leaf(
-            zero,
-            add_memory_pressure,
-            track_allocation,
-        ))
-    } else if extra == 1 {
-        Some(raw_malloc_varsize_char_extra_item_leaf(
-            zero,
-            add_memory_pressure,
-            track_allocation,
-        ))
-    } else {
-        None
+    if extra != 0 && extra != 1 {
+        panic!("raw malloc of Array(Char): extra_item_after_alloc={extra} changes layout");
     }
+    Some(match (nolength, extra == 1) {
+        (true, false) => raw_malloc_varsize_char_leaf(zero, add_memory_pressure, track_allocation),
+        (true, true) => {
+            raw_malloc_varsize_char_extra_item_leaf(zero, add_memory_pressure, track_allocation)
+        }
+        (false, false) => {
+            raw_malloc_varsize_char_with_length_leaf(zero, add_memory_pressure, track_allocation)
+        }
+        (false, true) => raw_malloc_varsize_char_with_length_extra_item_leaf(
+            zero,
+            add_memory_pressure,
+            track_allocation,
+        ),
+    })
 }
 
 fn raw_malloc_varsize_char_leaf(
@@ -16180,6 +16172,55 @@ fn raw_malloc_varsize_char_extra_item_leaf(
         }
         (true, true, false) => {
             "raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation"
+        }
+    }
+}
+
+/// Length-bearing CHAR family: same suffixes as [`raw_malloc_varsize_char_leaf`],
+/// storing `n` in the length word.
+fn raw_malloc_varsize_char_with_length_leaf(
+    zero: bool,
+    add_memory_pressure: bool,
+    track_allocation: bool,
+) -> &'static str {
+    match (zero, add_memory_pressure, track_allocation) {
+        (false, false, true) => "raw_malloc_varsize_char_with_length",
+        (true, false, true) => "raw_malloc_varsize_zero_with_length",
+        (false, true, true) => "raw_malloc_varsize_char_with_length_add_memory_pressure",
+        (true, true, true) => "raw_malloc_varsize_zero_with_length_add_memory_pressure",
+        (false, false, false) => "raw_malloc_varsize_char_with_length_no_track_allocation",
+        (true, false, false) => "raw_malloc_varsize_zero_with_length_no_track_allocation",
+        (false, true, false) => {
+            "raw_malloc_varsize_char_with_length_add_memory_pressure_no_track_allocation"
+        }
+        (true, true, false) => {
+            "raw_malloc_varsize_zero_with_length_add_memory_pressure_no_track_allocation"
+        }
+    }
+}
+
+/// Length-bearing extra-item CHAR family.
+fn raw_malloc_varsize_char_with_length_extra_item_leaf(
+    zero: bool,
+    add_memory_pressure: bool,
+    track_allocation: bool,
+) -> &'static str {
+    match (zero, add_memory_pressure, track_allocation) {
+        (false, false, true) => "raw_malloc_varsize_char_with_length_extra_item",
+        (true, false, true) => "raw_malloc_varsize_zero_with_length_extra_item",
+        (false, true, true) => "raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure",
+        (true, true, true) => "raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure",
+        (false, false, false) => {
+            "raw_malloc_varsize_char_with_length_extra_item_no_track_allocation"
+        }
+        (true, false, false) => {
+            "raw_malloc_varsize_zero_with_length_extra_item_no_track_allocation"
+        }
+        (false, true, false) => {
+            "raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure_no_track_allocation"
+        }
+        (true, true, false) => {
+            "raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure_no_track_allocation"
         }
     }
 }
@@ -16240,47 +16281,27 @@ fn raw_malloc_varsize_helper_leaf(
 fn raw_malloc_varsize_array(
     op: &SpaceOperation,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::Array> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
-    let ll = op.result.as_ref()?.concretetype()?;
-    match ll {
-        LowLevelType::Ptr(ptr) => match ptr.TO {
-            PtrTarget::Array(arr) => Some(arr),
-            _ => None,
-        },
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match raw_malloc_varsize_type(op)? {
         LowLevelType::Array(arr) => Some(*arr),
         _ => None,
     }
 }
 
-/// `jtransform.py _rewrite_raw_malloc`: `TYPE.OF == lltype.Char`.
-fn raw_malloc_varsize_of_is_char(op: &SpaceOperation, owner: &str) -> bool {
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    if let Some(arr) = raw_malloc_varsize_array(op) {
-        return matches!(arr.OF, LowLevelType::Char);
-    }
-    matches!(
-        raw_malloc_varsize_of_from_owner(owner),
-        Some(LowLevelType::Char)
-    )
-}
-
-fn raw_malloc_varsize_of_from_owner(
-    owner: &str,
+/// Result TYPE of a raw varsize malloc: an `Array` or a `Struct` with
+/// `_arrayfld` (`transform.py varsize_malloc_helper`).
+fn raw_malloc_varsize_type(
+    op: &SpaceOperation,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    let inner = owner
-        .strip_prefix("CArray(")
-        .or_else(|| owner.strip_prefix("Array("))
-        .and_then(|s| s.strip_suffix(')'))?;
-    match inner {
-        "Char" => Some(LowLevelType::Char),
-        "UniChar" => Some(LowLevelType::UniChar),
-        "Signed" => Some(LowLevelType::Signed),
-        "Unsigned" => Some(LowLevelType::Unsigned),
-        "Bool" => Some(LowLevelType::Bool),
-        "Float" => Some(LowLevelType::Float),
-        "SingleFloat" => Some(LowLevelType::SingleFloat),
-        "Address" => Some(LowLevelType::Address),
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    let ll = op.result.as_ref()?.concretetype()?;
+    match ll {
+        LowLevelType::Ptr(ptr) => match ptr.TO {
+            PtrTarget::Array(arr) => Some(LowLevelType::Array(Box::new(arr))),
+            PtrTarget::Struct(st) => Some(LowLevelType::Struct(Box::new(st))),
+            _ => None,
+        },
+        LowLevelType::Array(_) | LowLevelType::Struct(_) => Some(ll),
         _ => None,
     }
 }
@@ -16296,9 +16317,112 @@ impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout for RawMall
     }
 }
 
+/// Field offsets of a varsize Struct, from summing `sizeof` of the
+/// fields before `_arrayfld` when CallControl has no layout for the name.
+struct RawMallocVarsizeLayout<'a> {
+    inner: &'a dyn crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout,
+    struct_name: Option<String>,
+    field_offsets: Vec<(String, i64)>,
+}
+
+impl crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout
+    for RawMallocVarsizeLayout<'_>
+{
+    fn field_offset(&self, struct_name: &str, fldname: &str) -> Option<i64> {
+        if let Some(name) = &self.struct_name
+            && name == struct_name
+        {
+            if let Some((_, off)) = self.field_offsets.iter().find(|(f, _)| f == fldname) {
+                return Some(*off);
+            }
+        }
+        self.inner.field_offset(struct_name, fldname)
+    }
+    fn struct_size(&self, struct_name: &str) -> Option<i64> {
+        self.inner.struct_size(struct_name)
+    }
+}
+
+/// C-ABI alignment of a field type, the alignment `ll2ctypes.get_ctypes_type`'s `ctypes.Structure` lays the
+/// field out with (`symbolic.get_field_token`).
+fn raw_c_alignment(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    layout: &dyn crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout,
+    owner: &str,
+) -> i64 {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match ty {
+        LowLevelType::Ptr(_)
+        | LowLevelType::Signed
+        | LowLevelType::Unsigned
+        | LowLevelType::Address => layout.word_bytes(),
+        LowLevelType::Struct(st) => {
+            let mut align = 1i64;
+            for name in &st._names {
+                let field_ty = st._flds.get(name).unwrap_or_else(|| {
+                    panic!("raw malloc varsize of {owner}: missing field {name}")
+                });
+                align = align.max(raw_c_alignment(field_ty, layout, owner));
+            }
+            align
+        }
+        LowLevelType::Array(arr) => {
+            let item = raw_c_alignment(&arr.OF, layout, owner);
+            let nolength = matches!(arr._hints.get("nolength"), Some(ConstValue::Bool(true)));
+            if nolength {
+                item
+            } else {
+                layout.word_bytes().max(item)
+            }
+        }
+        LowLevelType::FixedSizeArray(arr) => raw_c_alignment(&arr.OF, layout, owner),
+        _ => match sizeof(ty, None).and_then(|c| match c {
+            ConstValue::AddressOffset(offset) => offset.byte_size(layout),
+            other => Err(format!("sizeof returned {other:?}")),
+        }) {
+            Ok(size) => size,
+            Err(_) => panic!("raw malloc varsize of {owner}: no C alignment for {ty:?}"),
+        },
+    }
+}
+
+fn varsize_struct_field_offsets(
+    st: &crate::translator::rtyper::lltypesystem::lltype::Struct,
+    layout: &dyn crate::translator::rtyper::lltypesystem::llmemory::OffsetLayout,
+    owner: &str,
+) -> Vec<(String, i64)> {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::llmemory::sizeof;
+    let mut off = 0i64;
+    let mut fields = Vec::new();
+    for name in &st._names {
+        let ty = st
+            ._flds
+            .get(name)
+            .unwrap_or_else(|| panic!("raw malloc varsize of {owner}: missing field {name}"));
+        let align = raw_c_alignment(ty, layout, owner);
+        off = (off + align - 1) / align * align;
+        fields.push((name.clone(), off));
+        if Some(name) == st._arrayfld.as_ref() {
+            break;
+        }
+        let size = sizeof(ty, None)
+            .and_then(|c| match c {
+                ConstValue::AddressOffset(offset) => offset.byte_size(layout),
+                other => Err(format!("sizeof returned {other:?}")),
+            })
+            .unwrap_or_else(|err| panic!("raw malloc varsize of {owner}: {err}"));
+        off += size;
+    }
+    fields
+}
+
 /// `transform.py varsize_malloc_helper`: `c_const_size = sizeof(TYPE, 0)`,
 /// `c_item_size = sizeof(ARRAY.OF)`, `c_offset_to_length =
-/// ArrayLengthOffset` when the ARRAY is not `nolength`.
+/// offsetof(TYPE, _arrayfld) + ArrayLengthOffset` for a Struct, else
+/// `ArrayLengthOffset`, none when the ARRAY is `nolength`.
 fn raw_malloc_varsize_basesize_itemsize_lengthoffset(
     op: &SpaceOperation,
     owner: &str,
@@ -16306,20 +16430,43 @@ fn raw_malloc_varsize_basesize_itemsize_lengthoffset(
 ) -> (i64, i64, Option<i64>) {
     use crate::flowspace::model::ConstValue;
     use crate::translator::rtyper::lltypesystem::llmemory::{
-        OffsetLayout, arraylengthoffset, sizeof,
+        OffsetLayout, arraylengthoffset, offsetof, sizeof,
     };
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    use crate::translator::rtyper::lltypesystem::rffi::CArray;
     let no_layout = RawMallocNoLayout;
-    let layout: &dyn OffsetLayout = match cc {
+    let inner: &dyn OffsetLayout = match cc {
         Some(cc) => cc,
         None => &no_layout,
     };
-    let array = raw_malloc_varsize_array(op).unwrap_or_else(|| {
-        let of = raw_malloc_varsize_of_from_owner(owner)
-            .unwrap_or_else(|| panic!("raw malloc varsize of {owner}: ARRAY.OF is not computable"));
-        CArray(of)
+    let type_ = raw_malloc_varsize_type(op).unwrap_or_else(|| {
+        panic!("raw malloc varsize of {owner}: TYPE is not an Array or a Struct with _arrayfld")
     });
+    let (array, arrayfld) = match &type_ {
+        LowLevelType::Array(arr) => ((**arr).clone(), None),
+        LowLevelType::Struct(st) => {
+            let fld = st._arrayfld.as_ref().unwrap_or_else(|| {
+                panic!("raw malloc varsize of {owner}: Struct has no _arrayfld")
+            });
+            let array_ty = st._flds.get(fld).unwrap_or_else(|| {
+                panic!("raw malloc varsize of {owner}: missing array field {fld}")
+            });
+            let LowLevelType::Array(arr) = array_ty else {
+                panic!("raw malloc varsize of {owner}: _arrayfld is not an Array");
+            };
+            ((**arr).clone(), Some((st._name.clone(), fld.clone())))
+        }
+        other => panic!("raw malloc varsize of {owner}: {other:?} is not varsize"),
+    };
+    let field_offsets = match &type_ {
+        LowLevelType::Struct(st) => varsize_struct_field_offsets(st, inner, owner),
+        _ => Vec::new(),
+    };
+    let wrapped = RawMallocVarsizeLayout {
+        inner,
+        struct_name: arrayfld.as_ref().map(|(name, _)| name.clone()),
+        field_offsets,
+    };
+    let layout: &dyn OffsetLayout = &wrapped;
     let array_ty = LowLevelType::Array(Box::new(array.clone()));
     let sizeof_bytes = |ty: &LowLevelType, n: Option<i64>| {
         sizeof(ty, n)
@@ -16329,14 +16476,20 @@ fn raw_malloc_varsize_basesize_itemsize_lengthoffset(
             })
             .unwrap_or_else(|err| panic!("raw malloc varsize of {owner}: {err}"))
     };
-    let basesize = sizeof_bytes(&array_ty, Some(0));
+    let basesize = sizeof_bytes(&type_, Some(0));
     let itemsize = sizeof_bytes(&array.OF, None);
     let nolength = matches!(array._hints.get("nolength"), Some(ConstValue::Bool(true)));
     let lengthoffset = if nolength {
         None
     } else {
+        let offset = match &arrayfld {
+            Some((_, fld)) => offsetof(&type_, fld)
+                .unwrap_or_else(|err| panic!("raw malloc varsize of {owner}: {err}"))
+                .add(arraylengthoffset(&array_ty)),
+            None => arraylengthoffset(&array_ty),
+        };
         Some(
-            arraylengthoffset(&array_ty)
+            offset
                 .byte_size(layout)
                 .unwrap_or_else(|err| panic!("raw malloc varsize of {owner}: {err}")),
         )
@@ -30041,15 +30194,14 @@ mod tests {
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
 
-    /// Length-bearing `Array(Char)` has TYPE-dependent basesize and
-    /// length offset; a fixed 1-arg extern cannot close over TYPE
-    /// (`support.py build_raw_malloc_varsize_builder`).
+    /// Length-bearing `Array(Char)` is the 1-arg CHAR leaf with
+    /// `OS_RAW_MALLOC_VARSIZE_CHAR` (`support.py
+    /// build_raw_malloc_varsize_builder` closed over TYPE).
     #[test]
-    #[should_panic(expected = "one-argument helper closed over TYPE")]
-    fn raw_malloc_varsize_length_bearing_char_needs_closed_over_helper() {
+    fn raw_malloc_varsize_length_bearing_char_takes_one_arg_char_leaf() {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
         let arr = Array::new(LowLevelType::Char);
-        let _ = transform_raw_malloc_ex(
+        let (graph, n) = transform_raw_malloc_ex(
             "Array(Char)",
             false,
             true,
@@ -30058,6 +30210,147 @@ mod tests {
             true,
             false,
             Vec::new(),
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert_eq!(
+            path, "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char_with_length",
+            "length-bearing Char is the 1-arg with_length CHAR leaf, got {path}"
+        );
+        assert!(
+            helper_fnaddr_publishes(path) || path.ends_with("raw_malloc_varsize_char_with_length"),
+            "length-bearing residual {path} is the published helper"
+        );
+        assert_eq!(args_i, std::slice::from_ref(&n));
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::RawMallocVarsizeChar
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+    }
+
+    /// Length-bearing `Array(Char)` with `extra_item_after_alloc=1`.
+    #[test]
+    fn raw_malloc_varsize_length_bearing_extra_item_char_takes_one_arg_char_leaf() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let arr = Array::with_hints(
+            LowLevelType::Char,
+            vec![("extra_item_after_alloc".into(), ConstValue::Int(1))],
+        );
+        let (graph, n) = transform_raw_malloc_ex(
+            "Array(Char)",
+            false,
+            true,
+            None,
+            Some(ptr_to_array(arr)),
+            true,
+            false,
+            Vec::new(),
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert_eq!(
+            path, "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char_with_length_extra_item",
+            "length-bearing extra-item Char is the 1-arg leaf, got {path}"
+        );
+        assert_eq!(args_i, std::slice::from_ref(&n));
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::RawMallocVarsizeChar
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+    }
+
+    /// `transform.py varsize_malloc_helper` for a raw varsize Struct:
+    /// generic `ll_raw_malloc_varsize_with_length`, no CHAR oopspec.
+    #[test]
+    fn raw_malloc_varsize_struct_with_arrayfld_uses_generic_helper() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        let st = Struct::new(
+            "VarsizeRaw",
+            vec![
+                ("x".into(), LowLevelType::Signed),
+                (
+                    "a".into(),
+                    LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
+                ),
+            ],
+        );
+        let result_ll = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(st),
+        }));
+        let (graph, n) = transform_raw_malloc_ex(
+            "VarsizeRaw",
+            false,
+            true,
+            None,
+            Some(result_ll),
+            true,
+            false,
+            Vec::new(),
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert_eq!(
+            path, "majit_rlib::rffi::ll_raw_malloc_varsize_with_length",
+            "varsize Struct residual is the generic with_length helper, got {path}"
+        );
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::None);
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
+        let [n_arg, basesize_arg, itemsize_arg, lengthoffset_arg] = args_i else {
+            panic!(
+                "with_length residual takes n, basesize, itemsize, lengthoffset, got {args_i:?}"
+            );
+        };
+        assert_eq!(n_arg, &n);
+        let word = crate::layout::target_word_size() as i64;
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(basesize_arg)
+                    && matches!(op.kind, OpKind::ConstInt(size) if size == 2 * word)
+            }),
+            "Struct {{x: Signed, a: Array(Signed)}} basesize is 2*WORD, ops {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(itemsize_arg)
+                    && matches!(op.kind, OpKind::ConstInt(size) if size == word)
+            }),
+            "Signed itemsize is WORD, ops {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(lengthoffset_arg)
+                    && matches!(op.kind, OpKind::ConstInt(off) if off == word)
+            }),
+            "length offset is offsetof(a)=WORD, ops {ops:?}"
+        );
+    }
+
+    /// A raw varsize Struct's field offsets follow C ABI alignment
+    /// (`symbolic.get_field_token` → `ll2ctypes.get_ctypes_type(STRUCT)`).
+    #[test]
+    fn varsize_struct_field_offsets_follow_c_alignment() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Struct};
+        let st = Struct::new(
+            "AlignRaw",
+            vec![
+                ("c".into(), LowLevelType::Char),
+                ("x".into(), LowLevelType::Signed),
+                (
+                    "a".into(),
+                    LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
+                ),
+            ],
+        );
+        let fields = varsize_struct_field_offsets(&st, &RawMallocNoLayout, "AlignRaw");
+        let w = crate::layout::target_word_size() as i64;
+        assert_eq!(
+            fields,
+            vec![("c".into(), 0), ("x".into(), w), ("a".into(), 2 * w),]
         );
     }
 

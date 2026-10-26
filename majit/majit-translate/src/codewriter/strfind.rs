@@ -57,6 +57,12 @@ pub const LL_SEARCH: &str = "ll_search";
 pub const SEARCH_ELIDABLE: &str = "_search_elidable";
 /// `rstring._search_normal` (`rlib/rstring.py`).
 pub const SEARCH_NORMAL: &str = "_search_normal";
+/// `rlist.py _ll_list_resize_hint_really` original body.
+const LL_LIST_RESIZE_HINT_REALLY: &str = "_ll_list_resize_hint_really";
+/// `look_inside_iff` wrapper residualized by `_ll_list_resize_ge`.
+const LL_LIST_RESIZE_HINT_REALLY_WRAPPER: &str = "_ll_list_resize_hint_really_look_inside_iff";
+/// `dont_look_inside` trampoline the wrapper's false arm `direct_call`s.
+const LL_LIST_RESIZE_HINT_REALLY_TRAMPOLINE: &str = "_ll_list_resize_hint_really_trampoline";
 
 #[cfg(test)]
 fn helper_fnaddr_path() -> String {
@@ -76,6 +82,11 @@ fn search_elidable_fnaddr_path() -> String {
 #[cfg(test)]
 fn search_normal_fnaddr_path() -> String {
     format!("majit_rlib::rstring::{SEARCH_NORMAL}")
+}
+
+#[cfg(test)]
+fn ll_list_resize_hint_really_fnaddr_path() -> String {
+    format!("majit_rlib::lltypesystem::rlist::{LL_LIST_RESIZE_HINT_REALLY}")
 }
 
 /// `description.py FunctionDesc.cachedgraph` `nameof` on one lltype.
@@ -254,25 +265,21 @@ fn graph_arg_lltypes(graph: &FunctionGraph) -> Vec<LowLevelType> {
         .collect()
 }
 
-fn is_search_family_leaf(name: &str) -> bool {
-    matches!(
-        unspecialized_helper_name(name),
-        LL_FIND | LL_FIND_CHAR | LL_SEARCH | SEARCH_ELIDABLE | SEARCH_NORMAL
-    )
-}
-
 /// `description.py FunctionDesc.cachedgraph` stamps `graph.name` to
 /// `name__<argtypes>` while the function object (and its oopspec) stays
 /// the unspecialized identity. Helper graphs this walk registers under
 /// that label are relabelled; a graphless funcptr and a HOST_ENV
-/// `rlib/jit.py` builtin keep `func._name`.
+/// `rlib/jit.py` builtin keep `func._name`. `jit_conditional_call`
+/// stores the funcptr in args[1] (`rlist.py _ll_list_resize_ge`).
 fn specialize_direct_call_funcptr_names(graph: &FunctionGraph) {
     for block in graph.iterblocks() {
         for op in &mut block.borrow_mut().operations {
-            if op.opname != "direct_call" {
-                continue;
-            }
-            let Some(Hlvalue::Constant(c)) = op.args.first_mut() else {
+            let funcptr_idx = match op.opname.as_str() {
+                "direct_call" => 0,
+                "jit_conditional_call" => 1,
+                _ => continue,
+            };
+            let Some(Hlvalue::Constant(c)) = op.args.get_mut(funcptr_idx) else {
                 continue;
             };
             let ConstValue::LLPtr(ptr) = &mut c.value else {
@@ -519,6 +526,7 @@ fn visit_direct_call_callees(
     seen: &mut HashSet<usize>,
 ) {
     specialize_direct_call_funcptr_names(graph);
+    bind_ll_list_resize_hint_really_from_graph(cc, graph);
     for func in direct_call_funcobjs(graph) {
         if !follow_regular_direct_call(cc, &func) {
             register_host_env_jit_body_graph(cc, rtyper, &func, seen);
@@ -594,6 +602,8 @@ fn register_callee_graph(
     callee: &crate::flowspace::model::FunctionGraph,
     offer_candidate: bool,
 ) {
+    bind_ll_list_resize_hint_really_from_graph(cc, callee);
+    bind_ll_list_resize_hint_really_fnaddr(cc, &path, &graph_arg_lltypes(callee));
     if cc.is_candidate(&path) {
         return;
     }
@@ -668,13 +678,130 @@ fn bind_residual_native_fnaddr(cc: &mut CallControl, dest: &CallPath, args: &[Lo
             }
         }
         None => {
-            let name = dest.last_segment().unwrap_or("");
-            debug_assert!(
-                !(is_search_family_leaf(name) && string_element_of_args(args).is_some()),
-                "no HELPER_FNADDRS row matches residual {dest} layout"
+            // `jtransform.py handle_residual_call` / `call.py CallControl.getcalldescr`
+            // need a real funcptr. A residual with no `HELPER_FNADDRS` family is a
+            // translation error; G5 (and a same-name HELPER row) bind `dest` first.
+            if cc.lookup_function_fnaddr(dest).is_some() {
+                return;
+            }
+            panic!(
+                "residual synthesized helper {dest} has no HELPER_FNADDRS row family (call.py getcalldescr needs a real funcptr)"
             );
         }
     }
+}
+
+fn is_ll_list_resize_hint_really_family_leaf(name: &str) -> bool {
+    matches!(
+        unspecialized_helper_name(name),
+        LL_LIST_RESIZE_HINT_REALLY
+            | LL_LIST_RESIZE_HINT_REALLY_WRAPPER
+            | LL_LIST_RESIZE_HINT_REALLY_TRAMPOLINE
+    )
+}
+
+/// ITEM of `Ptr(GcStruct("list", items: Ptr(GcArray(ITEM))))`.
+fn list_item_lltype_of_ptr(ptr: &LowLevelType) -> Option<LowLevelType> {
+    let LowLevelType::Ptr(p) = ptr else {
+        return None;
+    };
+    let PtrTarget::Struct(st) = &p.TO else {
+        return None;
+    };
+    if st._name != "list" {
+        return None;
+    }
+    let items = st._flds.get("items")?;
+    let LowLevelType::Ptr(items_p) = items else {
+        return None;
+    };
+    match &items_p.TO {
+        PtrTarget::Array(arr) => Some(arr.OF.clone()),
+        _ => None,
+    }
+}
+
+fn ll_list_resize_hint_really_fnaddr_key() -> CallPath {
+    CallPath::from_segments(["lltypesystem", "rlist", LL_LIST_RESIZE_HINT_REALLY])
+}
+
+/// Alias a synthesized `_ll_list_resize_hint_really*` CallPath onto the
+/// Signed `HELPER_FNADDRS` row (`bind_kind_trampoline_fnaddr`). A
+/// non-Signed ITEM has no native row.
+fn bind_ll_list_resize_hint_really_fnaddr(
+    cc: &mut CallControl,
+    dest: &CallPath,
+    args: &[LowLevelType],
+) {
+    let Some(leaf) = dest.last_segment() else {
+        return;
+    };
+    if !is_ll_list_resize_hint_really_family_leaf(leaf) {
+        return;
+    }
+    let item = args.first().and_then(list_item_lltype_of_ptr);
+    let Some(item) = item else {
+        panic!(
+            "_ll_list_resize_hint_really has no native row for item lltype {}",
+            args.first()
+                .map(|ty| ty.short_name())
+                .unwrap_or_else(|| "missing".to_string())
+        );
+    };
+    if item != LowLevelType::Signed {
+        panic!(
+            "_ll_list_resize_hint_really has no native row for item lltype {}",
+            item.short_name()
+        );
+    }
+    if cc.lookup_function_fnaddr(dest).is_some() {
+        return;
+    }
+    let src = ll_list_resize_hint_really_fnaddr_key();
+    if cc.lookup_function_fnaddr(&src).is_some() {
+        cc.alias_function_fnaddr(dest.clone(), &src);
+    }
+}
+
+fn bind_ll_list_resize_hint_really_func(cc: &mut CallControl, func: &_func) {
+    let unspecialized = unspecialized_helper_name(&func._name);
+    if !is_ll_list_resize_hint_really_family_leaf(unspecialized) {
+        return;
+    }
+    bind_ll_list_resize_hint_really_fnaddr(
+        cc,
+        &CallPath::from_segments([unspecialized]),
+        &func.TYPE.args,
+    );
+    let specialized = specialized_callee_leaf(func);
+    if specialized != unspecialized {
+        bind_ll_list_resize_hint_really_fnaddr(
+            cc,
+            &CallPath::from_segments([specialized.as_str()]),
+            &func.TYPE.args,
+        );
+    }
+    if func._name != unspecialized && func._name != specialized {
+        bind_ll_list_resize_hint_really_fnaddr(
+            cc,
+            &CallPath::from_segments([func._name.as_str()]),
+            &func.TYPE.args,
+        );
+    }
+}
+
+fn bind_ll_list_resize_hint_really_from_graph(
+    cc: &mut CallControl,
+    graph: &crate::flowspace::model::FunctionGraph,
+) {
+    for func in direct_call_funcobjs(graph) {
+        bind_ll_list_resize_hint_really_func(cc, &func);
+    }
+    bind_ll_list_resize_hint_really_fnaddr(
+        cc,
+        &CallPath::from_segments([graph.name.as_str()]),
+        &graph_arg_lltypes(graph),
+    );
 }
 
 #[cfg(test)]
@@ -971,7 +1098,42 @@ mod tests {
             !residual_first.is_candidate(&path),
             "ll_newlist under residual _search_elidable is effect-only"
         );
-        register_direct_call_callees(&mut residual_first, &rtyper, &prep.graph.borrow());
+        let func = direct_call_funcobjs(&prep.graph.borrow())
+            .into_iter()
+            .find(|func| unspecialized_helper_name(&func._name).ends_with("ll_newlist"))
+            .expect("ll_newlist funcobj");
+        let start = Block::shared(vec![]);
+        let ret = variable_with_lltype("out", LowLevelType::Signed);
+        let parent = FlowGraph::with_return_var("caller", start.clone(), Hlvalue::Variable(ret));
+        let funcptr = functionptr(
+            func.TYPE.clone(),
+            &func._name,
+            func.graph,
+            func._callable.clone(),
+        );
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", func.TYPE.result.clone());
+        let mut call_args = vec![callee];
+        for arg in &func.TYPE.args {
+            call_args.push(Hlvalue::Variable(variable_with_lltype("x", arg.clone())));
+        }
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            call_args,
+            Hlvalue::Variable(out),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![constant_with_lltype(
+                    ConstValue::Int(0),
+                    LowLevelType::Signed,
+                )],
+                Some(parent.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        register_direct_call_callees(&mut residual_first, &rtyper, &parent);
         assert!(
             residual_first.is_candidate(&path),
             "later candidate walk offers the shared helper"
@@ -982,7 +1144,7 @@ mod tests {
         );
 
         let mut candidate_first = CallControl::new();
-        register_direct_call_callees(&mut candidate_first, &rtyper, &prep.graph.borrow());
+        register_direct_call_callees(&mut candidate_first, &rtyper, &parent);
         visit_direct_call_callees(
             &mut candidate_first,
             &rtyper,
@@ -1920,6 +2082,13 @@ mod tests {
         ]);
 
         let mut cc = CallControl::new();
+        // The fixture stands for a translated function; getfunctionptr gives it an address.
+        cc.register_macro_helper_trace_fnaddr(&format!("fixture::{char_leaf}"), 0x7000);
+        cc.register_macro_helper_trace_fnaddr(&format!("fixture::{uni_leaf}"), 0x7008);
+        assert_eq!(
+            cc.lookup_function_fnaddr(&CallPath::from_segments([char_leaf.as_str()])),
+            Some(0x7000)
+        );
         register_direct_call_callees(&mut cc, &rtyper, &parent);
         let char_path = CallPath::from_segments([char_leaf.as_str()]);
         let uni_path = CallPath::from_segments([uni_leaf.as_str()]);
@@ -1966,7 +2135,15 @@ mod tests {
             .clone();
         drop(graphs);
         let mut cc = CallControl::new();
-        register_direct_call_callees(&mut cc, &rtyper, &prep.graph.borrow());
+        // rstring.py _twoway_preprocess is loopy: policy.py look_inside_graph rejects it, so its
+        // callees register effect-only.
+        visit_direct_call_callees(
+            &mut cc,
+            &rtyper,
+            &prep.graph.borrow(),
+            false,
+            &mut HashSet::new(),
+        );
         let path = CallPath::from_segments(["_ll_list_resize_ge"]);
         register_callee_graph(&mut cc, path.clone(), &ge.borrow(), true);
         assert!(
@@ -1997,7 +2174,15 @@ mod tests {
             .clone();
         drop(graphs);
         let mut cc = CallControl::new();
-        register_direct_call_callees(&mut cc, &rtyper, &prep.graph.borrow());
+        // rstring.py _twoway_preprocess is loopy: policy.py look_inside_graph rejects it, so its
+        // callees register effect-only.
+        visit_direct_call_callees(
+            &mut cc,
+            &rtyper,
+            &prep.graph.borrow(),
+            false,
+            &mut HashSet::new(),
+        );
         let path = CallPath::from_segments(["_ll_list_resize_ge"]);
         register_callee_graph(&mut cc, path, &ge.borrow(), true);
 
@@ -2071,5 +2256,209 @@ mod tests {
             !cc.is_candidate(&isc_path),
             "find_all_graphs follows only regular; isconstant is Builtin"
         );
+    }
+
+    /// `_ll_list_resize_ge`'s residual CondCall of the look_inside_iff
+    /// wrapper aliases the Signed `_ll_list_resize_hint_really` HELPER
+    /// row, as does the `dont_look_inside` trampoline.
+    #[test]
+    fn ll_list_resize_ge_conditional_call_funcptr_is_executable() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
+            &rtyper,
+            "_twoway_preprocess",
+            STRPTR.clone(),
+        )
+        .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge")
+            .clone();
+        drop(graphs);
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(&ll_list_resize_hint_really_fnaddr_path(), 0x5000);
+        // rstring.py _twoway_preprocess is loopy: policy.py look_inside_graph rejects it, so its
+        // callees register effect-only.
+        visit_direct_call_callees(
+            &mut cc,
+            &rtyper,
+            &prep.graph.borrow(),
+            false,
+            &mut HashSet::new(),
+        );
+        let path = CallPath::from_segments(["_ll_list_resize_ge"]);
+        register_callee_graph(&mut cc, path.clone(), &ge.borrow(), true);
+        assert!(
+            cc.is_candidate(&path),
+            "_ll_list_resize_ge must be a candidate; registered {:?}",
+            cc.function_graphs().keys()
+        );
+
+        let wrapper = CallPath::from_segments([LL_LIST_RESIZE_HINT_REALLY_WRAPPER]);
+        assert_eq!(cc.lookup_function_fnaddr(&wrapper), Some(0x5000));
+        let trampoline = CallPath::from_segments([LL_LIST_RESIZE_HINT_REALLY_TRAMPOLINE]);
+        assert_eq!(cc.lookup_function_fnaddr(&trampoline), Some(0x5000));
+
+        for func in direct_call_funcobjs(&ge.borrow()) {
+            if !is_ll_list_resize_hint_really_family_leaf(&func._name) {
+                continue;
+            }
+            let spec = CallPath::from_segments([specialized_callee_leaf(&func).as_str()]);
+            assert_eq!(
+                cc.lookup_function_fnaddr(&spec),
+                Some(0x5000),
+                "specialized {spec} must alias the HELPER row"
+            );
+        }
+
+        let model = lower_graph(&ge.borrow());
+        let fn_consts: Vec<_> = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } if args.is_empty() => {
+                    let segs = target.path_segments()?;
+                    if segs.first() == Some(&crate::model::FN_CONST_HEAD) {
+                        Some(target.clone())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !fn_consts.is_empty(),
+            "lower_graph emits __fn_const of the CondCall target"
+        );
+        for funcptr in &fn_consts {
+            let binding = cc.fnaddr_binding_for_target(funcptr);
+            assert!(
+                !binding.symbolic,
+                "ConditionalCall funcptr must be executable: {funcptr:?}"
+            );
+            assert!(!is_symbolic_fnaddr(binding.addr));
+            assert_eq!(binding.addr, 0x5000);
+        }
+
+        cc.mark_oopspec(
+            CallPath::from_segments(["majit_rlib", "jit", "conditional_call3"]),
+            "jit.conditional_call".to_string(),
+        );
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&model);
+        let funcptrs: Vec<_> = transformed
+            .graph
+            .iter_blocks()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::ConditionalCall { funcptr, .. } => Some(funcptr.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !funcptrs.is_empty(),
+            "_ll_list_resize_ge must emit ConditionalCall"
+        );
+        for funcptr in &funcptrs {
+            let binding = cc.fnaddr_binding_for_target(funcptr);
+            assert!(
+                !binding.symbolic,
+                "ConditionalCall funcptr must be executable: {funcptr:?}"
+            );
+            assert!(!is_symbolic_fnaddr(binding.addr));
+            assert_eq!(binding.addr, 0x5000);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "_ll_list_resize_hint_really has no native row")]
+    fn ll_list_resize_hint_really_non_signed_item_has_no_native_row() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, Struct};
+
+        let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Float)),
+        }));
+        let list = Struct::gc(
+            "list",
+            vec![
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items_ptr),
+            ],
+        );
+        let ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(list),
+        }));
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(&ll_list_resize_hint_really_fnaddr_path(), 0x5000);
+        bind_ll_list_resize_hint_really_fnaddr(
+            &mut cc,
+            &CallPath::from_segments([LL_LIST_RESIZE_HINT_REALLY_WRAPPER]),
+            &[ptr, LowLevelType::Signed, LowLevelType::Bool],
+        );
+    }
+
+    fn signed_list_ptr() -> LowLevelType {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, Struct};
+
+        let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let list = Struct::gc(
+            "list",
+            vec![
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items_ptr),
+            ],
+        );
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(list),
+        }))
+    }
+
+    /// A residual synthesized helper with no `HELPER_FNADDRS` family is a
+    /// translation error (`call.py CallControl.getcalldescr` needs a real
+    /// funcptr).
+    #[test]
+    #[should_panic(expected = "has no HELPER_FNADDRS row family")]
+    fn residual_synthesized_helper_without_row_family_is_a_translation_error() {
+        let mut graph = residual_named_helper("no_helper_fnaddrs_row_family", LowLevelType::Signed);
+        if let Some(func) = graph.func.as_mut() {
+            func._elidable_function_ = false;
+            func._jit_look_inside_ = Some(false);
+        }
+        let mut cc = CallControl::new();
+        register_callee_graph(
+            &mut cc,
+            CallPath::from_segments(["no_helper_fnaddrs_row_family"]),
+            &graph,
+            true,
+        );
+    }
+
+    /// G5 aliases the look_inside_iff wrapper onto the Signed HELPER row
+    /// before `bind_residual_native_fnaddr` checks for a row family.
+    #[test]
+    fn ll_list_resize_hint_really_wrapper_is_bound_before_residual_check() {
+        let mut graph =
+            residual_named_helper(LL_LIST_RESIZE_HINT_REALLY_WRAPPER, signed_list_ptr());
+        if let Some(func) = graph.func.as_mut() {
+            func._elidable_function_ = false;
+            func._jit_look_inside_ = Some(false);
+        }
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(&ll_list_resize_hint_really_fnaddr_path(), 0x5000);
+        let path = CallPath::from_segments([LL_LIST_RESIZE_HINT_REALLY_WRAPPER]);
+        register_callee_graph(&mut cc, path.clone(), &graph, true);
+        assert!(
+            !cc.is_candidate(&path),
+            "look_inside_graph refuses `_jit_look_inside_ = False`"
+        );
+        assert_eq!(cc.lookup_function_fnaddr(&path), Some(0x5000));
     }
 }

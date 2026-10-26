@@ -14,6 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::{Arc, LazyLock};
 
+use crate::annotator::bookkeeper::is_objectmodel_r_dict_instance;
 use crate::annotator::dictdef::DictDef;
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue,
@@ -1018,21 +1019,12 @@ impl Hash for DictCacheKey {
     }
 }
 
-fn is_objectmodel_r_dict_host(obj: &HostObject) -> bool {
-    obj.instance_class().is_some_and(|cls| {
-        matches!(
-            cls.qualname(),
-            "rpython.rlib.objectmodel.r_dict" | "rpython.rlib.objectmodel.r_ordereddict"
-        )
-    })
-}
-
 fn dict_cache_key(value: &ConstValue) -> Result<DictCacheKey, TyperError> {
     match value {
         ConstValue::Dict(items) => Ok(DictCacheKey::Dict {
             items: Arc::clone(items),
         }),
-        ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+        ConstValue::HostObject(obj) if is_objectmodel_r_dict_instance(obj) => {
             Ok(DictCacheKey::RDict { obj: obj.clone() })
         }
         other => Err(TyperError::message(format!(
@@ -1044,7 +1036,7 @@ fn dict_cache_key(value: &ConstValue) -> Result<DictCacheKey, TyperError> {
 fn dict_const_len(value: &ConstValue) -> Result<usize, TyperError> {
     match value {
         ConstValue::Dict(items) => Ok(items.len()),
-        ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+        ConstValue::HostObject(obj) if is_objectmodel_r_dict_instance(obj) => {
             match host_instance_attr(obj, "_dict")? {
                 ConstValue::Dict(items) => Ok(items.len()),
                 other => Err(TyperError::message(format!(
@@ -1272,7 +1264,7 @@ impl OrderedDictRepr {
             return Err(TyperError::message("No prebuilt dicts of address keys"));
         }
         match dictobj {
-            ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+            ConstValue::HostObject(obj) if is_objectmodel_r_dict_instance(obj) => {
                 self.convert_const_r_dict(obj, &mut l_dict)?;
             }
             ConstValue::Dict(items) => {
@@ -2442,7 +2434,7 @@ impl Repr for OrderedDictRepr {
                 ))
             }
             ConstValue::Dict(_) => self.convert_const_prebuilt_dict(value),
-            ConstValue::HostObject(obj) if is_objectmodel_r_dict_host(obj) => {
+            ConstValue::HostObject(obj) if is_objectmodel_r_dict_instance(obj) => {
                 self.convert_const_prebuilt_dict(value)
             }
             other => Err(TyperError::message(format!("expected a dict: {other:?}"))),
@@ -5256,6 +5248,10 @@ fn mint_ll_dict_create_initial_index_look_inside_iff(
 ///     ll_dict_reindex(d, new_size)
 /// ```
 ///
+/// `d.num_ever_used_items` is the range bound (read once). `d.entries` is
+/// re-read each loop iteration before `d_entry.key`, after the previous
+/// iteration's `d.keyhash`. `d.num_live_items` is read in the `new_size`
+/// while-test after the hash loop (`ll_dict_rehash_after_translation`).
 /// The `assert`s (`num_live_items == num_ever_used_items`, `not d.indexes`,
 /// `entries.valid(i)`) are debug-only, same omission as
 /// [`build_ll_ensure_indexes_helper_graph`].
@@ -5292,13 +5288,6 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     let mut graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
 
-    let entries = new_var("entries", entries_ptr_lltype.clone());
-    push(
-        &startblock,
-        "getfield",
-        vec![var(&d), void_field_const("entries")],
-        &entries,
-    );
     let ibound = new_var("ibound", sig());
     push(
         &startblock,
@@ -5306,30 +5295,15 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
         vec![var(&d), void_field_const("num_ever_used_items")],
         &ibound,
     );
-    let live = new_var("live", sig());
-    push(
-        &startblock,
-        "getfield",
-        vec![var(&d), void_field_const("num_live_items")],
-        &live,
-    );
 
     let cd_d = new_var("d", dict_ptr_lltype.clone());
-    let cd_entries = new_var("entries", entries_ptr_lltype.clone());
     let cd_ibound = new_var("ibound", sig());
-    let cd_live = new_var("live", sig());
     let cd_i = new_var("i", sig());
-    let block_cond = Block::shared(vec![
-        var(&cd_d),
-        var(&cd_entries),
-        var(&cd_ibound),
-        var(&cd_live),
-        var(&cd_i),
-    ]);
+    let block_cond = Block::shared(vec![var(&cd_d), var(&cd_ibound), var(&cd_i)]);
 
     startblock.closeblock(vec![
         Link::new(
-            vec![var(&d), var(&entries), var(&ibound), var(&live), signed(0)],
+            vec![var(&d), var(&ibound), signed(0)],
             Some(block_cond.clone()),
             None,
         )
@@ -5337,22 +5311,13 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     ]);
 
     let bd_d = new_var("d", dict_ptr_lltype.clone());
-    let bd_entries = new_var("entries", entries_ptr_lltype.clone());
     let bd_ibound = new_var("ibound", sig());
-    let bd_live = new_var("live", sig());
     let bd_i = new_var("i", sig());
-    let block_body = Block::shared(vec![
-        var(&bd_d),
-        var(&bd_entries),
-        var(&bd_ibound),
-        var(&bd_live),
-        var(&bd_i),
-    ]);
+    let block_body = Block::shared(vec![var(&bd_d), var(&bd_ibound), var(&bd_i)]);
 
     let sz_d = new_var("d", dict_ptr_lltype.clone());
-    let sz_live = new_var("live", sig());
     let sz_size = new_var("new_size", sig());
-    let block_size_cond = Block::shared(vec![var(&sz_d), var(&sz_live), var(&sz_size)]);
+    let block_size_cond = Block::shared(vec![var(&sz_d), var(&sz_size)]);
 
     let cond = new_var("cond", LowLevelType::Bool);
     push(
@@ -5364,19 +5329,13 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     block_cond.borrow_mut().exitswitch = Some(var(&cond));
     block_cond.closeblock(vec![
         Link::new(
-            vec![
-                var(&cd_d),
-                var(&cd_entries),
-                var(&cd_ibound),
-                var(&cd_live),
-                var(&cd_i),
-            ],
+            vec![var(&cd_d), var(&cd_ibound), var(&cd_i)],
             Some(block_body.clone()),
             Some(bool_const(true)),
         )
         .into_ref(),
         Link::new(
-            vec![var(&cd_d), var(&cd_live), signed(DICT_INITSIZE)],
+            vec![var(&cd_d), signed(DICT_INITSIZE)],
             Some(block_size_cond.clone()),
             Some(bool_const(false)),
         )
@@ -5386,11 +5345,18 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     let key_ll = dictentry_key_lltype(&entries_ptr_lltype).ok_or_else(|| {
         TyperError::message("ll_dict_rehash_after_translation: ENTRY.key missing")
     })?;
+    let entries = new_var("entries", entries_ptr_lltype.clone());
+    push(
+        &block_body,
+        "getfield",
+        vec![var(&bd_d), void_field_const("entries")],
+        &entries,
+    );
     let entry_key = new_var("entry_key", key_ll);
     push(
         &block_body,
         "getinteriorfield",
-        vec![var(&bd_entries), var(&bd_i), void_field_const("key")],
+        vec![var(&entries), var(&bd_i), void_field_const("key")],
         &entry_key,
     );
     let h = new_var("h", sig());
@@ -5405,7 +5371,7 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
             &block_body,
             "setinteriorfield",
             vec![
-                var(&bd_entries),
+                var(&entries),
                 var(&bd_i),
                 void_field_const("f_hash"),
                 var(&h),
@@ -5417,13 +5383,7 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     push(&block_body, "int_add", vec![var(&bd_i), signed(1)], &i_next);
     block_body.closeblock(vec![
         Link::new(
-            vec![
-                var(&bd_d),
-                var(&bd_entries),
-                var(&bd_ibound),
-                var(&bd_live),
-                var(&i_next),
-            ],
+            vec![var(&bd_d), var(&bd_ibound), var(&i_next)],
             Some(block_cond),
             None,
         )
@@ -5431,14 +5391,20 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     ]);
 
     let db_d = new_var("d", dict_ptr_lltype.clone());
-    let db_live = new_var("live", sig());
     let db_size = new_var("new_size", sig());
-    let block_size_body = Block::shared(vec![var(&db_d), var(&db_live), var(&db_size)]);
+    let block_size_body = Block::shared(vec![var(&db_d), var(&db_size)]);
 
     let cr_d = new_var("d", dict_ptr_lltype.clone());
     let cr_size = new_var("new_size", sig());
     let block_call_reindex = Block::shared(vec![var(&cr_d), var(&cr_size)]);
 
+    let live = new_var("live", sig());
+    push(
+        &block_size_cond,
+        "getfield",
+        vec![var(&sz_d), void_field_const("num_live_items")],
+        &live,
+    );
     let t1 = new_var("t1", sig());
     push(
         &block_size_cond,
@@ -5450,7 +5416,7 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     push(
         &block_size_cond,
         "int_mul",
-        vec![var(&sz_live), signed(3)],
+        vec![var(&live), signed(3)],
         &t2,
     );
     let t3 = new_var("t3", sig());
@@ -5460,7 +5426,7 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     block_size_cond.borrow_mut().exitswitch = Some(var(&grow));
     block_size_cond.closeblock(vec![
         Link::new(
-            vec![var(&sz_d), var(&sz_live), var(&sz_size)],
+            vec![var(&sz_d), var(&sz_size)],
             Some(block_size_body.clone()),
             Some(bool_const(true)),
         )
@@ -5482,7 +5448,7 @@ pub(crate) fn build_ll_dict_rehash_after_translation_helper_graph(
     );
     block_size_body.closeblock(vec![
         Link::new(
-            vec![var(&db_d), var(&db_live), var(&db_size2)],
+            vec![var(&db_d), var(&db_size2)],
             Some(block_size_cond),
             None,
         )
@@ -15297,7 +15263,9 @@ mod tests {
         key_hash: ConstValue,
         pairs: &[(i64, i64)],
     ) -> HostObject {
-        let cls = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let cls = crate::flowspace::model::HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_dict")
+            .expect("canonical r_dict class");
         let key_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
         let r_dict = HostObject::new_instance(cls, vec![]);
         r_dict.instance_set("key_eq", key_eq).expect("key_eq");
@@ -17133,6 +17101,92 @@ mod tests {
             helper.func._jit_look_inside_,
             Some(false),
             "ll_dict_rehash_after_translation is dont_look_inside"
+        );
+    }
+
+    fn getfield_field(op: &SpaceOperation) -> Option<ConstValue> {
+        if op.opname != "getfield" {
+            return None;
+        }
+        match op.args.get(1) {
+            Some(Hlvalue::Constant(c)) => Some(c.value.clone()),
+            _ => None,
+        }
+    }
+
+    /// `ll_dict_rehash_after_translation`: `d.entries` is re-read in the
+    /// loop body (not the entry block); `d.num_live_items` is read only
+    /// after the hash loop, in the `new_size` while-test.
+    #[test]
+    fn ll_dict_rehash_after_translation_reads_entries_in_loop_live_after() {
+        let repr = sample_ordered_dict_repr();
+        let entries_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(repr.DICTENTRYARRAY.clone()),
+        }));
+        let helper = build_ll_dict_rehash_after_translation_helper_graph(
+            "ll_dict_rehash_after_translation",
+            repr.lowleveltype().clone(),
+            entries_ptr,
+            dummy_funcptr_const(),
+            dummy_funcptr_const(),
+            false,
+        )
+        .expect("rehash helper");
+        crate::flowspace::model::checkgraph(&helper.graph.borrow());
+        let start = helper.graph.borrow().startblock.clone();
+        let start_fields: Vec<ConstValue> = start
+            .borrow()
+            .operations
+            .iter()
+            .filter_map(getfield_field)
+            .collect();
+        assert_eq!(
+            start_fields,
+            vec![ConstValue::byte_str("num_ever_used_items")],
+            "range bound is read once in the entry block"
+        );
+
+        let cond = start
+            .borrow()
+            .exits
+            .first()
+            .and_then(|l| l.borrow().target.clone())
+            .expect("loop cond");
+        let body = bool_exit(&cond, true);
+        let body_ops = body.borrow().operations.clone();
+        assert_eq!(
+            getfield_field(&body_ops[0]),
+            Some(ConstValue::byte_str("entries")),
+            "d.entries is re-read at the start of the loop body"
+        );
+        assert_eq!(body_ops[1].opname, "getinteriorfield");
+        assert_eq!(body_ops[2].opname, "direct_call");
+        assert!(
+            body_ops
+                .iter()
+                .all(|op| getfield_field(op) != Some(ConstValue::byte_str("num_live_items"))),
+            "num_live_items is not read in the hash loop"
+        );
+
+        let size_cond = bool_exit(&cond, false);
+        let size_fields: Vec<ConstValue> = size_cond
+            .borrow()
+            .operations
+            .iter()
+            .filter_map(getfield_field)
+            .collect();
+        assert_eq!(
+            size_fields,
+            vec![ConstValue::byte_str("num_live_items")],
+            "d.num_live_items is read in the new_size while-test after the loop"
+        );
+        assert!(
+            start
+                .borrow()
+                .operations
+                .iter()
+                .all(|op| getfield_field(op) != Some(ConstValue::byte_str("entries"))),
+            "d.entries is not hoisted into the entry block"
         );
     }
 

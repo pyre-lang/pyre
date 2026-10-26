@@ -101,3 +101,22 @@ fn trigger_looks_up_index_and_pops_without_collector_reentry() {
     set_active_finalizer_queue_table(None);
     ACTIVE_TABLE.store(std::ptr::null_mut(), Ordering::Release);
 }
+
+/// `boehm.py BoehmGCTransformer.get_finalizer_queue_index`: the host-heap
+/// descr still numbers a tag when no framework collector is installed.
+#[test]
+fn host_heap_numbers_finalizer_queue_indexes_without_a_collector() {
+    fn dummy() {}
+    static HOST_FQ: u8 = 0;
+    std::thread::spawn(|| {
+        let tag = FinalizerQueueTag {
+            fq: std::ptr::addr_of!(HOST_FQ) as usize,
+            trigger: dummy,
+        };
+        let index = gc_get_finalizer_queue_index(tag);
+        assert_eq!(index, gc_get_finalizer_queue_index(tag));
+        assert!(gc_fq_next_dead(index).is_none());
+    })
+    .join()
+    .expect("host-heap finalizer queue thread");
+}

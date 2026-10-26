@@ -12,40 +12,24 @@
 //! erased managed object.
 
 use parking_lot::Mutex;
-use std::alloc::{Layout, alloc, dealloc};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
 use crate::rffi::{MemoryError, free_charp, str2charp};
 
-/// Alignment of every block [`raw_malloc_varsize_char`] returns, and the
-/// header word [`raw_free`] reads the size back from.
-const RAW_BLOCK_ALIGN: usize = std::mem::align_of::<u128>();
+/// `lltype.Array(Char)` length word (`llmemory.ArrayLengthOffset` is 0,
+/// `ArrayItemsOffset` is `sizeof(Signed)`).
+const CHAR_ARRAY_LENGTH_SIZE: usize = std::mem::size_of::<isize>();
 
 /// `lltype.malloc(rffi.CCHARP.TO, size, flavor='raw')` —
 /// `support.py ll_raw_malloc_varsize_char`. A zero-size request still returns
-/// a distinct address.
+/// a distinct address (`raw_malloc` uses `size.max(1)`). Allocates through
+/// the same `raw_malloc` that `ll_raw_free` releases.
 #[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
 #[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_char(size: usize) -> usize {
-    // The size is kept in front of the block so `raw_free(ptr)` can rebuild
-    // the layout `dealloc` needs. Overflow or a failed `alloc` is
-    // MemoryError (`ll_raw_malloc_varsize_char` can raise).
-    let Some(total) = size.checked_add(RAW_BLOCK_ALIGN) else {
-        return raw_malloc_char_memory_error();
-    };
-    let Ok(layout) = Layout::from_size_align(total, RAW_BLOCK_ALIGN) else {
-        return raw_malloc_char_memory_error();
-    };
-    unsafe {
-        let base = alloc(layout);
-        if base.is_null() {
-            return raw_malloc_char_memory_error();
-        }
-        (base as *mut usize).write(total);
-        base as usize + RAW_BLOCK_ALIGN
-    }
+    raw_malloc_varsize_char_impl(size, false, false)
 }
 
 fn raw_malloc_char_memory_error() -> usize {
@@ -68,11 +52,14 @@ fn raw_malloc_varsize_char_impl(size: usize, zero: bool, add_memory_pressure: bo
     if add_memory_pressure && size > 0 {
         majit_gc::add_memory_pressure(size as isize, majit_ir::GcRef::NULL);
     }
-    let ptr = raw_malloc_varsize_char(size);
-    if ptr != 0 && zero && size > 0 {
-        unsafe { (ptr as *mut u8).write_bytes(0, size) };
+    let ptr = unsafe { crate::rffi::raw_malloc(size) };
+    if ptr.is_null() {
+        return raw_malloc_char_memory_error();
     }
-    ptr
+    if zero && size > 0 {
+        unsafe { ptr.write_bytes(0, size) };
+    }
+    ptr as usize
 }
 
 /// `_rewrite_raw_malloc` `name += '_add_memory_pressure'` on the CHAR path.
@@ -187,19 +174,157 @@ pub fn raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocatio
     raw_malloc_varsize_zero_extra_item_add_memory_pressure(n)
 }
 
+/// Length-bearing `Array(Char)`: one `Signed` length word at offset 0
+/// then `n` chars (`llmemory.ArrayLengthOffset` / `ArrayItemsOffset`).
+/// `extra` is `extra_item_after_alloc` (`llmemory.sizeof(TYPE, n)`).
+fn raw_malloc_varsize_char_with_length_impl(
+    n: usize,
+    extra: usize,
+    zero: bool,
+    add_memory_pressure: bool,
+) -> usize {
+    let Some(payload) = n.checked_add(extra) else {
+        return raw_malloc_char_memory_error();
+    };
+    if add_memory_pressure && payload > 0 {
+        majit_gc::add_memory_pressure(payload as isize, majit_ir::GcRef::NULL);
+    }
+    let Some(bytes) = CHAR_ARRAY_LENGTH_SIZE.checked_add(payload) else {
+        return raw_malloc_char_memory_error();
+    };
+    if bytes > isize::MAX as usize {
+        return raw_malloc_char_memory_error();
+    }
+    let ptr = unsafe { crate::rffi::raw_malloc(bytes) };
+    if ptr.is_null() {
+        return raw_malloc_char_memory_error();
+    }
+    if zero && bytes > 0 {
+        unsafe { ptr.write_bytes(0, bytes) };
+    }
+    unsafe { ptr.cast::<isize>().write(n as isize) };
+    ptr as usize
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_with_length(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 0, false, false)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_with_length(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 0, true, false)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_with_length_add_memory_pressure(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_add_memory_pressure(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 0, false, true)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_with_length_add_memory_pressure(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_add_memory_pressure(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 0, true, true)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_with_length_no_track_allocation(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_no_track_allocation(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length(n)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_with_length_no_track_allocation(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_no_track_allocation(n: usize) -> usize {
+    raw_malloc_varsize_zero_with_length(n)
+}
+
+#[majit_macros::oopspec(
+    "raw_malloc_varsize_char_with_length_add_memory_pressure_no_track_allocation(n)"
+)]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_add_memory_pressure_no_track_allocation(
+    n: usize,
+) -> usize {
+    raw_malloc_varsize_char_with_length_add_memory_pressure(n)
+}
+
+#[majit_macros::oopspec(
+    "raw_malloc_varsize_zero_with_length_add_memory_pressure_no_track_allocation(n)"
+)]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_add_memory_pressure_no_track_allocation(
+    n: usize,
+) -> usize {
+    raw_malloc_varsize_zero_with_length_add_memory_pressure(n)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_with_length_extra_item(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_extra_item(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 1, false, false)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_with_length_extra_item(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_extra_item(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 1, true, false)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 1, false, true)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_impl(n, 1, true, true)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_char_with_length_extra_item_no_track_allocation(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_extra_item_no_track_allocation(n: usize) -> usize {
+    raw_malloc_varsize_char_with_length_extra_item(n)
+}
+
+#[majit_macros::oopspec("raw_malloc_varsize_zero_with_length_extra_item_no_track_allocation(n)")]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_extra_item_no_track_allocation(n: usize) -> usize {
+    raw_malloc_varsize_zero_with_length_extra_item(n)
+}
+
+#[majit_macros::oopspec(
+    "raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure_no_track_allocation(n)"
+)]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure_no_track_allocation(
+    n: usize,
+) -> usize {
+    raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure(n)
+}
+
+#[majit_macros::oopspec(
+    "raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure_no_track_allocation(n)"
+)]
+#[majit_macros::dont_look_inside]
+pub fn raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure_no_track_allocation(
+    n: usize,
+) -> usize {
+    raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure(n)
+}
+
 /// `lltype.free(ptr, flavor='raw')` — `support.py ll_raw_free`. Frees a block
-/// [`raw_malloc_varsize_char`] returned.
+/// [`raw_malloc_varsize_char`] returned, through the same `raw_free` as
+/// `ll_raw_free`.
 #[majit_macros::oopspec("raw_free(ptr)")]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn raw_free(ptr: usize) {
-    unsafe {
-        let base = (ptr - RAW_BLOCK_ALIGN) as *mut u8;
-        let total = (base as *const usize).read();
-        dealloc(
-            base,
-            Layout::from_size_align_unchecked(total, RAW_BLOCK_ALIGN),
-        );
-    }
+    unsafe { crate::rffi::raw_free(ptr as *mut u8) }
 }
 
 /// `rffi.ptradd` — advance a raw byte address without a memory access.
@@ -414,16 +539,20 @@ mod tests {
         }
         raw_write_f64(block, 1.5);
         assert_eq!(raw_read_f64(block), 1.5);
-        raw_free(block);
+        crate::rffi::ll_raw_free(block as i64);
         let empty = raw_malloc_varsize_char(0);
+        let empty2 = raw_malloc_varsize_char(0);
         assert_ne!(empty, 0);
-        raw_free(empty);
+        assert_ne!(empty2, 0);
+        assert_ne!(empty, empty2);
+        crate::rffi::ll_raw_free(empty as i64);
+        crate::rffi::ll_raw_free(empty2 as i64);
         let zeroed = raw_malloc_varsize_zero(16);
         unsafe {
             let bytes = std::slice::from_raw_parts(zeroed as *const u8, 16);
             assert!(bytes.iter().all(|b| *b == 0));
         }
-        raw_free(zeroed);
+        crate::rffi::ll_raw_free(zeroed as i64);
     }
 
     /// `llmemory.sizeof(TYPE, n)` with `extra_item_after_alloc=1` is
@@ -437,14 +566,14 @@ mod tests {
             (ptr as *mut u8).add(n).write(0xAB);
             assert_eq!((ptr as *const u8).add(n).read(), 0xAB);
         }
-        raw_free(ptr);
+        crate::rffi::ll_raw_free(ptr as i64);
         let zeroed = raw_malloc_varsize_zero_extra_item(n);
         assert_ne!(zeroed, 0);
         unsafe {
             let bytes = std::slice::from_raw_parts(zeroed as *const u8, n + 1);
             assert!(bytes.iter().all(|b| *b == 0));
         }
-        raw_free(zeroed);
+        crate::rffi::ll_raw_free(zeroed as i64);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -462,6 +591,140 @@ mod tests {
             "raw_malloc_varsize_zero_extra_item_no_track_allocation",
             "raw_malloc_varsize_char_extra_item_add_memory_pressure_no_track_allocation",
             "raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation",
+        ] {
+            let path = format!("{module}::{leaf}");
+            assert!(
+                published.contains(&path.as_str()),
+                "{path} is not published"
+            );
+        }
+    }
+
+    /// Every CHAR leaf pairs with `ll_raw_free` (the residual `raw_free`).
+    #[test]
+    fn char_leaves_free_via_ll_raw_free() {
+        let n = 3usize;
+        let leaves: [fn(usize) -> usize; 32] = [
+            raw_malloc_varsize_char,
+            raw_malloc_varsize_char_add_memory_pressure,
+            raw_malloc_varsize_char_no_track_allocation,
+            raw_malloc_varsize_char_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_zero,
+            raw_malloc_varsize_zero_add_memory_pressure,
+            raw_malloc_varsize_zero_no_track_allocation,
+            raw_malloc_varsize_zero_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_char_extra_item,
+            raw_malloc_varsize_char_extra_item_add_memory_pressure,
+            raw_malloc_varsize_char_extra_item_no_track_allocation,
+            raw_malloc_varsize_char_extra_item_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_zero_extra_item,
+            raw_malloc_varsize_zero_extra_item_add_memory_pressure,
+            raw_malloc_varsize_zero_extra_item_no_track_allocation,
+            raw_malloc_varsize_zero_extra_item_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_char_with_length,
+            raw_malloc_varsize_char_with_length_add_memory_pressure,
+            raw_malloc_varsize_char_with_length_no_track_allocation,
+            raw_malloc_varsize_char_with_length_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_zero_with_length,
+            raw_malloc_varsize_zero_with_length_add_memory_pressure,
+            raw_malloc_varsize_zero_with_length_no_track_allocation,
+            raw_malloc_varsize_zero_with_length_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_char_with_length_extra_item,
+            raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure,
+            raw_malloc_varsize_char_with_length_extra_item_no_track_allocation,
+            raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_zero_with_length_extra_item,
+            raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure,
+            raw_malloc_varsize_zero_with_length_extra_item_no_track_allocation,
+            raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure_no_track_allocation,
+        ];
+        for alloc in leaves {
+            let ptr = alloc(n);
+            assert_ne!(ptr, 0);
+            crate::rffi::ll_raw_free(ptr as i64);
+        }
+        let empty = raw_malloc_varsize_char_with_length(0);
+        assert_ne!(empty, 0);
+        crate::rffi::ll_raw_free(empty as i64);
+    }
+
+    /// Length-bearing `Array(Char)`: length word holds `n`, payload is
+    /// writable, `_zero` clears the chars.
+    #[test]
+    fn length_bearing_char_stores_n_and_zero_clears() {
+        let n = 5usize;
+        let word = CHAR_ARRAY_LENGTH_SIZE;
+        let leaves: [fn(usize) -> usize; 8] = [
+            raw_malloc_varsize_char_with_length,
+            raw_malloc_varsize_char_with_length_add_memory_pressure,
+            raw_malloc_varsize_char_with_length_no_track_allocation,
+            raw_malloc_varsize_char_with_length_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_char_with_length_extra_item,
+            raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure,
+            raw_malloc_varsize_char_with_length_extra_item_no_track_allocation,
+            raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure_no_track_allocation,
+        ];
+        for alloc in leaves {
+            let ptr = alloc(n);
+            assert_ne!(ptr, 0);
+            unsafe {
+                assert_eq!((ptr as *const isize).read(), n as isize);
+                (ptr as *mut u8).add(word).write(0xAB);
+                assert_eq!((ptr as *const u8).add(word).read(), 0xAB);
+            }
+            crate::rffi::ll_raw_free(ptr as i64);
+        }
+        let zeros: [fn(usize) -> usize; 8] = [
+            raw_malloc_varsize_zero_with_length,
+            raw_malloc_varsize_zero_with_length_add_memory_pressure,
+            raw_malloc_varsize_zero_with_length_no_track_allocation,
+            raw_malloc_varsize_zero_with_length_add_memory_pressure_no_track_allocation,
+            raw_malloc_varsize_zero_with_length_extra_item,
+            raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure,
+            raw_malloc_varsize_zero_with_length_extra_item_no_track_allocation,
+            raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure_no_track_allocation,
+        ];
+        for alloc in zeros {
+            let ptr = alloc(n);
+            assert_ne!(ptr, 0);
+            unsafe {
+                assert_eq!((ptr as *const isize).read(), n as isize);
+                let payload = std::slice::from_raw_parts((ptr as *const u8).add(word), n);
+                assert!(payload.iter().all(|b| *b == 0));
+            }
+            crate::rffi::ll_raw_free(ptr as i64);
+        }
+        let extra = raw_malloc_varsize_char_with_length_extra_item(n);
+        unsafe {
+            (extra as *mut u8).add(word + n).write(0xCD);
+            assert_eq!((extra as *const u8).add(word + n).read(), 0xCD);
+        }
+        crate::rffi::ll_raw_free(extra as i64);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn length_bearing_char_helpers_are_published() {
+        let module = module_path!().trim_end_matches("::tests");
+        let mut published = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| published.push(desc.path));
+        for leaf in [
+            "raw_malloc_varsize_char_with_length",
+            "raw_malloc_varsize_zero_with_length",
+            "raw_malloc_varsize_char_with_length_add_memory_pressure",
+            "raw_malloc_varsize_zero_with_length_add_memory_pressure",
+            "raw_malloc_varsize_char_with_length_no_track_allocation",
+            "raw_malloc_varsize_zero_with_length_no_track_allocation",
+            "raw_malloc_varsize_char_with_length_add_memory_pressure_no_track_allocation",
+            "raw_malloc_varsize_zero_with_length_add_memory_pressure_no_track_allocation",
+            "raw_malloc_varsize_char_with_length_extra_item",
+            "raw_malloc_varsize_zero_with_length_extra_item",
+            "raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure",
+            "raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure",
+            "raw_malloc_varsize_char_with_length_extra_item_no_track_allocation",
+            "raw_malloc_varsize_zero_with_length_extra_item_no_track_allocation",
+            "raw_malloc_varsize_char_with_length_extra_item_add_memory_pressure_no_track_allocation",
+            "raw_malloc_varsize_zero_with_length_extra_item_add_memory_pressure_no_track_allocation",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(

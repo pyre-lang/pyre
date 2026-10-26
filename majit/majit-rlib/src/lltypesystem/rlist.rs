@@ -510,6 +510,38 @@ pub unsafe fn alloc_typed_items_block_immortal(cap: usize) -> *mut TypedItemsBlo
     }
 }
 
+/// `GcStruct("list", length: Signed, items: Ptr(GcArray(Signed)))` —
+/// `ListRepr::from_item_reprs`. MiniMark's GC header sits before the
+/// object pointer, so the pointer addresses `length`. Offsets are the
+/// `#[repr(C)]` field order the JIT descr uses for that GcStruct.
+#[repr(C)]
+pub struct GcList {
+    pub length: i64,
+    pub items: *mut TypedItemsBlock,
+}
+
+pub const GC_LIST_LENGTH_OFFSET: usize = std::mem::offset_of!(GcList, length);
+pub const GC_LIST_ITEMS_OFFSET: usize = std::mem::offset_of!(GcList, items);
+
+const _: () = assert!(GC_LIST_LENGTH_OFFSET == 0);
+const _: () = assert!(GC_LIST_ITEMS_OFFSET == std::mem::size_of::<i64>());
+const _: () = assert!(std::mem::size_of::<GcList>() == 2 * std::mem::size_of::<i64>());
+
+fn rlist_overallocate_signed(newsize: i64) -> i64 {
+    let some = if newsize < 9 { 3i64 } else { 6i64 };
+    let some = some.wrapping_add(newsize >> 3);
+    newsize.wrapping_add(some)
+}
+
+fn ll_prebuilt_empty_signed_items_block() -> *mut TypedItemsBlock {
+    static PREBUILT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *PREBUILT.get_or_init(|| unsafe {
+        let block = alloc_typed_items_block_immortal(0);
+        (*block).capacity = 0;
+        block as usize
+    }) as *mut TypedItemsBlock
+}
+
 fn clamp_repeat_count(count: i64) -> usize {
     if count < 0 { 0 } else { count as usize }
 }
@@ -523,6 +555,56 @@ unsafe fn fill_typed_items_block<T: Copy>(block: *mut TypedItemsBlock, count: us
             *base.add(i) = item;
             i += 1;
         }
+    }
+}
+
+/// Residual CondCall target of `_ll_list_resize_ge` (`rlist.py
+/// _ll_list_resize_hint_really`) for the Signed GC `ListRepr`.
+/// `dont_look_inside` publishes this to `HELPER_FNADDRS`.
+#[majit_macros::dont_look_inside]
+pub fn _ll_list_resize_hint_really(l: *mut GcList, newsize: i64, overallocate: bool) {
+    unsafe {
+        if newsize <= 0 {
+            debug_assert!(newsize == 0, "negative list length");
+            (*l).length = 0;
+            majit_gc::gc_write_barrier(majit_ir::GcRef(l as usize));
+            (*l).items = ll_prebuilt_empty_signed_items_block();
+            return;
+        }
+        let new_allocated = if overallocate {
+            rlist_overallocate_signed(newsize)
+        } else {
+            newsize
+        };
+        if new_allocated <= 0 {
+            std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>());
+        }
+        let mut roots = [majit_ir::GcRef(l as usize)];
+        let newitems = try_alloc_typed_items_block_nursery_rooted(
+            new_allocated as usize,
+            gc_int_array_gc_type_id(),
+            &mut roots,
+        )
+        .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()));
+        let l = roots[0].0 as *mut GcList;
+        let before_len = (*l).length;
+        if before_len != 0 {
+            let p = if before_len < newsize {
+                before_len
+            } else {
+                newsize
+            };
+            if p > 0 {
+                let items = (*l).items;
+                std::ptr::copy_nonoverlapping(
+                    typed_items_block_items_base(items) as *const i64,
+                    typed_items_block_items_base(newitems) as *mut i64,
+                    p as usize,
+                );
+            }
+        }
+        majit_gc::gc_write_barrier(majit_ir::GcRef(l as usize));
+        (*l).items = newitems;
     }
 }
 
@@ -650,12 +732,61 @@ mod tests {
         for leaf in [
             "_ll_fixed_alloc_and_set_nonnull_i_trampoline",
             "_ll_fixed_alloc_and_set_nonnull_f_trampoline",
+            "_ll_list_resize_hint_really",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
                 published.contains(&path.as_str()),
                 "{path} is not published"
             );
+        }
+    }
+
+    #[test]
+    fn hint_really_grows_signed_list() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let items = _ll_fixed_alloc_and_set_nonnull_i_trampoline(3, 0);
+        unsafe {
+            let base = typed_items_block_items_base(items) as *mut i64;
+            *base = 10;
+            *base.add(1) = 20;
+            *base.add(2) = 30;
+        }
+        let list = Box::into_raw(Box::new(GcList { length: 3, items }));
+        _ll_list_resize_hint_really(list, 10, true);
+        unsafe {
+            assert_eq!((*list).length, 3);
+            let grown = (*list).items;
+            assert_eq!(
+                typed_items_block_capacity(grown),
+                rlist_overallocate_signed(10) as usize
+            );
+            let base = typed_items_block_items_base(grown) as *const i64;
+            assert_eq!(*base, 10);
+            assert_eq!(*base.add(1), 20);
+            assert_eq!(*base.add(2), 30);
+            let _ = Box::from_raw(list);
+        }
+    }
+
+    #[test]
+    fn hint_really_newsize_zero_resets_to_prebuilt_empty() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let items = _ll_fixed_alloc_and_set_nonnull_i_trampoline(3, 7);
+        let list = Box::into_raw(Box::new(GcList { length: 3, items }));
+        _ll_list_resize_hint_really(list, 0, true);
+        unsafe {
+            assert_eq!((*list).length, 0);
+            let empty1 = (*list).items;
+            assert_eq!(typed_items_block_capacity(empty1), 0);
+            _ll_list_resize_hint_really(list, 0, false);
+            let empty2 = (*list).items;
+            assert_eq!(empty1, empty2);
+            let _ = Box::from_raw(list);
         }
     }
 }

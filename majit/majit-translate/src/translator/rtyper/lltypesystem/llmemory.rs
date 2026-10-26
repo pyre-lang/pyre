@@ -12,8 +12,8 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, _arraylenref, _endmarker, _ptr, _ptr_obj, _wref, Array, ArrayContainer, GCREF,
     GcKind, LowLevelType, NONGCREF, ParentIndex, Ptr, PtrTarget, WEAKREF_PTR, cast_int_to_ptr,
-    cast_opaque_ptr, cast_pointer, cast_ptr_to_int as lltype_cast_ptr_to_int,
-    container_value_as_ptr, direct_arrayitems, direct_fieldptr, direct_ptradd, nullptr, parentlink,
+    cast_opaque_ptr, cast_pointer, container_value_as_ptr, direct_arrayitems, direct_fieldptr,
+    direct_ptradd, nullptr, parentlink,
 };
 
 /// RPython `class fakeaddress(object)` (llmemory.py).
@@ -1149,13 +1149,15 @@ pub fn cast_ptr_to_adr(obj: &_ptr) -> _address {
 }
 
 /// `cast_adr_to_int(adr, mode="emulated")` (llmemory.py).
+///
+/// `"emulated"`: `adr._cast_to_int(symbolic=False)` — normalized
+/// container `_getid`. `"forced"`: the same integer `rffi.cast(Signed,
+/// AddressAsInt(adr))` would yield (`fakeaddress._cast_to_int` then
+/// `rffi.cast`). `"symbolic"` needs `AddressAsInt`, which is unported.
 pub fn cast_adr_to_int(adr: &_address, mode: Option<&str>) -> Result<i64, String> {
-    match mode.unwrap_or("emulated") {
-        "emulated" | "forced" => match adr {
-            _address::Null => Ok(0),
-            _address::Fake(ptr) => lltype_cast_ptr_to_int(ptr),
-            _address::IntCast(value) => Ok(*value),
-        },
+    let mode = mode.unwrap_or("emulated");
+    match mode {
+        "emulated" | "forced" => adr._cast_to_int(mode != "emulated"),
         "symbolic" => Err("cast_adr_to_int symbolic mode needs AddressAsInt".into()),
         other => Err(format!("unsupported cast_adr_to_int mode {other:?}")),
     }
@@ -1300,7 +1302,8 @@ mod tests {
     #[test]
     fn cast_address_to_int_uses_existing_pointer_cast_rules() {
         use crate::translator::rtyper::lltypesystem::lltype::{
-            MallocFlavor, Struct, cast_int_to_ptr, malloc,
+            MallocFlavor, Struct, cast_int_to_ptr, cast_ptr_to_int as lltype_cast_ptr_to_int,
+            malloc,
         };
 
         assert_eq!(cast_adr_to_int(&_address::Null, None), Ok(0));
@@ -1319,9 +1322,16 @@ mod tests {
         )
         .unwrap();
         let adr = cast_ptr_to_adr(&live);
+        let container_id = lltype_cast_ptr_to_int(&live).unwrap();
+        assert_eq!(cast_adr_to_int(&adr, Some("emulated")), Ok(container_id));
+        assert_eq!(cast_adr_to_int(&adr, Some("forced")), Ok(container_id));
+
+        let live2 = _ptr::new_with_solid(live._TYPE.clone(), live._obj0_value(), live._solid);
+        let adr2 = cast_ptr_to_adr(&live2);
+        assert_ne!(live._hashable_identity(), live2._hashable_identity());
         assert_eq!(
-            cast_adr_to_int(&adr, Some("emulated")),
-            Ok(live._hashable_identity() as i64)
+            cast_adr_to_int(&adr, Some("forced")),
+            cast_adr_to_int(&adr2, Some("forced"))
         );
 
         let ptr_t = Ptr {

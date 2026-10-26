@@ -9317,7 +9317,9 @@ pub(crate) fn funcobj_from_funcptr_constant(hlv: &Hlvalue) -> Option<_func> {
     }
 }
 
-/// Every `direct_call` callee funcobj in `graph`.
+/// Every `direct_call` / `jit_conditional_call` callee funcobj in `graph`.
+/// `direct_call` stores the funcptr in args[0]; `jit_conditional_call`
+/// stores it in args[1] (`rlist.py _ll_list_resize_ge`).
 pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
     graph
         .iterblocks()
@@ -9327,8 +9329,14 @@ pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
                 .borrow()
                 .operations
                 .iter()
-                .filter(|op| op.opname == "direct_call")
-                .filter_map(|op| op.args.first().and_then(funcobj_from_funcptr_constant))
+                .filter_map(|op| {
+                    let funcptr = match op.opname.as_str() {
+                        "direct_call" => op.args.first(),
+                        "jit_conditional_call" => op.args.get(1),
+                        _ => None,
+                    };
+                    funcptr.and_then(funcobj_from_funcptr_constant)
+                })
                 .collect::<Vec<_>>()
         })
         .collect()

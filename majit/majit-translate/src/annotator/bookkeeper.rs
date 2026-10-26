@@ -6272,27 +6272,46 @@ pub fn ishashable(_x: &HostObject) -> bool {
     true
 }
 
+fn objectmodel_r_dict_class() -> Option<HostObject> {
+    crate::flowspace::model::HOST_ENV.lookup_builtin("rpython.rlib.objectmodel.r_dict")
+}
+
+fn objectmodel_r_ordereddict_class() -> Option<HostObject> {
+    crate::flowspace::model::HOST_ENV.lookup_builtin("rpython.rlib.objectmodel.r_ordereddict")
+}
+
+fn collections_ordered_dict_class() -> Option<HostObject> {
+    crate::flowspace::model::HOST_ENV.lookup_builtin("OrderedDict")
+}
+
+/// `bookkeeper.py immutablevalue`: `issubclass(tp, r_dict)`.
 fn is_objectmodel_r_dict_class(cls: &HostObject) -> bool {
-    matches!(
-        cls.qualname(),
-        "rpython.rlib.objectmodel.r_dict" | "rpython.rlib.objectmodel.r_ordereddict"
-    )
+    objectmodel_r_dict_class()
+        .as_ref()
+        .is_some_and(|r_dict| cls.is_subclass_of(r_dict))
 }
 
+/// `bookkeeper.py immutablevalue`: `tp is r_ordereddict`.
 fn is_objectmodel_r_ordereddict_class(cls: &HostObject) -> bool {
-    cls.qualname() == "rpython.rlib.objectmodel.r_ordereddict"
+    objectmodel_r_ordereddict_class()
+        .as_ref()
+        .is_some_and(|canonical| cls == canonical)
 }
 
-fn is_objectmodel_r_dict_instance(obj: &HostObject) -> bool {
+/// `bookkeeper.py immutablevalue`: `tp is r_dict` / `issubclass(tp, r_dict)`.
+pub(crate) fn is_objectmodel_r_dict_instance(obj: &HostObject) -> bool {
     obj.instance_class()
         .is_some_and(is_objectmodel_r_dict_class)
 }
 
+/// `bookkeeper.py immutablevalue`: `tp is OrderedDict or tp is r_ordereddict`.
 fn is_prebuilt_ordered_dict_tp(x: &ConstValue) -> bool {
     match x {
         ConstValue::HostObject(obj) => obj.instance_class().is_some_and(|cls| {
             is_objectmodel_r_ordereddict_class(cls)
-                || matches!(cls.qualname(), "OrderedDict" | "collections.OrderedDict")
+                || collections_ordered_dict_class()
+                    .as_ref()
+                    .is_some_and(|ordered| cls == ordered)
         }),
         _ => false,
     }
@@ -10256,22 +10275,33 @@ mod tests {
         assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(b_key.id));
     }
 
+    fn canonical_r_dict_class() -> HostObject {
+        crate::flowspace::model::HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_dict")
+            .expect("canonical r_dict class")
+    }
+
+    fn canonical_r_ordereddict_class() -> HostObject {
+        crate::flowspace::model::HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_ordereddict")
+            .expect("canonical r_ordereddict class")
+    }
+
     fn prebuilt_r_dict(
         key_eq: HostObject,
         key_hash: HostObject,
         pairs: &[(i64, i64)],
     ) -> HostObject {
-        prebuilt_r_dict_named("rpython.rlib.objectmodel.r_dict", key_eq, key_hash, pairs)
+        prebuilt_r_dict_on(canonical_r_dict_class(), key_eq, key_hash, pairs)
     }
 
-    fn prebuilt_r_dict_named(
-        class_qualname: &str,
+    fn prebuilt_r_dict_on(
+        cls: HostObject,
         key_eq: HostObject,
         key_hash: HostObject,
         pairs: &[(i64, i64)],
     ) -> HostObject {
         use crate::flowspace::model::HostObject as HO;
-        let cls = HO::new_class(class_qualname, vec![]);
         let key_cls = HO::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
         let r_dict = HO::new_instance(cls, vec![]);
         r_dict
@@ -10379,8 +10409,8 @@ mod tests {
             "def key_hash(a):\n    return a\n",
             Vec::new(),
         ));
-        let r_dict = prebuilt_r_dict_named(
-            "rpython.rlib.objectmodel.r_ordereddict",
+        let r_dict = prebuilt_r_dict_on(
+            canonical_r_ordereddict_class(),
             key_eq,
             key_hash,
             &[(1, 10)],
@@ -10398,6 +10428,56 @@ mod tests {
         assert_eq!(
             sd.knowntype(),
             crate::annotator::model::KnownType::OrderedDict
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: `tp is r_dict` is class identity.
+    /// A distinct host class that only shares the qualname is an ordinary
+    /// instance, not SomeDict.
+    #[test]
+    fn immutablevalue_lookalike_r_dict_qualname_is_ordinary_instance() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let bk = bk();
+        let lookalike = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let inst = HostObject::new_instance(lookalike, vec![]);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(inst))
+            .expect("lookalike r_dict qualname");
+        assert!(
+            matches!(s, SomeValue::Instance(_)),
+            "look-alike r_dict class is SomeInstance, got {s:?}"
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: `is_r_dict = issubclass(tp, r_dict)`.
+    #[test]
+    fn immutablevalue_r_dict_subclass_is_r_dict() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let key_eq = HostObject::new_user_function(compiled_graph_func(
+            "def key_eq(a, b):\n    return a == b\n",
+            Vec::new(),
+        ));
+        let key_hash = HostObject::new_user_function(compiled_graph_func(
+            "def key_hash(a):\n    return a\n",
+            Vec::new(),
+        ));
+        let subclass = HostObject::new_class("pkg.MyRDict", vec![canonical_r_dict_class()]);
+        let r_dict = prebuilt_r_dict_on(subclass, key_eq, key_hash, &[(1, 10)]);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(r_dict))
+            .expect("r_dict subclass immutablevalue");
+        let SomeValue::Dict(sd) = s else {
+            panic!("expected SomeDict, got {s:?}");
+        };
+        assert!(
+            sd.dictdef.custom_eq_hash(),
+            "subclass of r_dict keeps is_r_dict"
         );
     }
 

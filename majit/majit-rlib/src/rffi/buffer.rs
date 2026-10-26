@@ -704,13 +704,13 @@ fn raw_malloc_or_memory_error(size: usize) -> Result<*mut u8, MemoryError> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn raw_malloc(size: usize) -> *mut u8 {
+pub(crate) unsafe fn raw_malloc(size: usize) -> *mut u8 {
     let request = size.max(1);
     unsafe { libc::malloc(request) }.cast()
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-unsafe fn raw_free(ptr: *mut u8) {
+pub(crate) unsafe fn raw_free(ptr: *mut u8) {
     unsafe { libc::free(ptr.cast()) }
 }
 
@@ -743,7 +743,7 @@ fn raw_malloc_layout(size: usize) -> std::alloc::Layout {
 /// wasm32-unknown-unknown does not link `libc`. The requested size sits in
 /// the header so [`raw_free`] can rebuild the [`raw_malloc_layout`].
 #[cfg(target_arch = "wasm32")]
-unsafe fn raw_malloc(size: usize) -> *mut u8 {
+pub(crate) unsafe fn raw_malloc(size: usize) -> *mut u8 {
     let Some(layout) = try_raw_malloc_layout(size) else {
         return core::ptr::null_mut();
     };
@@ -758,7 +758,7 @@ unsafe fn raw_malloc(size: usize) -> *mut u8 {
 }
 
 #[cfg(target_arch = "wasm32")]
-unsafe fn raw_free(ptr: *mut u8) {
+pub(crate) unsafe fn raw_free(ptr: *mut u8) {
     if ptr.is_null() {
         return;
     }

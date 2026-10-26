@@ -21,10 +21,12 @@
 use parking_lot::Mutex;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock};
+use std::thread::ThreadId;
 
 use crate::annotator::model::KnownType;
 use crate::flowspace::model::{
@@ -716,6 +718,25 @@ impl _address {
             Err("cannot subtract fakeaddresses in general".to_string())
         }
     }
+
+    /// `fakeaddress._cast_to_int(symbolic=False)` (`llmemory.py`).
+    /// Null is 0; a tagged-integer `_obj0` keeps that integer; otherwise
+    /// the normalized container's `_getid` (`_ptr._cast_to_int`).
+    /// `symbolic=True` is `AddressAsInt` upstream; the integer that
+    /// `rffi.cast(Signed, …)` then yields for `"forced"` is the same
+    /// container id.
+    pub fn _cast_to_int(&self, _symbolic: bool) -> Result<i64, String> {
+        match self {
+            _address::Null => Ok(0),
+            _address::IntCast(n) => Ok(*n),
+            _address::Fake(p) => match p._obj0_value() {
+                Ok(Some(_ptr_obj::IntCast(n))) => Ok(n),
+                Ok(None) => Ok(0),
+                Err(_) => Err("DelayedPointer".into()),
+                Ok(Some(_)) => p._cast_to_int(false),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1106,13 +1127,112 @@ impl Hash for PtrTarget {
     }
 }
 
-#[derive(Clone, Debug)]
+/// Owning `GraphRef` stored on `_func` (`lltype.py _func.graph = graph`).
+///
+/// `GraphRef` is `Rc<RefCell<FunctionGraph>>`. Putting it on `_func` makes
+/// `_ptr` / `ConstValue` `!Send`/`!Sync`, and rustc rejects
+/// `static HOST_ENV: LazyLock<HostEnv>` (`E0277`: `Rc<RefCell<FunctionGraph>>`
+/// cannot be sent/shared between threads). There is no `Arc` graph handle:
+/// `FunctionGraph` itself contains `Rc` blocks. This wrapper keeps the `Rc`
+/// strong count via `into_raw` / `from_raw` and records the creating thread
+/// (`Fragile`): Clone/`graph_ref` may touch the count only on that thread;
+/// Drop on any other thread leaks. Not an integer resurrection of a dangling
+/// graph.
+struct OwnedGraph {
+    ptr: *const RefCell<FunctionGraph>,
+    owner: ThreadId,
+}
+
+// SAFETY: the `Rc` count is only touched on `owner`. Other threads may read
+// the address (`as_usize`) or leak the handle on Drop; they must not clone
+// or `graph_ref()`. `_func` still has to live in `ConstValue` / `HOST_ENV`
+// (`LazyLock<HostEnv>: Sync`).
+unsafe impl Send for OwnedGraph {}
+unsafe impl Sync for OwnedGraph {}
+
+impl OwnedGraph {
+    fn new(graph: GraphRef) -> Self {
+        OwnedGraph {
+            ptr: Rc::into_raw(graph),
+            owner: std::thread::current().id(),
+        }
+    }
+
+    fn as_usize(&self) -> usize {
+        self.ptr as usize
+    }
+
+    fn assert_owner_thread(&self) {
+        assert_eq!(
+            std::thread::current().id(),
+            self.owner,
+            "graph handle belongs to the translator thread that created it"
+        );
+    }
+
+    fn graph_ref(&self) -> GraphRef {
+        self.assert_owner_thread();
+        // SAFETY: `ptr` came from `Rc::into_raw`; Clone/Drop keep the strong
+        // count above zero for the lifetime of this handle. Count access is
+        // only on `owner`.
+        unsafe {
+            Rc::increment_strong_count(self.ptr);
+            Rc::from_raw(self.ptr)
+        }
+    }
+}
+
+impl Clone for OwnedGraph {
+    fn clone(&self) -> Self {
+        self.assert_owner_thread();
+        // SAFETY: same invariant as `graph_ref`.
+        unsafe {
+            Rc::increment_strong_count(self.ptr);
+        }
+        OwnedGraph {
+            ptr: self.ptr,
+            owner: self.owner,
+        }
+    }
+}
+
+impl Drop for OwnedGraph {
+    fn drop(&mut self) {
+        if std::thread::current().id() != self.owner {
+            // Other thread: leak the Rc. Leaking is safe; a count race is not.
+            return;
+        }
+        // SAFETY: one strong count belongs to this handle.
+        unsafe {
+            drop(Rc::from_raw(self.ptr));
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct _func {
     pub TYPE: FuncType,
     pub _name: String,
+    /// Graph identity (`GraphKey::of` / `Rc::as_ptr`). Equality and hash
+    /// use this integer (`lltype.py _func.__eq__` / `__hash__` on
+    /// `self.graph`); existing readers (`rptr`, `rstr`, `rffi`) match it.
     pub graph: Option<usize>,
+    /// Owning graph handle (`lltype.py _func.graph = graph`).
+    graph_owned: Option<OwnedGraph>,
     pub _callable: Option<String>,
     pub attrs: HashMap<String, ConstValue>,
+}
+
+impl fmt::Debug for _func {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("_func")
+            .field("TYPE", &self.TYPE)
+            .field("_name", &self._name)
+            .field("graph", &self.graph)
+            .field("_callable", &self._callable)
+            .field("attrs", &self.attrs)
+            .finish()
+    }
 }
 
 impl _func {
@@ -1123,31 +1243,51 @@ impl _func {
         _callable: Option<String>,
         attrs: HashMap<String, ConstValue>,
     ) -> Self {
+        Self::new_owning_graph(TYPE, _name, graph, None, _callable, attrs)
+    }
+
+    fn new_owning_graph(
+        TYPE: FuncType,
+        _name: String,
+        graph: Option<usize>,
+        graph_owned: Option<GraphRef>,
+        _callable: Option<String>,
+        attrs: HashMap<String, ConstValue>,
+    ) -> Self {
+        let graph_owned = graph_owned.map(OwnedGraph::new);
+        let graph = match &graph_owned {
+            Some(g) => Some(GraphKey::of(&g.graph_ref()).as_usize()),
+            None => graph,
+        };
         _func {
             TYPE,
             _name,
             graph,
+            graph_owned,
             _callable,
             attrs,
         }
     }
 
-    /// Recover the `GraphRef` stored by [`functionptr_for_graph_with_type`]
-    /// as `GraphKey::of(graph).as_usize()`. The original `Rc` is kept alive
-    /// by `RPythonTyper.lowlevel_helper_graphs` / `translator.graphs`.
+    /// `fobj.graph` (`llinterp.py` `perform_call`). Clone of the owned
+    /// `GraphRef` stored by [`functionptr_for_graph_with_type`].
     pub fn graph_ref(&self) -> Option<GraphRef> {
-        let raw = self.graph? as *const RefCell<FunctionGraph>;
-        if raw.is_null() {
-            return None;
+        self.graph_owned.as_ref().map(OwnedGraph::graph_ref)
+    }
+
+    /// `_func._getid` (`lltype.py`): `id(self.graph)` when a graph is
+    /// present, else `id(self._callable)`, else `id(self)`.
+    fn _getid(&self) -> i64 {
+        if let Some(g) = &self.graph_owned {
+            return g.as_usize() as i64;
         }
-        // SAFETY: `graph` is `Rc::as_ptr` of a `GraphRef` that still lives
-        // in the helper-graph cache (or `translator.graphs`). Incrementing
-        // the strong count and rebuilding an `Rc` yields a new owner of
-        // that allocation (`llinterp.py` `fobj.graph`).
-        unsafe {
-            Rc::increment_strong_count(raw);
-            Some(Rc::from_raw(raw))
+        if let Some(id) = self.graph {
+            return id as i64;
         }
+        if let Some(name) = &self._callable {
+            return name.as_ptr() as i64;
+        }
+        self as *const _func as i64
     }
 }
 
@@ -3323,13 +3463,52 @@ impl _ptr {
     }
 
     pub fn _identityhash(&self) -> i64 {
+        // `_abstract_ptr._identityhash` (`lltype.py`): `p = normalizeptr(self)`
+        // then `hash(p._obj)` of the normalized container, not the `_ptr`
+        // wrapper. `assert self._T._gckind == 'gc'` / `assert self` stay on
+        // the original pointer.
+        let p = normalizeptr(self, true)
+            .expect("identityhash normalizeptr")
+            .expect("gc identityhash requires a concrete underlying object");
         assert_eq!(self._TYPE._gckind(), GcKind::Gc);
         assert!(self.nonzero());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        self._obj()
+        p._obj()
             .expect("gc identityhash requires a concrete underlying object")
             .hash(&mut hasher);
         hasher.finish() as i64
+    }
+
+    /// `_ptr._cast_to_int(check=True)` (`lltype.py`). Null is 0; a
+    /// tagged-integer `_obj0` keeps that integer; otherwise
+    /// `intmask(normalizeptr(self)._obj._getid())`.
+    pub fn _cast_to_int(&self, check: bool) -> Result<i64, String> {
+        let obj = self
+            ._getobj(check)
+            .map_err(|_| "DelayedPointer".to_string())?;
+        let Some(obj) = obj else {
+            return Ok(0);
+        };
+        if let _ptr_obj::IntCast(n) = obj {
+            return Ok(n);
+        }
+        let Some(normalized) = normalizeptr(self, check)? else {
+            return Ok(0);
+        };
+        let obj = normalized
+            ._getobj(check)
+            .map_err(|_| "DelayedPointer".to_string())?;
+        let Some(obj) = obj else {
+            return Ok(0);
+        };
+        if let _ptr_obj::IntCast(n) = obj {
+            return Ok(n);
+        }
+        let result = obj._getid();
+        if self._TYPE._gckind() == GcKind::Gc {
+            assert!(result != 0 && (result & 3) == 0);
+        }
+        Ok(result)
     }
 
     pub fn call(&self, args: &[LowLevelValue]) -> LowLevelValue {
@@ -5213,14 +5392,10 @@ pub fn nullptr(T: LowLevelType) -> Result<_ptr, String> {
 
 /// RPython `cast_ptr_to_int(ptr)` (`lltype.py`): delegate to
 /// `_ptr._cast_to_int`. Null pointers become 0, tagged integer pointers keep
-/// their payload, and ordinary pointers use their pointer identity.
+/// their payload, and ordinary pointers use the normalized container's
+/// `_getid`.
 pub fn cast_ptr_to_int(ptr: &_ptr) -> Result<i64, String> {
-    match ptr._getobj(true) {
-        Ok(None) => Ok(0),
-        Ok(Some(_ptr_obj::IntCast(n))) => Ok(n),
-        Ok(Some(_)) => Ok(ptr._hashable_identity() as i64),
-        Err(DelayedPointer) => Err("DelayedPointer".into()),
-    }
+    ptr._cast_to_int(true)
 }
 
 /// RPython `cast_int_to_ptr(PTRTYPE, oddint)` (`lltype.py`):
@@ -5377,6 +5552,22 @@ impl _ptr_obj {
             }
         };
         _ptr::new_with_solid(Ptr { TO: target }, Ok(Some(self.clone())), solid)
+    }
+
+    /// `_container._getid` (`lltype.py`): `id(self)` of the container.
+    /// `_func._getid` uses `id(self.graph)` when a graph is present.
+    fn _getid(&self) -> i64 {
+        match self {
+            _ptr_obj::Struct(s) => s.identity() as i64,
+            _ptr_obj::Array(a) => a.identity() as i64,
+            _ptr_obj::Opaque(o) => o.identity() as i64,
+            _ptr_obj::Subarray(s) => s._identity as i64,
+            _ptr_obj::ArrayLenRef(a) => a._identity as i64,
+            _ptr_obj::EndMarker(e) => e._identity as i64,
+            _ptr_obj::Wref(w) => w._identity as i64,
+            _ptr_obj::Func(f) => f._getid(),
+            _ptr_obj::IntCast(n) => *n,
+        }
     }
 
     /// The container's `_was_freed()`. `_struct`/`_array`/`_opaque` are
@@ -5927,7 +6118,7 @@ pub fn functionptr(
     graph: Option<usize>,
     _callable: Option<String>,
 ) -> _ptr {
-    functionptr_with_attrs(TYPE, name, graph, _callable, HashMap::new())
+    functionptr_with_attrs(TYPE, name, graph, None, _callable, HashMap::new())
 }
 
 /// `rpython/rtyper/extfunc.py:72-74, 87-89`
@@ -5939,13 +6130,14 @@ pub fn functionptr_with_external_name(
 ) -> _ptr {
     let mut attrs = HashMap::new();
     attrs.insert("_external_name".to_string(), ConstValue::byte_str(name));
-    functionptr_with_attrs(TYPE, name, None, _callable, attrs)
+    functionptr_with_attrs(TYPE, name, None, None, _callable, attrs)
 }
 
 fn functionptr_with_attrs(
     TYPE: FuncType,
     name: &str,
     graph: Option<usize>,
+    graph_owned: Option<GraphRef>,
     _callable: Option<String>,
     attrs: HashMap<String, ConstValue>,
 ) -> _ptr {
@@ -5953,10 +6145,11 @@ fn functionptr_with_attrs(
         Ptr {
             TO: PtrTarget::Func(TYPE.clone()),
         },
-        Ok(Some(_ptr_obj::Func(_func::new(
+        Ok(Some(_ptr_obj::Func(_func::new_owning_graph(
             TYPE,
             name.to_string(),
             graph,
+            graph_owned,
             _callable,
             attrs,
         )))),
@@ -6071,13 +6264,7 @@ pub fn functionptr_for_graph_with_type(graph: &GraphRef, TYPE: FuncType) -> _ptr
         }
     }
     drop(graph_b);
-    functionptr_with_attrs(
-        TYPE,
-        &name,
-        Some(GraphKey::of(graph).as_usize()),
-        callable,
-        attrs,
-    )
+    functionptr_with_attrs(TYPE, &name, None, Some(graph.clone()), callable, attrs)
 }
 
 /// RPython `class SomePtr(SomeObject)` (lltype.py).
@@ -6592,6 +6779,86 @@ mod tests {
             panic!("functionptr must expose a function object");
         };
         assert_eq!(funcobj.graph, Some(GraphKey::of(&graph).as_usize()));
+        assert!(
+            Rc::ptr_eq(&funcobj.graph_ref().expect("owned graph"), &graph),
+            "functionptr stores an owning GraphRef"
+        );
+    }
+
+    #[test]
+    fn funcptr_owns_graph_after_local_graph_owner_is_dropped() {
+        // `_func` stores `self.graph = graph` (`lltype.py _func`). A
+        // funcptr whose translator/graph owner has been dropped still
+        // yields the graph via `graph_ref()`.
+        let ptr = {
+            let start = Rc::new(RefCell::new(Block::new(vec![])));
+            let ret = Variable::new();
+            ret.set_concretetype(Some(LowLevelType::Void));
+            let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+                "owned_after_drop",
+                start,
+                Hlvalue::Variable(ret),
+            )));
+            getfunctionptr(&graph, _getconcretetype).unwrap()
+        };
+        let funcobj = ptr._obj().unwrap();
+        let _ptr_obj::Func(funcobj) = funcobj else {
+            panic!("functionptr must expose a function object");
+        };
+        let graph = funcobj
+            .graph_ref()
+            .expect("funcptr must own the graph after the local GraphRef is dropped");
+        assert_eq!(graph.borrow().name, "owned_after_drop");
+    }
+
+    fn void_funcptr_with_graph(name: &str) -> _ptr {
+        let start = Rc::new(RefCell::new(Block::new(vec![])));
+        let ret = Variable::new();
+        ret.set_concretetype(Some(LowLevelType::Void));
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            name,
+            start,
+            Hlvalue::Variable(ret),
+        )));
+        getfunctionptr(&graph, _getconcretetype).unwrap()
+    }
+
+    #[test]
+    fn funcptr_owned_graph_drop_on_other_thread_leaks() {
+        let ptr = void_funcptr_with_graph("cross_thread_drop");
+        let join = std::thread::spawn(move || drop(ptr)).join();
+        assert!(
+            join.is_ok(),
+            "dropping a funcptr on another thread must leak, not crash"
+        );
+    }
+
+    #[test]
+    fn funcptr_owned_graph_ref_on_other_thread_panics() {
+        let ptr = void_funcptr_with_graph("cross_thread_graph_ref");
+        let funcobj = ptr._obj().unwrap();
+        let _ptr_obj::Func(funcobj) = funcobj else {
+            panic!("functionptr must expose a function object");
+        };
+        let join = std::thread::spawn(move || {
+            let _ = funcobj.graph_ref();
+        })
+        .join();
+        assert!(join.is_err(), "graph_ref on another thread must panic");
+    }
+
+    #[test]
+    fn funcptr_owned_graph_same_thread_clone_graph_ref_drop() {
+        let ptr = void_funcptr_with_graph("same_thread");
+        let cloned = ptr.clone();
+        let funcobj = ptr._obj().unwrap();
+        let _ptr_obj::Func(funcobj) = funcobj else {
+            panic!("functionptr must expose a function object");
+        };
+        let graph = funcobj.graph_ref().expect("same-thread graph_ref");
+        assert_eq!(graph.borrow().name, "same_thread");
+        drop(cloned);
+        drop(ptr);
     }
 
     #[test]
@@ -6915,12 +7182,11 @@ mod tests {
             TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         }
         ._example();
-        let ptr2 = _ptr {
-            _identity: ptr1._identity,
-            _TYPE: ptr1._TYPE.clone(),
-            _solid: ptr1._solid,
-            _obj0: ptr1._obj0.clone(),
-        };
+        // Independently built `_ptr` wrapper for the same container (different
+        // `_identity` counter). `identityhash` hashes `normalizeptr(p)._obj`,
+        // so the wrappers hash equal (`lltype.py _identityhash`).
+        let ptr2 = _ptr::new_with_solid(ptr1._TYPE.clone(), ptr1._obj0_value(), ptr1._solid);
+        assert_ne!(ptr1._hashable_identity(), ptr2._hashable_identity());
         let ptr3 = Ptr {
             TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
         }
@@ -8645,6 +8911,13 @@ mod tests {
             false,
         )
         .unwrap();
-        assert_eq!(cast_ptr_to_int(&live), Ok(live._hashable_identity() as i64));
+        let _ptr_obj::Struct(s) = live._obj().unwrap() else {
+            panic!("live pointer must expose a struct container");
+        };
+        assert_eq!(cast_ptr_to_int(&live), Ok(s.identity() as i64));
+
+        let live2 = _ptr::new_with_solid(live._TYPE.clone(), live._obj0_value(), live._solid);
+        assert_ne!(live._hashable_identity(), live2._hashable_identity());
+        assert_eq!(cast_ptr_to_int(&live), cast_ptr_to_int(&live2));
     }
 }
