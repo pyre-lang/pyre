@@ -300,7 +300,7 @@ pub fn COpaquePtr(name: Option<&str>) -> LowLevelType {
 /// used by `extfunc.py`. Full wrapper generation remains with the broader
 /// `rffi.py` runtime port.
 pub fn llexternal(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> _ptr {
-    functionptr_with_external_name(FuncType { args, result }, name, None)
+    functionptr_with_external_name(FuncType { args, result }, name, None::<String>)
 }
 
 /// RPython `make(STRUCT, **fields)` (`rffi.py`).

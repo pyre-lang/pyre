@@ -4939,7 +4939,9 @@ fn legacy_const_define_hlvalue(
             let func_ptr = match entry.declared_funcptr_type() {
                 Some(ft) => match &maybe_graph {
                     Some(graph) => lltype::functionptr_for_graph_with_type(&graph.graph, ft),
-                    None => lltype::functionptr(ft, &key.segments().join("::"), None, None),
+                    None => {
+                        lltype::functionptr(ft, &key.segments().join("::"), None, None::<String>)
+                    }
                 },
                 None => {
                     let precise = match (&maybe_graph, &lift_error) {

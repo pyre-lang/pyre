@@ -897,7 +897,7 @@ mod tests {
                 functype,
                 "ext".to_string(),
                 None,
-                None,
+                None::<String>,
                 attrs,
             )))),
         );

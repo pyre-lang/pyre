@@ -657,7 +657,7 @@ pub(crate) mod tests {
             },
             name,
             None,
-            None,
+            None::<String>,
         )
     }
 

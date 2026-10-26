@@ -35,9 +35,6 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     _address, _func, _ptr, _ptr_obj, LowLevelType, LowLevelValue, MallocFlavor, PtrTarget, Struct,
     identityhash, isCompatibleType, malloc, typeOf,
 };
-use crate::translator::rtyper::lltypesystem::rstr::{
-    ll_strhash_value, prebuilt_str_bytes_and_hash,
-};
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
 
@@ -265,6 +262,41 @@ fn llvalue_to_lowlevel(value: &LLValue, opname: &str) -> Result<LowLevelValue, T
     }
 }
 
+/// Convert `value` to a `LowLevelValue` of the function's `RESULT` type
+/// (`llinterp.py` `perform_call` returns the graph's own typed value).
+fn llvalue_to_lowlevel_of_type(
+    value: &LLValue,
+    RESULT: &LowLevelType,
+    opname: &str,
+) -> Result<LowLevelValue, TaskError> {
+    match (RESULT, value) {
+        (LowLevelType::Unsigned, LLValue::Int(n)) => Ok(LowLevelValue::Unsigned(*n as u64)),
+        (LowLevelType::UniChar, LLValue::Str(s)) if s.chars().count() == 1 => {
+            Ok(LowLevelValue::UniChar(s.chars().next().expect("one char")))
+        }
+        (LowLevelType::UniChar, LLValue::Int(n)) => {
+            let c = char::from_u32(*n as u32).ok_or_else(|| TaskError {
+                message: format!("{opname}: {n} is not a valid UniChar"),
+            })?;
+            Ok(LowLevelValue::UniChar(c))
+        }
+        (LowLevelType::Char, LLValue::Str(s)) if s.chars().count() == 1 => {
+            Ok(LowLevelValue::Char(s.chars().next().expect("one char")))
+        }
+        (LowLevelType::Char, LLValue::Int(n)) => {
+            let c = char::from_u32(*n as u32).ok_or_else(|| TaskError {
+                message: format!("{opname}: {n} is not a valid Char"),
+            })?;
+            Ok(LowLevelValue::Char(c))
+        }
+        (LowLevelType::SingleFloat, LLValue::Float(bits)) => Ok(LowLevelValue::SingleFloat(
+            (f64::from_bits(*bits) as f32).to_bits(),
+        )),
+        (LowLevelType::LongFloat, LLValue::Float(bits)) => Ok(LowLevelValue::LongFloat(*bits)),
+        _ => llvalue_to_lowlevel(value, opname),
+    }
+}
+
 fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
     if let Some(v) = value.downcast_ref::<LLValue>() {
         return Ok(v.clone());
@@ -339,34 +371,79 @@ fn field_name(val: &LLValue, opname: &str) -> Result<String, TaskError> {
     }
 }
 
-fn signed_lshift(x: i64, y: i64) -> i64 {
-    if !(0..64).contains(&y) {
-        0
-    } else {
-        x.wrapping_shl(y as u32)
-    }
-}
-
-fn signed_rshift(x: i64, y: i64) -> i64 {
+/// Host Python shifts (`opimpl.py` `get_primitive_op_src` `int_lshift` /
+/// `op_int_rshift` / `op_uint_lshift` / `op_uint_rshift`): `y < 0` raises
+/// `ValueError("negative shift count")`. For `y >= 64`, lshift is 0 (low 64
+/// bits of a big int); signed rshift is `-1` if `x < 0` else `0`; unsigned
+/// rshift is 0.
+fn signed_lshift(x: i64, y: i64) -> Result<i64, TaskError> {
     if y < 0 {
-        0
+        Err(TaskError {
+            message: "ValueError: negative shift count".to_string(),
+        })
     } else if y >= 64 {
-        if x < 0 { -1 } else { 0 }
+        Ok(0)
     } else {
-        x >> y
+        Ok(x.wrapping_shl(y as u32))
     }
 }
 
-fn unsigned_lshift(x: u64, y: i64) -> u64 {
-    if !(0..64).contains(&y) {
-        0
+fn signed_rshift(x: i64, y: i64) -> Result<i64, TaskError> {
+    if y < 0 {
+        Err(TaskError {
+            message: "ValueError: negative shift count".to_string(),
+        })
+    } else if y >= 64 {
+        Ok(if x < 0 { -1 } else { 0 })
     } else {
-        x.wrapping_shl(y as u32)
+        Ok(x >> y)
     }
 }
 
-fn unsigned_rshift(x: u64, y: i64) -> u64 {
-    if !(0..64).contains(&y) { 0 } else { x >> y }
+fn unsigned_lshift(x: u64, y: i64) -> Result<u64, TaskError> {
+    if y < 0 {
+        Err(TaskError {
+            message: "ValueError: negative shift count".to_string(),
+        })
+    } else if y >= 64 {
+        Ok(0)
+    } else {
+        Ok(x.wrapping_shl(y as u32))
+    }
+}
+
+fn unsigned_rshift(x: u64, y: i64) -> Result<u64, TaskError> {
+    if y < 0 {
+        Err(TaskError {
+            message: "ValueError: negative shift count".to_string(),
+        })
+    } else if y >= 64 {
+        Ok(0)
+    } else {
+        Ok(x >> y)
+    }
+}
+
+/// `opimpl.py` `op_cast_float_to_int(f)`: `intmask(int(f))`. `int(inf)`
+/// raises `OverflowError`, `int(nan)` raises `ValueError`; finite values
+/// truncate toward zero then wrap to the low 64 bits.
+fn op_cast_float_to_int(f: f64) -> Result<i64, TaskError> {
+    if f.is_infinite() {
+        return Err(TaskError {
+            message: "OverflowError: cannot convert float infinity to integer".to_string(),
+        });
+    }
+    if f.is_nan() {
+        return Err(TaskError {
+            message: "ValueError: cannot convert float NaN to integer".to_string(),
+        });
+    }
+    let t = f.trunc();
+    if t.abs() < 2f64.powi(127) {
+        Ok((t as i128) as i64)
+    } else {
+        Ok(0)
+    }
 }
 
 fn lowlevel_to_llvalue(value: LowLevelValue, opname: &str) -> Result<LLValue, TaskError> {
@@ -381,11 +458,16 @@ fn dummy_interpreter() -> Rc<LLInterpreter> {
     Rc::new(LLInterpreter::new(typer, false, None))
 }
 
+/// `LLFrame.perform_call` starts `fobj = f._obj` (`_ptr._obj` →
+/// `_getobj(check=True)`). Map a delayed-pointer error into `TaskError`.
 fn func_from_ptr(p: &_ptr, opname: &str) -> Result<_func, TaskError> {
-    match p._obj0_value().ok().flatten() {
-        Some(_ptr_obj::Func(f)) => Ok(f),
-        other => Err(TaskError {
+    match p._obj() {
+        Ok(_ptr_obj::Func(f)) => Ok(f),
+        Ok(other) => Err(TaskError {
             message: format!("{opname}: expected a function pointer, got {other:?}"),
+        }),
+        Err(_) => Err(TaskError {
+            message: format!("{opname}: DelayedPointer"),
         }),
     }
 }
@@ -438,34 +520,6 @@ pub(crate) fn hash_float_value(f: f64) -> i64 {
     }
 }
 
-fn unicode_chars_and_stored_hash(p: &_ptr) -> Option<(Vec<char>, i64)> {
-    if !p.nonzero() {
-        return None;
-    }
-    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
-        return None;
-    };
-    if st.TYPE._name != "rpy_unicode" {
-        return None;
-    }
-    let fields = st._fields.lock();
-    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
-        return None;
-    };
-    let mut text = Vec::with_capacity(chars.getlength());
-    for i in 0..chars.getlength() {
-        match chars.getitem(i) {
-            Some(LowLevelValue::UniChar(c)) => text.push(c),
-            _ => return None,
-        }
-    }
-    let hash = match fields.iter().find(|(n, _)| n == "hash") {
-        Some((_, LowLevelValue::Signed(h))) => *h,
-        _ => 0,
-    };
-    Some((text, hash))
-}
-
 /// `_hash_string` over UniChar ords, then `_ll_strhash`'s `0 → 29872897`
 /// fixup (`LLHelpers.ll_strhash` / `objectmodel._hash_string`).
 pub(crate) fn hash_unichar_ords(chars: &[char]) -> i64 {
@@ -478,140 +532,6 @@ pub(crate) fn hash_unichar_ords(chars: &[char]) -> i64 {
     }
     x ^= chars.len() as i64;
     if x == 0 { 29872897 } else { x }
-}
-
-fn callable_hash_int(key: &LowLevelValue) -> Result<i64, TaskError> {
-    match key {
-        LowLevelValue::Signed(n) => Ok(*n),
-        LowLevelValue::Unsigned(n) => Ok(*n as i64),
-        LowLevelValue::Bool(b) => Ok(i64::from(*b)),
-        LowLevelValue::Char(c) => Ok(*c as i64),
-        LowLevelValue::UniChar(c) => Ok(*c as i64),
-        other => Err(TaskError {
-            message: format!("ll_hash_int: unsupported key {other:?}"),
-        }),
-    }
-}
-
-fn callable_hash_addr(key: &LowLevelValue) -> Result<i64, TaskError> {
-    match key {
-        LowLevelValue::Address(addr) => {
-            // `raddress.py ll_addrhash(addr1)`: `cast_adr_to_int(addr1, "forced")`.
-            llmemory::cast_adr_to_int(addr, Some("forced")).map_err(|e| TaskError { message: e })
-        }
-        other => Err(TaskError {
-            message: format!("ll_addrhash: unsupported key {other:?}"),
-        }),
-    }
-}
-
-fn callable_hash_identity_ptr(key: &LowLevelValue) -> Result<i64, TaskError> {
-    match key {
-        LowLevelValue::Ptr(p) => {
-            if !p.nonzero() {
-                // `rclass.py ll_inst_hash`: `if not ins: return 0`.
-                Ok(0)
-            } else {
-                Ok(identityhash(p))
-            }
-        }
-        other => Err(TaskError {
-            message: format!("ll_inst_hash: unsupported key {other:?}"),
-        }),
-    }
-}
-
-fn callable_hash_str(key: &LowLevelValue) -> Result<i64, TaskError> {
-    let LowLevelValue::Ptr(p) = key else {
-        return Err(TaskError {
-            message: "ll_strhash: key is not a pointer".to_string(),
-        });
-    };
-    if !p.nonzero() {
-        return Ok(0);
-    }
-    let Some((bytes, stored)) = prebuilt_str_bytes_and_hash(p) else {
-        return Err(TaskError {
-            message: "ll_strhash: not a STR pointer".to_string(),
-        });
-    };
-    if stored != 0 {
-        return Ok(stored);
-    }
-    let h = ll_strhash_value(&bytes);
-    let mut p = p.clone();
-    p.setattr("hash", LowLevelValue::Signed(h))
-        .map_err(|e| TaskError { message: e })?;
-    Ok(h)
-}
-
-fn callable_hash_unicode(key: &LowLevelValue) -> Result<i64, TaskError> {
-    let LowLevelValue::Ptr(p) = key else {
-        return Err(TaskError {
-            message: "ll_unicode_hash: key is not a pointer".to_string(),
-        });
-    };
-    if !p.nonzero() {
-        return Ok(0);
-    }
-    let Some((chars, stored)) = unicode_chars_and_stored_hash(p) else {
-        return Err(TaskError {
-            message: "ll_unicode_hash: not a UNICODE pointer".to_string(),
-        });
-    };
-    if stored != 0 {
-        return Ok(stored);
-    }
-    let h = hash_unichar_ords(&chars);
-    let mut p = p.clone();
-    p.setattr("hash", LowLevelValue::Signed(h))
-        .map_err(|e| TaskError { message: e })?;
-    Ok(h)
-}
-
-fn callable_streq(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TaskError> {
-    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
-        return Ok(a == b);
-    };
-    if s1 == s2 {
-        return Ok(true);
-    }
-    if !s1.nonzero() || !s2.nonzero() {
-        return Ok(false);
-    }
-    match (
-        prebuilt_str_bytes_and_hash(s1).map(|(bytes, _)| bytes),
-        prebuilt_str_bytes_and_hash(s2).map(|(bytes, _)| bytes),
-    ) {
-        (Some(x), Some(y)) => return Ok(x == y),
-        _ => {}
-    }
-    match (
-        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
-        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
-    ) {
-        (Some(x), Some(y)) => Ok(x == y),
-        _ => Ok(s1 == s2),
-    }
-}
-
-fn callable_unicode_eq(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TaskError> {
-    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
-        return Ok(false);
-    };
-    if s1 == s2 {
-        return Ok(true);
-    }
-    if !s1.nonzero() || !s2.nonzero() {
-        return Ok(false);
-    }
-    match (
-        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
-        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
-    ) {
-        (Some(x), Some(y)) => Ok(x == y),
-        _ => Ok(false),
-    }
 }
 
 /// RPython `TUPLE_TYPE([Float, Signed])` (`rtuple.py`): `Ptr(GcStruct(
@@ -695,75 +615,24 @@ fn funcptr_ARGS(p: &_ptr) -> Result<Vec<LowLevelType>, TaskError> {
     }
 }
 
-/// `_callable` table for graphless funcptrs (`llinterp.py`
-/// `op_direct_call` → `fobj._callable`). Consulted only when `_func.graph`
-/// is absent; a helper that carries a graph always goes through
-/// `eval_graph` / `newsubframe`.
+fn funcptr_RESULT(p: &_ptr) -> Result<LowLevelType, TaskError> {
+    match &typeOf(p).TO {
+        PtrTarget::Func(ft) => Ok(ft.result.clone()),
+        other => Err(TaskError {
+            message: format!("direct_call: expected a function pointer type, got {other:?}"),
+        }),
+    }
+}
+
+/// `fobj._callable(*args)` for a graphless external (`llexternal` /
+/// external function with an `llimpl`). A low-level helper always carries
+/// its graph and runs through `perform_call`'s graph arm.
 fn invoke_callable(name: &str, args: &[LLValue]) -> Result<LLValue, TaskError> {
     let ll_args: Vec<LowLevelValue> = args
         .iter()
         .map(|a| llvalue_to_lowlevel(a, name))
         .collect::<Result<_, _>>()?;
-    let hash_i64 = |n: i64| Ok(LLValue::Int(n));
     match name {
-        "ll_strhash" => hash_i64(callable_hash_str(ll_args.first().ok_or_else(|| {
-            TaskError {
-                message: "ll_strhash: missing argument".to_string(),
-            }
-        })?)?),
-        "ll_unicode_hash" => hash_i64(callable_hash_unicode(ll_args.first().ok_or_else(
-            || TaskError {
-                message: "ll_unicode_hash: missing argument".to_string(),
-            },
-        )?)?),
-        "_hash_float" => {
-            let LowLevelValue::Float(bits) = ll_args.first().ok_or_else(|| TaskError {
-                message: "_hash_float: missing argument".to_string(),
-            })?
-            else {
-                return Err(TaskError {
-                    message: format!("_hash_float: unsupported key {:?}", ll_args.first()),
-                });
-            };
-            hash_i64(hash_float_value(f64::from_bits(*bits)))
-        }
-        "ll_inst_hash" => hash_i64(callable_hash_identity_ptr(ll_args.first().ok_or_else(
-            || TaskError {
-                message: "ll_inst_hash: missing argument".to_string(),
-            },
-        )?)?),
-        "ll_char_hash" | "ll_unichar_hash" => {
-            hash_i64(callable_hash_int(ll_args.first().ok_or_else(|| {
-                TaskError {
-                    message: format!("{name}: missing argument"),
-                }
-            })?)?)
-        }
-        "ll_none_hash" | "ll_hash_void" => hash_i64(0),
-        "ll_addrhash" => hash_i64(callable_hash_addr(ll_args.first().ok_or_else(|| {
-            TaskError {
-                message: "ll_addrhash: missing argument".to_string(),
-            }
-        })?)?),
-        "ll_streq" => {
-            if ll_args.len() < 2 {
-                return Err(TaskError {
-                    message: "ll_streq: expected two arguments".to_string(),
-                });
-            }
-            Ok(LLValue::Bool(callable_streq(&ll_args[0], &ll_args[1])?))
-        }
-        "ll_unicode_eq" => {
-            if ll_args.len() < 2 {
-                return Err(TaskError {
-                    message: "ll_unicode_eq: expected two arguments".to_string(),
-                });
-            }
-            Ok(LLValue::Bool(callable_unicode_eq(
-                &ll_args[0],
-                &ll_args[1],
-            )?))
-        }
         "math.frexp" => {
             let LowLevelValue::Float(bits) = ll_args.first().ok_or_else(|| TaskError {
                 message: "math.frexp: missing argument".to_string(),
@@ -802,13 +671,6 @@ fn invoke_callable(name: &str, args: &[LLValue]) -> Result<LLValue, TaskError> {
                 .map_err(|e| TaskError { message: e })?;
             Ok(LLValue::Float(mant.to_bits()))
         }
-        other if other.starts_with("ll_hash_int") => {
-            hash_i64(callable_hash_int(ll_args.first().ok_or_else(|| {
-                TaskError {
-                    message: format!("{other}: missing argument"),
-                }
-            })?)?)
-        }
         other => Err(TaskError {
             message: format!(
                 "llinterp.py LLFrame.perform_call — graphless funcptr {other} has no _callable table entry"
@@ -820,6 +682,7 @@ fn invoke_callable(name: &str, args: &[LLValue]) -> Result<LLValue, TaskError> {
 fn eval_graph_on_funcptr(
     graph: GraphRef,
     args: &[LowLevelValue],
+    RESULT: &LowLevelType,
 ) -> Result<LowLevelValue, TaskError> {
     let ll_args: Vec<LLValue> = args
         .iter()
@@ -829,7 +692,7 @@ fn eval_graph_on_funcptr(
     if let Some(interp) = LLInterpreter::current_interpreter() {
         let frame = Rc::new(RefCell::new(LLFrame::new(graph, ll_args)));
         let result = frame.borrow_mut().eval(&interp, frame.clone())?;
-        llvalue_to_lowlevel(&result, "eval_funcptr")
+        llvalue_to_lowlevel_of_type(&result, RESULT, "eval_funcptr")
     } else {
         let interp = dummy_interpreter();
         let any_args: Vec<Rc<dyn Any>> = args
@@ -839,7 +702,7 @@ fn eval_graph_on_funcptr(
             .collect();
         let result = interp.eval_graph(graph as Rc<dyn Any>, any_args, false)?;
         let ll = any_to_llvalue(&result)?;
-        llvalue_to_lowlevel(&ll, "eval_funcptr")
+        llvalue_to_lowlevel_of_type(&ll, RESULT, "eval_funcptr")
     }
 }
 
@@ -849,10 +712,11 @@ fn eval_graph_on_funcptr(
 /// through its `_callable` name.
 pub fn eval_funcptr(funcptr: &_ptr, args: &[LowLevelValue]) -> Result<LowLevelValue, TaskError> {
     let func = func_from_ptr(funcptr, "eval_funcptr")?;
+    let RESULT = funcptr_RESULT(funcptr)?;
     if let Some(graph) = func.graph_ref() {
         let ARGS = funcptr_ARGS(funcptr)?;
         validate_graph_funcptr_type(&graph, &ARGS)?;
-        eval_graph_on_funcptr(graph, args)
+        eval_graph_on_funcptr(graph, args, &RESULT)
     } else if let Some(name) = &func._callable {
         let ll_args: Vec<LLValue> = args
             .iter()
@@ -860,7 +724,7 @@ pub fn eval_funcptr(funcptr: &_ptr, args: &[LowLevelValue]) -> Result<LowLevelVa
             .map(|v| lowlevel_to_llvalue(v, name))
             .collect::<Result<_, _>>()?;
         let result = invoke_callable(name, &ll_args)?;
-        llvalue_to_lowlevel(&result, name)
+        llvalue_to_lowlevel_of_type(&result, &RESULT, name)
     } else {
         Err(TaskError {
             message: format!(
@@ -1593,11 +1457,11 @@ impl LLFrame {
             "int_lshift" => Ok(LLValue::Int(signed_lshift(
                 vals[0].as_i64(opname)?,
                 vals[1].as_i64(opname)?,
-            ))),
+            )?)),
             "int_rshift" => Ok(LLValue::Int(signed_rshift(
                 vals[0].as_i64(opname)?,
                 vals[1].as_i64(opname)?,
-            ))),
+            )?)),
             "uint_eq" => Ok(LLValue::Bool(
                 (vals[0].as_i64(opname)? as u64) == (vals[1].as_i64(opname)? as u64),
             )),
@@ -1616,11 +1480,11 @@ impl LLFrame {
             "uint_lshift" => Ok(LLValue::Int(unsigned_lshift(
                 vals[0].as_i64(opname)? as u64,
                 vals[1].as_i64(opname)?,
-            ) as i64)),
+            )? as i64)),
             "uint_rshift" => Ok(LLValue::Int(unsigned_rshift(
                 vals[0].as_i64(opname)? as u64,
                 vals[1].as_i64(opname)?,
-            ) as i64)),
+            )? as i64)),
             "llong_eq" | "ullong_eq" | "lllong_eq" | "ulllong_eq" => Ok(LLValue::Bool(
                 vals[0].as_i64(opname)? == vals[1].as_i64(opname)?,
             )),
@@ -1646,15 +1510,15 @@ impl LLFrame {
             "llong_lshift" | "ullong_lshift" => Ok(LLValue::Int(signed_lshift(
                 vals[0].as_i64(opname)?,
                 vals[1].as_i64(opname)?,
-            ))),
+            )?)),
             "llong_rshift" => Ok(LLValue::Int(signed_rshift(
                 vals[0].as_i64(opname)?,
                 vals[1].as_i64(opname)?,
-            ))),
+            )?)),
             "ullong_rshift" => Ok(LLValue::Int(unsigned_rshift(
                 vals[0].as_i64(opname)? as u64,
                 vals[1].as_i64(opname)?,
-            ) as i64)),
+            )? as i64)),
             "float_sub" => Ok(LLValue::Float(
                 (vals[0].as_f64(opname)? - vals[1].as_f64(opname)?).to_bits(),
             )),
@@ -1668,10 +1532,21 @@ impl LLFrame {
                 vals[0].as_f64(opname)? < vals[1].as_f64(opname)?,
             )),
             "float_is_true" => Ok(LLValue::Bool(vals[0].as_f64(opname)? != 0.0)),
-            "char_eq" | "unichar_eq" => Ok(LLValue::Bool(match (&vals[0], &vals[1]) {
-                (LLValue::Str(a), LLValue::Str(b)) => a == b,
-                _ => false,
-            })),
+            "char_eq" | "unichar_eq" => {
+                // `get_primitive_op_src` `op_char_eq` raises `TypeError` unless
+                // both args are length-1 `str`; `op_unichar_eq` requires two
+                // length-1 unicode values.
+                match (&vals[0], &vals[1]) {
+                    (LLValue::Str(a), LLValue::Str(b))
+                        if a.chars().count() == 1 && b.chars().count() == 1 =>
+                    {
+                        Ok(LLValue::Bool(a == b))
+                    }
+                    _ => Err(TaskError {
+                        message: format!("TypeError: {opname} expects two characters"),
+                    }),
+                }
+            }
             "cast_char_to_int" | "cast_unichar_to_int" => {
                 let LLValue::Str(s) = &vals[0] else {
                     return Err(TaskError {
@@ -1684,7 +1559,7 @@ impl LLFrame {
                 Ok(LLValue::Int(ch as i64))
             }
             "cast_int_to_float" => Ok(LLValue::Float((vals[0].as_i64(opname)? as f64).to_bits())),
-            "cast_float_to_int" => Ok(LLValue::Int(vals[0].as_f64(opname)? as i64)),
+            "cast_float_to_int" => Ok(LLValue::Int(op_cast_float_to_int(vals[0].as_f64(opname)?)?)),
             "cast_longlong_to_float" => {
                 Ok(LLValue::Float((vals[0].as_i64(opname)? as f64).to_bits()))
             }
@@ -1818,11 +1693,25 @@ impl LLFrame {
         }
     }
 
-    /// `op_getfield` (`llinterp.py`): `getattr(obj, field)` on a pointer.
+    /// `LLFrame.op_getfield`: `checkptr`; assert the field on
+    /// `typeOf(obj).TO` is not a `ContainerType`; then `getattr(obj, field)`.
     fn op_getfield(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
         checkptr_ll(&vals[0], "getfield")?;
         let p = vals[0].as_ptr("getfield")?;
         let field = field_name(&vals[1], "getfield")?;
+        let field_t = match &typeOf(p).TO {
+            PtrTarget::Struct(s) => s.getattr_field_type(&field),
+            PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+                Some(LowLevelType::Struct(s)) => s.getattr_field_type(&field),
+                _ => None,
+            },
+            _ => None,
+        };
+        if field_t.is_some_and(|ftyp| ftyp.is_container_type()) {
+            return Err(TaskError {
+                message: format!("AssertionError: getfield of container field {field}"),
+            });
+        }
         let value = p.getattr(&field).map_err(|e| TaskError {
             message: format!("getfield: {e}"),
         })?;
@@ -1906,6 +1795,14 @@ impl LLFrame {
                     }
                 }
             };
+        }
+        // `LLFrame.op_getinteriorfield`: `assert not isinstance(ob, _interior_ptr)`
+        // after walking offsets, before materialising the value.
+        if matches!(current, LowLevelValue::InteriorPtr(_)) {
+            return Err(TaskError {
+                message: "AssertionError: getinteriorfield landed on an interior pointer"
+                    .to_string(),
+            });
         }
         lowlevel_to_llvalue(current, "getinteriorfield")
     }
@@ -2151,7 +2048,9 @@ mod tests {
         _getconcretetype, Array, FuncType, LowLevelType, Ptr, functionptr,
         functionptr_for_graph_with_type, getfunctionptr, nullptr,
     };
-    use crate::translator::rtyper::rtyper::RPythonTyper;
+    use crate::translator::rtyper::rclass::{Flavor, InstanceRepr, OBJECT};
+    use crate::translator::rtyper::rmodel::{Repr, address_repr};
+    use crate::translator::rtyper::rtyper::{LowLevelFunction, RPythonTyper};
 
     fn fixture_typer() -> Rc<RPythonTyper> {
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -2919,44 +2818,37 @@ mod tests {
         );
     }
 
+    fn funcptr_for_hash_helper(llfn: LowLevelFunction) -> _ptr {
+        let graph = llfn
+            .graph
+            .expect("hash helper carries a graph")
+            .graph
+            .clone();
+        getfunctionptr(&graph, _getconcretetype).expect("hash helper funcptr")
+    }
+
     #[test]
     fn ll_inst_hash_hashes_container_not_ptr_wrapper() {
-        let fptr = graphless(
-            "ll_inst_hash",
-            vec![LowLevelType::Void],
-            LowLevelType::Signed,
-        );
-        let p = malloc(
-            LowLevelType::Struct(Box::new(Struct::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            ))),
-            None,
-            MallocFlavor::Gc,
-            true,
-        )
-        .expect("instance");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let repr = InstanceRepr::new_rootinstance(&rtyper, Flavor::Gc);
+        let llfn = repr
+            .get_ll_hash_function(&rtyper)
+            .expect("ll_inst_hash helper")
+            .expect("Some");
+        let fptr = funcptr_for_hash_helper(llfn);
+        let p = malloc(OBJECT.clone(), None, MallocFlavor::Gc, true).expect("instance");
         let p2 = _ptr::new_with_solid(p._TYPE.clone(), p._obj0_value(), p._solid);
         assert_ne!(p._hashable_identity(), p2._hashable_identity());
         let h1 = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(p.clone()))])
             .expect("ll_inst_hash p");
         let h2 = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(p2))]).expect("ll_inst_hash p2");
         assert_eq!(h1, h2);
-        let q = malloc(
-            LowLevelType::Struct(Box::new(Struct::gc(
-                "S",
-                vec![("x".into(), LowLevelType::Signed)],
-            ))),
-            None,
-            MallocFlavor::Gc,
-            true,
-        )
-        .expect("other instance");
+        let q = malloc(OBJECT.clone(), None, MallocFlavor::Gc, true).expect("other instance");
         let h3 = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(q))]).expect("ll_inst_hash q");
         assert_ne!(h1, h3);
 
-        let null = nullptr(LowLevelType::Struct(Box::new(Struct::gc("S", vec![]))))
-            .expect("null instance");
+        let null = nullptr(OBJECT.clone()).expect("null instance");
         assert_eq!(
             eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(null))]).expect("null hash"),
             LowLevelValue::Signed(0)
@@ -2965,11 +2857,13 @@ mod tests {
 
     #[test]
     fn ll_addrhash_uses_forced_cast_adr_to_int() {
-        let fptr = graphless(
-            "ll_addrhash",
-            vec![LowLevelType::Address],
-            LowLevelType::Signed,
-        );
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let llfn = address_repr()
+            .get_ll_hash_function(&rtyper)
+            .expect("ll_addrhash helper")
+            .expect("Some");
+        let fptr = funcptr_for_hash_helper(llfn);
         assert_eq!(
             eval_funcptr(&fptr, &[LowLevelValue::Address(_address::Null)]).expect("null addr hash"),
             LowLevelValue::Signed(0)
@@ -3041,5 +2935,152 @@ mod tests {
         )
         .expect("matching call runs");
         assert_eq!(out, LowLevelValue::Signed(42));
+    }
+
+    #[test]
+    fn eval_funcptr_keeps_unsigned_result_type() {
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::Unsigned));
+        let start = Block::shared(vec![x.clone().into()]);
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Unsigned));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "id_unsigned",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![x.into()], Some(returnblock), None).into_ref(),
+        ]);
+        let ft = FuncType {
+            args: vec![LowLevelType::Unsigned],
+            result: LowLevelType::Unsigned,
+        };
+        let ptr = functionptr_for_graph_with_type(&graph, ft);
+        let out = eval_funcptr(&ptr, &[LowLevelValue::Unsigned(7)]).expect("unsigned identity");
+        assert_eq!(out, LowLevelValue::Unsigned(7));
+    }
+
+    fn dummy_frame() -> LLFrame {
+        let graph = Rc::new(RefCell::new(FunctionGraph::new(
+            "op_frame",
+            Block::shared(vec![]),
+        )));
+        LLFrame::new(graph, Vec::new())
+    }
+
+    #[test]
+    fn negative_shift_raises_value_error() {
+        // Host Python shifts (`get_primitive_op_src` / `op_int_rshift` /
+        // `op_uint_lshift` / `op_uint_rshift`): `y < 0` is ValueError.
+        for err in [
+            super::signed_lshift(1, -1).expect_err("signed_lshift"),
+            super::signed_rshift(1, -1).expect_err("signed_rshift"),
+            super::unsigned_lshift(1, -1).expect_err("unsigned_lshift"),
+            super::unsigned_rshift(1, -1).expect_err("unsigned_rshift"),
+        ] {
+            assert!(err.message.contains("ValueError"), "{}", err.message);
+        }
+        assert_eq!(super::signed_rshift(-8, 70).unwrap(), -1);
+        assert_eq!(super::signed_lshift(1, 64).unwrap(), 0);
+    }
+
+    #[test]
+    fn cast_float_to_int_raises_on_nonfinite_and_wraps() {
+        // `opimpl.py` `op_cast_float_to_int`.
+        assert_eq!(
+            super::op_cast_float_to_int(1e19).unwrap(),
+            10000000000000000000i128 as i64
+        );
+        assert_eq!(super::op_cast_float_to_int(-2.9).unwrap(), -2);
+        let inf = super::op_cast_float_to_int(f64::INFINITY).expect_err("inf");
+        assert!(inf.message.contains("OverflowError"), "{}", inf.message);
+        let nan = super::op_cast_float_to_int(f64::NAN).expect_err("nan");
+        assert!(nan.message.contains("ValueError"), "{}", nan.message);
+    }
+
+    #[test]
+    fn char_eq_rejects_non_char() {
+        let frame = dummy_frame();
+        let err = frame
+            .getoperationhandler("char_eq", &[LLValue::Int(1), LLValue::Str("a".into())])
+            .expect_err("non-char");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+        let err = frame
+            .getoperationhandler(
+                "unichar_eq",
+                &[LLValue::Str("ab".into()), LLValue::Str("a".into())],
+            )
+            .expect_err("multi-char");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+        assert_eq!(
+            frame
+                .getoperationhandler(
+                    "char_eq",
+                    &[LLValue::Str("a".into()), LLValue::Str("a".into())]
+                )
+                .unwrap(),
+            LLValue::Bool(true)
+        );
+        assert_eq!(
+            frame
+                .getoperationhandler(
+                    "char_eq",
+                    &[LLValue::Str("a".into()), LLValue::Str("b".into())]
+                )
+                .unwrap(),
+            LLValue::Bool(false)
+        );
+    }
+
+    fn nested_struct_ptr() -> _ptr {
+        let inner = Struct::new("inner", vec![("x".into(), LowLevelType::Signed)]);
+        let outer = Struct::gc(
+            "outer",
+            vec![
+                ("sub".into(), LowLevelType::Struct(Box::new(inner))),
+                ("n".into(), LowLevelType::Signed),
+            ],
+        );
+        malloc(
+            LowLevelType::Struct(Box::new(outer)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("nested struct")
+    }
+
+    #[test]
+    fn getfield_of_container_field_raises() {
+        // `LLFrame.op_getfield`: container field (inlined sub-struct) is
+        // `AssertionError`, not a value.
+        let frame = dummy_frame();
+        let p = nested_struct_ptr();
+        let err = frame
+            .getoperationhandler(
+                "getfield",
+                &[LLValue::Ptr(Box::new(p)), LLValue::Str("sub".into())],
+            )
+            .expect_err("container field");
+        assert!(err.message.contains("AssertionError"), "{}", err.message);
+    }
+
+    #[test]
+    fn getinteriorfield_of_interior_pointer_raises() {
+        // `LLFrame.op_getinteriorfield`: walking to an inlined Raw sub-struct
+        // of a Gc parent lands on `_interior_ptr`.
+        let frame = dummy_frame();
+        let p = nested_struct_ptr();
+        let err = frame
+            .getoperationhandler(
+                "getinteriorfield",
+                &[LLValue::Ptr(Box::new(p)), LLValue::Str("sub".into())],
+            )
+            .expect_err("interior pointer");
+        assert!(err.message.contains("AssertionError"), "{}", err.message);
     }
 }
