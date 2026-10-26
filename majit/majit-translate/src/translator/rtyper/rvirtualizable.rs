@@ -269,7 +269,10 @@ mod tests {
 
         let bk = Rc::new(Bookkeeper::new());
         let mut base_members = indexmap::IndexMap::new();
-        base_members.insert("_virtualizable_".into(), ConstValue::List(vec![]));
+        base_members.insert(
+            "_virtualizable_".into(),
+            ConstValue::List(std::sync::Arc::new(vec![])),
+        );
         let base = crate::annotator::classdesc::ClassDesc::new(
             &bk,
             HostObject::new_class_with_members("Base", vec![], base_members),
@@ -281,7 +284,7 @@ mod tests {
         let mut child_members = indexmap::IndexMap::new();
         child_members.insert(
             "_virtualizable_".into(),
-            ConstValue::List(vec![ConstValue::byte_str("x")]),
+            ConstValue::List(std::sync::Arc::new(vec![ConstValue::byte_str("x")])),
         );
         let child = crate::annotator::classdesc::ClassDesc::new(
             &bk,

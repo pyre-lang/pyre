@@ -5851,7 +5851,7 @@ fn build_ll_alloc_and_set_nonnull_helper_graph(
 /// `jit.isconstant`. Spine B splits that name on `::` so
 /// `rewrite_op_direct_call` emits `int_isconstant`.
 fn isconstant_intrinsic_funcptr(rtyper: &RPythonTyper) -> Result<Constant, TyperError> {
-    jit_isconstant_intrinsic_funcptr(rtyper)
+    jit_isconstant_intrinsic_funcptr(rtyper, LowLevelType::Signed)
 }
 
 /// `rlib/jit.py isconstant`: the interpreter fallback is

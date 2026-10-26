@@ -9411,11 +9411,13 @@ fn jit_intrinsic_false_funcptr(
 
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks
 /// `jit.isconstant`. The body graph is `return False`
-/// (`rlib/jit.py isconstant`).
+/// (`rlib/jit.py isconstant`). `arg_lltype` is the argument's lltype
+/// (any type; the codewriter emits `{kind}_isconstant` from it).
 pub(crate) fn jit_isconstant_intrinsic_funcptr(
     rtyper: &RPythonTyper,
+    arg_lltype: LowLevelType,
 ) -> Result<Constant, TyperError> {
-    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isconstant", LowLevelType::Signed)
+    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isconstant", arg_lltype)
 }
 
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks

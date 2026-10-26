@@ -415,19 +415,23 @@ fn hlvalue_byte_str(value: &Hlvalue) -> Option<String> {
 }
 
 fn const_value_field_names(value: &ConstValue) -> Vec<String> {
-    match value {
-        ConstValue::List(items) | ConstValue::Tuple(items) => items
-            .iter()
-            .filter_map(|item| match item {
-                ConstValue::ByteStr(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
-                ConstValue::UniStr(text) => Some(text.clone()),
-                _ => None,
-            })
-            .collect(),
-        ConstValue::ByteStr(bytes) => vec![String::from_utf8_lossy(bytes).into_owned()],
-        ConstValue::UniStr(text) => vec![text.clone()],
-        _ => Vec::new(),
-    }
+    let items: &[ConstValue] = match value {
+        ConstValue::List(items) => items.as_slice(),
+        ConstValue::Tuple(items) => items.as_slice(),
+        ConstValue::ByteStr(bytes) => {
+            return vec![String::from_utf8_lossy(bytes).into_owned()];
+        }
+        ConstValue::UniStr(text) => return vec![text.clone()],
+        _ => return Vec::new(),
+    };
+    items
+        .iter()
+        .filter_map(|item| match item {
+            ConstValue::ByteStr(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            ConstValue::UniStr(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 pub(crate) fn const_truthy(value: &ConstValue) -> bool {
@@ -6912,10 +6916,10 @@ mod tests {
         let mut members = indexmap::IndexMap::new();
         members.insert(
             "_virtualizable_".into(),
-            ConstValue::List(vec![
+            ConstValue::List(Arc::new(vec![
                 ConstValue::byte_str("x"),
                 ConstValue::byte_str("items[*]"),
-            ]),
+            ])),
         );
         let pyobj = HostObject::new_class_with_members("Frame", vec![], members);
         let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
@@ -6952,7 +6956,7 @@ mod tests {
         let mut members = indexmap::IndexMap::new();
         members.insert(
             "_virtualizable_".into(),
-            ConstValue::List(vec![ConstValue::byte_str("x")]),
+            ConstValue::List(Arc::new(vec![ConstValue::byte_str("x")])),
         );
         let pyobj = HostObject::new_class_with_members("V", vec![], members);
         let bk = std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());

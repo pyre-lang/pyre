@@ -21763,7 +21763,7 @@ mod tests {
         phi_sources.insert(
             forwarded,
             Some(LinkArg::from(crate::flowspace::model::ConstValue::List(
-                vec![],
+                std::sync::Arc::new(vec![]),
             ))),
         );
 

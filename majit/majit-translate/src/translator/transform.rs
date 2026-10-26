@@ -1665,7 +1665,7 @@ mod tests {
             ))));
         let result = Variable::new();
 
-        let nested = CV::Tuple(vec![CV::List(vec![CV::Bool(true)])]);
+        let nested = CV::Tuple(vec![CV::List(std::sync::Arc::new(vec![CV::Bool(true)]))]);
         block.borrow_mut().operations.push(SpaceOperation::new(
             "newlist",
             vec![Hlvalue::Constant(C::new(nested))],
