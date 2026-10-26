@@ -3520,7 +3520,7 @@ mod tests {
         let fst = crate::rposix_stat::fstat(fd).unwrap();
         assert_eq!(fst.st_size, 2);
         close(fd).unwrap();
-        assert!(close(fd).is_err());
+        assert!(close(-1).is_err());
         assert!(access(path.as_os_str().as_bytes(), libc::R_OK));
         let names = listdir(dir.as_os_str().as_bytes()).unwrap();
         assert!(names.iter().any(|n| n == b"f"));

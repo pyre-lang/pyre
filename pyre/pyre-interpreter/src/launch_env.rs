@@ -148,7 +148,11 @@ fn read_raw(name: &str) -> Option<Vec<u8>> {
     if let Some(table) = LAUNCH_ENV.lock().as_ref() {
         return table.get(name).cloned();
     }
-    crate::host_seam::getenv(name.as_bytes())
+    match crate::host_seam::getenv(name.as_bytes()) {
+        Ok(value) => value,
+        // `rposix_environ.py getenv_llimpl` lets `str2charp`'s MemoryError escape.
+        Err(_) => panic!("MemoryError while reading environment variable {name}"),
+    }
 }
 
 /// The decoded value, or `None` when unset *or* not valid Unicode — the

@@ -1102,17 +1102,34 @@ pub enum OpKind {
     New {
         owner: String,
     },
-    /// `lltype.malloc(T, flavor='raw')` for a fixed-size struct.
+    /// `lltype.malloc(T, flavor='raw')` for a fixed-size struct, or
+    /// `malloc_varsize` with `flavor='raw'` when `length` is set.
     ///
-    /// `jtransform.py _rewrite_raw_malloc` turns this into a residual
-    /// direct call of `raw_malloc_fixedsize` (the `_zero` helper when
-    /// `zero` is set). The result is a Signed address. The MIR front
-    /// end emits it when a call passes `&` / `&mut` of a primitive into
-    /// a raw scalar-pointer parameter: the borrow aliases the word, and
+    /// `jtransform.py _rewrite_raw_malloc` reads the flags dict
+    /// `op.args[1].value` (`flavor`, `zero`, `track_allocation`,
+    /// `add_memory_pressure`) and residualizes `raw_malloc_fixedsize`
+    /// / `raw_malloc_varsize` with the matching suffix. `TYPE.OF ==
+    /// lltype.Char` takes `OS_RAW_MALLOC_VARSIZE_CHAR`. The result is a
+    /// Signed address. The MIR front end emits the fixed-size form when
+    /// a call passes `&` / `&mut` of a primitive into a raw
+    /// scalar-pointer parameter: the borrow aliases the word, and
     /// `history.py` `getkind` of that parameter is the address.
     RawMalloc {
         owner: String,
+        /// `flags['zero']`; default false.
         zero: bool,
+        /// `flags.get('track_allocation', True)`.
+        track_allocation: bool,
+        /// `flags.get('add_memory_pressure', False)`.
+        add_memory_pressure: bool,
+        /// Remaining flag names after the ones `_rewrite_raw_malloc`
+        /// pops. Empty in the normal case; a leftover panics
+        /// (`UnsupportedMallocFlags`).
+        extra_flags: Vec<String>,
+        /// `op.args[2]` of `malloc_varsize`; `None` for fixed-size `malloc`.
+        /// `rewrite_op_malloc_varsize` passes this as the argument of
+        /// `raw_malloc_varsize`.
+        length: Option<crate::flowspace::model::Variable>,
     },
     /// `lltype.free(p, flavor='raw')`.
     ///
@@ -1817,16 +1834,20 @@ pub enum OpKind {
     ///
     /// The rtyper lowers certain helper graphs (the `ll_str*` family) to
     /// upstream-shaped low-level `SpaceOperation`s whose opnames map 1:1 onto
-    /// a register-only blackhole insn with NO descriptor operand — e.g.
+    /// a register-shaped blackhole insn with NO descriptor operand — e.g.
     /// `strlen` (`r>i`), `strgetitem` (`ri>i`), `strsetitem` (`rii`),
-    /// `newstr` (`i>r`).  Rather than mint a distinct rich `OpKind` per such
-    /// opname (each forcing an arm in every exhaustive `OpKind` match), the
-    /// transducer carries the blackhole `opname` and its operand `Variable`s
-    /// directly here.  The assembler's default `encode_op` arm emits
-    /// `{opname}/{argcodes}`, with operand kinds inferred from each operand's
-    /// register bank and the result kind (if any) appended from `op.result`
-    /// — matching the `bhimpl_<opname>` argcode shape the runtime handler is
-    /// keyed on (`blackhole.rs`).
+    /// `newstr` (`i>r`), `record_exact_value_{i,r}`.  Rather than mint a
+    /// distinct rich `OpKind` per such opname (each forcing an arm in every
+    /// exhaustive `OpKind` match), the transducer carries the blackhole
+    /// `opname` and its mixed operands here.  `args` is [`LinkArg`] — the
+    /// same Variable-or-Constant carrier `FieldWrite.value` / `Call.args`
+    /// already use — so `rewrite_op_jit_record_exact_value` can keep a
+    /// Constant operand for `Assembler.emit_const` (`assembler.py`) instead
+    /// of minting a Const* define.  The assembler's `LoweredBlackholeOp`
+    /// encode arm emits `{opname}/{argcodes}`, with a Variable taking its
+    /// register bank and a Constant going through `emit_const` (int short
+    /// form when `use_c_form(opname)`), matching the `bhimpl_<opname>`
+    /// argcode shape the runtime handler is keyed on (`blackhole.rs`).
     ///
     /// Only for opnames whose lowering is a single register-shaped insn with
     /// no descriptor operand; effect classification remains opname-driven
@@ -1835,7 +1856,7 @@ pub enum OpKind {
     /// (getfield/getarrayitem/…) keep their dedicated rich `OpKind`s.
     LoweredBlackholeOp {
         opname: String,
-        args: Vec<crate::flowspace::model::Variable>,
+        args: Vec<LinkArg>,
     },
 
     /// A single-segment path resolving to a crate-local `static`
@@ -1877,6 +1898,39 @@ pub enum OpKind {
         ty: ValueType,
         value: Option<crate::flowspace::model::ConstValue>,
     },
+}
+
+impl OpKind {
+    /// `lltype.malloc(..., flavor='raw')` with the defaults
+    /// `_rewrite_raw_malloc` uses: `track_allocation=True`,
+    /// `add_memory_pressure=False`, no leftover flags.
+    pub fn raw_malloc(
+        owner: impl Into<String>,
+        zero: bool,
+        length: Option<crate::flowspace::model::Variable>,
+    ) -> Self {
+        Self::raw_malloc_with_flags(owner, zero, true, false, Vec::new(), length)
+    }
+
+    /// `lltype.malloc(..., flavor='raw')` carrying the flags dict
+    /// `_rewrite_raw_malloc` pops from `op.args[1].value`.
+    pub fn raw_malloc_with_flags(
+        owner: impl Into<String>,
+        zero: bool,
+        track_allocation: bool,
+        add_memory_pressure: bool,
+        extra_flags: Vec<String>,
+        length: Option<crate::flowspace::model::Variable>,
+    ) -> Self {
+        OpKind::RawMalloc {
+            owner: owner.into(),
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

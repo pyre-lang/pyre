@@ -861,6 +861,7 @@ mod tests {
         use crate::translator::rtyper::lltypesystem::lltype::{
             _func, _ptr, _ptr_obj, FuncType, Ptr, PtrTarget,
         };
+        use indexmap::IndexMap;
         use std::collections::HashMap;
 
         let translator = TranslationContext::new();
@@ -874,7 +875,7 @@ mod tests {
         let mut cb_graph = FunctionGraph::new("cb", cb_start);
         cb_graph.func = Some(GraphFunc::new(
             "cb",
-            Constant::new(ConstValue::Dict(HashMap::new())),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         ));
         let cb_graph = std::rc::Rc::new(std::cell::RefCell::new(cb_graph));
         let cb_key = GraphKey::of(&cb_graph).as_usize();

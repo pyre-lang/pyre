@@ -13599,10 +13599,7 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(ptr.clone()),
-                kind: OpKind::RawMalloc {
-                    owner: RAW_SCALAR_SPILL_OWNER.to_string(),
-                    zero: false,
-                },
+                kind: OpKind::raw_malloc(RAW_SCALAR_SPILL_OWNER, false, None),
             });
             let offset = self
                 .graph
@@ -19962,12 +19959,14 @@ impl<'a> Lowering<'a> {
         // source GC struct schemas use (`program.immutable_fields`).
         // `with_hints` rejects underscore names; overlay has `_discriminant`.
         if let Some(ranks) = type_decl_immutable_fields(decl, self.immutable_fields) {
-            let mut dict = std::collections::HashMap::new();
+            let mut dict = indexmap::IndexMap::new();
             for (fname, _) in ranks {
                 dict.insert(ConstValue::byte_str(fname), ConstValue::Bool(true));
             }
-            body._hints =
-                frozendict::new(vec![("immutable_fields".into(), ConstValue::Dict(dict))]);
+            body._hints = frozendict::new(vec![(
+                "immutable_fields".into(),
+                ConstValue::Dict(std::sync::Arc::new(dict)),
+            )]);
         }
         let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
         Some(LowLevelType::Ptr(Box::new(ptr)))

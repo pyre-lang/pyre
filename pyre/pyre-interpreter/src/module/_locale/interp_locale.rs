@@ -330,11 +330,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "LC_MONETARY",
             pyre_object::w_int_new(rlocale::LC_MONETARY as i64)
         );
-        crate::__pyre_store!(
-            ns,
-            "LC_ALL",
-            pyre_object::w_int_new(rlocale::LC_ALL as i64)
-        );
+        crate::__pyre_store!(ns, "LC_ALL", pyre_object::w_int_new(rlocale::LC_ALL as i64));
     }
     // `LC_MESSAGES` is a POSIX category the MSVC CRT has no counterpart for.
     // `locale.py` appends it to `__all__` only if the name survived
@@ -699,8 +695,20 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             as i64;
                     #[cfg(unix)]
                     let ord = {
-                        let w1 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c1.as_bytes()), -1);
-                        let w2 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c2.as_bytes()), -1);
+                        let w1 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c1.as_bytes()), -1)
+                            .map_err(|e| {
+                                crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                )
+                            })?;
+                        let w2 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c2.as_bytes()), -1)
+                            .map_err(|e| {
+                                crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                )
+                            })?;
                         (unsafe { ll::_wcscoll(w1.buf, w2.buf) }) as i64
                     };
                     Ok(pyre_object::w_int_new(ord))

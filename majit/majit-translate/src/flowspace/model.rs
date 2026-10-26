@@ -1973,6 +1973,23 @@ impl HostEnv {
             "r_ordereddict",
             HostObject::new_builtin_callable("rpython.rlib.objectmodel.r_ordereddict"),
         );
+        // Host class objects for prebuilt `objectmodel.r_dict` /
+        // `r_ordereddict` / `_r_dictkey` instances (`objectmodel.py`
+        // class r_dict / class r_ordereddict(r_dict) / class _r_dictkey).
+        // The callables above stay the `typer_for` / BUILTIN_ANALYZERS
+        // targets. Annotator/rtyper classify instances by class identity
+        // (`bookkeeper.py immutablevalue`: `tp is r_dict`,
+        // `issubclass(tp, r_dict)`).
+        let r_dict_cls = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let r_ordereddict_cls = HostObject::new_class(
+            "rpython.rlib.objectmodel.r_ordereddict",
+            vec![r_dict_cls.clone()],
+        );
+        let r_dictkey_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
+        objectmodel.module_set("_r_dictkey", r_dictkey_cls.clone());
+        self.insert_builtin("rpython.rlib.objectmodel.r_dict", r_dict_cls);
+        self.insert_builtin("rpython.rlib.objectmodel.r_ordereddict", r_ordereddict_cls);
+        self.insert_builtin("rpython.rlib.objectmodel._r_dictkey", r_dictkey_cls);
 
         // `rbuiltin.py typer_for(OrderedDict)` — `from collections import
         // OrderedDict`.  Qualname matches `BUILTIN_ANALYZERS`.
@@ -2858,8 +2875,12 @@ pub enum ConstValue {
     Float(u64),
     /// Python dict constant. Mirrors upstream `Constant(dict)` and is
     /// used both for `func.__globals__` and optimizer rewrites like
-    /// `transform_list_contains`.
-    Dict(HashMap<ConstValue, ConstValue>),
+    /// `transform_list_contains`. `Arc` is the shared handle for one
+    /// host dict object (`HostObject` identity); clones share the
+    /// allocation the way Python references share one dict.
+    /// `IndexMap` keeps insertion order so `OrderedDictRepr.convert_const`
+    /// (`rordereddict.py`) walks keys in the source dict's iteration order.
+    Dict(Arc<IndexMap<ConstValue, ConstValue>>),
     /// Python 2 byte string constant (`str`).
     ///
     /// RPython keeps the byte/unicode distinction in the concrete
@@ -3155,7 +3176,7 @@ impl Hash for ConstValue {
             ConstValue::UInt128(value) => value.hash(state),
             ConstValue::Float(bits) => bits.hash(state),
             ConstValue::Dict(items) => {
-                // HashMap iteration order is nondeterministic; hash
+                // Python dict equality ignores insertion order; hash
                 // each entry independently and sort the resulting
                 // u64s so `ConstValue::Dict` remains stable under
                 // hashing regardless of insertion order.
@@ -3983,9 +4004,9 @@ impl ConstValue {
         }
     }
 
-    pub fn dict_items(&self) -> Option<&HashMap<ConstValue, ConstValue>> {
+    pub fn dict_items(&self) -> Option<&IndexMap<ConstValue, ConstValue>> {
         match self {
-            ConstValue::Dict(items) => Some(items),
+            ConstValue::Dict(items) => Some(items.as_ref()),
             _ => None,
         }
     }
@@ -6130,6 +6151,35 @@ mod tests {
     }
 
     #[test]
+    fn dict_constvalue_eq_and_hash_ignore_insertion_order() {
+        let mut a = IndexMap::new();
+        a.insert(ConstValue::Int(3), ConstValue::Int(30));
+        a.insert(ConstValue::Int(1), ConstValue::Int(10));
+        a.insert(ConstValue::Int(2), ConstValue::Int(20));
+        let mut b = IndexMap::new();
+        b.insert(ConstValue::Int(1), ConstValue::Int(10));
+        b.insert(ConstValue::Int(2), ConstValue::Int(20));
+        b.insert(ConstValue::Int(3), ConstValue::Int(30));
+        let da = ConstValue::Dict(Arc::new(a));
+        let db = ConstValue::Dict(Arc::new(b));
+        assert_eq!(da, db);
+        let hash_of = |v: &ConstValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(hash_of(&da), hash_of(&db));
+        assert_eq!(
+            da.iter_items(),
+            Some(vec![
+                ConstValue::Int(3),
+                ConstValue::Int(1),
+                ConstValue::Int(2)
+            ])
+        );
+    }
+
+    #[test]
     fn list_constants_use_hashable_identity_fallback() {
         let a = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
         let b = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
@@ -6327,6 +6377,21 @@ mod tests {
         let dict = HOST_ENV.lookup_builtin("dict").expect("dict class");
         assert!(ordered_dict.is_class());
         assert!(ordered_dict.is_subclass_of(&dict));
+    }
+
+    #[test]
+    fn r_ordereddict_class_subclasses_r_dict() {
+        // `objectmodel.py` `class r_ordereddict(r_dict)`.
+        let r_dict = HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_dict")
+            .expect("r_dict class");
+        let r_ordereddict = HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_ordereddict")
+            .expect("r_ordereddict class");
+        assert!(r_dict.is_class());
+        assert!(r_ordereddict.is_class());
+        assert!(r_ordereddict.is_subclass_of(&r_dict));
+        assert_ne!(r_dict, r_ordereddict);
     }
 
     #[test]
@@ -7364,7 +7429,7 @@ mod tests {
     fn host_getattr_user_function_dunder_name_and_module_follow_python_surface() {
         let func = HostObject::new_user_function(GraphFunc::new(
             "pkg.module.demo",
-            Constant::new(ConstValue::Dict(HashMap::new())),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         ));
         let out = host_getattr(&func, "__name__").expect("function.__name__");
         assert_eq!(out, ConstValue::byte_str("demo"));
@@ -7374,15 +7439,15 @@ mod tests {
 
     #[test]
     fn host_getattr_user_function_dunder_globals_returns_raw_dict() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new())));
         let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
         let out = host_getattr(&func, "__globals__").expect("function.__globals__");
-        assert_eq!(out, ConstValue::Dict(HashMap::new()));
+        assert_eq!(out, ConstValue::Dict(std::sync::Arc::new(IndexMap::new())));
     }
 
     #[test]
     fn host_getattr_user_function_dunder_defaults_returns_none_when_absent() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new())));
         let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
         let out = host_getattr(&func, "__defaults__").expect("function.__defaults__");
         assert_eq!(out, ConstValue::None);
@@ -7390,7 +7455,7 @@ mod tests {
 
     #[test]
     fn host_getattr_user_function_dunder_closure_returns_none_when_absent() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new())));
         let func = HostObject::new_user_function(GraphFunc::new("pkg.module.demo", globals));
         let out = host_getattr(&func, "__closure__").expect("function.__closure__");
         assert_eq!(out, ConstValue::None);
@@ -7398,7 +7463,7 @@ mod tests {
 
     #[test]
     fn host_getattr_user_function_dunder_defaults_and_closure_return_tuple_payloads() {
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new())));
         let mut graph_func = GraphFunc::new("pkg.module.demo", globals);
         graph_func.defaults = vec![Constant::new(ConstValue::Int(7))];
         graph_func.closure = vec![Constant::new(ConstValue::byte_str("cell"))];
@@ -7458,7 +7523,7 @@ mod tests {
         // discriminated `RequiresFlowEvaluator` marker so callsites
         // (`call_freeze_method`, `host_descriptor_get` property.fget)
         // can fall back to their annotator-side routing.
-        let globals = Constant::new(ConstValue::Dict(HashMap::new()));
+        let globals = Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new())));
         let gf = GraphFunc::new("pkg.user_fn", globals);
         let f = HostObject::new_user_function(gf);
         let err = f.call_host(&[]).unwrap_err();

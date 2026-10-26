@@ -42,6 +42,7 @@
 //!   typing. Rust closes the union as
 //!   `enum PendingBlock { Spam(SpamBlock), Egg(EggBlock) }`.
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, VecDeque};
 
 use rustpython_compiler_core::bytecode::oparg::VarNums;
@@ -303,7 +304,7 @@ fn is_host_class_named(w_value: &Hlvalue, name: &str) -> bool {
 }
 
 fn empty_globals_constant() -> Constant {
-    Constant::new(ConstValue::Dict(HashMap::new()))
+    Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new())))
 }
 
 fn null_value() -> Hlvalue {
@@ -3617,7 +3618,7 @@ mod test {
 
     fn flow_context_with_globals(
         src: &str,
-        globals: HashMap<ConstValue, ConstValue>,
+        globals: IndexMap<ConstValue, ConstValue>,
     ) -> FlowContext {
         let host = HostCode::from_code(&compile_function_body(src));
         let inputargs = (0..host.formalargcount())
@@ -3627,7 +3628,7 @@ mod test {
         let mut graph = FunctionGraph::new(host.co_name.clone(), startblock.clone());
         let mut func = GraphFunc::new(
             host.co_name.clone(),
-            Constant::new(ConstValue::Dict(globals)),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(globals))),
         );
         func.code = Some(Box::new(host.clone()));
         func.filename = Some(host.co_filename.clone());
@@ -3778,7 +3779,7 @@ mod test {
 
     #[test]
     fn find_global_reads_function_globals_before_builtins() {
-        let mut globals = HashMap::new();
+        let mut globals = IndexMap::new();
         globals.insert(ConstValue::byte_str("sentinel"), ConstValue::Int(42));
         let ctx = flow_context_with_globals("def f():\n    return sentinel\n", globals);
         assert_eq!(ctx.find_global("sentinel").unwrap(), iconst(42));

@@ -794,7 +794,9 @@ fn assert_address_spill(graph: &FunctionGraph, copy_out: bool, return_is_reload:
     );
     let ptr = mallocs[0].result.as_ref().expect("RawMalloc result");
     match &mallocs[0].kind {
-        OpKind::RawMalloc { owner, zero: false } if owner == "Tuple<i64>" => {}
+        OpKind::RawMalloc {
+            owner, zero: false, ..
+        } if owner == "Tuple<i64>" => {}
         other => panic!("spill owner is Tuple<i64>, got {other:?}"),
     }
     let stores = raw_ops(graph, |kind| matches!(kind, OpKind::RawStore { .. }));
@@ -1211,7 +1213,9 @@ fn malloc_ptrs(graph: &FunctionGraph) -> Vec<majit_translate::flowspace::model::
         .into_iter()
         .map(|op| {
             match &op.kind {
-                OpKind::RawMalloc { owner, zero: false } if owner == "Tuple<i64>" => {}
+                OpKind::RawMalloc {
+                    owner, zero: false, ..
+                } if owner == "Tuple<i64>" => {}
                 other => panic!("spill owner is Tuple<i64>, got {other:?}"),
             }
             op.result.clone().expect("RawMalloc result")

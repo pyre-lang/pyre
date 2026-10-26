@@ -194,9 +194,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 if name_b.contains(&0) {
                     return Err(pyre_interpreter::PyError::value_error("embedded null byte"));
                 }
+                let ll_name =
+                    majit_rlib::rffi::scoped_str2charp::new(Some(&name_b)).map_err(|e| {
+                        pyre_interpreter::error::get_converted_unexpected_exception(
+                            pyre_object::PY_NULL,
+                            &e,
+                        )
+                    })?;
                 let g = pyre_object::with_roots!(w_name => {
-                    let ll_name =
-                        majit_rlib::rffi::scoped_str2charp::new(Some(&name_b));
                     unsafe { ll::c_getgrnam(ll_name.buf) }
                 });
                 if g.is_null() {

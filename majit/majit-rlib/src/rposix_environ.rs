@@ -157,27 +157,29 @@ pub fn envitems_llimpl() -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// `rposix_environ.getenv_llimpl`.
 /// `register_external(..., export_name='ll_os.ll_os_getenv')`.
+/// `scoped_str2charp` raises `MemoryError` (`rffi.py scoped_str2charp.__init__`).
 #[majit_macros::replace_os_function("getenv")]
-pub fn getenv_llimpl(name: &[u8]) -> Option<Vec<u8>> {
-    let l_name = rffi::scoped_str2charp::new(Some(name));
+pub fn getenv_llimpl(name: &[u8]) -> Result<Option<Vec<u8>>, rffi::MemoryError> {
+    let l_name = rffi::scoped_str2charp::new(Some(name))?;
     let _keepalive = byname();
     let l_result = unsafe { os_getenv(l_name.buf) };
     if l_result.is_null() {
-        None
+        Ok(None)
     } else {
-        Some(unsafe { rffi::charp2str(l_result) })
+        Ok(Some(unsafe { rffi::charp2str(l_result) }))
     }
 }
 
 /// `rposix_environ.putenv_llimpl`. `os_putenv` is `putenv` (not `setenv`);
 /// the C library keeps the string until the next putenv/unsetenv of the
-/// same name.
-pub fn putenv_llimpl(name: &[u8], value: &[u8]) -> Result<(), i32> {
+/// same name. Inner `Err(i32)` is the saved errno; outer is `str2charp`
+/// `MemoryError` (`rposix_environ.py putenv_llimpl`).
+pub fn putenv_llimpl(name: &[u8], value: &[u8]) -> Result<Result<(), i32>, rffi::MemoryError> {
     let mut joined = Vec::with_capacity(name.len() + 1 + value.len());
     joined.extend_from_slice(name);
     joined.push(b'=');
     joined.extend_from_slice(value);
-    let l_string = rffi::str2charp(&joined, true);
+    let l_string = rffi::str2charp(&joined, true)?;
     // `putenv_llimpl` runs under the GIL in RPython. Hold the keepalive
     // mutex across `os_putenv` and the map update so two 3.14t callers
     // cannot free a string libc still owns.
@@ -186,7 +188,7 @@ pub fn putenv_llimpl(name: &[u8], value: &[u8]) -> Result<(), i32> {
     if error != 0 {
         drop(keepalive);
         unsafe { rffi::free_charp(l_string, true) };
-        return Err(crate::rposix::get_saved_errno());
+        return Ok(Err(crate::rposix::get_saved_errno()));
     }
     let l_oldstring = keepalive
         .byname
@@ -196,24 +198,25 @@ pub fn putenv_llimpl(name: &[u8], value: &[u8]) -> Result<(), i32> {
     if !l_oldstring.is_null() {
         unsafe { rffi::free_charp(l_oldstring, true) };
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 /// `rposix_environ.unsetenv_llimpl`. Calls `os_unsetenv`, then drops the
-/// keepalive entry.
-pub fn unsetenv_llimpl(name: &[u8]) -> Result<(), i32> {
-    let l_name = rffi::scoped_str2charp::new(Some(name));
+/// keepalive entry. Inner `Err(i32)` is the saved errno; outer is
+/// `scoped_str2charp` `MemoryError` (`rposix_environ.py unsetenv_llimpl`).
+pub fn unsetenv_llimpl(name: &[u8]) -> Result<Result<(), i32>, rffi::MemoryError> {
+    let l_name = rffi::scoped_str2charp::new(Some(name))?;
     let mut keepalive = byname();
     let error = (unsafe { os_unsetenv(l_name.buf) }) as isize;
     if error != 0 {
-        return Err(crate::rposix::get_saved_errno());
+        return Ok(Err(crate::rposix::get_saved_errno()));
     }
     let l_oldstring = keepalive.byname.remove(name);
     drop(keepalive);
     if let Some(l_oldstring) = l_oldstring {
         unsafe { rffi::free_charp(l_oldstring, true) };
     }
-    Ok(())
+    Ok(Ok(()))
 }
 
 #[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
@@ -227,8 +230,8 @@ mod tests {
         let mut entry = name_bytes.to_vec();
         entry.push(b'=');
         entry.extend_from_slice(b"pyre-rffi");
-        let l_name = rffi::str2charp(name_bytes, true);
-        let l_entry = rffi::str2charp(&entry, true);
+        let l_name = rffi::str2charp(name_bytes, true).unwrap();
+        let l_entry = rffi::str2charp(&entry, true).unwrap();
         unsafe {
             let err = os_putenv(l_entry);
             assert_eq!(
@@ -253,11 +256,31 @@ mod tests {
         }
 
         let name = format!("PYRE_RFFI_ENV_LL_{}", std::process::id()).into_bytes();
-        putenv_llimpl(&name, b"one").expect("putenv_llimpl one");
-        assert_eq!(getenv_llimpl(&name).as_deref(), Some(&b"one"[..]));
-        putenv_llimpl(&name, b"two").expect("putenv_llimpl two");
-        assert_eq!(getenv_llimpl(&name).as_deref(), Some(&b"two"[..]));
-        unsetenv_llimpl(&name).expect("unsetenv_llimpl");
-        assert!(getenv_llimpl(&name).is_none());
+        putenv_llimpl(&name, b"one")
+            .expect("putenv_llimpl MemoryError")
+            .expect("putenv_llimpl one");
+        assert_eq!(
+            getenv_llimpl(&name)
+                .expect("getenv_llimpl MemoryError")
+                .as_deref(),
+            Some(&b"one"[..])
+        );
+        putenv_llimpl(&name, b"two")
+            .expect("putenv_llimpl MemoryError")
+            .expect("putenv_llimpl two");
+        assert_eq!(
+            getenv_llimpl(&name)
+                .expect("getenv_llimpl MemoryError")
+                .as_deref(),
+            Some(&b"two"[..])
+        );
+        unsetenv_llimpl(&name)
+            .expect("unsetenv_llimpl MemoryError")
+            .expect("unsetenv_llimpl");
+        assert!(
+            getenv_llimpl(&name)
+                .expect("getenv_llimpl MemoryError")
+                .is_none()
+        );
     }
 }

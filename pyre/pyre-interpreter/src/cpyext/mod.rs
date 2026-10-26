@@ -411,7 +411,7 @@ fn init_basename(name: &str) -> Result<InitName, crate::PyError> {
 fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)>, crate::PyError> {
     let basename = init_basename(name)?;
     for protocol in [InitProtocol::Export, InitProtocol::Init] {
-        if let Some(address) = lookup_init_address(handle, &protocol.symbol(&basename)) {
+        if let Some(address) = lookup_init_address(handle, &protocol.symbol(&basename))? {
             return Ok(Some((protocol, address)));
         }
     }
@@ -420,7 +420,7 @@ fn lookup_init(handle: usize, name: &str) -> Result<Option<(InitProtocol, usize)
 
 /// PyPy `cpyext.api.load_extension_module` looks for the generated CFFI entry
 /// point before either cpyext protocol.
-fn lookup_cffi_init(handle: usize, name: &str) -> Option<usize> {
+fn lookup_cffi_init(handle: usize, name: &str) -> Result<Option<usize>, crate::PyError> {
     let basename = name.rsplit('.').next().unwrap_or(name);
     lookup_init_address(handle, &format!("_cffi_pypyinit_{basename}"))
 }
@@ -461,11 +461,15 @@ fn extension_import_error(message: String, name: &str, path: &Path) -> crate::Py
 /// returns NULL leaves `dlerror` unset, so the lookup reports success with
 /// address 0. `rdynload.dlsym` rejects that, and it must be rejected here too:
 /// address 0 transmuted to the init signature is a call through a null pointer.
-fn lookup_init_address(handle: usize, symbol: &str) -> Option<usize> {
+fn lookup_init_address(handle: usize, symbol: &str) -> Result<Option<usize>, crate::PyError> {
     match majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol.as_bytes())
     {
-        Ok(address) => Some(address as usize),
-        Err(_) => None,
+        Ok(Ok(address)) => Ok(Some(address as usize)),
+        Ok(Err(_)) => Ok(None),
+        Err(e) => Err(crate::error::get_converted_unexpected_exception(
+            pyre_object::PY_NULL,
+            &e,
+        )),
     }
 }
 
@@ -491,7 +495,7 @@ pub fn load_extension_module(
         // `name.lib` entry the initializer also registers missing. The CFFI
         // branch runs only with the `pyre-module` hooks; without them the
         // `PyInit_*` module is the one cached.
-        let cffi = lookup_cffi_init(handle, name).is_some()
+        let cffi = lookup_cffi_init(handle, name)?.is_some()
             && crate::importing::optional_module_hooks().is_some();
         if !cffi && lookup_init(handle, name)?.is_none() {
             return Err(missing_init_error(name, path));
@@ -511,8 +515,9 @@ pub fn load_extension_module(
     if mode & (libc::RTLD_LAZY | libc::RTLD_NOW) == 0 {
         mode |= libc::RTLD_NOW;
     }
-    let handle =
-        majit_rlib::rdynload::dlopen(Some(path.as_os_str().as_bytes()), mode).map_err(|error| {
+    let handle = majit_rlib::rdynload::dlopen(Some(path.as_os_str().as_bytes()), mode)
+        .map_err(|e| crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e))?
+        .map_err(|error| {
             match error {
                 majit_rlib::rdynload::DLOpenError::Message(msg) => extension_import_error(
                     format!(
@@ -542,7 +547,7 @@ pub fn load_extension_module(
     // then a pointer into text nobody has mapped, which the next minor
     // collection walks. Upstream keeps the library on both of these
     // failures.
-    let cffi_address = lookup_cffi_init(handle, name);
+    let cffi_address = lookup_cffi_init(handle, name)?;
     let found = lookup_init(handle, name)?;
     // `_cffi_backend` lives in `pyre-module`. Without its hooks an extension
     // that only exports the cffi init symbol is the same miss as one that

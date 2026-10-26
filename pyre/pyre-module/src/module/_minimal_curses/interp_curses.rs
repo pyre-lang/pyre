@@ -78,7 +78,9 @@ pub(super) fn setupterm(
         };
 
     let mut errret: INT = 0;
-    let ll_term = scoped_str2charp::new(term_bytes.as_deref());
+    let ll_term = scoped_str2charp::new(term_bytes.as_deref()).map_err(|e| {
+        pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+    })?;
     let errval = unsafe { fficurses::setupterm(ll_term.buf, call_fd as INT, &mut errret) };
     if errval == -1 {
         let msg_ext = if errret == 0 {
@@ -104,7 +106,9 @@ pub(super) fn tigetstr(capname: &str) -> Result<PyObjectRef, pyre_interpreter::P
     let capname_bytes = capname.as_bytes().to_vec();
     check_setup_invoked()?;
     let copied = {
-        let ll_capname = scoped_str2charp::new(Some(capname_bytes.as_slice()));
+        let ll_capname = scoped_str2charp::new(Some(capname_bytes.as_slice())).map_err(|e| {
+            pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+        })?;
         let ll_result = unsafe { fficurses::rpy_curses_tigetstr(ll_capname.buf) };
         if ll_result.is_null() {
             None
@@ -167,7 +171,9 @@ pub(super) fn tparm(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
     }
 
     let copied = {
-        let ll_str = scoped_str2charp::new(Some(s_bytes.as_slice()));
+        let ll_str = scoped_str2charp::new(Some(s_bytes.as_slice())).map_err(|e| {
+            pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+        })?;
         let ll_result = unsafe {
             fficurses::rpy_curses_tparm(
                 ll_str.buf, xs[0], xs[1], xs[2], xs[3], xs[4], xs[5], xs[6], xs[7], xs[8],

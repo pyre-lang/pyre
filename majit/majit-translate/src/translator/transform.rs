@@ -27,6 +27,7 @@
 //! `insert_ll_stackcheck` (transform.py) is rtyper-phase and
 //! therefore out of scope for the annotator-phase port.
 
+use indexmap::IndexMap;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -837,7 +838,7 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     continue;
                 };
                 let needle_binding = ann.binding(&op.args[1]);
-                let mut items: HashMap<ConstValue, ConstValue> = HashMap::new();
+                let mut items: IndexMap<ConstValue, ConstValue> = IndexMap::new();
                 // Track the canonical (`hash(True) == hash(1) == hash(1.0)`)
                 // form of every key we have already absorbed. Python's
                 // dict keeps the FIRST inserted key on a hash collision
@@ -895,8 +896,9 @@ pub fn transform_list_contains(ann: &RPythonAnnotator, block_subset: &[BlockRef]
                     }
                 }
                 if all_constant {
-                    block.borrow_mut().operations[i].args[0] =
-                        Hlvalue::Constant(Constant::new(ConstValue::Dict(items)));
+                    block.borrow_mut().operations[i].args[0] = Hlvalue::Constant(Constant::new(
+                        ConstValue::Dict(std::sync::Arc::new(items)),
+                    ));
                     let s_dict = ann
                         .annotation(&block.borrow().operations[i].args[0])
                         .expect("transform_list_contains: dict annotation missing");

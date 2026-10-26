@@ -462,19 +462,25 @@ pub const TICK_COUNTER_STEP: usize = 100;
 #[derive(Debug, Default)]
 pub struct WRootFinalizerQueue;
 
+static W_ROOT_FINALIZER_QUEUE: WRootFinalizerQueue = WRootFinalizerQueue;
+
 impl WRootFinalizerQueue {
     pub fn finalizer_trigger(&mut self) {
         finalizer_queue_trigger();
     }
 
-    /// framework.py `get_finalizer_queue_index`, cached like the
-    /// translation-time constant. This queue's `finalizer_queue_trigger` is
-    /// the identity key.
+    fn fq_tag() -> pyre_object::gc_hook::GcFinalizerQueueTag {
+        pyre_object::gc_hook::GcFinalizerQueueTag {
+            fq: std::ptr::addr_of!(W_ROOT_FINALIZER_QUEUE) as usize,
+            trigger: finalizer_queue_trigger,
+        }
+    }
+
+    /// framework.py `get_finalizer_queue_index`. `tag.fq` is the address of
+    /// this queue's static instance. The index lives on the process-wide
+    /// table, not on a collector instance.
     fn fq_index() -> usize {
-        static INDEX: OnceLock<usize> = OnceLock::new();
-        *INDEX.get_or_init(|| {
-            pyre_object::gc_hook::try_gc_get_finalizer_queue_index(finalizer_queue_trigger)
-        })
+        pyre_object::gc_hook::try_gc_get_finalizer_queue_index(Self::fq_tag())
     }
 
     /// `pypy/interpreter/executioncontext.py:640` —
@@ -573,11 +579,7 @@ pub(crate) fn walk_space_user_del_action_roots(visitor: &mut dyn FnMut(&mut maji
 // residual call, as for [`may_ignore_finalizer`].
 #[majit_macros::dont_look_inside]
 pub fn register_finalizer(obj: PyObjectRef) {
-    pyre_object::gc_hook::try_gc_register_finalizer(
-        WRootFinalizerQueue::fq_index(),
-        obj,
-        finalizer_queue_trigger,
-    );
+    pyre_object::gc_hook::try_gc_register_finalizer(WRootFinalizerQueue::fq_index(), obj);
 }
 
 /// objspace.py:486-487 `allocate_instance`:

@@ -2121,8 +2121,8 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
-        | OpKind::NewWithVtable { .. }
-        | OpKind::RawMalloc { .. } => Vec::new(),
+        | OpKind::NewWithVtable { .. } => Vec::new(),
+        OpKind::RawMalloc { length, .. } => length.iter().cloned().collect(),
         OpKind::RawFree { ptr } => vec![ptr.clone()],
 
         OpKind::RawLoad { base, offset, .. } => vec![base.clone(), offset.clone()],
@@ -2200,8 +2200,8 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::JitDebug { args }
         | OpKind::NewTuple { args }
         | OpKind::NewList { args }
-        | OpKind::GetSlice { args }
-        | OpKind::LoweredBlackholeOp { args, .. } => args.clone(),
+        | OpKind::GetSlice { args } => args.clone(),
+        OpKind::LoweredBlackholeOp { args, .. } => crate::model::call_arg_vars(args),
         // `new_array_clear(v_length, arraydescr)` — only the length is an
         // SSA operand; the arraydescr is a descriptor, not a value.
         OpKind::NewArray { length, .. } | OpKind::NewArrayClear { length, .. } => {

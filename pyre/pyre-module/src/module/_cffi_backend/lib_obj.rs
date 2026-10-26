@@ -564,7 +564,7 @@ fn cdlopen_fetch(w_lib: PyObjectRef, name: &str) -> Result<*mut u8, PyError> {
             libname(lib)?
         )));
     }
-    libraryobj::dlsym(lib.libhandle as usize, name)
+    libraryobj::dlsym(lib.libhandle as usize, name)?
         .map(|address| address as *mut u8)
         .ok_or_else(|| {
             ffi_obj::ffi_error(format!(

@@ -10,10 +10,17 @@
 //!
 //! `@jit.elidable` stamps `_elidable_function_` on `_search_elidable`
 //! only. `@specialize` is not a JIT hint.
+//!
+//! `_search_normal` takes `value_can_be_none` for the caller's
+//! `SomeString.can_be_None`. `LLHelpers.ll_search` asserts first, so
+//! its `_search` / `_search_elidable` / `_search_normal` callees pass
+//! `false` and `transform_dead_code` (`transform.py`) cuts the raise
+//! link.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
@@ -25,16 +32,20 @@ use crate::model::{
     FunctionGraph as ModelGraph, Link as ModelLink, LinkArg, OpKind, ValueType,
 };
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::{
-    Array, LowLevelType, Ptr, PtrTarget, Struct,
-};
+use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
 use crate::translator::rtyper::lltypesystem::rstr::{
-    chars_array_ptr_lltype_from_strptr, sub_helper_funcptr_constant,
+    chars_array_ptr_lltype_from_strptr, close_assert_ptr_not_none, sub_helper_funcptr_constant,
 };
-use crate::translator::rtyper::rmodel::{gc_flavor_const, lowlevel_type_const};
+use crate::translator::rtyper::rint::signed_repr;
+use crate::translator::rtyper::rlist::{
+    ListLayout, ListRepr, build_ll_append_helper_graph, build_ll_arraycopy_helper_graph,
+    build_ll_getitem_fast_helper_graph, build_ll_list_resize_ge_helper_graph,
+    build_ll_newlist_helper_graph, build_ll_setitem_fast_helper_graph, items_array_ptr_lltype,
+};
+use crate::translator::rtyper::rmodel::{Repr, gc_flavor_const, lowlevel_type_const};
 use crate::translator::rtyper::rtyper::{
-    RPythonTyper, constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
-    void_field_const,
+    RPythonTyper, constant_with_lltype, exception_args, helper_pygraph_from_graph,
+    variable_with_lltype, void_field_const,
 };
 
 /// `rstring.py` `SEARCH_COUNT`.
@@ -116,18 +127,16 @@ impl StringKind {
     }
 }
 
-fn table_array() -> Array {
-    Array::gc(LowLevelType::Signed)
-}
-
-fn table_array_lltype() -> LowLevelType {
-    LowLevelType::Array(Box::new(table_array()))
-}
-
-fn table_array_ptr_lltype() -> LowLevelType {
-    LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Array(table_array()),
-    }))
+/// `ListRepr` of Signed — `_twoway_preprocess` `table`
+/// (`rstring.py`). The comprehension
+/// `[not_found_shift for _i in range(TWOWAY_TABLE_SIZE)]` annotates as a
+/// resized list, so the tuple carries `Ptr(GcStruct("list", length, items))`
+/// rather than a bare `GcArray`.
+fn table_list_ptr_lltype() -> LowLevelType {
+    let item_repr: Arc<dyn Repr> = signed_repr();
+    ListRepr::from_primitive_item_repr(item_repr)
+        .lowleveltype()
+        .clone()
 }
 
 fn tuple2_struct() -> Struct {
@@ -154,7 +163,7 @@ fn tuple5_struct() -> Struct {
             ("item1".to_string(), LowLevelType::Signed),
             ("item2".to_string(), LowLevelType::Signed),
             ("item3".to_string(), LowLevelType::Bool),
-            ("item4".to_string(), table_array_ptr_lltype()),
+            ("item4".to_string(), table_list_ptr_lltype()),
         ],
     )
 }
@@ -301,10 +310,14 @@ fn emit_nul(kind: &StringKind, block: &BlockRef) -> Variable {
     )
 }
 
-fn emit_table_get(block: &BlockRef, table: &Variable, idx: Hlvalue) -> Variable {
-    let item = v("titem", LowLevelType::Signed);
-    emit(block, "getarrayitem", vec![hl(table), idx], item.clone());
-    item
+fn emit_table_get(block: &BlockRef, getitem: &Hlvalue, table: &Variable, idx: Hlvalue) -> Variable {
+    emit_direct_call(
+        block,
+        getitem.clone(),
+        vec![hl(table), idx],
+        "titem",
+        LowLevelType::Signed,
+    )
 }
 
 fn emit_malloc_struct(
@@ -408,6 +421,129 @@ fn cached_helper_funcptr(
     )?))
 }
 
+/// `ListRepr` helpers for the two-way bad-character table
+/// (`rlist.py` `ll_newlist` / `ll_append` / `ll_setitem_nonneg` with a
+/// known-nonneg index → `ll_setitem_fast` / `ll_getitem_nonneg` →
+/// `ll_getitem_fast`). Sub-helpers are minted in the same order as
+/// `ListRepr.rtype_method_append`.
+struct TwowayTableOps {
+    newlist: Hlvalue,
+    append: Hlvalue,
+    setitem: Hlvalue,
+    getitem: Hlvalue,
+}
+
+fn twoway_table_ops(rtyper: &RPythonTyper) -> Result<TwowayTableOps, TyperError> {
+    let list_lltype = table_list_ptr_lltype();
+    let item_lltype = LowLevelType::Signed;
+    let items_ptr = items_array_ptr_lltype(&item_lltype);
+
+    let newlist = {
+        let ptr = list_lltype.clone();
+        let item = item_lltype.clone();
+        cached_helper_funcptr(
+            rtyper,
+            "ll_newlist",
+            vec![LowLevelType::Signed],
+            list_lltype.clone(),
+            move |_rtyper| {
+                build_ll_newlist_helper_graph(
+                    "ll_newlist",
+                    ListLayout::Resized,
+                    ptr.clone(),
+                    item.clone(),
+                )
+            },
+        )?
+    };
+
+    let arraycopy = {
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_arraycopy".to_string(),
+            vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
+            },
+        )?
+    };
+    let setitem_fast = {
+        let ptr = list_lltype.clone();
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_setitem_fast".to_string(),
+            vec![
+                list_lltype.clone(),
+                LowLevelType::Signed,
+                item_lltype.clone(),
+            ],
+            LowLevelType::Void,
+            move |_rtyper, _args, _result| {
+                build_ll_setitem_fast_helper_graph("ll_setitem_fast", ptr.clone(), item.clone())
+            },
+        )?
+    };
+    let resize_ge = {
+        let ptr = list_lltype.clone();
+        let item = item_lltype.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            "_ll_list_resize_ge".to_string(),
+            vec![list_lltype.clone(), LowLevelType::Signed],
+            LowLevelType::Void,
+            move |rtyper, _args, _result| {
+                build_ll_list_resize_ge_helper_graph(
+                    rtyper,
+                    "_ll_list_resize_ge",
+                    ptr.clone(),
+                    item.clone(),
+                    &arraycopy,
+                )
+            },
+        )?
+    };
+    let setitem = Hlvalue::Constant(sub_helper_funcptr_constant(rtyper, &setitem_fast)?);
+    let append = {
+        let ptr = list_lltype.clone();
+        let item = item_lltype.clone();
+        cached_helper_funcptr(
+            rtyper,
+            "ll_append",
+            vec![list_lltype.clone(), item_lltype.clone()],
+            LowLevelType::Void,
+            move |rtyper| {
+                build_ll_append_helper_graph(
+                    rtyper,
+                    "ll_append",
+                    ptr.clone(),
+                    item.clone(),
+                    &resize_ge,
+                    &setitem_fast,
+                )
+            },
+        )?
+    };
+    let getitem = {
+        let ptr = list_lltype.clone();
+        let item = item_lltype.clone();
+        cached_helper_funcptr(
+            rtyper,
+            "ll_getitem_fast",
+            vec![list_lltype, LowLevelType::Signed],
+            item_lltype,
+            move |_rtyper| {
+                build_ll_getitem_fast_helper_graph("ll_getitem_fast", ptr.clone(), item.clone())
+            },
+        )?
+    };
+    Ok(TwowayTableOps {
+        newlist,
+        append,
+        setitem,
+        getitem,
+    })
+}
+
 fn emit_direct_call(
     block: &BlockRef,
     callee: Hlvalue,
@@ -454,7 +590,7 @@ fn two_way_args(kind: &StringKind) -> Vec<LowLevelType> {
         LowLevelType::Signed,
         LowLevelType::Signed,
         LowLevelType::Bool,
-        table_array_ptr_lltype(),
+        table_list_ptr_lltype(),
     ]
 }
 
@@ -555,28 +691,37 @@ fn funcptr_adaptive_find(rtyper: &RPythonTyper, kind: &StringKind) -> Result<Hlv
     )
 }
 
-fn funcptr_search_normal(rtyper: &RPythonTyper, kind: &StringKind) -> Result<Hlvalue, TyperError> {
-    funcptr_helper(
+fn funcptr_search_normal(
+    rtyper: &RPythonTyper,
+    kind: &StringKind,
+    value_can_be_none: bool,
+) -> Result<Hlvalue, TyperError> {
+    let ptr = kind.ptr_lltype.clone();
+    cached_helper_funcptr(
         rtyper,
         "_search_normal",
         search_args(kind),
         LowLevelType::Signed,
-        kind.ptr_lltype.clone(),
-        build_search_normal_helper_graph,
+        move |rtyper| {
+            build_search_normal_helper_graph(rtyper, "_search_normal", ptr, value_can_be_none)
+        },
     )
 }
 
 fn funcptr_search_elidable(
     rtyper: &RPythonTyper,
     kind: &StringKind,
+    value_can_be_none: bool,
 ) -> Result<Hlvalue, TyperError> {
-    funcptr_helper(
+    let ptr = kind.ptr_lltype.clone();
+    cached_helper_funcptr(
         rtyper,
         "_search_elidable",
         search_args(kind),
         LowLevelType::Signed,
-        kind.ptr_lltype.clone(),
-        build_search_elidable_helper_graph,
+        move |rtyper| {
+            build_search_elidable_helper_graph(rtyper, "_search_elidable", ptr, value_can_be_none)
+        },
     )
 }
 
@@ -589,7 +734,7 @@ fn unpack_tuple5(
         emit_getfield(block, tup, "item1", "period", LowLevelType::Signed),
         emit_getfield(block, tup, "item2", "gap", LowLevelType::Signed),
         emit_getfield(block, tup, "item3", "is_periodic", LowLevelType::Bool),
-        emit_getfield(block, tup, "item4", "table", table_array_ptr_lltype()),
+        emit_getfield(block, tup, "item4", "table", table_list_ptr_lltype()),
     )
 }
 
@@ -1374,11 +1519,12 @@ pub(crate) fn build_factorize_helper_graph(
 /// `rstring.py` `_twoway_preprocess`. Returns
 /// `(cut, period, gap, is_periodic, table)` as `tuple5`.
 ///
-/// The table is `malloc_varsize(GcArray(Signed), TWOWAY_TABLE_SIZE)`
-/// filled by an index loop of Signed — the rtyped form of
-/// `[not_found_shift for _i in range(TWOWAY_TABLE_SIZE)]`, which
-/// upstream uses instead of list-multiply so the low-level helper
-/// does not emit `alloc_and_set`.
+/// The table is a resized `ListRepr` of Signed. The comprehension
+/// `[not_found_shift for _i in range(TWOWAY_TABLE_SIZE)]` lowers to
+/// `ll_newlist(0)` plus an append loop (`flowspace` `LIST_APPEND`),
+/// then the `table[ord(needle[i]) & MASK] = ...` loop is
+/// `ll_setitem_fast` (`rlist.py` `ll_setitem_nonneg` with a known-nonneg
+/// index).
 pub(crate) fn build_twoway_preprocess_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
@@ -1392,6 +1538,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
 
+    let table_ops = twoway_table_ops(rtyper)?;
     let factorize = {
         let ptr = ptr_lltype.clone();
         cached_helper_funcptr(
@@ -1929,21 +2076,17 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         v("is_periodic", LowLevelType::Bool),
         v("gap", LowLevelType::Signed),
         v("not_found_shift", LowLevelType::Signed),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("_i", LowLevelType::Signed),
     ]);
     let enter_fill = |block: &BlockRef| -> Result<(), TyperError> {
         let ins = block_vars(block);
-        let table = v("table", table_array_ptr_lltype());
-        emit(
+        let table = emit_direct_call(
             block,
-            "malloc_varsize",
-            vec![
-                lowlevel_type_const(table_array_lltype()),
-                gc_flavor_const()?,
-                signed_const(TWOWAY_TABLE_SIZE),
-            ],
-            table.clone(),
+            table_ops.newlist.clone(),
+            vec![signed_const(0)],
+            "table",
+            table_list_ptr_lltype(),
         );
         goto(
             block,
@@ -1982,7 +2125,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         v("is_periodic", LowLevelType::Bool),
         v("gap", LowLevelType::Signed),
         v("not_found_shift", LowLevelType::Signed),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("_i", LowLevelType::Signed),
     ]);
     let after_fill = blk(vec![
@@ -1993,7 +2136,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         v("is_periodic", LowLevelType::Bool),
         v("gap", LowLevelType::Signed),
         v("not_found_shift", LowLevelType::Signed),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
     ]);
     let fb = block_vars(&fill_body);
     branch(
@@ -2023,10 +2166,12 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         ],
         after_fill.clone(),
     );
-    emit_void(
+    emit_direct_call(
         &fill_body,
-        "setarrayitem",
-        vec![hl(&fb[7]), hl(&fb[8]), hl(&fb[6])],
+        table_ops.append.clone(),
+        vec![hl(&fb[7]), hl(&fb[6])],
+        "v",
+        LowLevelType::Void,
     );
     let i_inc = emit_bin(
         &fill_body,
@@ -2068,7 +2213,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         v("period", LowLevelType::Signed),
         v("is_periodic", LowLevelType::Bool),
         v("gap", LowLevelType::Signed),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("i", LowLevelType::Signed),
     ]);
     goto(
@@ -2101,7 +2246,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         v("period", LowLevelType::Signed),
         v("is_periodic", LowLevelType::Bool),
         v("gap", LowLevelType::Signed),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("i", LowLevelType::Signed),
     ]);
     let sl_done = blk(vec![
@@ -2109,7 +2254,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         v("period", LowLevelType::Signed),
         v("gap", LowLevelType::Signed),
         v("is_periodic", LowLevelType::Bool),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
     ]);
     let slb = block_vars(&sl_body);
     let sld = block_vars(&sl_done);
@@ -2156,10 +2301,12 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
         "shift",
         LowLevelType::Signed,
     );
-    emit_void(
+    emit_direct_call(
         &sl_body,
-        "setarrayitem",
+        table_ops.setitem.clone(),
         vec![hl(&slb[6]), hl(&idx), hl(&shift)],
+        "v",
+        LowLevelType::Void,
     );
     let i_inc2 = emit_bin(
         &sl_body,
@@ -2203,6 +2350,7 @@ pub(crate) fn build_twoway_preprocess_helper_graph(
 fn emit_table_shift(
     kind: &StringKind,
     block: &BlockRef,
+    getitem: &Hlvalue,
     value: &Variable,
     table: &Variable,
     window_last: &Variable,
@@ -2217,7 +2365,7 @@ fn emit_table_shift(
         "idx",
         LowLevelType::Signed,
     );
-    let shift = emit_table_get(block, table, hl(&idx));
+    let shift = emit_table_get(block, getitem, table, hl(&idx));
     let window_last2 = emit_bin(
         block,
         "int_add",
@@ -2231,11 +2379,12 @@ fn emit_table_shift(
 
 /// `rstring.py` `_two_way`.
 pub(crate) fn build_two_way_helper_graph(
-    _rtyper: &RPythonTyper,
+    rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
+    let table_getitem = twoway_table_ops(rtyper)?.getitem;
     let value = v("value", kind.ptr_lltype.clone());
     let base = v("base", LowLevelType::Signed);
     let n = v("n", LowLevelType::Signed);
@@ -2245,7 +2394,7 @@ pub(crate) fn build_two_way_helper_graph(
     let period = v("period", LowLevelType::Signed);
     let gap = v("gap", LowLevelType::Signed);
     let is_periodic = v("is_periodic", LowLevelType::Bool);
-    let table = v("table", table_array_ptr_lltype());
+    let table = v("table", table_list_ptr_lltype());
     let startblock = blk(vec![
         value.clone(),
         base.clone(),
@@ -2289,7 +2438,7 @@ pub(crate) fn build_two_way_helper_graph(
     let p_init = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2302,7 +2451,7 @@ pub(crate) fn build_two_way_helper_graph(
     let np_init = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2343,8 +2492,8 @@ pub(crate) fn build_two_way_helper_graph(
         np_init.clone(),
     );
 
-    build_two_way_periodic(&kind, &p_init, graph.returnblock.clone())?;
-    build_two_way_nonperiodic(&kind, &np_init, graph.returnblock.clone())?;
+    build_two_way_periodic(&kind, &table_getitem, &p_init, graph.returnblock.clone())?;
+    build_two_way_nonperiodic(&kind, &table_getitem, &np_init, graph.returnblock.clone())?;
     Ok(finish_graph(
         graph,
         name,
@@ -2370,6 +2519,7 @@ fn pcarry(ins: &[Variable]) -> Vec<Hlvalue> {
 
 fn build_two_way_periodic(
     kind: &StringKind,
+    table_getitem: &Hlvalue,
     p_init: &BlockRef,
     returnblock: BlockRef,
 ) -> Result<(), TyperError> {
@@ -2377,7 +2527,7 @@ fn build_two_way_periodic(
     let loop_cond = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2400,7 +2550,7 @@ fn build_two_way_periodic(
     let body = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2429,7 +2579,7 @@ fn build_two_way_periodic(
     let hp = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2441,7 +2591,7 @@ fn build_two_way_periodic(
     let after_hp = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2480,7 +2630,7 @@ fn build_two_way_periodic(
         ],
         after_hp.clone(),
     );
-    emit_horspool_loop(kind, &hp, &after_hp, &returnblock, 10)?;
+    emit_horspool_loop(kind, table_getitem, &hp, &after_hp, &returnblock, 10)?;
 
     let ah = block_vars(&after_hp);
     let m1 = emit_bin(
@@ -2510,7 +2660,7 @@ fn build_two_way_periodic(
     let i_cut = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2524,7 +2674,7 @@ fn build_two_way_periodic(
     let i_mem = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2562,7 +2712,7 @@ fn build_two_way_periodic(
     let right_cond = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2587,7 +2737,7 @@ fn build_two_way_periodic(
     let right_body = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2601,7 +2751,7 @@ fn build_two_way_periodic(
     let left_init = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2653,7 +2803,7 @@ fn build_two_way_periodic(
     let r_mis = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2749,7 +2899,7 @@ fn build_two_way_periodic(
     let left_cond = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2790,7 +2940,7 @@ fn build_two_way_periodic(
     let left_body = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2835,7 +2985,7 @@ fn build_two_way_periodic(
     let l_mis = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2913,7 +3063,7 @@ fn build_two_way_periodic(
     let l_shift = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2943,7 +3093,7 @@ fn build_two_way_periodic(
     );
     ret(&l_end, signed_const(-1), returnblock.clone());
     let ls = block_vars(&l_shift);
-    let (shift, _) = emit_table_shift(kind, &l_shift, &ls[0], &ls[2], &ls[8]);
+    let (shift, _) = emit_table_shift(kind, &l_shift, table_getitem, &ls[0], &ls[2], &ls[8]);
     let shift_nz = emit_un(
         &l_shift,
         "int_is_true",
@@ -2954,7 +3104,7 @@ fn build_two_way_periodic(
     let do_jump = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -2967,7 +3117,7 @@ fn build_two_way_periodic(
     let skip_next = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -3037,7 +3187,7 @@ fn build_two_way_periodic(
     let mj_cut = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -3050,7 +3200,7 @@ fn build_two_way_periodic(
     let mj_mem = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -3121,7 +3271,7 @@ fn build_two_way_periodic(
         let take_sh = blk(vec![
             v("value", kind.ptr_lltype.clone()),
             v("needle", kind.ptr_lltype.clone()),
-            v("table", table_array_ptr_lltype()),
+            v("table", table_list_ptr_lltype()),
             v("base", LowLevelType::Signed),
             v("m", LowLevelType::Signed),
             v("cut", LowLevelType::Signed),
@@ -3133,7 +3283,7 @@ fn build_two_way_periodic(
         let take_mj = blk(vec![
             v("value", kind.ptr_lltype.clone()),
             v("needle", kind.ptr_lltype.clone()),
-            v("table", table_array_ptr_lltype()),
+            v("table", table_list_ptr_lltype()),
             v("base", LowLevelType::Signed),
             v("m", LowLevelType::Signed),
             v("cut", LowLevelType::Signed),
@@ -3225,6 +3375,7 @@ fn clone_block_like(ins: &[Variable]) -> BlockRef {
 
 fn emit_horspool_loop(
     kind: &StringKind,
+    table_getitem: &Hlvalue,
     hp: &BlockRef,
     after_hp: &BlockRef,
     returnblock: &BlockRef,
@@ -3232,7 +3383,7 @@ fn emit_horspool_loop(
 ) -> Result<(), TyperError> {
     let ins = block_vars(hp);
     debug_assert_eq!(ins.len(), ncarry);
-    let (shift, wl2) = emit_table_shift(kind, hp, &ins[0], &ins[2], &ins[8]);
+    let (shift, wl2) = emit_table_shift(kind, hp, table_getitem, &ins[0], &ins[2], &ins[8]);
     let z = emit_bin(
         hp,
         "int_eq",
@@ -3276,6 +3427,7 @@ fn emit_horspool_loop(
 
 fn build_two_way_nonperiodic(
     kind: &StringKind,
+    table_getitem: &Hlvalue,
     np_init: &BlockRef,
     returnblock: BlockRef,
 ) -> Result<(), TyperError> {
@@ -3304,7 +3456,7 @@ fn build_two_way_nonperiodic(
     let gje_join = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -3390,7 +3542,7 @@ fn build_two_way_nonperiodic(
     let hp_shuf = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -3419,7 +3571,7 @@ fn build_two_way_nonperiodic(
         hp_shuf.clone(),
     );
     let after_shuf = clone_block_like(&block_vars(&hp_shuf));
-    emit_horspool_loop(kind, &hp_shuf, &after_shuf, &returnblock, 11)?;
+    emit_horspool_loop(kind, table_getitem, &hp_shuf, &after_shuf, &returnblock, 11)?;
     let ash = block_vars(&after_shuf);
     // unshuffle: 0v 1n 2t 3b 4m 5cut 6per 7he 8wl 9gap 10gje -> original
     let after = clone_block_like(&lc);
@@ -3460,7 +3612,7 @@ fn build_two_way_nonperiodic(
     let scan = blk(vec![
         v("value", kind.ptr_lltype.clone()),
         v("needle", kind.ptr_lltype.clone()),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("base", LowLevelType::Signed),
         v("m", LowLevelType::Signed),
         v("cut", LowLevelType::Signed),
@@ -3700,7 +3852,7 @@ pub(crate) fn build_two_way_count_helper_graph(
     let period = v("period", LowLevelType::Signed);
     let gap = v("gap", LowLevelType::Signed);
     let is_periodic = v("is_periodic", LowLevelType::Bool);
-    let table = v("table", table_array_ptr_lltype());
+    let table = v("table", table_list_ptr_lltype());
     let startblock = blk(vec![
         value.clone(),
         base.clone(),
@@ -3726,7 +3878,7 @@ pub(crate) fn build_two_way_count_helper_graph(
         v("period", LowLevelType::Signed),
         v("gap", LowLevelType::Signed),
         v("is_periodic", LowLevelType::Bool),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("index", LowLevelType::Signed),
         v("count", LowLevelType::Signed),
     ]);
@@ -3811,7 +3963,7 @@ pub(crate) fn build_two_way_count_helper_graph(
         v("period", LowLevelType::Signed),
         v("gap", LowLevelType::Signed),
         v("is_periodic", LowLevelType::Bool),
-        v("table", table_array_ptr_lltype()),
+        v("table", table_list_ptr_lltype()),
         v("index", LowLevelType::Signed),
         v("count", LowLevelType::Signed),
         v("result", LowLevelType::Signed),
@@ -4588,7 +4740,7 @@ fn with_twoway_fields(base: &[Variable]) -> Vec<Variable> {
     vars.push(v("period", LowLevelType::Signed));
     vars.push(v("gap", LowLevelType::Signed));
     vars.push(v("is_periodic", LowLevelType::Bool));
-    vars.push(v("table", table_array_ptr_lltype()));
+    vars.push(v("table", table_list_ptr_lltype()));
     vars
 }
 
@@ -4755,10 +4907,14 @@ fn emit_adaptive_switch_to_twoway(
 }
 
 /// `rstring.py` `_search` — translation-time `isinstance` dispatch.
+///
+/// `value_can_be_none` is the caller's `SomeString.can_be_None`, forwarded
+/// to `_search_elidable` / `_search_normal`.
 pub(crate) fn build_search_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4777,9 +4933,9 @@ pub(crate) fn build_search_helper_graph(
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
     let callee = if kind.is_unicode() {
-        funcptr_search_normal(rtyper, &kind)?
+        funcptr_search_normal(rtyper, &kind, value_can_be_none)?
     } else {
-        funcptr_search_elidable(rtyper, &kind)?
+        funcptr_search_elidable(rtyper, &kind, value_can_be_none)?
     };
     let res = emit_direct_call(
         &startblock,
@@ -4805,10 +4961,13 @@ pub(crate) fn build_search_helper_graph(
 
 /// `rstring.py` `_search_elidable`. `@jit.elidable` stamps
 /// `_elidable_function_`; the body is `direct_call _search_normal`.
+///
+/// `value_can_be_none` is forwarded to `_search_normal`.
 pub(crate) fn build_search_elidable_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype)?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4826,7 +4985,7 @@ pub(crate) fn build_search_elidable_helper_graph(
     let return_var = v("result", LowLevelType::Signed);
     let graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
-    let callee = funcptr_search_normal(rtyper, &kind)?;
+    let callee = funcptr_search_normal(rtyper, &kind, value_can_be_none)?;
     let res = emit_direct_call(
         &startblock,
         callee,
@@ -4850,10 +5009,16 @@ pub(crate) fn build_search_elidable_helper_graph(
 }
 
 /// `rstring.py` `_search_normal`.
+///
+/// `assert value is not None` is emitted only when `value_can_be_none`.
+/// After `LLHelpers.ll_search` asserts, knowntypedata has
+/// `can_be_None=False`, so `transform_dead_code` (`transform.py`) cuts
+/// the raise link; that route passes `false`.
 pub(crate) fn build_search_normal_helper_graph(
     rtyper: &RPythonTyper,
     name: &str,
     ptr_lltype: LowLevelType,
+    value_can_be_none: bool,
 ) -> Result<PyGraph, TyperError> {
     let kind = StringKind::from_ptr(ptr_lltype.clone())?;
     let value = v("value", kind.ptr_lltype.clone());
@@ -4882,21 +5047,44 @@ pub(crate) fn build_search_normal_helper_graph(
             v("mode", LowLevelType::Signed),
         ]
     };
+    // `rstring.py` `_search_normal`: `assert value is not None`, cut
+    // when the caller annotation has `can_be_None=False`.
+    let body = if value_can_be_none {
+        let after_none = blk(voem());
+        close_assert_ptr_not_none(
+            &startblock,
+            &value,
+            vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
+            after_none.clone(),
+            graph.exceptblock.clone(),
+            exception_args("AssertionError")?,
+        );
+        after_none
+    } else {
+        startblock.clone()
+    };
     let clamp_s = blk(voem());
+    let an = block_vars(&body);
     let start_neg = emit_bin(
-        &startblock,
+        &body,
         "int_lt",
-        hl(&start),
+        hl(&an[2]),
         signed_const(0),
         "start_neg",
         LowLevelType::Bool,
     );
     branch(
-        &startblock,
+        &body,
         start_neg,
-        vec![hl(&value), hl(&other), signed_const(0), hl(&end), hl(&mode)],
+        vec![
+            hl(&an[0]),
+            hl(&an[1]),
+            signed_const(0),
+            hl(&an[3]),
+            hl(&an[4]),
+        ],
         clamp_s.clone(),
-        vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
+        vec![hl(&an[0]), hl(&an[1]), hl(&an[2]), hl(&an[3]), hl(&an[4])],
         clamp_s.clone(),
     );
 
@@ -4962,8 +5150,10 @@ pub(crate) fn build_search_normal_helper_graph(
     let mut nm_vars = voem();
     nm_vars.push(v("n", LowLevelType::Signed));
     nm_vars.push(v("m", LowLevelType::Signed));
-    let empty_m = blk(nm_vars.clone());
-    let has_m = blk(nm_vars.clone());
+    // `checkgraph` `definevar` (`flowspace/model.py`): each block's
+    // inputargs are a fresh Variable, even when names and lltypes match.
+    let empty_m = clone_block_like(&nm_vars);
+    let has_m = clone_block_like(&nm_vars);
     let mut nm_args = pcarry(&ne);
     nm_args.push(hl(&n));
     nm_args.push(hl(&m));
@@ -4994,8 +5184,8 @@ pub(crate) fn build_search_normal_helper_graph(
         "w_neg",
         LowLevelType::Bool,
     );
-    let too_small = blk(nm_vars.clone());
-    let mut sized_vars = nm_vars.clone();
+    let too_small = clone_block_like(&nm_vars);
+    let mut sized_vars: Vec<Variable> = nm_vars.iter().map(Variable::copy).collect();
     sized_vars.push(v("w", LowLevelType::Signed));
     let sized = blk(sized_vars);
     branch(
@@ -5212,6 +5402,11 @@ fn emit_forward_search(
     let prep = funcptr_twoway_preprocess(rtyper, kind)?;
     let two = funcptr_two_way(rtyper, kind)?;
     let two_count = funcptr_two_way_count(rtyper, kind)?;
+    // `_search` forward dispatch, short-circuit:
+    // `n < 2500` → `_default_find`;
+    // else `m < 100 and n < 30000` → `_default_find`;
+    // else `m < 6` → `_default_find`;
+    // else `(m >> 2) * 3 < (n >> 2)` → two-way, else `_adaptive_find`.
     let n_small = emit_bin(
         block,
         "int_lt",
@@ -5271,6 +5466,9 @@ fn emit_forward_search(
         rest.clone(),
     );
     emit_call_default_find(&def2, &default_find, returnblock.clone());
+    // Join onto `m_big` so the third disjunct `m < 6` runs after
+    // `n < 2500` and `m < 100 and n < 30000` both failed (`_search`).
+    goto(&rest, pcarry(&block_vars(&rest)), m_big.clone());
 
     let mb = block_vars(&m_big);
     let m_lt_6 = emit_bin(
@@ -5292,11 +5490,10 @@ fn emit_forward_search(
         rest2.clone(),
     );
     emit_call_default_find(&def3, &default_find, returnblock.clone());
-    goto(&rest2, pcarry(&block_vars(&rest2)), rest.clone());
 
     emit_twoway_or_adaptive(
         kind,
-        &rest,
+        &rest2,
         &prep,
         &two,
         &two_count,
@@ -5862,9 +6059,13 @@ fn emit_rfind_bloom_skip(
 /// Convert an rtyped search helper into a rich-`OpKind` graph for
 /// `CallControl::getcalldescr`. Extends `effect_graph_from_rtyped_helper`
 /// with `malloc` / `malloc_varsize` / `getfield` / `setfield` /
-/// `cast_unichar_to_int` / `cast_int_to_unichar`, which that converter
-/// rejects. `malloc_varsize` of the twoway table is `NewArray` with
-/// `array_type_id = "twoway_table"`.
+/// `cast_unichar_to_int` / `cast_int_to_unichar` / `ptr_nonzero` /
+/// `ptr_iszero`, which that converter rejects. List helpers
+/// (`ll_newlist` / `ll_append` / `ll_setitem_fast` / `ll_getitem_fast`)
+/// are `direct_call`. Nested `malloc_varsize` of a list `items` array
+/// is `NewArray` keyed by the array element type. `ptr_nonzero` is
+/// `ll_search`'s `assert value is not None` / `assert other is not None`
+/// (`rstr.py` `ll_search`).
 pub(crate) fn effect_graph_from_search_helper(graph: &FunctionGraph) -> ModelGraph {
     type FlowBlockKey = *const RefCell<Block>;
 
@@ -6052,6 +6253,10 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
                 ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
                 ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
                 ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
+                ConstValue::ByteStr(bytes) => {
+                    let n = i64::from(bytes.first().copied().unwrap_or(0));
+                    (OpKind::ConstInt(n), LowLevelType::Signed)
+                }
                 other => {
                     panic!("effect_graph_from_search_helper: cannot materialise constant {other:?}")
                 }
@@ -6065,7 +6270,7 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
     }
 }
 
-fn search_callee_name(hlv: &Hlvalue) -> String {
+fn search_callee_funcptr(hlv: &Hlvalue) -> (String, Option<usize>) {
     use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
     let Hlvalue::Constant(c) = hlv else {
         panic!("effect_graph_from_search_helper: direct_call callee is not a constant");
@@ -6077,7 +6282,7 @@ fn search_callee_name(hlv: &Hlvalue) -> String {
         );
     };
     match ptr._obj0_value() {
-        Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+        Ok(Some(_ptr_obj::Func(func))) => (func._name.clone(), func.graph),
         other => {
             panic!("effect_graph_from_search_helper: direct_call callee is not a Func: {other:?}")
         }
@@ -6197,13 +6402,19 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
         }
         "direct_call" => {
-            let callee = search_callee_name(&op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[0]);
+            let result = search_expect_var(&op.result);
+            // `graphanalyze.py GraphAnalyzer.analyze`: a `direct_call`
+            // whose funcobj has a graph is followed; a graphless funcobj
+            // is `analyze_external_call`. The graphless callee reached
+            // here is the `majit_rlib::jit::isconstant` oopspec
+            // (`rlib/jit.py isconstant`); emit the ordinary Call so
+            // analyzers classify the builtin target.
             let target = CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()));
             let args: Vec<_> = op.args[1..]
                 .iter()
                 .map(|a| search_materialize(out, block, a))
                 .collect();
-            let result = search_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
                 OpKind::Call {
@@ -6214,6 +6425,26 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 result,
             );
         }
+        "jit_conditional_call" => {
+            // Same interpreter-facing Call `lower_graph` emits.
+            // Analyzers treat `oopspec("jit.conditional_call")` as a
+            // builtin; callee effects reach through the
+            // `we_are_jitted()`-false `direct_call`.
+            assert!(
+                op.args.len() >= 2,
+                "effect_graph_from_search_helper: jit_conditional_call needs cond and fnptr"
+            );
+            let cond = search_materialize(out, block, &op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[1]);
+            let extra_args: Vec<_> = op.args[2..]
+                .iter()
+                .map(|a| search_materialize(out, block, a))
+                .collect();
+            let result = search_expect_var(&op.result);
+            crate::codewriter::jtransform_opname::emit_conditional_call_oopspec(
+                out, block, cond, &callee, extra_args, result,
+            );
+        }
         "malloc" => {
             let owner = search_malloc_owner(&op.args[0]);
             let result = search_expect_var(&op.result);
@@ -6222,12 +6453,13 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
         "malloc_varsize" => {
             let length = search_materialize(out, block, &op.args[2]);
             let result = search_expect_var(&op.result);
+            let array_type_id = search_array_type_id(&result);
             out.push_op_with_result_var(
                 block,
                 OpKind::NewArray {
                     length,
                     item_ty: ValueType::Int,
-                    array_type_id: Some("twoway_table".to_string()),
+                    array_type_id,
                 },
                 result,
             );
@@ -6289,7 +6521,8 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 result,
             );
         }
-        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not") => {
+        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not"
+        | "ptr_nonzero" | "ptr_iszero") => {
             let operand = search_materialize(out, block, &op.args[0]);
             let result = search_expect_var(&op.result);
             out.push_op_with_result_var(
@@ -6320,7 +6553,64 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 result,
             );
         }
-        other => panic!("effect_graph_from_search_helper: unsupported opname {other:?}"),
+        name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
+            // `effect_graph_from_rtyped_helper`: UnaryOp keeps the llop
+            // name so analyzers consult `ll_operations()`. Extra Variable
+            // operands stay materialised; Constant extras are already values.
+            let Some((last, rest)) = op.args.split_last() else {
+                panic!("effect_graph_from_search_helper: {name} has no operand");
+            };
+            for arg in rest {
+                if matches!(arg, Hlvalue::Variable(_)) {
+                    let _ = search_materialize(out, block, arg);
+                }
+            }
+            let operand = search_materialize(out, block, last);
+            let result = search_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty: search_value_type_of(&result),
+                },
+                result,
+            );
+        }
+        other => {
+            // `graphanalyze.py GraphAnalyzer.analyze` follows only
+            // `direct_call` / `indirect_call`; every other llop is
+            // `analyze_simple_operation` with the `lloperation.py` flags.
+            // UnaryOp keeps the llop name so analyzers consult
+            // `ll_operations()`, matching `effect_graph_from_rtyped_helper`.
+            if other != "direct_call"
+                && other != "indirect_call"
+                && crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
+                    .contains_key(other)
+            {
+                let Some((last, rest)) = op.args.split_last() else {
+                    panic!("effect_graph_from_search_helper: {other} has no operand");
+                };
+                for arg in rest {
+                    if matches!(arg, Hlvalue::Variable(_)) {
+                        let _ = search_materialize(out, block, arg);
+                    }
+                }
+                let operand = search_materialize(out, block, last);
+                let result = search_expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::UnaryOp {
+                        op: other.to_string(),
+                        operand,
+                        result_ty: search_value_type_of(&result),
+                    },
+                    result,
+                );
+            } else {
+                panic!("effect_graph_from_search_helper: unsupported opname {other:?}")
+            }
+        }
     }
 }
 
@@ -6328,9 +6618,12 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::flowspace::model::checkgraph;
     use crate::translator::rtyper::lltypesystem::rstr::{
         STRPTR, UNICODEPTR, funcobj_from_funcptr_constant,
     };
+    use std::collections::HashMap;
+    use std::rc::Rc;
 
     fn direct_call_names(graph: &FunctionGraph) -> Vec<String> {
         graph
@@ -6358,8 +6651,9 @@ mod tests {
         for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
             let ann = RPythonAnnotator::new(None, None, None, false);
             let rtyper = RPythonTyper::new(&ann);
-            let normal = build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone())
-                .expect("_search_normal");
+            let normal =
+                build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone(), false)
+                    .expect("_search_normal");
             let names = direct_call_names(&normal.graph.borrow());
             for expected in [
                 "_default_find",
@@ -6377,7 +6671,7 @@ mod tests {
             }
 
             let elidable =
-                build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone())
+                build_search_elidable_helper_graph(&rtyper, "_search_elidable", ptr.clone(), false)
                     .expect("_search_elidable");
             assert!(elidable.func._elidable_function_);
             assert_eq!(
@@ -6386,7 +6680,7 @@ mod tests {
             );
 
             let search =
-                build_search_helper_graph(&rtyper, "_search", ptr.clone()).expect("_search");
+                build_search_helper_graph(&rtyper, "_search", ptr.clone(), false).expect("_search");
             let expected = if ptr == *STRPTR {
                 "_search_elidable"
             } else {
@@ -6406,11 +6700,18 @@ mod tests {
             let prep =
                 build_twoway_preprocess_helper_graph(&rtyper, "_twoway_preprocess", ptr.clone())
                     .expect("_twoway_preprocess");
+            let prep_names = direct_call_names(&prep.graph.borrow());
             assert!(
-                direct_call_names(&prep.graph.borrow())
-                    .iter()
-                    .any(|n| n == "_factorize"),
+                prep_names.iter().any(|n| n == "_factorize"),
                 "_twoway_preprocess calls _factorize"
+            );
+            assert!(
+                prep_names.iter().any(|n| n == "ll_newlist"),
+                "_twoway_preprocess calls ll_newlist: {prep_names:?}"
+            );
+            assert!(
+                prep_names.iter().any(|n| n == "ll_append"),
+                "_twoway_preprocess calls ll_append: {prep_names:?}"
             );
             build_two_way_helper_graph(&rtyper, "_two_way", ptr.clone()).expect("_two_way");
             let count = build_two_way_count_helper_graph(&rtyper, "_two_way_count", ptr.clone())
@@ -6433,11 +6734,388 @@ mod tests {
 
             let effect = effect_graph_from_search_helper(&prep.graph.borrow());
             assert!(
-                effect
-                    .iter_block_ops()
-                    .any(|(_, op)| matches!(op.kind, OpKind::NewArray { .. })),
-                "_twoway_preprocess effect graph has NewArray"
+                effect.iter_block_ops().any(|(_, op)| matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if target.path_segments().is_some_and(|s| s.last() == Some(&"ll_newlist"))
+                )),
+                "_twoway_preprocess effect graph calls ll_newlist"
             );
         }
+    }
+
+    /// `_ll_list_resize_ge` effect graph keeps `direct_call` as `Call` and
+    /// `jit_conditional_call` as the `jit.conditional_call` oopspec Call.
+    /// Analyzers see those ops; there is no `same_as` stand-in and no
+    /// unary invented from the llop's first variable argument.
+    #[test]
+    fn ll_list_resize_ge_effect_graph_has_no_fabricated_ops() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        build_twoway_preprocess_helper_graph(&rtyper, "_twoway_preprocess", STRPTR.clone())
+            .expect("_twoway_preprocess");
+        let graphs = ann.translator.graphs.borrow();
+        let ge = graphs
+            .iter()
+            .find(|g| g.borrow().name == "_ll_list_resize_ge")
+            .expect("_twoway_preprocess mints _ll_list_resize_ge");
+        let effect = effect_graph_from_search_helper(&ge.borrow());
+        for (_, op) in effect.iter_block_ops() {
+            match &op.kind {
+                OpKind::UnaryOp { op, .. } => {
+                    assert_ne!(op, "same_as", "no same_as stand-in: {op:?}");
+                    assert_ne!(
+                        op, "jit_conditional_call",
+                        "jit_conditional_call is the oopspec Call, not a unary"
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            effect.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target.path_segments().is_some_and(|s| s
+                        == ["majit_rlib", "jit", "conditional_call3"])
+            )),
+            "effect graph has the jit.conditional_call oopspec Call"
+        );
+    }
+
+    #[test]
+    fn search_helper_graphs_pass_checkgraph() {
+        for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
+            let ann = RPythonAnnotator::new(None, None, None, false);
+            let rtyper = RPythonTyper::new(&ann);
+            let graphs = vec![
+                (
+                    "bloom_add",
+                    build_bloom_add_helper_graph(&rtyper, "bloom_add", ptr.clone())
+                        .expect("bloom_add"),
+                ),
+                (
+                    "bloom",
+                    build_bloom_helper_graph(&rtyper, "bloom", ptr.clone()).expect("bloom"),
+                ),
+                (
+                    "_lex_search",
+                    build_lex_search_helper_graph(&rtyper, "_lex_search", ptr.clone())
+                        .expect("_lex_search"),
+                ),
+                (
+                    "_factorize",
+                    build_factorize_helper_graph(&rtyper, "_factorize", ptr.clone())
+                        .expect("_factorize"),
+                ),
+                (
+                    "_twoway_preprocess",
+                    build_twoway_preprocess_helper_graph(
+                        &rtyper,
+                        "_twoway_preprocess",
+                        ptr.clone(),
+                    )
+                    .expect("_twoway_preprocess"),
+                ),
+                (
+                    "_two_way",
+                    build_two_way_helper_graph(&rtyper, "_two_way", ptr.clone()).expect("_two_way"),
+                ),
+                (
+                    "_two_way_count",
+                    build_two_way_count_helper_graph(&rtyper, "_two_way_count", ptr.clone())
+                        .expect("_two_way_count"),
+                ),
+                (
+                    "_default_find",
+                    build_default_find_helper_graph(&rtyper, "_default_find", ptr.clone())
+                        .expect("_default_find"),
+                ),
+                (
+                    "_adaptive_find",
+                    build_adaptive_find_helper_graph(&rtyper, "_adaptive_find", ptr.clone())
+                        .expect("_adaptive_find"),
+                ),
+                (
+                    "_search",
+                    build_search_helper_graph(&rtyper, "_search", ptr.clone(), false)
+                        .expect("_search"),
+                ),
+                (
+                    "_search_elidable",
+                    build_search_elidable_helper_graph(
+                        &rtyper,
+                        "_search_elidable",
+                        ptr.clone(),
+                        false,
+                    )
+                    .expect("_search_elidable"),
+                ),
+                (
+                    "_search_normal",
+                    build_search_normal_helper_graph(&rtyper, "_search_normal", ptr.clone(), false)
+                        .expect("_search_normal"),
+                ),
+            ];
+            for (name, py) in graphs {
+                assert_eq!(py.graph.borrow().name, name);
+                checkgraph(&py.graph.borrow());
+            }
+        }
+    }
+
+    fn search_normal_has_assertionerror_path(graph: &FunctionGraph) -> bool {
+        let start = graph.startblock.borrow();
+        if !start
+            .operations
+            .first()
+            .is_some_and(|op| op.opname == "ptr_nonzero")
+        {
+            return false;
+        }
+        start.exits.iter().any(|link| {
+            let link = link.borrow();
+            let is_false = matches!(
+                &link.exitcase,
+                Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(false)
+            );
+            let to_except = link
+                .target
+                .as_ref()
+                .is_some_and(|target| Rc::ptr_eq(target, &graph.exceptblock));
+            let assertionerror = matches!(
+                link.args.first().and_then(|arg| arg.as_ref()),
+                Some(Hlvalue::Constant(Constant {
+                    value: ConstValue::HostObject(obj),
+                    ..
+                })) if obj.qualname() == "AssertionError"
+            );
+            is_false && to_except && assertionerror
+        })
+    }
+
+    /// `_search_normal` (`rstring.py`): `assert value is not None` is
+    /// cut when the caller annotation has `can_be_None=False`
+    /// (`transform_dead_code`).
+    #[test]
+    fn search_normal_assert_follows_value_can_be_none() {
+        for ptr in [STRPTR.clone(), UNICODEPTR.clone()] {
+            for value_can_be_none in [true, false] {
+                let ann = RPythonAnnotator::new(None, None, None, false);
+                let rtyper = RPythonTyper::new(&ann);
+                let py = build_search_normal_helper_graph(
+                    &rtyper,
+                    "_search_normal",
+                    ptr.clone(),
+                    value_can_be_none,
+                )
+                .expect("_search_normal");
+                checkgraph(&py.graph.borrow());
+                assert_eq!(
+                    search_normal_has_assertionerror_path(&py.graph.borrow()),
+                    value_can_be_none,
+                    "value_can_be_none={value_can_be_none}"
+                );
+            }
+        }
+    }
+
+    fn malloc_varsize_is_signed_array_of_len(op: &SpaceOperation, len: i64) -> bool {
+        if op.opname != "malloc_varsize" {
+            return false;
+        }
+        let Some(Hlvalue::Constant(ty_c)) = op.args.first() else {
+            return false;
+        };
+        let ConstValue::LowLevelType(lltype) = &ty_c.value else {
+            return false;
+        };
+        let is_signed_array = matches!(
+            &**lltype,
+            LowLevelType::Array(arr) if arr.OF == LowLevelType::Signed
+        );
+        let is_len = matches!(
+            op.args.get(2),
+            Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::Int(n) if n == len)
+        );
+        is_signed_array && is_len
+    }
+
+    #[test]
+    fn twoway_preprocess_table_is_list_newlist_plus_append() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let prep =
+            build_twoway_preprocess_helper_graph(&rtyper, "_twoway_preprocess", STRPTR.clone())
+                .expect("_twoway_preprocess");
+        let graph = prep.graph.borrow();
+        let names = direct_call_names(&graph);
+        assert!(
+            names.iter().any(|n| n == "ll_newlist"),
+            "comprehension starts with ll_newlist: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ll_append"),
+            "comprehension appends not_found_shift: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "ll_setitem_fast"),
+            "setitem loop is ll_setitem_fast (nonneg): {names:?}"
+        );
+        let has_raw_table = graph.iterblocks().into_iter().any(|block| {
+            block
+                .borrow()
+                .operations
+                .iter()
+                .any(|op| malloc_varsize_is_signed_array_of_len(op, TWOWAY_TABLE_SIZE))
+        });
+        assert!(
+            !has_raw_table,
+            "preprocess graph must not malloc_varsize GcArray(Signed) of length {TWOWAY_TABLE_SIZE}"
+        );
+        checkgraph(&graph);
+    }
+
+    fn hl_i64(env: &HashMap<u64, i64>, hlv: &Hlvalue) -> Option<i64> {
+        match hlv {
+            Hlvalue::Constant(c) => match c.value {
+                ConstValue::Int(n) => Some(n),
+                ConstValue::Bool(b) => Some(i64::from(b)),
+                _ => None,
+            },
+            Hlvalue::Variable(v) => env.get(&v.id()).copied(),
+        }
+    }
+
+    fn eval_int_op(opname: &str, args: &[Option<i64>]) -> Option<i64> {
+        match (opname, args) {
+            ("int_lt", [Some(a), Some(b)]) => Some(i64::from(*a < *b)),
+            ("int_gt", [Some(a), Some(b)]) => Some(i64::from(*a > *b)),
+            ("int_eq", [Some(a), Some(b)]) => Some(i64::from(*a == *b)),
+            ("int_ne", [Some(a), Some(b)]) => Some(i64::from(*a != *b)),
+            ("int_le", [Some(a), Some(b)]) => Some(i64::from(*a <= *b)),
+            ("int_ge", [Some(a), Some(b)]) => Some(i64::from(*a >= *b)),
+            ("int_add", [Some(a), Some(b)]) => Some(*a + *b),
+            ("int_sub", [Some(a), Some(b)]) => Some(*a - *b),
+            ("int_mul", [Some(a), Some(b)]) => Some(*a * *b),
+            ("int_rshift", [Some(a), Some(b)]) => Some(*a >> *b),
+            ("int_lshift", [Some(a), Some(b)]) => Some(*a << *b),
+            ("int_and", [Some(a), Some(b)]) => Some(*a & *b),
+            ("int_or", [Some(a), Some(b)]) => Some(*a | *b),
+            ("bool_not", [Some(a)]) => Some(i64::from(*a == 0)),
+            ("int_is_zero", [Some(a)]) => Some(i64::from(*a == 0)),
+            ("int_is_true", [Some(a)]) => Some(i64::from(*a != 0)),
+            _ => None,
+        }
+    }
+
+    fn follow_forward_dispatch(graph: &FunctionGraph, n: i64, m: i64) -> String {
+        let start = graph
+            .iterblocks()
+            .into_iter()
+            .find(|block| {
+                block.borrow().operations.iter().any(|op| {
+                    op.opname == "int_lt"
+                        && matches!(
+                            op.args.get(1),
+                            Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::Int(2500))
+                        )
+                })
+            })
+            .expect("n < 2500 dispatch block");
+        let start_vars = block_vars(&start);
+        let mut env: HashMap<u64, i64> = HashMap::new();
+        env.insert(start_vars[5].id(), n);
+        env.insert(start_vars[6].id(), m);
+        if start_vars.len() > 7 {
+            env.insert(start_vars[7].id(), n - m);
+        }
+        let mut cur = start;
+        for _ in 0..64 {
+            let operations = cur.borrow().operations.clone();
+            for op in &operations {
+                if op.opname == "direct_call"
+                    && let Some(func) = op.args.first().and_then(funcobj_from_funcptr_constant)
+                {
+                    match func._name.as_str() {
+                        "_default_find" | "_twoway_preprocess" | "_adaptive_find" | "_two_way"
+                        | "_two_way_count" => return func._name,
+                        _ => {}
+                    }
+                }
+                let args: Vec<Option<i64>> = op.args.iter().map(|a| hl_i64(&env, a)).collect();
+                if let (Some(val), Hlvalue::Variable(v)) =
+                    (eval_int_op(&op.opname, &args), &op.result)
+                {
+                    env.insert(v.id(), val);
+                }
+            }
+            let exitswitch = cur.borrow().exitswitch.clone();
+            let exits = cur.borrow().exits.clone();
+            let link = match exitswitch {
+                Some(Hlvalue::Variable(sw)) => {
+                    let cond = *env
+                        .get(&sw.id())
+                        .unwrap_or_else(|| panic!("unbound dispatch cond {}", sw.name()));
+                    let want = cond != 0;
+                    exits
+                        .into_iter()
+                        .find(|link| {
+                            matches!(
+                                &link.borrow().exitcase,
+                                Some(Hlvalue::Constant(c))
+                                    if matches!(c.value, ConstValue::Bool(b) if b == want)
+                            )
+                        })
+                        .expect("bool exit")
+                }
+                None if exits.len() == 1 => exits.into_iter().next().unwrap(),
+                other => panic!("unexpected exitswitch {other:?}"),
+            };
+            let (target, args) = {
+                let l = link.borrow();
+                (l.target.clone().expect("link.target"), l.args.clone())
+            };
+            if Rc::ptr_eq(&target, &graph.returnblock) {
+                panic!("dispatch returned before a search helper call (n={n}, m={m})");
+            }
+            let tvars = block_vars(&target);
+            let mut next = HashMap::new();
+            for (arg, tv) in args.iter().zip(tvars.iter()) {
+                let Some(arg) = arg else {
+                    continue;
+                };
+                if let Some(val) = hl_i64(&env, arg) {
+                    next.insert(tv.id(), val);
+                }
+            }
+            env = next;
+            cur = target;
+        }
+        panic!("dispatch walk exceeded 64 blocks (n={n}, m={m})");
+    }
+
+    #[test]
+    fn search_normal_forward_dispatch_matches_upstream_thresholds() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let py = build_search_normal_helper_graph(&rtyper, "_search_normal", STRPTR.clone(), false)
+            .expect("_search_normal");
+        let graph = py.graph.borrow();
+        assert_eq!(
+            follow_forward_dispatch(&graph, 40000, 3),
+            "_default_find",
+            "n=40000 m=3 takes `_search` `m < 6` → `_default_find`"
+        );
+        assert_eq!(
+            follow_forward_dispatch(&graph, 40000, 200),
+            "_twoway_preprocess",
+            "n=40000 m=200 takes two-way"
+        );
+        assert_eq!(
+            follow_forward_dispatch(&graph, 1000, 50),
+            "_default_find",
+            "n=1000 m=50 takes `_search` `n < 2500` → `_default_find`"
+        );
     }
 }

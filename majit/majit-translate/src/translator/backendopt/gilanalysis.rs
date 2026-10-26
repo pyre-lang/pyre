@@ -184,8 +184,8 @@ mod tests {
     };
     use crate::translator::rtyper::lltypesystem::lltype;
     use crate::translator::translator::TranslationContext;
+    use indexmap::IndexMap;
     use std::cell::RefCell;
-    use std::collections::HashMap;
     use std::rc::Rc;
 
     fn graph_with_func(name: &str) -> GraphRef {
@@ -193,7 +193,7 @@ mod tests {
         let mut graph = FunctionGraph::new(name, start);
         graph.func = Some(GraphFunc::new(
             name,
-            Constant::new(ConstValue::Dict(HashMap::new())),
+            Constant::new(ConstValue::Dict(std::sync::Arc::new(IndexMap::new()))),
         ));
         Rc::new(RefCell::new(graph))
     }

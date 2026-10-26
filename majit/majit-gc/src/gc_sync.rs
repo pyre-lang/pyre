@@ -31,15 +31,15 @@
 //! next collection-capable call.
 
 use std::cell::{Cell, UnsafeCell};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 // `os_thread.reinit_threads` calls `rthread.thread_after_fork` while the
 // vanished parent mutators are still represented by native waiters.  Keep the
 // STW pair on OS-backed primitives: a parking_lot condvar also inherits its
 // process-global userspace waiter queue, and waking that queue in the child
 // deadlocks before the rest of the after-fork hooks can rebuild thread state.
-use std::sync::{Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 
-use crate::collector::MiniMarkGC;
+use crate::collector::{FinalizerQueueTable, MiniMarkGC};
 // The singleton is concrete, but its `GcAllocator` methods still need the
 // trait in scope to resolve.
 use crate::GcAllocator;
@@ -61,6 +61,11 @@ unsafe impl Sync for GcSingleton {}
 
 static GC_STORE: GcSingleton = GcSingleton(UnsafeCell::new(None));
 static GC_INITIALIZED: AtomicBool = AtomicBool::new(false);
+/// Handle to the singleton collector's `finalizer_handlers`, stored when
+/// the singleton is created so `ll_next_dead` / `get_finalizer_queue_index`
+/// never enter `gc_op`.
+static SINGLETON_FINALIZER_QUEUES: AtomicPtr<FinalizerQueueTable> =
+    AtomicPtr::new(std::ptr::null_mut());
 
 /// STW safepoint state.
 pub struct GcSync {
@@ -124,8 +129,25 @@ pub fn store_singleton(gc: Box<MiniMarkGC>) {
         *GC_STORE.0.get() = Some(gc);
         let installed = (*GC_STORE.0.get()).as_ref().unwrap();
         crate::publish_singleton_nursery(&**installed);
+        SINGLETON_FINALIZER_QUEUES.store(
+            Arc::as_ptr(&installed.finalizer_queues) as *mut FinalizerQueueTable,
+            Ordering::Release,
+        );
     }
     GC_INITIALIZED.store(true, Ordering::Release);
+}
+
+/// The singleton collector's `finalizer_handlers`. Does not borrow the
+/// collector.
+pub(crate) fn singleton_finalizer_queues() -> Option<&'static FinalizerQueueTable> {
+    let p = SINGLETON_FINALIZER_QUEUES.load(Ordering::Acquire);
+    if p.is_null() {
+        None
+    } else {
+        // SAFETY: published from `store_singleton`; the MiniMark in `GC_STORE`
+        // owns the `Arc` for the process lifetime.
+        Some(unsafe { &*p })
+    }
 }
 
 /// Check if the GC singleton has been initialized.

@@ -73,7 +73,8 @@ pub(crate) fn lookup_call_assembler_callee_locs(
 /// dependency, so the box is eliminated by the optimizer rather than by
 /// conditional compilation.
 mod gc_box {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::Arc;
 
     thread_local! {
         /// llmodel.py self.gc_ll_descr — owned by the active dynasm
@@ -84,8 +85,17 @@ mod gc_box {
             const { RefCell::new(None) };
         /// Read-only mirror of the box address, for the queries that can fire
         /// while an in-progress allocation already holds the mutable borrow.
-        static DYNASM_ACTIVE_GC_RAW: std::cell::Cell<Option<*mut dyn majit_gc::GcAllocator>> =
-            const { std::cell::Cell::new(None) };
+        static DYNASM_ACTIVE_GC_RAW: Cell<Option<*mut dyn majit_gc::GcAllocator>> =
+            const { Cell::new(None) };
+        /// Clone of the boxed MiniMark's `finalizer_queues`, stored next to
+        /// (not inside the borrow of) `DYNASM_ACTIVE_GC` so
+        /// `get_finalizer_queue_index` / `ll_next_dead` need no `RefCell`
+        /// borrow. Follows this thread's boxed collector the same way
+        /// `DYNASM_ACTIVE_GC` does.
+        static DYNASM_ACTIVE_FINALIZER_QUEUES: RefCell<Option<Arc<majit_gc::FinalizerQueueTable>>> =
+            const { RefCell::new(None) };
+        static DYNASM_ACTIVE_FINALIZER_QUEUES_PTR: Cell<*const majit_gc::FinalizerQueueTable> =
+            const { Cell::new(std::ptr::null()) };
     }
 
     /// Apply `f` to this thread's GC box. `None` means there is no box, and
@@ -166,6 +176,11 @@ mod gc_box {
 
     /// Store `gc` as this thread's box, publishing the raw mirror with it.
     pub(super) fn store(gc: Box<dyn majit_gc::GcAllocator>) {
+        let table = gc.finalizer_queue_table();
+        let ptr = table
+            .as_ref()
+            .map(|a| Arc::as_ptr(a))
+            .unwrap_or(std::ptr::null());
         DYNASM_ACTIVE_GC.with(|cell| {
             let mut guard = cell.borrow_mut();
             *guard = Some(gc);
@@ -174,6 +189,10 @@ mod gc_box {
                 .map(|g| g as *mut dyn majit_gc::GcAllocator);
             DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(raw));
         });
+        DYNASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = table;
+        });
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(ptr));
     }
 
     /// Drop this thread's box and clear the raw mirror.
@@ -185,6 +204,16 @@ mod gc_box {
             *cell.borrow_mut() = None;
         });
         DYNASM_ACTIVE_GC_RAW.with(|raw_cell| raw_cell.set(None));
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.set(std::ptr::null()));
+        DYNASM_ACTIVE_FINALIZER_QUEUES.with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+    }
+
+    /// Pointer to this thread's boxed collector table, or null when there is
+    /// no box. Does not borrow `DYNASM_ACTIVE_GC`.
+    pub(super) fn finalizer_queues_ptr() -> *const majit_gc::FinalizerQueueTable {
+        DYNASM_ACTIVE_FINALIZER_QUEUES_PTR.with(|cell| cell.get())
     }
 }
 
@@ -422,6 +451,15 @@ fn jitframe_is_gc_managed() -> bool {
 /// requiring a `DynasmBackend` instance.  This allows the GC subsystem
 /// to be installed at boot (via `init_gc_subsystem`) before the JIT
 /// driver is constructed.
+/// `transform.py _ll_malloc_fixedsize` OOM: `jit_exc_raise` of the
+/// prebuilt MemoryError singleton, then the allocator returns NULL.
+fn raise_memory_error() {
+    let v = majit_backend::memory_error_singleton_ref();
+    if v != 0 {
+        crate::jit_exc_raise(v);
+    }
+}
+
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
 /// dynasm trampolines. Shared by `install_gc_box` (thread-confined heap: also
 /// stores a box in TLS) and `install_gc_standalone` (shared heap: hooks only,
@@ -450,6 +488,7 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     });
     majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
     majit_gc::set_active_thread_has_gc_box(Some(gc_box::present));
+    majit_gc::set_active_raise_memory_error(Some(raise_memory_error));
     majit_gc::set_active_alloc_nursery_headerless_no_collect(Some(
         dynasm_alloc_nursery_headerless_no_collect,
     ));
@@ -523,10 +562,12 @@ fn register_active_hooks(supports_guard_gc_type: bool, has_gcrootmap: bool) {
     majit_gc::set_active_write_barrier_from_array(Some(dynasm_gc_write_barrier_from_array));
     majit_gc::set_active_writebarrier_before_copy(Some(dynasm_gc_writebarrier_before_copy));
     majit_gc::set_active_write_barrier_managed(Some(dynasm_gc_write_barrier_managed));
-    majit_gc::set_active_finalizer_hooks(
-        Some(dynasm_register_finalizer),
-        Some(dynasm_finalizer_next_dead),
-    );
+    majit_gc::set_active_finalizer_hooks(Some(dynasm_register_finalizer));
+    majit_gc::set_active_finalizer_queue_table(Some(dynasm_finalizer_queues));
+}
+
+fn dynasm_finalizer_queues() -> *const majit_gc::FinalizerQueueTable {
+    gc_box::finalizer_queues_ptr()
 }
 
 /// Install a GC allocator box into TLS and register all `set_active_*`
@@ -1169,12 +1210,8 @@ fn dynasm_collect_oldgen_nonmoving() {
     majit_gc::gc_sync::gc_op(|g| g.collect_oldgen_nonmoving());
 }
 
-fn dynasm_register_finalizer(fq_index: usize, obj: GcRef, trigger: majit_gc::FinalizerTriggerFn) {
-    with_dynasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj, trigger));
-}
-
-fn dynasm_finalizer_next_dead(fq_index: usize) -> Option<GcRef> {
-    with_dynasm_active_gc_mut(|gc| gc.finalizer_next_dead(fq_index)).flatten()
+fn dynasm_register_finalizer(fq_index: usize, obj: GcRef) {
+    with_dynasm_active_gc_mut(|gc| gc.register_finalizer(fq_index, obj));
 }
 
 /// Report `(oldgen_total, nursery_used)` for the interpreter GC safepoint.
@@ -5178,6 +5215,47 @@ mod tests {
         assert!(majit_gc::check_is_object(obj));
         assert_eq!(majit_gc::get_actual_typeid(obj), Some(obj_tid));
         assert_eq!(majit_gc::typeid_is_object(obj_tid), Some(true));
+    }
+
+    /// `_StrFinalizerQueue.finalizer_trigger` drains via `ll_next_dead` from
+    /// inside `execute_finalizers`. Index lookup and `next_dead` operate on
+    /// the boxed collector's table (`framework.py get_finalizer_queue_index`)
+    /// and do not re-enter the boxed collector.
+    #[test]
+    fn boxed_collector_next_dead_from_trigger_does_not_panic() {
+        use std::sync::atomic::AtomicUsize;
+
+        static FQ: u8 = 0;
+        static POPPED: AtomicUsize = AtomicUsize::new(0);
+
+        fn trigger() {
+            let tag = majit_gc::FinalizerQueueTag {
+                fq: std::ptr::addr_of!(FQ) as usize,
+                trigger,
+            };
+            let index = majit_gc::gc_get_finalizer_queue_index(tag);
+            if majit_gc::gc_fq_next_dead(index).is_some() {
+                POPPED.store(1, Ordering::Relaxed);
+            }
+        }
+
+        POPPED.store(0, Ordering::Relaxed);
+        let mut gc = MiniMarkGC::new();
+        register_jitframe_type(&mut gc);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let obj = gc.alloc_oldgen_typed(tid, 16);
+        let mut backend = DynasmBackend::new();
+        backend.set_gc_allocator(Box::new(gc));
+
+        let tag = majit_gc::FinalizerQueueTag {
+            fq: std::ptr::addr_of!(FQ) as usize,
+            trigger,
+        };
+        let fq_index = majit_gc::gc_get_finalizer_queue_index(tag);
+        majit_gc::gc_register_finalizer(fq_index, obj);
+        majit_gc::collect_oldgen_nonmoving();
+        assert_eq!(POPPED.load(Ordering::Relaxed), 1);
+        assert!(majit_gc::gc_fq_next_dead(fq_index).is_none());
     }
 
     #[test]

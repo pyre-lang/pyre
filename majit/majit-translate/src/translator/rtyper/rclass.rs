@@ -39,6 +39,7 @@
     private_interfaces
 )]
 
+use indexmap::IndexMap;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -2624,12 +2625,12 @@ impl InstanceRepr {
         }
         // `cflags = inputconst(lltype.Void, flags)`
         // `llops.genop('jit_force_virtualizable', [vinst, cname, cflags])`
-        let mut items = HashMap::new();
+        let mut items = IndexMap::new();
         for (key, value) in flags {
             items.insert(ConstValue::byte_str(key), value.clone());
         }
         let cflags = Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::Dict(items),
+            ConstValue::Dict(std::sync::Arc::new(items)),
             LowLevelType::Void,
         ));
         llops.genop(

@@ -1922,6 +1922,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     #[cfg(unix)]
                     {
                         majit_rlib::rposix_environ::putenv_llimpl(&name, &value)
+                            .map_err(|e| {
+                                crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                )
+                            })?
                             .map_err(|errno| errno_err(errno, ""))?;
                     }
                     #[cfg(not(unix))]
@@ -1965,7 +1971,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         // `rposix.unsetenv` (absent key) and wraps OSError
                         // with `eintr_retry=False`. `unsetenv_llimpl` does
                         // not raise KeyError.
-                        if let Err(errno) = majit_rlib::rposix_environ::unsetenv_llimpl(&name) {
+                        if let Err(errno) = majit_rlib::rposix_environ::unsetenv_llimpl(&name)
+                            .map_err(|e| {
+                                crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                )
+                            })?
+                        {
                             return Err(errno_err(errno, ""));
                         }
                     }

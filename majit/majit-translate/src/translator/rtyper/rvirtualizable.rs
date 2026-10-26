@@ -157,7 +157,7 @@ mod tests {
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
 
     fn force_op(vable: &Variable, access_directly: bool) -> SpaceOperation {
-        let mut flags = HashMap::new();
+        let mut flags = indexmap::IndexMap::new();
         if access_directly {
             flags.insert(
                 ConstValue::byte_str("access_directly"),
@@ -166,7 +166,10 @@ mod tests {
         }
         let c_name =
             Constant::with_concretetype(ConstValue::byte_str("inst_x"), LowLevelType::Void);
-        let c_flags = Constant::with_concretetype(ConstValue::Dict(flags), LowLevelType::Void);
+        let c_flags = Constant::with_concretetype(
+            ConstValue::Dict(std::sync::Arc::new(flags)),
+            LowLevelType::Void,
+        );
         SpaceOperation::new(
             "jit_force_virtualizable",
             vec![

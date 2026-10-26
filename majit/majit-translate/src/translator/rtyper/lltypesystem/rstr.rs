@@ -44,6 +44,7 @@
 
 use std::sync::LazyLock;
 
+#[cfg(test)]
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, GraphKey,
@@ -251,9 +252,8 @@ pub fn conststr(s: &str) -> Result<_ptr, String> {
 /// hash survive into the serialized jitcode.
 ///
 /// Returns `None` for null, a non-struct target, a missing/empty-typed
-/// `chars` field, or a non-`Char` element (a `Ptr(UNICODE)` container,
-/// whose `chars` are `UniChar`, is out of scope here — Unicode prebuilt
-/// constants are a separate lowering).
+/// `chars` field, or a non-`Char` element (a `Ptr(UNICODE)` container
+/// is [`prebuilt_unicode_bytes_and_hash`]).
 pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     if !p.nonzero() {
         return None;
@@ -261,6 +261,11 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
         return None;
     };
+    // Empty `chars` has no Char/UniChar items to inspect; the
+    // `GcStruct` name is `rpy_string` vs `rpy_unicode` (rstr.py).
+    if st.TYPE._name != "rpy_string" {
+        return None;
+    }
     let fields = st._fields.lock();
     // `chars` mirrors the read side of `llstr`'s per-index fill.
     let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
@@ -277,6 +282,43 @@ pub(crate) fn prebuilt_str_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
     }
     // `const_str_cache_llstr` precomputes and stores `hash` (rstr.py:199);
     // a bare `llstr` leaves the malloc-zeroed `0` (lazy not-computed).
+    let hash = match fields.iter().find(|(n, _)| n == "hash") {
+        Some((_, LowLevelValue::Signed(h))) => *h,
+        _ => ll_strhash_value(&bytes),
+    };
+    Some((bytes, hash))
+}
+
+/// Inverse of [`alloc_array_unicode`]: read back the UTF-8 payload and
+/// `hash`-slot value of a prebuilt `Ptr(UNICODE)` container.  Mirror of
+/// [`prebuilt_str_bytes_and_hash`] with `chars` as `UniChar` instead of
+/// `Char`; the codewriter routes the pair through `emit_str_const_r`
+/// with `as_unicode_object`.
+///
+/// Returns `None` for null, a non-struct target, a missing/empty-typed
+/// `chars` field, or a non-`UniChar` element (a `Ptr(STR)` container).
+pub(crate) fn prebuilt_unicode_bytes_and_hash(p: &_ptr) -> Option<(Vec<u8>, i64)> {
+    if !p.nonzero() {
+        return None;
+    }
+    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
+        return None;
+    };
+    if st.TYPE._name != "rpy_unicode" {
+        return None;
+    }
+    let fields = st._fields.lock();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return None;
+    };
+    let mut text = String::new();
+    for i in 0..chars.getlength() {
+        match chars.getitem(i) {
+            Some(LowLevelValue::UniChar(c)) => text.push(c),
+            _ => return None,
+        }
+    }
+    let bytes = text.into_bytes();
     let hash = match fields.iter().find(|(n, _)| n == "hash") {
         Some((_, LowLevelValue::Signed(h))) => *h,
         _ => ll_strhash_value(&bytes),
@@ -2302,23 +2344,11 @@ fn string2list_dst_items(
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks
 /// `jit.isvirtual`. Spine B splits that name on `::` so
 /// `rewrite_op_direct_call` emits `ref_isvirtual`.
-fn isvirtual_intrinsic_funcptr(ptr_lltype: LowLevelType) -> Constant {
-    let ft = FuncType {
-        args: vec![ptr_lltype],
-        result: LowLevelType::Bool,
-    };
-    let ptr = functionptr(
-        ft.clone(),
-        "majit_rlib::jit::isvirtual",
-        None,
-        Some("majit_rlib::jit::isvirtual".to_string()),
-    );
-    Constant::with_concretetype(
-        ConstValue::LLPtr(Box::new(ptr)),
-        LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Func(ft),
-        })),
-    )
+fn isvirtual_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+    ptr_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    jit_isvirtual_intrinsic_funcptr(rtyper, ptr_lltype)
 }
 
 /// Synthesise `LLHelpers.ll_join_chars` (`lltypesystem/rstr.py`):
@@ -2622,6 +2652,7 @@ pub(crate) fn build_ll_join_chars_trampoline_helper_graph(
 /// argument is the chars array pointer (`LIST.ll_items`), matching
 /// `LLHelpers.ll_join_chars`.
 pub(crate) fn build_ll_join_chars_isvirtual_helper_graph(
+    rtyper: &RPythonTyper,
     name: &str,
     items_ptr_lltype: LowLevelType,
 ) -> Result<PyGraph, TyperError> {
@@ -2637,7 +2668,7 @@ pub(crate) fn build_ll_join_chars_isvirtual_helper_graph(
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         "direct_call",
         vec![
-            Hlvalue::Constant(isvirtual_intrinsic_funcptr(items_ptr_lltype)),
+            Hlvalue::Constant(isvirtual_intrinsic_funcptr(rtyper, items_ptr_lltype)?),
             Hlvalue::Variable(value),
         ],
         Hlvalue::Variable(result.clone()),
@@ -9286,7 +9317,9 @@ pub(crate) fn funcobj_from_funcptr_constant(hlv: &Hlvalue) -> Option<_func> {
     }
 }
 
-/// Every `direct_call` callee funcobj in `graph`.
+/// Every `direct_call` / `jit_conditional_call` callee funcobj in `graph`.
+/// `direct_call` stores the funcptr in args[0]; `jit_conditional_call`
+/// stores it in args[1] (`rlist.py _ll_list_resize_ge`).
 pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
     graph
         .iterblocks()
@@ -9296,23 +9329,116 @@ pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
                 .borrow()
                 .operations
                 .iter()
-                .filter(|op| op.opname == "direct_call")
-                .filter_map(|op| op.args.first().and_then(funcobj_from_funcptr_constant))
+                .filter_map(|op| {
+                    let funcptr = match op.opname.as_str() {
+                        "direct_call" => op.args.first(),
+                        "jit_conditional_call" => op.args.get(1),
+                        _ => None,
+                    };
+                    funcptr.and_then(funcobj_from_funcptr_constant)
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
 }
 
+/// `rlib/jit.py isconstant` / `isvirtual`: `return NonConstant(False)`.
+fn build_jit_intrinsic_false_body_graph(name: &str, arg_lltype: LowLevelType) -> GraphRef {
+    let value = variable_with_lltype("value", arg_lltype);
+    let startblock = Block::shared(vec![Hlvalue::Variable(value)]);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    startblock.closeblock(vec![
+        Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    func.annspecialcase = Some("specialize:call_location".to_string());
+    graph.func = Some(func);
+    graph.into_ref()
+}
+
+/// `rlib/jit.py isconstant` / `isvirtual` body graph: ordinary
+/// annotated graph on `translator.graphs` (`TranslationContext.graphs`,
+/// `FunctionDesc.cachedgraph`). One graph per `specialize:call_location`
+/// site.
+fn jit_intrinsic_false_funcptr(
+    rtyper: &RPythonTyper,
+    name: &str,
+    arg_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    let graph = build_jit_intrinsic_false_body_graph(name, arg_lltype.clone());
+    let graph_id = GraphKey::of(&graph).as_usize();
+    let annotator = rtyper
+        .annotator
+        .upgrade()
+        .ok_or_else(|| TyperError::message("RPythonTyper.annotator weak reference dropped"))?;
+    {
+        let mut graphs = annotator.translator.graphs.borrow_mut();
+        if !graphs
+            .iter()
+            .any(|existing| GraphKey::of(existing).as_usize() == graph_id)
+        {
+            graphs.push(graph);
+        }
+    }
+    let ft = FuncType {
+        args: vec![arg_lltype],
+        result: LowLevelType::Bool,
+    };
+    let ptr = functionptr(ft.clone(), name, Some(graph_id), Some(name.to_string()));
+    Ok(Constant::with_concretetype(
+        ConstValue::LLPtr(Box::new(ptr)),
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Func(ft),
+        })),
+    ))
+}
+
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isconstant`. The body graph is `return False`
+/// (`rlib/jit.py isconstant`).
+pub(crate) fn jit_isconstant_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+) -> Result<Constant, TyperError> {
+    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isconstant", LowLevelType::Signed)
+}
+
+/// Function pointer whose `_name` is the CallPath `lib.rs` marks
+/// `jit.isvirtual`. The body graph is `return False`
+/// (`rlib/jit.py isvirtual`).
+pub(crate) fn jit_isvirtual_intrinsic_funcptr(
+    rtyper: &RPythonTyper,
+    ptr_lltype: LowLevelType,
+) -> Result<Constant, TyperError> {
+    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isvirtual", ptr_lltype)
+}
+
 /// `record_extra_call_by_graph_id`: the live graph `funcobj.graph` names
 /// lives on `translator.graphs`.
 pub(crate) fn graph_ref_for_funcptr_id(rtyper: &RPythonTyper, graph_id: usize) -> Option<GraphRef> {
-    let ann = rtyper.annotator.upgrade()?;
-    ann.translator
-        .graphs
-        .borrow()
-        .iter()
-        .find(|graph| GraphKey::of(graph).as_usize() == graph_id)
-        .cloned()
+    rtyper.annotator.upgrade().and_then(|ann| {
+        ann.translator
+            .graphs
+            .borrow()
+            .iter()
+            .find(|graph| GraphKey::of(graph).as_usize() == graph_id)
+            .cloned()
+    })
 }
 
 fn require_str_ptr(ptr_lltype: &LowLevelType, helper: &str) -> Result<(), TyperError> {
@@ -9396,6 +9522,11 @@ fn emit_record_exact_value_and_return(
 /// (`HighLevelOp.gendirectcall`), so `funcobj.graph` is set. Callers
 /// that keep `rtyper` alive (`build_ll_find_helper_graph_on`) can look
 /// those graphs up on `translator.graphs`.
+///
+/// Test-only: a throwaway annotator/rtyper. Production must call
+/// [`build_ll_find_helper_graph_on`] so callees stay on the caller's
+/// translator (`RPythonTyper.annotate_helper`).
+#[cfg(test)]
 pub(crate) fn build_ll_find_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -9835,6 +9966,11 @@ pub(crate) fn build_ll_find_helper_graph_on(
 /// `hlstr` / `hlunicode` are identity on the low-level pointer. `_search`
 /// dispatches on `isinstance(value, str)` at translation time: STR is
 /// `direct_call _search_elidable`; UNICODE is `direct_call _search_normal`.
+///
+/// Test-only: a throwaway annotator/rtyper. Production must call
+/// [`build_ll_search_helper_graph_on`] so the `_search_*` callee stays
+/// on the caller's translator (`RPythonTyper.annotate_helper`).
+#[cfg(test)]
 pub(crate) fn build_ll_search_helper_graph(
     name: &str,
     ptr_lltype: LowLevelType,
@@ -9842,6 +9978,60 @@ pub(crate) fn build_ll_search_helper_graph(
     let ann = RPythonAnnotator::new(None, None, None, false);
     let rtyper = RPythonTyper::new(&ann);
     build_ll_search_helper_graph_on(&rtyper, name, ptr_lltype)
+}
+
+/// `assert p is not None` on a `Ptr(STR)` / `Ptr(UNICODE)`:
+/// `ptr_nonzero` then the False arm raises AssertionError
+/// (`LLHelpers.ll_search`; flowspace `assert` lowering).
+pub(crate) fn close_assert_ptr_not_none(
+    block: &BlockRef,
+    ptr: &Variable,
+    continue_args: Vec<Hlvalue>,
+    continue_block: BlockRef,
+    exceptblock: BlockRef,
+    exc_args: Vec<Hlvalue>,
+) {
+    let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+    let bool_false = || constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+    let nz = variable_with_lltype("nz", LowLevelType::Bool);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_nonzero",
+        vec![Hlvalue::Variable(ptr.clone())],
+        Hlvalue::Variable(nz.clone()),
+    ));
+    block.borrow_mut().exitswitch = Some(Hlvalue::Variable(nz));
+    block.closeblock(vec![
+        Link::new(continue_args, Some(continue_block), Some(bool_true())).into_ref(),
+        Link::new(exc_args, Some(exceptblock), Some(bool_false())).into_ref(),
+    ]);
+}
+
+fn search_arg_vars(
+    ptr_lltype: &LowLevelType,
+) -> (Variable, Variable, Variable, Variable, Variable) {
+    (
+        variable_with_lltype("s1", ptr_lltype.clone()),
+        variable_with_lltype("s2", ptr_lltype.clone()),
+        variable_with_lltype("start", LowLevelType::Signed),
+        variable_with_lltype("end", LowLevelType::Signed),
+        variable_with_lltype("mode", LowLevelType::Signed),
+    )
+}
+
+fn search_carry(
+    s1: &Variable,
+    s2: &Variable,
+    start: &Variable,
+    end: &Variable,
+    mode: &Variable,
+) -> Vec<Hlvalue> {
+    vec![
+        Hlvalue::Variable(s1.clone()),
+        Hlvalue::Variable(s2.clone()),
+        Hlvalue::Variable(start.clone()),
+        Hlvalue::Variable(end.clone()),
+        Hlvalue::Variable(mode.clone()),
+    ]
 }
 
 /// [`build_ll_search_helper_graph`] against a live rtyper so the
@@ -9854,18 +10044,8 @@ pub(crate) fn build_ll_search_helper_graph_on(
     require_str_ptr(&ptr_lltype, "ll_search")?;
     let kind = crate::rlib::rstring::StringKind::from_ptr(ptr_lltype.clone())?;
 
-    let s1 = variable_with_lltype("s1", ptr_lltype.clone());
-    let s2 = variable_with_lltype("s2", ptr_lltype.clone());
-    let start_arg = variable_with_lltype("start", LowLevelType::Signed);
-    let end_arg = variable_with_lltype("end", LowLevelType::Signed);
-    let mode_arg = variable_with_lltype("mode", LowLevelType::Signed);
-    let startblock = Block::shared(vec![
-        Hlvalue::Variable(s1.clone()),
-        Hlvalue::Variable(s2.clone()),
-        Hlvalue::Variable(start_arg.clone()),
-        Hlvalue::Variable(end_arg.clone()),
-        Hlvalue::Variable(mode_arg.clone()),
-    ]);
+    let (s1, s2, start_arg, end_arg, mode_arg) = search_arg_vars(&ptr_lltype);
+    let startblock = Block::shared(search_carry(&s1, &s2, &start_arg, &end_arg, &mode_arg));
     let return_var = variable_with_lltype("result", LowLevelType::Signed);
     let mut graph = FunctionGraph::with_return_var(
         name.to_string(),
@@ -9873,27 +10053,48 @@ pub(crate) fn build_ll_search_helper_graph_on(
         Hlvalue::Variable(return_var),
     );
 
+    let (s1_other, s2_other, start_other, end_other, mode_other) = search_arg_vars(&ptr_lltype);
+    let block_check_other = Block::shared(search_carry(
+        &s1_other,
+        &s2_other,
+        &start_other,
+        &end_other,
+        &mode_other,
+    ));
+    let (s1_call, s2_call, start_call, end_call, mode_call) = search_arg_vars(&ptr_lltype);
+    let block_search = Block::shared(search_carry(
+        &s1_call,
+        &s2_call,
+        &start_call,
+        &end_call,
+        &mode_call,
+    ));
+
+    let search_args = vec![
+        ptr_lltype.clone(),
+        ptr_lltype.clone(),
+        LowLevelType::Signed,
+        LowLevelType::Signed,
+        LowLevelType::Signed,
+    ];
     let (callee_name, callee_ptr) = if kind.is_unicode() {
         (
             "_search_normal",
             cached_helper_funcptr(
                 rtyper,
                 "_search_normal",
-                vec![
-                    ptr_lltype.clone(),
-                    ptr_lltype.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
+                search_args.clone(),
                 LowLevelType::Signed,
                 {
                     let ptr = ptr_lltype;
+                    // `LLHelpers.ll_search` already asserted; knowntypedata
+                    // has `can_be_None=False` (`transform_dead_code`).
                     move |rtyper| {
                         crate::rlib::rstring::build_search_normal_helper_graph(
                             rtyper,
                             "_search_normal",
                             ptr,
+                            false,
                         )
                     }
                 },
@@ -9905,21 +10106,18 @@ pub(crate) fn build_ll_search_helper_graph_on(
             cached_helper_funcptr(
                 rtyper,
                 "_search_elidable",
-                vec![
-                    ptr_lltype.clone(),
-                    ptr_lltype.clone(),
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                    LowLevelType::Signed,
-                ],
+                search_args,
                 LowLevelType::Signed,
                 {
                     let ptr = ptr_lltype;
+                    // `LLHelpers.ll_search` already asserted; knowntypedata
+                    // has `can_be_None=False` (`transform_dead_code`).
                     move |rtyper| {
                         crate::rlib::rstring::build_search_elidable_helper_graph(
                             rtyper,
                             "_search_elidable",
                             ptr,
+                            false,
                         )
                     }
                 },
@@ -9927,20 +10125,44 @@ pub(crate) fn build_ll_search_helper_graph_on(
         )
     };
     let _ = callee_name;
+
+    // `LLHelpers.ll_search`: after `hlstr` / `hlunicode`,
+    // `assert value is not None` / `assert other is not None`.
+    let exc_args = exception_args("AssertionError")?;
+    close_assert_ptr_not_none(
+        &startblock,
+        &s1,
+        search_carry(&s1, &s2, &start_arg, &end_arg, &mode_arg),
+        block_check_other.clone(),
+        graph.exceptblock.clone(),
+        exc_args.clone(),
+    );
+    close_assert_ptr_not_none(
+        &block_check_other,
+        &s2_other,
+        search_carry(&s1_other, &s2_other, &start_other, &end_other, &mode_other),
+        block_search.clone(),
+        graph.exceptblock.clone(),
+        exc_args,
+    );
+
     let res = variable_with_lltype("res", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "direct_call",
-        vec![
-            callee_ptr,
-            Hlvalue::Variable(s1),
-            Hlvalue::Variable(s2),
-            Hlvalue::Variable(start_arg),
-            Hlvalue::Variable(end_arg),
-            Hlvalue::Variable(mode_arg),
-        ],
-        Hlvalue::Variable(res.clone()),
-    ));
-    startblock.closeblock(vec![
+    block_search
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                callee_ptr,
+                Hlvalue::Variable(s1_call),
+                Hlvalue::Variable(s2_call),
+                Hlvalue::Variable(start_call),
+                Hlvalue::Variable(end_call),
+                Hlvalue::Variable(mode_call),
+            ],
+            Hlvalue::Variable(res.clone()),
+        ));
+    block_search.closeblock(vec![
         Link::new(
             vec![Hlvalue::Variable(res)],
             Some(graph.returnblock.clone()),
@@ -12687,6 +12909,30 @@ mod tests {
         );
         // A typed null `Ptr(STR)` is not a prebuilt string.
         assert_eq!(prebuilt_str_bytes_and_hash(&null_str_ptr()), None);
+    }
+
+    /// [`prebuilt_unicode_bytes_and_hash`] is the inverse of
+    /// [`alloc_array_unicode`]: UTF-8 bytes round-trip and the stored
+    /// `hash` slot is read back.
+    #[test]
+    fn prebuilt_unicode_bytes_and_hash_round_trips_alloc_array_unicode() {
+        let p = alloc_array_unicode("αβγ").expect("alloc_array_unicode");
+        let (got_bytes, got_hash) =
+            prebuilt_unicode_bytes_and_hash(&p).expect("prebuilt UNICODE must decode");
+        assert_eq!(got_bytes, "αβγ".as_bytes());
+        assert_eq!(got_hash, 0, "alloc_array_unicode leaves hash at 0");
+        let empty = alloc_array_unicode("").expect("empty unicode");
+        assert_eq!(
+            prebuilt_unicode_bytes_and_hash(&empty),
+            Some((Vec::new(), 0))
+        );
+        assert_eq!(prebuilt_str_bytes_and_hash(&empty), None);
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&null_str_ptr()), None);
+        let str_p = const_str_cache_llstr(b"hello").expect("cache llstr");
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&str_p), None);
+        let empty_str = const_str_cache_llstr(b"").expect("cache llstr empty");
+        assert_eq!(prebuilt_unicode_bytes_and_hash(&empty_str), None);
+        assert_eq!(prebuilt_str_bytes_and_hash(&p), None);
     }
 
     /// `nullptr(self.lowleveltype.TO)` arm of
@@ -15780,36 +16026,160 @@ mod tests {
         );
     }
 
+    fn search_call_block(graph: &FunctionGraph) -> crate::flowspace::model::BlockRef {
+        let check_other = pick_bool_exit(&graph.startblock, true);
+        pick_bool_exit(&check_other, true)
+    }
+
+    fn host_qualname(hlv: &Hlvalue) -> Option<&str> {
+        match hlv {
+            Hlvalue::Constant(Constant {
+                value: ConstValue::HostObject(obj),
+                ..
+            }) => Some(obj.qualname()),
+            _ => None,
+        }
+    }
+
     /// `LLHelpers.ll_search` (`rstr.py`) STR arm: `hlstr` is identity,
-    /// `_search` picks `_search_elidable` at translation time.
+    /// `_search` picks `_search_elidable` at translation time. The
+    /// `direct_call` sits after the two `assert … is not None` branches.
     #[test]
     fn build_ll_search_calls_search_elidable_for_str() {
         let helper = build_ll_search_helper_graph("ll_search", STRPTR.clone())
             .expect("build_ll_search_helper_graph for STR");
         let inner = helper.graph.borrow();
-        assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
-        let startblock = inner.startblock.borrow();
-        let func = funcobj_from_funcptr_constant(&startblock.operations[0].args[0])
+        let call = search_call_block(&inner);
+        assert_eq!(opnames(&call), vec!["direct_call"]);
+        let call_borrow = call.borrow();
+        let func = funcobj_from_funcptr_constant(&call_borrow.operations[0].args[0])
             .expect("_search_elidable funcptr");
         assert_eq!(func._name, "_search_elidable");
         assert!(
             func.graph.is_some(),
             "HighLevelOp.gendirectcall funcptr carries graph"
         );
-        drop(startblock);
+        drop(call_borrow);
         drop(inner);
         let helper = build_ll_search_helper_graph("ll_unicode_search", UNICODEPTR.clone())
             .expect("build_ll_search_helper_graph for UNICODE");
         let inner = helper.graph.borrow();
-        assert_eq!(opnames(&inner.startblock), vec!["direct_call"]);
-        let startblock = inner.startblock.borrow();
-        let func = funcobj_from_funcptr_constant(&startblock.operations[0].args[0])
+        let call = search_call_block(&inner);
+        assert_eq!(opnames(&call), vec!["direct_call"]);
+        let call_borrow = call.borrow();
+        let func = funcobj_from_funcptr_constant(&call_borrow.operations[0].args[0])
             .expect("_search_normal funcptr");
         assert_eq!(func._name, "_search_normal");
         assert!(
             func.graph.is_some(),
             "HighLevelOp.gendirectcall funcptr carries graph"
         );
+    }
+
+    /// `LLHelpers.ll_search`: `assert value is not None` /
+    /// `assert other is not None` lower as two `ptr_nonzero` branches
+    /// whose False arms raise AssertionError.
+    #[test]
+    fn build_ll_search_asserts_converted_strings_not_none() {
+        let helper = build_ll_search_helper_graph("ll_search", STRPTR.clone())
+            .expect("build_ll_search_helper_graph for STR");
+        let inner = helper.graph.borrow();
+        let check_value = inner.startblock.clone();
+        let check_other = pick_bool_exit(&check_value, true);
+        assert_eq!(opnames(&check_value), vec!["ptr_nonzero"]);
+        assert_eq!(opnames(&check_other), vec!["ptr_nonzero"]);
+        let mut assertionerror_exits = 0;
+        for block in [&check_value, &check_other] {
+            let borrowed = block.borrow();
+            let false_link = borrowed
+                .exits
+                .iter()
+                .find(|link| {
+                    matches!(
+                        link.borrow().exitcase,
+                        Some(Hlvalue::Constant(ref c)) if c.value == ConstValue::Bool(false)
+                    )
+                })
+                .expect("null arm of assert");
+            let link = false_link.borrow();
+            let target = link.target.as_ref().expect("exceptblock target");
+            assert!(
+                std::rc::Rc::ptr_eq(target, &inner.exceptblock),
+                "null arm raises via exceptblock"
+            );
+            let class = link
+                .args
+                .first()
+                .and_then(|arg| arg.as_ref())
+                .expect("exception class");
+            assert_eq!(host_qualname(class), Some("AssertionError"));
+            assertionerror_exits += 1;
+        }
+        assert_eq!(assertionerror_exits, 2);
+    }
+
+    /// `lowlevel_helper_function_with_builder` on one rtyper leaves
+    /// every `ll_find` family callee (`ll_search`, `ll_find_char`,
+    /// `_search_elidable`, `_search_normal`) on that same rtyper's
+    /// translator (`RPythonTyper.annotate_helper`).
+    #[test]
+    fn ll_find_family_callees_live_on_same_rtyper_translator() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_find".to_string(),
+                vec![
+                    STRPTR.clone(),
+                    STRPTR.clone(),
+                    LowLevelType::Signed,
+                    LowLevelType::Signed,
+                ],
+                LowLevelType::Signed,
+                |rtyper, _args, _result| {
+                    build_ll_find_helper_graph_on(rtyper, "ll_find", STRPTR.clone())
+                },
+            )
+            .expect("ll_find helper");
+        let py = helper.graph.expect("builder registered the outer graph");
+        let mut seen = std::collections::HashSet::new();
+        let mut names = Vec::new();
+        fn walk(
+            rtyper: &RPythonTyper,
+            graph: &FunctionGraph,
+            seen: &mut std::collections::HashSet<usize>,
+            names: &mut Vec<String>,
+        ) {
+            for func in direct_call_funcobjs(graph) {
+                // `call.py guess_call_kind`: a funcobj without a graph is
+                // residual (oopspec builtin included); follow regular calls.
+                let Some(graph_id) = func.graph else {
+                    continue;
+                };
+                names.push(func._name.clone());
+                let callee = graph_ref_for_funcptr_id(rtyper, graph_id).unwrap_or_else(|| {
+                    panic!(
+                        "{} graph id {graph_id} missing from translator.graphs",
+                        func._name
+                    )
+                });
+                if seen.insert(graph_id) {
+                    walk(rtyper, &callee.borrow(), seen, names);
+                }
+            }
+        }
+        walk(&rtyper, &py.graph.borrow(), &mut seen, &mut names);
+        for expected in [
+            "ll_search",
+            "ll_find_char",
+            "_search_elidable",
+            "_search_normal",
+        ] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "missing {expected} in {names:?}"
+            );
+        }
     }
 
     /// UNICODE variants substitute `unichar_eq` for the comparison op

@@ -854,6 +854,71 @@ pub struct MemoFamily {
     pub host_err: Rc<RefCell<Option<AnnotatorError>>>,
 }
 
+/// `specialize.py memo` KeyError branch:
+/// `bookkeeper.all_specializations[funcdesc] = UnionFind(compute_one_result)`,
+/// then `find(args)`.
+///
+/// `funcdesc_key` is the same key kind [`memo`] uses
+/// (`funcdesc as *const FunctionDesc as usize`). Does not call
+/// [`MemoTable::register_finish`]: [`memo`] does that so `finish` can
+/// synthesise the pycall dispatch graph. Callers that only need the
+/// host result (rtyper-time `specialize:memo` helpers) read
+/// [`MemoTable::table`].
+pub fn memotable_for_args(
+    bookkeeper: &Bookkeeper,
+    funcdesc_key: usize,
+    funcdesc_name: &str,
+    args: Vec<ConstValue>,
+    compute_one_result: impl Fn(&[ConstValue]) -> Result<ConstValue, String> + 'static,
+) -> Result<Rc<RefCell<MemoTable>>, AnnotatorError> {
+    let memotable = {
+        let mut specs = bookkeeper.all_specializations.borrow_mut();
+        let family = specs.entry(funcdesc_key).or_insert_with(|| {
+            let name = funcdesc_name.to_string();
+            let host_err: Rc<RefCell<Option<AnnotatorError>>> = Rc::new(RefCell::new(None));
+            let factory_err = host_err.clone();
+            let uf = UnionFind::new(
+                move |args: &Vec<ConstValue>| match compute_one_result(args) {
+                    Ok(value) => Rc::new(RefCell::new(MemoTable::new(
+                        name.clone(),
+                        Vec::new(),
+                        Weak::new(),
+                        args.clone(),
+                        value,
+                    ))),
+                    Err(e) => {
+                        if factory_err.borrow().is_none() {
+                            *factory_err.borrow_mut() = Some(AnnotatorError::new(format!(
+                                "memo call: compute_one_result for {name} failed on {args:?}: {e}"
+                            )));
+                        }
+                        let memotable = Rc::new(RefCell::new(MemoTable::new(
+                            name.clone(),
+                            Vec::new(),
+                            Weak::new(),
+                            args.clone(),
+                            ConstValue::None,
+                        )));
+                        memotable.borrow_mut().do_not_process = true;
+                        memotable
+                    }
+                },
+            );
+            MemoFamily { uf, host_err }
+        });
+        let rep = family.uf.find(args).1;
+        if let Some(e) = family.host_err.borrow_mut().take() {
+            return Err(e);
+        }
+        family
+            .uf
+            .get(&rep)
+            .expect("memotable_for_args: representative MemoTable present after find")
+            .clone()
+    };
+    Ok(memotable)
+}
+
 /// RPython `memo(funcdesc, args_s)` (specialize.py).
 ///
 /// Calls the memo function now for every combination of possible
@@ -1295,5 +1360,24 @@ mod tests {
                 sb.exitswitch
             );
         }
+    }
+
+    #[test]
+    fn memotable_for_args_reuses_all_specializations_entry() {
+        let bk = Bookkeeper::new();
+        let key = 0xF4F4_F4F4;
+        let args = vec![ConstValue::Int(1)];
+        let t1 = memotable_for_args(&bk, key, "helper", args.clone(), |_| Ok(ConstValue::Int(7)))
+            .expect("first");
+        let t2 = memotable_for_args(&bk, key, "helper", args, |_| {
+            panic!("compute_one_result must not rerun on a hit")
+        })
+        .expect("reuse");
+        assert!(Rc::ptr_eq(&t1, &t2));
+        assert_eq!(bk.all_specializations.borrow().len(), 1);
+        assert_eq!(
+            t1.borrow().table.get(&vec![ConstValue::Int(1)]),
+            Some(&ConstValue::Int(7))
+        );
     }
 }

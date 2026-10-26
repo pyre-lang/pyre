@@ -49,7 +49,7 @@ const _: () = {
 /// `_utf8` payload — pointer to an [`Utf8Str`] / rstr `STR` allocation.
 pub type UnicodeValueStorage = Utf8Str;
 
-/// Allocate an rstr `STR` from WTF-8 bytes (`W_UnicodeObject._utf8`).
+/// Allocate an rstr `STR` (`rstr.py mallocstr`) and copy `bytes` into `chars`.
 ///
 /// `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
 /// The copy below fills every byte the caller asked for.
@@ -1207,9 +1207,9 @@ pub fn prebuilt_str_storage_bytes(bytes: &[u8]) -> *mut UnicodeValueStorage {
 
 /// Kind of a `box_str_constant` residual operand.
 ///
-/// `OpKind::ConstStr` / `StrConstDescriptor.as_unicode_object == false` is
-/// rstr `Ptr(STR)` (`StringRepr.convert_const`). `OpKind::ConstInternedStr`
-/// / `as_unicode_object == true` is the interned `W_UnicodeObject`
+/// `OpKind::ConstStr` / `StrConstKind::Str` is rstr `Ptr(STR)`
+/// (`StringRepr.convert_const`). `OpKind::ConstInternedStr` /
+/// `StrConstKind::UnicodeObject` is the interned `W_UnicodeObject`
 /// (`box_str_constant` / `WeakValueDictRepr.convert_const`). Kind is a
 /// typed-constant property; it is never recovered by probing the pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1221,7 +1221,7 @@ pub enum BoxStrConstKind {
 }
 
 /// Intern a typed string constant. `kind` is `OpKind::ConstStr` vs
-/// `ConstInternedStr` / `StrConstDescriptor.as_unicode_object`.
+/// `ConstInternedStr` / `StrConstKind::UnicodeObject`.
 ///
 /// STR intern is `interned_strings.get(llkey)` (`WeakValueDictRepr.ll_get`)
 /// with `llkey` the operand itself. A miss leaves intern to

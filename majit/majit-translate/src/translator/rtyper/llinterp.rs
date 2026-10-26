@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::LazyLock;
 
+use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
     BlockRef, ConstValue, Constant, FunctionGraph, GraphRef, Hlvalue, LinkRef, SpaceOperation,
     Variable,
@@ -31,7 +32,11 @@ use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _ptr, LowLevelType, LowLevelValue, MallocFlavor, malloc,
+    _address, _func, _ptr, _ptr_obj, LowLevelType, LowLevelValue, MallocFlavor, PtrTarget, Struct,
+    identityhash, isCompatibleType, malloc, typeOf,
+};
+use crate::translator::rtyper::lltypesystem::rstr::{
+    ll_strhash_value, prebuilt_str_bytes_and_hash,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
@@ -174,6 +179,39 @@ impl LLValue {
         }
     }
 
+    fn as_f64(&self, opname: &str) -> Result<f64, TaskError> {
+        match self {
+            LLValue::Float(bits) => Ok(f64::from_bits(*bits)),
+            other => Err(TaskError {
+                message: format!(
+                    "llinterp.py LLFrame.getval {opname}: expected Float, got {other:?}"
+                ),
+            }),
+        }
+    }
+
+    fn as_ptr(&self, opname: &str) -> Result<&_ptr, TaskError> {
+        match self {
+            LLValue::Ptr(p) => Ok(p.as_ref()),
+            other => Err(TaskError {
+                message: format!(
+                    "llinterp.py LLFrame.getval {opname}: expected Ptr, got {other:?}"
+                ),
+            }),
+        }
+    }
+
+    fn as_address(&self, opname: &str) -> Result<&_address, TaskError> {
+        match self {
+            LLValue::Address(a) => Ok(a),
+            other => Err(TaskError {
+                message: format!(
+                    "llinterp.py LLFrame.getval {opname}: expected Address, got {other:?}"
+                ),
+            }),
+        }
+    }
+
     fn truth(&self) -> bool {
         match self {
             LLValue::Void => false,
@@ -256,6 +294,12 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
             LowLevelValue::Char(c) | LowLevelValue::UniChar(c) => Ok(LLValue::Str(c.to_string())),
             LowLevelValue::Address(a) => Ok(LLValue::Address(a.clone())),
             LowLevelValue::Ptr(p) => Ok(LLValue::Ptr(p.clone())),
+            LowLevelValue::InteriorPtr(ip) => {
+                let p = ip._as_container_ptr(true).map_err(|e| TaskError {
+                    message: format!("llinterp.py LLInterpreter.eval_graph InteriorPtr: {e}"),
+                })?;
+                Ok(LLValue::Ptr(Box::new(p)))
+            }
             other => Err(TaskError {
                 message: format!(
                     "llinterp.py:84 LLInterpreter.eval_graph — unsupported LowLevelValue {other:?}"
@@ -282,6 +326,549 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
         message: "llinterp.py:84 LLInterpreter.eval_graph — unsupported concrete argument type"
             .to_string(),
     })
+}
+
+fn field_name(val: &LLValue, opname: &str) -> Result<String, TaskError> {
+    match val {
+        LLValue::Str(s) => Ok(s.clone()),
+        LLValue::Const(ConstValue::ByteStr(s)) => Ok(String::from_utf8_lossy(s).into_owned()),
+        LLValue::Const(ConstValue::UniStr(s)) => Ok(s.clone()),
+        other => Err(TaskError {
+            message: format!("{opname}: expected a field name, got {other:?}"),
+        }),
+    }
+}
+
+fn signed_lshift(x: i64, y: i64) -> i64 {
+    if !(0..64).contains(&y) {
+        0
+    } else {
+        x.wrapping_shl(y as u32)
+    }
+}
+
+fn signed_rshift(x: i64, y: i64) -> i64 {
+    if y < 0 {
+        0
+    } else if y >= 64 {
+        if x < 0 { -1 } else { 0 }
+    } else {
+        x >> y
+    }
+}
+
+fn unsigned_lshift(x: u64, y: i64) -> u64 {
+    if !(0..64).contains(&y) {
+        0
+    } else {
+        x.wrapping_shl(y as u32)
+    }
+}
+
+fn unsigned_rshift(x: u64, y: i64) -> u64 {
+    if !(0..64).contains(&y) { 0 } else { x >> y }
+}
+
+fn lowlevel_to_llvalue(value: LowLevelValue, opname: &str) -> Result<LLValue, TaskError> {
+    any_to_llvalue(&(Rc::new(value) as Rc<dyn Any>)).map_err(|e| TaskError {
+        message: format!("{opname}: {}", e.message),
+    })
+}
+
+fn dummy_interpreter() -> Rc<LLInterpreter> {
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let typer = Rc::new(RPythonTyper::new(&ann));
+    Rc::new(LLInterpreter::new(typer, false, None))
+}
+
+fn func_from_ptr(p: &_ptr, opname: &str) -> Result<_func, TaskError> {
+    match p._obj0_value().ok().flatten() {
+        Some(_ptr_obj::Func(f)) => Ok(f),
+        other => Err(TaskError {
+            message: format!("{opname}: expected a function pointer, got {other:?}"),
+        }),
+    }
+}
+
+/// `ll_math.py ll_math_frexp`: `if not isfinite(x) or not x: return (x, 0)`,
+/// otherwise mantissa in `[0.5, 1)` (or `(-1, -0.5]`) with
+/// `f == mant * 2**exp`. Subnormals start the unbiased exponent at
+/// `-1021` so the smallest positive subnormal is `(0.5, -1073)`.
+pub(crate) fn python_frexp(f: f64) -> (f64, i32) {
+    if !f.is_finite() || f == 0.0 {
+        return (f, 0);
+    }
+    let bits = f.to_bits();
+    let sign = bits & (1u64 << 63);
+    let exp_raw = ((bits >> 52) & 0x7ff) as i32;
+    let mut frac = bits & ((1u64 << 52) - 1);
+    if exp_raw == 0 {
+        let mut e = -1021;
+        while frac < (1u64 << 52) {
+            frac <<= 1;
+            e -= 1;
+        }
+        frac &= (1u64 << 52) - 1;
+        let mant = f64::from_bits(sign | (1022u64 << 52) | frac);
+        (mant, e)
+    } else {
+        let mant = f64::from_bits(sign | (1022u64 << 52) | frac);
+        (mant, exp_raw - 1022)
+    }
+}
+
+const TAKE_NEXT: f64 = 2147483648.0; // 2**31
+
+/// `objectmodel._hash_float`.
+pub(crate) fn hash_float_value(f: f64) -> i64 {
+    if !f.is_finite() {
+        if f.is_infinite() {
+            if f < 0.0 { -271828 } else { 314159 }
+        } else {
+            0
+        }
+    } else if f == 0.0 {
+        0
+    } else {
+        let (mut v, expo) = python_frexp(f);
+        v *= TAKE_NEXT;
+        let hipart = v as i64;
+        v = (v - hipart as f64) * TAKE_NEXT;
+        hipart + (v as i64) + ((expo as i64) << 15)
+    }
+}
+
+fn unicode_chars_and_stored_hash(p: &_ptr) -> Option<(Vec<char>, i64)> {
+    if !p.nonzero() {
+        return None;
+    }
+    let _ptr_obj::Struct(st) = p._obj0_value().ok().flatten()? else {
+        return None;
+    };
+    if st.TYPE._name != "rpy_unicode" {
+        return None;
+    }
+    let fields = st._fields.lock();
+    let Some((_, LowLevelValue::Array(chars))) = fields.iter().find(|(n, _)| n == "chars") else {
+        return None;
+    };
+    let mut text = Vec::with_capacity(chars.getlength());
+    for i in 0..chars.getlength() {
+        match chars.getitem(i) {
+            Some(LowLevelValue::UniChar(c)) => text.push(c),
+            _ => return None,
+        }
+    }
+    let hash = match fields.iter().find(|(n, _)| n == "hash") {
+        Some((_, LowLevelValue::Signed(h))) => *h,
+        _ => 0,
+    };
+    Some((text, hash))
+}
+
+/// `_hash_string` over UniChar ords, then `_ll_strhash`'s `0 → 29872897`
+/// fixup (`LLHelpers.ll_strhash` / `objectmodel._hash_string`).
+pub(crate) fn hash_unichar_ords(chars: &[char]) -> i64 {
+    let Some(&first) = chars.first() else {
+        return -1;
+    };
+    let mut x = (first as i64) << 7;
+    for &c in chars {
+        x = 1000003i64.wrapping_mul(x) ^ (c as i64);
+    }
+    x ^= chars.len() as i64;
+    if x == 0 { 29872897 } else { x }
+}
+
+fn callable_hash_int(key: &LowLevelValue) -> Result<i64, TaskError> {
+    match key {
+        LowLevelValue::Signed(n) => Ok(*n),
+        LowLevelValue::Unsigned(n) => Ok(*n as i64),
+        LowLevelValue::Bool(b) => Ok(i64::from(*b)),
+        LowLevelValue::Char(c) => Ok(*c as i64),
+        LowLevelValue::UniChar(c) => Ok(*c as i64),
+        other => Err(TaskError {
+            message: format!("ll_hash_int: unsupported key {other:?}"),
+        }),
+    }
+}
+
+fn callable_hash_addr(key: &LowLevelValue) -> Result<i64, TaskError> {
+    match key {
+        LowLevelValue::Address(addr) => {
+            // `raddress.py ll_addrhash(addr1)`: `cast_adr_to_int(addr1, "forced")`.
+            llmemory::cast_adr_to_int(addr, Some("forced")).map_err(|e| TaskError { message: e })
+        }
+        other => Err(TaskError {
+            message: format!("ll_addrhash: unsupported key {other:?}"),
+        }),
+    }
+}
+
+fn callable_hash_identity_ptr(key: &LowLevelValue) -> Result<i64, TaskError> {
+    match key {
+        LowLevelValue::Ptr(p) => {
+            if !p.nonzero() {
+                // `rclass.py ll_inst_hash`: `if not ins: return 0`.
+                Ok(0)
+            } else {
+                Ok(identityhash(p))
+            }
+        }
+        other => Err(TaskError {
+            message: format!("ll_inst_hash: unsupported key {other:?}"),
+        }),
+    }
+}
+
+fn callable_hash_str(key: &LowLevelValue) -> Result<i64, TaskError> {
+    let LowLevelValue::Ptr(p) = key else {
+        return Err(TaskError {
+            message: "ll_strhash: key is not a pointer".to_string(),
+        });
+    };
+    if !p.nonzero() {
+        return Ok(0);
+    }
+    let Some((bytes, stored)) = prebuilt_str_bytes_and_hash(p) else {
+        return Err(TaskError {
+            message: "ll_strhash: not a STR pointer".to_string(),
+        });
+    };
+    if stored != 0 {
+        return Ok(stored);
+    }
+    let h = ll_strhash_value(&bytes);
+    let mut p = p.clone();
+    p.setattr("hash", LowLevelValue::Signed(h))
+        .map_err(|e| TaskError { message: e })?;
+    Ok(h)
+}
+
+fn callable_hash_unicode(key: &LowLevelValue) -> Result<i64, TaskError> {
+    let LowLevelValue::Ptr(p) = key else {
+        return Err(TaskError {
+            message: "ll_unicode_hash: key is not a pointer".to_string(),
+        });
+    };
+    if !p.nonzero() {
+        return Ok(0);
+    }
+    let Some((chars, stored)) = unicode_chars_and_stored_hash(p) else {
+        return Err(TaskError {
+            message: "ll_unicode_hash: not a UNICODE pointer".to_string(),
+        });
+    };
+    if stored != 0 {
+        return Ok(stored);
+    }
+    let h = hash_unichar_ords(&chars);
+    let mut p = p.clone();
+    p.setattr("hash", LowLevelValue::Signed(h))
+        .map_err(|e| TaskError { message: e })?;
+    Ok(h)
+}
+
+fn callable_streq(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TaskError> {
+    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
+        return Ok(a == b);
+    };
+    if s1 == s2 {
+        return Ok(true);
+    }
+    if !s1.nonzero() || !s2.nonzero() {
+        return Ok(false);
+    }
+    match (
+        prebuilt_str_bytes_and_hash(s1).map(|(bytes, _)| bytes),
+        prebuilt_str_bytes_and_hash(s2).map(|(bytes, _)| bytes),
+    ) {
+        (Some(x), Some(y)) => return Ok(x == y),
+        _ => {}
+    }
+    match (
+        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
+        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
+    ) {
+        (Some(x), Some(y)) => Ok(x == y),
+        _ => Ok(s1 == s2),
+    }
+}
+
+fn callable_unicode_eq(a: &LowLevelValue, b: &LowLevelValue) -> Result<bool, TaskError> {
+    let (LowLevelValue::Ptr(s1), LowLevelValue::Ptr(s2)) = (a, b) else {
+        return Ok(false);
+    };
+    if s1 == s2 {
+        return Ok(true);
+    }
+    if !s1.nonzero() || !s2.nonzero() {
+        return Ok(false);
+    }
+    match (
+        unicode_chars_and_stored_hash(s1).map(|(c, _)| c),
+        unicode_chars_and_stored_hash(s2).map(|(c, _)| c),
+    ) {
+        (Some(x), Some(y)) => Ok(x == y),
+        _ => Ok(false),
+    }
+}
+
+/// RPython `TUPLE_TYPE([Float, Signed])` (`rtuple.py`): `Ptr(GcStruct(
+/// 'tuple2', ('item0', Float), ('item1', Signed), hints={immutable, noidentity}))`.
+fn malloc_frexp_tuple(mant: f64, exp: i32) -> Result<_ptr, TaskError> {
+    let body = Struct::gc_with_hints(
+        "tuple2",
+        vec![
+            ("item0".into(), LowLevelType::Float),
+            ("item1".into(), LowLevelType::Signed),
+        ],
+        vec![
+            ("immutable".into(), ConstValue::Bool(true)),
+            ("noidentity".into(), ConstValue::Bool(true)),
+        ],
+    );
+    let mut p = malloc(
+        LowLevelType::Struct(Box::new(body)),
+        None,
+        MallocFlavor::Gc,
+        true,
+    )
+    .map_err(|e| TaskError { message: e })?;
+    p.setattr("item0", LowLevelValue::Float(mant.to_bits()))
+        .map_err(|e| TaskError { message: e })?;
+    p.setattr("item1", LowLevelValue::Signed(exp as i64))
+        .map_err(|e| TaskError { message: e })?;
+    Ok(p)
+}
+
+fn hlvalue_concretetype(v: &Hlvalue) -> Option<LowLevelType> {
+    match v {
+        Hlvalue::Variable(var) => var.concretetype(),
+        Hlvalue::Constant(c) => c.concretetype.clone(),
+    }
+}
+
+/// `LLFrame.perform_call` (`llinterp.py`): `ARGS = typeOf(f).TO.ARGS`
+/// must match `graph.getargs()` arity and `isCompatibleType` per slot.
+fn validate_graph_funcptr_type(graph: &GraphRef, ARGS: &[LowLevelType]) -> Result<(), TaskError> {
+    let graph_b = graph.borrow();
+    let args_v = graph_b.getargs();
+    if ARGS.len() != args_v.len() {
+        return Err(TaskError {
+            message: format!(
+                "graph with {} args called with wrong func ptr type: {:?}",
+                args_v.len(),
+                ARGS
+            ),
+        });
+    }
+    for (T, v) in ARGS.iter().zip(args_v.iter()) {
+        let Some(ct) = hlvalue_concretetype(v) else {
+            let expected: Vec<_> = args_v.iter().map(hlvalue_concretetype).collect();
+            return Err(TaskError {
+                message: format!(
+                    "graph with {:?} args called with wrong func ptr type: {:?}",
+                    expected, ARGS
+                ),
+            });
+        };
+        if !isCompatibleType(T, &ct) {
+            let expected: Vec<_> = args_v.iter().map(hlvalue_concretetype).collect();
+            return Err(TaskError {
+                message: format!(
+                    "graph with {:?} args called with wrong func ptr type: {:?}",
+                    expected, ARGS
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn funcptr_ARGS(p: &_ptr) -> Result<Vec<LowLevelType>, TaskError> {
+    match &typeOf(p).TO {
+        PtrTarget::Func(ft) => Ok(ft.args.clone()),
+        other => Err(TaskError {
+            message: format!("direct_call: expected a function pointer type, got {other:?}"),
+        }),
+    }
+}
+
+/// `_callable` table for graphless funcptrs (`llinterp.py`
+/// `op_direct_call` → `fobj._callable`). Consulted only when `_func.graph`
+/// is absent; a helper that carries a graph always goes through
+/// `eval_graph` / `newsubframe`.
+fn invoke_callable(name: &str, args: &[LLValue]) -> Result<LLValue, TaskError> {
+    let ll_args: Vec<LowLevelValue> = args
+        .iter()
+        .map(|a| llvalue_to_lowlevel(a, name))
+        .collect::<Result<_, _>>()?;
+    let hash_i64 = |n: i64| Ok(LLValue::Int(n));
+    match name {
+        "ll_strhash" => hash_i64(callable_hash_str(ll_args.first().ok_or_else(|| {
+            TaskError {
+                message: "ll_strhash: missing argument".to_string(),
+            }
+        })?)?),
+        "ll_unicode_hash" => hash_i64(callable_hash_unicode(ll_args.first().ok_or_else(
+            || TaskError {
+                message: "ll_unicode_hash: missing argument".to_string(),
+            },
+        )?)?),
+        "_hash_float" => {
+            let LowLevelValue::Float(bits) = ll_args.first().ok_or_else(|| TaskError {
+                message: "_hash_float: missing argument".to_string(),
+            })?
+            else {
+                return Err(TaskError {
+                    message: format!("_hash_float: unsupported key {:?}", ll_args.first()),
+                });
+            };
+            hash_i64(hash_float_value(f64::from_bits(*bits)))
+        }
+        "ll_inst_hash" => hash_i64(callable_hash_identity_ptr(ll_args.first().ok_or_else(
+            || TaskError {
+                message: "ll_inst_hash: missing argument".to_string(),
+            },
+        )?)?),
+        "ll_char_hash" | "ll_unichar_hash" => {
+            hash_i64(callable_hash_int(ll_args.first().ok_or_else(|| {
+                TaskError {
+                    message: format!("{name}: missing argument"),
+                }
+            })?)?)
+        }
+        "ll_none_hash" | "ll_hash_void" => hash_i64(0),
+        "ll_addrhash" => hash_i64(callable_hash_addr(ll_args.first().ok_or_else(|| {
+            TaskError {
+                message: "ll_addrhash: missing argument".to_string(),
+            }
+        })?)?),
+        "ll_streq" => {
+            if ll_args.len() < 2 {
+                return Err(TaskError {
+                    message: "ll_streq: expected two arguments".to_string(),
+                });
+            }
+            Ok(LLValue::Bool(callable_streq(&ll_args[0], &ll_args[1])?))
+        }
+        "ll_unicode_eq" => {
+            if ll_args.len() < 2 {
+                return Err(TaskError {
+                    message: "ll_unicode_eq: expected two arguments".to_string(),
+                });
+            }
+            Ok(LLValue::Bool(callable_unicode_eq(
+                &ll_args[0],
+                &ll_args[1],
+            )?))
+        }
+        "math.frexp" => {
+            let LowLevelValue::Float(bits) = ll_args.first().ok_or_else(|| TaskError {
+                message: "math.frexp: missing argument".to_string(),
+            })?
+            else {
+                return Err(TaskError {
+                    message: "math.frexp: expected a Float".to_string(),
+                });
+            };
+            let (mant, exp) = python_frexp(f64::from_bits(*bits));
+            Ok(LLValue::Ptr(Box::new(malloc_frexp_tuple(mant, exp)?)))
+        }
+        "frexp" => {
+            // C `math_frexp(x, exp_p)` (`ll_math.py`): write the exponent
+            // through the INTP raw array and return the mantissa.
+            let LowLevelValue::Float(bits) = ll_args.first().ok_or_else(|| TaskError {
+                message: "frexp: missing argument".to_string(),
+            })?
+            else {
+                return Err(TaskError {
+                    message: "frexp: expected a Float".to_string(),
+                });
+            };
+            let LowLevelValue::Ptr(exp_p) = ll_args.get(1).ok_or_else(|| TaskError {
+                message: "frexp: missing exponent pointer".to_string(),
+            })?
+            else {
+                return Err(TaskError {
+                    message: "frexp: expected an INTP exponent pointer".to_string(),
+                });
+            };
+            let (mant, exp) = python_frexp(f64::from_bits(*bits));
+            let mut exp_p = (**exp_p).clone();
+            exp_p
+                .setitem(0, LowLevelValue::Signed(exp as i64))
+                .map_err(|e| TaskError { message: e })?;
+            Ok(LLValue::Float(mant.to_bits()))
+        }
+        other if other.starts_with("ll_hash_int") => {
+            hash_i64(callable_hash_int(ll_args.first().ok_or_else(|| {
+                TaskError {
+                    message: format!("{other}: missing argument"),
+                }
+            })?)?)
+        }
+        other => Err(TaskError {
+            message: format!(
+                "llinterp.py LLFrame.perform_call — graphless funcptr {other} has no _callable table entry"
+            ),
+        }),
+    }
+}
+
+fn eval_graph_on_funcptr(
+    graph: GraphRef,
+    args: &[LowLevelValue],
+) -> Result<LowLevelValue, TaskError> {
+    let ll_args: Vec<LLValue> = args
+        .iter()
+        .cloned()
+        .map(|v| lowlevel_to_llvalue(v, "eval_funcptr"))
+        .collect::<Result<_, _>>()?;
+    if let Some(interp) = LLInterpreter::current_interpreter() {
+        let frame = Rc::new(RefCell::new(LLFrame::new(graph, ll_args)));
+        let result = frame.borrow_mut().eval(&interp, frame.clone())?;
+        llvalue_to_lowlevel(&result, "eval_funcptr")
+    } else {
+        let interp = dummy_interpreter();
+        let any_args: Vec<Rc<dyn Any>> = args
+            .iter()
+            .cloned()
+            .map(|v| Rc::new(v) as Rc<dyn Any>)
+            .collect();
+        let result = interp.eval_graph(graph as Rc<dyn Any>, any_args, false)?;
+        let ll = any_to_llvalue(&result)?;
+        llvalue_to_lowlevel(&ll, "eval_funcptr")
+    }
+}
+
+/// Run a stored adtmeth funcptr (`llinterp.py` `op_direct_call` /
+/// `perform_call`): a graph goes through `LLInterpreter.eval_graph` (or
+/// a subframe when already interpreting); a graphless funcptr goes
+/// through its `_callable` name.
+pub fn eval_funcptr(funcptr: &_ptr, args: &[LowLevelValue]) -> Result<LowLevelValue, TaskError> {
+    let func = func_from_ptr(funcptr, "eval_funcptr")?;
+    if let Some(graph) = func.graph_ref() {
+        let ARGS = funcptr_ARGS(funcptr)?;
+        validate_graph_funcptr_type(&graph, &ARGS)?;
+        eval_graph_on_funcptr(graph, args)
+    } else if let Some(name) = &func._callable {
+        let ll_args: Vec<LLValue> = args
+            .iter()
+            .cloned()
+            .map(|v| lowlevel_to_llvalue(v, name))
+            .collect::<Result<_, _>>()?;
+        let result = invoke_callable(name, &ll_args)?;
+        llvalue_to_lowlevel(&result, name)
+    } else {
+        Err(TaskError {
+            message: format!(
+                "llinterp.py LLFrame.perform_call — don't know how to execute {}",
+                func._name
+            ),
+        })
+    }
 }
 
 /// Port of upstream `class LLInterpreter(object)` at `:67-…`.
@@ -989,12 +1576,366 @@ impl LLFrame {
                     })?;
                 Ok(LLValue::Void)
             }
+            "getfield" => self.op_getfield(vals),
+            "getarrayitem" => self.op_getarrayitem(vals),
+            "getarraysize" => self.op_getarraysize(vals),
+            "getinteriorfield" => self.op_getinteriorfield(vals),
+            "direct_call" => self.op_direct_call(vals),
+            "int_xor" => Ok(LLValue::Int(
+                vals[0].as_i64(opname)? ^ vals[1].as_i64(opname)?,
+            )),
+            "int_and" => Ok(LLValue::Int(
+                vals[0].as_i64(opname)? & vals[1].as_i64(opname)?,
+            )),
+            "int_or" => Ok(LLValue::Int(
+                vals[0].as_i64(opname)? | vals[1].as_i64(opname)?,
+            )),
+            "int_lshift" => Ok(LLValue::Int(signed_lshift(
+                vals[0].as_i64(opname)?,
+                vals[1].as_i64(opname)?,
+            ))),
+            "int_rshift" => Ok(LLValue::Int(signed_rshift(
+                vals[0].as_i64(opname)?,
+                vals[1].as_i64(opname)?,
+            ))),
+            "uint_eq" => Ok(LLValue::Bool(
+                (vals[0].as_i64(opname)? as u64) == (vals[1].as_i64(opname)? as u64),
+            )),
+            "uint_ne" => Ok(LLValue::Bool(
+                (vals[0].as_i64(opname)? as u64) != (vals[1].as_i64(opname)? as u64),
+            )),
+            "uint_and" => Ok(LLValue::Int(
+                ((vals[0].as_i64(opname)? as u64) & (vals[1].as_i64(opname)? as u64)) as i64,
+            )),
+            "uint_or" => Ok(LLValue::Int(
+                ((vals[0].as_i64(opname)? as u64) | (vals[1].as_i64(opname)? as u64)) as i64,
+            )),
+            "uint_xor" => Ok(LLValue::Int(
+                ((vals[0].as_i64(opname)? as u64) ^ (vals[1].as_i64(opname)? as u64)) as i64,
+            )),
+            "uint_lshift" => Ok(LLValue::Int(unsigned_lshift(
+                vals[0].as_i64(opname)? as u64,
+                vals[1].as_i64(opname)?,
+            ) as i64)),
+            "uint_rshift" => Ok(LLValue::Int(unsigned_rshift(
+                vals[0].as_i64(opname)? as u64,
+                vals[1].as_i64(opname)?,
+            ) as i64)),
+            "llong_eq" | "ullong_eq" | "lllong_eq" | "ulllong_eq" => Ok(LLValue::Bool(
+                vals[0].as_i64(opname)? == vals[1].as_i64(opname)?,
+            )),
+            "llong_and" | "ullong_and" => Ok(LLValue::Int(
+                vals[0].as_i64(opname)? & vals[1].as_i64(opname)?,
+            )),
+            "llong_or" | "ullong_or" => Ok(LLValue::Int(
+                vals[0].as_i64(opname)? | vals[1].as_i64(opname)?,
+            )),
+            "llong_xor" | "ullong_xor" => Ok(LLValue::Int(
+                vals[0].as_i64(opname)? ^ vals[1].as_i64(opname)?,
+            )),
+            "llong_sub" => Ok(LLValue::Int(
+                vals[0]
+                    .as_i64(opname)?
+                    .wrapping_sub(vals[1].as_i64(opname)?),
+            )),
+            "llong_add" => Ok(LLValue::Int(
+                vals[0]
+                    .as_i64(opname)?
+                    .wrapping_add(vals[1].as_i64(opname)?),
+            )),
+            "llong_lshift" | "ullong_lshift" => Ok(LLValue::Int(signed_lshift(
+                vals[0].as_i64(opname)?,
+                vals[1].as_i64(opname)?,
+            ))),
+            "llong_rshift" => Ok(LLValue::Int(signed_rshift(
+                vals[0].as_i64(opname)?,
+                vals[1].as_i64(opname)?,
+            ))),
+            "ullong_rshift" => Ok(LLValue::Int(unsigned_rshift(
+                vals[0].as_i64(opname)? as u64,
+                vals[1].as_i64(opname)?,
+            ) as i64)),
+            "float_sub" => Ok(LLValue::Float(
+                (vals[0].as_f64(opname)? - vals[1].as_f64(opname)?).to_bits(),
+            )),
+            "float_mul" => Ok(LLValue::Float(
+                (vals[0].as_f64(opname)? * vals[1].as_f64(opname)?).to_bits(),
+            )),
+            "float_eq" => Ok(LLValue::Bool(
+                vals[0].as_f64(opname)? == vals[1].as_f64(opname)?,
+            )),
+            "float_lt" => Ok(LLValue::Bool(
+                vals[0].as_f64(opname)? < vals[1].as_f64(opname)?,
+            )),
+            "float_is_true" => Ok(LLValue::Bool(vals[0].as_f64(opname)? != 0.0)),
+            "char_eq" | "unichar_eq" => Ok(LLValue::Bool(match (&vals[0], &vals[1]) {
+                (LLValue::Str(a), LLValue::Str(b)) => a == b,
+                _ => false,
+            })),
+            "cast_char_to_int" | "cast_unichar_to_int" => {
+                let LLValue::Str(s) = &vals[0] else {
+                    return Err(TaskError {
+                        message: format!("{opname}: expected Char, got {:?}", vals[0]),
+                    });
+                };
+                let ch = s.chars().next().ok_or_else(|| TaskError {
+                    message: format!("{opname}: empty char"),
+                })?;
+                Ok(LLValue::Int(ch as i64))
+            }
+            "cast_int_to_float" => Ok(LLValue::Float((vals[0].as_i64(opname)? as f64).to_bits())),
+            "cast_float_to_int" => Ok(LLValue::Int(vals[0].as_f64(opname)? as i64)),
+            "cast_longlong_to_float" => {
+                Ok(LLValue::Float((vals[0].as_i64(opname)? as f64).to_bits()))
+            }
+            "cast_longlong_to_int"
+            | "cast_lllong_to_int"
+            | "cast_ulonglong_to_int"
+            | "cast_ulllong_to_int"
+            | "truncate_longlong_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
+            "convert_float_bytes_to_longlong" => {
+                Ok(LLValue::Int(vals[0].as_f64(opname)?.to_bits() as i64))
+            }
+            "convert_longlong_bytes_to_float" => Ok(LLValue::Float(
+                f64::from_bits(vals[0].as_i64(opname)? as u64).to_bits(),
+            )),
+            "ptr_nonzero" => {
+                checkptr_ll(&vals[0], opname)?;
+                Ok(LLValue::Bool(vals[0].as_ptr(opname)?.nonzero()))
+            }
+            "ptr_iszero" => {
+                checkptr_ll(&vals[0], opname)?;
+                Ok(LLValue::Bool(!vals[0].as_ptr(opname)?.nonzero()))
+            }
+            "ptr_eq" => {
+                checkptr_ll(&vals[0], opname)?;
+                checkptr_ll(&vals[1], opname)?;
+                Ok(LLValue::Bool(
+                    vals[0].as_ptr(opname)? == vals[1].as_ptr(opname)?,
+                ))
+            }
+            "ptr_ne" => {
+                checkptr_ll(&vals[0], opname)?;
+                checkptr_ll(&vals[1], opname)?;
+                Ok(LLValue::Bool(
+                    vals[0].as_ptr(opname)? != vals[1].as_ptr(opname)?,
+                ))
+            }
+            "gc_identityhash" | "identityhash" => {
+                checkptr_ll(&vals[0], opname)?;
+                let p = vals[0].as_ptr(opname)?;
+                if !p.nonzero() {
+                    return Err(TaskError {
+                        message: format!("{opname}: null pointer"),
+                    });
+                }
+                Ok(LLValue::Int(identityhash(p)))
+            }
+            "cast_adr_to_int" => {
+                let addr = vals[0].as_address(opname)?;
+                let mode = match vals.get(1) {
+                    Some(v) => Some(field_name(v, opname)?),
+                    None => None,
+                };
+                let n =
+                    llmemory::cast_adr_to_int(addr, mode.as_deref()).map_err(|e| TaskError {
+                        message: format!("{opname}: {e}"),
+                    })?;
+                Ok(LLValue::Int(n))
+            }
+            "debug_assert" => {
+                if !vals[0].truth() {
+                    let msg = vals
+                        .get(1)
+                        .and_then(|v| match v {
+                            LLValue::Str(s) => Some(s.as_str()),
+                            _ => None,
+                        })
+                        .unwrap_or("debug_assert failed");
+                    return Err(TaskError {
+                        message: format!(
+                            "llinterp.py LLFrame.op_debug_assert LLAssertFailure: {msg}"
+                        ),
+                    });
+                }
+                Ok(LLValue::Void)
+            }
+            "keepalive" => Ok(LLValue::Void),
+            "jit_marker"
+            | "jit_record_exact_class"
+            | "jit_record_exact_value"
+            | "gc_stack_bottom" => Ok(LLValue::Void),
+            "hint" => vals.first().cloned().ok_or_else(|| TaskError {
+                message: "llinterp.py LLFrame.op_hint expected a value".to_string(),
+            }),
+            "jit_conditional_call_value" => self.op_jit_conditional_call_value(vals),
             _ => Err(TaskError {
                 message: format!(
                     "llinterp.py:273 LLFrame.getoperationhandler — op_{opname} not yet ported"
                 ),
             }),
         }
+    }
+
+    /// `LLFrame.op_direct_call` → `perform_call` (`llinterp.py`).
+    fn op_direct_call(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        if vals.is_empty() {
+            return Err(TaskError {
+                message: "llinterp.py LLFrame.op_direct_call expected a funcptr".to_string(),
+            });
+        }
+        let p = vals[0].as_ptr("direct_call")?;
+        let ARGS = funcptr_ARGS(p)?;
+        self.perform_call(&vals[0], &ARGS, &vals[1..])
+    }
+
+    /// `LLFrame.perform_call` (`llinterp.py`): graph → `newsubframe.eval`;
+    /// otherwise `_callable`. `ARGS` is `lltype.typeOf(f).TO.ARGS`.
+    fn perform_call(
+        &self,
+        f: &LLValue,
+        ARGS: &[LowLevelType],
+        args: &[LLValue],
+    ) -> Result<LLValue, TaskError> {
+        let p = f.as_ptr("direct_call")?;
+        let func = func_from_ptr(p, "direct_call")?;
+        if let Some(graph) = func.graph_ref() {
+            validate_graph_funcptr_type(&graph, ARGS)?;
+            let interp = LLInterpreter::current_interpreter().ok_or_else(|| TaskError {
+                message: "llinterp.py LLFrame.perform_call: no current LLInterpreter".to_string(),
+            })?;
+            let frame = Rc::new(RefCell::new(LLFrame::new(graph, args.to_vec())));
+            frame.borrow_mut().eval(&interp, frame.clone())
+        } else if let Some(name) = &func._callable {
+            invoke_callable(name, args)
+        } else {
+            Err(TaskError {
+                message: format!(
+                    "llinterp.py LLFrame.perform_call — don't know how to execute {}",
+                    func._name
+                ),
+            })
+        }
+    }
+
+    /// `op_getfield` (`llinterp.py`): `getattr(obj, field)` on a pointer.
+    fn op_getfield(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        checkptr_ll(&vals[0], "getfield")?;
+        let p = vals[0].as_ptr("getfield")?;
+        let field = field_name(&vals[1], "getfield")?;
+        let value = p.getattr(&field).map_err(|e| TaskError {
+            message: format!("getfield: {e}"),
+        })?;
+        lowlevel_to_llvalue(value, "getfield")
+    }
+
+    /// `op_getarrayitem` (`opimpl.py`): `array[index]`.
+    fn op_getarrayitem(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        checkptr_ll(&vals[0], "getarrayitem")?;
+        let p = vals[0].as_ptr("getarrayitem")?;
+        let index = vals[1].as_i64("getarrayitem")?;
+        if index < 0 {
+            return Err(TaskError {
+                message: format!("getarrayitem: negative index {index}"),
+            });
+        }
+        let value = p.getitem(index as usize).map_err(|e| TaskError {
+            message: format!("getarrayitem: {e}"),
+        })?;
+        lowlevel_to_llvalue(value, "getarrayitem")
+    }
+
+    /// `op_getarraysize` (`opimpl.py`): `len(array)`.
+    fn op_getarraysize(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        checkptr_ll(&vals[0], "getarraysize")?;
+        let p = vals[0].as_ptr("getarraysize")?;
+        let n = p.len().map_err(|e| TaskError {
+            message: format!("getarraysize: {e}"),
+        })?;
+        Ok(LLValue::Int(n as i64))
+    }
+
+    /// `op_getinteriorfield` (`llinterp.py`): walk field names / indices.
+    fn op_getinteriorfield(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        checkptr_ll(&vals[0], "getinteriorfield")?;
+        let mut current = llvalue_to_lowlevel(&vals[0], "getinteriorfield")?;
+        for offset in &vals[1..] {
+            current = match offset {
+                LLValue::Int(i) => {
+                    if *i < 0 {
+                        return Err(TaskError {
+                            message: format!("getinteriorfield: negative index {i}"),
+                        });
+                    }
+                    match current {
+                        LowLevelValue::Ptr(p) => p.getitem(*i as usize).map_err(|e| TaskError {
+                            message: format!("getinteriorfield: {e}"),
+                        })?,
+                        LowLevelValue::InteriorPtr(ip) => {
+                            ip.getitem(*i as usize).map_err(|e| TaskError {
+                                message: format!("getinteriorfield: {e}"),
+                            })?
+                        }
+                        other => {
+                            return Err(TaskError {
+                                message: format!(
+                                    "getinteriorfield: not an array at index: {other:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+                other => {
+                    let field = field_name(other, "getinteriorfield")?;
+                    match current {
+                        LowLevelValue::Ptr(p) => p.getattr(&field).map_err(|e| TaskError {
+                            message: format!("getinteriorfield: {e}"),
+                        })?,
+                        LowLevelValue::InteriorPtr(ip) => {
+                            ip.getattr(&field).map_err(|e| TaskError {
+                                message: format!("getinteriorfield: {e}"),
+                            })?
+                        }
+                        other => {
+                            return Err(TaskError {
+                                message: format!(
+                                    "getinteriorfield: not a struct at field {field}: {other:?}"
+                                ),
+                            });
+                        }
+                    }
+                }
+            };
+        }
+        lowlevel_to_llvalue(current, "getinteriorfield")
+    }
+
+    /// Non-jitted `conditional_call_elidable`: if `value` is nonzero
+    /// return it, otherwise `direct_call(function, *args)`. Helper graphs
+    /// emit `jit_conditional_call_value` as that residual form
+    /// (`LLHelpers.ll_strhash`).
+    fn op_jit_conditional_call_value(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        if vals.len() < 2 {
+            return Err(TaskError {
+                message:
+                    "llinterp.py LLFrame.op_jit_conditional_call_value expected value, function"
+                        .to_string(),
+            });
+        }
+        if vals[0].truth() {
+            Ok(vals[0].clone())
+        } else {
+            self.op_direct_call(&vals[1..])
+        }
+    }
+}
+
+fn checkptr_ll(val: &LLValue, opname: &str) -> Result<(), TaskError> {
+    match val {
+        LLValue::Ptr(_) => Ok(()),
+        other => Err(TaskError {
+            message: format!("llinterp.checkptr: {opname} expected Ptr, got {other:?}"),
+        }),
     }
 }
 
@@ -1206,7 +2147,10 @@ mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{Block, BlockRefExt, Link};
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        _getconcretetype, Array, FuncType, LowLevelType, Ptr, functionptr,
+        functionptr_for_graph_with_type, getfunctionptr, nullptr,
+    };
     use crate::translator::rtyper::rtyper::RPythonTyper;
 
     fn fixture_typer() -> Rc<RPythonTyper> {
@@ -1440,9 +2384,9 @@ mod tests {
             ))))
         };
         let flavor_c = || {
-            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
-                std::collections::HashMap::new(),
-            )))
+            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
+                indexmap::IndexMap::new(),
+            ))))
         };
         let int_c = |n: i64| Hlvalue::Constant(FlowConstant::new(ConstValue::Int(n)));
 
@@ -1510,9 +2454,9 @@ mod tests {
         let type_c = Hlvalue::Constant(FlowConstant::new(ConstValue::LowLevelType(Box::new(
             char_array,
         ))));
-        let flavor_c = Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(
-            std::collections::HashMap::new(),
-        )));
+        let flavor_c = Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
+            indexmap::IndexMap::new(),
+        ))));
         let neg_len = Hlvalue::Constant(FlowConstant::new(ConstValue::Int(-1)));
 
         let arr = Variable::named("arr");
@@ -1853,5 +2797,249 @@ mod tests {
             )
             .expect("canraise block with successful op takes exits[0]");
         assert_eq!(*out.downcast::<i64>().expect("Signed return"), 42);
+    }
+
+    fn add_graph() -> GraphRef {
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::Signed));
+        let y = Variable::named("y");
+        y.set_concretetype(Some(LowLevelType::Signed));
+        let z = Variable::named("z");
+        z.set_concretetype(Some(LowLevelType::Signed));
+        let start = Block::shared(vec![x.clone().into(), y.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add",
+            vec![x.into(), y.into()],
+            z.clone().into(),
+        ));
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "add",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![z.into()], Some(returnblock), None).into_ref(),
+        ]);
+        graph
+    }
+
+    fn graphless(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> _ptr {
+        functionptr(
+            FuncType { args, result },
+            name,
+            None,
+            Some(name.to_string()),
+        )
+    }
+
+    #[test]
+    fn python_frexp_matches_ll_math_frexp_specials_and_normals() {
+        // `ll_math.py ll_math_frexp`: non-finite / ±0 keep the input and
+        // exponent 0; finite non-zero uses mantissa in [0.5, 1).
+        assert_eq!(python_frexp(8.0), (0.5, 4));
+        assert_eq!(python_frexp(f64::INFINITY), (f64::INFINITY, 0));
+        assert_eq!(python_frexp(f64::NEG_INFINITY), (f64::NEG_INFINITY, 0));
+        let (nan_m, nan_e) = python_frexp(f64::NAN);
+        assert!(nan_m.is_nan());
+        assert_eq!(nan_e, 0);
+        let (m0, e0) = python_frexp(-0.0);
+        assert_eq!(m0.to_bits(), (-0.0f64).to_bits());
+        assert_eq!(e0, 0);
+        let (mant, exp) = python_frexp(f64::from_bits(1));
+        assert_eq!(mant, 0.5);
+        assert_eq!(exp, -1073);
+    }
+
+    #[test]
+    fn math_frexp_callable_returns_mantissa_exponent_tuple() {
+        let fptr = graphless("math.frexp", vec![LowLevelType::Float], LowLevelType::Void);
+        let LowLevelValue::Ptr(p) =
+            eval_funcptr(&fptr, &[LowLevelValue::Float(8.0f64.to_bits())]).expect("math.frexp")
+        else {
+            panic!("math.frexp returns a tuple2 pointer");
+        };
+        assert_eq!(
+            p.getattr("item0").expect("item0"),
+            LowLevelValue::Float(0.5f64.to_bits())
+        );
+        assert_eq!(p.getattr("item1").expect("item1"), LowLevelValue::Signed(4));
+
+        let LowLevelValue::Ptr(inf_p) =
+            eval_funcptr(&fptr, &[LowLevelValue::Float(f64::INFINITY.to_bits())])
+                .expect("math.frexp inf")
+        else {
+            panic!("math.frexp inf returns a tuple2 pointer");
+        };
+        assert_eq!(
+            inf_p.getattr("item0").expect("item0"),
+            LowLevelValue::Float(f64::INFINITY.to_bits())
+        );
+        assert_eq!(
+            inf_p.getattr("item1").expect("item1"),
+            LowLevelValue::Signed(0)
+        );
+    }
+
+    #[test]
+    fn c_frexp_callable_writes_exponent_through_intp() {
+        let exp_p = malloc(
+            LowLevelType::Array(Box::new(Array::new(LowLevelType::Signed))),
+            Some(1),
+            MallocFlavor::Raw,
+            false,
+        )
+        .expect("INTP");
+        let fptr = graphless(
+            "frexp",
+            vec![
+                LowLevelType::Float,
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::Array(Array::new(LowLevelType::Signed)),
+                })),
+            ],
+            LowLevelType::Float,
+        );
+        let mant = eval_funcptr(
+            &fptr,
+            &[
+                LowLevelValue::Float(8.0f64.to_bits()),
+                LowLevelValue::Ptr(Box::new(exp_p.clone())),
+            ],
+        )
+        .expect("C frexp");
+        assert_eq!(mant, LowLevelValue::Float(0.5f64.to_bits()));
+        assert_eq!(
+            exp_p.getitem(0).expect("exp_p[0]"),
+            LowLevelValue::Signed(4)
+        );
+    }
+
+    #[test]
+    fn ll_inst_hash_hashes_container_not_ptr_wrapper() {
+        let fptr = graphless(
+            "ll_inst_hash",
+            vec![LowLevelType::Void],
+            LowLevelType::Signed,
+        );
+        let p = malloc(
+            LowLevelType::Struct(Box::new(Struct::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("instance");
+        let p2 = _ptr::new_with_solid(p._TYPE.clone(), p._obj0_value(), p._solid);
+        assert_ne!(p._hashable_identity(), p2._hashable_identity());
+        let h1 = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(p.clone()))])
+            .expect("ll_inst_hash p");
+        let h2 = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(p2))]).expect("ll_inst_hash p2");
+        assert_eq!(h1, h2);
+        let q = malloc(
+            LowLevelType::Struct(Box::new(Struct::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("other instance");
+        let h3 = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(q))]).expect("ll_inst_hash q");
+        assert_ne!(h1, h3);
+
+        let null = nullptr(LowLevelType::Struct(Box::new(Struct::gc("S", vec![]))))
+            .expect("null instance");
+        assert_eq!(
+            eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(null))]).expect("null hash"),
+            LowLevelValue::Signed(0)
+        );
+    }
+
+    #[test]
+    fn ll_addrhash_uses_forced_cast_adr_to_int() {
+        let fptr = graphless(
+            "ll_addrhash",
+            vec![LowLevelType::Address],
+            LowLevelType::Signed,
+        );
+        assert_eq!(
+            eval_funcptr(&fptr, &[LowLevelValue::Address(_address::Null)]).expect("null addr hash"),
+            LowLevelValue::Signed(0)
+        );
+        let live = malloc(
+            LowLevelType::Struct(Box::new(Struct::new(
+                "thing",
+                vec![("x".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .expect("live");
+        let live2 = _ptr::new_with_solid(live._TYPE.clone(), live._obj0_value(), live._solid);
+        let h1 = eval_funcptr(
+            &fptr,
+            &[LowLevelValue::Address(llmemory::cast_ptr_to_adr(&live))],
+        )
+        .expect("addr hash");
+        let h2 = eval_funcptr(
+            &fptr,
+            &[LowLevelValue::Address(llmemory::cast_ptr_to_adr(&live2))],
+        )
+        .expect("addr hash wrapper");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn eval_funcptr_rejects_arity_and_type_mismatch_then_runs_matching_call() {
+        let graph = add_graph();
+        let arity_ft = FuncType {
+            args: vec![],
+            result: LowLevelType::Signed,
+        };
+        let arity_ptr = functionptr_for_graph_with_type(&graph, arity_ft);
+        let arity_err = eval_funcptr(&arity_ptr, &[]).expect_err("arity mismatch");
+        assert!(
+            arity_err
+                .message
+                .contains("graph with 2 args called with wrong func ptr type"),
+            "{}",
+            arity_err.message
+        );
+
+        let type_ft = FuncType {
+            args: vec![LowLevelType::Float, LowLevelType::Float],
+            result: LowLevelType::Signed,
+        };
+        let type_ptr = functionptr_for_graph_with_type(&graph, type_ft);
+        let type_err = eval_funcptr(
+            &type_ptr,
+            &[
+                LowLevelValue::Float(0.0f64.to_bits()),
+                LowLevelValue::Float(0.0f64.to_bits()),
+            ],
+        )
+        .expect_err("type mismatch");
+        assert!(
+            type_err.message.contains("called with wrong func ptr type"),
+            "{}",
+            type_err.message
+        );
+
+        let ok_ptr = getfunctionptr(&graph, _getconcretetype).expect("matching funcptr");
+        let out = eval_funcptr(
+            &ok_ptr,
+            &[LowLevelValue::Signed(40), LowLevelValue::Signed(2)],
+        )
+        .expect("matching call runs");
+        assert_eq!(out, LowLevelValue::Signed(42));
     }
 }

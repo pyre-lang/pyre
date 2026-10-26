@@ -907,10 +907,10 @@ winexternal!(
 );
 
 /// `rwin32.DelEnvironmentVariableW`.
-pub fn DelEnvironmentVariableW(name: &[u8]) -> BOOL {
-    let name_wbuf = rffi::scoped_utf82wcharp::new(Some(name), -1);
+pub fn DelEnvironmentVariableW(name: &[u8]) -> Result<BOOL, rffi::MemoryError> {
+    let name_wbuf = rffi::scoped_utf82wcharp::new(Some(name), -1)?;
     let value_wbuf: CWCHARP = core::ptr::null_mut();
-    unsafe { _SetEnvironmentVariableW(name_wbuf.buf, value_wbuf) }
+    Ok(unsafe { _SetEnvironmentVariableW(name_wbuf.buf, value_wbuf) })
 }
 
 winexternal!(
@@ -921,9 +921,9 @@ winexternal!(
 );
 
 /// `rwin32.AddDllDirectory`.
-pub fn AddDllDirectory(path: &[u8], length: isize) -> VOIDP {
-    let path_w = rffi::scoped_utf82wcharp::new(Some(path), length);
-    unsafe { _AddDllDirectory(path_w.buf) }
+pub fn AddDllDirectory(path: &[u8], length: isize) -> Result<VOIDP, rffi::MemoryError> {
+    let path_w = rffi::scoped_utf82wcharp::new(Some(path), length)?;
+    Ok(unsafe { _AddDllDirectory(path_w.buf) })
 }
 
 winexternal!(

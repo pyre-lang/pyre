@@ -5073,6 +5073,14 @@ mod tests {
                 majit_rlib::rffi::ll_raw_malloc_fixedsize as *const () as usize as i64,
             );
             cc.register_function_fnaddr(
+                CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_malloc_varsize"]),
+                majit_rlib::rffi::ll_raw_malloc_varsize as *const () as usize as i64,
+            );
+            cc.register_function_fnaddr(
+                CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_malloc_varsize_zero"]),
+                majit_rlib::rffi::ll_raw_malloc_varsize_zero as *const () as usize as i64,
+            );
+            cc.register_function_fnaddr(
                 CallPath::from_segments(["majit_rlib", "rffi", "ll_raw_free"]),
                 majit_rlib::rffi::ll_raw_free as *const () as usize as i64,
             );
@@ -5095,10 +5103,7 @@ mod tests {
             let p = graph
                 .push_op_var(
                     graph.startblock,
-                    OpKind::RawMalloc {
-                        owner: owner.into(),
-                        zero: false,
-                    },
+                    OpKind::raw_malloc(owner, false, None),
                     true,
                 )
                 .expect("raw malloc result");

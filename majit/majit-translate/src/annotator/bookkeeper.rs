@@ -37,12 +37,12 @@ use super::description::{
     CallFamily, ClassAttrFamily, ClassDefKey, DescEntry, DescKey, FrozenAttrFamily, FrozenDesc,
     FunctionDesc, MethodDesc,
 };
-use super::dictdef::DictDef;
+use super::dictdef::{DictDef, DictKey};
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomePBC, SomeString, SomeTuple, SomeType, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue,
-    s_impossible_value, s_none, union,
+    SomeOrderedDict, SomePBC, SomeString, SomeTuple, SomeType, SomeUnicodeCodePoint,
+    SomeUnicodeString, SomeValue, s_impossible_value, s_none, union,
 };
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
@@ -50,6 +50,19 @@ use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
 use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostObject};
 use crate::tool::algo::unionfind::UnionFind;
+
+/// Key of `Bookkeeper.immutable_cache` (`bookkeeper.py`).
+///
+/// `Constant(x)` is `Hashable` (`uid.py`): a hashable value uses
+/// `(type(x), x)`, an unhashable `r_dict` / `dict` / `list` uses
+/// `id(x)`. List/dict callers that still hold a `Constant` use
+/// [`ImmutableCacheKey::Constant`]; a prebuilt `objectmodel.r_dict`
+/// is a `HostObject` whose Hash/Eq is `Arc::ptr_eq` (`id(x)`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ImmutableCacheKey {
+    Constant(u64),
+    HostObject(HostObject),
+}
 
 // Exists to localise prepass nondeterminism (gh#1139).
 static REFLOW_FROM_ATTR: AtomicU64 = AtomicU64::new(0);
@@ -298,7 +311,11 @@ pub struct Bookkeeper {
     /// dictdef via `generalize_key`. Without the cache the second
     /// `annotation()` call builds a fresh DictDef and the mutation
     /// dissolves.
-    pub immutable_cache: RefCell<HashMap<u64, SomeValue>>,
+    ///
+    /// `Hashable` (`uid.py`) uses `id(x)` for an unhashable `r_dict`;
+    /// two `Constant` wrappers of the same host object share that key.
+    /// [`ImmutableCacheKey::HostObject`] is that `id(x)` arm.
+    pub immutable_cache: RefCell<HashMap<ImmutableCacheKey, SomeValue>>,
     /// RPython `self.pending_specializations = []` (bookkeeper.py).
     ///
     /// List of callbacks drained by
@@ -4986,7 +5003,11 @@ impl Bookkeeper {
         items: &[ConstValue],
     ) -> Result<SomeValue, AnnotatorError> {
         if let Some(key) = key
-            && let Some(hit) = self.immutable_cache.borrow().get(&key.id).cloned()
+            && let Some(hit) = self
+                .immutable_cache
+                .borrow()
+                .get(&ImmutableCacheKey::Constant(key.id))
+                .cloned()
         {
             return Ok(hit);
         }
@@ -4994,9 +5015,10 @@ impl Bookkeeper {
         let mut result = SomeList::new(listdef.clone());
         result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
         if let Some(key) = key {
-            self.immutable_cache
-                .borrow_mut()
-                .insert(key.id, SomeValue::List(result.clone()));
+            self.immutable_cache.borrow_mut().insert(
+                ImmutableCacheKey::Constant(key.id),
+                SomeValue::List(result.clone()),
+            );
         }
         for e in items {
             let s_e = self.immutablevalue(e)?;
@@ -5007,41 +5029,82 @@ impl Bookkeeper {
         Ok(SomeValue::List(result))
     }
 
+    /// RPython `Bookkeeper.immutablevalue` dict arm (`bookkeeper.py`):
+    /// `tp is dict or tp is r_dict or tp is OrderedDict or tp is r_ordereddict`.
     fn immutable_dict_with_key(
         self: &Rc<Self>,
         key: Option<&Constant>,
         x: &ConstValue,
-        items: &HashMap<ConstValue, ConstValue>,
     ) -> Result<SomeValue, AnnotatorError> {
-        if let Some(key) = key
-            && let Some(hit) = self.immutable_cache.borrow().get(&key.id).cloned()
+        let cache_key = prebuilt_dict_cache_key(key, x);
+        if let Some(cache_key) = &cache_key
+            && let Some(hit) = self.immutable_cache.borrow().get(cache_key).cloned()
         {
             return Ok(hit);
         }
+        // `if tp is OrderedDict or tp is r_ordereddict: cls = SomeOrderedDict
+        //  else: cls = SomeDict`. `SomeDict = SomeOrderedDict` (`model.py`).
+        let is_ordered = is_prebuilt_ordered_dict_tp(x);
+        let is_r_dict = is_prebuilt_r_dict_tp(x);
         let dictdef = DictDef::new(
             Some(self.clone()),
             SomeValue::Impossible,
             SomeValue::Impossible,
-            false,
+            is_r_dict,
             false,
             false,
         );
-        let mut result = SomeDict::new(dictdef.clone());
-        result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
-        if let Some(key) = key {
+        #[expect(
+            clippy::if_same_then_else,
+            reason = "model.py SomeDict = SomeOrderedDict; both arms construct the rebound type"
+        )]
+        let mut result = if is_ordered {
+            SomeOrderedDict::new(dictdef.clone())
+        } else {
+            SomeDict::new(dictdef.clone())
+        };
+        if let Some(cache_key) = &cache_key {
             self.immutable_cache
                 .borrow_mut()
-                .insert(key.id, SomeValue::Dict(result.clone()));
+                .insert(cache_key.clone(), SomeValue::Dict(result.clone()));
         }
-        for (k, v) in items {
-            let s_k = self.immutablevalue(k)?;
-            let s_v = self.immutablevalue(v)?;
-            dictdef
-                .generalize_key(&s_k)
+        if is_r_dict {
+            let obj = match x {
+                ConstValue::HostObject(obj) => obj,
+                other => {
+                    return Err(AnnotatorError::new(format!(
+                        "Bookkeeper.immutablevalue(r_dict): expected host instance, got {other:?}"
+                    )));
+                }
+            };
+            let key_eq = host_instance_attr(obj, "key_eq")?;
+            let key_hash = host_instance_attr(obj, "key_hash")?;
+            let s_eqfn = self.immutablevalue(&key_eq)?;
+            let s_hashfn = self.immutablevalue(&key_hash)?;
+            DictKey::update_rdict_annotations(&dictdef.dictkey_rc(), s_eqfn, s_hashfn)
                 .map_err(|e| AnnotatorError::new(e.msg))?;
-            dictdef
-                .generalize_value(&s_v)
-                .map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        let mut seen_elements = 0usize;
+        while seen_elements != prebuilt_dict_len(x)? {
+            let items = prebuilt_dict_items(x)?;
+            for (ek, ev) in &items {
+                let s_k = self.immutablevalue(ek)?;
+                let s_v = self.immutablevalue(ev)?;
+                dictdef
+                    .generalize_key(&s_k)
+                    .map_err(|e| AnnotatorError::new(e.msg))?;
+                dictdef
+                    .generalize_value(&s_v)
+                    .map_err(|e| AnnotatorError::new(e.msg))?;
+            }
+            seen_elements = items.len();
+            // if the dictionary grew during the iteration, start over
+        }
+        result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
+        if let Some(cache_key) = cache_key {
+            self.immutable_cache
+                .borrow_mut()
+                .insert(cache_key, SomeValue::Dict(result.clone()));
         }
         Ok(SomeValue::Dict(result))
     }
@@ -5053,7 +5116,7 @@ impl Bookkeeper {
     pub fn immutableconstant(self: &Rc<Self>, c: &Constant) -> Result<SomeValue, AnnotatorError> {
         match &c.value {
             ConstValue::List(items) => self.immutable_list_with_key(Some(c), &c.value, items),
-            ConstValue::Dict(items) => self.immutable_dict_with_key(Some(c), &c.value, items),
+            ConstValue::Dict(_) => self.immutable_dict_with_key(Some(c), &c.value),
             // Legacy `ConstUInt` stored as `ConstValue::Int` with
             // `concretetype = Unsigned`. Prefer `ConstValue::UInt`; this
             // arm still annotates leftover Int+Unsigned stamps as
@@ -5170,7 +5233,7 @@ impl Bookkeeper {
                 Ok(SomeValue::Tuple(SomeTuple::new(items_s)))
             }
             ConstValue::List(items) => self.immutable_list_with_key(None, x, items),
-            ConstValue::Dict(items) => self.immutable_dict_with_key(None, x, items),
+            ConstValue::Dict(_) => self.immutable_dict_with_key(None, x),
             ConstValue::HostObject(obj) => self.immutablevalue_hostobject(obj, x),
             ConstValue::Function(func) => {
                 let host = HostObject::new_user_function((**func).clone());
@@ -5271,6 +5334,13 @@ impl Bookkeeper {
         obj: &HostObject,
         raw: &ConstValue,
     ) -> Result<SomeValue, AnnotatorError> {
+        // `bookkeeper.py immutablevalue`: `tp is dict or tp is r_dict or
+        // tp is OrderedDict or tp is r_ordereddict` sits immediately
+        // before the weakref arm. A prebuilt `objectmodel.r_dict` is a
+        // host instance of that class.
+        if is_objectmodel_r_dict_instance(obj) {
+            return self.immutable_dict_with_key(None, raw);
+        }
         // upstream bookkeeper.py — `tp is weakref.ReferenceType`:
         //   x1 = x()
         //   if x1 is None:
@@ -6200,6 +6270,124 @@ pub fn origin_of_meth(boundmeth: &HostObject) -> Result<(&HostObject, String), A
 /// RPython `ishashable(x)` (bookkeeper.py).
 pub fn ishashable(_x: &HostObject) -> bool {
     true
+}
+
+fn objectmodel_r_dict_class() -> Option<HostObject> {
+    crate::flowspace::model::HOST_ENV.lookup_builtin("rpython.rlib.objectmodel.r_dict")
+}
+
+fn objectmodel_r_ordereddict_class() -> Option<HostObject> {
+    crate::flowspace::model::HOST_ENV.lookup_builtin("rpython.rlib.objectmodel.r_ordereddict")
+}
+
+fn collections_ordered_dict_class() -> Option<HostObject> {
+    crate::flowspace::model::HOST_ENV.lookup_builtin("OrderedDict")
+}
+
+/// `bookkeeper.py immutablevalue`: `issubclass(tp, r_dict)`.
+fn is_objectmodel_r_dict_class(cls: &HostObject) -> bool {
+    objectmodel_r_dict_class()
+        .as_ref()
+        .is_some_and(|r_dict| cls.is_subclass_of(r_dict))
+}
+
+/// `bookkeeper.py immutablevalue`: `tp is r_ordereddict`.
+fn is_objectmodel_r_ordereddict_class(cls: &HostObject) -> bool {
+    objectmodel_r_ordereddict_class()
+        .as_ref()
+        .is_some_and(|canonical| cls == canonical)
+}
+
+/// `bookkeeper.py immutablevalue`: `tp is r_dict` / `issubclass(tp, r_dict)`.
+pub(crate) fn is_objectmodel_r_dict_instance(obj: &HostObject) -> bool {
+    obj.instance_class()
+        .is_some_and(is_objectmodel_r_dict_class)
+}
+
+/// `bookkeeper.py immutablevalue`: `tp is OrderedDict or tp is r_ordereddict`.
+fn is_prebuilt_ordered_dict_tp(x: &ConstValue) -> bool {
+    match x {
+        ConstValue::HostObject(obj) => obj.instance_class().is_some_and(|cls| {
+            is_objectmodel_r_ordereddict_class(cls)
+                || collections_ordered_dict_class()
+                    .as_ref()
+                    .is_some_and(|ordered| cls == ordered)
+        }),
+        _ => false,
+    }
+}
+
+fn is_prebuilt_r_dict_tp(x: &ConstValue) -> bool {
+    match x {
+        ConstValue::HostObject(obj) => is_objectmodel_r_dict_instance(obj),
+        _ => false,
+    }
+}
+
+fn prebuilt_dict_cache_key(key: Option<&Constant>, x: &ConstValue) -> Option<ImmutableCacheKey> {
+    if let Some(key) = key {
+        return Some(ImmutableCacheKey::Constant(key.id));
+    }
+    match x {
+        ConstValue::HostObject(obj) => Some(ImmutableCacheKey::HostObject(obj.clone())),
+        _ => None,
+    }
+}
+
+fn host_instance_attr(obj: &HostObject, name: &str) -> Result<ConstValue, AnnotatorError> {
+    obj.instance_get(name).map_err(|err| {
+        AnnotatorError::new(format!(
+            "Bookkeeper.immutablevalue(r_dict): getattr({name}) failed: {err:?}"
+        ))
+    })
+}
+
+fn r_dict_item_key(dictkeycontainer: &ConstValue) -> Result<ConstValue, AnnotatorError> {
+    match dictkeycontainer {
+        ConstValue::HostObject(container) => host_instance_attr(container, "key"),
+        other => Err(AnnotatorError::new(format!(
+            "Bookkeeper.immutablevalue(r_dict): _dict key is not _r_dictkey, got {other:?}"
+        ))),
+    }
+}
+
+fn prebuilt_dict_len(x: &ConstValue) -> Result<usize, AnnotatorError> {
+    match x {
+        ConstValue::Dict(items) => Ok(items.len()),
+        ConstValue::HostObject(obj) if is_objectmodel_r_dict_instance(obj) => {
+            match host_instance_attr(obj, "_dict")? {
+                ConstValue::Dict(items) => Ok(items.len()),
+                other => Err(AnnotatorError::new(format!(
+                    "Bookkeeper.immutablevalue(r_dict): _dict is not a dict, got {other:?}"
+                ))),
+            }
+        }
+        other => Err(AnnotatorError::new(format!(
+            "Bookkeeper.immutablevalue: expected a dict, got {other:?}"
+        ))),
+    }
+}
+
+fn prebuilt_dict_items(x: &ConstValue) -> Result<Vec<(ConstValue, ConstValue)>, AnnotatorError> {
+    match x {
+        ConstValue::Dict(items) => Ok(items.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+        ConstValue::HostObject(obj) if is_objectmodel_r_dict_instance(obj) => {
+            let inner = host_instance_attr(obj, "_dict")?;
+            let ConstValue::Dict(items) = inner else {
+                return Err(AnnotatorError::new(format!(
+                    "Bookkeeper.immutablevalue(r_dict): _dict is not a dict, got {inner:?}"
+                )));
+            };
+            let mut out = Vec::with_capacity(items.len());
+            for (dictkeycontainer, dictvalue) in items.iter() {
+                out.push((r_dict_item_key(dictkeycontainer)?, dictvalue.clone()));
+            }
+            Ok(out)
+        }
+        other => Err(AnnotatorError::new(format!(
+            "Bookkeeper.immutablevalue: expected a dict, got {other:?}"
+        ))),
+    }
 }
 
 /// RAII guard returned by [`Bookkeeper::at_position`]. Mirrors the
@@ -10071,12 +10259,12 @@ mod tests {
     #[test]
     fn immutableconstant_dict_distinguishes_equal_but_distinct_constants() {
         let bk = bk();
-        let mut a_items = HashMap::new();
+        let mut a_items = IndexMap::new();
         a_items.insert(ConstValue::Int(1), ConstValue::None);
-        let mut b_items = HashMap::new();
+        let mut b_items = IndexMap::new();
         b_items.insert(ConstValue::Int(1), ConstValue::None);
-        let a_key = Constant::new(ConstValue::Dict(a_items));
-        let b_key = Constant::new(ConstValue::Dict(b_items));
+        let a_key = Constant::new(ConstValue::Dict(std::sync::Arc::new(a_items)));
+        let b_key = Constant::new(ConstValue::Dict(std::sync::Arc::new(b_items)));
         let a = bk.immutableconstant(&a_key).unwrap();
         let b = bk.immutableconstant(&b_key).unwrap();
         let (SomeValue::Dict(a), SomeValue::Dict(b)) = (a, b) else {
@@ -10085,6 +10273,308 @@ mod tests {
         assert_ne!(a.dictdef, b.dictdef);
         assert_eq!(a.base.const_box.as_ref().map(|c| c.id), Some(a_key.id));
         assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(b_key.id));
+    }
+
+    fn canonical_r_dict_class() -> HostObject {
+        crate::flowspace::model::HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_dict")
+            .expect("canonical r_dict class")
+    }
+
+    fn canonical_r_ordereddict_class() -> HostObject {
+        crate::flowspace::model::HOST_ENV
+            .lookup_builtin("rpython.rlib.objectmodel.r_ordereddict")
+            .expect("canonical r_ordereddict class")
+    }
+
+    fn prebuilt_r_dict(
+        key_eq: HostObject,
+        key_hash: HostObject,
+        pairs: &[(i64, i64)],
+    ) -> HostObject {
+        prebuilt_r_dict_on(canonical_r_dict_class(), key_eq, key_hash, pairs)
+    }
+
+    fn prebuilt_r_dict_on(
+        cls: HostObject,
+        key_eq: HostObject,
+        key_hash: HostObject,
+        pairs: &[(i64, i64)],
+    ) -> HostObject {
+        use crate::flowspace::model::HostObject as HO;
+        let key_cls = HO::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
+        let r_dict = HO::new_instance(cls, vec![]);
+        r_dict
+            .instance_set("key_eq", ConstValue::HostObject(key_eq))
+            .expect("key_eq");
+        r_dict
+            .instance_set("key_hash", ConstValue::HostObject(key_hash))
+            .expect("key_hash");
+        let mut inner = IndexMap::new();
+        for &(k, v) in pairs {
+            let dk = HO::new_instance(key_cls.clone(), vec![]);
+            dk.instance_set("dic", ConstValue::HostObject(r_dict.clone()))
+                .expect("dic");
+            dk.instance_set("key", ConstValue::Int(k)).expect("key");
+            dk.instance_set("hash", ConstValue::Int(k)).expect("hash");
+            inner.insert(ConstValue::HostObject(dk), ConstValue::Int(v));
+        }
+        r_dict
+            .instance_set("_dict", ConstValue::Dict(std::sync::Arc::new(inner)))
+            .expect("_dict");
+        r_dict
+    }
+
+    /// `bookkeeper.py immutablevalue`: a prebuilt `objectmodel.r_dict`
+    /// annotates as SomeDict whose DictDef is `is_r_dict`, records
+    /// eq/hash annotations, and is cached by host identity.
+    #[test]
+    fn immutablevalue_prebuilt_r_dict_is_r_dict_and_cached() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let key_eq = HostObject::new_user_function(compiled_graph_func(
+            "def key_eq(a, b):\n    return a == b\n",
+            Vec::new(),
+        ));
+        let key_hash = HostObject::new_user_function(compiled_graph_func(
+            "def key_hash(a):\n    return a\n",
+            Vec::new(),
+        ));
+        let r_dict = prebuilt_r_dict(key_eq.clone(), key_hash.clone(), &[(1, 10), (2, 20)]);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(r_dict.clone()))
+            .expect("prebuilt r_dict immutablevalue");
+        let SomeValue::Dict(sd) = s else {
+            panic!("expected SomeDict, got {s:?}");
+        };
+        assert!(
+            sd.dictdef.custom_eq_hash(),
+            "DictDef is_r_dict / custom_eq_hash"
+        );
+        {
+            let key = sd.dictdef.dictkey_rc();
+            let kb = key.borrow();
+            assert!(
+                matches!(kb.s_rdict_eqfn, SomeValue::PBC(_)),
+                "eq annotation recorded, got {:?}",
+                kb.s_rdict_eqfn
+            );
+            assert!(
+                matches!(kb.s_rdict_hashfn, SomeValue::PBC(_)),
+                "hash annotation recorded, got {:?}",
+                kb.s_rdict_hashfn
+            );
+        }
+        let s2 = bk
+            .immutablevalue(&ConstValue::HostObject(r_dict.clone()))
+            .expect("cached r_dict");
+        let SomeValue::Dict(sd2) = s2 else {
+            panic!("expected SomeDict");
+        };
+        assert!(
+            sd.dictdef.same_as(&sd2.dictdef),
+            "same r_dict reuses the cached SomeDict / DictDef"
+        );
+        let other = prebuilt_r_dict(key_eq, key_hash, &[(1, 10), (2, 20)]);
+        let s3 = bk
+            .immutablevalue(&ConstValue::HostObject(other))
+            .expect("other r_dict");
+        let SomeValue::Dict(sd3) = s3 else {
+            panic!("expected SomeDict");
+        };
+        assert!(
+            !sd.dictdef.same_as(&sd3.dictdef),
+            "equal contents on a distinct r_dict mint a fresh DictDef"
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: `tp is r_ordereddict` selects
+    /// `SomeOrderedDict` (`SomeDict = SomeOrderedDict` in `model.py`)
+    /// and `issubclass(tp, r_dict)` keeps `is_r_dict`.
+    #[test]
+    fn immutablevalue_prebuilt_r_ordereddict_selects_ordered_cls() {
+        use crate::annotator::model::{SomeObjectTrait, SomeValue};
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let key_eq = HostObject::new_user_function(compiled_graph_func(
+            "def key_eq(a, b):\n    return a == b\n",
+            Vec::new(),
+        ));
+        let key_hash = HostObject::new_user_function(compiled_graph_func(
+            "def key_hash(a):\n    return a\n",
+            Vec::new(),
+        ));
+        let r_dict = prebuilt_r_dict_on(
+            canonical_r_ordereddict_class(),
+            key_eq,
+            key_hash,
+            &[(1, 10)],
+        );
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(r_dict))
+            .expect("prebuilt r_ordereddict immutablevalue");
+        let SomeValue::Dict(sd) = s else {
+            panic!("expected SomeDict, got {s:?}");
+        };
+        assert!(
+            sd.dictdef.custom_eq_hash(),
+            "r_ordereddict is a subclass of r_dict"
+        );
+        assert_eq!(
+            sd.knowntype(),
+            crate::annotator::model::KnownType::OrderedDict
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: `tp is r_dict` is class identity.
+    /// A distinct host class that only shares the qualname is an ordinary
+    /// instance, not SomeDict.
+    #[test]
+    fn immutablevalue_lookalike_r_dict_qualname_is_ordinary_instance() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let bk = bk();
+        let lookalike = HostObject::new_class("rpython.rlib.objectmodel.r_dict", vec![]);
+        let inst = HostObject::new_instance(lookalike, vec![]);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(inst))
+            .expect("lookalike r_dict qualname");
+        assert!(
+            matches!(s, SomeValue::Instance(_)),
+            "look-alike r_dict class is SomeInstance, got {s:?}"
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: `is_r_dict = issubclass(tp, r_dict)`.
+    #[test]
+    fn immutablevalue_r_dict_subclass_is_r_dict() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let key_eq = HostObject::new_user_function(compiled_graph_func(
+            "def key_eq(a, b):\n    return a == b\n",
+            Vec::new(),
+        ));
+        let key_hash = HostObject::new_user_function(compiled_graph_func(
+            "def key_hash(a):\n    return a\n",
+            Vec::new(),
+        ));
+        let subclass = HostObject::new_class("pkg.MyRDict", vec![canonical_r_dict_class()]);
+        let r_dict = prebuilt_r_dict_on(subclass, key_eq, key_hash, &[(1, 10)]);
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(r_dict))
+            .expect("r_dict subclass immutablevalue");
+        let SomeValue::Dict(sd) = s else {
+            panic!("expected SomeDict, got {s:?}");
+        };
+        assert!(
+            sd.dictdef.custom_eq_hash(),
+            "subclass of r_dict keeps is_r_dict"
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: `while seen_elements != len(x)`
+    /// re-reads the live `r_dict._dict` so entries added during
+    /// recursive annotation are generalized.
+    #[test]
+    fn immutablevalue_r_dict_generalizes_entries_added_during_annotation() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+        use std::sync::Arc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let key_eq = HostObject::new_user_function(compiled_graph_func(
+            "def key_eq(a, b):\n    return a == b\n",
+            Vec::new(),
+        ));
+        let key_hash = HostObject::new_user_function(compiled_graph_func(
+            "def key_hash(a):\n    return a\n",
+            Vec::new(),
+        ));
+        let r_dict = prebuilt_r_dict(key_eq, key_hash, &[]);
+        let key_cls = HostObject::new_class("rpython.rlib.objectmodel._r_dictkey", vec![]);
+        let extra_dk = HostObject::new_instance(key_cls.clone(), vec![]);
+        extra_dk
+            .instance_set("dic", ConstValue::HostObject(r_dict.clone()))
+            .expect("dic");
+        extra_dk
+            .instance_set("key", ConstValue::Int(-5))
+            .expect("key");
+        extra_dk
+            .instance_set("hash", ConstValue::Int(-5))
+            .expect("hash");
+        let grow_cls = HostObject::new_class("pkg.GrowDict", vec![]);
+        let r_dict_for_freeze = r_dict.clone();
+        let extra_dk_for_freeze = extra_dk.clone();
+        grow_cls.class_set(
+            "_freeze_",
+            ConstValue::HostObject(HostObject::new_native_callable(
+                "pkg.GrowDict._freeze_",
+                Arc::new(move |_args| {
+                    let inner = r_dict_for_freeze.instance_get("_dict").expect("_dict");
+                    let ConstValue::Dict(items) = inner else {
+                        return Err("_dict is not a dict".into());
+                    };
+                    let mut grown = (*items).clone();
+                    let first_value = items
+                        .values()
+                        .next()
+                        .cloned()
+                        .ok_or_else(|| "empty _dict".to_string())?;
+                    grown.insert(
+                        ConstValue::HostObject(extra_dk_for_freeze.clone()),
+                        first_value,
+                    );
+                    r_dict_for_freeze
+                        .instance_set("_dict", ConstValue::Dict(Arc::new(grown)))
+                        .map_err(|err| format!("{err:?}"))?;
+                    Ok(ConstValue::Bool(true))
+                }),
+            )),
+        );
+        let grow = HostObject::new_instance(grow_cls, vec![]);
+        let first_dk = HostObject::new_instance(key_cls, vec![]);
+        first_dk
+            .instance_set("dic", ConstValue::HostObject(r_dict.clone()))
+            .expect("dic");
+        first_dk
+            .instance_set("key", ConstValue::Int(1))
+            .expect("key");
+        first_dk
+            .instance_set("hash", ConstValue::Int(1))
+            .expect("hash");
+        let mut inner = IndexMap::new();
+        inner.insert(
+            ConstValue::HostObject(first_dk),
+            ConstValue::Tuple(vec![ConstValue::Int(10), ConstValue::HostObject(grow)]),
+        );
+        r_dict
+            .instance_set("_dict", ConstValue::Dict(Arc::new(inner)))
+            .expect("_dict");
+        let s = bk
+            .immutablevalue(&ConstValue::HostObject(r_dict))
+            .expect("growing r_dict immutablevalue");
+        let SomeValue::Dict(sd) = s else {
+            panic!("expected SomeDict, got {s:?}");
+        };
+        match sd.dictdef.s_key() {
+            SomeValue::Integer(si) => {
+                assert!(
+                    !si.nonneg,
+                    "late key -5 must be generalized so s_key is not nonneg"
+                );
+            }
+            other => panic!("expected integer keys, got {other:?}"),
+        }
     }
 
     #[test]

@@ -264,6 +264,14 @@ pub struct Assembler {
     /// Parallel to [`Self::type_static_by_addr`]: these rows name the
     /// `reloc_consts_r` descriptor the pool writes for a prebuilt GCREF.
     static_ref_by_addr: Vec<(i64, String)>,
+    /// Live reference-constant containers retained for this assembly
+    /// (`assembler.py emit_const` `constants_dict` keys the container
+    /// object). Translate-side `_ptr` / `HostObject` values; downcast
+    /// at the emit site. Holding them here keeps `Arc::as_ptr` identity
+    /// stable for the whole assembly, so later jitcodes of the same
+    /// assembler cannot reuse a dropped container's address as a new
+    /// ordinal.
+    pub live_ref_consts: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl Assembler {
@@ -291,6 +299,7 @@ impl Assembler {
             inline_prebuild_seen: indexmap::IndexSet::new(),
             type_static_by_addr: Vec::new(),
             static_ref_by_addr: Vec::new(),
+            live_ref_consts: None,
         }
     }
 

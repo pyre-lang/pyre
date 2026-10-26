@@ -4664,6 +4664,54 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     cpa1!(
         &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_add_memory_pressure",
+        "majit_rlib::ll_raw_malloc_fixedsize_add_memory_pressure",
+        majit_rlib::rffi::ll_raw_malloc_fixedsize_add_memory_pressure,
+    );
+    cpa1!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_add_memory_pressure",
+        "majit_rlib::ll_raw_malloc_fixedsize_zero_add_memory_pressure",
+        majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_add_memory_pressure,
+    );
+    cpa1!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_no_track_allocation",
+        "majit_rlib::ll_raw_malloc_fixedsize_no_track_allocation",
+        majit_rlib::rffi::ll_raw_malloc_fixedsize_no_track_allocation,
+    );
+    cpa1!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_no_track_allocation",
+        "majit_rlib::ll_raw_malloc_fixedsize_zero_no_track_allocation",
+        majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_no_track_allocation,
+    );
+    cpa1!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation",
+        "majit_rlib::ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation",
+        majit_rlib::rffi::ll_raw_malloc_fixedsize_add_memory_pressure_no_track_allocation,
+    );
+    cpa1!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation",
+        "majit_rlib::ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation",
+        majit_rlib::rffi::ll_raw_malloc_fixedsize_zero_add_memory_pressure_no_track_allocation,
+    );
+    cpa3!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_varsize",
+        "majit_rlib::ll_raw_malloc_varsize",
+        majit_rlib::rffi::ll_raw_malloc_varsize,
+    );
+    cpa3!(
+        &mut entries,
+        "majit_rlib::rffi::ll_raw_malloc_varsize_zero",
+        "majit_rlib::ll_raw_malloc_varsize_zero",
+        majit_rlib::rffi::ll_raw_malloc_varsize_zero,
+    );
+    cpa1!(
+        &mut entries,
         "majit_rlib::rffi::ll_raw_free",
         "majit_rlib::ll_raw_free",
         majit_rlib::rffi::ll_raw_free,
