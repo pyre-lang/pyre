@@ -160,10 +160,13 @@ fn saturating_arith_knowntype(result_ty: &crate::model::ValueType) -> Option<&'s
 /// annotation per external; a one-word `Vec<T>` is `RustVecRepr`
 /// (`rrustvec.rs rust_vec_lltype`) and its annotation is
 /// `Bookkeeper::project_rust_vec`. The front stamps that header on the
-/// call result (`front::mir stamp_rust_vec_header`). Insert the item-kind
-/// letter before the leaf, the way [`saturating_arith_registry_key`]
-/// inserts `specialize.py specialize_argtype`'s knowntype, so the MIR
-/// path — and the fnaddr it residualizes — stays the untyped spelling.
+/// call result (`front::mir stamp_rust_vec_header`). Insert the item
+/// lowleveltype segment before the leaf, the way
+/// [`saturating_arith_registry_key`] inserts `specialize.py
+/// specialize_argtype`'s knowntype, so the MIR path — and the fnaddr it
+/// residualizes — stays the untyped spelling. `rlist.py` `ll_copy`
+/// specializes per LIST type; `llannotation.py` `lltype_to_annotation`
+/// keeps `Signed` and `Unsigned` distinct.
 pub(crate) fn is_alloc_slice_to_vec(segments: &[String]) -> bool {
     matches!(
         segments,
@@ -171,10 +174,18 @@ pub(crate) fn is_alloc_slice_to_vec(segments: &[String]) -> bool {
     )
 }
 
-/// Registry key for a one-word `to_vec` result. `None` when `segments`
-/// is not `<[T]>::to_vec`, or when the result lltype is not a
-/// [`crate::translator::rtyper::rrustvec::rust_vec_lltype`] header (the
-/// untyped `GCREF` row stays the fallback).
+/// Registry key for a one-word `to_vec` result.
+///
+/// The extra segment is the header's item lowleveltype
+/// ([`crate::translator::rtyper::rrustvec::rust_vec_item_key_segment`] of
+/// [`crate::translator::rtyper::rrustvec::rust_vec_item_lltype`]).
+/// `rlist.py` `ll_copy` specializes per LIST type, and
+/// `llannotation.py` `lltype_to_annotation` keeps `Signed` and
+/// `Unsigned` distinct. `None` when `segments` is not `<[T]>::to_vec`,
+/// when the result lltype is not a
+/// [`crate::translator::rtyper::rrustvec::rust_vec_lltype`] header, or
+/// when the item lowleveltype has no segment. The untyped `GCREF` row
+/// stays the fallback.
 pub(crate) fn to_vec_registry_key(
     segments: &[String],
     result_concretetype: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
@@ -182,11 +193,13 @@ pub(crate) fn to_vec_registry_key(
     if !is_alloc_slice_to_vec(segments) {
         return None;
     }
-    let kind = crate::translator::rtyper::rrustvec::rust_vec_item_kind(result_concretetype?)?;
+    let header = result_concretetype?;
+    let item = crate::translator::rtyper::rrustvec::rust_vec_item_lltype(header)?;
+    let segment = crate::translator::rtyper::rrustvec::rust_vec_item_key_segment(item)?;
     let n = segments.len();
     let mut keyed = Vec::with_capacity(n + 1);
     keyed.extend_from_slice(&segments[..n - 1]);
-    keyed.push(kind.kind_char().to_string());
+    keyed.push(segment.to_string());
     keyed.push(segments[n - 1].clone());
     Some(FunctionPathKey::from_segments(keyed))
 }
