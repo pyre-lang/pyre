@@ -2032,9 +2032,23 @@ fn save_module_content_for_future_reload(w_mod: PyObjectRef) -> Result<(), crate
 
 /// `module.py init_extra_module_attrs`.
 fn init_extra_module_attrs(w_dict: PyObjectRef) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict);
     for extra in ["__package__", "__loader__", "__spec__"] {
-        if unsafe { pyre_object::dictmultiobject::w_dict_getitem_str(w_dict, extra) }.is_none() {
-            crate::module_ns_store(w_dict, extra, pyre_object::w_none());
+        if unsafe {
+            pyre_object::dictmultiobject::w_dict_getitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                extra,
+            )
+        }
+        .is_none()
+        {
+            crate::module_ns_store(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                extra,
+                pyre_object::w_none(),
+            );
         }
     }
 }
@@ -4782,11 +4796,11 @@ fn exec_code_module(
     // pointer with no surprises.
     if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__builtins__") }.is_none() {
         let ctx = unsafe { &*execution_context };
-        let w_builtin = ctx.get_builtin();
+        let mut w_builtin = pyre_object::with_roots!(w_code, w_globals => ctx.get_builtin());
         if !w_builtin.is_null() {
-            unsafe {
+            pyre_object::with_roots!(w_code, w_globals, w_builtin => unsafe {
                 pyre_object::w_dict_setitem_str(w_globals, "__builtins__", w_builtin);
-            }
+            });
         }
     }
     // importing.py:275-298 write_paths block.  Pyre callers always pass
@@ -4795,23 +4809,25 @@ fn exec_code_module(
     if let Some(p) = pathname {
         // importing.py:284 setitem('__file__', w_pathname).
         // `importing.py` `space.newfilename` / `newutf8` copies the path once.
-        let w_pathname = pyre_object::with_roots!(w_code, w_globals => {
+        let mut w_pathname = pyre_object::with_roots!(w_code, w_globals => {
             pyre_object::w_str_from_wtf8_managed_borrowed(p)
         });
-        unsafe {
+        pyre_object::with_roots!(w_code, w_globals, w_pathname => unsafe {
             pyre_object::w_dict_setitem_str(w_globals, "__file__", w_pathname);
-        }
+        });
         // importing.py:285 setitem('__cached__', w_cpathname).  PyPy
         // surfaces `space.w_None` when `cpathname is None`, i.e. the
         // import was not satisfied from a `.pyc`.  Pyre has no .pyc
         // path today so reachable callers still hit the None arm.
-        let w_cpathname = match cpathname {
-            Some(c) => pyre_object::w_str_from_wtf8_managed_borrowed(c),
+        let mut w_cpathname = match cpathname {
+            Some(c) => pyre_object::with_roots!(w_code, w_globals => {
+                pyre_object::w_str_from_wtf8_managed_borrowed(c)
+            }),
             None => pyre_object::w_none(),
         };
-        unsafe {
+        pyre_object::with_roots!(w_code, w_globals, w_cpathname => unsafe {
             pyre_object::w_dict_setitem_str(w_globals, "__cached__", w_cpathname);
-        }
+        });
         // importing.py:286-298 — `_fix_up_module(d, name, pathname,
         // cpathname)` sets `__spec__`/`__loader__`/`__file__`/`__cached__`
         // from the app-level `SourceFileLoader` + `spec_from_file_location`
@@ -4822,14 +4838,14 @@ fn exec_code_module(
         if !pyre_object::with_roots!(w_code, w_globals => fix_up_source_module_spec(w_globals, p, cpathname))?
         {
             if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__loader__") }.is_none() {
-                unsafe {
+                pyre_object::with_roots!(w_code, w_globals => unsafe {
                     pyre_object::w_dict_setitem_str(w_globals, "__loader__", pyre_object::w_none());
-                }
+                });
             }
             if unsafe { pyre_object::w_dict_getitem_str(w_globals, "__spec__") }.is_none() {
-                unsafe {
+                pyre_object::with_roots!(w_code, w_globals => unsafe {
                     pyre_object::w_dict_setitem_str(w_globals, "__spec__", pyre_object::w_none());
-                }
+                });
             }
         }
     }

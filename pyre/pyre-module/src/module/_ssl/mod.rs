@@ -359,11 +359,22 @@ fn password_bytes(mut obj: PyObjectRef) -> Result<Option<Vec<u8>>, pyre_interpre
 }
 
 fn dict_from_pairs(items: &[(&str, PyObjectRef)]) -> PyObjectRef {
-    let dict = w_dict_new();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_dict_new());
     for (key, value) in items {
-        unsafe { w_dict_setitem_str(dict, key, *value) };
+        let _iter = pyre_object::gc_roots::push_roots();
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(*value);
+        unsafe {
+            w_dict_setitem_str(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                key,
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            )
+        };
     }
-    dict
+    pyre_object::gc_roots::shadow_stack_get(dict_slot)
 }
 
 fn dict_put(dict_slot: usize, key: &str, value: PyObjectRef) {

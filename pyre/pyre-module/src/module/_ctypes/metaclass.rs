@@ -582,9 +582,11 @@ fn pointer_set_type(args: &[PyObjectRef]) -> PyResult {
     data.length = 1;
     data.proto = Some(proto);
     data.flags |= stginfo::TYPEFLAG_ISPOINTER;
-    let info = pyre_object::with_roots!(pointer_cls, proto => stginfo::stginfo_new(data));
-    stginfo::stginfo_set(pointer_cls, info);
-    set_type_attr(pointer_cls, "_type_", proto);
+    let mut info = pyre_object::with_roots!(pointer_cls, proto => stginfo::stginfo_new(data));
+    pyre_object::with_roots!(pointer_cls, proto, info => {
+        stginfo::stginfo_set(pointer_cls, info);
+        set_type_attr(pointer_cls, "_type_", proto);
+    });
     if let Some(info) = stginfo::stginfo_of(proto) {
         stginfo::stginfo_set_pointer_type(info, pointer_cls);
     }
@@ -689,16 +691,18 @@ fn simple_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     if cfield::simple_type_is_pointer(&tc) {
         data.flags |= stginfo::TYPEFLAG_ISPOINTER;
     }
-    let info = pyre_object::with_roots!(cls => stginfo::stginfo_new(data));
-    stginfo::stginfo_set(cls, info);
+    let mut info = pyre_object::with_roots!(cls => stginfo::stginfo_new(data));
+    pyre_object::with_roots!(cls, info => stginfo::stginfo_set(cls, info));
 
     let endian_capable = matches!(
         tc.as_str(),
         "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L" | "q" | "Q" | "f" | "d" | "g"
     );
     if endian_capable && size == 1 {
-        set_type_attr(cls, "__ctype_le__", cls);
-        set_type_attr(cls, "__ctype_be__", cls);
+        pyre_object::with_roots!(cls => {
+            set_type_attr(cls, "__ctype_le__", cls);
+            set_type_attr(cls, "__ctype_be__", cls);
+        });
     } else if endian_capable && own_dict_get(cls, "_ctypes_native_peer").is_none() {
         // The namespace `dict` moves: each insertion allocates the key string
         // and may grow the dict, and building the swapped class allocates
@@ -1024,9 +1028,11 @@ fn struct_union_init_stginfo(mut cls: PyObjectRef, is_union: bool) -> PyResult {
                     let mut data = StgInfoData::new(size, align, paramfunc);
                     data.length = pyre_object::with_roots!(base_info, cls => stginfo::stginfo_length(base_info));
                     // Cleared FINAL / pointer_type on the clone; mark base FINAL.
-                    let info =
+                    let mut info =
                         pyre_object::with_roots!(base_info, cls => stginfo::stginfo_new(data));
-                    stginfo::stginfo_set(cls, info);
+                    pyre_object::with_roots!(base_info, cls, info => {
+                        stginfo::stginfo_set(cls, info)
+                    });
                     stginfo::stginfo_mark_final(base_info);
                 }
                 None => {
@@ -2235,11 +2241,13 @@ fn own_dict_get(cls: PyObjectRef, key: &str) -> Option<PyObjectRef> {
 }
 
 /// Store a class attribute directly and invalidate the type cache for it.
-fn set_type_attr(cls: PyObjectRef, key: &str, value: PyObjectRef) {
-    if pyre_interpreter::type_dict_store(cls, key, value) {
-        pyre_object::gc_hook::try_gc_write_barrier(cls as pyre_object::gc_hook::GCREF);
-        unsafe { pyre_interpreter::baseobjspace::mutated(cls, key) };
-    }
+fn set_type_attr(mut cls: PyObjectRef, key: &str, mut value: PyObjectRef) {
+    pyre_object::with_roots!(cls, value => {
+        if pyre_interpreter::type_dict_store(cls, key, value) {
+            pyre_object::gc_hook::try_gc_write_barrier(cls as pyre_object::gc_hook::GCREF);
+            unsafe { pyre_interpreter::baseobjspace::mutated(cls, key) };
+        }
+    });
 }
 
 /// `cls.__name__`, read the way `type.__name__` reads it.
@@ -2351,11 +2359,15 @@ fn array_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     {
         data.flags |= stginfo::TYPEFLAG_HASPOINTER;
     }
-    let info = pyre_object::with_roots!(cls, elem => stginfo::stginfo_new(data));
-    stginfo::stginfo_set(cls, info);
-
-    set_type_attr(cls, "_type_", elem);
-    set_type_attr(cls, "_length_", pyre_object::w_int_new(length as i64));
+    let mut info = pyre_object::with_roots!(cls, elem => stginfo::stginfo_new(data));
+    pyre_object::with_roots!(cls, elem, info => {
+        stginfo::stginfo_set(cls, info);
+        set_type_attr(cls, "_type_", elem);
+    });
+    let mut w_length = pyre_object::w_int_new(length as i64);
+    pyre_object::with_roots!(cls, elem, w_length => {
+        set_type_attr(cls, "_length_", w_length)
+    });
 
     // Character arrays expose the CPython/PyPy convenience descriptors.
     match cdata::type_code_of(elem).as_deref() {
@@ -2398,9 +2410,14 @@ fn array_type_from_ctype(elem: PyObjectRef, n: usize) -> PyResult {
     let ns_slot = ns_roots.base();
     let _ = ns_roots.pin_root(pyre_object::w_dict_new());
     let w_length = pyre_object::w_int_new(n as i64);
+    let w_length_slot = ns_roots.pin_roots(&[w_length]);
     unsafe {
         pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_type_", roots.get(elem_slot));
-        pyre_object::w_dict_setitem_str(ns_roots.get(ns_slot), "_length_", w_length);
+        pyre_object::w_dict_setitem_str(
+            ns_roots.get(ns_slot),
+            "_length_",
+            ns_roots.get(w_length_slot),
+        );
     }
     let bases = ns_roots.pin_root(pyre_object::w_tuple_new(vec![array_type()]));
     let w_name = ns_roots.pin_root(pyre_object::w_str_new_managed(&name));
@@ -2994,12 +3011,12 @@ fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
                     pyre_object::with_roots!(cls, p => stginfo::field_align_of(p)).unwrap_or(1);
                 cls = roots.get(cls_slot);
                 p = roots.get(proto_slot);
-                let info = pyre_object::with_roots!(cls, p => stginfo::stginfo_new(StgInfoData::new(
+                let mut info = pyre_object::with_roots!(cls, p => stginfo::stginfo_new(StgInfoData::new(
                     size,
                     align,
                     ParamFunc::Simple
                 )));
-                stginfo::stginfo_set(p, info);
+                pyre_object::with_roots!(cls, p, info => stginfo::stginfo_set(p, info));
                 info
             }
         };

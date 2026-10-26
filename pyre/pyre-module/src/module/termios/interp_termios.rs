@@ -1106,6 +1106,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // `new_exception_class` with no bases derives from `Exception`, so
     // `termios.error` is not an OSError subclass; `convert_error` still names
     // it as the class to raise, which is what `except termios.error` catches.
+    ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
     let mut w_exception = pyre_interpreter::builtins::lookup_exc_class("Exception")
         .expect("Exception must be installed before termios init");
     let mut w_error = pyre_object::with_roots!(ns, w_exception => pyre_interpreter::builtins::new_exception_class(

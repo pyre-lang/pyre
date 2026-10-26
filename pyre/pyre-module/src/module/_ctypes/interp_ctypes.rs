@@ -1154,10 +1154,12 @@ pub(super) fn make_carg(
         let roots = pyre_object::gc_roots::push_roots();
         let dict_slot = roots.base();
         let _ = roots.pin_root(d);
+        let obj_slot = dict_slot + 1;
+        let _ = roots.pin_root(obj);
         let ptr = pyre_object::w_int_new(addr as i64);
         unsafe {
             pyre_object::w_dict_setitem_str(roots.get(dict_slot), "_ptr", ptr);
-            pyre_object::w_dict_setitem_str(roots.get(dict_slot), "_obj", obj);
+            pyre_object::w_dict_setitem_str(roots.get(dict_slot), "_obj", roots.get(obj_slot));
         }
     }
     carg
@@ -1183,4 +1185,3 @@ pub(super) fn carg_ptr(carg: pyre_object::PyObjectRef) -> usize {
         _ => 0,
     }
 }
-

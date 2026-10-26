@@ -92,8 +92,8 @@ fn native_store(name: &str, value: PyObjectRef) -> Result<(), PyError> {
 }
 
 fn get_default_action() -> Result<PyObjectRef, PyError> {
-    if let Some(action) = warnings_attr("defaultaction") {
-        native_store("_defaultaction", action)?;
+    if let Some(mut action) = warnings_attr("defaultaction") {
+        pyre_object::with_roots!(action => native_store("_defaultaction", action))?;
         Ok(action)
     } else {
         native_attr("_defaultaction")
@@ -101,8 +101,8 @@ fn get_default_action() -> Result<PyObjectRef, PyError> {
 }
 
 fn get_once_registry() -> Result<PyObjectRef, PyError> {
-    if let Some(registry) = warnings_attr("onceregistry") {
-        native_store("_onceregistry", registry)?;
+    if let Some(mut registry) = warnings_attr("onceregistry") {
+        pyre_object::with_roots!(registry => native_store("_onceregistry", registry))?;
         Ok(registry)
     } else {
         native_attr("_onceregistry")
@@ -356,13 +356,16 @@ fn get_filter(
     let text_slot = pin_root_slot(text);
     let module_slot = pin_root_slot(module);
     let filename_slot = pin_root_slot(filename);
-    let filters = if let Some(filters) = warnings_attr("filters") {
-        native_store("filters", filters)?;
-        filters
+    let filters_slot = if let Some(filters) = warnings_attr("filters") {
+        let filters_slot = pin_root_slot(filters);
+        native_store(
+            "filters",
+            pyre_object::gc_roots::shadow_stack_get(filters_slot),
+        )?;
+        filters_slot
     } else {
-        native_attr("filters")?
+        pin_root_slot(native_attr("filters")?)
     };
-    let filters_slot = pin_root_slot(filters);
     // PyPy `space.fixedview(w_filters)` snapshots any iterable before the
     // loop because user code may mutate `warnings.filters` while matching.
     let items =

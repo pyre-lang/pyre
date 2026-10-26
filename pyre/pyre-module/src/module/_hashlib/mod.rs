@@ -1174,7 +1174,7 @@ pyre_interpreter::py_module! {
             )
         };
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "new") } {
-            function = wrap_hash_factory(function, 1);
+            function = pyre_object::with_roots!(ns => wrap_hash_factory(function, 1));
             pyre_interpreter::__pyre_store!(ns, "new", function);
         }
         for name in [
@@ -1192,7 +1192,7 @@ pyre_interpreter::py_module! {
             "openssl_shake_256",
         ] {
             if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, name) } {
-                function = wrap_hash_factory(function, 1);
+                function = pyre_object::with_roots!(ns => wrap_hash_factory(function, 1));
                 pyre_interpreter::__pyre_store!(ns, name, function);
             }
         }
@@ -1205,11 +1205,11 @@ pyre_interpreter::py_module! {
             pyre_interpreter::__pyre_store!(ns, "pbkdf2_hmac", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "scrypt") } {
-            function = pyre_interpreter::function_set_kwonly_defaults!(
+            function = pyre_object::with_roots!(ns => pyre_interpreter::function_set_kwonly_defaults!(
                 function,
                 "maxmem" => pyre_object::w_int_new(0),
                 "dklen" => pyre_object::w_int_new(64),
-            );
+            ));
             pyre_interpreter::__pyre_store!(ns, "scrypt", function);
         }
         // [3.14-spec] PyPy owns `HMAC` as the ordinary app-level

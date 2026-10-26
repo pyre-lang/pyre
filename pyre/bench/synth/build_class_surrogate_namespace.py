@@ -140,3 +140,70 @@ def main():
 
 
 main()
+
+# `_set_names` then `_init_subclass` then the cell check.
+class Desc:
+    def __set_name__(self, owner, name):
+        owner.method.__closure__[0].cell_contents = 123
+class Base:
+    def __init_subclass__(cls, **kw):
+        cls.method.__closure__[0].cell_contents = cls
+class C(Base):
+    d = Desc()
+    def method(self): return __class__
+print("repaired", C().method() is C)
+
+class Base300:
+    def __init_subclass__(cls, **kw):
+        cls.method.__closure__[0].cell_contents = "x" * 300
+try:
+    class C300(Base300):
+        def method(self): return __class__
+except TypeError as e:
+    print(type(e).__name__, str(e).startswith("__class__ set to"))
+
+class DescHook:
+    def __set_name__(self, owner, name):
+        owner.method.__closure__[0].cell_contents = 5
+class BaseHook:
+    def __init_subclass__(cls, **kw):
+        raise KeyError("hook")
+try:
+    class CHook(BaseHook):
+        d = DescHook()
+        def method(self): return __class__
+except Exception as e:
+    print(type(e).__name__, str(e))
+
+# cell bound when MRO fails (`allocate_instance` then `_store_type_in_classcell`)
+grab = []
+try:
+    class C(object, object):
+        def f(self): return __class__
+        grab.append(f)
+except TypeError as e:
+    print("dup", type(e).__name__)
+try:
+    v = grab[0].__closure__[0].cell_contents
+    print("cell bound", type(v).__name__, v.__name__)
+except ValueError:
+    print("cell empty")
+
+# empty-cell RuntimeError: prefix of the `builtin___build_class__` message
+class PopCell(type):
+    def __new__(mcs, name, bases, ns):
+        ns.pop("__classcell__", None)
+        return super().__new__(mcs, name, bases, ns)
+try:
+    class EmptyCell(metaclass=PopCell):
+        def method(self):
+            return __class__
+except RuntimeError as e:
+    print(type(e).__name__, str(e).startswith("__class__ not set defining"))
+
+# non-cell `__classcell__`: prefix of the `type_new_set_classcell` TypeError
+try:
+    class E:
+        __classcell__ = 1
+except TypeError as e:
+    print(type(e).__name__, str(e).startswith("__classcell__ must be a nonlocal cell, not"))

@@ -117,26 +117,23 @@ pyre_interpreter::py_module! {
                 1,
             )
         );
-        pyre_interpreter::__pyre_store!(
-            ns,
-            "isclose",
-            pyre_interpreter::function_set_kwonly_defaults!(
-                pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
-                    "isclose",
-                    m::__majit_wrap_math_isclose,
-                    pyre_interpreter::HOPELESS,
-                    pyre_interpreter::Signature::new(
-                        vec!["a", "b", "rel_tol", "abs_tol"],
-                        None,
-                        None,
-                        2,
-                        0,
-                    ),
+        let mut isclose = pyre_object::with_roots!(ns => pyre_interpreter::function_set_kwonly_defaults!(
+            pyre_interpreter::make_module_builtin_function_with_arity_and_sig(
+                "isclose",
+                m::__majit_wrap_math_isclose,
+                pyre_interpreter::HOPELESS,
+                pyre_interpreter::Signature::new(
+                    vec!["a", "b", "rel_tol", "abs_tol"],
+                    None,
+                    None,
+                    2,
+                    0,
                 ),
-                "rel_tol" => pyre_object::floatobject::w_float_new(1e-9),
-                "abs_tol" => pyre_object::floatobject::w_float_new(0.0),
-            )
-        );
+            ),
+            "rel_tol" => pyre_object::floatobject::w_float_new(1e-9),
+            "abs_tol" => pyre_object::floatobject::w_float_new(0.0),
+        ));
+        pyre_interpreter::__pyre_store!(ns, "isclose", isclose);
         let install2 = |mut ns: pyre_object::PyObjectRef,
                         name: &'static str,
                         func: pyre_interpreter::BuiltinCodeFn| {
@@ -161,17 +158,19 @@ pyre_interpreter::py_module! {
             pyre_interpreter::__pyre_store!(ns, "perm", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "prod") } {
-            function = pyre_interpreter::function_set_kwonly_defaults!(
+            function = pyre_object::with_roots!(ns => pyre_interpreter::function_set_kwonly_defaults!(
                 function,
                 "start" => pyre_object::w_int_new(1),
-            );
+            ));
             pyre_interpreter::__pyre_store!(ns, "prod", function);
         }
         if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "nextafter") } {
-            function = pyre_interpreter::function_set_kwonly_default_pairs(
-                function,
-                &[("steps", pyre_object::w_none())],
-            );
+            function = pyre_object::with_roots!(ns => {
+                pyre_interpreter::function_set_kwonly_default_pairs(
+                    function,
+                    &[("steps", pyre_object::w_none())],
+                )
+            });
             pyre_interpreter::__pyre_store!(ns, "nextafter", function);
         }
     },

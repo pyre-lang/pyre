@@ -181,9 +181,13 @@ fn type_error_names_the_installed_class() -> bool {
     let Some(&lifeline) = BUILTIN_TYPE_ERROR.get() else {
         return false;
     };
-    let installed =
+    let mut installed =
         pyre_interpreter::module::_weakref::interp__weakref::dereference(lifeline as PyObjectRef);
-    !installed.is_null() && builtin_type_error().is_some_and(|now| std::ptr::eq(now, installed))
+    if installed.is_null() {
+        return false;
+    }
+    pyre_object::with_roots!(installed => builtin_type_error())
+        .is_some_and(|now| std::ptr::eq(now, installed))
 }
 
 /// The installed `__contains__`, the code object it currently holds and its two

@@ -147,7 +147,7 @@ pub extern "C" fn jit_load_name_from_namespace(
     // honoured exactly as before.
     let frame = frame_anchor.live();
     let w_builtin = if !frame.is_null() {
-        unsafe { (*frame).get_builtin() }
+        pyre_object::with_roots!(w_globals => unsafe { (*frame).get_builtin() })
     } else {
         std::ptr::null_mut()
     };

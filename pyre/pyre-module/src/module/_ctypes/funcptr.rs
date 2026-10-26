@@ -3312,14 +3312,16 @@ fn make_aggregate_instance(
         pyre_object::w_bytearray_data_mut(ba)[..n].copy_from_slice(&bytes[..n]);
     }
     let mut obj = pyre_object::w_instance_new(ty);
-    let d =
+    let mut d =
         pyre_object::with_roots!(ba, obj => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return Err(pyre_interpreter::PyError::type_error(
             "aggregate instance has no instance dict",
         ));
     }
-    unsafe { pyre_object::w_dict_setitem_str(d, "_b_", ba) };
+    pyre_object::with_roots!(ba, obj, d => unsafe {
+        pyre_object::w_dict_setitem_str(d, "_b_", ba)
+    });
     Ok(obj)
 }
 

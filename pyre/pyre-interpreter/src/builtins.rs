@@ -4286,7 +4286,7 @@ pub fn install_default_builtins(mut ns: PyObjectRef) {
             import_error,
         )
     );
-    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error => {
+    pyre_object::with_roots!(base_exc, exception, runtime_error, value_error, import_error => {
         crate::__pyre_store!(ns, "ModuleNotFoundError", exc_type);
     });
     let mut exc_type = pyre_object::with_roots!(ns, base_exc, exception, runtime_error, value_error, import_error => make_exc_type_with_doc(
@@ -7379,9 +7379,10 @@ pub(crate) fn py_repr_clipped_200(
 /// offending type with `%T` (`not int`). `typeobject.c type_new_set_classcell`
 /// (and `type_new_set_classdictcell`) use `%.200R` of `Py_TYPE(cell)`
 /// (`not <class 'int'>`; a metaclass `__repr__` returning `"custom-repr"`
-/// yields `not custom-repr`). Artefact: v3.15.1 `Objects/typeobject.c` plus
-/// a 3.15.1t measurement. A raising `__repr__` leaves that exception in
-/// place: `_PyErr_FormatV` returns without setting the TypeError.
+/// yields `not custom-repr`). Artefact:
+/// `Objects/typeobject.c type_new_set_classcell` read at v3.15.0 and
+/// v3.15.1. A raising `__repr__` leaves that exception in place:
+/// `_PyErr_FormatV` returns without setting the TypeError.
 pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyError {
     let rendered = match crate::typedef::r#type(value) {
         Some(w_valtype) => match py_repr_clipped_200(w_valtype.as_ptr()) {
@@ -19899,7 +19900,7 @@ pub fn exec_or_eval(
     }
 
     fn ensure_eval_builtins(
-        w_globals: pyre_object::PyObjectRef,
+        mut w_globals: pyre_object::PyObjectRef,
         exec_ctx: *const crate::PyExecutionContext,
     ) -> Result<(), crate::PyError> {
         // pypy/module/__builtin__/compiling.py eval:
@@ -19912,7 +19913,9 @@ pub fn exec_or_eval(
         // not fire for eval() in PyPy.  Dispatch on the dict object so
         // the str-keyed write fans into the storage proxy.
         let w_builtin = if !exec_ctx.is_null() {
-            planted_builtins(unsafe { (*exec_ctx).get_builtin() })
+            planted_builtins(
+                pyre_object::with_roots!(w_globals => unsafe { (*exec_ctx).get_builtin() }),
+            )
         } else {
             pyre_object::PY_NULL
         };
@@ -19943,7 +19946,7 @@ pub fn exec_or_eval(
     }
 
     fn ensure_exec_builtins(
-        w_globals: pyre_object::PyObjectRef,
+        mut w_globals: pyre_object::PyObjectRef,
         caller_frame: *const crate::PyFrame,
         exec_ctx: *const crate::PyExecutionContext,
     ) -> Result<(), crate::PyError> {
@@ -19957,13 +19960,15 @@ pub fn exec_or_eval(
         // through to the EC default.  The receiver is the ORIGINAL
         // `w_globals` object so a dict-subclass `setdefault` override
         // fires.
-        let w_builtin = if !caller_frame.is_null() {
-            planted_builtins(unsafe { (*caller_frame).get_builtin() })
-        } else if !exec_ctx.is_null() {
-            planted_builtins(unsafe { (*exec_ctx).get_builtin() })
-        } else {
-            pyre_object::PY_NULL
-        };
+        let w_builtin = pyre_object::with_roots!(w_globals => {
+            if !caller_frame.is_null() {
+                planted_builtins(unsafe { (*caller_frame).get_builtin() })
+            } else if !exec_ctx.is_null() {
+                planted_builtins(unsafe { (*exec_ctx).get_builtin() })
+            } else {
+                pyre_object::PY_NULL
+            }
+        });
         if w_builtin.is_null() || w_globals.is_null() {
             return Ok(());
         }

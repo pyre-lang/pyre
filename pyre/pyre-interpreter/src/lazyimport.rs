@@ -981,7 +981,9 @@ pub fn eval_lazy_import_name(
     if !lazy {
         return crate::importing::import_name(frame, name, fromlist, level_obj);
     }
-    let mut builtins = builtins_mapping_from_frame(frame);
+    let mut builtins = pyre_object::with_roots!(fromlist, level_obj, name => {
+        builtins_mapping_from_frame(frame)
+    });
     let lazy_import_func = if builtins.is_null() {
         None
     } else {

@@ -179,15 +179,29 @@ pub(crate) fn install_applevel_builtins() {
     // `StoreBare` — MixedModule._load_lazily writes the applevel
     // BuiltinFunction once, and LOAD_GLOBAL then folds to ConstPtr.
     let _roots = pyre_object::gc_roots::push_roots();
+    let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(builtins);
     let sorted_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(handles[SORTED] as PyObjectRef);
     let sum_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(handles[SUM] as PyObjectRef);
     if sorted_placeholder {
-        publish_one(builtins, "sorted", sorted_slot, SIGS[SORTED], ctx);
+        publish_one(
+            pyre_object::gc_roots::shadow_stack_get(builtins_slot),
+            "sorted",
+            sorted_slot,
+            SIGS[SORTED],
+            ctx,
+        );
     }
     if sum_placeholder {
-        publish_one(builtins, "sum", sum_slot, SIGS[SUM], ctx);
+        publish_one(
+            pyre_object::gc_roots::shadow_stack_get(builtins_slot),
+            "sum",
+            sum_slot,
+            SIGS[SUM],
+            ctx,
+        );
     }
 }
 
@@ -236,8 +250,8 @@ fn publish_one(
     unsafe {
         crate::function::fset_func_text_signature(func, sig);
     }
-    let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
     let w_builtin = unsafe { (*ctx).get_builtin() };
+    let func = pyre_object::gc_roots::shadow_stack_get(func_slot);
     unsafe {
         crate::function::builtin_function_set_module_obj(func, w_builtin);
     }
