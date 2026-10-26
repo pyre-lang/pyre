@@ -8879,6 +8879,32 @@ impl<'a> Transformer<'a> {
                 }]);
             }
         }
+        // `jtransform.py rewrite_op_getfield`: a raw STRUCT with
+        // `(kind, pure) == ('r', '')` raises. The assembler keys raw vs gc
+        // off the *base register* (`is_gc = kc == 'r'`), not the owner's
+        // recorded gckind. When that base is already Int, stamp the loaded
+        // word into the int bank so assemble emits `getfield_raw_i`.
+        // Immutable fields already returned `_pure` above
+        // (`MapNodeTerminatorView.w_cls`).
+        if let OpKind::FieldRead { base, pure, .. } = &op.kind
+            && !*pure
+            && self.get_value_kind_var(base) == 'i'
+            && op
+                .result
+                .as_ref()
+                .is_some_and(|r| self.get_value_kind_var(r) == 'r')
+        {
+            self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::FieldRead {
+                    base: base.clone(),
+                    field: field.clone(),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+            }]);
+        }
         if &typed_ty != ty {
             let OpKind::FieldRead { base, pure, .. } = &op.kind else {
                 return RewriteResult::Keep;
@@ -18867,6 +18893,247 @@ mod tests {
         );
         let field = FieldDescriptor::new("count", Some(owner.into())).with_taken_by_address(true);
         assert_eq!(wide_inline_borrow_offset(&field, Some(&cc)), None);
+    }
+
+    /// `PinnedResult.roots` is a one-word raw nested struct. A rtyped
+    /// `Ptr(raw)` base is Signed; a leftover Ref result would assemble
+    /// `getfield_raw_r`, which `jtransform.py rewrite_op_getfield` raises
+    /// for. The borrow is `rewrite_op_getsubstruct` (`int_add` / identity
+    /// at offset 0) so the result stays in the int bank.
+    #[test]
+    fn raw_one_word_struct_borrow_from_int_base_is_not_getfield_raw_r() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "executioncontext::PinnedResult";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "roots".into(),
+                        offset: 0,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Struct,
+                        field_type: majit_ir::value::Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "base".into(),
+                        offset: word,
+                        size: word,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
+
+        let mut graph = FunctionGraph::new("reload");
+        let pinned =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, pinned.clone());
+        let roots = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: pinned,
+                    field: FieldDescriptor::new("roots", Some(owner.into()))
+                        .with_taken_by_address(true)
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(roots));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "one-word raw struct borrow must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A by-value load of that same one-word nested struct from a Signed
+    /// base is still `getfield_raw_*`. `rewrite_op_getfield` raises
+    /// `getfield_raw_r` without `_pure`, so the result must stay in the
+    /// int bank (`getfield_raw_i`).
+    #[test]
+    fn raw_one_word_struct_value_from_int_base_is_getfield_raw_i() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "executioncontext::PinnedResultValue";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 2 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "roots".into(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
+
+        let mut graph = FunctionGraph::new("reload_value");
+        let pinned =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, pinned.clone());
+        let roots = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: pinned,
+                    field: FieldDescriptor::new("roots", Some(owner.into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(roots));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.keys().any(|k| k.starts_with("getfield_raw_i")),
+            "one-word raw struct value must assemble getfield_raw_i, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "one-word raw struct value must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A GC-pointer word on a raw owner is an address. Loading it as Ref
+    /// from a Signed base is `getfield_raw_r`, which
+    /// `jtransform.py rewrite_op_getfield` raises for unless `_pure`.
+    #[test]
+    fn raw_pointer_field_from_int_base_is_getfield_raw_i() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::model::FieldDescriptor;
+
+        let owner = "executioncontext::PinnedResultPtr";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let word = crate::layout::target_word_size();
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "cell".into(),
+                    offset: 0,
+                    size: word,
+                    flag: majit_ir::descr::ArrayFlag::Pointer,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_storage(&[crate::StructStorageDescriptor::raw(owner)]);
+
+        let mut graph = FunctionGraph::new("reload_ptr");
+        let pinned =
+            graph.alloc_value_var_with_type(crate::codewriter::type_state::ConcreteType::Signed);
+        graph.push_inputarg_var(graph.startblock, pinned.clone());
+        let cell = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: pinned,
+                    field: FieldDescriptor::new("cell", Some(owner.into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Ref(None),
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(cell));
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            !asm.insns.keys().any(|k| k.starts_with("getfield_raw_r")),
+            "raw pointer field must not assemble getfield_raw_r, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
     }
 
     /// `&mut s.tags` on a raw `#[repr(C)]` holder is `int_add` of the

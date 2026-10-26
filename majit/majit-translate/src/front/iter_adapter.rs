@@ -827,7 +827,9 @@ fn emit_call_mut(
             result_ty: ValueType::Ref(Some(tuple_owner.clone())),
         },
     });
-    if let Some((value, value_ty, class_root)) = arg {
+    if let Some((value, value_ty, class_root)) =
+        arg.filter(|_| majit_ir::descr::is_shaped_tuple_name(&tuple_owner))
+    {
         let value = emit_narrow(graph, block, value, &class_root);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
@@ -1934,7 +1936,7 @@ mod tests {
             call_once_owner: "test::closure".into(),
             payload_ty: ValueType::Int,
             payload_class_root: None,
-            args_tuple_suffix: String::new(),
+            args_tuple_suffix: "<i64>".into(),
             call_result_ty: ValueType::Ref(None),
             inner_item_ty: ValueType::Int,
             rust_vec_kind: None,

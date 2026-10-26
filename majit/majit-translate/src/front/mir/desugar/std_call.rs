@@ -4695,7 +4695,7 @@ impl<'a> Lowering<'a> {
     ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
         let owner = tyref_positional_aggregate_root(tuple_ty, self.llbc)
-            .unwrap_or_else(|| format!("Tuple{}", tyref_tuple_suffix(tuple_ty, self.llbc)));
+            .expect("emit_tuple_clone only reads a shaped tuple");
         let ty = tuple_element_field_value_type(
             elem_ty,
             Some(clone_tyref(elem_ty)),
@@ -4728,6 +4728,9 @@ impl<'a> Lowering<'a> {
         tuple_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
+        if tyref_positional_aggregate_root(tuple_ty, self.llbc).is_none() {
+            return Ok(false);
+        }
         let mut cloned = Vec::new();
         let mut elem_tys = Vec::new();
         let mut idx = 0;

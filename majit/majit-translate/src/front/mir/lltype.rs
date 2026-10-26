@@ -6951,6 +6951,9 @@ pub(in crate::front::mir) fn type_node_is_sized_pointee(
 
 /// See [`Lowering::tyref_is_niche_option_ptr`].
 pub(in crate::front::mir) fn tyref_is_niche_option(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_option_payload_is_fn_ptr(ty, llbc) {
+        return true;
+    }
     if !crate::front::result_exc::tyref_is_option(ty, llbc) {
         return false;
     }
@@ -7514,13 +7517,17 @@ pub(in crate::front::mir) fn tyref_is_ptr_to_int_cast_origin(ty: &TyRef, llbc: &
 
 /// `Option<fn(..)>` — the nullable raw function pointer, one machine address.
 pub(in crate::front::mir) fn tyref_option_payload_is_fn_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
-    if !crate::front::result_exc::tyref_is_option(ty, llbc) {
-        return false;
+    if crate::front::result_exc::tyref_is_option(ty, llbc)
+        && let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc)
+    {
+        if tyref_node(&payload, llbc).is_some_and(|node| type_node_is_fn_ptr(node, llbc)) {
+            return true;
+        }
+        if majit_ir::descr::is_fn_ptr_spelling(&tyref_to_ast_string(&payload, llbc)) {
+            return true;
+        }
     }
-    crate::front::result_exc::tyref_option_payload(ty, llbc)
-        .as_ref()
-        .and_then(|payload| tyref_node(payload, llbc))
-        .is_some_and(|node| type_node_is_fn_ptr(node, llbc))
+    majit_ir::descr::is_option_of_fn_ptr_spelling(&tyref_to_ast_string(ty, llbc))
 }
 
 /// `class_root` of an `Int`-banked function-pointer parameter. `history.getkind`
@@ -7891,8 +7898,8 @@ pub(in crate::front::mir) fn node_is_dyn_trait(node: &serde_json::Value, llbc: &
 
 /// Strip the indirection wrappers a Charon type node can carry —
 /// `{"Deduplicated": id}` / `{"Value": [id, ty]}` /
-/// `{"Ref": [region, ty, kind]}` — and return the underlying type node
-/// (`Adt`, `TypeVar`, `Literal`, …).
+/// `{"HashConsedValue": [id, ty]}` / `{"Ref": [region, ty, kind]}` —
+/// and return the underlying type node (`Adt`, `TypeVar`, `Literal`, …).
 pub(in crate::front::mir) fn strip_ty_wrappers<'l>(
     mut node: &'l serde_json::Value,
     llbc: &'l Llbc,
@@ -7903,7 +7910,10 @@ pub(in crate::front::mir) fn strip_ty_wrappers<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj
+            .get("Value")
+            .or_else(|| obj.get("HashConsedValue"))
+            .and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -7918,8 +7928,9 @@ pub(in crate::front::mir) fn strip_ty_wrappers<'l>(
     None
 }
 
-/// Strip only the indirection wrappers — `{"Deduplicated": id}` and
-/// `{"Value": [id, ty]}` — leaving any `Ref` in place.
+/// Strip only the indirection wrappers — `{"Deduplicated": id}`,
+/// `{"Value": [id, ty]}`, and `{"HashConsedValue": [id, ty]}` — leaving any
+/// `Ref` in place.
 ///
 /// [`strip_ty_wrappers`] peels `Ref` too, and peels it repeatedly.  A caller
 /// that must account for exactly one reference level cannot use it: over
@@ -7934,7 +7945,10 @@ pub(in crate::front::mir) fn strip_ty_indirections<'l>(
             node = llbc.dedup_body(id)?;
             continue;
         }
-        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+        if let Some(arr) = obj
+            .get("Value")
+            .or_else(|| obj.get("HashConsedValue"))
+            .and_then(serde_json::Value::as_array)
             && arr.len() == 2
         {
             node = &arr[1];
@@ -9711,7 +9725,10 @@ pub(crate) fn charon_type_value_to_ast_string(
             None => format!("??unresolved_dedup#{id}"),
         };
     }
-    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+    if let Some(arr) = obj
+        .get("Value")
+        .or_else(|| obj.get("HashConsedValue"))
+        .and_then(serde_json::Value::as_array)
         && arr.len() == 2
     {
         return charon_type_value_to_ast_string(&arr[1], llbc, depth + 1);
@@ -10344,16 +10361,10 @@ pub(in crate::front::mir) fn tuple_shape_suffix(
 /// `__pos_N` write and read owners agree.  `""` for non-tuple / gate-off /
 /// unit; see [`tuple_shape_suffix`].
 pub(in crate::front::mir) fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
-    let value = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return String::new(),
-        },
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return String::new();
     };
-    value
-        .as_object()
+    node.as_object()
         .and_then(|m| m.get("Adt"))
         .and_then(serde_json::Value::as_object)
         .map(|adt| tuple_shape_suffix(adt, llbc))
@@ -10377,11 +10388,7 @@ pub(in crate::front::mir) fn tyref_tuple_element(
     idx: usize,
     llbc: &Llbc,
 ) -> Option<TyRef> {
-    let value = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
-    };
+    let value = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
     let adt = value.as_object()?.get("Adt")?;
     if type_decl_ref_builtin(adt) != Some("Tuple") {
         return None;
@@ -10421,13 +10428,8 @@ pub(in crate::front::mir) fn tyref_shaped_tuple_root(ty: &TyRef, llbc: &Llbc) ->
 /// destination/place [`TyRef`]. An unresolved const-generic length is kept
 /// bare and therefore outside the shaped-array allocation rewrite.
 pub(in crate::front::mir) fn tyref_array_suffix(ty: &TyRef, llbc: &Llbc) -> String {
-    let value = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return String::new(),
-        },
+    let Some(value) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return String::new();
     };
     let Some(array) = value
         .as_object()
@@ -10467,7 +10469,7 @@ pub(in crate::front::mir) fn tyref_positional_aggregate_root(
     ty: &TyRef,
     llbc: &Llbc,
 ) -> Option<String> {
-    let node = tyref_node(ty, llbc)?;
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let suffix = tyref_positional_aggregate_suffix(ty, llbc);
     if suffix.is_empty() {
         return None;
@@ -10546,13 +10548,8 @@ pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &
 pub(in crate::front::mir) fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: &Llbc) -> String {
     // 1. pull recv_ty.Adt.generics.types[0] exactly as
     //    tyref_option_payload_value_type does.
-    let body = match recv_ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return String::new(),
-        },
+    let Some(body) = tyref_node(recv_ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return String::new();
     };
     let Some(node) = body
         .get("Adt")
@@ -10580,12 +10577,11 @@ pub(in crate::front::mir) fn option_payload_tuple_suffix(recv_ty: &TyRef, llbc: 
 /// `tyref_tuple_suffix`, so reference erasure and generic rendering stay
 /// identical on the two sides.
 pub(in crate::front::mir) fn payload_tuple_suffix(payload: &TyRef, llbc: &Llbc) -> String {
-    let node = match payload {
-        TyRef::Inline { value: (_, value) } | TyRef::Other(value) => value.clone(),
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(value) => value.clone(),
-            None => return String::new(),
-        },
+    let Some(node) = tyref_node(payload, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .cloned()
+    else {
+        return String::new();
     };
     let wrapper = serde_json::json!({
         "Adt": {

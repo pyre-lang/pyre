@@ -4364,14 +4364,12 @@ impl StructLayout {
         immutable_field_ranks: &std::collections::HashMap<String, crate::model::ImmutableRank>,
         raw_alloc_flavor_structs: &HashSet<String>,
     ) -> Self {
-        // RPython: symbolic.get_array_token() computes itemsize for ANY struct,
-        // even those with nested structs. UnsupportedFieldExc only affects
-        // all_interiorfielddescrs (field enumeration), NOT the struct size.
-        // So we always compute the full size, but mark has_nested_struct to
-        // clear interior field descriptors.
-        let has_nested_struct = fields
-            .iter()
-            .any(|(_, type_str)| is_known_by_value_struct(known_structs, type_str));
+        // `symbolic.get_array_token` / `get_field_token` size the STRUCT
+        // including nested members. `heaptracker.all_interiorfielddescrs`
+        // raises `UnsupportedFieldExc` only for `array(struct(struct))`,
+        // not for the struct's own `_names`. Keep every named row so
+        // `getattr(STRUCT, fieldname)` can still resolve it; nested
+        // members stay `FLAG_STRUCT` and `all_fielddescrs` recurses.
         let mut offset: usize = 0;
         let mut layout_fields = Vec::new();
         for (name, type_str) in fields {
@@ -4401,13 +4399,25 @@ impl StructLayout {
                 known_struct_sizes,
                 raw_alloc_flavor_structs,
             );
+            let rank = immutable_field_ranks.get(name).copied();
             if field_type == majit_ir::value::Type::Void || field_size == 0 {
+                // `lltype.Void` still occupies a `_names` slot
+                // (`_names_without_voids` only drops it from descr
+                // enumeration). Keep the named ZST so a later
+                // `getattr(STRUCT, fieldname)` hits the layout row.
+                layout_fields.push(StructFieldLayout {
+                    name: name.clone(),
+                    offset,
+                    size: 0,
+                    flag,
+                    field_type,
+                    rank,
+                });
                 continue;
             }
             // RPython: alignment is typically min(field_size, WORD).
             let align = field_size.min(crate::layout::target_word_size());
             offset = (offset + align - 1) & !(align - 1);
-            let rank = immutable_field_ranks.get(name).copied();
             layout_fields.push(StructFieldLayout {
                 name: name.clone(),
                 offset,
@@ -4417,13 +4427,6 @@ impl StructLayout {
                 rank,
             });
             offset += field_size;
-        }
-        // RPython: heaptracker.py:89-90 — if nested struct exists,
-        // all_interiorfielddescrs raises UnsupportedFieldExc, so
-        // interior field descriptors are not enumerable. Clear fields
-        // but keep the correct size.
-        if has_nested_struct {
-            layout_fields.clear();
         }
         let max_align = fields
             .iter()
@@ -4474,13 +4477,12 @@ impl StructLayout {
     /// the C compiler); the heuristic only approximates `#[repr(C)]`, and
     /// `#[repr(Rust)]` reorders/repacks fields, so the approximation can
     /// disagree with the real allocation. Each present field's offset is
-    /// overwritten from `exact_offsets`. Fields the heuristic dropped (it
-    /// clears the field list when a nested struct makes interior offsets
-    /// unknown — but here every offset is known exactly) are re-synthesised
-    /// from `rows` at their exact offsets, so every field resolves through
-    /// `fielddescrof`'s struct-layout lookup rather than a tag-unaware
-    /// recompute. Per-field type/size/immutability classification stays as
-    /// computed from the type strings.
+    /// overwritten from `exact_offsets`. Fields the sequential walk dropped
+    /// (typeptr / padding, or a row whose exact offset was unknown then)
+    /// are re-synthesised from `rows` at their exact offsets, so every
+    /// field resolves through `fielddescrof`'s struct-layout lookup rather
+    /// than a tag-unaware recompute. Per-field type/size/immutability
+    /// classification stays as computed from the type strings.
     ///
     /// `heaptracker.py all_fielddescrs`: this re-synthesis keeps each
     /// `rows` entry as one leaf — the offset-by-name layout consumed by
@@ -4529,14 +4531,16 @@ impl StructLayout {
                 known_struct_sizes,
                 raw_alloc_flavor_structs,
             );
-            if field_type == majit_ir::value::Type::Void || field_size == 0 {
-                continue;
-            }
             let rank = immutable_field_ranks.get(name).copied();
+            let size = if field_type == majit_ir::value::Type::Void || field_size == 0 {
+                0
+            } else {
+                field_size
+            };
             synthesised.push(StructFieldLayout {
                 name: name.clone(),
                 offset: offset as usize,
-                size: field_size,
+                size,
                 flag,
                 field_type,
                 rank,
@@ -14437,12 +14441,13 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Ref,
             2 * crate::layout::target_word_size(),
         ),
-        // A shared `&[u8]` / `*const [u8]` / `Option<&[u8]>` is the
+        // A shared `&[T]` / `*const [T]` / `Option<&[u8]>` is the
         // two-word fat window `{data: Address, len: Signed}`. Data is
-        // `CCHARP`, not a GC pointer. `&mut [u8]` stays the list arm
+        // `CCHARP`, not a GC pointer. `&mut [T]` stays the list arm
         // below.
         s if majit_ir::descr::is_shared_u8_slice_spelling(s)
-            || majit_ir::descr::is_option_of_u8_window_spelling(s) =>
+            || majit_ir::descr::is_option_of_u8_window_spelling(s)
+            || majit_ir::descr::is_shared_slice_spelling(s) =>
         {
             (
                 ArrayFlag::Struct,
@@ -16228,6 +16233,108 @@ mod tests {
         assert_eq!(size_bb, word);
         let (_, _, size_opt) = get_type_flag("Option<&[u8]>", &HashSet::new());
         assert_eq!(size_opt, 2 * word);
+        let (flag_u32, ty_u32, size_u32) = get_type_flag("&[u32]", &HashSet::new());
+        assert_eq!(size_u32, 2 * word);
+        assert_eq!(flag_u32, majit_ir::descr::ArrayFlag::Struct);
+        assert_ne!(ty_u32, majit_ir::value::Type::Ref);
+    }
+
+    /// Nested-struct rows stay on the owner so `getattr(STRUCT, fieldname)`
+    /// hits the layout. `MutRef<T>.value` is this shape.
+    #[test]
+    fn from_type_strings_keeps_nested_struct_field_rows() {
+        use majit_ir::descr::ArrayFlag;
+
+        let mut known = std::collections::HashSet::new();
+        known.insert("PyError".to_string());
+        let layout = StructLayout::from_type_strings(
+            &[("value".into(), "PyError".into())],
+            &known,
+            &std::collections::HashMap::from([("PyError".to_string(), 8)]),
+            &std::collections::HashMap::from([("PyError".to_string(), 8)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].name, "value");
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[0].size, 8);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(layout.size, 8);
+    }
+
+    /// `engine::Request.pattern_codes` is `&[u32]` (two words). Sequential
+    /// layout then places `must_advance` at 41 for an 8-byte `string`.
+    #[test]
+    fn from_type_strings_places_must_advance_after_a_fat_slice() {
+        let word = crate::layout::target_word_size();
+        let layout = StructLayout::from_type_strings(
+            &[
+                ("string".into(), "*mut u8".into()),
+                ("start".into(), "usize".into()),
+                ("end".into(), "usize".into()),
+                ("pattern_codes".into(), "&[u32]".into()),
+                ("match_all".into(), "bool".into()),
+                ("must_advance".into(), "bool".into()),
+            ],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        let must_advance = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "must_advance")
+            .expect("must_advance row");
+        assert_eq!(must_advance.offset, 3 * word + 2 * word + 1);
+        let pattern = layout
+            .fields
+            .iter()
+            .find(|field| field.name == "pattern_codes")
+            .expect("pattern_codes row");
+        assert_eq!(pattern.size, 2 * word);
+    }
+
+    /// Charon exact offsets re-synthesise a row the sequential walk dropped.
+    #[test]
+    fn apply_exact_layout_restores_a_missing_named_row() {
+        use majit_ir::descr::ArrayFlag;
+
+        let mut layout = StructLayout {
+            size: 8,
+            align: 8,
+            gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+            fields: Vec::new(),
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        let mut known = std::collections::HashSet::new();
+        known.insert("Inner".to_string());
+        layout.apply_exact_layout(
+            &[
+                ("value".into(), "Inner".into()),
+                ("_not_send".into(), "PhantomData<*const ()>".into()),
+            ],
+            &std::collections::HashMap::from([
+                ("value".to_string(), 0u64),
+                ("_not_send".to_string(), 8u64),
+            ]),
+            Some(8),
+            &known,
+            &std::collections::HashMap::from([("Inner".to_string(), 8)]),
+            &std::collections::HashMap::new(),
+            &HashSet::new(),
+        );
+        assert_eq!(layout.fields.len(), 2);
+        assert_eq!(layout.fields[0].name, "value");
+        assert_eq!(layout.fields[0].offset, 0);
+        assert_eq!(layout.fields[0].flag, ArrayFlag::Struct);
+        assert_eq!(layout.fields[1].name, "_not_send");
+        assert_eq!(layout.fields[1].offset, 8);
+        assert_eq!(layout.fields[1].size, 0);
     }
 
     /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
@@ -21308,6 +21415,11 @@ mod tests {
         );
         assert_eq!(nested.align, 4, "three u32 align to 4, not a word");
         assert_eq!(nested.size, 12);
+        assert_eq!(nested.fields.len(), 1);
+        assert_eq!(nested.fields[0].name, "t");
+        assert_eq!(nested.fields[0].offset, 0);
+        assert_eq!(nested.fields[0].size, 12);
+        assert_eq!(nested.fields[0].flag, ArrayFlag::Struct);
 
         let mut heuristic = CallControl::new();
         let mut rows = crate::front::StructFieldRegistry::default();

@@ -1989,8 +1989,15 @@ impl AssemblerEncode for Assembler {
                 // `getfield_raw_r` with the `_pure` suffix stripped.
                 if !is_gc && result_kind == 'r' && !*pure {
                     panic!(
-                        "getfield_raw_r (without _pure) not supported — graph {:?}",
-                        self.current_graph_name
+                        "getfield_raw_r (without _pure) not supported — graph {:?}, \
+                         owner {:?}, field {}, ty {:?}, taken_by_address {}, \
+                         owner_declared_gc {:?}",
+                        self.current_graph_name,
+                        field.owner_root,
+                        field.name,
+                        ty,
+                        field.taken_by_address,
+                        field.owner_declared_gc,
                     );
                 }
                 let mut opname = if is_gc {
@@ -5133,23 +5140,13 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
     };
     if let Some(parent_spec) = bh_size_spec_from_callcontrol(cc, owner) {
         let full_name = bh_field_name(owner, &field.name);
-        // `all_fielddescrs` is flattened depth-first, so a nested
-        // `Outer.inner.x` precedes the `Outer.x` the caller named. A
-        // single `find` over the disjunction would let that nested row
-        // win on the dotted-suffix arm alone; run the exact spellings to
-        // exhaustion first and keep the suffix match as the fallback.
-        let dotted_suffix = format!(".{}", field.name);
-        let matched = parent_spec
+        // `descr.py get_field_descr` is `getattr(STRUCT, fieldname)`:
+        // only the STRUCT's own field, never a nested `inner.fieldname`.
+        if let Some(spec) = parent_spec
             .all_fielddescrs
             .iter()
             .find(|spec| spec.name == full_name || spec.field_key() == field.name)
-            .or_else(|| {
-                parent_spec
-                    .all_fielddescrs
-                    .iter()
-                    .find(|spec| spec.name.ends_with(&dotted_suffix))
-            });
-        if let Some(spec) = matched {
+        {
             return BhFieldLookup::Parent(spec.clone());
         }
     }
@@ -5171,21 +5168,16 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
 enum FieldLayoutResolution {
     Parent(crate::jitcode::BhFieldSpec),
     Layout(crate::codewriter::call::StructFieldLayout),
-    Heuristic {
-        offset: usize,
-        size: usize,
-        field_type: majit_ir::value::Type,
-        flag: majit_ir::descr::ArrayFlag,
-        signed: bool,
-    },
     ScalarWord(crate::model::ScalarFieldWord),
     Unresolved,
 }
 
 /// Resolution order of the `fielddescrof` mint: `bh_field_lookup` (Parent /
-/// Layout), then `heuristic_field_layout`, then `scalar_word`.
-/// `require_mutate_field_resolved` accepts only Parent / Layout, matching
-/// `descr.py get_field_descr` / `symbolic.get_field_token` (`llmemory.offsetof`).
+/// Layout), then `scalar_word`. `require_mutate_field_resolved` accepts
+/// only Parent / Layout, matching `descr.py get_field_descr` /
+/// `symbolic.get_field_token` (`llmemory.offsetof`). An ordinary
+/// `Unresolved` panics at the mint the way `getattr(STRUCT, fieldname)`
+/// raises.
 fn resolve_field_layout(
     cc: &CallControl,
     field: &crate::model::FieldDescriptor,
@@ -5194,18 +5186,7 @@ fn resolve_field_layout(
         BhFieldLookup::Parent(spec) => FieldLayoutResolution::Parent(spec),
         BhFieldLookup::Layout(row) => FieldLayoutResolution::Layout(row),
         BhFieldLookup::Missing => {
-            if let Some(owner) = canonical_field_owner(field)
-                && let Some((offset, size, field_type, flag, signed)) =
-                    heuristic_field_layout(cc, &owner, &field.name)
-            {
-                FieldLayoutResolution::Heuristic {
-                    offset,
-                    size,
-                    field_type,
-                    flag,
-                    signed,
-                }
-            } else if let Some(word) = field.scalar_word {
+            if let Some(word) = field.scalar_word {
                 FieldLayoutResolution::ScalarWord(word)
             } else {
                 FieldLayoutResolution::Unresolved
@@ -5216,13 +5197,13 @@ fn resolve_field_layout(
 
 /// `cpu.fielddescrof(STRUCT, get_mutate_field_name(name))` raises at
 /// translation when the hidden field `rclass.py InstanceRepr._setup_repr`
-/// synthesizes as `mutate_<name>` is absent. Ordinary field `Missing`
-/// still mints offset 0; only a mutate operand of
-/// `record_quasiimmut_field` / `jit_force_quasi_immutable` is required.
+/// synthesizes as `mutate_<name>` is absent. Ordinary `Unresolved`
+/// panics at the mint (`getattr(STRUCT, fieldname)`); a mutate operand of
+/// `record_quasiimmut_field` / `jit_force_quasi_immutable` uses this
+/// message.
 ///
 /// Uses `resolve_field_layout`. Only a Parent / Layout hit is a real
-/// `symbolic.get_field_token` offset; Heuristic is a size-as-align walk
-/// and is not `llmemory.offsetof`.
+/// `symbolic.get_field_token` offset (`llmemory.offsetof`).
 fn require_mutate_field_resolved(
     callcontrol: Option<&CallControl>,
     mutate_field: &crate::model::FieldDescriptor,
@@ -5470,7 +5451,13 @@ pub(crate) fn bh_size_spec_from_callcontrol(
     // blackhole must reconstruct the same inherited tag slot or the payload
     // takes slot 0 here while living at byte 8 there.  `None` carries no
     // payload row, so it needs no reconstruction.
-    let result_variant = is_explicit_shell_variant_owner(template_owner);
+    let result_variant = is_explicit_shell_variant_owner(template_owner)
+        && cc.struct_layout_for(owner).is_none_or(|layout| {
+            layout
+                .fields
+                .iter()
+                .any(|field| field.name == "__discriminant")
+        });
     // The bare Charon variant can contain only the inherited enum tag while
     // the annotator keeps the payload row on the concrete instantiation
     // (`Result<PyObjectRef, PyError>::Ok`).  RPython has one concrete low-level
@@ -6050,13 +6037,9 @@ fn fielddescrof(
     let mut is_immutable = false;
     let mut is_quasi_immutable = false;
     let mut load_is_acquire = false;
-    // `None` until a lookup arm actually resolves a slot. The minted descr still
-    // carries `0` for the unresolved case (`unwrap_or(0)` at the bottom), so the
-    // emitted `BhDescr::Field` is unchanged; what the `Option` adds is that the
-    // two states stop being the same bytes while they are still separable.
-    // Written as a literal `0`, an unresolved mint and a mint that resolved to
-    // slot 0 are indistinguishable the moment this function returns, and every
-    // census downstream inherits that.
+    // `None` until a lookup arm actually resolves a slot. `Unresolved`
+    // panics before a descr is minted, so a surviving `None` is only the
+    // no-`CallControl` path.
     let mut index_in_parent: Option<usize> = None;
     let mut parent = None;
     let mut field_key = if let Some(owner) = field.owner_root.as_deref() {
@@ -6097,11 +6080,10 @@ fn fielddescrof(
             };
         }
         // `resolve_field_layout` mints in this order: `bh_field_lookup`
-        // (Parent / Layout), then `heuristic_field_layout`, then
-        // `scalar_word`. `require_mutate_field_resolved` accepts only
-        // Parent / Layout (`descr.py get_field_descr`). The Layout arm
-        // still runs `transparent_scalar_field` here so a one-word
-        // newtype stays a leaf load.
+        // (Parent / Layout), then `scalar_word`. `require_mutate_field_resolved`
+        // accepts only Parent / Layout (`descr.py get_field_descr`). The
+        // Layout arm still runs `transparent_scalar_field` here so a
+        // one-word newtype stays a leaf load.
         let resolution = resolve_field_layout(cc, field);
         let mut found_parent_field = matches!(resolution, FieldLayoutResolution::Parent(_));
         match resolution {
@@ -6148,24 +6130,11 @@ fn fielddescrof(
                     is_quasi_immutable = layout_field.is_quasi_immutable();
                 }
             }
-            FieldLayoutResolution::Heuristic {
-                offset: computed_offset,
-                size: computed_size,
-                field_type: computed_type,
-                flag: computed_flag,
-                signed: computed_signed,
-            } => {
-                offset = computed_offset;
-                field_size = computed_size;
-                field_type = computed_type;
-                field_flag = computed_flag;
-                is_field_signed = computed_signed;
-            }
             FieldLayoutResolution::ScalarWord(word) => {
                 // An opaque dependency struct has a layout and no field list, so
                 // the name lookup misses. The front records that scalar's byte
-                // offset on the descriptor. A parent, layout, or heuristic hit
-                // already named the slot and keeps its own offset. Apply the word
+                // offset on the descriptor. A parent or layout hit already
+                // named the slot and keeps its own offset. Apply the word
                 // before `unique_slot_at_offset` so the slot follows the offset
                 // that is actually emitted.
                 apply_scalar_field_word(
@@ -6177,14 +6146,20 @@ fn fielddescrof(
                     &mut is_field_signed,
                 );
             }
-            FieldLayoutResolution::Unresolved => {}
+            FieldLayoutResolution::Unresolved => {
+                panic!(
+                    "fielddescrof: getattr({owner}, {}) failed: field is not a member of that STRUCT \
+                     (descr.py get_field_descr / symbolic.get_field_token)",
+                    field.name
+                );
+            }
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
             is_quasi_immutable = rank.is_quasi_immutable();
         }
         // Both fallbacks above take `offset` from a second source — the
-        // `struct_layout_for` registry or `heuristic_field_layout` — and neither
+        // `struct_layout_for` registry or the recorded scalar word — and neither
         // touches `index_in_parent`, which is still its `0` initialiser while
         // `parent` carries the whole flattened list.  Slot 0 of that list is
         // some other field, and `all_fielddescrs()[index_in_parent]` is what
@@ -6379,63 +6354,6 @@ fn fielddescrof(
         owner: canonical_owner.unwrap_or_default(),
         load_is_acquire,
     }
-}
-
-fn heuristic_field_layout(
-    cc: &CallControl,
-    owner: &str,
-    field_name: &str,
-) -> Option<(
-    usize,
-    usize,
-    majit_ir::value::Type,
-    majit_ir::descr::ArrayFlag,
-    bool,
-)> {
-    let fields = cc.struct_field_entries(owner)?;
-    let mut offset = 0usize;
-    let word = crate::layout::target_word_size();
-    for row in fields {
-        let name = &row.name;
-        let type_str = &row.ty;
-        let (flag, field_type, mut field_size, align) = if cc.is_known_struct(type_str) {
-            let (size, align) = match cc.struct_layout_for(type_str) {
-                Some(layout) => (layout.size, layout.align.max(1)),
-                None => (word, word.max(1)),
-            };
-            (
-                majit_ir::descr::ArrayFlag::Struct,
-                majit_ir::value::Type::Ref,
-                size,
-                align,
-            )
-        } else {
-            let (flag, field_type, field_size) =
-                type_flag_from_str(type_str, &cc.raw_alloc_flavor_structs);
-            (
-                flag,
-                field_type,
-                field_size,
-                scalar_align(field_size).max(1),
-            )
-        };
-        if field_type == majit_ir::value::Type::Void || field_size == 0 {
-            continue;
-        }
-        offset = (offset + align - 1) & !(align - 1);
-        if name == field_name {
-            return Some((
-                offset,
-                field_size,
-                field_type,
-                flag,
-                flag == majit_ir::descr::ArrayFlag::Signed,
-            ));
-        }
-        field_size = field_size.max(1);
-        offset += field_size;
-    }
-    None
 }
 
 /// `cpu.arraydescrof(rffi.CArray(T))` for a raw element access
@@ -7188,9 +7106,12 @@ mod tests {
 
         let owner = "vec_component_layout::Holder";
         let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let vec_owner = "alloc::vec::Vec";
+        let vec_id = majit_ir::descr::StructId::from_canonical(vec_owner);
         let _guard =
             crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
                 (owner.to_string(), Some(owner_id)),
+                (vec_owner.to_string(), Some(vec_id)),
             ]));
         let mut cc = CallControl::new();
         cc.set_struct_layout(
@@ -7214,6 +7135,43 @@ mod tests {
                         size: 3 * word,
                         flag: ArrayFlag::Struct,
                         field_type: Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "imp".into(),
+                        offset: 0,
+                        size: 2 * word,
+                        flag: ArrayFlag::Struct,
+                        field_type: Type::Ref,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            vec_id,
+            StructLayout {
+                size: 3 * word,
+                align: word,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "buf".into(),
+                        offset: 0,
+                        size: word,
+                        flag: ArrayFlag::Pointer,
+                        field_type: Type::Ref,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "len".into(),
+                        offset: 0,
+                        size: word,
+                        flag: ArrayFlag::Unsigned,
+                        field_type: Type::Int,
                         rank: None,
                     },
                 ],
@@ -7938,6 +7896,196 @@ mod tests {
         let crate::jitcode::BhDescr::Field {
             offset, field_size, ..
         } = fielddescrof(&field, &crate::model::ValueType::Unsigned, Some(&cc), true)
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert_eq!(offset, 0);
+        assert_eq!(field_size, crate::layout::target_word_size());
+    }
+
+    /// `get_field_descr` / `getattr(STRUCT, fieldname)` rejects a nested
+    /// `inner.x` when the caller named `Outer.x`.
+    #[test]
+    #[should_panic(expected = "getattr(s1_suffix::Outer, x)")]
+    fn fielddescrof_does_not_resolve_a_nested_field_by_dotted_suffix() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let outer = "s1_suffix::Outer";
+        let inner = "s1_suffix::Inner";
+        let outer_id = majit_ir::descr::StructId::from_canonical(outer);
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _registry = register_struct_ids_serialized(HashMap::from([
+            (outer.to_string(), Some(outer_id)),
+            (inner.to_string(), Some(inner_id)),
+        ]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            outer.to_string(),
+            vec![("inner".to_string(), inner.to_string())],
+        );
+        struct_fields.fields.insert(
+            inner.to_string(),
+            vec![("x".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_known_struct_names([inner.to_string()].into_iter().collect());
+        cc.set_struct_layout(
+            inner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "x".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            outer_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "inner".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Struct,
+                    field_type: majit_ir::value::Type::Ref,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let _ = fielddescrof(
+            &FieldDescriptor::new("x", Some(outer.to_string())),
+            &crate::model::ValueType::Int,
+            Some(&cc),
+            true,
+        );
+    }
+
+    /// `get_field_descr` raises when `getattr(STRUCT, fieldname)` misses.
+    #[test]
+    #[should_panic(expected = "getattr(s2_unresolved::Owner, missing)")]
+    fn fielddescrof_unresolved_ordinary_field_panics() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "s2_unresolved::Owner";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(owner_id))]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("visible".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 8,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![StructFieldLayout {
+                    name: "visible".to_string(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+
+        let _ = fielddescrof(
+            &FieldDescriptor::new("missing", Some(owner.to_string())),
+            &crate::model::ValueType::Int,
+            Some(&cc),
+            true,
+        );
+    }
+
+    /// Bare `Tuple` is unit `()`. `__pos_0` is not a member
+    /// (`getattr(STRUCT, fieldname)` / `get_field_descr`).
+    #[test]
+    #[should_panic(expected = "getattr(Tuple, __pos_0)")]
+    fn fielddescrof_bare_tuple_pos0_panics() {
+        use crate::call::CallControl;
+        use crate::model::FieldDescriptor;
+
+        let cc = CallControl::new();
+        let _ = fielddescrof(
+            &FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+            &crate::model::ValueType::Int,
+            Some(&cc),
+            true,
+        );
+    }
+
+    /// Instantiated `Option<fn(..)>::Some` records `__pos_0` at byte 0
+    /// under the canonical key the lookup uses (null-pointer niche).
+    #[test]
+    fn fielddescrof_option_fn_some_payload_uses_canonical_niche_layout() {
+        use crate::call::{CallControl, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        let owner = "option::Option<fn(*mut u8, *mut u8) -> Result<*mut u8, E>>::Some";
+        let owner_id = majit_ir::descr::StructId::from_canonical_spelling(owner);
+        let _registry =
+            register_struct_ids_serialized(HashMap::from([(owner.to_string(), Some(owner_id))]));
+
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![(
+                "__pos_0".to_string(),
+                "fn(*mut u8) -> Result<*mut u8, E>".to_string(),
+            )],
+        );
+        cc.set_struct_fields(struct_fields);
+        let layout = StructLayout::from_type_strings(
+            &[("__pos_0".into(), "fn(*mut u8) -> Result<*mut u8, E>".into())],
+            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashSet::new(),
+        );
+        assert_eq!(layout.fields.len(), 1);
+        assert_eq!(layout.fields[0].name, "__pos_0");
+        assert_eq!(layout.fields[0].offset, 0);
+        cc.set_struct_layout(owner_id, layout);
+
+        let crate::jitcode::BhDescr::Field {
+            offset, field_size, ..
+        } = fielddescrof(
+            &FieldDescriptor::new("__pos_0", Some(owner.to_string())),
+            &crate::model::ValueType::Ref(None),
+            Some(&cc),
+            true,
+        )
         else {
             panic!("fielddescrof must produce a field descriptor");
         };
@@ -10821,10 +10969,8 @@ mod tests {
     /// Owner known only through `struct_field_entries`, with an embedded
     /// `mutate_value` whose layout is registered separately. The parent's
     /// flattened descrs hold `mutate_value.ptr` / `mutate_value.lock`, so
-    /// `bh_field_lookup` misses and only `heuristic_field_layout` would
-    /// supply an offset. `descr.py get_field_descr` /
-    /// `symbolic.get_field_token` require the real layout; Heuristic is
-    /// not `llmemory.offsetof`.
+    /// `bh_field_lookup` misses. `descr.py get_field_descr` /
+    /// `symbolic.get_field_token` require the real layout.
     #[test]
     #[should_panic(
         expected = "the hidden field must be named mutate_<name> (rclass.py InstanceRepr._setup_repr)"
@@ -10908,19 +11054,18 @@ mod tests {
             !parent_keys.iter().any(|key| *key == "mutate_value"),
             "flattened parent descrs must not hold a mutate_value row, got {parent_keys:?}"
         );
-        let (heuristic_offset, ..) = heuristic_field_layout(&cc, owner, "mutate_value")
-            .expect("heuristic_field_layout must find the embedded mutate_value row");
-        assert_ne!(heuristic_offset, 0);
 
         let _ = assemble_quasiimmut_field_read(owner, "value", cc);
     }
 
-    /// wasm32-shaped `{ u32 a; Watcher {size 8, align 4} mutate_x }`.
-    /// `symbolic.get_field_token` / `llmemory.offsetof` place the watcher
-    /// at 4; `scalar_align(8)` would round it to 8.
+    /// wasm32-shaped `{ u32 a; Watcher {size 8, align 4} mutate_x }` with
+    /// no owner layout row for `mutate_x`. `getattr(STRUCT, fieldname)`
+    /// raises; the size-as-align walk is gone.
     #[test]
+    #[should_panic(expected = "getattr(assembler_heuristic_align_test::Outer, mutate_x)")]
     fn heuristic_field_layout_uses_embedded_struct_recorded_align() {
         use crate::call::{CallControl, StructLayout};
+        use crate::model::FieldDescriptor;
 
         let owner = "assembler_heuristic_align_test::Outer";
         let watcher = "assembler_heuristic_align_test::Watcher";
@@ -10956,10 +11101,12 @@ mod tests {
             },
         );
 
-        let (offset, size, ..) = heuristic_field_layout(&cc, owner, "mutate_x")
-            .expect("heuristic_field_layout must find mutate_x");
-        assert_eq!(size, 8);
-        assert_eq!(offset, 4);
+        let _ = fielddescrof(
+            &FieldDescriptor::new("mutate_x", Some(owner.to_string())),
+            &crate::model::ValueType::Int,
+            Some(&cc),
+            true,
+        );
     }
 
     /// Watcher listed under another name (`size_watchers`) while the
@@ -11191,7 +11338,7 @@ mod tests {
             "list".to_string(),
             vec![
                 ("length".to_string(), "i64".to_string()),
-                ("items".to_string(), "&[i64]".to_string()),
+                ("items".to_string(), "&()".to_string()),
             ],
         );
         cc.set_struct_fields(registry);

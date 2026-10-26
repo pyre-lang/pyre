@@ -942,6 +942,7 @@ fn register_ref_enum_instantiation_rows(
         std::collections::HashMap<i64, String>,
     >,
     struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    struct_ids: &mut std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) {
     for inst in insts {
@@ -1028,11 +1029,17 @@ fn register_ref_enum_instantiation_rows(
             // the discriminant-map guard) — a withdrawn leaf fails closed
             // rather than projecting whichever colliding decl was inserted
             // first.
+            let sid = majit_ir::descr::StructId::from_canonical_spelling(&format!(
+                "{canon_base}{}::{}",
+                inst.suffix, v.name
+            ));
             for base in &bases {
+                let key = format!("{base}{}::{}", inst.suffix, v.name);
                 struct_fields
                     .fields
-                    .entry(format!("{base}{}::{}", inst.suffix, v.name))
+                    .entry(key.clone())
                     .or_insert_with(|| rows.clone());
+                record_struct_id(struct_ids, key, sid);
             }
         }
     }
@@ -1433,6 +1440,7 @@ impl CrateLoweringState {
             &ref_enum_insts,
             &enum_variant_by_discriminant,
             &mut struct_fields,
+            &mut struct_ids,
             gc_struct_ids,
         );
         // Concrete `Entry<i64, *mut PyObject>` rows. The generic decl's
@@ -4195,6 +4203,78 @@ fn derive_program_metadata(
         );
     }
 
+    // `alloc::vec::Vec<T>` is Opaque in the interpreter snapshot. Field
+    // reads of `buf` / `len` name the Vec value; `fielddescrof` then adds
+    // the component offset (`vec_part`). Record both names at byte 0 so
+    // the layout lookup hits before `getattr` panics, matching the
+    // previous Unresolved mint of offset 0 plus `vec_part`.
+    let alloc_vec_path = "alloc::vec::Vec";
+    if llbc
+        .iter_type_decls()
+        .any(|td| td.item_meta.name_path() == alloc_vec_path)
+    {
+        let rows = vec![
+            crate::front::semantic::FieldRow::named("buf", "*mut u8"),
+            crate::front::semantic::FieldRow::named("len", "usize"),
+        ];
+        for key in [alloc_vec_path, "Vec"] {
+            struct_fields.fields.insert(key.to_string(), rows.clone());
+            known_struct_names.insert(key.to_string());
+        }
+        let sid = majit_ir::descr::StructId::from_canonical(alloc_vec_path);
+        for key in [alloc_vec_path, "Vec"] {
+            record_struct_id(&mut struct_ids, key.to_string(), sid);
+        }
+        let word = crate::layout::target_word_size() as u64;
+        let mut field_offsets = std::collections::HashMap::new();
+        field_offsets.insert("buf".to_string(), 0);
+        field_offsets.insert("len".to_string(), 0);
+        exact_layouts.insert(
+            sid,
+            crate::front::semantic::ExactLayout {
+                size: Some(3 * word),
+                align: Some(word),
+                field_offsets,
+                host: None,
+            },
+        );
+    }
+
+    // `core::alloc::layout::Layout` is Opaque. It is the two-word
+    // `{size, align}` aggregate (`from_size_align.rs`); Charon has no
+    // field rows. `__pos_0` is size at 0, `__pos_1` is align at one word.
+    let layout_path = "core::alloc::layout::Layout";
+    if llbc
+        .iter_type_decls()
+        .any(|td| td.item_meta.name_path() == layout_path)
+    {
+        let rows = vec![
+            crate::front::semantic::FieldRow::positional("__pos_0", "usize"),
+            crate::front::semantic::FieldRow::positional("__pos_1", "usize"),
+        ];
+        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
+            struct_fields.fields.insert(key.to_string(), rows.clone());
+            known_struct_names.insert(key.to_string());
+        }
+        let sid = majit_ir::descr::StructId::from_canonical("alloc::layout::Layout");
+        for key in [layout_path, "alloc::layout::Layout", "Layout"] {
+            record_struct_id(&mut struct_ids, key.to_string(), sid);
+        }
+        let word = crate::layout::target_word_size() as u64;
+        let mut field_offsets = std::collections::HashMap::new();
+        field_offsets.insert("__pos_0".to_string(), 0);
+        field_offsets.insert("__pos_1".to_string(), word);
+        exact_layouts.insert(
+            sid,
+            crate::front::semantic::ExactLayout {
+                size: Some(2 * word),
+                align: Some(word),
+                field_offsets,
+                host: None,
+            },
+        );
+    }
+
     for td in llbc.iter_trait_decls() {
         let name = td.item_meta.name_path();
         let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
@@ -5008,6 +5088,14 @@ impl<'a> LowerContext<'a> {
             raw_alloc_flavor_structs,
             immutable_fields,
         }
+    }
+
+    /// Harvested `{owner → field rows}` for this artefact. A test that
+    /// assembles a graph lowered from the same LLBC installs this on
+    /// `CallControl` so `fielddescrof` can `getattr` the names the
+    /// lowering emitted (`descr.py get_field_descr`).
+    pub fn struct_field_registry(&self) -> crate::front::semantic::StructFieldRegistry {
+        struct_field_registry_from_rows(&self.struct_fields)
     }
 }
 

@@ -708,11 +708,14 @@ pub(crate) fn emit_call_once(
             result_ty: ValueType::Ref(Some(tuple_owner.clone())),
         },
     });
-    if let Some((value, value_ty, class_root)) = arg {
+    if let Some((value, value_ty, class_root)) =
+        arg.filter(|_| majit_ir::descr::is_shaped_tuple_name(&tuple_owner))
+    {
         // RPython derives an instance field's low-level repr from the concrete
         // annotation stored on that field (`rclass.py:501-509`).  Preserve the
         // source payload class before this synthetic tuple write instead of
         // widening every `Tuple<*mut T>.__pos_0` reader to OBJECTPTR.
+        // Bare `Tuple` is unit `()`: `getattr(Tuple, __pos_0)` raises.
         let value = emit_narrow(graph, block, value, &class_root);
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
@@ -780,7 +783,7 @@ mod tests {
             payload_ty: ValueType::Int,
             payload_class_root: None,
             call_result_ty: ValueType::Int,
-            args_tuple_suffix: String::new(),
+            args_tuple_suffix: "<i64>".into(),
             niche: false,
             int_null: None,
             niche_null_cast: None,
@@ -912,6 +915,37 @@ mod tests {
     }
 
     #[test]
+    fn call_once_does_not_write_pos0_on_unit_tuple() {
+        let mut g = FunctionGraph::new("test_call_once_unit_tuple");
+        let block = g.startblock;
+        let env = g.push_op_var(block, OpKind::ConstInt(7), true).unwrap();
+        let payload = g.push_op_var(block, OpKind::ConstInt(1), true).unwrap();
+
+        emit_call_once(
+            &mut g,
+            block,
+            env,
+            Some((payload, ValueType::Int, None)),
+            "test::closure",
+            ValueType::Int,
+            "",
+        );
+
+        let wrote_unit = g.blocks[block.0].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref() == Some("Tuple")
+            )
+        });
+        assert!(
+            !wrote_unit,
+            "unit Tuple has no __pos_0 (getattr(Tuple, __pos_0) raises)"
+        );
+    }
+
+    #[test]
     fn map_selects_some_call_wrapped_and_none() {
         let (g, a) = build_and_rewrite(ClosureCombinator::Map, "map");
         assert!(residual_gone(&g, "map"), "residual map call removed");
@@ -937,7 +971,7 @@ mod tests {
         // a real `Tuple` and unrelated to either `Option` instantiation.
         assert_eq!(
             field_write_owners(&g, "__pos_0"),
-            vec!["Tuple".to_string(), RESULT_SOME.to_string()],
+            vec!["Tuple<i64>".to_string(), RESULT_SOME.to_string()],
             "the Some(U) payload keys the result Some variant"
         );
     }

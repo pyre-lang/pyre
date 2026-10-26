@@ -809,12 +809,15 @@ pub fn positional_shape_id(name: &str) -> Option<StructId> {
 /// The first balanced generic argument group in `name`, including brackets.
 /// A trailing enum variant (`Result<T>::Ok`) is deliberately excluded: the
 /// template [`StructId`] already distinguishes the base and each variant.
-fn generic_args_span(name: &str) -> Option<&str> {
+/// `>` in a `->` return arrow is not a generic closer (`fn(A) -> B`).
+pub fn generic_args_span(name: &str) -> Option<&str> {
     let start = name.find('<')?;
+    let bytes = name.as_bytes();
     let mut depth = 0usize;
-    for (offset, byte) in name.as_bytes()[start..].iter().copied().enumerate() {
+    for (offset, &byte) in bytes[start..].iter().enumerate() {
         match byte {
             b'<' => depth += 1,
+            b'>' if start + offset > 0 && bytes[start + offset - 1] == b'-' => {}
             b'>' => {
                 depth = depth.checked_sub(1)?;
                 if depth == 0 {
@@ -987,6 +990,56 @@ pub fn is_shared_u8_slice_spelling(spelling: &str) -> bool {
     rest == "[u8]" || rest == "Slice<u8>"
 }
 
+/// Shared immutable `&[T]` / `*const [T]` (and Charon `&Slice<T>`).
+///
+/// A shared slice is the two-word fat window `{data, len}`. `&mut [T]`,
+/// `*mut [T]`, and `[T; N]` stay the one-word / list arms.
+pub fn is_shared_slice_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    let rest = if let Some(rest) = t.strip_prefix("*const ") {
+        rest.trim()
+    } else if let Some(rest) = t.strip_prefix('&') {
+        let rest = rest.trim();
+        if rest.starts_with("mut ") {
+            return false;
+        }
+        if rest.starts_with('\'') {
+            rest.split_once(char::is_whitespace)
+                .map(|(_, r)| r.trim())
+                .unwrap_or("")
+        } else {
+            rest
+        }
+    } else {
+        return false;
+    };
+    if rest.starts_with("Slice<") && rest.ends_with('>') {
+        return true;
+    }
+    rest.starts_with('[') && rest.ends_with(']') && !rest.contains(';')
+}
+
+/// A function-pointer type spelling (`fn(...)`, `unsafe fn(...)`).
+pub fn is_fn_ptr_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    let t = t.strip_prefix("unsafe ").map(str::trim).unwrap_or(t);
+    t.starts_with("fn(") || t.starts_with("fn ")
+}
+
+/// `Option<fn(...)>` / `option::Option<fn(...) -> Result<...>>` (and the
+/// `::Some` variant of that instantiation). The first balanced `<…>` is
+/// the payload; a `->` inside it is not a generic closer.
+pub fn is_option_of_fn_ptr_spelling(spelling: &str) -> bool {
+    let t = spelling.trim();
+    if !t.contains("Option<") {
+        return false;
+    }
+    let Some(span) = generic_args_span(t) else {
+        return false;
+    };
+    is_fn_ptr_spelling(&span[1..span.len() - 1])
+}
+
 /// `Option<&[u8]>` / Charon `Option<[u8]>` / `Option<Slice<u8>>`: a
 /// nullable window, not a nullable `STR`.
 pub fn is_option_of_u8_window_spelling(spelling: &str) -> bool {
@@ -1060,11 +1113,13 @@ pub fn strip_generic_args(name: &str) -> std::borrow::Cow<'_, str> {
     let Some(start) = name.find('<') else {
         return std::borrow::Cow::Borrowed(name);
     };
+    let bytes = name.as_bytes();
     let mut depth = 0usize;
     let mut end = None;
-    for (i, b) in name.bytes().enumerate().skip(start) {
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
         match b {
             b'<' => depth += 1,
+            b'>' if i > 0 && bytes[i - 1] == b'-' => {}
             b'>' => {
                 depth -= 1;
                 if depth == 0 {
@@ -11009,6 +11064,21 @@ mod tests {
         assert!(!is_shared_u8_slice_spelling("&mut [u8]"));
         assert!(!is_shared_u8_slice_spelling("[u8]"));
         assert!(!is_shared_u8_slice_spelling("&[u8; 4]"));
+        assert!(is_shared_slice_spelling("&[u32]"));
+        assert!(is_shared_slice_spelling("&Slice<u32>"));
+        assert!(is_shared_slice_spelling("*const [u32]"));
+        assert!(!is_shared_slice_spelling("&mut [u32]"));
+        assert!(!is_shared_slice_spelling("[u32]"));
+        assert!(!is_shared_slice_spelling("&[u32; 4]"));
+        assert!(is_fn_ptr_spelling(
+            "fn(*mut u8, *mut u8) -> Result<*mut u8, E>"
+        ));
+        assert!(is_fn_ptr_spelling("unsafe fn()"));
+        assert!(!is_fn_ptr_spelling("Option<fn()>"));
+        assert!(is_option_of_fn_ptr_spelling(
+            "option::Option<fn(*mut PyObject) -> Result<*mut PyObject,PyError>>::Some"
+        ));
+        assert!(!is_option_of_fn_ptr_spelling("option::Option<i64>::Some"));
         assert!(is_option_of_u8_window_spelling("Option<&[u8]>"));
         assert!(is_option_of_u8_window_spelling("Option<[u8]>"));
         assert!(is_option_of_u8_window_spelling("Option<Slice<u8>>"));
@@ -11993,6 +12063,14 @@ mod tests {
         );
         assert_eq!(generic_args_span("Result::Ok"), None);
         assert_eq!(generic_args_span("Result<i64"), None);
+        assert_eq!(
+            generic_args_span("option::Option<fn(*mut u8,*mut u8) -> Result<*mut u8,E>>::Some"),
+            Some("<fn(*mut u8,*mut u8) -> Result<*mut u8,E>>")
+        );
+        assert_eq!(
+            strip_generic_args("option::Option<fn(*mut u8,*mut u8) -> Result<*mut u8,E>>::Some"),
+            "option::Option::Some"
+        );
     }
 
     #[test]

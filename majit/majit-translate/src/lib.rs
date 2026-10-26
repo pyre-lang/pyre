@@ -2057,9 +2057,28 @@ fn analyze_pipeline_from_module_paths(
         // generic identities are derived later from use-site type arguments,
         // so inherit the declaration's exact offsets when it has no concrete
         // entry (notably the explicit translated `Result` shell).
+        // `Option<fn(..)>::Some` is a pointer niche (`null_fn`): the
+        // payload sits at byte 0. The Option template is the explicit
+        // `[tag@0 | payload@8]` shell, so inheriting it would place
+        // `__pos_0` at 8.
+        let skip_template_exact =
+            program
+                .struct_fields
+                .fields
+                .get(struct_name)
+                .is_some_and(|rows| {
+                    !rows.iter().any(|row| row.name == "__discriminant")
+                        && rows.iter().any(|row| {
+                            row.name == "__pos_0" && majit_ir::descr::is_fn_ptr_spelling(&row.ty)
+                        })
+                });
         let exact = program.exact_layouts.get(&sid).or_else(|| {
-            majit_ir::descr::struct_template_id_for_name(struct_name)
-                .and_then(|template| program.exact_layouts.get(&template))
+            if skip_template_exact {
+                None
+            } else {
+                majit_ir::descr::struct_template_id_for_name(struct_name)
+                    .and_then(|template| program.exact_layouts.get(&template))
+            }
         });
         // An opaque/shadow declaration can share the runtime identity of its
         // defining type (e.g. pyre-interpreter's zero-field GetSetProperty

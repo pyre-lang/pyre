@@ -546,7 +546,7 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
     );
     assert_eq!(
         tyref_ref_param_class_root(&tupled, &fn_llbc, no_tombstoned_leaves(), None),
-        Some(shaped)
+        Some(shaped.clone())
     );
     let empty_gc: std::collections::HashSet<majit_ir::descr::StructId> =
         std::collections::HashSet::new();
@@ -561,6 +561,55 @@ fn a_tuple_param_names_the_shape_its_reads_name() {
         .as_deref(),
         Some("Tuple<i64,bool>"),
         "a pair tuple must keep SomeTuple items, not collapse to ref"
+    );
+
+    // Construction keys `__pos_N` off `tyref_tuple_suffix` /
+    // `tyref_positional_aggregate_root`. A hash-consed or `Value`-wrapped
+    // destination must recover the same shaped owner the read side uses,
+    // otherwise assemble asks `getattr(Tuple, __pos_0)`.
+    assert!(
+        !tyref_tuple_suffix(&tupled, &fn_llbc).is_empty(),
+        "dedup Tuple<fn> construction suffix must not collapse to unit Tuple"
+    );
+    assert_eq!(
+        tyref_positional_aggregate_root(&tupled, &fn_llbc),
+        Some(shaped.clone())
+    );
+    let hashed = TyRef::Other(serde_json::json!({
+        "HashConsedValue": [99, {
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "types": [
+                        { "Scalar": { "Integer": { "Signed": "I64" } } },
+                        { "Scalar": "Bool" }
+                    ]
+                }
+            }
+        }]
+    }));
+    assert_eq!(tyref_tuple_suffix(&hashed, &llbc), "<i64,bool>");
+    assert_eq!(
+        tyref_positional_aggregate_root(&hashed, &llbc),
+        Some("Tuple<i64,bool>".to_string())
+    );
+    let valued = TyRef::Other(serde_json::json!({
+        "Value": [7, {
+            "Adt": {
+                "id": 0, "builtin": "Tuple",
+                "generics": {
+                    "types": [
+                        { "Scalar": { "Integer": { "Signed": "I64" } } },
+                        { "Scalar": "Bool" }
+                    ]
+                }
+            }
+        }]
+    }));
+    assert_eq!(tyref_tuple_suffix(&valued, &llbc), "<i64,bool>");
+    assert_eq!(
+        tyref_positional_aggregate_root(&valued, &llbc),
+        Some("Tuple<i64,bool>".to_string())
     );
 }
 

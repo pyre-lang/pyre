@@ -6977,18 +6977,23 @@ impl<'a> Lowering<'a> {
                     .map(|(name, field_ty, _)| (name.clone(), field_ty.clone()))
                     .unwrap_or_else(|| (format!("__pos_{i}"), String::new()));
                 let declared_ty = field_rows.get(i).and_then(|(_, _, ty)| ty.as_ref());
+                // `_names_without_voids()` (`lltype.py`) /
+                // `heaptracker.py get_fielddescr_index_in`: a
+                // zero-sized field occupies no storage and gets no slot,
+                // so no write is generated for it. Unit `()` / unsuffixed
+                // `Array` have no `__pos_N` member (`getattr(Tuple, __pos_0)`
+                // raises). Never ask.
+                let void = crate::codewriter::call::get_type_flag(
+                    &field_ty,
+                    &self.raw_alloc_flavor_structs,
+                )
+                .1 == majit_ir::value::Type::Void
+                    || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc))
+                    || ((result_owner == "Tuple" || result_owner == "Array")
+                        && name.starts_with("__pos_"));
                 AggregateField {
                     name,
-                    // `_names_without_voids()` (`lltype.py`) /
-                    // `heaptracker.py` `get_fielddescr_index_in`: a
-                    // zero-sized field occupies no storage and gets no slot,
-                    // so no write is generated for it.
-                    void: crate::codewriter::call::get_type_flag(
-                        &field_ty,
-                        &self.raw_alloc_flavor_structs,
-                    )
-                    .1 == majit_ir::value::Type::Void
-                        || declared_ty.is_some_and(|ty| tyref_is_void_zst(ty, self.llbc)),
+                    void,
                     narrow_root: self.typed_ref_field_narrow_root(declared_ty),
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
