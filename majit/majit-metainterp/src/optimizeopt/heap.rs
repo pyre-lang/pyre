@@ -141,6 +141,16 @@ impl DictArgKey {
             }
         }
     }
+
+    /// `history.py same_box` for a already-resolved struct box: Const
+    /// terminals key by value so two minted `ConstPtr`s of the same
+    /// gcref hit, producers key by identity.
+    fn from_resolved(obj: &Operand, ctx: &OptContext) -> Self {
+        match ctx.get_constant_box(obj) {
+            Some(value) => DictArgKey::Const(value),
+            None => DictArgKey::Op(obj.clone()),
+        }
+    }
 }
 
 /// Rust representation of `heap.AbstractCachedEntry` and `CachedField`.
@@ -841,12 +851,12 @@ pub struct OptHeapState {
     /// The map key is the descriptor object's identity; `descr.index()` is
     /// not globally unique across descriptor objects.
     corresponding_array_descrs: crate::FxIndexMap<usize, (DescrRef, usize)>,
-    /// Fields known to be quasi-immutable: (obj box, field_idx) -> cached value
-    /// OpRef. Keyed by the object's `Operand` identity (heap keys structs by box,
-    /// not by the retired `opref.raw()` slot). Populated by QUASIIMMUT_FIELD,
-    /// consumed by subsequent GETFIELD_GC_*. Survives calls (guarded by
-    /// GUARD_NOT_INVALIDATED).
-    quasi_immut_cache: crate::FxIndexMap<(Operand, usize), OpRef>,
+    /// Fields known to be quasi-immutable: (obj, field descr) -> cached value
+    /// OpRef. Obj keys with [`DictArgKey`] so two minted `ConstPtr`s of the
+    /// same gcref hit (`history.py same_box` / `util.py args_dict`). Populated
+    /// by QUASIIMMUT_FIELD, consumed by subsequent GETFIELD_GC_*. Survives
+    /// calls (guarded by GUARD_NOT_INVALIDATED).
+    quasi_immut_cache: crate::FxIndexMap<(DictArgKey, usize), OpRef>,
     /// Weak handle to `OptHeap.state`, set at construction (`Rc::new_cyclic`).
     /// `vstring.py` `optstring.emit_extra` re-enters `OptHeap.propagate_forward`
     /// during `Optimizer.emit` `force_box`; `emit_extra` upgrades this to park
@@ -2436,7 +2446,7 @@ impl OptHeapState {
         // Keyed by the object's canonical box identity.
         {
             let qi_obj = ctx.resolve_operand_operand(&obj_box);
-            let qi_key = (qi_obj, descr_id);
+            let qi_key = (DictArgKey::from_resolved(&qi_obj, ctx), descr_id);
             if let Some(qi_cached) = self.quasi_immut_cache.get(&qi_key).copied() {
                 if !qi_cached.is_none() {
                     // Subsequent read: reuse the cached value.
@@ -2447,6 +2457,12 @@ impl OptHeapState {
                 }
                 // First read after QUASIIMMUT_FIELD: emit the load, then cache
                 // the result so it survives calls (unlike normal mutable fields).
+                // heap.py `optimize_QUASIIMMUT_FIELD`: "If 's' is a constant
+                // we rely on the rest of the optimizations to constant-fold
+                // the following pure getfield_gc." That fold is the early
+                // `descr.is_always_pure()` arm (`optimize_GETFIELD_GC_I`);
+                // a `?` field's FieldDescr answers true
+                // (`descr.py get_field_descr` `!= False`).
                 self.quasi_immut_cache.insert(qi_key, op.pos().get());
                 make_nonnull_box(ctx, &op.arg(0));
                 let obj_box = ctx.resolve_operand_operand(&obj_box);
@@ -3633,7 +3649,8 @@ impl OptHeapState {
                             .as_quasi_immut_descr()
                             .map_or(descr, |q| q.fielddescr()),
                     );
-                    self.quasi_immut_cache.insert((obj_box, key), OpRef::NONE);
+                    let obj_key = DictArgKey::from_resolved(&obj_box, ctx);
+                    self.quasi_immut_cache.insert((obj_key, key), OpRef::NONE);
                 }
                 OptimizationResult::Remove
             }

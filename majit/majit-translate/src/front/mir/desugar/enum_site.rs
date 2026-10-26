@@ -298,7 +298,9 @@ impl<'a> Lowering<'a> {
                     .as_object()
                     .and_then(|o| o.get("Adt"))
                     .and_then(serde_json::Value::as_object)
-                    .and_then(|adt| adt_head_instantiation_suffix(adt, self.llbc))
+                    .and_then(|adt| {
+                        adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves)
+                    })
                     .is_some();
         if !payload_ok {
             return None;
@@ -307,7 +309,7 @@ impl<'a> Lowering<'a> {
         // spelling a static `Some(..)` construction of this instantiation mints.
         // An empty suffix is the template ClassDef; its `Some.__pos_0` is the
         // typevar and getattr cannot succeed (`bookkeeper.py` `getuniqueclassdef`).
-        let suffix = tyref_enum_instantiation_suffix(dest_ty, self.llbc);
+        let suffix = tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves);
         if suffix.is_empty() {
             return None;
         }
@@ -464,7 +466,7 @@ impl<'a> Lowering<'a> {
         let option_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
         let payload_ty = self.tyref_option_payload_value_type(dest_ty)?;
@@ -703,9 +705,12 @@ impl<'a> Lowering<'a> {
         }
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
-        let result_suffix =
-            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc)
-                .unwrap_or_default();
+        let result_suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+        )
+        .unwrap_or_default();
         let ok_ty = self.tyref_adt_type_arg(dest_ty, 0)?;
         let err_ty = self.tyref_adt_type_arg(dest_ty, 1)?;
         Some(crate::front::checked_arith::CheckedArithOkOrElseSite {
@@ -922,7 +927,7 @@ impl<'a> Lowering<'a> {
         option_owner: &mut String,
         some_owner: &mut String,
     ) {
-        if !tyref_enum_instantiation_suffix(dest_ty, self.llbc).is_empty() {
+        if !tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves).is_empty() {
             return;
         }
         let Some(hint) = payload_hint else {
@@ -934,7 +939,7 @@ impl<'a> Lowering<'a> {
         let Some(inst) = self.option_dest_with_payload(dest_ty, hint) else {
             return;
         };
-        if tyref_enum_instantiation_suffix(&inst, self.llbc).is_empty() {
+        if tyref_enum_instantiation_suffix(&inst, self.llbc, self.tombstoned_leaves).is_empty() {
             return;
         }
         if let Some((owner, some, _)) = self.resolve_option_dest_owners(&inst) {
@@ -1187,7 +1192,7 @@ impl<'a> Lowering<'a> {
         let result_owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(ty, self.llbc)
+            tyref_enum_instantiation_suffix(ty, self.llbc, self.tombstoned_leaves)
         );
         let ok_owner = Self::tagged_pair_payload_owner(td, &result_owner, 0)?;
         let err_owner = Self::tagged_pair_payload_owner(td, &result_owner, 1)?;
@@ -1612,12 +1617,12 @@ impl<'a> Lowering<'a> {
         let receiver_owner = format!(
             "{}{}",
             recv_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
+            tyref_enum_instantiation_suffix(recv_ty, self.llbc, self.tombstoned_leaves)
         );
         let result_owner = format!(
             "{}{}",
             dest_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let receiver_ok_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 0)?;
         let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;

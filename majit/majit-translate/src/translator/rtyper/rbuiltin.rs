@@ -574,9 +574,19 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "malloc_raw",
             rtype_malloc_raw,
         ),
-        // `majit_gc::header` varsize immortal helpers (`malloc_varsize` +
+        // `majit_gc::header` varsize helpers (`malloc_varsize` +
         // `init_gc_object_immortal`). Residual `direct_call`, like
         // `malloc_raw`: no vtable to fuse into `NewWithVtable`.
+        (
+            crate::runtime_names::modules::GC_HEADER,
+            "alloc_varsize_with_gc_header",
+            rtype_alloc_varsize_gc_header_reclaimable,
+        ),
+        (
+            crate::runtime_names::modules::GC_HEADER,
+            "alloc_varsize_with_gc_header_zeroed",
+            rtype_alloc_varsize_gc_header_reclaimable_zeroed,
+        ),
         (
             crate::runtime_names::modules::GC_HEADER,
             "alloc_varsize_with_gc_header_immortal",
@@ -2129,6 +2139,22 @@ pub fn rtype_malloc_raw(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> 
     Ok(hop.genop("direct_call", vlist, GenopResult::Repr(r_result)))
 }
 
+/// `@typer_for(majit_gc.header.alloc_varsize_with_gc_header)`.
+fn rtype_alloc_varsize_gc_header_reclaimable(
+    hop: &HighLevelOp,
+    kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_alloc_varsize_gc_header(hop, kwds_i, "alloc_varsize_with_gc_header")
+}
+
+/// `@typer_for(majit_gc.header.alloc_varsize_with_gc_header_zeroed)`.
+fn rtype_alloc_varsize_gc_header_reclaimable_zeroed(
+    hop: &HighLevelOp,
+    kwds_i: &HashMap<String, usize>,
+) -> RTypeResult {
+    rtype_alloc_varsize_gc_header(hop, kwds_i, "alloc_varsize_with_gc_header_zeroed")
+}
+
 /// `@typer_for(majit_gc.header.alloc_varsize_with_gc_header_immortal)`.
 fn rtype_alloc_varsize_gc_header_immortal(
     hop: &HighLevelOp,
@@ -2145,7 +2171,7 @@ fn rtype_alloc_varsize_gc_header_immortal_zeroed(
     rtype_alloc_varsize_gc_header(hop, kwds_i, "alloc_varsize_with_gc_header_immortal_zeroed")
 }
 
-/// Residual `direct_call` for the varsize immortal header allocators
+/// Residual `direct_call` for the varsize header allocators
 /// (`malloc_varsize` + `init_gc_object_immortal`). Two positional
 /// arguments (`payload_size`, `type_id`); result is the `*mut u8`
 /// payload pointer. Allocation failure returns null rather than
@@ -4538,6 +4564,21 @@ fn ptr_as_address(
     }
 }
 
+/// Item whose `sizeof` scales `count`. A `nolength` Array is a C pointer
+/// (`rffi.py` `CCHARP`); the copy is `count` elements of `OF`, not the
+/// Array container (`lltype.py` Array with `nolength` has no length word).
+fn copy_nonoverlapping_item_type(pointee: &LowLevelType) -> Result<LowLevelType, TyperError> {
+    match pointee {
+        LowLevelType::Array(arr) if arr._hints.get("nolength") == Some(&ConstValue::Bool(true)) => {
+            Ok(arr.OF.clone())
+        }
+        other if other._is_varsize() => Err(TyperError::message(format!(
+            "copy_nonoverlapping: cannot size varsize pointee {other:?}"
+        ))),
+        other => Ok(other.clone()),
+    }
+}
+
 /// `rgc.ll_arraycopy`: `raw_memcopy(..., sizeof(TP.OF) * length)`.
 fn scale_copy_count(
     hop: &HighLevelOp,
@@ -4557,12 +4598,8 @@ fn scale_copy_count(
             )));
         }
     };
-    if pointee._is_varsize() {
-        return Err(TyperError::message(format!(
-            "copy_nonoverlapping: cannot size varsize pointee {pointee:?}"
-        )));
-    }
-    let size = sizeof(&pointee, None).map_err(TyperError::message)?;
+    let item = copy_nonoverlapping_item_type(&pointee)?;
+    let size = sizeof(&item, None).map_err(TyperError::message)?;
     let c_size = HighLevelOp::inputconst(&LowLevelType::Signed, &size)?;
     hop.genop(
         "int_mul",
@@ -6239,6 +6276,92 @@ mod tests {
     }
 
     #[test]
+    fn copy_nonoverlapping_ccharp_scales_by_item_not_array() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomePtr, s_none};
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+
+        let host = HOST_ENV
+            .import_module("std.ptr")
+            .and_then(|m| m.module_get("copy_nonoverlapping"))
+            .expect("HOST_ENV missing std.ptr.copy_nonoverlapping");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // `CCHARP` is `Ptr(Array(Char, nolength))`. sizeof of the Array
+        // itself errors (`_is_varsize`); the copy is `count` Char items.
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let src = Variable::named("src");
+        src.annotation
+            .replace(Some(Rc::new(SomeValue::Ptr(SomePtr::new(
+                (*ccharp).clone(),
+            )))));
+        let dst = Variable::named("dst");
+        dst.annotation
+            .replace(Some(Rc::new(SomeValue::Ptr(SomePtr::new(
+                (*ccharp).clone(),
+            )))));
+        let count = Variable::named("count");
+        count
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let result = Variable::named("copied");
+        result.annotation.replace(Some(Rc::new(s_none())));
+
+        let spaceop = SpaceOperation::new(
+            "simple_call".to_string(),
+            vec![
+                Hlvalue::Constant(Constant::new(ConstValue::HostObject(host))),
+                Hlvalue::Variable(src.clone()),
+                Hlvalue::Variable(dst.clone()),
+                Hlvalue::Variable(count.clone()),
+            ],
+            Hlvalue::Variable(result.clone()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), Rc::clone(&llops));
+        hop.setup().expect("copy_nonoverlapping hop setup");
+        for var in [&src, &dst, &count] {
+            let shell = ann.binding(&Hlvalue::Variable(var.clone()));
+            let repr = rtyper.getrepr(&shell).expect("operand repr");
+            var.set_concretetype(Some(repr.lowleveltype().clone()));
+        }
+        let mut varmapping = HashMap::new();
+        rtyper
+            .translate_hl_to_ll(&hop, &mut varmapping)
+            .expect("CCHARP copy_nonoverlapping must scale by sizeof(Char)");
+        let names: Vec<String> = llops
+            .borrow()
+            .ops
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert!(
+            names.iter().any(|name| name == "raw_memcopy"),
+            "raw_memcopy missing from {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "int_mul"),
+            "element count must scale by sizeof(Char), missing int_mul in {names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "cast_ptr_to_adr"),
+            "Ptr operands must convert to Address, missing cast_ptr_to_adr in {names:?}"
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Void));
+    }
+
+    #[test]
     fn install_default_typers_registers_direct_ptradd_from_lltype_module() {
         // rbuiltin.py — `@typer_for(lltype.direct_ptradd)`.
         let host = HOST_ENV
@@ -6519,6 +6642,8 @@ mod tests {
     #[test]
     fn install_default_typers_registers_varsize_gc_header_allocs() {
         for leaf in [
+            "alloc_varsize_with_gc_header",
+            "alloc_varsize_with_gc_header_zeroed",
             "alloc_varsize_with_gc_header_immortal",
             "alloc_varsize_with_gc_header_immortal_zeroed",
             "dealloc_varsize_with_gc_header",
@@ -7733,6 +7858,112 @@ mod tests {
             panic!("force_cast result is a Variable, got {:?}", last.result);
         };
         assert_eq!(v.concretetype(), Some(entry_ty));
+        assert!(llops._called_exception_is_here_or_cannot_occur);
+    }
+
+    fn spill_struct_ptr() -> crate::translator::rtyper::lltypesystem::lltype::Ptr {
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, Struct};
+        Ptr::from_container_type(LowLevelType::Struct(Box::new(Struct::new(
+            "Tuple<i64>",
+            vec![("item0".to_string(), LowLevelType::Signed)],
+        ))))
+        .expect("spill Struct")
+    }
+
+    #[test]
+    fn rtype_force_cast_accepts_raw_malloc_someptr() {
+        // `rffi.cast` / `ForceCastEntry`: malloc's SomePtr(Ptr(TYPE)) is
+        // the source; dest is the callee's pointer arg (`CArrayPtr`).
+        use crate::annotator::model::{SomePtr, SomeType};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let src = spill_struct_ptr();
+        let entry_ty = CArrayPtr(LowLevelType::Signed);
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            entry_ty.clone(),
+        ))));
+        hop.args_s.borrow_mut().push(s_restype);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new(src.clone())));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LowLevelType(Box::new(entry_ty.clone())),
+                LowLevelType::Void,
+            )));
+        let var = Variable::named("p");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(src.clone()))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r.borrow_mut().push(None);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(src)) as Arc<dyn Repr>));
+
+        let result = rtype_force_cast(&hop, &HashMap::new())
+            .expect("ForceCastEntry rtypes a malloc SomePtr")
+            .expect("force_cast returns a value");
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(last.opname, "force_cast");
+        assert_eq!(result, last.result);
+        let Hlvalue::Variable(v) = &last.result else {
+            panic!("force_cast result is a Variable, got {:?}", last.result);
+        };
+        assert_eq!(v.concretetype(), Some(entry_ty));
+        assert!(llops._called_exception_is_here_or_cannot_occur);
+    }
+
+    #[test]
+    fn rtype_free_accepts_raw_malloc_someptr() {
+        // `rbuiltin.py` `rtype_free`: `hop.inputarg(hop.args_r[0])` keeps
+        // the malloc SomePtr's PtrRepr.
+        use crate::annotator::model::SomePtr;
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let src = spill_struct_ptr();
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new(src.clone())));
+        let var = Variable::named("p");
+        var.set_concretetype(Some(LowLevelType::Ptr(Box::new(src.clone()))));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(src)) as Arc<dyn Repr>));
+
+        hop.args_s.borrow_mut().push({
+            let mut s = crate::annotator::model::SomeString::new(false, false);
+            s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("raw")));
+            SomeValue::String(s)
+        });
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str("raw"),
+                LowLevelType::Void,
+            )));
+        hop.args_r.borrow_mut().push(None);
+
+        let mut kwds_i = HashMap::new();
+        kwds_i.insert("i_flavor".to_string(), 1);
+        let result = rtype_free(&hop, &kwds_i).expect("rtype_free of a malloc SomePtr");
+        assert!(result.is_none(), "free genops Void, got {result:?}");
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(last.opname, "free");
         assert!(llops._called_exception_is_here_or_cannot_occur);
     }
 

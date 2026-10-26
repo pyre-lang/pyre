@@ -63,6 +63,21 @@ impl<'a> Lowering<'a> {
         if self.try_lower_raw_adt_ptr_null(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
+        // `null_mut()` of an rstr `STR` pointer (`*mut Utf8Str`) is
+        // `lltype.nullptr(STR)`. Residual `ptr_null_constant` is a
+        // classdef-less Instance; dest-Str restore makes
+        // `SomeString(can_be_None=True)` so the live STR arm unions
+        // (`annmodel.SomeString.noneify`).
+        if self.try_lower_str_family_ptr_null(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
+        // `null_mut()` of a scalar `_arrayfld` GcArray (`*mut TypedItemsBlock`)
+        // is `lltype.nullptr(GcArray(ITEM))`. Residual `ptr_null_constant`
+        // is a classdef-less Instance; dest recast is skipped when the
+        // Call dest already names that root.
+        if self.try_lower_gcarray_ptr_null(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
         // `base()` and the read-back all leave the jitcode here, before any
         // operand is resolved -- the guard and its borrow bind no Variable,
@@ -157,8 +172,14 @@ impl<'a> Lowering<'a> {
         };
         let dest_class_ty: &TyRef = match &fd_output {
             Some(out)
-                if tyref_enum_instantiation_suffix(&call.dest.ty, self.llbc).is_empty()
-                    && !tyref_enum_instantiation_suffix(out, self.llbc).is_empty() =>
+                if tyref_enum_instantiation_suffix(
+                    &call.dest.ty,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                )
+                .is_empty()
+                    && !tyref_enum_instantiation_suffix(out, self.llbc, self.tombstoned_leaves)
+                        .is_empty() =>
             {
                 out
             }
@@ -596,7 +617,8 @@ impl<'a> Lowering<'a> {
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
-        let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
+        let raw_scalar_spills =
+            self.raw_scalar_borrow_spills(&call.func, &call_arg_tys, &arg_locals);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -781,6 +803,53 @@ impl<'a> Lowering<'a> {
                     && !from_bytes_identity
                     && !regular_call_is_slice_to_vec(&reg, self.llbc) =>
             {
+                // A pair slice's `.len()` / `.is_empty()` is its length
+                // word (`Rvalue::Len`). A string-byte-view window planted
+                // that word as `ll_strlen`; an object-list view keeps
+                // `array_view_logical_len`. Residualizing `slice::len` as
+                // a two-arg FunDecl call annotates `len` with two
+                // receivers.
+                if args.len() == 1
+                    && (self.is_slice_len(&reg) || self.is_slice_is_empty(&reg))
+                    && let Some(len_var) = pair_lens
+                        .iter()
+                        .find(|(index, _)| *index == 0)
+                        .map(|(_, len)| len.clone())
+                {
+                    let len = if let Some(logical) = self.array_view_logical_len_for_var(&args[0]) {
+                        self.bind_array_view_len_in_block(bb_id, logical)
+                    } else {
+                        len_var
+                    };
+                    if self.is_slice_is_empty(&reg) {
+                        let zero = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(zero.clone()),
+                            kind: OpKind::ConstInt(0),
+                        });
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::BinOp {
+                                op: "eq".to_string(),
+                                lhs: len,
+                                rhs: zero,
+                                result_ty: ValueType::Int,
+                            },
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else {
+                        self.local_var[dest_local] = Some(LocalValue::One(len));
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Checked `Wtf8::from_bytes(&[u8])` is the window pair
                 // (`rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8`).
                 if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty) {
@@ -1090,7 +1159,7 @@ impl<'a> Lowering<'a> {
                                     target,
                                     args[0].clone(),
                                     "cast_int_to_ptr",
-                                    ValueType::Ref(None),
+                                    dst_vt,
                                 );
                             }
                             _ => {}
@@ -3424,20 +3493,62 @@ impl<'a> Lowering<'a> {
                     // the wrong op here: the header is `SomeInstance`,
                     // `null_mut` joins that as an instance, and
                     // `ann_direct_arrayitems` is still deferred.
-                    let dest_is_ref = matches!(
+                    let dest_kind = tyref_to_value_type_with(
+                        &call.dest.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    );
+                    let dest_is_ref = matches!(dest_kind, ValueType::Ref(_));
+                    // Dest rstr `STR` (`is_rstr_str_layout_declaration`).
+                    // Aliasing keeps the source annotation (GCREF or the
+                    // CCHARP `Ptr(Array)` `alloc_varsize_with_gc_header_immortal`
+                    // returns) on a `SomeString` dest;
+                    // `mergeinputargs` panics `String ∪ Ptr(Array)`
+                    // (`llannotation.py` has no arm). Same dest-Str restore
+                    // / `cast_int_to_ptr(Ptr(STR))` the `Rvalue::Cast` arm
+                    // already emits (`ptr_cast_marker`,
+                    // `emit_cast_int_to_strptr`).
+                    let dest_is_str = matches!(dest_kind, ValueType::Str)
+                        || tyref_raw_ptr_pointee_is_string_value(&call.dest.ty, self.llbc);
+                    let src_kind = first_arg_ty.as_ref().map(|ty| {
                         tyref_to_value_type_with(
-                            &call.dest.ty,
+                            ty,
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,
                             &self.raw_alloc_flavor_structs,
-                        ),
-                        ValueType::Ref(_)
-                    );
+                        )
+                    });
                     let src_root = first_arg_ty.as_ref().and_then(|ty| {
                         tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
                     });
-                    if dest_is_ref
+                    if dest_is_str
+                        && let Some((kind, res)) = self.ptr_cast_marker(
+                            src_kind.as_ref(),
+                            src_root.as_deref(),
+                            &call.dest.ty,
+                            &args[0],
+                            self.cast_src_is_pointer(
+                                first_arg_ty.as_ref(),
+                                src_kind.as_ref(),
+                                &args[0],
+                            ),
+                        )
+                    {
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if dest_is_str
+                        && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && tyref_raw_ptr_pointee_is_string_value(&call.dest.ty, self.llbc)
+                    {
+                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, args[0].clone());
+                        self.local_var[dest_local] = Some(LocalValue::One(raw));
+                    } else if dest_is_ref
                         && let Some(kind) = self.instance_narrow_for_type(
                             &call.dest.ty,
                             &args[0],
@@ -4682,7 +4793,9 @@ impl<'a> Lowering<'a> {
                 // graph-less std helper.  A string-byte-view (`as_bytes()`)
                 // is `ll_strlen == 0`, not a GcArray header read.
                 if args.len() == 1 && self.is_slice_is_empty(&reg) {
-                    let fat_len = if first_arg_is_string_byte_view {
+                    let str_family_len = first_arg_is_string_byte_view
+                        || self.var_is_str_family_len_receiver(&args[0], first_arg_ty.as_ref());
+                    let fat_len = if str_family_len {
                         None
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
@@ -4695,7 +4808,7 @@ impl<'a> Lowering<'a> {
                         let len = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                        let len_kind = if first_arg_is_string_byte_view {
+                        let len_kind = if str_family_len {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
@@ -4766,7 +4879,9 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1 && self.is_slice_len(&reg) {
                     // A `Box<[T]>` field read — list views included — reads the fat pointer's length word (`rlist.py` `ll_length` reads the list's own length);
                     // a list view with no fat word in the graph (a parameter, a `Vec`) keeps `__len`.
-                    let fat_len = if first_arg_is_string_byte_view {
+                    let str_family_len = first_arg_is_string_byte_view
+                        || self.var_is_str_family_len_receiver(&args[0], first_arg_ty.as_ref());
+                    let fat_len = if str_family_len {
                         None
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
@@ -4782,7 +4897,7 @@ impl<'a> Lowering<'a> {
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
-                        let kind = if first_arg_is_string_byte_view {
+                        let kind = if str_family_len {
                             OpKind::Call {
                                 target: CallTarget::FunctionPath {
                                     segments: vec!["__strlen".to_string()],
@@ -4828,17 +4943,23 @@ impl<'a> Lowering<'a> {
                 // to the receiver so a subsequent `*base.add(idx)` is
                 // `getarrayitem_gc` on that array, not a call whose
                 // `*mut ItemsBlock` signature seeds `SomeInstance` and
-                // unions with `SomeList` at `mergeinputargs`. The same
-                // callee on a resizable list's `l.items` header stays a
-                // call; the split is the operand's lowleveltype.
+                // unions with `SomeList` at `mergeinputargs`. A scalar
+                // `_arrayfld` block (`TypedItemsBlock`) is the same
+                // identity: `typed_items_block_items_base` is
+                // `ll_fixed_items` of `GcArray(ITEM)`. The same callee
+                // on a resizable list's `l.items` header stays a call;
+                // the split is the operand's lowleveltype.
                 if args.len() == 1
                     && regular_call_name_path(&reg, self.llbc)
                         .is_some_and(|path| items_block_accessor_returns_its_block(&path))
-                    && arg_locals
+                    && (arg_locals
                         .first()
                         .copied()
                         .flatten()
                         .is_some_and(|local| self.local_is_fixed_object_array(local))
+                        || first_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| self.tyref_is_scalar_flexible_gcarray(ty)))
                 {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
@@ -7782,6 +7903,7 @@ impl<'a> Lowering<'a> {
             let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
                 &call.dest.ty,
                 self.llbc,
+                self.tombstoned_leaves,
             );
             // `Result<(), PyError>`: the transformed callee returns void
             // (`tyref_result_ok_is_unit`), so the payload is `Void`, not the
@@ -7825,9 +7947,19 @@ impl<'a> Lowering<'a> {
         // is liberal — any `next`-leaf call returning `Option` — because
         // the rewrite itself validates the surrounding for-loop match and
         // declines (leaving the residual call) on any other shape.
+        // A `slice::iter::{Iter,IterMut}::next` FunDecl (inherent or the
+        // `Iterator` trait-impl identity) may type the dest as opaque `Ref`
+        // so `tyref_is_option` misses; still record it — same method
+        // `ListIteratorRepr.rtype_next` already rewrites from the inherent
+        // four-segment path.
         if let OpKind::Call { target, .. } = &op_kind
             && crate::front::iter_next::is_iterator_next_target(target)
-            && crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+            && (crate::front::result_exc::tyref_is_option(&call.dest.ty, self.llbc)
+                || matches!(
+                    target,
+                    CallTarget::FunctionPath { segments, .. }
+                        if crate::front::iter_next::is_slice_iter_next_segments(segments)
+                ))
         {
             // A slice iterator yields `Option<&T>`; peel that one `&` so the
             // recorded kind is the item's own, the way `ll_listnext` hands
@@ -9092,6 +9224,7 @@ impl<'a> Lowering<'a> {
             &signature.output,
             self.llbc,
             carrier,
+            self.tombstoned_leaves,
             self.gc_struct_ids,
             &self.raw_alloc_flavor_structs,
         );

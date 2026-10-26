@@ -39811,6 +39811,7 @@ mod tests {
                 ("items".to_string(), "[u64; 0]".to_string()),
             ],
         );
+        struct_fields.note_declared_gc_name("TypedItemsBlock");
         let mut cc = crate::call::CallControl::new();
         cc.set_struct_fields(struct_fields);
 

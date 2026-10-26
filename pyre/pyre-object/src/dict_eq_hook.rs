@@ -229,7 +229,14 @@ pub extern "C" fn has_eq_w_hook() -> bool {
 /// Not `unsafe` for ABI-surface reasons (residual calls dispatch through a
 /// plain fnaddr); `a` / `b` must nonetheless be valid PyObjectRefs (null
 /// tolerated as per PyPy's `is_w` shortcut at `baseobjspace.py`).
-#[majit_macros::dont_look_inside]
+///
+/// `baseobjspace.py eq_w` is looked inside and reaches `__eq__` through
+/// `get_and_call_function` (`descroperation.py`), which may-forces. This
+/// trampoline is the crate-boundary residual of that call, so it carries
+/// the same extraeffect: a transparent helper must refuse it before
+/// `execute_varargs` (`residual_call_refused_up_front`), or the callback
+/// runs and the helper abort replays the Python CALL.
+#[majit_macros::jit_may_force]
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"
@@ -290,7 +297,14 @@ pub extern "C" fn has_hash_w_hook() -> bool {
 /// wrapper does).  Not `unsafe` for ABI-surface reasons (residual
 /// calls dispatch through a plain fnaddr); `obj` must nonetheless be
 /// a valid PyObjectRef (null tolerated).
-#[majit_macros::dont_look_inside]
+///
+/// `descroperation.py hash_w` is looked inside and reaches `__hash__`
+/// through `get_and_call_function`, which may-forces. This trampoline is
+/// the crate-boundary residual of that call, so it carries the same
+/// extraeffect: a transparent helper must refuse it before
+/// `execute_varargs` (`residual_call_refused_up_front`), or the callback
+/// runs and the helper abort replays the Python CALL.
+#[majit_macros::jit_may_force]
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the interpreter boundary; this item is the safe object-space facade"

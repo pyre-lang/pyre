@@ -6588,9 +6588,15 @@ impl<'a> Lowering<'a> {
         };
         match self.llbc.fn_by_id(*id)?.item_meta.name_path().as_str() {
             "pyre_object::int_array::<Impl>::as_slice"
-            | "pyre_object::int_array::<Impl>::as_mut_slice" => Some(("IntArray", "[i64]")),
+            | "pyre_object::int_array::<Impl>::as_mut_slice" => Some((
+                "IntArray",
+                super::super::numeric_array_slice_spelling("IntArray")?,
+            )),
             "pyre_object::float_array::<Impl>::as_slice"
-            | "pyre_object::float_array::<Impl>::as_mut_slice" => Some(("FloatArray", "[f64]")),
+            | "pyre_object::float_array::<Impl>::as_mut_slice" => Some((
+                "FloatArray",
+                super::super::numeric_array_slice_spelling("FloatArray")?,
+            )),
             _ => None,
         }
     }
@@ -7591,6 +7597,14 @@ impl<'a> Lowering<'a> {
         result_ty: ValueType,
     ) -> Result<(), LowerError> {
         let bb_id = self.emit_bb(mir_bb);
+        if op == "cast_int_to_ptr" && matches!(result_ty, ValueType::Str) {
+            let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, operand);
+            self.local_var[dest_local] = Some(LocalValue::One(raw));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(());
+        }
         let concretetype = if op == "cast_int_to_ptr" {
             crate::model::ConcreteType::GcRef
         } else {

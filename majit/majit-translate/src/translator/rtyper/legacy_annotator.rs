@@ -1010,25 +1010,17 @@ fn ccharp_someptr_incoming() -> Incoming {
 fn someptr_from_raw_malloc_type(
     TYPE: Option<&crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
 ) -> SomeValue {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr};
     let Some(t) = TYPE else {
         return ccharp_someptr();
     };
-    if let LowLevelType::Ptr(ptr_ty) = t {
-        return SomeValue::Ptr(SomePtr::new((**ptr_ty).clone()));
-    }
-    match Ptr::from_container_type(t.clone()) {
-        Ok(ptr) => SomeValue::Ptr(SomePtr::new(ptr)),
-        Err(_) => ccharp_someptr(),
-    }
+    crate::translator::rtyper::llannotation::ann_malloc_result_annotation(t.clone())
 }
 
 /// `history.py` `getkind` of a raw `Ptr` is `'int'`. `resolve_types`
-/// `commit_concretetype` keeps a `Ptr(Array)` (`rffi.py` `CCHARP`) and
-/// a `Ptr(FuncType)` (`lltype.FuncType` / `getfunctionptr`) and will
-/// not replace them with the kind-only overlay (`Signed` from
-/// `somevalue_to_valuetype` of `Ptr(FuncType)`, `GcRef` from a
-/// non-function `SomePtr`).
+/// `commit_concretetype` keeps a stamped raw `Ptr` (`CCHARP`,
+/// `Ptr(FuncType)`, `Ptr(Struct)` spill cell) and will not replace it
+/// with the kind-only overlay (`Signed` from `infer_op_type`
+/// `RawMalloc`, `GcRef` from a non-function `SomePtr`).
 fn stamp_someptr_lltype(var: &Variable, sv: &SomeValue) {
     let SomeValue::Ptr(p) = sv else {
         return;

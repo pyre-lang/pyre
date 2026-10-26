@@ -797,6 +797,18 @@ fn init_someobject_defaults(
                         s_self, s_attr
                     );
                 };
+                // pyre paints rstr `STR` (`Utf8Str` / `BytesBlock`) as
+                // `SomeString`. Prefix fields of that GcStruct (`hash`,
+                // the length word, `chars`) are still `getattr` on
+                // `Ptr(STR)` (`rptr.py` `PtrRepr.rtype_getattr`,
+                // `rstr.py` `s.hash`). Resolve them before
+                // `find_method` so a FieldRead of the hash slot is the
+                // Signed word, not a missing-attr error.
+                if matches!(&s_self, SomeValue::String(_))
+                    && let Some(s_field) = str_gcstruct_field_annotation(&ann.bookkeeper, &attr)
+                {
+                    return s_field;
+                }
                 if let Some(s_method) = s_self.find_method(&attr) {
                     return s_method;
                 }
@@ -2224,6 +2236,91 @@ pub fn contains_String(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     SomeValue::Bool(SomeBool::new())
 }
 
+/// `Ptr(STR)` example used for field getattr/setattr on a value the
+/// front end painted `SomeString` (`ValueType::Str` is rstr `STR`).
+fn rstr_str_someptr() -> crate::translator::rtyper::lltypesystem::lltype::SomePtr {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+    match &*crate::translator::rtyper::lltypesystem::rstr::STRPTR {
+        LowLevelType::Ptr(p) => SomePtr::new(*p.clone()),
+        other => panic!("STRPTR must be Ptr, got {other:?}"),
+    }
+}
+
+fn const_field_name(name: &str) -> SomeValue {
+    let mut s = SomeString::new(false, false);
+    s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(name)));
+    SomeValue::String(s)
+}
+
+fn integer_word_field_annotation(ty: &str) -> Option<SomeValue> {
+    let leaf = ty.trim().rsplit("::").next().unwrap_or(ty.trim());
+    let unsigned = matches!(leaf, "u8" | "u16" | "u32" | "u64" | "u128" | "usize");
+    let signed = matches!(leaf, "i8" | "i16" | "i32" | "i64" | "i128" | "isize");
+    if !(unsigned || signed) {
+        return None;
+    }
+    Some(SomeValue::Integer(SomeInteger::new(unsigned, unsigned)))
+}
+
+/// Harvested field type of `attr` on an interned rstr `STR` layout
+/// (`Utf8Str` / `BytesBlock` / `LowlevelStringHeader`). The pyre STR
+/// overlay stores the array length as its own integer word; rstr
+/// `STR` only has `hash` and `chars`.
+fn interned_str_layout_field_ty(bk: &super::bookkeeper::Bookkeeper, attr: &str) -> Option<String> {
+    let guard = bk.struct_fields.borrow();
+    let reg = guard.as_ref()?;
+    let roots = crate::front::mir::STR_LENGTH_FIELD_CLASS_ROOTS
+        .iter()
+        .copied()
+        .chain(crate::front::mir::STR_FAMILY_DECLARED_PATHS.iter().copied());
+    for root in roots {
+        if let Some(ty) = reg.field_type(root, attr) {
+            return Some(ty.to_string());
+        }
+    }
+    None
+}
+
+fn str_gcstruct_field_annotation(
+    bk: &super::bookkeeper::Bookkeeper,
+    attr: &str,
+) -> Option<SomeValue> {
+    let s_attr = const_field_name(attr);
+    if let Ok(s) = rstr_str_someptr().getattr(&s_attr) {
+        return Some(s);
+    }
+    integer_word_field_annotation(&interned_str_layout_field_ty(bk, attr)?)
+}
+
+fn some_string_setattr_str_field(
+    bk: &super::bookkeeper::Bookkeeper,
+    s_attr: &SomeValue,
+    s_value: &SomeValue,
+) -> Result<(), AnnotatorError> {
+    let ptr = rstr_str_someptr();
+    if ptr.getattr(s_attr).is_ok() {
+        ptr.setattr(s_attr, s_value)?;
+        return Ok(());
+    }
+    let attr = s_attr
+        .const_()
+        .and_then(ConstValue::as_text)
+        .ok_or_else(|| AnnotatorError::new("setattr on str with non-constant field-name"))?;
+    let ty = interned_str_layout_field_ty(bk, attr)
+        .ok_or_else(|| AnnotatorError::new(format!("setattr on str with no field {attr:?}")))?;
+    if integer_word_field_annotation(&ty).is_none() {
+        return Err(AnnotatorError::new(format!(
+            "setattr on str field {attr:?} is not an integer prefix of the STR overlay"
+        )));
+    }
+    if !matches!(s_value, SomeValue::Integer(_)) {
+        return Err(AnnotatorError::new(format!(
+            "setattr on str field {attr:?} expected an integer, got {s_value:?}"
+        )));
+    }
+    Ok(())
+}
+
 fn init_somestring_overrides(
     reg: &mut std::collections::HashMap<
         OpKind,
@@ -2298,6 +2395,28 @@ fn init_somestring_overrides(
                     return SomeValue::Integer(i);
                 }
                 SomeValue::Integer(SomeInteger::new(true, false))
+            }),
+            can_only_throw: CanOnlyThrow::Absent,
+        },
+    );
+    // pyre `ValueType::Str` is rstr `Ptr(STR)`. FieldWrite of the
+    // GcStruct prefix (`hash`, the length word) is `SomePtr.setattr`
+    // on that struct (`lltype.py`), void.
+    register(
+        reg,
+        OpKind::SetAttr,
+        SomeValueTag::String,
+        Specialization {
+            apply: Box::new(|ann, hl| {
+                let s_attr = ann
+                    .annotation(&hl.args[1])
+                    .expect("string.setattr: attr unbound");
+                let s_value = ann
+                    .annotation(&hl.args[2])
+                    .expect("string.setattr: value unbound");
+                some_string_setattr_str_field(&ann.bookkeeper, &s_attr, &s_value)
+                    .unwrap_or_else(|err| std::panic::panic_any(err));
+                None
             }),
             can_only_throw: CanOnlyThrow::Absent,
         },
@@ -6894,6 +7013,94 @@ mod tests {
             panic!("Vec.append must still resolve through find_method");
         };
         assert_eq!(bound.analyser_name, "rustvec_method_append");
+    }
+
+    #[test]
+    fn string_setattr_hash_is_void_and_getattr_is_signed() {
+        let ann = mk_ann();
+        let mut v_s = Variable::named("s");
+        ann.setbinding(&mut v_s, SomeValue::String(SomeString::new(false, true)));
+        let mut v_zero = Variable::named("z");
+        ann.setbinding(
+            &mut v_zero,
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        );
+        let hl_set = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_s.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("hash"))),
+                Hlvalue::Variable(v_zero),
+            ],
+        );
+        assert!(
+            hl_set.consider(&ann).expect("setattr hash").is_none(),
+            "SomePtr.setattr on STR.hash is void"
+        );
+
+        let hl_get = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_s.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("hash"))),
+            ],
+        );
+        let got = hl_get.consider(&ann).expect("getattr hash").unwrap();
+        assert!(matches!(got, SomeValue::Integer(_)), "got {got:?}");
+
+        let hl_split = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_s),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("split"))),
+            ],
+        );
+        let SomeValue::BuiltinMethod(bound) =
+            hl_split.consider(&ann).expect("getattr split").unwrap()
+        else {
+            panic!("str.split must still resolve through find_method");
+        };
+        assert_eq!(bound.analyser_name, "str_method_split");
+    }
+
+    #[test]
+    fn string_setattr_length_uses_interned_str_overlay() {
+        let ann = mk_ann();
+        let mut reg = crate::front::StructFieldRegistry::default();
+        reg.fields.insert(
+            "unicodeobject::Utf8Str".to_string(),
+            vec![
+                ("hash".to_string(), "i64".to_string()),
+                ("length".to_string(), "usize".to_string()),
+                ("chars".to_string(), "[u8; 0]".to_string()),
+            ],
+        );
+        ann.bookkeeper.set_struct_fields(std::rc::Rc::new(reg));
+        let mut v_s = Variable::named("s");
+        ann.setbinding(&mut v_s, SomeValue::String(SomeString::new(false, true)));
+        let mut v_n = Variable::named("n");
+        ann.setbinding(&mut v_n, SomeValue::Integer(SomeInteger::new(true, true)));
+        let hl_set = HLOperation::new(
+            OpKind::SetAttr,
+            vec![
+                Hlvalue::Variable(v_s.clone()),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("length"))),
+                Hlvalue::Variable(v_n),
+            ],
+        );
+        assert!(
+            hl_set.consider(&ann).expect("setattr length").is_none(),
+            "STR overlay length word is void setattr"
+        );
+        let hl_get = HLOperation::new(
+            OpKind::GetAttr,
+            vec![
+                Hlvalue::Variable(v_s),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("length"))),
+            ],
+        );
+        let got = hl_get.consider(&ann).expect("getattr length").unwrap();
+        assert!(matches!(got, SomeValue::Integer(_)), "got {got:?}");
     }
 
     #[test]

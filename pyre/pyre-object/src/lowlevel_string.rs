@@ -174,13 +174,15 @@ fn alloc_lowlevel_string(
         }
         ptr
     } else {
-        // Off-heap `rstr.STR` / `UNICODE` is still a `GcStruct` (`rstr.py`):
-        // a prebuilt `rpy_string` carries `init_gc_object_immortal`. The
-        // pointer handed out is the address after the header.
+        // Host fallback of `rstr.mallocstr` (`malloc(STR, length)`): reclaimable
+        // `malloc_varsize`, not a prebuilt. The leaf still stamps
+        // `init_gc_object_immortal` so a write barrier skips it; dealloc
+        // frees the `std::alloc` block. The pointer is the address after
+        // the header.
         let ptr = if zero_fill {
-            majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(total_size, tid)
+            majit_gc::header::alloc_varsize_with_gc_header_zeroed(total_size, tid)
         } else {
-            majit_gc::header::alloc_varsize_with_gc_header_immortal(total_size, tid)
+            majit_gc::header::alloc_varsize_with_gc_header(total_size, tid)
         };
         if ptr.is_null() {
             return 0;
@@ -1118,6 +1120,10 @@ mod tests {
         // `rstr.mallocstr` with `malloc_zero_filled = False`.
         let buf = bh_alloc_str_nofill(4);
         assert_ne!(buf, 0);
+        assert!(
+            !majit_gc::is_immortal_header_payload(buf as usize),
+            "rstr.mallocstr fallback is reclaimable, not an arena prebuilt"
+        );
         unsafe {
             let hdr = majit_gc::header::header_of(buf as usize);
             assert!((*hdr).has_flag(majit_gc::GcFlags::GCFLAG_NO_HEAP_PTRS));

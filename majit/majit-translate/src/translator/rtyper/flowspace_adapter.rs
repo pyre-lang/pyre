@@ -71,7 +71,7 @@ use crate::flowspace::model::{
 use crate::front::slice_index::vec_inherent_index_segments;
 use crate::model::{BlockId, ExitCase, ExitSwitch, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::llannotation::lltype_to_annotation;
+use crate::translator::rtyper::llannotation::{ann_malloc_result_annotation, lltype_to_annotation};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 
 /// Map from a legacy graph `Variable` to the representative typed
@@ -769,6 +769,68 @@ fn seed_raw_item_annotation(result: &Hlvalue, lltype: LowLevelType) {
     if let Hlvalue::Variable(v) = result {
         *v.annotation.borrow_mut() = Some(Rc::new(lltype_to_annotation(lltype)));
     }
+}
+
+/// `lltype.py` `ann_malloc`: seed `SomePtr(Ptr(TYPE))` so flowin
+/// `setbinding` contains the same typed pointer. TYPE is the allocated
+/// container (`Array(Char)` / spill `Struct`); wrap it in `Ptr`.
+#[allow(non_snake_case)]
+fn seed_malloc_result_annotation(result: &Hlvalue, TYPE: LowLevelType) {
+    if let Hlvalue::Variable(v) = result {
+        *v.annotation.borrow_mut() = Some(Rc::new(ann_malloc_result_annotation(TYPE)));
+    }
+}
+
+/// `op.args[0].value` of the rtyped `malloc` / `malloc_varsize` llop
+/// (`jtransform.py _rewrite_raw_malloc`). A typed frontend emit already
+/// carries `TYPE`; the scalar spill (`address.rs`
+/// `raw_scalar_borrow_spills`) has none, and `CallControl::struct_layout_for`
+/// sizes it from the owner string (`Tuple<i64>`).
+#[allow(non_snake_case)]
+fn raw_malloc_type_const(owner: &str, TYPE: &Option<LowLevelType>) -> LowLevelType {
+    match TYPE {
+        Some(ty) => ty.clone(),
+        None => LowLevelType::Struct(Box::new(
+            crate::translator::rtyper::lltypesystem::lltype::Struct::new(
+                owner,
+                vec![("item0".to_string(), LowLevelType::Signed)],
+            ),
+        )),
+    }
+}
+
+/// `op.args[1].value` flags dict `_rewrite_raw_malloc` pops. Flavor is
+/// always `raw` on [`OpKind::RawMalloc`]. Default `zero` / `track_allocation`
+/// / `add_memory_pressure` are omitted the way `rtype_malloc` only stores
+/// kwargs that were passed; leftovers stay so `UnsupportedMallocFlags` still
+/// fires.
+fn raw_malloc_flags_const(
+    zero: bool,
+    track_allocation: bool,
+    add_memory_pressure: bool,
+    extra_flags: &[String],
+) -> ConstValue {
+    let mut flags_map = indexmap::IndexMap::new();
+    flags_map.insert(ConstValue::byte_str("flavor"), ConstValue::byte_str("raw"));
+    if zero {
+        flags_map.insert(ConstValue::byte_str("zero"), ConstValue::Bool(true));
+    }
+    if !track_allocation {
+        flags_map.insert(
+            ConstValue::byte_str("track_allocation"),
+            ConstValue::Bool(false),
+        );
+    }
+    if add_memory_pressure {
+        flags_map.insert(
+            ConstValue::byte_str("add_memory_pressure"),
+            ConstValue::Bool(true),
+        );
+    }
+    for name in extra_flags {
+        flags_map.insert(ConstValue::byte_str(name.as_str()), ConstValue::Bool(true));
+    }
+    ConstValue::Dict(Arc::new(flags_map))
 }
 
 /// Map a pyre-frontend unary op name (`front::mir::unary_op_label`)
@@ -4662,6 +4724,69 @@ pub fn translate_op(
             )])
         }
 
+        // `lltype.malloc(T, flavor='raw')` / `lltype.free(p, flavor='raw')`.
+        // The frontend emits `OpKind::RawMalloc` for a typed raw struct and
+        // for the scalar `&mut i64` spill (`address.rs`
+        // `install_raw_scalar_address_call`). Upstream the high-level form
+        // is `simple_call(lltype.malloc, TYPE, flavor='raw')`; `rtype_malloc`
+        // genops the llop `malloc(TYPE, flags)` that
+        // `jtransform.py _rewrite_raw_malloc` residualizes. Emit that rtyped
+        // shape here, the way `RawLoad` emits `raw_load(TYPE, addr, ofs)`.
+        // `ann_malloc` annotates `SomePtr(Ptr(TYPE))`; `history.py`
+        // `getkind` of a raw pointer is `'int'` at the codewriter.
+        OpKind::RawMalloc {
+            owner,
+            TYPE,
+            zero,
+            track_allocation,
+            add_memory_pressure,
+            extra_flags,
+            length,
+        } => {
+            let malloc_type = raw_malloc_type_const(owner, TYPE);
+            let type_hl = Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(
+                malloc_type.clone(),
+            ))));
+            let flags_hl = Hlvalue::Constant(Constant::new(raw_malloc_flags_const(
+                *zero,
+                *track_allocation,
+                *add_memory_pressure,
+                extra_flags,
+            )));
+            let result = resolve_result_hlvalue(op, value_map)?;
+            seed_malloc_result_annotation(&result, malloc_type);
+            if let Some(n) = length {
+                let n_hl = lookup_operand(value_map, n, op, "length")?;
+                Ok(vec![FlowspaceOp::new(
+                    "malloc_varsize",
+                    vec![type_hl, flags_hl, n_hl],
+                    result,
+                )])
+            } else {
+                Ok(vec![FlowspaceOp::new(
+                    "malloc",
+                    vec![type_hl, flags_hl],
+                    result,
+                )])
+            }
+        }
+        OpKind::RawFree { ptr } => {
+            let ptr_hl = lookup_operand(value_map, ptr, op, "ptr")?;
+            let flags_hl = Hlvalue::Constant(Constant::new(raw_malloc_flags_const(
+                false,
+                true,
+                false,
+                &[],
+            )));
+            let result = resolve_result_hlvalue(op, value_map)?;
+            seed_raw_item_annotation(&result, LowLevelType::Void);
+            Ok(vec![FlowspaceOp::new(
+                "free",
+                vec![ptr_hl, flags_hl],
+                result,
+            )])
+        }
+
         // ─── Stage-invariant fail-loud catch-all ───
         // No remaining variants reach here legitimately: every legitimate
         // pre-rtyper input shape has an explicit arm above, every
@@ -5652,6 +5777,26 @@ pub(crate) fn derive_subject_inputcells(
                         .cloned()
                         .unwrap_or_else(|| root.clone());
                     let root = &root;
+                    // A `GcStruct._arrayfld` block (`lltype.py`) is
+                    // `SomePtr(GcArray)` or `FixedSizeListRepr`
+                    // (`SomeList`), not the wrapping ClassDef.
+                    // `split_struct_template_rows_known` is exact-key
+                    // (plus Entry / foreign-body templates). A leaf
+                    // class_root or a suffixed `GcEntries<K,V>` still
+                    // has `_arrayfld` rows via `field_rows`; seed that
+                    // projection even when `known` is false so `len`
+                    // is `getarraysize` / `SomeList.len`, not
+                    // `getattr("__len__")` on `SomeInstance`
+                    // (`unaryop.py` `len_SomeInstance`).
+                    let projected = bk.project_struct_field_type(root);
+                    if matches!(
+                        projected,
+                        crate::annotator::model::SomeValue::Ptr(_)
+                            | crate::annotator::model::SomeValue::List(_)
+                    ) {
+                        cells.push(projected);
+                        continue;
+                    }
                     // `lookup_fields` drops a `<…>` suffix and reads the
                     // harvested template rows. A `RangeInclusive<i64>`
                     // receiver is that instantiation's class
@@ -5673,17 +5818,6 @@ pub(crate) fn derive_subject_inputcells(
                         // struct-field rows, interned by qualname like its constructor.
                         || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
                     if known {
-                        // A `&FixedObjectArray` receiver models as its
-                        // `_items` element list, not the wrapping struct
-                        // (project_struct_field_type), so an `arr[idx]` access
-                        // resolves as a list `getitem` rather than rewriting
-                        // to `getattr("__getitem__")`.
-                        if majit_ir::descr::canonical_struct_name(root)
-                            == "object_array::FixedObjectArray"
-                        {
-                            cells.push(bk.project_struct_field_type(root));
-                            continue;
-                        }
                         // A `&RawStruct` is the address of that struct
                         // (`Ptr` of a raw `Struct`, `history.getkind`).
                         // FieldRead of the same owner already seeds
@@ -5755,14 +5889,25 @@ pub(crate) fn derive_subject_inputcells(
             // `Ref` at the front and take the `Ref` arm above
             // (`rclass.py getgcflavor`). Fieldless enums are also `Int`
             // and carry a class root; the storage-raw predicate does not
-            // match, so they stay the integer shell.
+            // match, so they stay the integer shell. An `_arrayfld`
+            // block that arrived as Int still seeds Ptr/List.
             if matches!(ty, crate::model::ValueType::Int)
                 && let Some(root) = class_root.as_deref()
                 && let Some(bk) = bookkeeper
-                && let Some(cell) = bk.raw_struct_ptr_annotation(root)
             {
-                cells.push(cell);
-                continue;
+                let projected = bk.project_struct_field_type(root);
+                if matches!(
+                    projected,
+                    crate::annotator::model::SomeValue::Ptr(_)
+                        | crate::annotator::model::SomeValue::List(_)
+                ) {
+                    cells.push(projected);
+                    continue;
+                }
+                if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
+                    cells.push(cell);
+                    continue;
+                }
             }
             cells.push(shell);
             continue;
@@ -8236,6 +8381,159 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_typed_items_block_as_gcarray_ptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let owner = "lltypesystem::rlist::TypedItemsBlock";
+        let mut graph = LegacyGraph::new("typed_items_block_capacity");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "block".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        fields.note_declared_gc_name(owner);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells =
+            derive_subject_inputcells(&graph, Some(&bk)).expect("TypedItemsBlock input must seed");
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!(
+                "TypedItemsBlock must seed SomePtr(GcArray), got {:?}",
+                cells[0]
+            );
+        };
+        assert!(
+            matches!(ptr.ll_ptrtype.TO, PtrTarget::Array(_)),
+            "TypedItemsBlock input must be Ptr(GcArray), got {:?}",
+            ptr.ll_ptrtype.TO
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_typed_items_block_leaf_as_gcarray_ptr() {
+        // Registry key is the crate-stripped path; Input class_root is
+        // the leaf. `split_struct_template_rows_known` is exact-key, so
+        // `known` is false; `_arrayfld` projection still seeds Ptr.
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let registry_key = "lltypesystem::rlist::TypedItemsBlock";
+        let class_root = "TypedItemsBlock";
+        let mut graph = LegacyGraph::new("typed_items_block_capacity");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "block".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(class_root.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            registry_key.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        fields.note_declared_gc_name(registry_key);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("leaf TypedItemsBlock input must seed");
+        let SomeValue::Ptr(ptr) = &cells[0] else {
+            panic!(
+                "leaf TypedItemsBlock must seed SomePtr(GcArray), got {:?}",
+                cells[0]
+            );
+        };
+        assert!(
+            matches!(ptr.ll_ptrtype.TO, PtrTarget::Array(_)),
+            "leaf TypedItemsBlock input must be Ptr(GcArray), got {:?}",
+            ptr.ll_ptrtype.TO
+        );
+    }
+
+    #[test]
+    fn derive_subject_inputcells_seeds_suffixed_gc_entries_as_list() {
+        // Harvest registers the unsuffixed template; Input class_root
+        // is `GcEntries<K,V>`. `known` is false (only Entry is the
+        // split-struct exception); `_arrayfld` still seeds SomeList.
+        let registry_key = "rordereddict_entries::GcEntries";
+        let class_root = "rordereddict_entries::GcEntries<StrKey, PyObject>";
+        let mut graph = LegacyGraph::new("entries_allocated_len");
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "entries".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(class_root.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            registry_key.to_string(),
+            vec![
+                ("length".to_string(), "usize".to_string()),
+                (
+                    "items".to_string(),
+                    "[rordereddict_entries::Entry<StrKey, PyObject>; 0]".to_string(),
+                ),
+            ],
+        );
+        fields.fields.insert(
+            "rordereddict_entries::Entry".to_string(),
+            vec![
+                ("key".to_string(), "StrKey".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "*mut PyObject".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        fields.note_declared_gc_name(registry_key);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let cells = derive_subject_inputcells(&graph, Some(&bk))
+            .expect("suffixed GcEntries input must seed");
+        assert!(
+            matches!(cells[0], SomeValue::List(_)),
+            "suffixed GcEntries must seed SomeList, got {:?}",
+            cells[0]
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_a_slice_of_gc_refs_as_somelist() {
         let mut graph = LegacyGraph::new("ctypefunc::call");
         let entry = graph.startblock;
@@ -9482,6 +9780,211 @@ mod tests {
         match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
             Some(SomeValue::None_(_)) => {}
             other => panic!("RawStore must seed s_None, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_op_raw_malloc_lowers_to_malloc_spaceop() {
+        // Scalar spill: TYPE=None, owner `Tuple<i64>`. The rtyped shape is
+        // `malloc(TYPE, flags)` with flavor `raw`; `ann_malloc` seeds
+        // `SomePtr(Ptr(Struct))`. `history.py` `getkind` of that raw
+        // pointer is `'int'`.
+        use crate::translator::rtyper::lltypesystem::lltype::{Ptr, PtrTarget};
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_raw_malloc_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::raw_malloc("Tuple<i64>", false, None),
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RawMalloc arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "malloc");
+        assert_eq!(lowered.args.len(), 2);
+        match &lowered.args[0] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::LowLevelType(ll) => match &**ll {
+                    LowLevelType::Struct(s) => assert_eq!(s._name, "Tuple<i64>"),
+                    other => panic!("scalar-spill TYPE must be Struct Tuple<i64>, got {other:?}"),
+                },
+                other => panic!("malloc TYPE must be LowLevelType, got {other:?}"),
+            },
+            other => panic!("malloc TYPE must be Constant, got {other:?}"),
+        }
+        match &lowered.args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Dict(map) => {
+                    assert_eq!(
+                        map.get(&ConstValue::byte_str("flavor")),
+                        Some(&ConstValue::byte_str("raw"))
+                    );
+                    assert!(map.get(&ConstValue::byte_str("zero")).is_none());
+                    assert!(map.get(&ConstValue::byte_str("track_allocation")).is_none());
+                }
+                other => panic!("malloc flags must be Dict, got {other:?}"),
+            },
+            other => panic!("malloc flags must be Constant, got {other:?}"),
+        }
+        let Hlvalue::Variable(result) = &lowered.result else {
+            panic!("RawMalloc result must be a Variable");
+        };
+        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+            Some(SomeValue::Ptr(p)) => {
+                assert!(
+                    matches!(&p.ll_ptrtype.TO, PtrTarget::Struct(s) if s._name == "Tuple<i64>"),
+                    "ann_malloc seeds Ptr(Struct Tuple<i64>), got {:?}",
+                    p.ll_ptrtype
+                );
+                let ptr_ll = LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()));
+                assert_eq!(
+                    crate::model::getkind(&ptr_ll),
+                    crate::model::ConcreteType::Signed,
+                    "getkind of a raw Ptr is int"
+                );
+                let expected = Ptr::from_container_type(raw_malloc_type_const("Tuple<i64>", &None))
+                    .expect("spill Struct");
+                assert_eq!(p.ll_ptrtype, expected);
+            }
+            other => panic!("RawMalloc must seed SomePtr(Ptr(TYPE)), got {other:?}"),
+        }
+    }
+
+    #[allow(non_snake_case)]
+    fn flowin_raw_malloc_result(
+        owner: &str,
+        TYPE: Option<LowLevelType>,
+        length: Option<Variable>,
+    ) -> (
+        SomeValue,
+        crate::translator::rtyper::lltypesystem::lltype::Ptr,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::Block as FlowspaceBlock;
+        use crate::flowspace::model::FunctionGraph as FlowspaceGraph;
+        use crate::translator::rtyper::lltypesystem::lltype::Ptr;
+
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("raw_malloc_ann_fixture");
+        let nvars = if length.is_some() { 3 } else { 2 };
+        let vars = mint_vars(&mut graph, nvars);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        if let Some(n) = length.as_ref() {
+            value_map.insert(n.clone(), Hlvalue::Variable(Variable::new()));
+        }
+        let op = SpaceOperation {
+            result: Some(vars[1].clone()),
+            kind: OpKind::raw_malloc_with_flags(
+                owner,
+                TYPE.clone(),
+                false,
+                true,
+                false,
+                Vec::new(),
+                length,
+            ),
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("RawMalloc arm must lower");
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let startblock = FlowspaceBlock::shared(Vec::new());
+        startblock.borrow_mut().operations = translated;
+        let fs_graph = Rc::new(std::cell::RefCell::new(FlowspaceGraph::new(
+            "raw_malloc_ann_fixture",
+            startblock.clone(),
+        )));
+        ann.processblock(&fs_graph, &startblock)
+            .expect("flowin of malloc must succeed");
+        let blk = startblock.borrow();
+        let Hlvalue::Variable(result) = &blk.operations[0].result else {
+            panic!("malloc result must be a Variable");
+        };
+        let sv = result
+            .annotation
+            .borrow()
+            .as_ref()
+            .map(|rc| (**rc).clone())
+            .expect("flowin must bind the malloc result");
+        let expected = Ptr::from_container_type(raw_malloc_type_const(owner, &TYPE))
+            .expect("malloc TYPE is a container");
+        (sv, expected)
+    }
+
+    #[test]
+    fn raw_malloc_spill_struct_flowin_binds_someptr_of_ptr_type() {
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let (sv, expected) = flowin_raw_malloc_result("Tuple<i64>", None, None);
+        let SomeValue::Ptr(p) = sv else {
+            panic!("ann_malloc of the spill Struct is SomePtr, got {sv:?}");
+        };
+        assert_eq!(p.ll_ptrtype, expected);
+        assert!(
+            matches!(&p.ll_ptrtype.TO, PtrTarget::Struct(s) if s._name == "Tuple<i64>"),
+            "TYPE is the spill Struct, got {:?}",
+            p.ll_ptrtype
+        );
+        assert_eq!(
+            crate::model::getkind(
+                &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(Box::new(
+                    p.ll_ptrtype.clone()
+                ))
+            ),
+            crate::model::ConcreteType::Signed
+        );
+    }
+
+    #[test]
+    fn raw_malloc_varsize_char_flowin_binds_someptr_of_ptr_array() {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::rffi::CArray;
+
+        let mut graph = LegacyGraph::new("raw_malloc_varsize_ann_fixture");
+        let n = graph.alloc_value_var();
+        let array_ll = LowLevelType::Array(Box::new(CArray(LowLevelType::Char)));
+        let (sv, expected) = flowin_raw_malloc_result("Array(Char)", Some(array_ll), Some(n));
+        let SomeValue::Ptr(p) = sv else {
+            panic!("ann_malloc of Array(Char) is SomePtr, got {sv:?}");
+        };
+        assert_eq!(p.ll_ptrtype, expected);
+        assert!(
+            matches!(&p.ll_ptrtype.TO, PtrTarget::Array(a) if matches!(a.OF, LowLevelType::Char)),
+            "TYPE is Array(Char), got {:?}",
+            p.ll_ptrtype
+        );
+        assert_eq!(
+            crate::model::getkind(&LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed
+        );
+    }
+
+    #[test]
+    fn translate_op_raw_free_lowers_to_free_spaceop() {
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_raw_free_fixture");
+        let vars = mint_vars(&mut graph, 2);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::RawFree {
+                ptr: vars[1].clone(),
+            },
+        };
+        let translated =
+            translate_op(&op, &value_map, &empty_call_registry()).expect("RawFree arm must lower");
+        assert_eq!(translated.len(), 1);
+        let lowered = &translated[0];
+        assert_eq!(lowered.opname, "free");
+        assert_eq!(lowered.args.len(), 2);
+        let Hlvalue::Variable(result) = &lowered.result else {
+            panic!("RawFree result must be a Variable");
+        };
+        match result.annotation.borrow().as_ref().map(|rc| (**rc).clone()) {
+            Some(SomeValue::None_(_)) => {}
+            other => panic!("RawFree must seed s_None, got {other:?}"),
         }
     }
 
