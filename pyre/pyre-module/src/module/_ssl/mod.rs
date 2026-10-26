@@ -2494,20 +2494,25 @@ mod ssl_socket_methods {
         fn read(&mut self, args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
             // `args` is the gateway's native copy; a collection in
             // `ensure_connection` or `int_w` does not forward it.
+            // `_SSLSocket.read(self, length, buffer_into=None)` — `length` is
+            // required.
             let positional = args;
-            let mut w_size = positional.get(1).copied().unwrap_or(PY_NULL);
-            let mut w_buffer = positional.get(2).copied().unwrap_or(PY_NULL);
-            pyre_object::with_roots!(w_size, w_buffer => ensure_connection(self))?;
             if positional.len() > 3 {
                 return Err(pyre_interpreter::PyError::type_error(
                     "read() takes at most 2 arguments",
                 ));
             }
-            let requested = if w_size.is_null() {
-                1024
-            } else {
-                pyre_object::with_roots!(w_buffer => pyre_interpreter::baseobjspace::int_w(w_size))?
-            };
+            let mut w_size = positional.get(1).copied().unwrap_or(PY_NULL);
+            let mut w_buffer = positional.get(2).copied().unwrap_or(PY_NULL);
+            if w_size.is_null() {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "read() missing required argument 'length' (pos 1)",
+                ));
+            }
+            pyre_object::with_roots!(w_size, w_buffer => ensure_connection(self))?;
+            let requested = pyre_object::with_roots!(w_buffer => {
+                pyre_interpreter::baseobjspace::int_w(w_size)
+            })?;
             if requested < 0 && w_buffer.is_null() {
                 return Err(pyre_interpreter::PyError::value_error(
                     "size should not be negative",
