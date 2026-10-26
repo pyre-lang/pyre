@@ -7162,6 +7162,33 @@ mod tests {
     }
 
     #[test]
+    fn derive_subject_inputcells_seeds_ccharp_ref_input_as_someptr() {
+        let mut graph = LegacyGraph::new("takes_ccharp");
+        let entry = graph.startblock;
+        let p_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "cp".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some("CCHARP".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, p_var);
+
+        let cells = derive_subject_inputcells(&graph, None)
+            .expect("CCHARP argument Input must project to a definite SomeValue cell");
+        assert_eq!(cells.len(), 1);
+        assert!(
+            matches!(cells[0], SomeValue::Ptr(_)),
+            "Ref + class_root CCHARP must seed SomePtr(CCHARP), got {:?}",
+            cells[0],
+        );
+    }
+
+    #[test]
     fn derive_subject_inputcells_seeds_option_fn_int_input_as_someptr() {
         let mut graph = LegacyGraph::new("takes_option_fn");
         let entry = graph.startblock;
