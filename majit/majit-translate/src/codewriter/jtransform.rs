@@ -8040,7 +8040,9 @@ impl<'a> Transformer<'a> {
             .unwrap_or_else(|| panic!("jit_force_quasi_immutable: missing arg0: {target}"));
         let fieldname = args
             .get(1)
-            .and_then(|arg| link_arg_const_str_in_graph(graph, arg))
+            .and_then(|arg| {
+                link_arg_const_str_in_graph(graph, arg, &self.aliases, &self.renamings_constants)
+            })
             .unwrap_or_else(|| {
                 panic!("jit_force_quasi_immutable fieldname is not a constant: {target}")
             });
@@ -16879,24 +16881,33 @@ fn ptr_struct_owner_root(
 
 /// `c_fieldname` is always a Constant upstream. After `fold_str_consts`,
 /// a `&'static str` argument is `LinkArg::Const` or an SSA `ConstStr`.
+/// Identity of a `ConstStr` producer is still a Variable (`do_rename`
+/// does not put Const* Identity into `renamings_constants`, k16
+/// `call_arg_vars`); chase it the same way `renamed_constant_of`
+/// answers `isinstance(v, Constant)`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn link_arg_const_str_in_graph(
     graph: &crate::model::FunctionGraph,
     arg: &crate::model::LinkArg,
+    aliases: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    >,
+    constants: &std::collections::HashMap<
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Constant,
+    >,
 ) -> Option<String> {
     match arg {
         crate::model::LinkArg::Const(c) => c.value.as_text().map(str::to_string),
         crate::model::LinkArg::Value(var) => {
-            for block in &graph.blocks {
-                for op in &block.operations {
-                    if op.result.as_ref() == Some(var) {
-                        return match &op.kind {
-                            OpKind::ConstStr(bytes) => String::from_utf8(bytes.clone()).ok(),
-                            _ => None,
-                        };
-                    }
-                }
+            match renamed_constant_of(graph, var, aliases, constants) {
+                Some(ConstKind::Value(v)) => v.as_text().map(str::to_string),
+                _ => None,
             }
-            None
         }
     }
 }
@@ -26421,6 +26432,77 @@ mod tests {
         );
     }
 
+    /// `name = same_as("mutate_x")` reaches rewrite as the alias Variable.
+    /// `renamed_constant_of` follows the ConstStr producer the way
+    /// `isinstance(v, Constant)` sees the substituted Constant.
+    #[test]
+    fn rewrite_op_jit_force_quasi_immutable_fieldname_through_same_as_alias() {
+        let mut graph = FunctionGraph::new("set_x");
+        let inst = graph.alloc_value_var();
+        inst.set_concretetype(Some(qi_ptr_struct("function::Function")));
+        graph.push_inputarg_var(graph.startblock, inst.clone());
+        let name = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ConstStr(b"mutate_x".to_vec()),
+                true,
+            )
+            .unwrap();
+        let aliased = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: name,
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let path = crate::parse::CallPath::for_impl_method(
+            "function::Function",
+            "jit_force_quasi_immutable",
+        );
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::Call {
+                target: CallTarget::Method {
+                    name: "jit_force_quasi_immutable".to_string(),
+                    receiver_root: Some("Function".to_string()),
+                    resolved_path: Some(path.clone()),
+                    fun_decl_id: None,
+                    branch_payloads: None,
+                },
+                args: vec![LinkArg::from(inst), LinkArg::from(aliased)],
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let result = transform_with_qi_llop(&graph, path);
+        let ops: Vec<&OpKind> = result
+            .graph
+            .block(graph.startblock)
+            .operations
+            .iter()
+            .map(|o| &o.kind)
+            .collect();
+        let live_idx = ops
+            .iter()
+            .position(|k| matches!(k, OpKind::Live { .. }))
+            .expect("Live marker present");
+        assert!(
+            matches!(
+                ops[live_idx + 1],
+                OpKind::JitForceQuasiImmutable { mutate_field, .. }
+                    if mutate_field.name == "mutate_x"
+                        && mutate_field.owner_root.as_deref() == Some("Function")
+            ),
+            "same_as(\"mutate_x\") fieldname must rewrite, got {ops:?}"
+        );
+    }
+
     #[test]
     fn rewrite_op_jit_force_quasi_immutable_emits_module_dict_mutate_version() {
         use crate::flowspace::model::{ConstValue, Constant};
@@ -26639,7 +26721,7 @@ mod tests {
             .collect();
         let live_idx = ops
             .iter()
-            .position(|k| matches!(k, OpKind::Live))
+            .position(|k| matches!(k, OpKind::Live { .. }))
             .expect("Live marker present");
         assert!(
             matches!(

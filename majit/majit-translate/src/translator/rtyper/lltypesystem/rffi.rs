@@ -24,9 +24,9 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, Array, CastWhateverError, FixedSizeArray, FuncType, GCREF, LowLevelType, LowLevelValue,
-    MallocFlavor, OpaqueType, Ptr, PtrTarget, SomePtr, Struct, functionptr_with_external_name,
-    malloc, nullptr, typeOf,
+    _address, _ptr, _ptr_obj, Array, CastWhateverError, FixedSizeArray, FuncType, GCREF,
+    LowLevelType, LowLevelValue, MallocFlavor, OpaqueType, Ptr, PtrTarget, SomePtr, Struct,
+    cast_primitive, functionptr_with_external_name, malloc, nullptr, typeOf, typeOf_const,
 };
 use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
 use crate::translator::rtyper::lltypesystem::rstr::{
@@ -475,33 +475,82 @@ pub fn cast() -> Result<(), TyperError> {
 }
 
 /// Interpreter-level `rffi.cast(TGT, value)` (`rffi.py` = `ll2ctypes.force_cast`).
-/// `ll2ctypes` is never added (`lltypesystem/mod.rs`). Integer 0 to a `Ptr`
-/// is `nullptr`, matching `ctypes.c_void_p(0)` → null.
+/// Integer 0 to a `Ptr` is `nullptr` (`ctypes.c_void_p(0)`). A nonzero
+/// integer becomes the `_ptr_obj::IntCast` address carrier
+/// (`cast_int_to_ptr` / `force_cast` `c_void_p`). Primitive destinations
+/// go through `cast_primitive`.
 pub fn cast_value(tgt: &LowLevelType, value: &ConstValue) -> Result<ConstValue, CastWhateverError> {
+    if !(tgt.is_primitive() || matches!(tgt, LowLevelType::Ptr(_))) {
+        return Err(CastWhateverError::TypeError(format!(
+            "rffi.cast() first arg should be a TYPE, got {tgt:?}"
+        )));
+    }
+    let value = unwrap_force_cast_source(value);
+    if let Ok(orig) = typeOf_const(&value)
+        && orig == *tgt
+    {
+        return Ok(value);
+    }
+    if tgt.is_primitive() {
+        if let Ok(orig) = typeOf_const(&value)
+            && orig.is_primitive()
+        {
+            return cast_primitive(tgt, &value);
+        }
+        return Err(CastWhateverError::TypeError(format!(
+            "casting {value:?} to {tgt:?}"
+        )));
+    }
     let LowLevelType::Ptr(tgt_ptr) = tgt else {
         return Err(CastWhateverError::TypeError(format!(
             "rffi.cast() first arg should be a TYPE, got {tgt:?}"
         )));
     };
-    let n = match value {
-        ConstValue::UInt(n) => *n,
-        ConstValue::Int(n) => *n as u64,
-        ConstValue::Bool(false) => 0,
-        ConstValue::Bool(true) => 1,
-        _ => {
-            return Err(CastWhateverError::TypeError(format!(
-                "casting {value:?} to {tgt:?}"
-            )));
-        }
-    };
+    let n = integer_bits_for_ptr_cast(&value)?;
     if n == 0 {
         return nullptr(tgt_ptr.TO.clone().into())
             .map(|p| ConstValue::LLPtr(Box::new(p)))
             .map_err(CastWhateverError::TypeError);
     }
-    Err(CastWhateverError::TypeError(format!(
-        "rffi.cast of non-zero integer to {tgt:?} needs ll2ctypes"
-    )))
+    Ok(ConstValue::LLPtr(Box::new(_ptr::new_with_solid(
+        *tgt_ptr.clone(),
+        Ok(Some(_ptr_obj::IntCast(n))),
+        true,
+    ))))
+}
+
+fn unwrap_force_cast_source(value: &ConstValue) -> ConstValue {
+    match value {
+        ConstValue::AddressAsInt(adr) | ConstValue::LLAddress(adr) => match adr {
+            _address::Null => ConstValue::Int(0),
+            _address::IntCast(n) => ConstValue::Int(*n),
+            _address::Fake(ptr) => {
+                if ptr.nonzero() {
+                    ConstValue::LLPtr(ptr.clone())
+                } else {
+                    ConstValue::Int(0)
+                }
+            }
+        },
+        ConstValue::SingleFloat(bits) => ConstValue::float(f32::from_bits(*bits) as f64),
+        ConstValue::LongFloat(bits) => ConstValue::float(f64::from_bits(*bits)),
+        other => other.clone(),
+    }
+}
+
+fn integer_bits_for_ptr_cast(value: &ConstValue) -> Result<i64, CastWhateverError> {
+    match value {
+        ConstValue::Int(n) => Ok(*n),
+        ConstValue::UInt(n) => Ok(*n as i64),
+        ConstValue::Bool(false) => Ok(0),
+        ConstValue::Bool(true) => Ok(1),
+        ConstValue::Int128(n) => Ok(*n as i64),
+        ConstValue::UInt128(n) => Ok(*n as i64),
+        ConstValue::LLPtr(p) if !p.nonzero() => Ok(0),
+        _ => Err(CastWhateverError::TypeError(format!(
+            "casting {value:?} to pointer"
+        ))),
+    }
 }
 
 pub fn ptradd() -> Result<(), TyperError> {
@@ -1538,6 +1587,26 @@ mod tests {
             panic!("expected Ptr(Array), got {value:?}");
         };
         array
+    }
+
+    #[test]
+    fn cast_value_nonzero_integer_to_voidp_is_intcast_and_primitives_cast() {
+        let got = cast_value(&*VOIDP, &ConstValue::UInt(0x1000)).expect("nonzero → VOIDP");
+        let ConstValue::LLPtr(ptr) = got else {
+            panic!("expected VOIDP pointer, got {got:?}");
+        };
+        assert!(ptr.nonzero());
+        assert!(matches!(
+            ptr._obj0_value(),
+            Ok(Some(_ptr_obj::IntCast(0x1000)))
+        ));
+        let signed = cast_value(&LowLevelType::Signed, &ConstValue::UInt(7)).expect("prim dest");
+        assert_eq!(signed, ConstValue::Int(7));
+        let null = cast_value(&*VOIDP, &ConstValue::Int(0)).expect("0 → nullptr");
+        let ConstValue::LLPtr(p0) = null else {
+            panic!("expected nullptr, got {null:?}");
+        };
+        assert!(!p0.nonzero());
     }
 
     #[test]

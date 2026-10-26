@@ -82,8 +82,17 @@ pub fn compute_restype(self_type: KnownType, other_type: KnownType) -> KnownType
 }
 
 /// `r_singlefloat(floatval)` (`rarithmetic.py`): `struct.pack("f", floatval)`.
-pub fn r_singlefloat_bits(floatval: f64) -> u32 {
-    (floatval as f32).to_bits()
+/// `ieee.float_pack` raises `OverflowError` when a finite value overflows
+/// the format (`"float too large to pack in this format"`). Inf/NaN pack.
+pub fn r_singlefloat_bits(floatval: f64) -> Result<u32, &'static str> {
+    if floatval.is_nan() || floatval.is_infinite() {
+        return Ok((floatval as f32).to_bits());
+    }
+    let packed = floatval as f32;
+    if packed.is_infinite() {
+        return Err("float too large to pack in this format");
+    }
+    Ok(packed.to_bits())
 }
 
 /// `r_longfloat(floatval)` (`rarithmetic.py`): stores `floatval` as a Python float.
@@ -158,6 +167,13 @@ mod tests {
             compute_restype(KnownType::Int, KnownType::Float),
             KnownType::Float
         );
+    }
+
+    #[test]
+    fn r_singlefloat_bits_raises_on_overflow_and_packs_inf() {
+        assert!(r_singlefloat_bits(1e300).is_err());
+        assert!(r_singlefloat_bits(f64::INFINITY).unwrap() == f32::INFINITY.to_bits());
+        assert!(r_singlefloat_bits(2.1).is_ok());
     }
 
     #[test]

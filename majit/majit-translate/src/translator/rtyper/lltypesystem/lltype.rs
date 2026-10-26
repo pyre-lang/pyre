@@ -667,12 +667,15 @@ impl _address {
     }
 
     /// `fakeaddress.__nonzero__` (`llmemory.py`): `self.ptr is not
-    /// None`. `Fake` wraps a live pointer (a tagged-integer `_NONGCREF`
-    /// pointer included, whose `_obj0` is non-`None`) and `IntCast` a raw
-    /// `ConstRefAddr` pointer; only `Null` — the normalization of `_obj0 is
-    /// None` (llmemory.py) — is the NULL address.
+    /// None`. `Fake` wraps a live pointer. `IntCast(0)` is NULL
+    /// (`fakeaddress._cast_to_int` returns 0); a nonzero `IntCast` is a
+    /// raw address.
     pub fn nonzero(&self) -> bool {
-        matches!(self, _address::Fake(_) | _address::IntCast(_))
+        match self {
+            _address::Null => false,
+            _address::Fake(_) => true,
+            _address::IntCast(n) => *n != 0,
+        }
     }
 
     /// `fakeaddress.__lt__` (`llmemory.py`). For the convenience of
@@ -5533,33 +5536,75 @@ fn const_value_type_name(value: &ConstValue) -> &'static str {
     }
 }
 
-fn const_as_i128(value: &ConstValue) -> Result<i128, CastWhateverError> {
+/// Truncated integer of unbounded magnitude, with the low 128 bits for
+/// wrapping integer destinations. `cast_primitive` converts a float to
+/// `long` first (`lltype.py`); Bool/Char/UniChar use the exact value,
+/// wrapping applies only to `Number._cast`.
+struct TruncatedInt {
+    low: u128,
+    is_zero: bool,
+    fits_i128: bool,
+}
+
+impl TruncatedInt {
+    fn from_i128(n: i128) -> Self {
+        Self {
+            low: n as u128,
+            is_zero: n == 0,
+            fits_i128: true,
+        }
+    }
+
+    fn from_u128(n: u128) -> Self {
+        Self {
+            low: n,
+            is_zero: n == 0,
+            fits_i128: n <= i128::MAX as u128,
+        }
+    }
+
+    fn as_i128(&self) -> Option<i128> {
+        if self.fits_i128 {
+            Some(self.low as i128)
+        } else {
+            None
+        }
+    }
+}
+
+fn truncated_from_const(value: &ConstValue) -> Result<TruncatedInt, CastWhateverError> {
     match value {
-        ConstValue::Bool(true) => Ok(1),
-        ConstValue::Bool(false) => Ok(0),
-        ConstValue::Int(n) => Ok(*n as i128),
-        ConstValue::UInt(n) => Ok(*n as i128),
-        ConstValue::Int128(n) => Ok(*n),
-        ConstValue::UInt128(n) => Ok(*n as i128),
-        ConstValue::Float(bits) => f64_trunc_toward_zero_as_i128(f64::from_bits(*bits)),
-        ConstValue::ByteStr(bytes) if bytes.len() == 1 => Ok(bytes[0] as i128),
+        ConstValue::Bool(true) => Ok(TruncatedInt::from_i128(1)),
+        ConstValue::Bool(false) => Ok(TruncatedInt::from_i128(0)),
+        ConstValue::Int(n) => Ok(TruncatedInt::from_i128(*n as i128)),
+        ConstValue::UInt(n) => Ok(TruncatedInt::from_u128(*n as u128)),
+        ConstValue::Int128(n) => Ok(TruncatedInt::from_i128(*n)),
+        ConstValue::UInt128(n) => Ok(TruncatedInt::from_u128(*n)),
+        ConstValue::Float(bits) => f64_trunc_toward_zero(f64::from_bits(*bits)),
+        ConstValue::ByteStr(bytes) if bytes.len() == 1 => {
+            Ok(TruncatedInt::from_i128(bytes[0] as i128))
+        }
         ConstValue::UniStr(s) => {
             let mut chars = s.chars();
             match (chars.next(), chars.next()) {
-                (Some(ch), None) => Ok(u32::from(ch) as i128),
+                (Some(ch), None) => Ok(TruncatedInt::from_i128(u32::from(ch) as i128)),
                 _ => Err(CastWhateverError::type_error("unsupported cast")),
             }
         }
-        ConstValue::UniChar(cp) => Ok(*cp as i128),
+        ConstValue::UniChar(cp) => Ok(TruncatedInt::from_i128(*cp as i128)),
         _ => Err(CastWhateverError::type_error("unsupported cast")),
     }
 }
 
+fn const_as_i128(value: &ConstValue) -> Result<i128, CastWhateverError> {
+    truncated_from_const(value)?
+        .as_i128()
+        .ok_or_else(|| CastWhateverError::overflow_error("integer too large for signed 128-bit"))
+}
+
 /// Python 2 `long(float)`: NaN is `ValueError`, infinity is `OverflowError`,
 /// a finite value truncates toward zero to an arbitrary-precision integer.
-/// The result is then wrapped to 128 bits so `Number._cast` / `intmask`
-/// can take the destination width.
-fn f64_trunc_toward_zero_as_i128(f: f64) -> Result<i128, CastWhateverError> {
+fn f64_trunc_toward_zero(f: f64) -> Result<TruncatedInt, CastWhateverError> {
     if f.is_nan() {
         return Err(CastWhateverError::value_error(
             "cannot convert float NaN to integer",
@@ -5574,24 +5619,35 @@ fn f64_trunc_toward_zero_as_i128(f: f64) -> Result<i128, CastWhateverError> {
     let sign = (bits >> 63) != 0;
     let exp = ((bits >> 52) & 0x7ff) as i32 - 1023;
     if exp < 0 {
-        return Ok(0);
+        return Ok(TruncatedInt::from_i128(0));
     }
     let mantissa = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
     let shift = exp - 52;
-    let mag: u128 = if shift >= 128 {
-        0
+    let mantissa_u128 = mantissa as u128;
+    let (mag, mag_overflow) = if shift >= 128 {
+        (0u128, true)
     } else if shift >= 0 {
-        (mantissa as u128) << shift
+        let overflow = mantissa_u128 > (u128::MAX >> shift as u32);
+        (mantissa_u128.wrapping_shl(shift as u32), overflow)
     } else if shift > -64 {
-        (mantissa as u128) >> ((-shift) as u32)
+        (mantissa_u128 >> ((-shift) as u32), false)
     } else {
-        0
+        (0u128, false)
     };
-    if sign {
-        Ok(mag.wrapping_neg() as i128)
+    let is_zero = mag == 0 && !mag_overflow;
+    let fits_i128 = if mag_overflow {
+        false
+    } else if sign {
+        mag <= (1u128 << 127)
     } else {
-        Ok(mag as i128)
-    }
+        mag <= i128::MAX as u128
+    };
+    let low = if sign { mag.wrapping_neg() } else { mag };
+    Ok(TruncatedInt {
+        low,
+        is_zero,
+        fits_i128,
+    })
 }
 
 fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
@@ -5618,15 +5674,46 @@ fn const_as_f64(value: &ConstValue) -> Result<f64, CastWhateverError> {
 }
 
 fn number_cast(tgt: &LowLevelType, value: &ConstValue) -> Result<ConstValue, CastWhateverError> {
-    let n = const_as_i128(value)?;
+    number_cast_truncated(tgt, truncated_from_const(value)?)
+}
+
+fn number_cast_truncated(
+    tgt: &LowLevelType,
+    t: TruncatedInt,
+) -> Result<ConstValue, CastWhateverError> {
     match tgt {
-        // `Number._cast` for Signed is `intmask`.
-        LowLevelType::Signed | LowLevelType::SignedLongLong => Ok(ConstValue::Int(n as i64)),
+        // `Number._cast` for Signed is `intmask` (machine word).
+        LowLevelType::Signed => Ok(ConstValue::Int((t.low as usize) as isize as i64)),
         // `Unsigned = build_number("Unsigned", r_uint)`: wrap to word bits.
-        LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => Ok(ConstValue::UInt(n as u64)),
-        LowLevelType::SignedLongLongLong => Ok(ConstValue::Int128(n)),
-        LowLevelType::UnsignedLongLongLong => Ok(ConstValue::UInt128(n as u128)),
+        LowLevelType::Unsigned => Ok(ConstValue::UInt(t.low as usize as u64)),
+        // `longlongmask` / `r_longlong` are 64-bit.
+        LowLevelType::SignedLongLong => Ok(ConstValue::Int(t.low as i64)),
+        LowLevelType::UnsignedLongLong => Ok(ConstValue::UInt(t.low as u64)),
+        // `signed_int.__new__` / `r_longlonglong`: range check, no wrap.
+        LowLevelType::SignedLongLongLong => {
+            let Some(n) = t.as_i128() else {
+                return Err(CastWhateverError::overflow_error(
+                    "does not fit in signed 128-bit integer",
+                ));
+            };
+            Ok(ConstValue::Int128(n))
+        }
+        LowLevelType::UnsignedLongLongLong => Ok(ConstValue::UInt128(t.low)),
         _ => Err(CastWhateverError::type_error("unsupported cast")),
+    }
+}
+
+fn chr_or_unichr_from_truncated(
+    t: TruncatedInt,
+    max: i128,
+    range_msg: &str,
+) -> Result<i128, CastWhateverError> {
+    match t.as_i128() {
+        Some(n) if (0..=max).contains(&n) => Ok(n),
+        Some(_) => Err(CastWhateverError::value_error(range_msg.to_string())),
+        None => Err(CastWhateverError::overflow_error(
+            "Python int too large to convert to C long",
+        )),
     }
 }
 
@@ -5649,41 +5736,43 @@ pub fn cast_primitive(
         work = ConstValue::Int(const_as_i128(&work)? as i64);
     } else if orig == LowLevelType::Float {
         if *tgt == LowLevelType::SingleFloat {
-            return Ok(ConstValue::SingleFloat(
-                crate::rlib::rarithmetic::r_singlefloat_bits(const_as_f64(&work)?),
-            ));
+            let bits = crate::rlib::rarithmetic::r_singlefloat_bits(const_as_f64(&work)?)
+                .map_err(CastWhateverError::overflow_error)?;
+            return Ok(ConstValue::SingleFloat(bits));
         }
         if *tgt == LowLevelType::LongFloat {
             return Ok(ConstValue::LongFloat(
                 crate::rlib::rarithmetic::r_longfloat_bits(const_as_f64(&work)?),
             ));
         }
-        work = ConstValue::Int128(const_as_i128(&work)?);
+        // `value = long(value)` — keep unbounded; wrap only at Number dests.
     }
     // `_to_primitive = {Char: chr, UniChar: unichr, Float: float, Bool: bool}`
     match tgt {
         LowLevelType::Char => {
-            let n = const_as_i128(&work)?;
-            if !(0..=255).contains(&n) {
-                return Err(CastWhateverError::value_error(
-                    "chr() arg not in range(256)",
-                ));
-            }
+            let n = chr_or_unichr_from_truncated(
+                truncated_from_const(&work)?,
+                255,
+                "chr() arg not in range(256)",
+            )?;
             return Ok(ConstValue::ByteStr(vec![n as u8]));
         }
         LowLevelType::UniChar => {
-            let n = const_as_i128(&work)?;
-            if !(0..=0x10FFFF).contains(&n) {
-                return Err(CastWhateverError::value_error(
-                    "unichr() arg not in range(0x110000) (wide Python)",
-                ));
-            }
+            let n = chr_or_unichr_from_truncated(
+                truncated_from_const(&work)?,
+                0x10FFFF,
+                "unichr() arg not in range(0x110000) (wide Python)",
+            )?;
             return Ok(ConstValue::UniChar(n as u32));
         }
         LowLevelType::Float => {
             return Ok(ConstValue::float(const_as_f64(&work)?));
         }
         LowLevelType::Bool => {
+            if orig == LowLevelType::Float {
+                let t = truncated_from_const(&work)?;
+                return Ok(ConstValue::Bool(!t.is_zero));
+            }
             let truthy = work
                 .truthy()
                 .ok_or_else(|| CastWhateverError::type_error("unsupported cast"))?;
@@ -9594,7 +9683,7 @@ mod tests {
         };
         assert_eq!(
             bits,
-            crate::rlib::rarithmetic::r_singlefloat_bits(2.1),
+            crate::rlib::rarithmetic::r_singlefloat_bits(2.1).expect("2.1 packs"),
             "struct.pack('f', 2.1) bits"
         );
         assert_eq!(typeOf_const(&res).unwrap(), LowLevelType::SingleFloat);
@@ -9647,6 +9736,87 @@ mod tests {
             matches!(err, CastWhateverError::ValueError(ref msg) if msg.contains("unichr()")),
             "got {err:?}"
         );
+    }
+
+    #[test]
+    fn cast_primitive_huge_float_bool_is_true_and_char_raises() {
+        let huge = ConstValue::float(2.0f64.powi(128));
+        let b = cast_primitive(&LowLevelType::Bool, &huge).expect("bool(long(2.0**128))");
+        assert_eq!(b, ConstValue::Bool(true));
+        let err = cast_primitive(&LowLevelType::Char, &huge).expect_err("chr(2**128)");
+        assert!(
+            matches!(
+                err,
+                CastWhateverError::OverflowError(_) | CastWhateverError::ValueError(_)
+            ),
+            "chr of a huge long raises, got {err:?}"
+        );
+        let err = cast_primitive(&LowLevelType::UniChar, &huge).expect_err("unichr(2**128)");
+        assert!(
+            matches!(
+                err,
+                CastWhateverError::OverflowError(_) | CastWhateverError::ValueError(_)
+            ),
+            "unichr of a huge long raises, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn number_cast_word_size_follows_signed_and_longlong() {
+        let u32max = ConstValue::UInt(0xffff_ffff);
+        let signed = cast_primitive(&LowLevelType::Signed, &u32max).expect("Unsigned → Signed");
+        if cfg!(target_pointer_width = "32") {
+            assert_eq!(signed, ConstValue::Int(-1));
+        } else {
+            assert_eq!(signed, ConstValue::Int(0xffff_ffff));
+        }
+        let longlong =
+            cast_primitive(&LowLevelType::SignedLongLong, &u32max).expect("→ SignedLongLong");
+        assert_eq!(longlong, ConstValue::Int(0xffff_ffff));
+        let word_max = cast_primitive(&LowLevelType::Signed, &ConstValue::UInt(u64::MAX))
+            .expect("word-max → Signed");
+        assert_eq!(
+            word_max,
+            ConstValue::Int((u64::MAX as usize) as isize as i64)
+        );
+    }
+
+    #[test]
+    fn signed_longlonglong_rejects_unsigned_two_pow_127() {
+        let err = cast_primitive(
+            &LowLevelType::SignedLongLongLong,
+            &ConstValue::UInt128(1u128 << 127),
+        )
+        .expect_err("2**127 does not fit in signed 128-bit");
+        assert!(
+            matches!(err, CastWhateverError::OverflowError(_)),
+            "signed_int.__new__ is OverflowError, got {err:?}"
+        );
+        let min = cast_primitive(
+            &LowLevelType::SignedLongLongLong,
+            &ConstValue::Int128(i128::MIN),
+        )
+        .expect("i128::MIN fits");
+        assert_eq!(min, ConstValue::Int128(i128::MIN));
+    }
+
+    #[test]
+    fn r_singlefloat_overflow_is_overflow_error() {
+        let err = cast_primitive(&LowLevelType::SingleFloat, &ConstValue::float(1e300))
+            .expect_err("struct.pack('f', 1e300)");
+        assert!(
+            matches!(err, CastWhateverError::OverflowError(_)),
+            "r_singlefloat overflow is OverflowError, got {err:?}"
+        );
+        let inf = cast_primitive(
+            &LowLevelType::SingleFloat,
+            &ConstValue::float(f64::INFINITY),
+        )
+        .expect("inf packs");
+        let ConstValue::SingleFloat(bits) = inf else {
+            panic!("expected SingleFloat, got {inf:?}");
+        };
+        assert!(f32::from_bits(bits).is_infinite());
     }
 
     #[test]

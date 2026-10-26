@@ -516,7 +516,7 @@ fn lowlevel_value_to_const_value(v: &LowLevelValue) -> Option<ConstValue> {
             // `opimpl.rs`'s `op_cast_int_to_char`).
             Some(ConstValue::ByteStr(vec![*c as u8]))
         }
-        LowLevelValue::UniChar(c) => Some(ConstValue::UniChar(u32::from(*c))),
+        LowLevelValue::UniChar(c) => Some(ConstValue::uni_str(c.to_string())),
         LowLevelValue::Ptr(p) => Some(ConstValue::LLPtr(p.clone())),
         LowLevelValue::Address(a) => Some(ConstValue::LLAddress(a.clone())),
         // Void / Struct / Array / Opaque / InteriorPtr have no flat
@@ -540,6 +540,13 @@ mod tests {
 
     fn const_field(name: &str) -> Hlvalue {
         Hlvalue::Constant(Constant::new(ConstValue::byte_str(name)))
+    }
+
+    #[test]
+    fn unichar_field_value_equals_equivalent_unistr() {
+        let v = lowlevel_value_to_const_value(&LowLevelValue::UniChar('A')).expect("UniChar");
+        assert_eq!(v, ConstValue::uni_str("A"));
+        assert_eq!(v, ConstValue::UniChar(u32::from('A')));
     }
 
     #[test]

@@ -1058,8 +1058,15 @@ pub fn builtin_bool(
             ConstValue::Int128(n) => *n != 0,
             ConstValue::UInt128(n) => *n != 0,
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
-            ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => {
-                return Ok(SomeValue::Bool(r));
+            ConstValue::SingleFloat(_) => {
+                return Err(AnnotatorError::new(
+                    "TypeError: not supported on r_singlefloat instances",
+                ));
+            }
+            ConstValue::LongFloat(_) => {
+                return Err(AnnotatorError::new(
+                    "TypeError: not supported on r_longfloat instances",
+                ));
             }
             ConstValue::ByteStr(s) => !s.is_empty(),
             ConstValue::UniStr(s) => !s.is_empty(),
@@ -6040,6 +6047,31 @@ mod tests {
             },
             other => panic!("expected SomeBool, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn builtin_bool_constant_single_and_long_float_raise_type_error() {
+        let bk = bk();
+        let s_sf = bk
+            .immutablevalue(&ConstValue::SingleFloat(1f32.to_bits()))
+            .unwrap();
+        let err = builtin_bool(&bk, &[Some(s_sf)], &no_kwds()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not supported on r_singlefloat instances"),
+            "err was {:?}",
+            err.msg
+        );
+        let s_lf = bk
+            .immutablevalue(&ConstValue::LongFloat(1.0f64.to_bits()))
+            .unwrap();
+        let err = builtin_bool(&bk, &[Some(s_lf)], &no_kwds()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("not supported on r_longfloat instances"),
+            "err was {:?}",
+            err.msg
+        );
     }
 
     #[test]

@@ -4020,6 +4020,28 @@ impl AssemblerEncode for Assembler {
                 };
                 resolved.unwrap_or_else(|err| panic!("emit_const_i: {err}"))
             }
+            ConstValue::UniChar(_) => {
+                match crate::translator::rtyper::lltypesystem::lltype::cast_primitive(
+                    &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+                    value,
+                ) {
+                    Ok(ConstValue::Int(n)) => n,
+                    other => panic!("emit_const UniChar → Signed: {other:?}"),
+                }
+            }
+            ConstValue::SingleFloat(bits) => {
+                super::longlong::singlefloat2int(f32::from_bits(*bits))
+            }
+            ConstValue::AddressAsInt(addr) => match addr {
+                crate::translator::rtyper::lltypesystem::lltype::_address::Null => 0,
+                crate::translator::rtyper::lltypesystem::lltype::_address::IntCast(n) => *n,
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_) => {
+                    panic!(
+                        "AddressAsInt of a container-backed address is symbolic; \
+                         Assembler has no ConstIRelocKind for it (only FnAddr/StaticAddr)"
+                    )
+                }
+            },
             other => std::panic::panic_any(AssemblerError::message(format!(
                 "integer-kind constant not supported by emit_const_i: {other:?}"
             ))),
@@ -9919,6 +9941,69 @@ mod tests {
         };
         let mut asm = Assembler::new();
         let _ = asm.assemble_with_callcontrol(&mut flat, &empty_regallocs(), Some(&cc));
+    }
+
+    #[test]
+    fn resolve_const_i_unichar_is_cast_primitive_signed() {
+        assert_eq!(
+            Assembler::resolve_const_i_value(&ConstValue::UniChar(u32::from('A')), None),
+            i64::from(u32::from('A'))
+        );
+        assert_eq!(
+            Assembler::resolve_const_i_value(&ConstValue::UniChar(0xD800), None),
+            0xD800
+        );
+    }
+
+    #[test]
+    fn resolve_const_i_address_as_int_null_and_intcast() {
+        use crate::translator::rtyper::lltypesystem::lltype::_address;
+        assert_eq!(
+            Assembler::resolve_const_i_value(&ConstValue::AddressAsInt(_address::Null), None),
+            0
+        );
+        assert_eq!(
+            Assembler::resolve_const_i_value(
+                &ConstValue::AddressAsInt(_address::IntCast(41)),
+                None
+            ),
+            41
+        );
+    }
+
+    #[test]
+    fn resolve_const_i_singlefloat_uses_singlefloat2int() {
+        let bits = 2.1f32.to_bits();
+        assert_eq!(
+            Assembler::resolve_const_i_value(&ConstValue::SingleFloat(bits), None),
+            crate::codewriter::longlong::singlefloat2int(2.1f32)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "no ConstIRelocKind")]
+    fn resolve_const_i_address_as_int_fake_has_no_reloc() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _address, MallocFlavor, Struct, malloc,
+        };
+        let s = Struct::new(
+            "asm_adr",
+            vec![(
+                "x".into(),
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+            )],
+        );
+        let live = malloc(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .unwrap();
+        Assembler::resolve_const_i_value(
+            &ConstValue::AddressAsInt(_address::Fake(Box::new(live))),
+            None,
+        );
     }
 
     #[test]

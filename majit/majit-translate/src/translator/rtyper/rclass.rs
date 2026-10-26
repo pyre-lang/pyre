@@ -445,21 +445,25 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::Int128(value) => *value != 0,
         ConstValue::UInt128(value) => *value != 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
-        ConstValue::SingleFloat(_) | ConstValue::LongFloat(_) => true,
+        ConstValue::SingleFloat(_) => {
+            panic!("TypeError: not supported on r_singlefloat instances")
+        }
+        ConstValue::LongFloat(_) => {
+            panic!("TypeError: not supported on r_longfloat instances")
+        }
         ConstValue::ByteStr(text) => !text.is_empty(),
         ConstValue::UniStr(text) => !text.is_empty(),
         ConstValue::UniChar(_) => true,
         ConstValue::Tuple(items) => !items.is_empty(),
         ConstValue::List(items) => !items.is_empty(),
         ConstValue::Dict(items) => !items.is_empty(),
+        ConstValue::LLAddress(addr) | ConstValue::AddressAsInt(addr) => addr.nonzero(),
         ConstValue::Atom(_)
         | ConstValue::Code(_)
         | ConstValue::Function(_)
         | ConstValue::Graphs(_)
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
-        | ConstValue::LLAddress(_)
-        | ConstValue::AddressAsInt(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)
@@ -5076,6 +5080,12 @@ pub(crate) type InstanceReprKey = (Option<ClassDefKey>, Flavor);
 mod tests {
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+    #[test]
+    #[should_panic(expected = "not supported on r_singlefloat instances")]
+    fn const_truthy_singlefloat_raises_type_error() {
+        let _ = const_truthy(&ConstValue::SingleFloat(1f32.to_bits()));
+    }
 
     #[test]
     fn top_level_runtime_helper_parity_surface() {

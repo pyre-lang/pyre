@@ -1285,17 +1285,17 @@ pub fn cast_adr_to_int_value(
         "emulated" | "forced" => cast_adr_to_int(adr, mode)
             .map(ConstValue::Int)
             .map_err(CastWhateverError::TypeError),
-        "symbolic" => {
-            if let _address::Null = adr {
-                return Ok(ConstValue::Int(0));
+        "symbolic" => match adr {
+            _address::Null => Ok(ConstValue::Int(0)),
+            _address::IntCast(n) => Ok(ConstValue::Int(*n)),
+            _address::Fake(ptr) => {
+                if let Ok(Some(_ptr_obj::IntCast(n))) = ptr._obj0_value() {
+                    Ok(ConstValue::Int(n))
+                } else {
+                    Ok(ConstValue::AddressAsInt(adr.clone()))
+                }
             }
-            if let _address::Fake(ptr) = adr
-                && let Ok(Some(_ptr_obj::IntCast(n))) = ptr._obj0_value()
-            {
-                return Ok(ConstValue::Int(n));
-            }
-            Ok(ConstValue::AddressAsInt(adr.clone()))
-        }
+        },
         other => Err(CastWhateverError::TypeError(format!(
             "unsupported cast_adr_to_int mode {other:?}"
         ))),
@@ -1477,6 +1477,20 @@ mod tests {
         };
         let tagged = cast_int_to_ptr(&ptr_t, 19).unwrap();
         assert_eq!(cast_adr_to_int(&cast_ptr_to_adr(&tagged), None), Ok(19));
+    }
+
+    #[test]
+    fn symbolic_cast_returns_intcast_payload_and_zero_for_null() {
+        assert_eq!(
+            cast_adr_to_int_value(&_address::IntCast(41), Some("symbolic")).unwrap(),
+            ConstValue::Int(41)
+        );
+        assert_eq!(
+            cast_adr_to_int_value(&_address::IntCast(0), Some("symbolic")).unwrap(),
+            ConstValue::Int(0)
+        );
+        assert!(!_address::IntCast(0).nonzero());
+        assert!(_address::IntCast(41).nonzero());
     }
 
     #[test]
