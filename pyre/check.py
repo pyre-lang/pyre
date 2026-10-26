@@ -873,17 +873,17 @@ def pyre_env():
     env.setdefault("PYPY_GC_NURSERY", PYPY_GC_NURSERY_PIN)
     # Pin the major-collection threshold too, because the nursery pin above only
     # fixes one term of it. `min_heap_size` is `PYPY_GC_MIN`, else `nursery * 8`
-    # (collector.rs:648), floored by `nursery * major_collection_threshold`
-    # (:662), and installed as `next_major_collection_threshold` (:702) — so a
-    # 4MB nursery also sets a 32MB threshold, and where old-gen use crosses it
-    # (:2437 `threshold_reached`) stayed free to move.
+    # (`MiniMarkGC::with_config`), floored by `nursery * major_collection_threshold`
+    # (`MiniMarkGC::with_config`), and installed as `next_major_collection_threshold`
+    # (`set_major_threshold_from`) — so a 4MB nursery also sets a 32MB threshold,
+    # and where old-gen use crosses it (`threshold_reached`) stayed free to move.
     #
-    # Crossing it used to reach `guard_failures`, and no longer does. The major
-    # step's finalizer trigger arms the eval-breaker word, and every compiled
-    # loop's back edge polls that word through a real guard —
+    # Crossing it used to reach `guard_failures`, and no longer does. Crossing
+    # the threshold arms the eval-breaker word through `set_gc` (`EB_GC`), and
+    # every compiled loop's back edge polls that word through a real guard —
     # `RawLoadI(&EVAL_BREAKER_WORD) -> IntAnd(word, JIT_BREAKER_MASK) ->
-    # IntIsTrue -> GuardFalse` (trace_opcode.rs) — whose failure was counted
-    # like any other. It is now tallied separately as `back_edge_polls`
+    # IntIsTrue -> GuardFalse` (`emit_jump_absolute_tick`) — whose failure was
+    # counted like any other. It is now tallied separately as `back_edge_polls`
     # (`is_back_edge_poll_guard` marks the guard, `record_guard_failure_event`
     # splits the total), which is what removes the whole class rather than
     # avoiding it; the rest of this note is kept because it describes the pins
@@ -927,9 +927,9 @@ def pyre_env():
     # is what settled this one. Holding the startup allocation still
     # (`child_env_base`) narrows what can move the placement; it does not
     # remove the placement. Host RAM cannot re-open it: `max_delta`
-    # (0.125 * total memory) enters only as an upper bound at collector.rs:3570
-    # and the `min_heap_size` floor is applied after it (:2452), so the floor
-    # wins on every host.
+    # (0.125 * total memory) enters only as an upper bound at
+    # `finish_incremental_cycle` and the `min_heap_size` floor is applied after
+    # it (`set_major_threshold_from`), so the floor wins on every host.
     #
     # "Every fixture's working set" is the criterion, but the value was chosen
     # against the two fixtures that motivated it, and `str_fstring` sits above

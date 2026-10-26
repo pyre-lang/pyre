@@ -493,20 +493,16 @@ impl W_Unpickler {
         let _ = pyre_object::gc_roots::pin_root(self_obj);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         memo_proxy::type_object();
-        let proxy = UnpicklerMemoProxy::allocate_stable(UnpicklerMemoProxy {
+        let proxy = UnpicklerMemoProxy::allocate(UnpicklerMemoProxy {
             ob: pyre_object::PyObject {
                 ob_type: std::ptr::null(),
                 w_class: std::ptr::null_mut(),
             },
             w_unpickler: pyre_object::PY_NULL,
         });
-        // `allocate` may have relocated the unpickler; wire the (young) proxy to
-        // its post-collection address.
+        // Ordinary young proxy; the unpickler stays rooted because allocate does not collect.
         if let Some(px) = UnpicklerMemoProxy::from_obj(proxy) {
             px.w_unpickler = pyre_object::gc_roots::shadow_stack_get(slot);
-            // See the pickler twin: `allocate_stable` already consumed the
-            // proxy's fresh TRACK_YOUNG_PTRS, so the initializing-store
-            // exemption does not apply.
             unpickler_write_barrier(proxy);
         }
         proxy
