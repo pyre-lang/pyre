@@ -1857,24 +1857,18 @@ fn windows_fill_local_zone(tm: &mut c_tm, when: time_t) {
 }
 
 /// `interp_time.py _init_timezone` Windows arm: `c_tzset` then
-/// `c_get_timezone` / `c_get_daylight` / `c_get_tzname` from the same
-/// CRT (`_tzset`, `_get_timezone`, `_get_daylight`, `_get_tzname`).
-/// `altzone` is `timezone - 3600`.  Each `_tzname` buffer is decoded
-/// with `str_decode_locale_surrogateescape` (`charp2uni`).  Each store
+/// `c_get_timezone` / `c_get_daylight` from the same CRT (`_tzset`,
+/// `_get_timezone`, `_get_daylight`).
+/// `altzone` is `timezone - 3600`.  `tzname` follows the 3.15 shape noted
+/// at its read below.  Each store
 /// re-reads `ns` from a shadow-stack slot, matching
 /// `interp_time.py _set_module_object`.
-#[cfg(windows)]
+#[cfg(all(windows, feature = "host_env"))]
 pub(crate) fn init_timezone(ns: PyObjectRef) {
     unsafe extern "C" {
         fn _tzset();
         fn _get_timezone(p_value: *mut libc::c_long) -> libc::c_int;
         fn _get_daylight(p_daylight: *mut libc::c_int) -> libc::c_int;
-        fn _get_tzname(
-            p_return_value: *mut usize,
-            time_zone_name: *mut libc::c_char,
-            size_in_bytes: usize,
-            index: libc::c_int,
-        ) -> libc::c_int;
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1887,24 +1881,15 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
     let mut daylight: libc::c_int = 0;
     unsafe { _get_daylight(&mut daylight) };
     let daylight = i64::from(daylight);
-    let mut tzname_bytes = [Vec::new(), Vec::new()];
-    for i in 0usize..2 {
-        let mut blen: usize = 0;
-        unsafe { _get_tzname(&mut blen, std::ptr::null_mut(), 0, i as libc::c_int) };
-        let mut buf = vec![0u8; blen];
-        let mut s: usize = 0;
-        unsafe {
-            _get_tzname(
-                &mut s,
-                buf.as_mut_ptr() as *mut libc::c_char,
-                blen,
-                i as libc::c_int,
-            )
-        };
-        let n = s.saturating_sub(1).min(buf.len());
-        buf.truncate(n);
-        tzname_bytes[i] = buf;
-    }
+    // [3.15-spec] `interp_time.py _init_timezone` reads the CRT's
+    // `_get_tzname` bytes and decodes them in the locale; `init_timezone` at
+    // v3.15.0 builds `tzname` from `GetTimeZoneInformation`'s
+    // `StandardName` / `DaylightName` with `PyUnicode_FromWideChar`, so a
+    // name in any script reads back as itself whatever the code page
+    // (`test_time.TestPytime.test_localtime_timezone` compares it with
+    // `tm_zone`).  `timezone` / `daylight` / `altzone` still come from the CRT
+    // on both sides.
+    let tz_info = host_time::get_tz_info();
     let w_timezone = w_int_new(timezone);
     crate::module_ns_store(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -1919,8 +1904,8 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
     );
     let w_tzname = {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(crate::typedef::charp2uni(&tzname_bytes[0]));
-        fields.push(crate::typedef::charp2uni(&tzname_bytes[1]));
+        fields.push(pyre_object::w_str_new_managed(&tz_info.standard_name));
+        fields.push(pyre_object::w_str_new_managed(&tz_info.daylight_name));
         w_tuple_new(fields.take())
     };
     crate::module_ns_store(

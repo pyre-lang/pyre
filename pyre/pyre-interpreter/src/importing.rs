@@ -1292,6 +1292,34 @@ fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
             Ok(roots.get(vars_slot))
         })
     );
+    // [3.15-spec] `sysconfig.get_platform()` on `os.name == 'nt'` asks
+    // `_sysconfig.get_platform()` first; `_sysconfig_get_platform_impl` at
+    // v3.15.0 exists only under `MS_WINDOWS` and names the target
+    // architecture, or answers `None` for one it does not know.  PyPy has no
+    // `_sysconfig`.
+    #[cfg(windows)]
+    crate::__pyre_put_new!(
+        ns_slot,
+        "get_platform",
+        crate::make_builtin_function_with_arity(
+            "get_platform",
+            |_| {
+                let platform = if cfg!(target_arch = "x86_64") {
+                    Some("win-amd64")
+                } else if cfg!(target_arch = "aarch64") {
+                    Some("win-arm64")
+                } else if cfg!(target_arch = "x86") {
+                    Some("win32")
+                } else if cfg!(target_arch = "arm") {
+                    Some("win-arm32")
+                } else {
+                    None
+                };
+                Ok(platform.map_or_else(pyre_object::w_none, pyre_object::w_str_new))
+            },
+            0
+        )
+    );
     Ok(())
 }
 
@@ -3172,6 +3200,9 @@ pub fn apply_pth_config(flags: &mut crate::launch_env::LaunchFlags) {
     };
     flags.isolated = true;
     flags.ignore_environment = true;
+    // `getpath.py` at v3.15.0 also clears `user_site_directory` here
+    // (`test_site._pthFileTests.test_underpth_no_user_site`).
+    flags.no_user_site = true;
     flags.safe_path = true;
     flags.no_site = flags.no_site || !pth.import_site;
 }

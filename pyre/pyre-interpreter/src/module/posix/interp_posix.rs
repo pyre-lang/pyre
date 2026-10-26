@@ -5312,7 +5312,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 #[cfg(not(unix))]
                 {
-                    let entries = host_fs::read_dir(path_from_bytes(path).as_ref())
+                    // `_listdir_windows_no_opendir` walks the directory
+                    // `win_find_dir` normalizes.
+                    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+                    let dir = {
+                        let wide = wide_path(path)?;
+                        let normalized =
+                            win_find_dir(&wide).map_err(|e| fs_err_with_filename(e, w_path()))?;
+                        normalized.to_os_string()
+                    };
+                    #[cfg(not(all(windows, feature = "host_env", not(feature = "sandbox"))))]
+                    let dir = path_from_bytes(path).into_owned().into_os_string();
+                    let entries = host_fs::read_dir(std::path::Path::new(&dir))
                         .map_err(|e| fs_err_with_filename(e, w_path()))?;
                     let mut items = pyre_object::gc_roots::RootedItems::new();
                     for entry in entries {
@@ -6033,6 +6044,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         }
     }
 
+    /// The directory `join_path_filenameW(path, L"*.*", 1)` puts the wildcard
+    /// after: at v3.15.0 (gh-150880) a path that is not already `\\?\`
+    /// extended goes through `GetFullPathNameW` first, so a component Win32
+    /// would trim -- `"dir "` -- names the directory `os.path.exists` found
+    /// (`test_os.TestScandir.test_windows_trailing_space_path`).  An empty
+    /// path stays empty.
+    #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+    fn win_find_dir(wide: &widestring::WideCStr) -> std::io::Result<widestring::WideCString> {
+        let units = wide.as_slice();
+        let extended = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
+        if units.is_empty() || units.starts_with(&extended) {
+            return Ok(wide.to_ucstring());
+        }
+        let full = rustpython_host_env::nt::getfullpathname(wide)?;
+        widestring::WideCString::from_os_str(&full).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "embedded null character in path",
+            )
+        })
+    }
+
     /// `os_scandir_impl`'s Windows arm -- `FindFirstFileW` over the directory
     /// joined to `*.*`.  It is the one directory walk that hands each entry's
     /// `WIN32_FIND_DATAW` back, which is what lets a `DirEntry` answer
@@ -6055,12 +6088,22 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "embedded null character in path",
                 )
             })?;
-        let mut scan = rustpython_host_env::nt::scandir(&wide)?;
+        // The wildcard goes after the normalized directory, but each
+        // `DirEntry.path` is `join_path_filenameW(path->wide, cFileName, 0)`:
+        // the directory as the caller spelled it.
+        let mut scan = rustpython_host_env::nt::scandir(&win_find_dir(&wide)?)?;
         while let Some(entry) = scan.next_entry()? {
             if entry.is_dot_or_dotdot() {
                 continue;
             }
-            let full = scan.entry_path(&entry);
+            let full = {
+                use std::os::windows::ffi::{OsStrExt, OsStringExt};
+                let name: Vec<u16> = entry.name.encode_wide().collect();
+                std::ffi::OsString::from_wide(&rustpython_host_env::nt::join_path_filename(
+                    wide.as_slice(),
+                    &name,
+                ))
+            };
             each(
                 entry.name.as_encoded_bytes(),
                 full.as_encoded_bytes(),
@@ -14604,8 +14647,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 
         /// The same elements as wide strings. `fsconvert_strdup` reports for
         /// itself, and only `spawnv` replaces what it says with a message of
-        /// its own -- the rejected type and the embedded null alike, since
-        /// `os_spawnv_impl` sets its own error over whichever one came back.
+        /// its own -- and only a `TypeError`: `os_spawnv_impl` at v3.15.0
+        /// lets the embedded-null `ValueError` and any `__fspath__` error
+        /// through unmasked (gh-151416,
+        /// `test_os.SpawnTests.test_spawnv_arg_conversion_errors`).
         fn spawn_argv_wide(
             items: Vec<PyObjectRef>,
             function: &str,
@@ -14618,7 +14663,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         .map_err(|_| crate::PyError::value_error("embedded null character"))
                 });
                 let wide = converted.map_err(|error| {
-                    if name_element_errors {
+                    if name_element_errors && error.kind == crate::PyErrorKind::TypeError {
                         crate::PyError::type_error(format!(
                             "{function}() arg 2 must contain only strings"
                         ))
@@ -14753,10 +14798,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         // through the link's own attributes.  `dir_fd` is the one modifier
         // Windows cannot honour — `chmod` types it as
         // `dir_fd(requires='fchmodat')`, which is `_DirFD_Unavailable`.
-        crate::__pyre_put_new!(
-            ns_slot,
-            "chmod",
-            posix_builtin(
+        crate::__pyre_put_new!(ns_slot, "chmod", {
+            let function = posix_builtin(
                 "chmod",
                 |args| {
                     let (bound, kwargs, kwonly) = bind_path_args(
@@ -14826,8 +14869,23 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 },
                 &["path", "mode"],
                 &["dir_fd", "follow_symlinks"],
-            )
-        );
+            );
+            // `posix_builtin` stores `follow_symlinks=True` as the kw-only
+            // default, and the binder fills an omitted name from it, which
+            // would make the `None => false` arm above unreachable.  Store
+            // `CHMOD_DEFAULT_FOLLOW_SYMLINKS` (0 here) instead, so an
+            // unqualified `chmod` on a link changes the link
+            // (`test_posix.PosixTester.test_chmod_file_symlink`).
+            let roots = pyre_object::gc_roots::push_roots();
+            let fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(function);
+            crate::gateway::function_set_kwonly_default_pair(
+                fn_slot,
+                "follow_symlinks",
+                pyre_object::w_bool_from(false),
+            );
+            roots.get(fn_slot)
+        });
 
         // `os.lchmod` is the named `follow_symlinks=False` operation.  Windows
         // implements that distinction with the reparse point's own file

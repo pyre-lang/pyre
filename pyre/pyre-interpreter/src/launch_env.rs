@@ -176,46 +176,21 @@ fn is_set_nonempty(name: &str) -> bool {
     read_raw(name).is_some_and(|value| !value.is_empty())
 }
 
-/// Whether the effective `LC_CTYPE` is the legacy C/POSIX locale, which is what
-/// coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …) leaves it 0.
-fn locale_implies_utf8_mode() -> bool {
-    // Windows has no such rule: `preconfig_init_utf8_mode` guards the whole
-    // locale block with `#ifndef MS_WINDOWS`, so there the mode stays 0 unless
-    // `-X utf8` or `PYTHONUTF8` asks for it. The variables the cascade below
-    // reads are normally unset on Windows, and an unset chain resolves to C --
-    // which would turn the mode on for every process on the platform whose
-    // streams the mode most changes.
-    if cfg!(windows) {
-        return false;
-    }
-    // `_Py_SetLocaleFromEnv(LC_CTYPE)` and read the answer back, so the value
-    // tested is the locale the C library actually installed rather than the
-    // variables that asked for it. The two differ whenever the environment
-    // names a locale the system cannot set: `setlocale` keeps C there, and
-    // utf8_mode has to follow the installed locale, not the unusable name.
-    //
-    // Only when the process environment is the authority — an embedding that
-    // supplied its own table is describing an environment this process does not
-    // have, and `setlocale("")` would answer from the wrong one, so that path
-    // keeps the string cascade below. wasm32 has no locale database at all and
-    // reaches the cascade the same way.
-    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
+/// `_PyPreConfig_Write`'s `_Py_SetLocaleFromEnv(LC_CTYPE)`: `configure_locale`
+/// is on by default, so `LC_CTYPE` becomes the user preferred locale on every
+/// platform before any module initializes (measured on Windows at v3.15.0:
+/// `locale.setlocale(locale.LC_CTYPE)` is `Korean_Korea.949`, where pyre
+/// reported `C`). PyPy's `app_main.py initstdio` makes the same
+/// `setlocale(LC_CTYPE, "")` call.
+///
+/// Only when the process environment is the authority: an embedding that
+/// supplied its own table is describing an environment this process does not
+/// have, and `setlocale("")` would answer from the wrong one.
+fn set_locale_from_env() {
+    #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     if LAUNCH_ENV.lock().is_none() {
         let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
-        let effective = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None).ok();
-        return matches!(effective.as_deref(), None | Some(b"C") | Some(b"POSIX"));
     }
-    // An empty variable is treated as unset (`setlocale` POSIX semantics) and
-    // falls through to the next, so `LC_ALL= LC_CTYPE=en_US.UTF-8` resolves to
-    // en_US.UTF-8, not C.
-    let read = |name: &str| read(name).filter(|v| !v.is_empty());
-    let locale = read("LC_ALL")
-        .or_else(|| read("LC_CTYPE"))
-        .or_else(|| read("LANG"));
-    // Only the legacy C/POSIX locale — or a fully unset chain, which resolves to
-    // C — coerces utf8_mode to 1; every named locale (en_US, C.UTF-8, …) leaves
-    // it 0.
-    matches!(locale.as_deref(), None | Some("C") | Some("POSIX"))
 }
 
 /// A configuration failure that ends the process before the interpreter
@@ -279,7 +254,12 @@ fn resolve_utf8_mode(flags: &LaunchFlags) -> Result<i64, PreConfigError> {
             };
         }
     }
-    Ok(if locale_implies_utf8_mode() { 1 } else { 0 })
+    // [3.15-spec] PEP 686: `preconfig_init_utf8_mode` at v3.15.0 ends on
+    // `config->utf8_mode = 1` with no locale test, so the mode is on unless
+    // `-X utf8=0`, `PYTHONUTF8=0` or the legacy filesystem codec turns it off
+    // (`test_utf8_mode.UTF8ModeTests.test_env_var`). PyPy 3.11 has no UTF-8
+    // mode default to follow.
+    Ok(1)
 }
 
 /// `_Py_get_env_flag`: an integer environment flag. An unset or empty value is
@@ -449,6 +429,7 @@ pub fn finalize(mut flags: LaunchFlags) -> Result<LaunchFlags, PreConfigError> {
         );
     }
     flags.utf8_mode = Some(resolve_utf8_mode(&flags)?);
+    set_locale_from_env();
     flags.optimize = resolve_counter(&flags, flags.optimize, "PYTHONOPTIMIZE");
     flags.verbose = resolve_counter(&flags, flags.verbose, "PYTHONVERBOSE");
     flags.debug = resolve_counter(&flags, flags.debug, "PYTHONDEBUG");
