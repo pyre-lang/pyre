@@ -12717,8 +12717,10 @@ fn walker_pin_function_quasi_field<Sym: WalkSym>(
     callable: pyre_object::PyObjectRef,
     descr: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
+    let mutate = crate::descr::function_mutate_descr_for_field(&descr)
+        .expect("Function ? field has mutate_<name> in FUNCTION_DESCR_GROUP");
     let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr, None);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr, Some(&mutate));
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12745,11 +12747,12 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
         return Ok(false);
     }
     let strategy_const = ctx.trace_ctx.const_ref(strategy as i64);
+    let mutate = crate::descr::module_dict_mutate_version_descr();
     crate::state::record_quasiimmut_field(
         ctx.trace_ctx,
         strategy_const,
         crate::descr::module_dict_version_descr(),
-        None,
+        Some(&mutate),
     );
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
     Ok(true)

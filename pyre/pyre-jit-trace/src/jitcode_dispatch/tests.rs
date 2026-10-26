@@ -5819,6 +5819,190 @@ fn assembled_w_ctype_mutate_size_quasi_descr_is_the_embedded_field() {
 }
 
 #[test]
+fn assembled_function_code_quasi_descr_is_the_group_mutate_code_row() {
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_code` for `function.py Function.code?`.
+    // Assembler `fielddescrof` must hydrate the group row
+    // (`FUNCTION_DESCR_GROUP` `mutate_code`).
+    let expected_field = crate::descr::function_code_descr();
+    let expected_mutate = crate::descr::function_mutate_descr_for_field(&expected_field)
+        .expect("Function.code has mutate_code");
+    let mut seen = 0usize;
+    for jc in crate::jitcode_runtime::all_jitcodes() {
+        for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+            if op.key != "record_quasiimmut_field/rdd" {
+                continue;
+            }
+            if op.pc + 6 > jc.code.len() {
+                continue;
+            }
+            let field_idx = u16::from_le_bytes([jc.code[op.pc + 2], jc.code[op.pc + 3]]) as usize;
+            let mutate_idx = u16::from_le_bytes([jc.code[op.pc + 4], jc.code[op.pc + 5]]) as usize;
+            let Some(field_bh) = crate::jitcode_runtime::get_descr_by_index(field_idx) else {
+                continue;
+            };
+            let Some(mutate_bh) = crate::jitcode_runtime::get_descr_by_index(mutate_idx) else {
+                continue;
+            };
+            let (
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: fname,
+                    owner: fowner,
+                    ..
+                },
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: mname,
+                    owner: mowner,
+                    ..
+                },
+            ) = (field_bh, mutate_bh)
+            else {
+                continue;
+            };
+            let function_owner =
+                fowner.as_str() == "Function" || fowner.as_str().ends_with("::Function");
+            let mutate_owner =
+                mowner.as_str() == "Function" || mowner.as_str().ends_with("::Function");
+            let is_code = fname.as_str() == "code" || fname.as_str().ends_with(".code");
+            let is_mutate_code =
+                mname.as_str() == "mutate_code" || mname.as_str().ends_with(".mutate_code");
+            if !(function_owner && mutate_owner && is_code && is_mutate_code) {
+                continue;
+            }
+            let field_descr = crate::descr::make_descr_from_bh(field_bh);
+            let mutate_descr = crate::descr::make_descr_from_bh(mutate_bh);
+            assert!(
+                std::sync::Arc::ptr_eq(&field_descr, &expected_field),
+                "{} Function.code field descr must be the group row",
+                jc.name
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&mutate_descr, &expected_mutate),
+                "{} Function.mutate_code must be the group row",
+                jc.name
+            );
+            seen += 1;
+        }
+    }
+    assert!(
+        seen > 0,
+        "translation must assemble at least one Function.code? /rdd with mutate_code"
+    );
+}
+
+#[test]
+fn walker_pin_namespace_version_records_quasiimmut_from_mutate_descr() {
+    // `celldict.py ModuleDictStrategy._immutable_fields_ = ["version?"]`.
+    // `walker_pin_namespace_version` must pass `mutate_version` so
+    // `quasiimmut.py QuasiImmutDescr` is built by
+    // `quasi_immut_descr_from_mutate`.
+    use crate::state::ConcreteValue;
+
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let ns = pyre_object::w_module_dict_new();
+
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            assert!(
+                walker_pin_namespace_version(wc, 0, ns).expect("pin"),
+                "module dict must have a strategy box to pin"
+            );
+        },
+    );
+    let recorder = tc.into_recorder();
+    let qmut_ops: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .collect();
+    assert_eq!(qmut_ops.len(), 1, "one QUASIIMMUT_FIELD for version?");
+    let qmut_descr = qmut_ops[0]
+        .getdescr()
+        .expect("QUASIIMMUT_FIELD has a descr");
+    let qd = qmut_descr
+        .as_quasi_immut_descr()
+        .expect("QuasiImmutDescr from quasi_immut_descr_from_mutate");
+    let expected_field = crate::descr::module_dict_version_descr();
+    assert!(
+        std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_field),
+        "recorded field descr must be ModuleDictStrategy.version"
+    );
+    assert_ne!(qd.qmut().instance_identity(), 0);
+}
+
+/// Process-global `HOST_HOOKS` is one slot; save and restore it so this
+/// test cannot overwrite a sibling.
+struct WalkerQmutHookGuard {
+    saved: majit_metainterp::HostHooks,
+    _lock: parking_lot::MutexGuard<'static, ()>,
+}
+
+static WALKER_QMUT_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+impl WalkerQmutHookGuard {
+    fn install() -> Self {
+        let lock = WALKER_QMUT_HOOK_TEST_LOCK.lock();
+        let saved = majit_metainterp::host_hooks();
+        majit_metainterp::publish_host_hooks(majit_metainterp::HostHooks {
+            get_current_qmut_instance: Some(walker_test_get_current_qmut_instance),
+            ..saved
+        });
+        Self { saved, _lock: lock }
+    }
+}
+
+impl Drop for WalkerQmutHookGuard {
+    fn drop(&mut self) {
+        majit_metainterp::publish_host_hooks(self.saved);
+    }
+}
+
+struct WalkerRecordedQuasiImmut(std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>);
+
+impl std::fmt::Debug for WalkerRecordedQuasiImmut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "QuasiImmut({:p})", std::sync::Arc::as_ptr(&self.0))
+    }
+}
+
+impl majit_ir::QuasiImmutHandle for WalkerRecordedQuasiImmut {
+    fn is_current(&self) -> bool {
+        self.0.is_current()
+    }
+
+    fn register_loop_token(&self, token: &std::sync::Arc<dyn majit_ir::QuasiImmutLoopToken>) {
+        self.0.register_loop_token(token);
+    }
+
+    fn instance_identity(&self) -> usize {
+        std::sync::Arc::as_ptr(&self.0) as usize
+    }
+}
+
+fn walker_test_get_current_qmut_instance(
+    field_addr: i64,
+) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
+    assert_ne!(field_addr, 0);
+    let field = unsafe { &*(field_addr as *const pyre_object::quasiimmut::QuasiImmutField) };
+    std::sync::Arc::new(WalkerRecordedQuasiImmut(field.get_current_qmut_instance()))
+}
+
+#[test]
 fn int_truediv_and_newfloat_jitcodes_are_the_pypy_leaf() {
     // intobject.py `_truediv` + `space.newfloat`: the `/` descent walks
     // `int_truediv`, which looks inside `newfloat`.  `fuse_boxing_alloc`

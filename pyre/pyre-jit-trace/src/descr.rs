@@ -122,12 +122,11 @@ const CELL_FAMILY_DESCR_TAG: u32 = 0x5300_0000;
 const CELL_FAMILY_EVER_MUTATED_INDEX: u32 = CELL_FAMILY_DESCR_TAG;
 
 // `ExecutionContext.w_tracefunc` is a new `?` field.  `quasi_immut_descr`
-// and `function_quasi_immut_slot` select the pointer cast from
-// `descr.index()` alone, and the EC group's ordinal `2` is not an owner
-// identity — any other group's field 2 would take the same arm.  Reserved
-// in a tag of its own, disjoint from FIELD / ARRAY / SIZE / CELL / MAPDICT /
-// PROPERTY / WRAPPER / CELL_FAMILY / `object.typeptr` / NATIVE_MAPDICT /
-// the GC tid.
+// selects the pointer cast from `descr.index()` alone, and the EC group's
+// ordinal `2` is not an owner identity — any other group's field 2 would
+// take the same arm.  Reserved in a tag of its own, disjoint from FIELD /
+// ARRAY / SIZE / CELL / MAPDICT / PROPERTY / WRAPPER / CELL_FAMILY /
+// `object.typeptr` / NATIVE_MAPDICT / the GC tid.
 const EC_DESCR_TAG: u32 = 0x5400_0000;
 const EC_W_TRACEFUNC_INDEX: u32 = EC_DESCR_TAG;
 const EC_PROFILEFUNC_INDEX: u32 = EC_DESCR_TAG + 1;
@@ -2413,11 +2412,12 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// assume.  A tuple's backing array has its own immutable descriptor and is
 /// read with `GetarrayitemGcPureR`.
 ///
-/// The declarative attribute stays off this struct. Emitting
-/// `record_quasiimmut_field` for these nine fields would put the opcode in
-/// every interpreter jitcode that reads them, and `pyjitpl/dispatch.rs` still
-/// has no arm for that byte. The descriptors in this group are what the
-/// hand-written trace paths resolve.
+/// `function.py Function._immutable_fields_` is declared on `Function` as
+/// `#[jit_immutable_fields]`. `jtransform.py rewrite_op_getfield` emits
+/// `record_quasiimmut_field` with this group's `mutate_<name>` row
+/// (`quasiimmut.py get_mutate_field_name`) before each `?` read. Walker
+/// pins of the same slots pass that same mutate descr. The dispatch arm is
+/// `jitcode_dispatch/mod.rs` `"record_quasiimmut_field/rdd"`.
 ///
 /// The entries are in byte-offset order and each key is the struct's own field
 /// name, which is what makes the group's numbering agree with the analyzer's.
@@ -4458,56 +4458,34 @@ pub fn function_w_text_signature_descr() -> DescrRef {
     function_field_descr(pyre_interpreter::function::FUNCTION_W_TEXT_SIGNATURE_OFFSET)
 }
 
-/// Resolve a field-descr index to the `Function` watcher slot it names, or
-/// `None` when the index is not one of the nine `function.py:34-42` fields.
-///
-/// `quasiimmut.py get_current_qmut_instance` reaches the hidden
-/// `mutate_<name>` field through a `mutatefielddescr` the rtyper minted next to
-/// the field's own descr.  Pyre carries the same pairing as this table: both
-/// the record-time install (`state.rs`) and the compile-time watcher
-/// registration (`pyre-jit/src/eval.rs`) key on `descr.index()`, so they resolve
-/// through one list instead of two chains that could drift apart.
-///
-/// The index carries no struct identity — `stable_field_index` derives it from
-/// `(offset, field_size, field_type, signed)` — so keying an arm on it is only
-/// safe while no other quasi-immutable descriptor can land on the same number.
-/// The other owners that address a real struct field either use a different
-/// `Type` ([`TYPE_VERSION_TAG_FIELD_DESCR`], [`module_dict_version_descr`])
-/// or carry a reserved tag outside `FIELD_DESCR_TAG`
-/// ([`MAPDICT_DESCR_TAG`], [`PROPERTY_DESCR_TAG`], [`WRAPPER_DESCR_TAG`],
-/// [`CELL_FAMILY_DESCR_TAG`], [`EC_W_TRACEFUNC_INDEX`]).  A descriptor that
-/// is not quasi-immutable reaches neither caller.
-pub fn function_quasi_immut_slot(index: u32) -> Option<pyre_interpreter::function::QuasiImmutSlot> {
-    use pyre_interpreter::function::QuasiImmutSlot;
-    static SLOTS: LazyLock<Vec<(u32, QuasiImmutSlot)>> = LazyLock::new(|| {
-        vec![
-            (function_code_descr().index(), QuasiImmutSlot::Code),
-            (
-                function_w_globals_descr().index(),
-                QuasiImmutSlot::WFuncGlobalsObj,
-            ),
-            (function_closure_descr().index(), QuasiImmutSlot::Closure),
-            (function_defs_w_descr().index(), QuasiImmutSlot::DefsW),
-            (function_name_descr().index(), QuasiImmutSlot::Name),
-            (
-                function_w_qualname_descr().index(),
-                QuasiImmutSlot::WQualname,
-            ),
-            (
-                function_w_objclass_descr().index(),
-                QuasiImmutSlot::WObjclass,
-            ),
-            (
-                function_w_text_signature_descr().index(),
-                QuasiImmutSlot::WTextSignature,
-            ),
-            (function_w_kw_defs_descr().index(), QuasiImmutSlot::WKwDefs),
-        ]
-    });
-    SLOTS
+/// `quasiimmut.py get_mutate_field_name(fieldname)` = `'mutate_' + fieldname`
+/// for a Function `?` field. Lookup is `(STRUCT, fieldname)` through
+/// [`FUNCTION_DESCR_GROUP`] (`descr.py get_field_descr`), not an index or
+/// offset. `None` when `field` is not a Function `?` row.
+pub fn function_mutate_descr_for_field(field: &DescrRef) -> Option<DescrRef> {
+    let fd = field.as_field_descr()?;
+    if !field.is_quasi_immutable() {
+        return None;
+    }
+    let function_parent = FUNCTION_DESCR_GROUP.size_descr.clone() as DescrRef;
+    let parent_is_function = fd
+        .get_parent_descr()
+        .is_some_and(|parent| std::sync::Arc::ptr_eq(&parent, &function_parent));
+    let is_group_row = FUNCTION_DESCR_GROUP
+        .field_descrs()
         .iter()
-        .find(|(slot_index, _)| *slot_index == index)
-        .map(|(_, slot)| *slot)
+        .any(|row| std::sync::Arc::ptr_eq(&(row.clone() as DescrRef), field));
+    if !parent_is_function && !is_group_row {
+        return None;
+    }
+    let key = fd.field_key();
+    if key.is_empty() || key.starts_with("mutate_") {
+        return None;
+    }
+    Some(field_descr_from_group_named(
+        &*FUNCTION_DESCR_GROUP,
+        &format!("mutate_{key}"),
+    ))
 }
 
 /// `function.py can_change_code = True` — a plain byte, so a fresh
@@ -4957,6 +4935,26 @@ fn module_dict_strategy_field_descr(field_key: &str) -> DescrRef {
 
 pub fn module_dict_mutate_version_descr() -> DescrRef {
     module_dict_strategy_field_descr("mutate_version")
+}
+
+/// True when `descr` is [`module_dict_version_descr`]: same Arc, or the
+/// ModuleDictStrategy parent SizeDescr plus field key `version`
+/// (`descr.py get_field_descr(STRUCT, fieldname)`).
+pub fn is_module_dict_version_field(descr: &DescrRef) -> bool {
+    if std::sync::Arc::ptr_eq(descr, &module_dict_version_descr()) {
+        return true;
+    }
+    let Some(fd) = descr.as_field_descr() else {
+        return false;
+    };
+    if fd.field_key() != "version" {
+        return false;
+    }
+    let Some(parent) = fd.get_parent_descr() else {
+        return false;
+    };
+    let module_parent = MODULE_DICT_STRATEGY_DESCR_GROUP.size_descr.clone() as DescrRef;
+    std::sync::Arc::ptr_eq(&parent, &module_parent)
 }
 
 // These headerless-map-node descrs deliberately retain `parent_descr = None`
@@ -10634,8 +10632,8 @@ mod tests {
         assert_eq!(idx, EC_W_TRACEFUNC_INDEX);
         assert_ne!(idx, 2);
         assert_ne!(idx, function_code_descr().index());
-        assert!(function_quasi_immut_slot(idx).is_none());
-        assert!(function_quasi_immut_slot(function_code_descr().index()).is_some());
+        assert!(function_mutate_descr_for_field(&ec_w_tracefunc_descr()).is_none());
+        assert!(function_mutate_descr_for_field(&function_code_descr()).is_some());
     }
 
     #[test]
@@ -10643,7 +10641,33 @@ mod tests {
         let idx = ec_profilefunc_descr().index();
         assert_eq!(idx, EC_PROFILEFUNC_INDEX);
         assert_ne!(idx, EC_W_TRACEFUNC_INDEX);
-        assert!(function_quasi_immut_slot(idx).is_none());
+        assert!(function_mutate_descr_for_field(&ec_profilefunc_descr()).is_none());
+    }
+
+    #[test]
+    fn function_mutate_descr_for_field_is_the_group_mutate_row() {
+        let cases: &[(DescrRef, &str)] = &[
+            (function_code_descr(), "mutate_code"),
+            (function_w_globals_descr(), "mutate_w_func_globals_obj"),
+            (function_closure_descr(), "mutate_closure"),
+            (function_defs_w_descr(), "mutate_defs_w"),
+            (function_name_descr(), "mutate_name"),
+            (function_w_qualname_descr(), "mutate_w_qualname"),
+            (function_w_objclass_descr(), "mutate_w_objclass"),
+            (function_w_text_signature_descr(), "mutate_w_text_signature"),
+            (function_w_kw_defs_descr(), "mutate_w_kw_defs"),
+        ];
+        for (field, mutate_key) in cases {
+            let mutate = function_mutate_descr_for_field(field)
+                .unwrap_or_else(|| panic!("Function ? field {mutate_key}"));
+            let expected = field_descr_from_group_named(&*FUNCTION_DESCR_GROUP, mutate_key);
+            assert!(
+                std::sync::Arc::ptr_eq(&mutate, &expected),
+                "{mutate_key} must be the FUNCTION_DESCR_GROUP row"
+            );
+        }
+        assert!(function_mutate_descr_for_field(&module_dict_version_descr()).is_none());
+        assert!(function_mutate_descr_for_field(&function_w_name_descr()).is_none());
     }
 
     #[test]
@@ -12624,6 +12648,83 @@ mod tests {
         assert!(
             !std::sync::Arc::ptr_eq(&narrow, &canonical),
             "a 4-byte spelling must not bridge onto the 8-byte version cell",
+        );
+    }
+
+    #[test]
+    fn make_descr_from_bh_bridges_function_code_and_mutate_code() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let canonical_code = function_code_descr();
+        let canonical_mutate = function_mutate_descr_for_field(&canonical_code)
+            .expect("Function.code has mutate_code");
+        let code_offset = pyre_interpreter::function::FUNCTION_CODE_OFFSET;
+        let mutate_offset = pyre_interpreter::function::FUNCTION_MUTATE_CODE_OFFSET;
+        for owner in [
+            "Function",
+            "function::Function",
+            "pyre_interpreter::function::Function",
+        ] {
+            for name in ["code", "Function.code"] {
+                let descr = make_descr_from_bh(&BhDescr::Field {
+                    offset: code_offset,
+                    field_size: WORD,
+                    field_type: Type::Ref,
+                    field_flag: ArrayFlag::Pointer,
+                    is_field_signed: false,
+                    is_immutable: true,
+                    is_quasi_immutable: true,
+                    index_in_parent: Some(0),
+                    parent: None,
+                    name: name.into(),
+                    owner: owner.into(),
+                    load_is_acquire: false,
+                });
+                assert!(
+                    std::sync::Arc::ptr_eq(&descr, &canonical_code),
+                    "{owner}.{name} must bridge to Function.code"
+                );
+            }
+            for name in ["mutate_code", "Function.mutate_code"] {
+                let descr = make_descr_from_bh(&BhDescr::Field {
+                    offset: mutate_offset,
+                    field_size: WORD,
+                    field_type: Type::Ref,
+                    field_flag: ArrayFlag::Pointer,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: Some(0),
+                    parent: None,
+                    name: name.into(),
+                    owner: owner.into(),
+                    load_is_acquire: false,
+                });
+                assert!(
+                    std::sync::Arc::ptr_eq(&descr, &canonical_mutate),
+                    "{owner}.{name} must bridge to Function.mutate_code"
+                );
+            }
+        }
+
+        let nested = make_descr_from_bh(&BhDescr::Field {
+            offset: mutate_offset,
+            field_size: 2 * WORD,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Struct,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(0),
+            parent: None,
+            name: "mutate_code".into(),
+            owner: "Function".into(),
+            load_is_acquire: false,
+        });
+        assert!(
+            std::sync::Arc::ptr_eq(&nested, &canonical_mutate),
+            "a two-word STRUCT spelling must still bridge onto Function.mutate_code"
         );
     }
 
@@ -14637,6 +14738,32 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     && (*field_size == field.field_size() || *field_size == 2 * WORD)
                 {
                     return canonical;
+                }
+            }
+            // `function.py Function._immutable_fields_` `?` reads assemble
+            // `record_quasiimmut_field` with this group's `mutate_<name>`
+            // (`quasiimmut.py get_mutate_field_name`). Bridge by
+            // `(STRUCT, fieldname)` so the hydrated Arc is the group row.
+            // Flatten may store the display name (`Function.code`) with a
+            // crate-qualified owner; `descr.py get_field_descr` keys the
+            // STRUCT-local fieldname, so look up the leaf.
+            if owner.as_str() == "Function" || owner.as_str().ends_with("::Function") {
+                let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
+                if let Some(canonical) = FUNCTION_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == leaf)
+                {
+                    let canonical = canonical.clone() as DescrRef;
+                    if let Some(field) = canonical.as_field_descr() {
+                        let nested_mutate = leaf.starts_with("mutate_") && *field_size == 2 * WORD;
+                        if nested_mutate
+                            || (field.field_size() == *field_size
+                                && field.field_type() == *field_type)
+                        {
+                            return canonical;
+                        }
+                    }
                 }
             }
             if owner.as_str() == "W_ListObject" {
