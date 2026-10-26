@@ -16876,11 +16876,17 @@ fn descend_generatorentry<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        let pycode_descr = crate::descr::make_immutable_field_descr(
+        let pycode_descr = crate::descr::gc_cached_field_descr(
+            "generator::GeneratorIterator",
+            "pycode",
+            "GeneratorIterator.pycode",
             std::mem::offset_of!(pyre_object::generator::GeneratorIterator, pycode),
             std::mem::size_of::<pyre_object::PyObjectRef>(),
             majit_ir::Type::Ref,
             false,
+            true,
+            false,
+            u32::MAX,
         );
         let pycode_op =
             ctx.trace_ctx
@@ -17160,11 +17166,17 @@ fn walk_generator_resume<Sym: WalkSym>(
     // re-reads the suspended frame each iteration instead of baking the
     // address from this recording.
     let frame_offset = std::mem::offset_of!(pyre_object::generator::GeneratorIterator, frame_ptr);
-    let frame_descr = crate::descr::make_field_descr(
+    let frame_descr = crate::descr::gc_cached_field_descr(
+        "generator::GeneratorIterator",
+        "frame_ptr",
+        "GeneratorIterator.frame_ptr",
         frame_offset,
         std::mem::size_of::<*mut u8>(),
         majit_ir::Type::Ref,
         false,
+        false,
+        false,
+        u32::MAX,
     );
     let frame_box =
         ctx.trace_ctx

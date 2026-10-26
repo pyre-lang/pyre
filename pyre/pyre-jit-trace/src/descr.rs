@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use majit_ir::{
     ArrayDescr, Descr, DescrRef, FieldDescr, IndexMapExt, JitCodeDescr, SizeDescr, SwitchDescr,
@@ -42,6 +42,8 @@ const WORD: usize = core::mem::size_of::<usize>();
 const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
 const SIZE_DESCR_TAG: u32 = 0x3000_0000;
+const _: () = assert!(FIELD_DESCR_TAG == 0x1000_0000);
+const _: () = assert!(ARRAY_DESCR_TAG == 0x2000_0000);
 const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 
 // Reserved, hand-assigned indices for mutable-cell payload fields. The
@@ -58,8 +60,9 @@ const HEADERLESS_SIZE_OWNER_MARKER: &str = "__majit_headerless_size__";
 const CELL_DESCR_TAG: u32 = 0x4000_0000;
 const INT_MUTABLE_CELL_VALUE_INDEX: u32 = CELL_DESCR_TAG;
 
-// FIELD spans [0x1000_0000, 0x10FF_FFFF], ARRAY 0x2xxx_xxxx,
-// SIZE 0x3xxx_xxxx, CELL 0x4000_0000 — 0x5000_0000 is disjoint from all four.
+// FIELD intern spans 0x1000_0000..=0x1FFF_FFFF (`next_field_heapcache_index`),
+// ARRAY 0x2xxx_xxxx, SIZE 0x3xxx_xxxx, CELL 0x4000_0000 — 0x5000_0000 is
+// disjoint from all four.
 // These reserved indices cannot use `make_quasi_immutable_field_descr`:
 // `Terminator.allow_unboxing` and `PlainAttribute.ever_mutated` are both
 // `Cell<bool>`, so `stable_field_index(offset, field_size, field_type, signed)`
@@ -168,16 +171,11 @@ fn type_bits(tp: Type) -> u32 {
     }
 }
 
-fn stable_field_index(offset: usize, field_size: usize, field_type: Type, signed: bool) -> u32 {
-    FIELD_DESCR_TAG
-        | (((offset as u32) & 0x000f_ffff) << 4)
-        | (((field_size as u32) & 0x7) << 1)
-        | ((signed as u32) << 3)
-        | type_bits(field_type)
-}
-
 /// Concrete field descriptor for pyre object fields.
 /// RPython FieldDescr: describes a field in a GC/raw struct.
+/// Runtime mint goes through `get_field_descr` (`SimpleFieldDescr`); this
+/// type remains for the `is_class_word` special case.
+#[allow(dead_code)]
 #[derive(Debug)]
 pub struct PyreFieldDescr {
     offset: usize,
@@ -197,6 +195,9 @@ pub struct PyreFieldDescr {
     /// site rather than recovered from `name`, so a consumer never has to
     /// know how this host spells its header.
     is_class_word: bool,
+    /// HeapCache identity interned at `get_field_descr` for this
+    /// `(STRUCT, fieldname)`. Not a layout hash.
+    heapcache_index: u32,
     index_in_parent: usize,
     parent_descr: Option<Weak<dyn Descr>>,
     /// `effectinfo.py compute_bitstrings` ei_index. `u32::MAX` until
@@ -281,7 +282,7 @@ fn runtime_array_flag(item_type: Type, signed: bool) -> majit_ir::descr::ArrayFl
 /// `descr.py get_field_descr(gccache, STRUCT, fieldname)` — one Arc
 /// per `(STRUCT, fieldname)`. The cache is the owner; do not wrap
 /// callers in a process-global OnceLock.
-fn gc_cached_field_descr(
+pub(crate) fn gc_cached_field_descr(
     struct_name: &str,
     field_name: &str,
     display_name: &str,
@@ -290,23 +291,43 @@ fn gc_cached_field_descr(
     field_type: Type,
     signed: bool,
     is_immutable: bool,
+    is_quasi_immutable: bool,
     index: u32,
 ) -> DescrRef {
+    debug_assert!(
+        !struct_name.is_empty(),
+        "get_field_descr STRUCT name must not be empty"
+    );
+    let (struct_key, _) = majit_ir::descr::struct_key_from_owner_or_name(struct_name, display_name);
     majit_ir::descr::gc_cache().lock().get_field_descr(
-        majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(struct_name)),
+        struct_key,
         field_name,
         Some(display_name),
         offset,
         field_size,
         field_type,
         is_immutable,
-        false,
+        is_quasi_immutable,
         runtime_array_flag(field_type, signed),
         index,
         false,
         None,
         false,
     ) as DescrRef
+}
+
+fn unique_anon_struct_name() -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    format!(
+        "__anon_field_struct_{}",
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn unique_anon_array_key() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    majit_ir::descr::path_hash(&format!("__anon_array_{n}"))
 }
 
 fn get_or_create_array_descr(
@@ -427,7 +448,14 @@ fn get_or_create_array_descr_with_full_id(
         item_type,
         runtime_array_flag(item_type, signed),
     );
-    array_descr.lendescr = maybe_array_lendescr_at_offset(len_offset);
+    array_descr.lendescr = len_offset.map(|off| {
+        let key = if cache_key == 0 {
+            unique_anon_array_key()
+        } else {
+            cache_key
+        };
+        array_lendescr_at_offset_for(key, off)
+    });
     array_descr.set_cache_key(cache_key);
     array_descr = array_descr.with_load_is_acquire(key.load_is_acquire);
     // `cpu.arraydescrof(rffi.CArray(TYPE))`: no GC header, so
@@ -504,7 +532,7 @@ impl Descr for PyreFieldDescr {
             // header field from every other first-Ref at the same offset.
             OBJECT_W_CLASS_INDEX
         } else {
-            stable_field_index(self.offset, self.field_size, self.field_type, self.signed)
+            self.heapcache_index
         }
     }
 
@@ -566,19 +594,20 @@ pub fn make_field_descr(
     field_type: Type,
     signed: bool,
 ) -> DescrRef {
-    Arc::new(PyreFieldDescr {
+    let struct_name = unique_anon_struct_name();
+    let display = format!("{struct_name}.field");
+    gc_cached_field_descr(
+        &struct_name,
+        "field",
+        &display,
         offset,
         field_size,
         field_type,
         signed,
-        immutable: false,
-        quasi_immutable: false,
-        name: "",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+        false,
+        false,
+        u32::MAX,
+    )
 }
 
 /// Create a field descr with an explicit parent SizeDescr.
@@ -586,8 +615,8 @@ pub fn make_field_descr(
 /// RPython parity: `fielddescr.get_parent_descr()` returns the owning
 /// struct's SizeDescr, enabling `info.py init_fields(parent_descr,
 /// index)`. Without parent_descr, `descr_index()` falls back to
-/// `stable_field_index` (a hash) instead of `index_in_parent` (a small
-/// sequential index), causing OOM in `ensure_field_descr_slot`.
+/// `index_in_parent` (a small sequential index), causing OOM in
+/// `ensure_field_descr_slot`. The HeapCache id is interned at mint.
 ///
 /// The `index_in_parent` is computed by scanning the parent SizeDescr's
 /// `all_fielddescrs` for a matching offset.
@@ -602,19 +631,20 @@ pub fn make_field_descr_full(
     field_type: Type,
     immutable: bool,
 ) -> DescrRef {
-    Arc::new(PyreFieldDescr {
+    let struct_name = unique_anon_struct_name();
+    let display = format!("{struct_name}.field");
+    gc_cached_field_descr(
+        &struct_name,
+        "field",
+        &display,
         offset,
         field_size,
         field_type,
-        signed: false,
+        false,
         immutable,
-        quasi_immutable: false,
-        name: "",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+        false,
+        u32::MAX,
+    )
 }
 
 /// Create a field descriptor for an immutable field (RPython is_immutable_field).
@@ -625,19 +655,20 @@ pub fn make_immutable_field_descr(
     field_type: Type,
     signed: bool,
 ) -> DescrRef {
-    Arc::new(PyreFieldDescr {
+    let struct_name = unique_anon_struct_name();
+    let display = format!("{struct_name}.field");
+    gc_cached_field_descr(
+        &struct_name,
+        "field",
+        &display,
         offset,
         field_size,
         field_type,
         signed,
-        immutable: true,
-        quasi_immutable: false,
-        name: "",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+        true,
+        false,
+        u32::MAX,
+    )
 }
 
 /// Create a field descriptor for a quasi-immutable field.
@@ -648,19 +679,20 @@ pub fn make_quasi_immutable_field_descr(
     field_type: Type,
     signed: bool,
 ) -> DescrRef {
-    Arc::new(PyreFieldDescr {
+    let struct_name = unique_anon_struct_name();
+    let display = format!("{struct_name}.field");
+    gc_cached_field_descr(
+        &struct_name,
+        "field",
+        &display,
         offset,
         field_size,
         field_type,
         signed,
-        immutable: false,
-        quasi_immutable: true,
-        name: "",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+        false,
+        true,
+        u32::MAX,
+    )
 }
 
 /// Concrete size descriptor for fixed-size object allocations.
@@ -1145,15 +1177,14 @@ fn build_object_descr_group_inlining_parent(
     // onto whichever no-name group is inserted first, and `resolve_gc_tid`
     // then hands that group's `type_id` to every header write whose descr
     // carries no key — stamping one STRUCT's tid on another STRUCT's block.
-    let cache_key = if !cache_key_name.is_empty() {
-        majit_ir::descr::path_hash(cache_key_name)
+    let spelling = if !cache_key_name.is_empty() {
+        cache_key_name
     } else if !def_path.is_empty() {
-        majit_ir::descr::path_hash(def_path)
-    } else if !simple_name.is_empty() {
-        majit_ir::descr::path_hash(simple_name)
+        def_path
     } else {
-        0
+        simple_name
     };
+    let (_, cache_key) = majit_ir::descr::struct_key_from_owner_or_name(spelling, "");
     // descr.py `get_field_descr` fills `cache[STRUCT][fieldname]` when the
     // name is requested. An absent STRUCT publishes the static field key
     // directly; the owned-spec path below is the second publication.
@@ -1168,42 +1199,42 @@ fn build_object_descr_group_inlining_parent(
                 headerless || offset != pyre_object::pyobject::W_CLASS_OFFSET
             })
             .collect();
-        let borrowed: Vec<majit_ir::descr::BorrowedField> =
-            payload
-                .iter()
-                .enumerate()
-                .map(
-                    |(
+        let borrowed: Vec<majit_ir::descr::BorrowedField> = payload
+            .iter()
+            .enumerate()
+            .map(
+                |(
+                    index_in_parent,
+                    &(
+                        field_key,
+                        offset,
+                        field_size,
+                        field_type,
+                        signed,
+                        immutable,
+                        quasi_immutable,
+                    ),
+                )| {
+                    majit_ir::descr::BorrowedField {
+                        index: field_indices
+                            .get(index_in_parent)
+                            .copied()
+                            .unwrap_or(u32::MAX),
+                        name: borrowed_field_display_name(simple_name, field_key),
+                        field_key,
+                        offset,
+                        field_size,
+                        field_type,
+                        flag: runtime_array_flag(field_type, signed),
+                        is_immutable: immutable,
+                        is_quasi_immutable: quasi_immutable,
                         index_in_parent,
-                        &(
-                            field_key,
-                            offset,
-                            field_size,
-                            field_type,
-                            signed,
-                            immutable,
-                            quasi_immutable,
-                        ),
-                    )| {
-                        majit_ir::descr::BorrowedField {
-                            index: field_indices.get(index_in_parent).copied().unwrap_or_else(
-                                || stable_field_index(offset, field_size, field_type, signed),
-                            ),
-                            name: borrowed_field_display_name(simple_name, field_key),
-                            field_key,
-                            offset,
-                            field_size,
-                            field_type,
-                            flag: runtime_array_flag(field_type, signed),
-                            is_immutable: immutable,
-                            is_quasi_immutable: quasi_immutable,
-                            index_in_parent,
-                            is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
-                            load_is_acquire: false,
-                        }
-                    },
-                )
-                .collect();
+                        is_class_word: Some(offset == pyre_object::pyobject::W_CLASS_OFFSET),
+                        load_is_acquire: false,
+                    }
+                },
+            )
+            .collect();
         let mut gc_edges: Vec<Arc<dyn majit_ir::descr::FieldDescr>> = Vec::new();
         if !headerless {
             gc_edges.push(inherited_w_class_gc_edge());
@@ -1261,7 +1292,7 @@ fn build_object_descr_group_inlining_parent(
                 index: field_indices
                     .get(index_in_parent)
                     .copied()
-                    .unwrap_or_else(|| stable_field_index(offset, field_size, field_type, signed)),
+                    .unwrap_or(u32::MAX),
                 field_key: field_key.to_string(),
                 // `descr.py` `get_field_descr` stores one FieldDescr per
                 // `(STRUCT, fieldname)`. The display name is
@@ -1367,7 +1398,7 @@ fn build_bare_gcstruct_descr_group(
     fields: &[(&'static str, usize, usize, Type, bool, bool, bool)],
     simple_name: &str,
 ) -> PyreObjectDescrGroup {
-    let cache_key = majit_ir::descr::path_hash(simple_name);
+    let (_, cache_key) = majit_ir::descr::struct_key_from_owner_or_name(simple_name, "");
     let specs: Vec<majit_ir::descr::SimpleFieldDescrSpec> = fields
         .iter()
         .enumerate()
@@ -1376,7 +1407,7 @@ fn build_bare_gcstruct_descr_group(
                 index_in_parent,
                 &(field_key, offset, field_size, field_type, signed, immutable, quasi_immutable),
             )| majit_ir::descr::SimpleFieldDescrSpec {
-                index: stable_field_index(offset, field_size, field_type, signed),
+                index: u32::MAX,
                 field_key: field_key.to_string(),
                 name: field_display_name(simple_name, field_key),
                 offset,
@@ -2644,7 +2675,7 @@ fn mint_w_dict_int_alias(field_key: &str, display: &str, offset: usize) -> Descr
         false,
         false,
         runtime_array_flag(Type::Int, false),
-        stable_field_index(offset, WORD, Type::Int, false),
+        u32::MAX,
         false,
         None,
         false,
@@ -3896,19 +3927,13 @@ pub fn make_size_descr_with_type_and_vtable(
 /// (`rewrite.py:565,572`) emits the runtime length store after
 /// `CallMallocNurseryVarsize`.
 fn array_lendescr_at_offset(offset: usize) -> DescrRef {
-    Arc::new(PyreFieldDescr {
-        offset,
-        field_size: std::mem::size_of::<usize>(),
-        field_type: Type::Int,
-        signed: true,
-        immutable: false,
-        quasi_immutable: false,
-        name: "len",
-        is_class_word: false,
-        index_in_parent: 0,
-        parent_descr: None,
-        ei_index: AtomicU32::new(u32::MAX),
-    })
+    array_lendescr_at_offset_for(unique_anon_array_key(), offset)
+}
+
+fn array_lendescr_at_offset_for(array_key: u64, offset: usize) -> DescrRef {
+    majit_ir::descr::gc_cache()
+        .lock()
+        .get_field_arraylen_descr(majit_ir::descr::LLType::Array(array_key), offset)
 }
 
 /// Lift `Option<usize>` ↔ `Option<DescrRef>` so `make_array_descr*`
@@ -4680,6 +4705,7 @@ pub fn int_mutable_cell_value_descr() -> DescrRef {
         Type::Int,
         true,
         false,
+        false,
         INT_MUTABLE_CELL_VALUE_INDEX,
     )
 }
@@ -4717,11 +4743,17 @@ pub fn w_list_size_descr() -> DescrRef {
 /// `quasi_immut_cache` on `field_cache_identity`, which is the `Arc` pointer,
 /// so a per-call descriptor would miss its own cache on every read.
 static TYPE_VERSION_TAG_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
-    make_quasi_immutable_field_descr(
+    gc_cached_field_descr(
+        "typeobject::W_TypeObject",
+        "version_tag",
+        "W_TypeObject.version_tag",
         core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag),
         8,
         Type::Int,
         false,
+        false,
+        true,
+        u32::MAX,
     )
 });
 
@@ -4742,11 +4774,17 @@ pub fn type_version_tag_descr() -> DescrRef {
 /// per-call descriptor would miss its own cache on every read.  The size
 /// follows the same descriptor's: one pointer, from the target.
 static TYPE_NAME_OBJ_FIELD_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
-    make_quasi_immutable_field_descr(
+    gc_cached_field_descr(
+        "typeobject::W_TypeObject",
+        "w_name",
+        "W_TypeObject.w_name",
         core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, w_name),
         WORD,
         Type::Ref,
         false,
+        false,
+        true,
+        u32::MAX,
     )
 });
 
@@ -4772,9 +4810,8 @@ pub fn type_name_obj_descr() -> DescrRef {
 /// `QUASIIMMUT_FIELD` on this field. `_setitem_str_cell_known` (`celldict.py`)
 /// calls `mutated()` before every write that replaces the stored pointer.
 /// `is_immutable` / `is_quasi_immutable` match
-/// [`make_quasi_immutable_field_descr`]. Its `index` stays
-/// `stable_field_index` of the 8-byte Int so `state.rs quasi_immut_descr`
-/// still selects this slot.
+/// [`make_quasi_immutable_field_descr`]. Its HeapCache `index` is the
+/// interned `(STRUCT, fieldname)` identity.
 ///
 /// `caches` is `celldict.py ModuleDictStrategy.caches`. `heaptracker.py
 /// all_fielddescrs` walks every field of the STRUCT; the JIT never loads
@@ -4824,7 +4861,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             }
         };
         let mut specs = vec![field(
-            stable_field_index(version_offset, 8, Type::Int, false),
+            u32::MAX,
             "version",
             version_offset,
             8,
@@ -4846,7 +4883,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
                 format!("caches_{caches_word}")
             };
             specs.push(field(
-                stable_field_index(caches_offset_cur, field_size, Type::Int, false),
+                u32::MAX,
                 &key,
                 caches_offset_cur,
                 field_size,
@@ -4862,7 +4899,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             index_in_parent += 1;
         }
         specs.push(field(
-            stable_field_index(mutate_offset, WORD, Type::Ref, false),
+            u32::MAX,
             "mutate_version",
             mutate_offset,
             WORD,
@@ -4874,7 +4911,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
         ));
         index_in_parent += 1;
         specs.push(field(
-            stable_field_index(mutate_lock_offset, WORD, Type::Ref, false),
+            u32::MAX,
             "mutate_version_lock",
             mutate_lock_offset,
             WORD,
@@ -7116,7 +7153,8 @@ pub fn pyobject_ob_type_stable_descr() -> DescrRef {
         Type::Ref,
         false,
         false,
-        stable_field_index(pyre_object::pyobject::OB_TYPE_OFFSET, 8, Type::Ref, false),
+        false,
+        u32::MAX,
     )
 }
 
@@ -7130,7 +7168,8 @@ pub fn pyobject_w_class_stable_descr() -> DescrRef {
         Type::Ref,
         false,
         false,
-        stable_field_index(pyre_object::pyobject::W_CLASS_OFFSET, 8, Type::Ref, false),
+        false,
+        u32::MAX,
     )
 }
 
@@ -8795,25 +8834,29 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     profilefunc.is_quasi_immutable = true;
     let mut specs = vec![
         field(
-            0,
+            u32::MAX,
             "sys_exc_value",
             pyre_interpreter::EC_SYS_EXC_VALUE_OFFSET,
         ),
-        field(1, "topframeref", pyre_interpreter::EC_TOPFRAMEREF_OFFSET),
+        field(
+            u32::MAX,
+            "topframeref",
+            pyre_interpreter::EC_TOPFRAMEREF_OFFSET,
+        ),
         w_tracefunc,
         int_field(
-            3,
+            u32::MAX,
             "py_recursion_depth",
             pyre_interpreter::EC_PY_RECURSION_DEPTH_OFFSET,
         ),
         int_field(
-            4,
+            u32::MAX,
             "accounted_activation",
             pyre_interpreter::EC_ACCOUNTED_ACTIVATION_OFFSET,
         ),
         profilefunc,
         field(
-            6,
+            u32::MAX,
             "current_gen_or_coroutine",
             pyre_interpreter::EC_CURRENT_GEN_OR_COROUTINE_OFFSET,
         ),
@@ -8833,10 +8876,15 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     for (index_in_parent, spec) in specs.iter_mut().enumerate() {
         spec.index_in_parent = index_in_parent;
     }
-    majit_ir::descr::make_simple_descr_group_with_flags(
+    // `descr.py get_field_descr` caches `(STRUCT, fieldname)`. Never intern
+    // under STRUCT key 0 — that sentinel collapses every no-name group onto
+    // the first insert.
+    let cache_key = majit_ir::descr::path_hash("executioncontext::ExecutionContext");
+    let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         u32::MAX,
         pyre_interpreter::EC_SIZE,
         0,
+        cache_key,
         0,
         // is_gc_managed: no GC header, so no runtime type-id to guard on.
         false,
@@ -8844,7 +8892,13 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
         // `NEW` rewrite shape this flag selects is not reachable.
         false,
         &specs,
-    )
+        &[],
+    );
+    majit_ir::descr_registry::register_keyed_size(
+        majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("ExecutionContext")),
+        group.size_descr.clone() as majit_ir::DescrRef,
+    );
+    group
 });
 
 /// `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ = ['gil_ready?']`).
@@ -10549,8 +10603,29 @@ mod tests {
         let b = make_field_descr(8, 8, Type::Int, false);
         let c = make_field_descr(16, 8, Type::Int, false);
 
-        assert_eq!(a.index(), b.index());
+        // Anonymous factories mint a unique STRUCT per call, so two
+        // identical layouts intern distinct HeapCache ids.
+        assert_ne!(a.index(), b.index());
         assert_ne!(a.index(), c.index());
+        assert_ne!(b.index(), c.index());
+        assert!(
+            (FIELD_DESCR_TAG..ARRAY_DESCR_TAG).contains(&a.index())
+                && (FIELD_DESCR_TAG..ARRAY_DESCR_TAG).contains(&b.index())
+                && (FIELD_DESCR_TAG..ARRAY_DESCR_TAG).contains(&c.index())
+        );
+    }
+
+    #[test]
+    fn named_fields_with_shared_layout_intern_distinct_heapcache_indices() {
+        let w_f_trace = frame_debug_data_w_f_trace_descr();
+        let locals = pyframe_locals_cells_stack_descr();
+        let args_w = w_exception_descrs_for(ExcKind::BaseException, false).3;
+        assert_ne!(w_f_trace.index(), locals.index());
+        assert_ne!(w_f_trace.index(), args_w.index());
+        assert_ne!(locals.index(), args_w.index());
+        let can_change = function_can_change_code_descr();
+        let imag = complex_imag_descr();
+        assert_ne!(can_change.index(), imag.index());
     }
 
     #[test]
@@ -11081,7 +11156,7 @@ mod tests {
             ArrayFlag::Unsigned,
             Some(0),
         );
-        assert_eq!(data.index(), 0);
+        assert_ne!(data.index(), 0);
         assert_ne!(len.index(), 0);
         assert_ne!(data.index(), len.index());
 
@@ -11119,7 +11194,7 @@ mod tests {
             ArrayFlag::Unsigned,
             Some(0),
         );
-        assert_eq!(count.index(), 0);
+        assert_ne!(count.index(), 0);
 
         // `&dyn` data word `imp` and vtable word `imp.vtable` share one slot.
         // The vtable read must not reuse the data word's heapcache key.
@@ -11166,7 +11241,7 @@ mod tests {
             ArrayFlag::Pointer,
             Some(1),
         );
-        assert_eq!(imp.index(), 1);
+        assert_ne!(imp.index(), 0);
         assert_ne!(vtable.index(), imp.index());
         assert_eq!(vtable.as_field_descr().unwrap().offset(), 16);
     }
@@ -11240,7 +11315,7 @@ mod tests {
             Type::Int,
             ArrayFlag::Unsigned,
         );
-        assert_eq!(data.index(), 0);
+        assert_ne!(data.index(), 0);
         assert_ne!(len.index(), data.index());
 
         let dyn_parent = std::sync::Arc::new(BhSizeSpec {
@@ -11296,7 +11371,7 @@ mod tests {
             load_is_acquire: false,
         })
         .1;
-        assert_eq!(imp.index(), 1);
+        assert_ne!(imp.index(), 0);
         assert_ne!(vtable.index(), imp.index());
         assert_eq!(vtable.as_field_descr().unwrap().offset(), 16);
     }
@@ -12127,6 +12202,113 @@ mod tests {
         }
     }
 
+    /// A declared group that lists a subset still owns the STRUCT.
+    /// Packed leftover names intern through `get_field_descr` so an
+    /// EffectInfo member that names them resolves (`descr.py`).
+    #[test]
+    fn publish_kind0_parent_layout_interns_leftover_on_a_declared_subset() {
+        use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
+        use majit_ir::effectinfo::DescrSetMember;
+        use majit_jitcode::jitcode::{BhFieldSpec, BhSizeSpec};
+
+        let type_id = majit_ir::descr::path_hash("d1_leftover_probe::SubsetStruct");
+        let listed = SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: "listed".into(),
+            name: "SubsetStruct.listed".into(),
+            offset: 0,
+            field_size: 8,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Unsigned,
+            virtualizable: false,
+            is_class_word: Some(false),
+            index_in_parent: 0,
+            load_is_acquire: false,
+        };
+        let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            16,
+            0,
+            type_id,
+            0,
+            false,
+            true,
+            &[listed],
+            &[],
+        );
+        let listed_descr = group.field_descrs[0].clone();
+        let spec = BhSizeSpec {
+            size: 16,
+            type_id,
+            vtable: 0,
+            owner: "d1_leftover_probe::SubsetStruct".into(),
+            is_gc_managed: false,
+            headerless: true,
+            all_fielddescrs: vec![
+                BhFieldSpec {
+                    index: 0,
+                    field_key: "listed".into(),
+                    name: "SubsetStruct.listed".into(),
+                    offset: 0,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    field_flag: ArrayFlag::Unsigned,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                    load_is_acquire: false,
+                },
+                BhFieldSpec {
+                    index: 1,
+                    field_key: "leftover".into(),
+                    name: "SubsetStruct.leftover".into(),
+                    offset: 8,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    field_flag: ArrayFlag::Unsigned,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 1,
+                    is_class_word: Some(false),
+                    load_is_acquire: false,
+                },
+            ],
+        };
+        publish_kind0_parent_layout(spec);
+        let key = majit_ir::descr::LLType::Struct(type_id);
+        let leftover = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_field
+            .get(&key)
+            .and_then(|fields| fields.get("leftover"))
+            .cloned()
+            .expect("leftover packed field interned under the declared STRUCT");
+        let listed_after = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_field
+            .get(&key)
+            .and_then(|fields| fields.get("listed"))
+            .cloned()
+            .expect("listed field stays interned");
+        assert!(std::sync::Arc::ptr_eq(&listed_after, &listed_descr));
+        assert!(!std::sync::Arc::ptr_eq(&leftover, &listed_descr));
+        assert_ne!(leftover.index(), listed_descr.index());
+        let lookup = descr_from_set_member(&DescrSetMember::Field {
+            struct_id: type_id,
+            field_name: "leftover".into(),
+        });
+        let SetMemberLookup::Resolved(found) = lookup else {
+            panic!("leftover EffectInfo member did not resolve uniquely");
+        };
+        let leftover_ref: DescrRef = leftover;
+        assert!(std::sync::Arc::ptr_eq(&found, &leftover_ref));
+    }
+
     #[test]
     fn make_descr_from_bh_bridges_pyobject_w_class_to_the_walker_descr() {
         let canonical = w_class_descr();
@@ -12141,26 +12323,28 @@ mod tests {
         }
     }
 
-    /// …but only when the two spellings describe the same access. The canonical
-    /// descr hardcodes an 8-byte width while the codewriter sizes a pointer by
-    /// `target_word_size()`, so on a 32-bit target the incoming descr is a
-    /// narrower load at the same offset. Bridging there would widen the read
-    /// over the adjacent payload, so the mismatch declines instead.
+    /// `descr.py` `get_field_descr` is first-wins: a later request for
+    /// `(PyObject, w_class)` with a different width still receives the
+    /// cached descr. The special-case bridge declines on a width mismatch,
+    /// then intern hits that same Arc.
     #[test]
-    fn make_descr_from_bh_declines_w_class_bridge_on_a_width_mismatch() {
+    fn make_descr_from_bh_w_class_width_mismatch_keeps_interned_descr() {
         let canonical = w_class_descr();
         let narrower = W_CLASS_FIELD_DESCR.field_size() / 2;
+        let cached_width = canonical
+            .as_field_descr()
+            .expect("w_class descr")
+            .field_size();
 
         for owner in ["PyObject", "pyre_object::pyobject::PyObject"] {
             let descr = make_descr_from_bh(&w_class_bh(owner, narrower));
             assert!(
-                !std::sync::Arc::ptr_eq(&descr, &canonical),
-                "{owner}.w_class must not bridge to a descr of a different width",
+                std::sync::Arc::ptr_eq(&descr, &canonical),
+                "{owner}.w_class must keep the interned descr on a width mismatch",
             );
             assert_eq!(
                 descr.as_field_descr().map(|f| f.field_size()),
-                Some(narrower),
-                "the declined descr must keep the width the codewriter asked for",
+                Some(cached_width),
             );
         }
     }
@@ -12302,14 +12486,12 @@ mod tests {
         {
             assert_eq!(descr.index_in_parent(), i, "{}", descr.field_key());
         }
-        assert_eq!(
-            version.index(),
-            stable_field_index(
-                core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),
-                8,
-                Type::Int,
-                false,
-            ),
+        assert_ne!(version.index(), 0);
+        assert!(
+            (FIELD_DESCR_TAG..ARRAY_DESCR_TAG).contains(&version.index())
+                || (version.index() >> 24) >= 0x40,
+            "interned or reserved HeapCache id, got {:#x}",
+            version.index()
         );
         assert!(version.is_quasi_immutable());
         assert!(!version.is_always_pure());
@@ -13209,6 +13391,12 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("interp_exceptions::W_ExceptionExtendedUser", || {
         let _ = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
     }),
+    ("executioncontext::ExecutionContext", || {
+        LazyLock::force(&EC_DESCR_GROUP);
+    }),
+    ("ExecutionContext", || {
+        LazyLock::force(&EC_DESCR_GROUP);
+    }),
     ("gil_ready::GilReadyState", || {
         LazyLock::force(&GIL_READY_DESCR_GROUP);
     }),
@@ -13347,10 +13535,15 @@ fn published_declared_group(
     // FieldDescr objects inside a longer listed list and trip
     // `listed_fielddescrs` (`descr.py get_field_descr` is first-wins).
     // Skip packed names the runtime group did not mint; the SizeDescr walk
-    // stays the declared list.
+    // stays the declared list. Leftover names are interned into
+    // `_cache_field` by [`intern_packed_fields_into_gccache`].
     let mut field_descrs = Vec::with_capacity(spec.all_fielddescrs.len());
     for field in &spec.all_fielddescrs {
-        let Some(descr) = fields.get(field.field_key()) else {
+        let intern_key = packed_field_intern_key(field);
+        let Some(descr) = fields
+            .get(intern_key)
+            .or_else(|| fields.get(field.field_key()))
+        else {
             continue;
         };
         if let Some(is_class_word) = field.is_class_word {
@@ -13370,6 +13563,7 @@ fn simple_descr_group_from_bh_size(
     if spec.type_id != 0 {
         force_declared_group(spec.type_id);
         if let Some(group) = published_declared_group(spec) {
+            intern_packed_fields_into_gccache(spec);
             return group;
         }
     }
@@ -13380,25 +13574,25 @@ fn simple_descr_group_from_bh_size(
         .collect();
 
     if spec.type_id == 0 {
-        // No STRUCT-identity carrier — mint fresh per call so distinct
-        // type_id-less STRUCTs don't collapse onto the first-inserted
-        // descr group.  Per-STRUCT caching kicks in only when callers
-        // route through a real `type_id` source.
-        //
-        // The missing key says nothing about the STRUCT's shape, so carry
-        // `is_gc_managed`/`headerless` here exactly as the keyed arm below
-        // does.  `bh_size_spec_from_descr` (`majit-translate`) reads both
-        // straight off a descr while taking `type_id` from `cache_key()`, so
-        // a raw or header-less parent with no key reaches this arm; the
-        // defaulting factory would give it back a GC header it does not have.
-        return majit_ir::descr::make_simple_descr_group_with_flags(
+        // Never intern under STRUCT key 0. Prefer the serialized owner;
+        // fall back to the display-name prefix, then a unique spelling so
+        // empty-owner STRUCTs stay distinct.
+        let display = spec
+            .all_fielddescrs
+            .first()
+            .map(|f| f.name.as_str())
+            .unwrap_or("");
+        let (_, cache_key) = majit_ir::descr::struct_key_from_owner_or_name(&spec.owner, display);
+        return majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
             u32::MAX,
             spec.size,
             spec.type_id as u32,
+            cache_key,
             spec.vtable as usize,
             spec.is_gc_managed,
             spec.headerless,
             &field_specs,
+            &[],
         );
     }
     // The spec describes every field as plain mutable: the codewriter's
@@ -13600,15 +13794,69 @@ pub(crate) fn kind0_size_already_published(type_id: u64) -> bool {
     )
 }
 
+/// descr.py `get_field_descr` fieldname for a packed parent row.
+///
+/// The map key is the STRUCT-local name. A vacant `field_key` on the wire
+/// still carries the printable `STRUCT.field` display in `name`.
+fn packed_field_intern_key(field: &majit_jitcode::jitcode::BhFieldSpec) -> &str {
+    if !field.field_key.is_empty() {
+        field.field_key.as_str()
+    } else {
+        field.name.rsplit('.').next().unwrap_or(field.name.as_str())
+    }
+}
+
+/// `descr.py` `get_field_descr`: intern each packed field whose
+/// `(STRUCT, fieldname)` slot is still vacant.
+///
+/// A declared group can list a subset of `heaptracker.all_fielddescrs`.
+/// That listed ranking stays on the SizeDescr; leftover names still occupy
+/// `_cache_field` so an EffectInfo member that names them resolves.
+pub(crate) fn intern_packed_fields_into_gccache(spec: &majit_jitcode::jitcode::BhSizeSpec) {
+    if spec.type_id == 0 {
+        return;
+    }
+    let struct_key = majit_ir::descr::LLType::Struct(spec.type_id);
+    let mut gc = majit_ir::descr::gc_cache().lock();
+    for field in &spec.all_fielddescrs {
+        let intern_key = packed_field_intern_key(field);
+        let already = gc._cache_field.get(&struct_key).and_then(|inner| {
+            inner
+                .get(intern_key)
+                .or_else(|| inner.get(field.field_key()))
+        });
+        if already.is_some() {
+            continue;
+        }
+        let _ = gc.get_field_descr_declaring(
+            struct_key.clone(),
+            intern_key,
+            Some(field.name.as_str()),
+            field.offset,
+            field.field_size,
+            field.field_type,
+            field.is_immutable,
+            field.is_quasi_immutable,
+            field.field_flag,
+            u32::MAX,
+            false,
+            Some(field.index_in_parent),
+            field.is_class_word,
+            field.load_is_acquire,
+        );
+    }
+}
+
 pub(crate) fn publish_kind0_parent_layout(spec: majit_jitcode::jitcode::BhSizeSpec) {
     if spec.type_id == 0 {
         return;
     }
     // `descr.py` `get_field_descr` returns the cached row. A declared group
-    // already filled it; moving the serialized names into a second mint would
-    // allocate those strings again.
+    // already filled the listed fields; leftover packed names still have to
+    // occupy `_cache_field` (`get_field_descr` on a cache miss).
     force_declared_group(spec.type_id);
     if published_declared_group(&spec).is_some() {
+        intern_packed_fields_into_gccache(&spec);
         return;
     }
     let field_specs: Vec<_> = spec
@@ -13743,28 +13991,29 @@ fn field_descr_from_bh_field(
         }
     }
 
-    let mut descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
-        field.index,
-        field.offset,
-        field.field_size,
-        field.field_type,
-        field.is_immutable,
-        field.field_flag,
-        field.name.clone(),
-        field.field_key().to_string(),
-    )
-    .with_quasi_immutable(field.is_quasi_immutable)
-    .with_load_is_acquire(field.load_is_acquire);
-    // `new_with_name` seeded the answer from the display name; a spec that
-    // declared one replaces that guess. A spec that declared nothing leaves it.
-    if let Some(is_class_word) = field.is_class_word {
-        descr = descr.with_class_word(is_class_word);
-    }
-    let arc: DescrRef = Arc::new(descr);
-    // descr.py `get_field_descr` cache-miss path — register the
-    // freshly-minted field descr so `compute_bitstrings` enumerates it.
-    majit_ir::descr_registry::register_field(arc.clone());
-    arc
+    let owner = parent.map(|p| p.owner.as_str()).unwrap_or("");
+    let (struct_key, _) = majit_ir::descr::struct_key_from_owner_or_name(owner, &field.name);
+    // `get_field_descr` already stores the Arc in `_cache_field`, which
+    // `setup_descrs` walks. Do not call `register_field` while this guard
+    // is live: that helper locks `gc_cache` again.
+    majit_ir::descr::gc_cache()
+        .lock()
+        .get_field_descr_declaring(
+            struct_key,
+            field.field_key(),
+            Some(field.name.as_str()),
+            field.offset,
+            field.field_size,
+            field.field_type,
+            field.is_immutable,
+            field.is_quasi_immutable,
+            field.field_flag,
+            u32::MAX,
+            false,
+            claimed_index,
+            field.is_class_word,
+            field.load_is_acquire,
+        ) as DescrRef
 }
 
 /// Heapcache identity for one `BhDescr::Field` access.
@@ -13777,7 +14026,7 @@ fn field_descr_from_bh_field(
 /// vtable returns the data word.
 ///
 /// A suffixed part whose parent slot does not describe this access takes
-/// `stable_field_index` instead.  A part that still describes the slot keeps
+/// `u32::MAX` (interned at mint). A part that still describes the slot keeps
 /// the position, and so does every access that is not one of those parts.
 fn heapcache_index_for_field_access(
     index_in_parent: Option<usize>,
@@ -13786,7 +14035,7 @@ fn heapcache_index_for_field_access(
     offset: usize,
     field_size: usize,
     field_type: Type,
-    is_field_signed: bool,
+    _is_field_signed: bool,
 ) -> u32 {
     let slot_describes_access = match (index_in_parent, parent) {
         (Some(index), Some(parent_spec)) => {
@@ -13803,11 +14052,11 @@ fn heapcache_index_for_field_access(
         || name.ends_with(".buf")
         || name.ends_with(".vtable");
     if parent.is_some() && index_in_parent.is_some() && split_part && !slot_describes_access {
-        return stable_field_index(offset, field_size, field_type, is_field_signed);
+        return u32::MAX;
     }
     match index_in_parent {
         Some(index) => index as u32,
-        None => stable_field_index(offset, field_size, field_type, is_field_signed),
+        None => u32::MAX,
     }
 }
 

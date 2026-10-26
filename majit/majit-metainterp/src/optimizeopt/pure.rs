@@ -1491,6 +1491,7 @@ mod tests {
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;
+    use majit_ir::Descr;
     use majit_ir::OpRc;
     use majit_ir::Type;
     use majit_ir::descr::make_field_descr_full;
@@ -2938,6 +2939,68 @@ mod tests {
             })
             .collect();
         assert!(pure.is_empty());
+    }
+
+    #[test]
+    fn imported_short_pure_getfields_with_shared_layout_are_not_eq() {
+        // `ImportedShortPureOp` compares descrs by `Descr::index()`. A
+        // layout hash would collapse two getfields of different STRUCTs
+        // that share `(offset, size, Ref)`.
+        let mut gc = majit_ir::descr::GcCache::new();
+        let descr_a = gc.get_field_descr(
+            majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("PureA")),
+            "f",
+            Some("PureA.f"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        let descr_b = gc.get_field_descr(
+            majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("PureB")),
+            "f",
+            Some("PureB.f"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        assert_ne!(descr_a.index(), descr_b.index());
+        let mut ctx = OptContext::with_num_inputs(4, 0);
+        let box0 = ctx.materialize_operand_at(OpRef::ref_op(0));
+        let a = crate::optimizeopt::ImportedShortPureOp::new(
+            &mut ctx,
+            OpCode::GetfieldGcR,
+            Some(descr_a as majit_ir::DescrRef),
+            vec![box0.clone()],
+            OpRef::ref_op(1),
+            OpRef::ref_op(1),
+            false,
+            None,
+        );
+        let b = crate::optimizeopt::ImportedShortPureOp::new(
+            &mut ctx,
+            OpCode::GetfieldGcR,
+            Some(descr_b as majit_ir::DescrRef),
+            vec![box0],
+            OpRef::ref_op(1),
+            OpRef::ref_op(1),
+            false,
+            None,
+        );
+        assert_ne!(a, b);
     }
 
     #[test]

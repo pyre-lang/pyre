@@ -12,33 +12,19 @@ use indexmap::IndexSet;
 
 use majit_ir::{EffectInfo, ExtraEffect, GcRef, OpCode, OpRef, Type, Value};
 
-/// Value-equality predicate over constant OpRefs.  Mirrors
-/// `Const.same_constant` (history.py): two ConstInt/ConstFloat/
-/// ConstPtr instances are equal when they share the same subclass and
-/// underlying value, independent of Box identity.
-///
-/// The trait is defined here (not in `majit-ir`) because `majit-trace`
-/// is the lowest crate that needs the predicate (for the
-/// `_unique_const_heuristic` ConstPtr canonicalisation,
-/// heapcache.py) and the implementation lives in `majit-metainterp`
-/// (`history::ConstOprefOracle`).  `&dyn SameConstantOracle`
-/// keeps the heapcache layer agnostic of the oracle's representation.
 /// The `field_index` that stands for a descr no numberer ever reached.
 ///
 /// `heapcache.py get_field_updater(box, descr)` keys the per-box field
-/// cache on the descr object, so two fields of one struct can never share
-/// an entry.  Flattening that key to `Descr::index()` preserves the
-/// property only while the number is assigned: the unassigned answer is
-/// the `u32::MAX` sentinel (`descr.rs Descr::index`), a single key
-/// standing for every field of every struct.
+/// cache on the descr object. Flattening that key to `Descr::index()`
+/// holds only while each interned `(STRUCT, fieldname)` FieldDescr
+/// (`descr.py` `get_field_descr` / `gccache._cache_field[STRUCT][fieldname]`)
+/// carries one number: `_clear_cache_on_write` (heapcache.py) clears the
+/// whole CacheEntry for that key, so two STRUCTs that shared a layout
+/// hash used to evict each other's cached getfields.
 ///
-/// Distinct structs colliding here is harmless — an entry is read back
-/// per box, and a box belongs to one struct.  What the flattening cannot
-/// express is *this* case: one box's own fields, which reach the cache
-/// with distinct offsets and so distinct numbers everywhere the number
-/// exists, all aliasing onto one entry when it does not.  Decline the
-/// sentinel rather than let a store under it answer a load of a
-/// different field.
+/// One number per interned `(STRUCT, fieldname)`. `u32::MAX` is the
+/// unassigned sentinel (`Descr::index`); decline it rather than let
+/// every unnumbered field of every struct alias onto one entry.
 const UNNUMBERED_FIELD: u32 = u32::MAX;
 
 /// Field-cache operations declined because the descr carried
@@ -73,6 +59,17 @@ fn declines_unnumbered_field(field_index: u32) -> bool {
     unnumbered
 }
 
+/// Value-equality predicate over constant OpRefs.  Mirrors
+/// `Const.same_constant` (history.py): two ConstInt/ConstFloat/
+/// ConstPtr instances are equal when they share the same subclass and
+/// underlying value, independent of Box identity.
+///
+/// The trait is defined here (not in `majit-ir`) because `majit-trace`
+/// is the lowest crate that needs the predicate (for the
+/// `_unique_const_heuristic` ConstPtr canonicalisation,
+/// heapcache.py) and the implementation lives in `majit-metainterp`
+/// (`history::ConstOprefOracle`).  `&dyn SameConstantOracle`
+/// keeps the heapcache layer agnostic of the oracle's representation.
 pub trait SameConstantOracle {
     fn same_constant(&self, a: OpRef, b: OpRef) -> bool;
 }
@@ -2552,6 +2549,7 @@ impl HeapcBoxes for TestHeapcBoxes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::Descr;
 
     struct Fixture {
         cache: HeapCache,
@@ -2719,6 +2717,59 @@ mod tests {
             Some(OpRef::ref_op(30))
         );
         assert_eq!(cache.getfield_cached(obj_b, field, IDENTITY_ORACLE), None); // invalidated
+    }
+
+    /// Two STRUCTs sharing `(offset, size, Ref)` intern distinct HeapCache
+    /// keys. `do_write_with_aliasing` / `_clear_cache_on_write` clears the
+    /// whole CacheEntry for the written key; a shared layout hash used to
+    /// evict the other STRUCT's cached getfield.
+    #[test]
+    fn setfield_on_one_struct_does_not_clear_same_layout_field_of_another() {
+        let mut gc = majit_ir::descr::GcCache::new();
+        let descr_a = gc.get_field_descr(
+            majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("HeapA")),
+            "f",
+            Some("HeapA.f"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        let descr_b = gc.get_field_descr(
+            majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("HeapB")),
+            "f",
+            Some("HeapB.f"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            majit_ir::descr::ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        assert_ne!(descr_a.index(), descr_b.index());
+
+        let mut fx = Fixture::new();
+        let mut cache = fx.view();
+        let box_x = OpRef::ref_op(0);
+        let box_y = OpRef::ref_op(1);
+        let val_b = OpRef::ref_op(20);
+        cache.getfield_now_known(box_y, descr_b.index(), val_b, IDENTITY_ORACLE);
+        cache.setfield_cached(box_x, descr_a.index(), OpRef::ref_op(30), IDENTITY_ORACLE);
+        assert_eq!(
+            cache.getfield_cached(box_y, descr_b.index(), IDENTITY_ORACLE),
+            Some(val_b),
+            "a write of field A must not clear the CacheEntry of field B"
+        );
     }
 
     /// heapcache.py `_clear_cache_on_write(seen_alloc)`.  When the

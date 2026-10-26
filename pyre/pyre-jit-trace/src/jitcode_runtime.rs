@@ -2039,6 +2039,26 @@ fn publish_kind0_field(struct_id: u64, field_name: &str) {
         }
         let _ = crate::descr::make_descr_from_bh(&bh);
     }
+    intern_leftover_packed_field(struct_id, field_name);
+}
+
+/// Packed parent `all_fielddescrs` is `heaptracker.all_fielddescrs`. A
+/// leftover field named only by EffectInfo still lives there when no
+/// opcode Field slot carries it.
+fn intern_leftover_packed_field(struct_id: u64, _field_name: &str) {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let mut rest: &[u8] = BYTES;
+    while !rest.is_empty() {
+        let (type_id, _) = majit_jitcode::jitcode::BhSizeSpec::peek_header(rest);
+        if type_id != struct_id {
+            let consumed = majit_jitcode::jitcode::BhSizeSpec::skip_record(rest);
+            rest = &rest[consumed..];
+            continue;
+        }
+        let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(rest);
+        rest = &rest[consumed..];
+        crate::descr::intern_packed_fields_into_gccache(&spec);
+    }
 }
 
 pub fn rehydrate_build_descr_raw_sets() {

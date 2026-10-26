@@ -5151,10 +5151,9 @@ impl CallControl {
     ///      descr.py so the bare match uses suffix `.field_name`
     ///      OR exact `field_name` (the latter covers SimpleFieldDescr
     ///      mints that store the bare name).
-    ///   3. Found → return that trait-obj Arc with `set_index(idx)`
-    ///      applied (no-op on PyreFieldDescr — fd.index() is the
-    ///      deterministic `stable_field_index` carried through
-    ///      BhDescr structural fields, not via the atomic).
+    ///   3. Found → return that trait-obj Arc. The analyzer sequential
+    ///      `field_index` is a serialization handle on `BhFieldSpec` only;
+    ///      it must not `set_index` the HeapCache identity on the runtime Arc.
     ///   4. Miss → fall through to
     ///      `gc_cache.get_field_descr(struct_key, ...)` mint —
     ///      analyzer-only path; runtime convergence skipped for
@@ -5162,7 +5161,7 @@ impl CallControl {
     ///      runtime `build_object_descr_group` publish).
     fn fielddescrof_concrete(
         &self,
-        idx: u32,
+        _idx: u32,
         owner_root: &str,
         owner_id: Option<majit_ir::descr::StructId>,
         field_name: &str,
@@ -5253,15 +5252,10 @@ impl CallControl {
         // `cpu.fielddescrof(STRUCT, fieldname)` per-tuple
         // object identity.
         //
-        // After the cache-or-mint resolves, stamp the
-        // analyzer's per-trace `idx` (from
-        // `descr_indices.field_index`) onto the descr via
-        // `set_index` so trace serialization round-trips on
-        // the analyzer's id (`pyre-jit-trace::state` line
-        // 5879/5933 matches by `fd.index() == field_idx`).
-        // The atomic write is benign on cache hit — analyzer
-        // is the sole writer of this slot (the macro path
-        // discards the return).
+        // The analyzer sequential `field_index` lives on
+        // `BhFieldSpec` only. Do not `set_index` that handle
+        // onto the runtime Arc: `Descr::index()` is the interned
+        // HeapCache identity of `(STRUCT, fieldname)`.
         //
         // `descr.py is_immutable = STRUCT._immutable_field(
         // fieldname)` parity: consult
@@ -5353,7 +5347,6 @@ impl CallControl {
             struct_id,
             field_name: field_name.to_string(),
         };
-        use majit_ir::descr::Descr;
         let size_descr_arc = {
             let mut gc = majit_ir::descr::gc_cache().lock();
             gc.get_size_descr(struct_key.clone(), struct_size, 0, false)
@@ -5375,7 +5368,6 @@ impl CallControl {
             for fd in sd.all_fielddescrs() {
                 let stored = fd.field_name();
                 if stored == field_name || stored.ends_with(&needle) {
-                    fd.set_index(idx);
                     // This slot is filled in *this* process; the
                     // runtime's own cache is a different one, so the
                     // layout still has to travel. Read it back off the
@@ -5440,7 +5432,6 @@ impl CallControl {
             Some(index_in_parent),
             false,
         );
-        descr.set_index(idx);
         // Same arguments this `get_field_descr` miss just used, kept so
         // the runtime's own cache can take the same miss branch
         // (`descr.py`) instead of finding an empty slot.
@@ -12835,7 +12826,7 @@ fn effect_array_ir_type(item_ty: &crate::model::ValueType) -> majit_ir::value::T
     }
 }
 
-fn replay_fielddescrof_hit(cc: &CallControl, hit: &FieldDescrofMemoEntry, idx: u32) {
+fn replay_fielddescrof_hit(cc: &CallControl, hit: &FieldDescrofMemoEntry, _idx: u32) {
     let n = hit.sized_structs.len();
     // The owner's `compute_struct_size` is the last logged call, and it
     // runs after the owner-id miss record. Nested sizes run before that.
@@ -12858,9 +12849,6 @@ fn replay_fielddescrof_hit(cc: &CallControl, hit: &FieldDescrofMemoEntry, idx: u
     }
     if let Some((member, spec)) = &hit.mint {
         majit_ir::descr::record_ei_descr_mint(member.clone(), spec.clone());
-    }
-    if let Some((descr, _)) = &hit.result {
-        descr.set_index(idx);
     }
 }
 

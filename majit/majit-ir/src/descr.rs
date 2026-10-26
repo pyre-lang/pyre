@@ -114,7 +114,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use crate::OpRef;
 use crate::effectinfo::{DescrMintEntry, DescrMintSpec, DescrSetMember};
@@ -1125,6 +1125,17 @@ impl LLType {
 
 static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000);
 
+/// HeapCache identity of a FIELD descr interned at `descr.py`
+/// `get_field_descr` (`gccache._cache_field[STRUCT][fieldname]`). Sequential
+/// in `0x1000_0000 ..= 0x1FFF_FFFF`. Disjoint from ARRAY (`0x2xxx_xxxx`),
+/// SIZE (`0x3xxx_xxxx`), call descrs (`next_call_descr_heapcache_index` from
+/// 1_000_000_000), `object.typeptr` (`0x6000_0000`), GC tid (`0x7000_0000`),
+/// reserved owner tags (`0x40` / `0x50`–`0x57` / `0x61` high bytes),
+/// FailDescr / TargetToken small integers, and `u32::MAX`.
+const FIELD_HEAPCACHE_INDEX_MIN: u32 = 0x1000_0000;
+const FIELD_HEAPCACHE_INDEX_MAX: u32 = 0x1FFF_FFFF;
+static NEXT_FIELD_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(FIELD_HEAPCACHE_INDEX_MIN);
+
 /// Stable per-descr identity used as a heapcache key.
 ///
 /// Call descrs use it for loop-invariant slots; field and array descrs
@@ -1137,6 +1148,72 @@ static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000
 /// guarantees.
 pub fn next_call_descr_heapcache_index() -> u32 {
     NEXT_CALL_DESCR_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Next interned HeapCache identity for one `(STRUCT, fieldname)` FieldDescr.
+pub fn next_field_heapcache_index() -> u32 {
+    let idx = NEXT_FIELD_HEAPCACHE_INDEX.fetch_add(1, Ordering::Relaxed);
+    assert!(
+        (FIELD_HEAPCACHE_INDEX_MIN..=FIELD_HEAPCACHE_INDEX_MAX).contains(&idx),
+        "FIELD heapcache intern exhausted 0x1000_0000..=0x1FFF_FFFF"
+    );
+    idx
+}
+
+/// Reserved owner-identity tags (CELL / MAPDICT / PROPERTY / WRAPPER /
+/// CELL_FAMILY / EC / OBJECT_W_CLASS / GIL_READY / PYCODE / typeptr /
+/// NATIVE_MAPDICT / tid). A vacant `get_field_descr` insert keeps these;
+/// every other requested number — including leftover layout hashes in
+/// `0x1xxxxxxx` — is replaced by [`next_field_heapcache_index`].
+pub fn is_reserved_field_heapcache_index(index: u32) -> bool {
+    matches!(
+        (index >> 24) as u8,
+        0x40 | 0x50 | 0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56 | 0x57 | 0x60 | 0x61 | 0x70
+    )
+}
+
+/// HeapCache number stored on a newly minted FieldDescr.
+///
+/// `descr.py` `get_field_descr` returns one object per `(STRUCT, fieldname)`;
+/// flattening that object to `Descr::index()` for `HeapCache` needs one
+/// number per interned Arc. Reserved tags stay so `quasi_immut_descr` still
+/// matches them (D2 rewrites that dispatch).
+pub fn intern_field_heapcache_index(requested: u32) -> u32 {
+    if is_reserved_field_heapcache_index(requested) {
+        requested
+    } else {
+        next_field_heapcache_index()
+    }
+}
+
+/// STRUCT identity for a field that arrived without a collector tid.
+///
+/// `owner` is `BhSizeSpec.owner`; empty falls back to the display-name
+/// prefix before the last `.` (`STRUCT.field`). A bare field name is not
+/// a STRUCT: two type-id-less parents that share `"x"` stay distinct.
+/// Never returns `LLType::Struct(0)`.
+pub fn struct_key_from_owner_or_name(owner: &str, display_name: &str) -> (LLType, u64) {
+    let spelling = if !owner.is_empty() {
+        owner
+    } else if let Some((prefix, _)) = display_name.rsplit_once('.') {
+        prefix
+    } else {
+        ""
+    };
+    let key = if spelling.is_empty() {
+        static NEXT: AtomicU64 = AtomicU64::new(1);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        path_hash(&format!("__anon_field_struct_{n}"))
+    } else {
+        let hashed = path_hash(spelling);
+        if hashed == 0 {
+            path_hash(&format!("__nonzero_{spelling}"))
+        } else {
+            hashed
+        }
+    };
+    debug_assert!(key != 0, "STRUCT intern key must not be 0");
+    (LLType::Struct(key), key)
 }
 
 /// Replace the unassigned `Descr::index()` sentinel with a unique identity.
@@ -2698,6 +2775,10 @@ impl GcCache {
         declared_class_word: Option<bool>,
         load_is_acquire: bool,
     ) -> Arc<SimpleFieldDescr> {
+        debug_assert!(
+            !matches!(struct_key, LLType::Struct(0) | LLType::Array(0)),
+            "get_field_descr must not intern under STRUCT/ARRAY key 0"
+        );
         // descr.py: parent_descr = get_size_descr(gccache, STRUCT, vtable)
         let parent = self._cache_size.get(&struct_key).cloned();
         // descr.py get_field_descr: cache[STRUCT][fieldname]. First insert
@@ -2959,8 +3040,16 @@ impl GcCache {
         declared_class_word: Option<bool>,
         load_is_acquire: bool,
     ) -> Arc<SimpleFieldDescr> {
+        debug_assert!(
+            !matches!(struct_key, LLType::Struct(0) | LLType::Array(0)),
+            "get_field_descr must not intern under STRUCT/ARRAY key 0"
+        );
+        // `descr.py` `get_field_descr` returns one FieldDescr object;
+        // `HeapCache.get_field_updater` keys on that object. Vacant insert
+        // assigns one HeapCache number; a cache hit above leaves it unchanged.
+        let interned = intern_field_heapcache_index(index);
         let mut fd = SimpleFieldDescr::new_with_name(
-            index,
+            interned,
             offset,
             field_size,
             field_type,
@@ -3104,11 +3193,16 @@ impl GcCache {
         if let Some(descr) = self._cache_arraylen.get(&key) {
             return descr.clone();
         }
+        debug_assert!(
+            !matches!(key, LLType::Struct(0) | LLType::Array(0)),
+            "get_field_arraylen_descr must not intern under ARRAY key 0"
+        );
         // descr.py:263: size = symbolic.get_size(lltype.Signed, tsc)
         let word_size = std::mem::size_of::<usize>();
         // descr.py: FieldDescr("len", ofs, size, get_type_flag(lltype.Signed))
+        let interned = intern_field_heapcache_index(u32::MAX);
         let descr: DescrRef = Arc::new(SimpleFieldDescr::new_with_name(
-            u32::MAX,
+            interned,
             length_offset,
             word_size,
             Type::Int,
@@ -7599,6 +7693,16 @@ pub fn make_simple_descr_group_keyed_with_inlined_parent(
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
     inlined_parent: &[Arc<SimpleFieldDescr>],
 ) -> SimpleDescrGroup {
+    debug_assert!(
+        cache_key != 0,
+        "get_field_descr must not intern under STRUCT key 0"
+    );
+    let cache_key = if cache_key == 0 {
+        let display = field_specs.first().map(|s| s.name.as_str()).unwrap_or("");
+        struct_key_from_owner_or_name("", display).1
+    } else {
+        cache_key
+    };
     let struct_key = LLType::struct_key(cache_key);
     // Before `get_field_descr` below can normalise anything: the producer's own
     // `index_in_parent` against the position it hands the field in.
@@ -8071,7 +8175,7 @@ fn make_simple_descr_group_inner(
             .map(|spec| {
                 let field_key_start = field_key_start(&spec.name, &spec.field_key);
                 Arc::new(SimpleFieldDescr {
-                    index: AtomicU32::new(heapcache_index_value(spec.index)),
+                    index: AtomicU32::new(intern_field_heapcache_index(spec.index)),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
                     name: Cow::Owned(spec.name.clone()),
@@ -10305,6 +10409,111 @@ mod register_keyed_size_authority_tests {
             false,
         );
         assert!(std::sync::Arc::ptr_eq(&first, &third));
+    }
+
+    /// `descr.py` `get_field_descr` returns one FieldDescr per
+    /// `(STRUCT, fieldname)`. The HeapCache number is that interned identity.
+    #[test]
+    fn get_field_descr_declaring_interns_once_per_struct_field() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(path_hash("InternOnce"));
+        let first = gc.get_field_descr(
+            key.clone(),
+            "x",
+            Some("InternOnce.x"),
+            8,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        let second = gc.get_field_descr(
+            key,
+            "x",
+            Some("InternOnce.x"),
+            8,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "cache[STRUCT][fieldname] is one Arc"
+        );
+        assert_eq!(first.index(), second.index());
+        assert!(
+            (FIELD_HEAPCACHE_INDEX_MIN..=FIELD_HEAPCACHE_INDEX_MAX).contains(&first.index()),
+            "interned FIELD HeapCache id, got {:#x}",
+            first.index()
+        );
+    }
+
+    /// A bare field name is not a STRUCT. Two type-id-less parents that
+    /// share `"x"` must not intern under one `_cache_size` slot.
+    #[test]
+    fn empty_owner_bare_field_name_does_not_share_a_struct_key() {
+        let a = struct_key_from_owner_or_name("", "x");
+        let b = struct_key_from_owner_or_name("", "x");
+        assert_ne!(a.1, 0);
+        assert_ne!(a.1, b.1);
+        let named = struct_key_from_owner_or_name("", "HeapA.f");
+        let again = struct_key_from_owner_or_name("", "HeapA.f");
+        assert_eq!(named.1, again.1);
+        assert_ne!(named.1, 0);
+        let owned = struct_key_from_owner_or_name("HeapA", "x");
+        assert_eq!(owned.1, named.1);
+    }
+
+    /// Two STRUCTs sharing `(offset, size, Ref)` must not share a HeapCache key.
+    #[test]
+    fn two_structs_same_layout_get_distinct_heapcache_indices() {
+        let mut gc = GcCache::new();
+        let a = gc.get_field_descr(
+            LLType::Struct(path_hash("StructA")),
+            "f",
+            Some("StructA.f"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        let b = gc.get_field_descr(
+            LLType::Struct(path_hash("StructB")),
+            "f",
+            Some("StructB.f"),
+            24,
+            8,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            u32::MAX,
+            false,
+            Some(0),
+            false,
+        );
+        assert_ne!(a.index(), b.index());
+        assert!(
+            (FIELD_HEAPCACHE_INDEX_MIN..=FIELD_HEAPCACHE_INDEX_MAX).contains(&a.index())
+                && (FIELD_HEAPCACHE_INDEX_MIN..=FIELD_HEAPCACHE_INDEX_MAX).contains(&b.index())
+        );
     }
 
     /// A listed parent row is adopted only when `cache[STRUCT][fieldname]`
