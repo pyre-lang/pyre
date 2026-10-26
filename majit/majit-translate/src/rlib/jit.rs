@@ -24,6 +24,7 @@
 //! recognize that public path today, while this crate owns the
 //! translator-only extregistry half.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -359,7 +360,8 @@ pub enum LookInsidePred {
 /// `specialize:call_location`, mints `<name>_trampoline` (`dont_look_inside`,
 /// `specialize:call_location`) and `<name>_look_inside_iff`
 /// (`if not we_are_jitted() or predicate(*args): return func(*args) else: return trampoline(*args)`).
-/// Returns the wrapper.
+/// Moves `func.oopspec` onto the trampoline (`trampoline.oopspec = func.oopspec;
+/// del func.oopspec`). Returns the wrapper.
 pub fn mint_look_inside_iff(
     rtyper: &RPythonTyper,
     name: &str,
@@ -378,26 +380,35 @@ pub fn mint_look_inside_iff(
     }
 
     let orig_name = name.to_string();
-    let orig = rtyper.lowlevel_helper_function_with_builder(
-        orig_name.clone(),
-        args.clone(),
-        result.clone(),
-        move |_r, _a, _res| {
-            let mut pygraph = orig_builder(&orig_name)?;
-            pygraph.func._jit_unroll_safe_ = true;
-            pygraph.func.annspecialcase = Some("specialize:call_location".to_string());
-            {
-                let mut inner = pygraph.graph.borrow_mut();
-                if let Some(func) = inner.func.as_mut() {
-                    func._jit_unroll_safe_ = true;
-                    func.annspecialcase = Some("specialize:call_location".to_string());
-                } else {
-                    inner.func = Some(pygraph.func.clone());
+    let moved_oopspec = Rc::new(RefCell::new(None::<String>));
+    let orig = {
+        let moved_oopspec = moved_oopspec.clone();
+        rtyper.lowlevel_helper_function_with_builder(
+            orig_name.clone(),
+            args.clone(),
+            result.clone(),
+            move |_r, _a, _res| {
+                let mut pygraph = orig_builder(&orig_name)?;
+                pygraph.func._jit_unroll_safe_ = true;
+                pygraph.func.annspecialcase = Some("specialize:call_location".to_string());
+                // `rlib/jit.py look_inside_iff`: `trampoline.oopspec = func.oopspec; del func.oopspec`.
+                let oopspec = pygraph.func.oopspec.take();
+                *moved_oopspec.borrow_mut() = oopspec;
+                {
+                    let mut inner = pygraph.graph.borrow_mut();
+                    if let Some(func) = inner.func.as_mut() {
+                        func._jit_unroll_safe_ = true;
+                        func.annspecialcase = Some("specialize:call_location".to_string());
+                        func.oopspec = None;
+                    } else {
+                        inner.func = Some(pygraph.func.clone());
+                    }
                 }
-            }
-            Ok(pygraph)
-        },
-    )?;
+                Ok(pygraph)
+            },
+        )?
+    };
+    let trampoline_oopspec = moved_oopspec.borrow().clone();
 
     let trampoline_name = format!("{name}_trampoline");
     let orig_fn = sub_helper_funcptr_constant(rtyper, &orig)?;
@@ -407,6 +418,7 @@ pub fn mint_look_inside_iff(
         let args_owned = args.clone();
         let result_owned = result.clone();
         let orig_fn = orig_fn.clone();
+        let trampoline_oopspec = trampoline_oopspec.clone();
         rtyper.lowlevel_helper_function_with_builder(
             trampoline_name.clone(),
             args.clone(),
@@ -419,6 +431,7 @@ pub fn mint_look_inside_iff(
                     &args_owned,
                     &result_owned,
                     orig_fn.clone(),
+                    trampoline_oopspec.clone(),
                 )
             },
         )?
@@ -539,13 +552,15 @@ fn build_direct_call_return_block(
 }
 
 /// `look_inside_iff`'s `@dont_look_inside` trampoline: one `direct_call`
-/// of the original (`rlib/jit.py` `look_inside_iff`).
+/// of the original (`rlib/jit.py` `look_inside_iff`). `oopspec` is the
+/// spec moved off orig (`trampoline.oopspec = func.oopspec`).
 fn build_look_inside_iff_trampoline_graph(
     name: &str,
     argnames: &[&str],
     args: &[LowLevelType],
     result: &LowLevelType,
     orig_fn: Constant,
+    oopspec: Option<String>,
 ) -> Result<PyGraph, TyperError> {
     let vars = look_inside_arg_vars(argnames, args);
     let startblock = Block::shared(hl_vars(&vars));
@@ -588,6 +603,7 @@ fn build_look_inside_iff_trampoline_graph(
     );
     func._jit_look_inside_ = Some(false);
     func.annspecialcase = Some("specialize:call_location".to_string());
+    func.oopspec = oopspec;
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -777,7 +793,14 @@ mod tests {
             &["x"],
             vec![LowLevelType::Signed],
             LowLevelType::Void,
-            |name| trivial_void_builder(name, LowLevelType::Signed),
+            |name| {
+                let mut py = trivial_void_builder(name, LowLevelType::Signed)?;
+                py.func.oopspec = Some("test.oopspec(x)".to_string());
+                if let Some(func) = py.graph.borrow_mut().func.as_mut() {
+                    func.oopspec = Some("test.oopspec(x)".to_string());
+                }
+                Ok(py)
+            },
             &[LookInsidePred::IsVirtual(0), LookInsidePred::IsConstant(0)],
         )
         .expect("mint_look_inside_iff");
@@ -813,6 +836,15 @@ mod tests {
             tramp_func.annspecialcase.as_deref(),
             Some("specialize:call_location")
         );
+        assert_eq!(
+            orig_func.oopspec, None,
+            "look_inside_iff deletes orig oopspec (`rlib/jit.py look_inside_iff`)"
+        );
+        assert_eq!(
+            tramp_func.oopspec.as_deref(),
+            Some("test.oopspec(x)"),
+            "look_inside_iff moves oopspec onto the trampoline"
+        );
 
         let wrap_func = wrapper
             .graph
@@ -821,6 +853,7 @@ mod tests {
             .func
             .clone();
         assert_eq!(wrap_func.annspecialcase, None);
+        assert_eq!(wrap_func.oopspec, None);
         assert_eq!(wrap_func.name, "ll_dummy_look_inside_look_inside_iff");
 
         let startblock = wrapper_graph.borrow().startblock.clone();

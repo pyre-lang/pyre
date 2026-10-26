@@ -6185,6 +6185,10 @@ pub(crate) fn effect_graph_from_search_helper(graph: &FunctionGraph) -> ModelGra
         if func._jit_unroll_safe_ {
             out.func.unroll_safe = true;
         }
+        out.func.oopspec = func.oopspec.clone();
+        if func.oopspec.is_some() {
+            out.func.oopspec_argnames = startblock_oopspec_argnames(graph);
+        }
     }
     if out
         .block(out.returnblock)
@@ -6195,6 +6199,30 @@ pub(crate) fn effect_graph_from_search_helper(graph: &FunctionGraph) -> ModelGra
         out.return_type = Some("i64".into());
     }
     out
+}
+
+/// Bare startblock inputarg names for `FuncEffects.oopspec_argnames`.
+/// Same source as `OpKind::Input { name }` (`Variable::name_prefix` when
+/// renamed); strip the intern trailing `_` so the names match harvested
+/// `#[oopspec]` argnames (no numbering suffix).
+fn startblock_oopspec_argnames(graph: &FunctionGraph) -> Vec<String> {
+    graph
+        .startblock
+        .borrow()
+        .inputargs
+        .iter()
+        .filter_map(|hlv| match hlv {
+            Hlvalue::Variable(v) => {
+                let name = if v.renamed() {
+                    v.name_prefix()
+                } else {
+                    "arg".to_string()
+                };
+                Some(name.strip_suffix('_').unwrap_or(&name).to_string())
+            }
+            Hlvalue::Constant(_) => None,
+        })
+        .collect()
 }
 
 fn search_value_type_of(var: &Variable) -> ValueType {

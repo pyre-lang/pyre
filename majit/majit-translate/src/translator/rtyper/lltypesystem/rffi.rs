@@ -1071,6 +1071,8 @@ fn build_copy_string_to_raw_helper_graph(name: &str) -> Result<PyGraph, TyperErr
         Constant::new(ConstValue::Dict(Default::default())),
     );
     func._always_inline_ = AlwaysInline::True;
+    // `rstr.py copy_string_to_raw`: `@jit.oopspec('stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)')`.
+    func.oopspec = Some("stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,

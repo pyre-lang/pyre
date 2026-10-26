@@ -4846,6 +4846,11 @@ pub struct GraphFunc {
     /// it to pick `EF_ELIDABLE_*`. `false` mirrors the "attribute absent"
     /// default (`getattr(func, '_elidable_function_', False)`).
     pub _elidable_function_: bool,
+    /// Upstream `func.oopspec` set by `rlib/jit.py oopspec`. `None`
+    /// mirrors the attribute-absent case (`hasattr(func, 'oopspec')`
+    /// is false). `look_inside_iff` moves this onto the trampoline
+    /// (`trampoline.oopspec = func.oopspec; del func.oopspec`).
+    pub oopspec: Option<String>,
     /// Upstream function attribute consulted by
     /// `description.py:222-224`.
     ///
@@ -4986,6 +4991,7 @@ impl GraphFunc {
             _jit_unroll_safe_: false,
             _jit_llop_: None,
             _elidable_function_: false,
+            oopspec: None,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
             _always_inline_: AlwaysInline::Absent,

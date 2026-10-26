@@ -260,9 +260,37 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
         if let Some(look) = func._jit_look_inside_ {
             out.func.jit_look_inside = Some(look);
         }
+        out.func.oopspec = func.oopspec.clone();
+        if func.oopspec.is_some() {
+            out.func.oopspec_argnames = startblock_oopspec_argnames(graph);
+        }
     }
 
     out
+}
+
+/// Bare startblock inputarg names for `FuncEffects.oopspec_argnames`.
+/// Same source as `effect_graph_from_rtyped_helper`'s `OpKind::Input { name }`
+/// (`Variable::name_prefix` when renamed); strip the intern trailing `_`
+/// so the names match harvested `#[oopspec]` argnames (no numbering suffix).
+fn startblock_oopspec_argnames(graph: &FlowGraph) -> Vec<String> {
+    graph
+        .startblock
+        .borrow()
+        .inputargs
+        .iter()
+        .filter_map(|hlv| match hlv {
+            Hlvalue::Variable(v) => {
+                let name = if v.renamed() {
+                    v.name_prefix()
+                } else {
+                    "arg".to_string()
+                };
+                Some(name.strip_suffix('_').unwrap_or(&name).to_string())
+            }
+            Hlvalue::Constant(_) => None,
+        })
+        .collect()
 }
 
 /// Transduce a single flowspace `SpaceOperation` into the model graph at

@@ -603,6 +603,7 @@ fn close_keyeq_found_or_paranoia(
     key_lltype: &LowLevelType,
     eq_op: &str,
     paranoia: bool,
+    t_const: Hlvalue,
 ) {
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let bool_true = || constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
@@ -860,7 +861,13 @@ fn close_keyeq_found_or_paranoia(
     let pe_cont = hl_vars(&pe_map);
     block_para_entries.closeblock(vec![
         Link::new(
-            vec![var(&pe_d), var(&pe_key), var(&pe_hash), var(&pe_sf)],
+            vec![
+                var(&pe_d),
+                var(&pe_key),
+                var(&pe_hash),
+                var(&pe_sf),
+                t_const.clone(),
+            ],
             Some(startblock.clone()),
             Some(bool_true()),
         )
@@ -898,7 +905,13 @@ fn close_keyeq_found_or_paranoia(
     let pi_cont = hl_vars(&pi_map);
     block_para_indexes.closeblock(vec![
         Link::new(
-            vec![var(&pi_d), var(&pi_key), var(&pi_hash), var(&pi_sf)],
+            vec![
+                var(&pi_d),
+                var(&pi_key),
+                var(&pi_hash),
+                var(&pi_sf),
+                t_const.clone(),
+            ],
             Some(startblock.clone()),
             Some(bool_true()),
         )
@@ -924,7 +937,13 @@ fn close_keyeq_found_or_paranoia(
     let pv_cont = hl_vars(&pv_map);
     block_para_valid.closeblock(vec![
         Link::new(
-            vec![var(&pv_d), var(&pv_key), var(&pv_hash), var(&pv_sf)],
+            vec![
+                var(&pv_d),
+                var(&pv_key),
+                var(&pv_hash),
+                var(&pv_sf),
+                t_const.clone(),
+            ],
             Some(startblock.clone()),
             Some(bool_true()),
         )
@@ -958,7 +977,13 @@ fn close_keyeq_found_or_paranoia(
     pk_to_found.extend(mapped_miss_args(miss_vars, &map_origs, &pk_map, &[]));
     block_para_key.closeblock(vec![
         Link::new(
-            vec![var(&pk_d), var(&pk_key), var(&pk_hash), var(&pk_sf)],
+            vec![
+                var(&pk_d),
+                var(&pk_key),
+                var(&pk_hash),
+                var(&pk_sf),
+                t_const,
+            ],
             Some(startblock),
             Some(bool_true()),
         )
@@ -1460,7 +1485,7 @@ impl OrderedDictRepr {
             (hash_fn_const, eq_fn_const, false, false, false)
         };
 
-        // `@jit.oopspec('ordereddict.lookup(...)')` moves onto the trampoline upstream; generated graphs carry no oopspec yet.
+        // `@jit.oopspec('ordereddict.lookup(...)')` is stamped on orig; `mint_look_inside_iff` moves it onto the trampoline (`rlib/jit.py look_inside_iff`).
         let lookup_fn = {
             let dict_ptr = dict_ptr.clone();
             let entries_ptr = entries_ptr.clone();
@@ -1470,12 +1495,13 @@ impl OrderedDictRepr {
             mint_look_inside_iff(
                 rtyper,
                 "ll_dict_lookup",
-                &["d", "key", "hash", "store_flag"],
+                &["d", "key", "hash", "store_flag", "T"],
                 vec![
                     dict_ptr.clone(),
                     key_lltype.clone(),
                     LowLevelType::Signed,
                     LowLevelType::Signed,
+                    LowLevelType::Void,
                 ],
                 LowLevelType::Signed,
                 move |name| {
@@ -3476,12 +3502,20 @@ pub fn build_ll_dict_lookup_helper_graph(
     let uns = || LowLevelType::Unsigned;
     let new_var = |n: &str, t: LowLevelType| variable_with_lltype(n, t);
 
-    // startblock inputargs: (d, key, hash, store_flag).
+    // startblock inputargs: (d, key, hash, store_flag, T). `T` is the Void
+    // lltype (`ll_dict_lookup`); the body uses `index_elem_lltype` for INDEXES.
     let d = new_var("d", dict_ptr_lltype.clone());
     let key = new_var("key", key_lltype.clone());
     let hash = new_var("hash", sig());
     let store_flag = new_var("store_flag", sig());
-    let startblock = Block::shared(vec![var(&d), var(&key), var(&hash), var(&store_flag)]);
+    let t = new_var("T", LowLevelType::Void);
+    let startblock = Block::shared(vec![
+        var(&d),
+        var(&key),
+        var(&hash),
+        var(&store_flag),
+        var(&t),
+    ]);
     let return_var = new_var("result", sig());
     let mut graph =
         FunctionGraph::with_return_var(name.to_string(), startblock.clone(), var(&return_var));
@@ -3981,6 +4015,7 @@ pub fn build_ll_dict_lookup_helper_graph(
             &key_lltype,
             eq_op,
             paranoia,
+            lowlevel_type_const(index_elem_lltype.clone()),
         );
     } else {
         block_first_valid.closeblock(vec![
@@ -4504,6 +4539,7 @@ pub fn build_ll_dict_lookup_helper_graph(
             &key_lltype,
             eq_op,
             paranoia,
+            lowlevel_type_const(index_elem_lltype.clone()),
         );
     } else {
         block_loop_valid.closeblock(vec![
@@ -4651,10 +4687,12 @@ pub fn build_ll_dict_lookup_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `rordereddict.py ll_dict_lookup`: `@jit.oopspec('ordereddict.lookup(d, key, hash, store_flag, T)')`.
+    func.oopspec = Some("ordereddict.lookup(d, key, hash, store_flag, T)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -4663,6 +4701,7 @@ pub fn build_ll_dict_lookup_helper_graph(
             "key".to_string(),
             "hash".to_string(),
             "store_flag".to_string(),
+            "T".to_string(),
         ],
         func,
     ))
@@ -5410,6 +5449,7 @@ pub(crate) fn build_ll_call_lookup_function_helper_graph(
             Hlvalue::Variable(key),
             Hlvalue::Variable(hash),
             Hlvalue::Variable(store_flag),
+            lowlevel_type_const(TYPE_LONG.clone()),
         ],
         Hlvalue::Variable(index.clone()),
     ));
@@ -5422,10 +5462,12 @@ pub(crate) fn build_ll_call_lookup_function_helper_graph(
         .into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `rordereddict.py ll_call_lookup_function`: `@jit.oopspec('ordereddict.lookup(d, key, hash, flag)')`.
+    func.oopspec = Some("ordereddict.lookup(d, key, hash, flag)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -11013,10 +11055,12 @@ pub fn build_ll_dictnext_helper_graph(
         Link::new(exc_args, Some(graph.exceptblock.clone()), None).into_ref(),
     ]);
 
-    let func = GraphFunc::new(
+    let mut func = GraphFunc::new(
         name.to_string(),
         Constant::new(ConstValue::Dict(Default::default())),
     );
+    // `rordereddict.py _ll_dictnext`: `@jit.oopspec("odictiter.next(iter)")`.
+    func.oopspec = Some("odictiter.next(iter)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,
@@ -12627,6 +12671,7 @@ impl Repr for DictIteratorRepr {
         let iter_for_builder = iter_lltype.clone();
         let dict_for_builder = dict_lltype.clone();
         let entries_for_builder = entries_lltype.clone();
+        // `look_inside_iff` is not ported: its predicate reads `iter.dict`, which `LookInsidePred` cannot express.
         let helper = hop.rtyper.lowlevel_helper_function_with_builder(
             "_ll_dictnext".to_string(),
             vec![iter_lltype],
@@ -13437,6 +13482,26 @@ mod tests {
         )
     }
 
+    fn startblock_arg_names(graph: &FunctionGraph) -> Vec<String> {
+        graph
+            .startblock
+            .borrow()
+            .inputargs
+            .iter()
+            .map(|hlv| match hlv {
+                Hlvalue::Variable(v) => {
+                    let name = if v.renamed() {
+                        v.name_prefix()
+                    } else {
+                        "arg".to_string()
+                    };
+                    name.strip_suffix('_').unwrap_or(&name).to_string()
+                }
+                Hlvalue::Constant(_) => panic!("startblock inputarg is a Constant"),
+            })
+            .collect()
+    }
+
     /// Walk every block reachable from `start`, returning the visited block
     /// count and the flattened op-name list.
     fn walk_blocks(start: &BlockRef) -> (usize, Vec<String>) {
@@ -13606,6 +13671,10 @@ mod tests {
         assert!(startblock.exitswitch.is_some());
         assert_eq!(startblock.exits.len(), 2);
         drop(startblock);
+        assert_eq!(
+            startblock_arg_names(&inner),
+            ["d", "key", "hash", "store_flag", "T"]
+        );
 
         // 13 work blocks + the returnblock are all reachable.
         let (block_count, ops) = walk_blocks(&inner.startblock);
@@ -14059,6 +14128,22 @@ mod tests {
             .map(|op| op.opname.as_str())
             .collect();
         assert_eq!(ops, vec!["direct_call", "direct_call"]);
+        let lookup = &startblock.operations[1];
+        assert_eq!(
+            lookup.args.len(),
+            6,
+            "ll_dict_lookup(d, key, hash, flag, T)"
+        );
+        match &lookup.args[5] {
+            Hlvalue::Constant(c) => {
+                assert_eq!(c.concretetype, Some(LowLevelType::Void));
+                assert_eq!(
+                    c.value,
+                    ConstValue::LowLevelType(Box::new(TYPE_LONG.clone()))
+                );
+            }
+            other => panic!("T is a Void lltype constant, got {other:?}"),
+        }
 
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
@@ -16252,8 +16337,8 @@ mod tests {
                         restart_links += 1;
                         assert_eq!(
                             l.args.len(),
-                            4,
-                            "restart is ll_dict_lookup(d, key, hash, store_flag)"
+                            5,
+                            "restart is ll_dict_lookup(d, key, hash, store_flag, T)"
                         );
                     }
                     stack.push(t);
@@ -18128,6 +18213,52 @@ mod tests {
         assert!(
             matches!(true_first, Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(true)),
             "we_are_jitted true link first"
+        );
+    }
+
+    /// `ll_dict_lookup` trampoline (`rlib/jit.py look_inside_iff`) keeps the
+    /// Void `T` inputarg so `parse_oopspec` can resolve the oopspec name `T`.
+    #[test]
+    fn ll_dict_lookup_trampoline_carries_void_t_and_oopspec() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let repr = OrderedDictRepr::new(
+            rtyper.clone(),
+            signed_repr() as Arc<dyn Repr>,
+            string_repr() as Arc<dyn Repr>,
+            dictdef,
+            None,
+            false,
+            false,
+        )
+        .expect("ordered dict repr");
+        repr.lookup_chain_helpers_on(&rtyper).expect("lookup chain");
+        let trampoline = ann
+            .translator
+            .graphs
+            .borrow()
+            .iter()
+            .find(|g| g.borrow().name == "ll_dict_lookup_trampoline")
+            .unwrap_or_else(|| panic!("missing ll_dict_lookup_trampoline"))
+            .clone();
+        let inner = trampoline.borrow();
+        assert_eq!(
+            startblock_arg_names(&inner),
+            ["d", "key", "hash", "store_flag", "T"]
+        );
+        assert_eq!(
+            inner.func.as_ref().and_then(|f| f.oopspec.as_deref()),
+            Some("ordereddict.lookup(d, key, hash, store_flag, T)"),
+            "look_inside_iff moves oopspec onto the trampoline"
         );
     }
 }
