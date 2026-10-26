@@ -95,11 +95,7 @@ pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bo
                         }
                         _ => infer_op_type(&op.kind),
                     };
-                    let inferred = declared_ref_valuetype(inferred, bookkeeper);
-                    let current = read_binding(result);
-                    let merged = union_type(&current, &inferred);
-                    if merged != current {
-                        setbinding_with(result, merged, bookkeeper);
+                    if merge_binding(result, inferred, bookkeeper) {
                         changed = true;
                     }
                 }
@@ -163,16 +159,23 @@ pub(crate) fn setbinding(var: &Variable, ty: ValueType) {
     setbinding_with(var, ty, None);
 }
 
-fn setbinding_with(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) {
-    let shell = match &ty {
+/// `SomeValue` shell `setbinding` would write for `ty`. A classed
+/// `Ref(Some(root))` is `SomeInstance(classdef, can_be_None=False)`;
+/// `Ref(None)` is the classdef-less `ref_fallback_instance`.
+fn shell_for(ty: &ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> Option<SomeValue> {
+    match ty {
         ValueType::Ref(Some(root)) => bookkeeper
             .and_then(|bk| bk.classdef_for_known_struct_root(root))
             .map(|classdef| {
                 SomeValue::Instance(SomeInstance::new(Some(classdef), false, Default::default()))
             })
-            .or_else(|| valuetype_to_someshell(&ty)),
-        _ => valuetype_to_someshell(&ty),
-    };
+            .or_else(|| valuetype_to_someshell(ty)),
+        _ => valuetype_to_someshell(ty),
+    }
+}
+
+fn setbinding_with(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) {
+    let shell = shell_for(&ty, bookkeeper);
     if let Some(shell) = shell {
         let new_val = Rc::new(shell);
         let mut slot = var.annotation.borrow_mut();
@@ -261,14 +264,56 @@ fn merge_value_type(
     src_ty: ValueType,
     bookkeeper: Option<&Rc<Bookkeeper>>,
 ) -> bool {
-    let src_ty = declared_ref_valuetype(src_ty, bookkeeper);
-    let current = read_binding(dst);
-    let merged = union_type(&current, &src_ty);
-    if merged != current {
-        setbinding_with(dst, merged, bookkeeper);
-        true
+    merge_binding(dst, src_ty, bookkeeper)
+}
+
+/// Join `ty` into `var.annotation`. Instance unions go through
+/// `union` (`annrpython.py mergeinputargs`, `binaryop.py
+/// pairtype(SomeInstance, SomeInstance).union`) so `can_be_None` is
+/// kept. No common base stores the classdef-less root instance
+/// (`rclass.py getinstancerepr(None)`).
+fn merge_binding(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> bool {
+    let ty = declared_ref_valuetype(ty, bookkeeper);
+    let incoming = shell_for(&ty, bookkeeper);
+    if let (Some(existing), Some(incoming_sv)) = (read_binding_some(var), incoming.as_ref())
+        && matches!(existing.as_ref(), SomeValue::Instance(_))
+        && matches!(incoming_sv, SomeValue::Instance(_))
+    {
+        match crate::annotator::model::union(existing.as_ref(), incoming_sv) {
+            Ok(u) => {
+                if u != *existing {
+                    *var.annotation.borrow_mut() = Some(Rc::new(u));
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(_) => {
+                let can_be_none = match (existing.as_ref(), incoming_sv) {
+                    (SomeValue::Instance(a), SomeValue::Instance(b)) => {
+                        a.can_be_none || b.can_be_none
+                    }
+                    _ => unreachable!(),
+                };
+                let root =
+                    SomeValue::Instance(SomeInstance::new(None, can_be_none, Default::default()));
+                if root != *existing {
+                    *var.annotation.borrow_mut() = Some(Rc::new(root));
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     } else {
-        false
+        let current = read_binding(var);
+        let merged = union_type(&current, &ty);
+        if merged != current {
+            setbinding_with(var, merged, bookkeeper);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -821,6 +866,53 @@ mod tests {
         assert_eq!(
             union_type(&ValueType::Unsigned, &ValueType::Int),
             ValueType::Unknown
+        );
+    }
+
+    fn instance_is_nullable(var: &Variable) -> bool {
+        matches!(
+            read_binding_some(var).as_deref(),
+            Some(SomeValue::Instance(inst)) if inst.can_be_none
+        )
+    }
+
+    /// `annrpython.py mergeinputargs` unions `SomeInstance` shells so a
+    /// nullable classed annotation is not rebound through a non-nullable
+    /// `setbinding` shell (`binaryop.py pairtype(SomeInstance,
+    /// SomeInstance).union` keeps `can_be_None`).
+    #[test]
+    fn merge_binding_nullable_instance_stays_nullable() {
+        use crate::annotator::classdesc::ClassDef;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let _host = bk.intern_class_by_qualname("bytecode::CodeObject");
+        let classdef = bk
+            .classdef_for_known_struct_root("bytecode::CodeObject")
+            .unwrap_or_else(|| ClassDef::new_standalone("bytecode::CodeObject", None));
+        let mut graph = FunctionGraph::new("nullable_instance_merge");
+        let seed =
+            |graph: &mut FunctionGraph| {
+                let var = graph.alloc_value_var();
+                *var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(
+                    SomeInstance::new(Some(classdef.clone()), true, Default::default()),
+                )));
+                var
+            };
+        let v_none = seed(&mut graph);
+        merge_binding(&v_none, ValueType::Ref(None), Some(&bk));
+        assert!(
+            instance_is_nullable(&v_none),
+            "Ref(None) join keeps can_be_None"
+        );
+        let v_root = seed(&mut graph);
+        merge_binding(
+            &v_root,
+            ValueType::Ref(Some("bytecode::CodeObject".into())),
+            Some(&bk),
+        );
+        assert!(
+            instance_is_nullable(&v_root),
+            "Ref(Some(root)) join keeps can_be_None"
         );
     }
 }

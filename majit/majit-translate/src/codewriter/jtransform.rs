@@ -8227,14 +8227,19 @@ impl<'a> Transformer<'a> {
                 && matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
             {
                 let arg = resolve_alias(&args[0], &self.aliases);
+                // A raw-flavor dest is int-kind (`history.getkind`).
+                // Stamp Signed and keep the int word before the
+                // `cast_ptr_to_int` round-trip fold
+                // (`rewrite_op_cast_ptr_to_int`); that fold would
+                // restore the GC source.
+                if self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) {
+                    self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                    return RewriteResult::Identity(arg);
+                }
                 if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
                     return RewriteResult::Identity(src);
                 }
                 if self.get_value_kind_var(&arg) == 'i' {
-                    if self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) {
-                        self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
-                        return RewriteResult::Identity(arg);
-                    }
                     // Stamp the operand Signed so flatten emits
                     // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
                     // `/r>r` from an unstamped Unknown.
@@ -29167,6 +29172,86 @@ mod tests {
             FunctionGraph::concretetype_of(&result),
             ConcreteType::Signed,
             "flavor-raw CodeObject dest is int-kind"
+        );
+    }
+
+    /// `cast_int_to_ptr(cast_ptr_to_int(gc_p))` to a flavor-raw dest is
+    /// the int word (`rewrite_op_force_cast` / `_int_to_int_cast`).
+    /// The `cast_ptr_to_int` source map must not restore the GC ref.
+    #[test]
+    fn cast_int_to_ptr_round_trip_flavor_raw_keeps_int_word() {
+        let _origins = register_codeobject_origin();
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("cast_round_trip_raw");
+        let p = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&p, ConcreteType::GcRef);
+        let as_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&as_int, ConcreteType::Signed);
+        let dest_ty = ValueType::Ref(Some("CodeObject".into()));
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let ptr_to_int = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_ptr_to_int",
+        ]);
+        let int_to_ptr = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]);
+        let op_ptr_to_int = SpaceOperation {
+            result: Some(as_int.clone()),
+            kind: OpKind::Call {
+                target: ptr_to_int.clone(),
+                args: crate::model::call_args(vec![p.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op_ptr_to_int,
+            &ptr_to_int,
+            std::slice::from_ref(&p),
+            &ValueType::Int,
+            "cast_ptr_to_int",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(_) | RewriteResult::Identity(_) => {}
+            RewriteResult::Keep => panic!("cast_ptr_to_int must rewrite"),
+        }
+        let op_int_to_ptr = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: int_to_ptr.clone(),
+                args: crate::model::call_args(vec![as_int.clone()]),
+                result_ty: dest_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op_int_to_ptr,
+            &int_to_ptr,
+            std::slice::from_ref(&as_int),
+            &dest_ty,
+            "cast_int_to_ptr",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => {
+                assert_eq!(alias, as_int, "raw dest is the int word, not the GC source");
+            }
+            RewriteResult::Replace(_) => panic!("expected Identity of int word, got Replace"),
+            RewriteResult::Keep => panic!("expected Identity of int word, got Keep"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed,
+            "flavor-raw dest is int-kind"
         );
     }
 

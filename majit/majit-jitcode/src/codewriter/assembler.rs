@@ -325,7 +325,12 @@ impl Assembler {
 
     /// Record host-static ref addresses so `emit_const_r` can emit a
     /// named reloc descriptor instead of an untagged translator-local
-    /// pointer. Duplicate addresses keep the first name.
+    /// pointer. Skip `addr == 0` and a row whose `(addr, name)` pair is
+    /// already recorded. A second name for the same address is kept so
+    /// [`Self::static_ref_addr_by_name`] finds every alias
+    /// (`assembler.py emit_const` converts the pointer to an address
+    /// regardless of which name spelled it). [`Self::static_ref_by_addr`]
+    /// still returns the first name recorded for that address.
     pub fn intern_static_ref_addrs(&mut self, rows: &[(&str, i64)]) {
         for (name, addr) in rows {
             if *addr == 0 {
@@ -334,14 +339,16 @@ impl Assembler {
             if !self
                 .static_ref_by_addr
                 .iter()
-                .any(|(existing, _)| *existing == *addr)
+                .any(|(existing_addr, existing_name)| {
+                    *existing_addr == *addr && existing_name == name
+                })
             {
                 self.static_ref_by_addr.push((*addr, (*name).to_string()));
             }
         }
     }
 
-    /// The name [`Self::intern_static_ref_addrs`] recorded for `addr`.
+    /// The first name [`Self::intern_static_ref_addrs`] recorded for `addr`.
     pub fn static_ref_by_addr(&self, addr: i64) -> Option<&str> {
         if addr == 0 {
             return None;
@@ -353,7 +360,8 @@ impl Assembler {
     }
 
     /// The address [`Self::intern_static_ref_addrs`] recorded for `name`.
-    /// Duplicate names keep the first address.
+    /// Finds any alias of that address. Duplicate names keep the first
+    /// address.
     pub fn static_ref_addr_by_name(&self, name: &str) -> Option<i64> {
         self.static_ref_by_addr
             .iter()

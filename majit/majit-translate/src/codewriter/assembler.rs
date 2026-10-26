@@ -1696,9 +1696,14 @@ impl AssemblerEncode for Assembler {
                         // address; `ConstIRelocKind::StaticAddr` is the
                         // load-time reloc. No static row means the
                         // constant has no runtime counterpart.
-                        let named = self
-                            .static_ref_addr_by_name(obj.qualname())
-                            .map(|addr| (addr, obj.qualname().to_string()));
+                        let named = self.static_ref_addr_by_name(obj.qualname()).map(|addr| {
+                            (
+                                addr,
+                                self.static_ref_by_addr(addr)
+                                    .unwrap_or(obj.qualname())
+                                    .to_string(),
+                            )
+                        });
                         let (idx, src_argcode) = if let Some((addr, name)) = named {
                             (
                                 self.emit_const_i_reloc(
@@ -8220,6 +8225,14 @@ mod tests {
             }
         );
         assert!(state.constants_r.is_empty());
+    }
+
+    #[test]
+    fn intern_static_ref_addrs_keeps_alias_names() {
+        let mut asm = Assembler::new();
+        asm.intern_static_ref_addrs(&[("alias_a", 0x2000), ("alias_b", 0x2000)]);
+        assert_eq!(asm.static_ref_addr_by_name("alias_b"), Some(0x2000));
+        assert_eq!(asm.static_ref_by_addr(0x2000), Some("alias_a"));
     }
 
     #[test]
