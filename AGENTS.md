@@ -84,7 +84,7 @@ traces the descent work exists to retire, and their count is monotonic:
 ## Charon LLBC extraction — the prepass input
 
 The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read
-**pre-extracted `.ullbc` under `build/llbc/`, not the Rust source**. A change to
+**pre-extracted `.ullbc` under `target/llbc/`, not the Rust source**. A change to
 `pyre-interpreter` / `pyre-object` / `pyre-module` / `pyre-jit` is invisible until re-extraction;
 `majit-translate` changes take effect immediately, because the translator runs
 live over the frozen bodies.
@@ -108,8 +108,10 @@ PYRE_RTYPER_VERBOSE=1 cargo build --release -p pyre-jit-trace   # runs the prepa
   `LLBC_STORE`) and import a matching artefact via clone/reflink instead of
   re-running Charon. `LLBC_STORE=off` disables it; `--prune-store` drops unused
   entries.
-- **A Linux container never extracts into the host's `build/llbc`.** Mount a
-  per-container directory over `/workspace/pyre/build/llbc` at `container run`
+- `cargo clean` drops `target/llbc`; the next extract re-imports it from the
+  LLBC store. The prepass cache lives in `<shared>/jit-trace-cache`.
+- **A Linux container never extracts into the host's `target/llbc`.** Mount a
+  per-container directory over `/workspace/pyre/target/llbc` at `container run`
   (see `/apple-container`, step 2).
 - **On Windows, keep `CHARON_TARGET_DIR` short.** cargo passes one
   `-L dependency=...` per dependency build dir, so under a long target path

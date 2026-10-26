@@ -11,7 +11,7 @@ by `scripts/extract-llbc.py` running the pinned Charon binary that
 ```rust
 use majit_charon_reader::{Llbc, ullbc::{CallClass, TermKind}};
 
-let llbc = Llbc::load("build/llbc/pyre-object.ullbc")?;
+let llbc = Llbc::load("target/llbc/pyre-object.ullbc")?;
 println!("crate = {}", llbc.crate_name());
 
 for fd in llbc.iter_local_fns() {
@@ -44,9 +44,9 @@ Run the diagnostic example to spot a fresh schema gap:
 
 ```sh
 cargo run --example dump_stats -p majit-charon-reader -- \
-    build/llbc/pyre-object.ullbc
+    target/llbc/pyre-object.ullbc
 cargo run --example probe_errors -p majit-charon-reader -- \
-    build/llbc/pyre-object.ullbc        # error tally per outer variant
+    target/llbc/pyre-object.ullbc        # error tally per outer variant
 ```
 
 Add a new typed variant + a regression test under `tests/corpus.rs`

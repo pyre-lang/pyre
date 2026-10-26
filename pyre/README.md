@@ -42,7 +42,7 @@ The CPython and wasm/native comparisons are approximate quotients of the display
 
 The native JIT is approximately 1.24x–28.5x faster than CPython across all ten benchmarks. Against PyPy it is 1.25x faster on `float_loop` and 1.1x–2.0x slower on the other nine. Wasm is about even with the native JIT on `int_loop`, approximately 1.16x faster on `float_loop`, and 1.12x–2.22x slower on the other eight. These are small synthetic benchmarks selected to exercise specific JIT paths, not a representative sample of general Python workloads; do not read these ratios as overall application-performance claims.
 
-Run `python3 pyre/check.py --full` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine. If the release backend binaries are already built, pass `--build=no` to skip the Cargo build phase; it still checks that `build/llbc/` describes the current tree, because the field offsets the benchmarks measure come from there and a build is what normally asks.
+Run `python3 pyre/check.py --full` to reproduce all benchmarks with CPython / PyPy / pyre comparison on your machine. If the release backend binaries are already built, pass `--build=no` to skip the Cargo build phase; it still checks that `target/llbc/` describes the current tree, because the field offsets the benchmarks measure come from there and a build is what normally asks.
 
 ## Installation
 
@@ -74,7 +74,7 @@ cargo build --release -p pyrex
 ```
 
 `install-charon.py` installs the pinned Charon version used to produce the
-LLBC artifacts; `extract-llbc.py` generates the artifacts under `build/llbc`
+LLBC artifacts; `extract-llbc.py` generates the artifacts under `target/llbc`
 that MaJIT needs during its build.
 
 ## How it works

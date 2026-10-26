@@ -3258,12 +3258,12 @@ def llbc_input_paths():
 
     `majit_translate::build_semantic_program_via_active_frontend` reads them from
     `MAJIT_MIR_FRONTEND_LLBC` (an OS path-list) before falling back to the
-    workspace `build/llbc`, so a run under that override is built against
+    workspace `target/llbc`, so a run under that override is built against
     different bytes than the default glob names.
 
     A relative entry is resolved against `LLBC_OVERRIDE_BASE` rather than taken
     as written. The reader is `pyre-jit-trace/build.rs`, and a build script's
-    working directory is its own package, so `../../build/llbc/pyre-jit.ullbc`
+    working directory is its own package, so `../../target/llbc/pyre-jit.ullbc`
     is the workspace artefact to the build and two levels above the repository
     to a caller resolving from the root. Taken as written it names a file that
     is not there, which the digest records as an unreadable input — the same
@@ -3277,7 +3277,7 @@ def llbc_input_paths():
             else os.path.normpath(os.path.join(LLBC_OVERRIDE_BASE, entry)).replace(os.sep, "/")
             for entry in override.split(os.pathsep) if entry
         ]
-    return [str(path) for path in Path("build/llbc").glob("*.ullbc")]
+    return [str(path) for path in Path("target/llbc").glob("*.ullbc")]
 
 
 # `include_str!("x")`, `include_bytes!("x")` and `include!("x")` with a plain
@@ -3768,7 +3768,7 @@ def require_fresh_artefacts(artefacts, reason, remedy):
 
 
 def require_fresh_llbc():
-    """Refuse to measure when `build/llbc/` no longer matches the tree.
+    """Refuse to measure when `target/llbc/` no longer matches the tree.
 
     Field offsets are read out of those artefacts, so one that predates an edit
     names the wrong bytes — and a miscompiled field access returns a NUMBER
@@ -3796,7 +3796,7 @@ def require_fresh_llbc():
     )
     if proc.returncode == 0:
         return
-    print(red("LLBC artefacts under build/llbc/ are STALE."))
+    print(red("LLBC artefacts under target/llbc/ are STALE."))
     for line in ((proc.stdout or "") + (proc.stderr or "")).splitlines():
         if line.startswith("  ") and ": artefact says" in line:
             print(line)
@@ -4672,7 +4672,7 @@ class Check:
     # ── build ──
 
     def build_backend(self, backend):
-        # `pyre-jit-trace/build.rs` compares each `build/llbc/*.ullbc` against
+        # `pyre-jit-trace/build.rs` compares each `target/llbc/*.ullbc` against
         # what its crate's sources hash to now and fails the build on a
         # mismatch. Every number this script produces is read out of a binary
         # whose field offsets come from those artefacts, so a stale one does
@@ -4726,7 +4726,7 @@ class Check:
                 # failure that got us here. It already printed the exact
                 # `extract-llbc.py` line naming the crates that moved, so
                 # repeat the reason rather than the command.
-                print(red("LLBC artefacts under build/llbc/ are STALE."))
+                print(red("LLBC artefacts under target/llbc/ are STALE."))
                 print("Field offsets come from them, so a run on this tree "
                       "would measure the wrong bytes.")
                 print("Re-extract with the command build.rs printed above, "
@@ -4739,11 +4739,11 @@ class Check:
                 or "Extract the LLBC" in cargo_output
             )
             if llbc_missing:
-                # The JIT front-end has no MIR to lower because build/llbc/
+                # The JIT front-end has no MIR to lower because target/llbc/
                 # is empty. This is a setup step, not a toolchain fault — the
                 # rustup diagnostics below would be noise, so point at the
                 # producer instead.
-                print(red("LLBC artefacts are missing under build/llbc/."))
+                print(red("LLBC artefacts are missing under target/llbc/."))
                 print("Run the extractor first, then re-run this script:")
                 # No crate arguments: extract the full DEFAULT_CRATES set
                 # (majit-rlib, pyre-object, pyre-interpreter, pyre-jit). The
@@ -6608,7 +6608,7 @@ def main():
     # Once per run, before any backend is measured: the check is over the tree,
     # not over a backend.
     #
-    # The offsets in `build/llbc/` describe an artefact only if that artefact
+    # The offsets in `target/llbc/` describe an artefact only if that artefact
     # was built from them, so the question is per leg and it is about the thing
     # the leg *executes*. For a native backend that is the binary, and a
     # positional one names a binary built somewhere else — the reason

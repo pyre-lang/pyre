@@ -3,7 +3,7 @@
 
 Declares the pyre crate table and delegates to the neutral engine in
 `<repo-root>/scripts/llbc_extract.py`. Artefacts land under
-`<repo-root>/build/llbc`.
+`<repo-root>/target/llbc`.
 """
 
 from __future__ import annotations
@@ -286,7 +286,7 @@ DEFAULT_CRATES = [
 ]
 
 # Targets, besides the extraction host, that get a layout sidecar. The
-# wasm32 build reads the same `build/llbc` set as the native build, and its
+# wasm32 build reads the same `target/llbc` set as the native build, and its
 # pointers are 4 bytes wide: without its own field offsets every descr field
 # past the first pointer names the wrong bytes.
 LAYOUT_TARGETS = ("wasm32-unknown-unknown",)
@@ -315,7 +315,7 @@ def main() -> None:
     specs = SPECS
     crates = DEFAULT_CRATES
     layout_targets = LAYOUT_TARGETS
-    out_dir = ROOT / "build" / "llbc"
+    out_dir = ROOT / "target" / "llbc"
     run_cli(
         specs,
         crates,

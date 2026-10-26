@@ -3447,7 +3447,10 @@ fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
         "majit-rlib.ullbc",
         "pyre-jit.ullbc",
     ] {
-        let path = format!("{}/../../build/llbc/{artefact}", env!("CARGO_MANIFEST_DIR"));
+        let path = format!(
+            "{}/../../target/llbc/{artefact}",
+            env!("CARGO_MANIFEST_DIR")
+        );
         let llbc = Llbc::load(&path).unwrap_or_else(|err| panic!("load {artefact}: {err}"));
         let mut escapes = residual_owner_root_guard_escapes(&llbc);
         escapes.sort();

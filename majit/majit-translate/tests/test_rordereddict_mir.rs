@@ -8,7 +8,7 @@ use majit_translate::front::llbc_hints::harvest_hints_from_llbcs;
 fn dict_compaction_keeps_upstream_opaque_boundary() {
     let llbc = Llbc::load(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     ))
     .expect("extract pyre-object before testing its JIT hints");
     let functions: Vec<_> = llbc

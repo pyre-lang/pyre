@@ -11,19 +11,19 @@ use std::sync::OnceLock;
 
 pub const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
+    "/../../target/llbc/pyre-interpreter.ullbc"
 );
 pub const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
+    "/../../target/llbc/pyre-object.ullbc"
 );
 pub const MODULE_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-module.ullbc"
+    "/../../target/llbc/pyre-module.ullbc"
 );
 pub const RLIB_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/majit-rlib.ullbc"
+    "/../../target/llbc/majit-rlib.ullbc"
 );
 
 /// Compile `src` as an exec-mode module and return the first nested code

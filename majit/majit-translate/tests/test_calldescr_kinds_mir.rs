@@ -19,7 +19,7 @@ use majit_translate::{
 
 const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
+    "/../../target/llbc/pyre-object.ullbc"
 );
 
 fn load_object() -> Llbc {
@@ -374,7 +374,7 @@ fn ll_list_int_length_reads_int_array_len_field() {
 fn orig_extend_from_tuple_has_no_undefined_link_args() {
     const INTERPRETER_LLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = Llbc::load(INTERPRETER_LLBC).expect("pyre-interpreter.ullbc is already extracted");
     let graph =

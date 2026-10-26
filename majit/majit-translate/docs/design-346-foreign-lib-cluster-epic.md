@@ -6,7 +6,7 @@ The measurements in this document have the following provenance. They are not
 three readings of one unchanged input set:
 
 - **268 total phaseA failures:** commit `eca75827fe43618b24328653c150751f9b5399e8`,
-  release profile, default features, the then-current frozen `build/llbc`
+  release profile, default features, the then-current frozen `target/llbc`
   snapshot (not re-extracted), and `MAJIT_RTYPER_VERBOSE=1`. The exact command
   was:
 
@@ -19,7 +19,7 @@ three readings of one unchanged input set:
 
 - **16 `try_from`-headed phaseA failures:** commit
   `ccdc1a52be2237365154976149e7b573db811d82`, release profile, default
-  features, that worktree's frozen `build/llbc` snapshot, and
+  features, that worktree's frozen `target/llbc` snapshot, and
   `MAJIT_RTYPER_VERBOSE=1`. This is a filtered diagnostic count, not a total:
 
   ```text
@@ -275,7 +275,7 @@ deferral note) name no record now; re-derive a population from a fresh census
 before working any item list in this document.
 
 **Provenance.** Branch `rtyper2` with the batch below applied: release
-profile, default features, `build/llbc` re-extracted for `majit-rlib
+profile, default features, `target/llbc` re-extracted for `majit-rlib
 pyre-object pyre-interpreter pyre-jit` at each tree, `PYRE_RTYPER_VERBOSE=1
 cargo build --release -p pyre-jit-trace`, graded by the build's own exit status
 and by the stderr file's mtime against the build start, never by `ls -t` alone.
@@ -288,7 +288,7 @@ re-measures on a later base and finds different.
 
 A census is comparable only to another census taken on the same tree with the
 same artefacts. Both halves matter: a rebase that touches any of the four
-extracted crates restales `build/llbc`, and the chain order is therefore
+extracted crates restales `target/llbc`, and the chain order is therefore
 extract → test → census, never test → census on artefacts from an older tree.
 
 **Phase A = 1883 records, one record per subject.** Reading a record: split on
@@ -385,7 +385,7 @@ covers it) or give the ctor an owner path. Both change the existing
 ### What a base move does to these numbers
 
 Re-taken with the same batch applied on a base 238 files further on, and
-`build/llbc` re-extracted for all four crates, phase A reads 1889 and phase B
+`target/llbc` re-extracted for all four crates, phase A reads 1889 and phase B
 reads 5. Neither is comparable to the 1848 and 25 above — that is the rule at
 the top of this section, applied to itself. What carries over is the
 composition.

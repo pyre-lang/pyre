@@ -6997,11 +6997,11 @@ mod tests {
 
         let interpreter_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let object_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let interpreter = Llbc::load(interpreter_path).expect("load real interpreter LLBC");
         let object = Llbc::load(object_path).expect("load real object LLBC");
@@ -7060,7 +7060,7 @@ mod tests {
         use crate::translator::rtyper::rmodel::Repr;
         use majit_charon_reader::Llbc;
 
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/llbc/");
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/llbc/");
         let object = Llbc::load(format!("{root}pyre-object.ullbc")).expect("load real object LLBC");
         let interpreter = Llbc::load(format!("{root}pyre-interpreter.ullbc"))
             .expect("load real interpreter LLBC");

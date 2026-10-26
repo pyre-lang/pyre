@@ -250,7 +250,7 @@ jobs:
     - name: Compute LLBC fingerprints
       id: llbc-fingerprint
       shell: bash
-      # One cache key per Charon target crate. `build/llbc` is empty this early,
+      # One cache key per Charon target crate. `target/llbc` is empty this early,
       # so no crate has a `.readfiles` yet and `source=` is the whole cargo
       # closure — which is what a key wants: it must be computable before the
       # artefact it will name exists. The narrow digest the stamp records is a
@@ -275,7 +275,7 @@ jobs:
           echo "${crate//-/_}=${value}" >> "$GITHUB_OUTPUT"
         done
     # Per-crate caches (per-OS/arch because cfg(target_os)/cfg(target_arch)
-    # bodies differ). Splitting the former single build/llbc entry lets the
+    # bodies differ). Splitting the former single target/llbc entry lets the
     # unchanged crates restore while only the changed crate re-extracts; the
     # Extract step below refills any missed crate, so the downstream artefact
     # always carries the whole ullbc set.
@@ -325,10 +325,10 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/majit-rlib.ullbc
-          build/llbc/majit-rlib.ullbc.fingerprint
-          build/llbc/majit-rlib.ullbc.readfiles
-          build/llbc/majit-rlib.*.layouts.ullbc
+          target/llbc/majit-rlib.ullbc
+          target/llbc/majit-rlib.ullbc.fingerprint
+          target/llbc/majit-rlib.ullbc.readfiles
+          target/llbc/majit-rlib.*.layouts.ullbc
         key: llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
         restore-keys: |
           llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -337,10 +337,10 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-object.ullbc
-          build/llbc/pyre-object.ullbc.fingerprint
-          build/llbc/pyre-object.ullbc.readfiles
-          build/llbc/pyre-object.*.layouts.ullbc
+          target/llbc/pyre-object.ullbc
+          target/llbc/pyre-object.ullbc.fingerprint
+          target/llbc/pyre-object.ullbc.readfiles
+          target/llbc/pyre-object.*.layouts.ullbc
         key: llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
         restore-keys: |
           llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -349,10 +349,10 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-interpreter.ullbc
-          build/llbc/pyre-interpreter.ullbc.fingerprint
-          build/llbc/pyre-interpreter.ullbc.readfiles
-          build/llbc/pyre-interpreter.*.layouts.ullbc
+          target/llbc/pyre-interpreter.ullbc
+          target/llbc/pyre-interpreter.ullbc.fingerprint
+          target/llbc/pyre-interpreter.ullbc.readfiles
+          target/llbc/pyre-interpreter.*.layouts.ullbc
         key: llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
         restore-keys: |
           llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -361,10 +361,10 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-module.ullbc
-          build/llbc/pyre-module.ullbc.fingerprint
-          build/llbc/pyre-module.ullbc.readfiles
-          build/llbc/pyre-module.*.layouts.ullbc
+          target/llbc/pyre-module.ullbc
+          target/llbc/pyre-module.ullbc.fingerprint
+          target/llbc/pyre-module.ullbc.readfiles
+          target/llbc/pyre-module.*.layouts.ullbc
         key: llbc3-pyre-module-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_module }}
         restore-keys: |
           llbc3-pyre-module-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -373,9 +373,9 @@ jobs:
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-jit.ullbc
-          build/llbc/pyre-jit.ullbc.fingerprint
-          build/llbc/pyre-jit.ullbc.readfiles
+          target/llbc/pyre-jit.ullbc
+          target/llbc/pyre-jit.ullbc.fingerprint
+          target/llbc/pyre-jit.ullbc.readfiles
         key: llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
         restore-keys: |
           llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-
@@ -410,49 +410,49 @@ jobs:
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/majit-rlib.ullbc
-          build/llbc/majit-rlib.ullbc.fingerprint
-          build/llbc/majit-rlib.ullbc.readfiles
-          build/llbc/majit-rlib.*.layouts.ullbc
+          target/llbc/majit-rlib.ullbc
+          target/llbc/majit-rlib.ullbc.fingerprint
+          target/llbc/majit-rlib.ullbc.readfiles
+          target/llbc/majit-rlib.*.layouts.ullbc
         key: llbc3-majit-rlib-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.majit_rlib }}
     - name: Save LLBC (pyre-object)
       if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_object_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-object.ullbc
-          build/llbc/pyre-object.ullbc.fingerprint
-          build/llbc/pyre-object.ullbc.readfiles
-          build/llbc/pyre-object.*.layouts.ullbc
+          target/llbc/pyre-object.ullbc
+          target/llbc/pyre-object.ullbc.fingerprint
+          target/llbc/pyre-object.ullbc.readfiles
+          target/llbc/pyre-object.*.layouts.ullbc
         key: llbc3-pyre-object-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_object }}
     - name: Save LLBC (pyre-interpreter)
       if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_interpreter_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-interpreter.ullbc
-          build/llbc/pyre-interpreter.ullbc.fingerprint
-          build/llbc/pyre-interpreter.ullbc.readfiles
-          build/llbc/pyre-interpreter.*.layouts.ullbc
+          target/llbc/pyre-interpreter.ullbc
+          target/llbc/pyre-interpreter.ullbc.fingerprint
+          target/llbc/pyre-interpreter.ullbc.readfiles
+          target/llbc/pyre-interpreter.*.layouts.ullbc
         key: llbc3-pyre-interpreter-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_interpreter }}
     - name: Save LLBC (pyre-module)
       if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_module_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-module.ullbc
-          build/llbc/pyre-module.ullbc.fingerprint
-          build/llbc/pyre-module.ullbc.readfiles
-          build/llbc/pyre-module.*.layouts.ullbc
+          target/llbc/pyre-module.ullbc
+          target/llbc/pyre-module.ullbc.fingerprint
+          target/llbc/pyre-module.ullbc.readfiles
+          target/llbc/pyre-module.*.layouts.ullbc
         key: llbc3-pyre-module-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_module }}
     - name: Save LLBC (pyre-jit)
       if: github.ref == 'refs/heads/main' && steps.llbc-extract.outputs.pyre_jit_rewrote == '1'
       uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: |
-          build/llbc/pyre-jit.ullbc
-          build/llbc/pyre-jit.ullbc.fingerprint
-          build/llbc/pyre-jit.ullbc.readfiles
+          target/llbc/pyre-jit.ullbc
+          target/llbc/pyre-jit.ullbc.fingerprint
+          target/llbc/pyre-jit.ullbc.readfiles
         key: llbc3-pyre-jit-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.pyre_jit }}
     - name: Drop superseded LLBC cache entries
       # Every push that rewrites a crate saves a new entry under a new
@@ -521,7 +521,7 @@ jobs:
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
       with:
         name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
+        path: target/llbc
         retention-days: 1
         if-no-files-found: error
 
@@ -641,18 +641,18 @@ jobs:
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
+        path: target/llbc
     - name: Verify prepared Charon/LLBC
       shell: bash
       run: |
         test -d .pyre-build/charon
         for crate in majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit; do
-          test -s "build/llbc/${crate}.ullbc"
+          test -s "target/llbc/${crate}.ullbc"
           # The sidecar carries the artefact's own file table, which is what
           # `source=` hashes. Without it the fingerprint falls back to the whole
           # cargo closure and every consumer reports LLBC STALE, so fail here
           # where the cause is still visible.
-          test -s "build/llbc/${crate}.ullbc.readfiles"
+          test -s "target/llbc/${crate}.ullbc.readfiles"
         done
     - name: Free up runner disk space
       if: runner.os == 'Linux'
@@ -904,18 +904,18 @@ jobs:
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
+        path: target/llbc
     - name: Verify prepared Charon/LLBC
       shell: bash
       run: |
         test -d .pyre-build/charon
         for crate in majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit; do
-          test -s "build/llbc/${crate}.ullbc"
+          test -s "target/llbc/${crate}.ullbc"
           # The sidecar carries the artefact's own file table, which is what
           # `source=` hashes. Without it the fingerprint falls back to the whole
           # cargo closure and every consumer reports LLBC STALE, so fail here
           # where the cause is still visible.
-          test -s "build/llbc/${crate}.ullbc.readfiles"
+          test -s "target/llbc/${crate}.ullbc.readfiles"
         done
     - name: Run release-only dispatcher-graph acceptance test
       run: |
@@ -1052,19 +1052,19 @@ jobs:
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
+        path: target/llbc
     - name: Verify prepared Charon/LLBC
       if: ${{ steps.environment.outputs.match != 'false' }}
       shell: bash
       run: |
         test -d .pyre-build/charon
         for crate in majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit; do
-          test -s "build/llbc/${crate}.ullbc"
+          test -s "target/llbc/${crate}.ullbc"
           # The sidecar carries the artefact's own file table, which is what
           # `source=` hashes. Without it the fingerprint falls back to the whole
           # cargo closure and every consumer reports LLBC STALE, so fail here
           # where the cause is still visible.
-          test -s "build/llbc/${crate}.ullbc.readfiles"
+          test -s "target/llbc/${crate}.ullbc.readfiles"
         done
     - name: Build pyre-dynasm
       if: ${{ steps.environment.outputs.match != 'false' }}
@@ -1197,18 +1197,18 @@ jobs:
       uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
       with:
         name: llbc-${{ runner.os }}-${{ runner.arch }}
-        path: build/llbc
+        path: target/llbc
     - name: Verify prepared Charon/LLBC
       shell: bash
       run: |
         test -d .pyre-build/charon
         for crate in majit-rlib pyre-object pyre-interpreter pyre-module pyre-jit; do
-          test -s "build/llbc/${crate}.ullbc"
+          test -s "target/llbc/${crate}.ullbc"
           # The sidecar carries the artefact's own file table, which is what
           # `source=` hashes. Without it the fingerprint falls back to the whole
           # cargo closure and every consumer reports LLBC STALE, so fail here
           # where the cause is still visible.
-          test -s "build/llbc/${crate}.ullbc.readfiles"
+          test -s "target/llbc/${crate}.ullbc.readfiles"
         done
     - name: Add wasm32 target (Linux only)
       # check.py adds wasm to its default backends when this target is

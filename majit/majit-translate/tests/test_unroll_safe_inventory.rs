@@ -13,7 +13,7 @@
 //! So an addition here is a descent-scope change that needs its own
 //! evidence, and this test makes adding one without saying so fail.  It is
 //! deliberately a *subset* check rather than an equality check: a developer's
-//! `build/llbc` is routinely older than the source (a `pyre-interpreter`
+//! `target/llbc` is routinely older than the source (a `pyre-interpreter`
 //! edit is invisible until re-extraction), and a stale artefact must not
 //! produce a false red.  A stale artefact can only under-report, which
 //! passes; a new hint can only over-report, which fails.
@@ -23,7 +23,7 @@ use majit_translate::front::llbc_hints::harvest_hints_from_llbcs;
 
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
+    "/../../target/llbc/pyre-interpreter.ullbc"
 );
 
 /// The leaf name of every function reviewed as `unroll_safe`, with the
@@ -446,7 +446,7 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     // Source now marks `action_dispatcher` `dont_look_inside`. The leaf
-    // stays: this test reads `build/llbc/pyre-interpreter.ullbc`, which
+    // stays: this test reads `target/llbc/pyre-interpreter.ullbc`, which
     // still harvests `_jit_unroll_safe_action_dispatcher`, and the check
     // is harvested ⊆ reviewed.
     ("action_dispatcher", "executioncontext.py action_dispatcher"),

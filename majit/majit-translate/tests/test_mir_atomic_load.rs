@@ -99,7 +99,7 @@ fn atomic_load_must_not_erase_ordering() {
 fn atomic_load_real_acquire_readers_preserve_the_diagnostic() {
     let llbc = Llbc::load(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     ))
     .expect("load fresh pyre-object corpus");
     // The version tag publishes class mutations across threads: its Acquire
@@ -123,11 +123,11 @@ fn atomic_load_real_acquire_readers_preserve_the_diagnostic() {
 }
 
 #[test]
-#[ignore = "loads build/llbc/pyre-interpreter.ullbc"]
+#[ignore = "loads target/llbc/pyre-interpreter.ullbc"]
 fn acquire_quasi_w_globals_lowers_across_the_block_copy() {
     let llbc = Llbc::load(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     ))
     .expect("fresh pyre-interpreter corpus");
     let graph = lower_function(&llbc, "w_code_get_w_globals")

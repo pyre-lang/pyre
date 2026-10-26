@@ -23,7 +23,7 @@ fn stress_path() -> Option<PathBuf> {
     }
     let default = PathBuf::from(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     ));
     if default.exists() {
         Some(default)
@@ -802,7 +802,7 @@ fn mir_on_unwind_target_taxonomy() {
     let Some(path) = stress_path() else {
         eprintln!(
             "skip: set MAJIT_MIR_STRESS_LLBC or run scripts/extract-llbc.py to make \
-             build/llbc/pyre-interpreter.ullbc available"
+             target/llbc/pyre-interpreter.ullbc available"
         );
         return;
     };

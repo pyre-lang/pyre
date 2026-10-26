@@ -4868,7 +4868,7 @@ mod harvested_funcobj_hints_tests {
     fn rbigint_elidable_invert_does_not_mark_descroperation_invert() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
         let harvested =
@@ -5041,7 +5041,7 @@ mod harvested_funcobj_hints_tests {
     fn product_get_attr_elidable_orig_residual_is_elidable_can_raise() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-module.ullbc"
+            "/../../target/llbc/pyre-module.ullbc"
         );
         let llbc = majit_charon_reader::Llbc::load(path).expect("load pyre-module.ullbc");
         let harvested =

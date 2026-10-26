@@ -19,15 +19,15 @@ use majit_translate::model::OpKind;
 
 const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
+    "/../../target/llbc/pyre-object.ullbc"
 );
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
+    "/../../target/llbc/pyre-interpreter.ullbc"
 );
 const MODULE_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-module.ullbc"
+    "/../../target/llbc/pyre-module.ullbc"
 );
 
 /// Bodies that open a bracket, sampled: every `erased_root_bracket_guards`

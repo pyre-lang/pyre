@@ -3,7 +3,7 @@
 //! ```sh
 //! cargo run --release --example who_calls -p majit-charon-reader -- \
 //!     baseobjspace::isinstance vec::Vec::with_capacity \
-//!     build/llbc/pyre-interpreter.ullbc build/llbc/pyre-object.ullbc
+//!     target/llbc/pyre-interpreter.ullbc target/llbc/pyre-object.ullbc
 //! ```
 //!
 //! Loads every `.ullbc` given, builds the direct-call graph over their merged

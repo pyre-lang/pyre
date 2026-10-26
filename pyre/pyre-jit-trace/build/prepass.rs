@@ -318,7 +318,7 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
     }
 
     let llbc_dir = std::path::Path::new(repo_root)
-        .join("build")
+        .join("target")
         .join(LLBC_SUBDIR);
     LLBC_CRATES
         .iter()
@@ -335,7 +335,7 @@ fn analysis_llbc_paths(repo_root: &str) -> Vec<String> {
 /// Pre-flight the LLBC prerequisite, mirroring the resolution order in
 /// `majit-translate` (`build_semantic_program_via_active_frontend`):
 /// honour the `MAJIT_MIR_FRONTEND_LLBC` override, else require the
-/// `LLBC_CRATES` artefacts under `build/<LLBC_SUBDIR>/`. `pyre-jit` contains
+/// `LLBC_CRATES` artefacts under `target/<LLBC_SUBDIR>/`. `pyre-jit` contains
 /// the exact `eval::eval_loop_jit` portal; `pyre-module`, in a build that
 /// links it, holds optional builtin-module graphs so look_inside/elidable survive
 /// the crate split.
@@ -378,9 +378,7 @@ fn charon_install_present(repo_root: &std::path::Path) -> bool {
     let Some(platform) = platform_key(std::env::consts::OS, std::env::consts::ARCH) else {
         return false;
     };
-    let shared = std::env::var_os("PYRE_SHARED_BUILD")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| repo_root.join("..").join(".pyre-build"));
+    let shared = shared_build_dir(repo_root);
     shared
         .join("charon")
         .join(platform)
@@ -397,6 +395,14 @@ fn charon_exe_name() -> &'static str {
     }
 }
 
+/// Same rule as `scripts/llbc_extract.py` `shared_build_dir`: `PYRE_SHARED_BUILD`
+/// if set, else `<repo>/../.pyre-build`.
+fn shared_build_dir(repo_root: &std::path::Path) -> std::path::PathBuf {
+    std::env::var_os("PYRE_SHARED_BUILD")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("..").join(".pyre-build"))
+}
+
 fn preflight_llbc_or_fail() {
     // Explicit override: trust it and let the translator validate the
     // individual paths (its loader panics per-file with the bad path).
@@ -410,7 +416,7 @@ fn preflight_llbc_or_fail() {
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let llbc_dir = repo_root.join("build").join(LLBC_SUBDIR);
+    let llbc_dir = repo_root.join("target").join(LLBC_SUBDIR);
     let mut missing: Vec<String> = LLBC_CRATES
         .iter()
         .map(|crate_name| format!("{crate_name}.ullbc"))
@@ -442,7 +448,7 @@ fn preflight_llbc_or_fail() {
     // explicit non-zero exit is the belt-and-suspenders stop for a Cargo
     // too old to recognise `cargo::error`.
     println!(
-        "cargo::error=pyre-jit codegen needs the Charon-extracted LLBC artefacts, but build/{LLBC_SUBDIR}/ is missing: {}",
+        "cargo::error=pyre-jit codegen needs the Charon-extracted LLBC artefacts, but target/{LLBC_SUBDIR}/ is missing: {}",
         missing.join(", "),
     );
     if !charon_present {
@@ -492,7 +498,7 @@ fn preflight_llbc_or_fail() {
 ========================================================================\n",
         missing
             .iter()
-            .map(|name| format!("   build/{LLBC_SUBDIR}/{name}"))
+            .map(|name| format!("   target/{LLBC_SUBDIR}/{name}"))
             .collect::<Vec<_>>()
             .join("\n"),
         install_line,
@@ -588,7 +594,7 @@ fn llbc_current_fingerprint(
             .current_dir(repo_root)
             .env("CARGO_FEATURES", features)
             .env("LLBC_LAYOUT_TARGETS", layout_targets)
-            .env("LLBC_DEST", repo_root.join("build").join(LLBC_SUBDIR))
+            .env("LLBC_DEST", repo_root.join("target").join(LLBC_SUBDIR))
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
@@ -603,7 +609,7 @@ fn llbc_current_fingerprint(
 
 /// Compare every `.ullbc` against the sources it was extracted from.
 ///
-/// The prepass reads `build/llbc/*.ullbc`, never the Rust sources
+/// The prepass reads `target/llbc/*.ullbc`, never the Rust sources
 /// (AGENTS.md:48), so a field inserted anywhere but last in a `#[repr(C)]`
 /// struct shifts every following descr offset while the build stays green
 /// if the artefact is not re-extracted. The existence test in
@@ -687,12 +693,12 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
         // failing here would break the builds the fallback exists for.
         println!(
             "cargo::warning=LLBC FRESHNESS UNKNOWN: no crate was checked \
-             (scripts/extract-llbc.py is not present); the artefacts in build/llbc may or may \
+             (scripts/extract-llbc.py is not present); the artefacts in target/llbc may or may \
              not match the current sources"
         );
         return;
     }
-    let llbc_dir = repo_root.join("build").join(LLBC_SUBDIR);
+    let llbc_dir = repo_root.join("target").join(LLBC_SUBDIR);
     // `(crate, field, recorded, current)`. One crate can be stale on both
     // fields, and which one moved is the difference between "your own sources
     // changed" and "a dependency in another checkout changed".
@@ -736,7 +742,7 @@ fn fail_if_llbc_stale(repo_root: &std::path::Path) {
             continue;
         };
         // Required for the same reason, and the only field here that describes
-        // what is IN `build/llbc` rather than what went into it.  A stamp too
+        // what is IN `target/llbc` rather than what went into it.  A stamp too
         // old to carry it cannot answer whether these are still the bytes
         // extraction wrote, and "nobody checked" is not a licence to read
         // their offsets.
@@ -2370,6 +2376,8 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     // to re-run this script when they move so the outputs land in, and are
     // pruned against, the directory now in force.
     println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_DIR_ENV}");
+    println!("cargo::rerun-if-env-changed=CI");
+    println!("cargo::rerun-if-env-changed=PYRE_SHARED_BUILD");
     println!("cargo::rerun-if-env-changed={CODEGEN_CACHE_ENTRIES_ENV}");
     println!("cargo::rerun-if-env-changed=MAJIT_RTYPER_VERBOSE");
     println!("cargo::rerun-if-env-changed=MAJIT_CALLEE_CENSUS");
@@ -2406,10 +2414,10 @@ fn emit_rerun_directives(repo_root: &str, source_paths: &[String]) {
     // production input, and a copy of the list that missed it would let cargo
     // skip this script after that artefact alone changed.
     for crate_name in LLBC_CRATES {
-        println!("cargo::rerun-if-changed={repo_root}/build/{LLBC_SUBDIR}/{crate_name}.ullbc");
+        println!("cargo::rerun-if-changed={repo_root}/target/{LLBC_SUBDIR}/{crate_name}.ullbc");
     }
     for sidecar in llbc_layout_sidecars() {
-        println!("cargo::rerun-if-changed={repo_root}/build/{LLBC_SUBDIR}/{sidecar}");
+        println!("cargo::rerun-if-changed={repo_root}/target/{LLBC_SUBDIR}/{sidecar}");
     }
 }
 
@@ -2436,15 +2444,14 @@ fn llbc_layout_sidecars() -> Vec<String> {
         .collect()
 }
 
-/// The cache sits under `build/` rather than the Cargo target directory so
-/// `cargo clean`, a fresh `CARGO_TARGET_DIR`, or a profile switch does not
-/// re-pay the translation prepass — the same reason the prepass's own inputs
-/// (`build/llbc/*.ullbc`) live there. `codegen_cache_key` already folds
+/// The cache sits in the machine-wide shared dir (`<shared>/jit-trace-cache`)
+/// so `cargo clean` does not drop it; CI keeps it under `target/`.
+/// `codegen_cache_key` already folds
 /// HOST/TARGET/PROFILE/OPT_LEVEL, the feature set, the translator sources
 /// and the LLBC content, so an entry is only ever served back to the
 /// configuration that produced it.
-/// The cache root when several checkouts are pointed at one, or `None` for the
-/// per-worktree default.
+/// The cache root when several checkouts share one directory, or `None` for the
+/// per-worktree default (`target/pyre-jit-trace-cache`, used when `CI` is set).
 ///
 /// Sharing is sound because `codegen_cache_key` derives the key from content
 /// alone -- translator sources, `Cargo.lock`, the rustc version string, the
@@ -2465,27 +2472,31 @@ fn llbc_layout_sidecars() -> Vec<String> {
 ///
 /// Deliberately absent from `codegen_cache_key`: keying on where the cache
 /// lives would give each worktree its own key again and defeat the point.
-fn codegen_cache_shared_base() -> Option<std::path::PathBuf> {
-    let dir = std::env::var_os(CODEGEN_CACHE_DIR_ENV)?;
-    if dir.is_empty() {
+fn codegen_cache_shared_base(repo_root: &str) -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os(CODEGEN_CACHE_DIR_ENV) {
+        if !dir.is_empty() {
+            return Some(std::path::PathBuf::from(dir));
+        }
+    }
+    if std::env::var_os("CI").is_some_and(|v| !v.is_empty()) {
         return None;
     }
-    Some(std::path::PathBuf::from(dir))
+    Some(shared_build_dir(std::path::Path::new(repo_root)).join("jit-trace-cache"))
 }
 
 fn codegen_cache_base(repo_root: &str) -> std::path::PathBuf {
-    codegen_cache_shared_base()
-        .unwrap_or_else(|| std::path::Path::new(repo_root).join("build/pyre-jit-trace-cache"))
+    codegen_cache_shared_base(repo_root)
+        .unwrap_or_else(|| std::path::Path::new(repo_root).join("target/pyre-jit-trace-cache"))
 }
 
-fn codegen_cache_max_entries() -> usize {
+fn codegen_cache_max_entries(repo_root: &str) -> usize {
     if let Some(n) = std::env::var(CODEGEN_CACHE_ENTRIES_ENV)
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
     {
         return n.max(1);
     }
-    if codegen_cache_shared_base().is_some() {
+    if codegen_cache_shared_base(repo_root).is_some() {
         CODEGEN_CACHE_MAX_ENTRIES_SHARED
     } else {
         CODEGEN_CACHE_MAX_ENTRIES_LOCAL
@@ -2544,7 +2555,7 @@ fn touch_codegen_cache_entry(cache_dir: &std::path::Path) {
 /// every output or reports failure — it never serves a partial set.
 fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
     let base = codegen_cache_base(repo_root);
-    let shared = codegen_cache_shared_base().is_some();
+    let shared = codegen_cache_shared_base(repo_root).is_some();
     if let Ok(versions) = std::fs::read_dir(&base) {
         for version in versions.flatten() {
             if version.file_name() == std::ffi::OsStr::new(CODEGEN_CACHE_VERSION) {
@@ -2581,7 +2592,7 @@ fn prune_codegen_cache(repo_root: &str, keep: &std::path::Path) {
     }
     by_last_use.sort_by_key(|item| std::cmp::Reverse(item.0));
     // `keep` is excluded above and occupies one of the retained slots.
-    let retained = codegen_cache_max_entries().saturating_sub(1);
+    let retained = codegen_cache_max_entries(repo_root).saturating_sub(1);
     for (_, path) in by_last_use.into_iter().skip(retained) {
         let _ = std::fs::remove_dir_all(path);
     }
@@ -2912,7 +2923,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
             h,
             repo_root,
             &repo_root
-                .join("build")
+                .join("target")
                 .join(LLBC_SUBDIR)
                 .join(format!("{crate_name}.ullbc")),
         );
@@ -2927,7 +2938,7 @@ fn hash_llbc_inputs(h: &mut CacheHasher, repo_root: &std::path::Path) {
         hash_ullbc_file(
             h,
             repo_root,
-            &repo_root.join("build").join(LLBC_SUBDIR).join(&sidecar),
+            &repo_root.join("target").join(LLBC_SUBDIR).join(&sidecar),
         );
     }
 }

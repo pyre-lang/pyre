@@ -73,7 +73,7 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
    the worktree; the shared build cache **outside** the worktree so sibling
    worktrees and container runs reuse one charon install; the main checkout
    at its own host path, because these worktrees are `git worktree`s (see the
-   trap below); and a per-container directory over `/workspace/pyre/build/llbc`
+   trap below); and a per-container directory over `/workspace/pyre/target/llbc`
    so extraction never writes into the host's artefacts.
 
    ```shell
@@ -84,7 +84,7 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
      --mount type=bind,source="$(pwd)",target=/workspace/pyre \
      --mount type=bind,source="$(dirname "$PWD")/.pyre-build",target=/workspace/.pyre-build \
      --mount type=bind,source="$MAIN",target="$MAIN" \
-     --mount type=bind,source="$(dirname "$PWD")/.pyre-build/llbc-container/pyre-linux",target=/workspace/pyre/build/llbc \
+     --mount type=bind,source="$(dirname "$PWD")/.pyre-build/llbc-container/pyre-linux",target=/workspace/pyre/target/llbc \
      pyre-ubuntu24-arm64-repro sleep infinity
    ```
 
@@ -129,7 +129,7 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
    ```
 
    Extraction and the Linux `pyre-jit-trace` build both read and write
-   `/workspace/pyre/build/llbc` as usual; that is the step-2 mount.
+   `/workspace/pyre/target/llbc` as usual; that is the step-2 mount.
 
    `scripts/extract-llbc.py` takes **no crate arguments** — the bare form
    extracts the whole set. Naming a subset mixes fresh and stale artefacts.
@@ -192,8 +192,8 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
   other way too: `source=` is a hash of the tree, so editing anything after an
   extraction marks the artefacts stale — do the extract last and leave the tree
   alone until whatever you are measuring has finished.
-- **A container lacking the `build/llbc` mount must not extract.** The
-  driver's `out_dir` is a fixed `<repo-root>/build/llbc` with no override,
+- **A container lacking the `target/llbc` mount must not extract.** The
+  driver's `out_dir` is a fixed `<repo-root>/target/llbc` with no override,
   and the worktree is bind-mounted, so an extract without the nested mount
   replaces the artefacts your macOS build reads. The step-2 mount is now
   mandatory; recreate a container that lacks it (`container rm` then
@@ -206,4 +206,4 @@ container build --platform linux/amd64 -m 8G -c 4 --progress plain \
   (`llbc_dest_path`) takes it as an output override and resolves a relative
   value against the repo root, i.e. the bind-mounted host worktree, so a set
   `LLBC_DEST` bypasses the step-2 mount; the Linux `pyre-jit-trace` build
-  reads the fixed `build/llbc` regardless.
+  reads the fixed `target/llbc` regardless.

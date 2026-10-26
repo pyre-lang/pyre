@@ -16,7 +16,7 @@ use majit_translate::model::{CallTarget, FunctionGraph, OpKind, VecFieldPart};
 
 const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
+    "/../../target/llbc/pyre-object.ullbc"
 );
 
 fn object_llbc() -> Option<&'static Llbc> {

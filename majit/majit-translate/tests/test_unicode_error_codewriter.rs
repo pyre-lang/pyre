@@ -11,7 +11,7 @@ use majit_translate::model::{CallTarget, OpKind, ValueType};
 fn unicode_translate_error_borrow_chain_is_value_lowered() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     );
     if !std::path::Path::new(path).is_file() {
         eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");

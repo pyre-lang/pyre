@@ -74,7 +74,7 @@ jobs:
       id: llbc-cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: build/llbc
+        path: target/llbc
         key: llbc3-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
         # A miss with no prefix to fall back on restores nothing and re-extracts
         # all four crates. A loose restore is safe: `extract-llbc.py` re-judges
@@ -166,7 +166,7 @@ jobs:
       id: llbc-cache
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
-        path: build/llbc
+        path: target/llbc
         key: llbc3-${{ runner.os }}-${{ runner.arch }}-${{ env.CHARON_VERSION }}-${{ steps.llbc-fingerprint.outputs.value }}
         # A miss with no prefix to fall back on restores nothing and re-extracts
         # all four crates. A loose restore is safe: `extract-llbc.py` re-judges

@@ -1,6 +1,6 @@
 #!/bin/sh
 # Fast core for JIT-quality loops. Leaves `pyre-module` out of the binary and
-# out of the extraction; the other artefacts are the product `build/llbc` set.
+# out of the extraction; the other artefacts are the product `target/llbc` set.
 #
 #   pyre/scripts/build-jit-core.sh
 #   pyre/scripts/build-jit-core.sh --check   # cargo check, no codegen

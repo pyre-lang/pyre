@@ -10,7 +10,7 @@ use majit_translate::{
 fn float_power_lowers_infinity_predicates_to_arithmetic() {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     );
     let llbc = Llbc::load(path).expect("extract interpreter before running this test");
     let graph = lower_function(&llbc, "float_pow_inner").expect("lower float power");

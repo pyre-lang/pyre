@@ -56,7 +56,7 @@ fn repo_root() -> PathBuf {
 }
 
 fn require_ullbc(name: &str) -> PathBuf {
-    let path = repo_root().join("build/llbc").join(name);
+    let path = repo_root().join("target/llbc").join(name);
     assert!(
         path.is_file(),
         "{} is missing — run `python3 scripts/extract-llbc.py` to produce the extracted LLBC",
@@ -457,7 +457,7 @@ fn census_corpus(allowed: &[&str]) -> (Census, Result<(), Vec<String>>) {
 /// share a process with the parallel suite. CI runs it from the dedicated
 /// cargo-test step.
 #[test]
-#[ignore = "loads build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc"]
+#[ignore = "loads target/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc"]
 fn framebox_new_is_the_only_non_deref_pyframe_vable_projection() {
     let (census, result) = census_corpus(ALLOWED);
     if let Err(failures) = result {

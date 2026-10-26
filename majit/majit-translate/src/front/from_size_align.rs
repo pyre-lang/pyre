@@ -2087,7 +2087,7 @@ mod tests {
 
         let object = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         ))
         .expect("load pyre-object.ullbc");
         let rlib = Llbc::load(crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC)

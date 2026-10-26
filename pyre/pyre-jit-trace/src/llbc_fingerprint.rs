@@ -142,7 +142,7 @@ pub fn freshness_policy(strict: Option<&str>, skip: Option<&str>) -> FreshnessPo
         // the conflation the FRESHNESS UNKNOWN channel exists to prevent.
         FreshnessMode::Skip => diagnostics.push(format!(
             "{SKIP}=1 — the LLBC freshness check was skipped; field offsets \
-             read out of build/llbc may not match the current sources"
+             read out of target/llbc may not match the current sources"
         )),
         FreshnessMode::Warn | FreshnessMode::Strict => {}
     }

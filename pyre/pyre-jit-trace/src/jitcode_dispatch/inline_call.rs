@@ -1231,8 +1231,11 @@ fn descent_unlowered_helper_scan_enabled() -> bool {
 /// their own. The hash-to-path map is not in the binary — it is snapshotted by
 /// the translation pipeline (`symbolic_fnaddr_paths_snapshot`) and written to
 /// the codegen cache, so resolve a hash by reading `symbolic_fnaddr_paths` out
-/// of the newest `build/pyre-jit-trace-cache/*/*/jit_metadata.json` (newest by
+/// of the newest `*/*/jit_metadata.json` under the codegen cache (newest by
 /// mtime — older generations hold different jitcode indices for the same path).
+/// The directory is `PYRE_JIT_TRACE_CACHE_DIR` if set, else
+/// `target/pyre-jit-trace-cache` when `CI` is set, else
+/// `<shared>/jit-trace-cache` (`PYRE_SHARED_BUILD` or `<repo>/../.pyre-build`).
 /// A hash whose high bit is set is stored there as a negative `i64`.
 fn log_descent_unlowered_helper_blockers(jitcode_index: usize) {
     if !fbw_inline_diag_enabled() {

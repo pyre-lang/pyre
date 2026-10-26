@@ -8499,7 +8499,7 @@ mod tests {
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
         let mut all_sites = Vec::new();

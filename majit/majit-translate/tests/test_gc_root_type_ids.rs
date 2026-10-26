@@ -10,7 +10,7 @@ use majit_translate::memory::gctransform::liveness;
 
 const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
+    "/../../target/llbc/pyre-object.ullbc"
 );
 
 #[test]

@@ -695,7 +695,7 @@ mod tests {
     fn deferred_malloc_template_with_a_clause_size_is_not_look_inside() {
         let llbc = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         ))
         .expect("pyre-object.ullbc is already extracted");
         let mut provider = GraphBodyProvider::new(

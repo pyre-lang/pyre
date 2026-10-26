@@ -7,8 +7,8 @@
 //! interpreter the answer is
 //!
 //! ```text
-//! GC_JOIN_WITH=build/llbc/pyre-jit.ullbc,build/llbc/pyre-object.ullbc,build/llbc/majit-rlib.ullbc \
-//!   ./target/release/examples/gc-root-reachability build/llbc/pyre-interpreter.ullbc
+//! GC_JOIN_WITH=target/llbc/pyre-jit.ullbc,target/llbc/pyre-object.ullbc,target/llbc/majit-rlib.ullbc \
+//!   ./target/release/examples/gc-root-reachability target/llbc/pyre-interpreter.ullbc
 //! ```
 
 use majit_translate::memory::gctransform::{framework, liveness};

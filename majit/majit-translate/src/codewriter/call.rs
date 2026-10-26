@@ -3725,7 +3725,7 @@ pub struct CallControl {
     /// An `unsafe fn` is NOT held back from body lowering: no gate reads
     /// `signature.is_unsafe` anywhere except the collector above, and
     /// `front::mir::build_semantic_program_from_llbc` over
-    /// `build/llbc/pyre-object.ullbc` lowers 1445 of the 1445 unsafe fns
+    /// `target/llbc/pyre-object.ullbc` lowers 1445 of the 1445 unsafe fns
     /// that carry a body — `is_generic_alias` and `is_union` among them.
     /// A stub therefore stands in for a missing registry key, and for the
     /// declarations Charon emits with no body at all; it does not stand in

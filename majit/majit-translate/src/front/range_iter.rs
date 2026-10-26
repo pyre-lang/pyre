@@ -1069,7 +1069,7 @@ mod tests {
         use majit_charon_reader::Llbc;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("pyre-object.ullbc");
         let graph = lower_function(&llbc, "kind_of_canonical_exc_class")

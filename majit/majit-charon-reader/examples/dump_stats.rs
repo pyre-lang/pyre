@@ -3,7 +3,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --example dump_stats -p majit-charon-reader -- build/llbc/pyre-object.ullbc
+//! cargo run --example dump_stats -p majit-charon-reader -- target/llbc/pyre-object.ullbc
 //! ```
 //!
 //! Prints crate name, function counts (decoded / error / opaque), and

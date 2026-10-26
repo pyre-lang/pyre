@@ -59,7 +59,7 @@ fn test_make_jitcodes_produces_graph_keyed_output() {
 fn slow_generated_jitcodes_preserve_complete_dispatcher_graph() {
     if !ensure_workspace_llbc_env() {
         eprintln!(
-            "skipping: build/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
+            "skipping: target/llbc/{{pyre-object,pyre-interpreter,pyre-jit}}.ullbc missing — \
              run `scripts/extract-llbc.py` to enable this test"
         );
         return;
@@ -407,7 +407,7 @@ fn ensure_workspace_llbc_env() -> bool {
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let llbc_dir = workspace_root.join("build").join("llbc");
+    let llbc_dir = workspace_root.join("target").join("llbc");
     let required = [
         "pyre-object.ullbc",
         "pyre-interpreter.ullbc",

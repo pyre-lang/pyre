@@ -27,7 +27,7 @@ subjects off.  `--no-build` skips the build and reads the census already
 on disk, for a second look at a reading just taken.
 
 The set is read against the corpus it was measured on.  The prepass reads
-`build/llbc/*.ullbc`, and a re-extraction brings interpreter code the
+`target/llbc/*.ullbc`, and a re-extraction brings interpreter code the
 baseline never saw: its graphs land in this set exactly like a regression
 would.  A rise measured over a corpus the baseline does not name is a
 ratchet failure; refresh with `--update` only after attributing the
@@ -103,7 +103,7 @@ def corpus_key() -> tuple[str, list[str]]:
     parts = []
     unstamped = []
     for crate in CORPUS_CRATES:
-        path = ROOT / "build" / "llbc" / f"{crate}.ullbc.fingerprint"
+        path = ROOT / "target" / "llbc" / f"{crate}.ullbc.fingerprint"
         source = ""
         if path.is_file():
             for line in path.read_text().splitlines():

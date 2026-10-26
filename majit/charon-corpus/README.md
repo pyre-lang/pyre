@@ -55,7 +55,7 @@ nightly; it only needs the `.llbc` JSON.
 <charon> cargo --ullbc --reconstruct-panic-calls --inline-anon-consts --dest-file "$PWD/corpus.ullbc"
 
 # (`../../scripts/extract-llbc.py corpus` runs the same extraction through the
-#  fingerprinting driver, but its artefact lands in `build/llbc/corpus.ullbc`,
+#  fingerprinting driver, but its artefact lands in `target/llbc/corpus.ullbc`,
 #  not here; the checked-in fixture is only updated by writing this path.)
 
 # 2. inspect

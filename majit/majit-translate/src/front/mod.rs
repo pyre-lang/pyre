@@ -30,7 +30,7 @@
 //! extracted artefacts and produces the `SemanticProgram` whose
 //! `program.functions` carry the per-method graphs the rest of the
 //! pipeline consumes.  `auto_discover_workspace_llbc_paths` in `lib.rs`
-//! resolves `<workspace>/build/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc`
+//! resolves `<workspace>/target/llbc/{pyre-object,pyre-interpreter,pyre-jit}.ullbc`
 //! when `MAJIT_MIR_FRONTEND_LLBC` is unset; that canonical set is REQUIRED.
 //! `build_semantic_program_via_active_frontend` panics when no LLBC source
 //! resolves, so every build asserts that graphs come from MIR.

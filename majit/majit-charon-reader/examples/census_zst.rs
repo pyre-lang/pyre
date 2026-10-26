@@ -11,7 +11,7 @@
 //! Run with:
 //!
 //! ```sh
-//! cargo run --release -p majit-charon-reader --example census_zst -- build/llbc/pyre-jit.ullbc
+//! cargo run --release -p majit-charon-reader --example census_zst -- target/llbc/pyre-jit.ullbc
 //! ```
 use majit_charon_reader::{
     Llbc,

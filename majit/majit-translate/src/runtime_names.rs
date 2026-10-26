@@ -67,32 +67,32 @@
 /// takes literals, so a site that wants the path cannot compose it from a
 /// `const &str` and would have to spell the tail again.
 ///
-/// These are `build/` outputs, so a fixture naming one is `#[ignore]`d — it
+/// These are `target/llbc` outputs, so a fixture naming one is `#[ignore]`d — it
 /// asserts against an artefact that a plain `cargo test` has no reason to have
 /// produced. Nothing outside a test names one, which is what the gate records:
-/// a path into `build/` appearing in a non-test build would be this crate
+/// a path into `target/llbc` appearing in a non-test build would be this crate
 /// reaching for an artefact at run time, and it does not.
 #[cfg(test)]
 pub(crate) mod artifacts {
     pub(crate) const INTERPRETER_ULLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-interpreter.ullbc"
+        "/../../target/llbc/pyre-interpreter.ullbc"
     );
     pub(crate) const OBJECT_ULLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-object.ullbc"
+        "/../../target/llbc/pyre-object.ullbc"
     );
     pub(crate) const MODULE_ULLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-module.ullbc"
+        "/../../target/llbc/pyre-module.ullbc"
     );
     pub(crate) const JIT_ULLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/pyre-jit.ullbc"
+        "/../../target/llbc/pyre-jit.ullbc"
     );
     pub(crate) const MAJIT_RLIB_ULLBC: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../../build/llbc/majit-rlib.ullbc"
+        "/../../target/llbc/majit-rlib.ullbc"
     );
     pub(crate) const CHARON_CORPUS_ULLBC: &str =
         concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");

@@ -56,15 +56,15 @@ EXAMPLE = ROOT / "target" / "release" / "examples" / "gc-root-reachability"
 # `module_ns_store` signatures, so a `--opaque pyre_object` module
 # artefact still has an artefact-local `PyObjectRef` id.
 LLBC = (
-    "build/llbc/majit-rlib.ullbc",
-    "build/llbc/pyre-object.ullbc",
-    "build/llbc/pyre-interpreter.ullbc",
-    "build/llbc/pyre-module.ullbc",
-    "build/llbc/pyre-jit.ullbc",
+    "target/llbc/majit-rlib.ullbc",
+    "target/llbc/pyre-object.ullbc",
+    "target/llbc/pyre-interpreter.ullbc",
+    "target/llbc/pyre-module.ullbc",
+    "target/llbc/pyre-jit.ullbc",
 )
 SUBJECTS = (
-    "build/llbc/pyre-interpreter.ullbc",
-    "build/llbc/pyre-module.ullbc",
+    "target/llbc/pyre-interpreter.ullbc",
+    "target/llbc/pyre-module.ullbc",
 )
 
 # (key, regex).  Every one of these must match exactly once, in this order.

@@ -962,7 +962,7 @@ mod tests {
     fn module_less_elidable_marker_is_not_harvested_as_bare_leaf() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
         let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
@@ -1002,7 +1002,7 @@ mod tests {
     fn random_effects_marker_keys_the_graphless_leaf() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = majit_charon_reader::Llbc::load(path).expect("load majit-rlib.ullbc");
         let harvested = super::harvest_hints_from_llbcs(std::slice::from_ref(&llbc));

@@ -93796,7 +93796,7 @@ mod tests {
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
         let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
@@ -93841,7 +93841,7 @@ mod tests {
     fn dict_strategy_ref_imp_layout_is_dyn_fat() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         if !std::path::Path::new(path).is_file() {
             return;
@@ -95118,9 +95118,9 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
 
         for (relpath, fname) in [
-            ("/../../build/llbc/pyre-interpreter.ullbc", "index_c_int_w"),
+            ("/../../target/llbc/pyre-interpreter.ullbc", "index_c_int_w"),
             (
-                "/../../build/llbc/pyre-object.ullbc",
+                "/../../target/llbc/pyre-object.ullbc",
                 "int_or_float_encode_int",
             ),
         ] {
@@ -95167,7 +95167,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
 
         let path = format!(
-            "{}/../../build/llbc/pyre-object.ullbc",
+            "{}/../../target/llbc/pyre-object.ullbc",
             env!("CARGO_MANIFEST_DIR")
         );
         let llbc = Llbc::load(path).unwrap_or_else(|e| panic!("load w_range_iter LLBC: {e}"));
@@ -98290,7 +98290,7 @@ mod tests {
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
         let graph = super::lower_function(&llbc, "pyre_interpreter::importing::import_head")
@@ -116556,7 +116556,7 @@ mod tests {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(
@@ -116587,7 +116587,7 @@ mod tests {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::call_method")
@@ -117279,7 +117279,7 @@ mod tests {
     fn load_local_value_arrayread_narrows_instance_item() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
         let graph =
@@ -117310,7 +117310,7 @@ mod tests {
     fn opcode_impl_receiver_keeps_pyframe_input_root() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::eval::<Impl>::pop_value")
@@ -117410,7 +117410,7 @@ mod tests {
     fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
         let mut owners = std::collections::BTreeSet::new();
@@ -117498,7 +117498,7 @@ mod tests {
     fn range_list_length_lowers_signed_to_usize_try_from() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real object LLBC");
         let source = super::lower_function(&llbc, "pyre_object::listobject::range_state_value")
@@ -117675,7 +117675,7 @@ mod tests {
     fn complex_arithmetic_unwraps_lower_to_payload_guards() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
         for name in [
@@ -117721,7 +117721,7 @@ mod tests {
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real object LLBC");
         // `offset_leaf` is `None` for the two string rows on purpose: their
@@ -119750,7 +119750,7 @@ mod tests {
     #[ignore]
     fn raw_pointer_eq_lowers_to_is() {
         let path = format!(
-            "{}/../../build/llbc/pyre-object.ullbc",
+            "{}/../../target/llbc/pyre-object.ullbc",
             env!("CARGO_MANIFEST_DIR")
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
@@ -119780,7 +119780,7 @@ mod tests {
     #[ignore]
     fn raw_pointer_ne_lowers_to_negated_is() {
         let path = format!(
-            "{}/../../build/llbc/pyre-object.ullbc",
+            "{}/../../target/llbc/pyre-object.ullbc",
             env!("CARGO_MANIFEST_DIR")
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
@@ -119839,7 +119839,7 @@ mod tests {
     fn string_residual_result_token_is_str() {
         use crate::translator::rtyper::cutover::{STR_RETURN_TYPE, residual_return_shell};
         let path = format!(
-            "{}/../../build/llbc/pyre-object.ullbc",
+            "{}/../../target/llbc/pyre-object.ullbc",
             env!("CARGO_MANIFEST_DIR")
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
@@ -119873,7 +119873,7 @@ mod tests {
             STRINGBUILDER_APPEND, STRINGBUILDER_BUILD, STRINGBUILDER_NEW,
         };
         let path = format!(
-            "{}/../../build/llbc/pyre-object.ullbc",
+            "{}/../../target/llbc/pyre-object.ullbc",
             env!("CARGO_MANIFEST_DIR")
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
@@ -120159,7 +120159,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
         let graph =
@@ -120212,7 +120212,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
         let graph =
@@ -120350,7 +120350,7 @@ mod tests {
         use crate::model::{CallTarget, ExitSwitch, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
         let graph = super::lower_function(&llbc, "ll_grow_by").expect("lower ll_grow_by");
@@ -120391,7 +120391,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
         let graph =
@@ -120444,7 +120444,7 @@ mod tests {
         use crate::model::{CallTarget, LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
         let graph = super::lower_function(&llbc, "try_gc_current_object_address")
@@ -120657,7 +120657,7 @@ mod tests {
     fn dict_strategy_vtable_call_keeps_its_family_identity() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
         for (function, method) in [
@@ -121668,7 +121668,7 @@ mod tests {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -121699,7 +121699,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -121772,7 +121772,7 @@ mod tests {
     #[ignore]
     fn struct_ptr_write_lowers_to_per_field_initialization() {
         use crate::model::{CallTarget, OpKind};
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../build/llbc/");
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../target/llbc/");
         let llbcs = [
             Llbc::load(format!("{root}pyre-object.ullbc")).expect("load pyre-object LLBC"),
             Llbc::load(format!("{root}pyre-interpreter.ullbc"))
@@ -121889,7 +121889,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
         let fd = llbc
@@ -121952,7 +121952,7 @@ mod tests {
         use crate::model::OpKind;
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
         let fd = llbc
@@ -122003,7 +122003,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "hash_slot").expect("lower hash_slot");
@@ -122028,7 +122028,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "w_specialised_tuple_ii_new")
@@ -122048,7 +122048,7 @@ mod tests {
     fn unicode_hash_atomic_store_is_the_exact_residual_choke_point() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let residuals = super::dont_look_inside_set_of(&llbc);
@@ -122068,7 +122068,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "deque_compare").expect("lower deque_compare");
@@ -122134,7 +122134,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-module.ullbc"
+            "/../../target/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let name = "pyre_module::module::unicodedata::interp_ucd::char_and_default";
@@ -122191,7 +122191,7 @@ mod tests {
     fn fundecl_module_is_the_crate_qualified_defining_module() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-module.ullbc"
+            "/../../target/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let module_of = |name: &str| {
@@ -122236,7 +122236,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-module.ullbc"
+            "/../../target/llbc/pyre-module.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let name = "pyre_module::module::unicodedata::interp_ucd::ucd_method_args";
@@ -122275,7 +122275,7 @@ mod tests {
         use crate::translator::rtyper::cutover::{DualGateOutcome, dual_gate_check_with_registry};
         let llbc = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-module.ullbc"
+            "/../../target/llbc/pyre-module.ullbc"
         ))
         .expect("load real LLBC");
         let graph = super::lower_function(
@@ -122329,7 +122329,7 @@ mod tests {
     fn native_load_fast_preserves_unit_operand_rtype() {
         let llbc = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         ))
         .expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::pyopcode::execute_load_fast")
@@ -123450,7 +123450,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "bytearray_repr_string")
@@ -123532,7 +123532,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -123577,7 +123577,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -123623,7 +123623,7 @@ mod tests {
         use crate::model::{CallTarget, LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load pyre-object LLBC");
         let graph = super::lower_function(&llbc, "w_str_from_wtf8").expect("lower w_str_from_wtf8");
@@ -123665,7 +123665,7 @@ mod tests {
     fn str_traced_codepoint_bound_some_ctors_keep_i64_instantiation() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "str_traced_codepoint_bound")
@@ -123722,7 +123722,7 @@ mod tests {
     fn str_idx_params_unrooted_pos0_owners_are_option_i64() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "str_idx_params_unrooted")
@@ -123756,7 +123756,7 @@ mod tests {
         // The `?` must not getattr `__pos_0` on the template `Option::Some`.
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -123792,7 +123792,7 @@ mod tests {
         // (`bookkeeper.py` `getuniqueclassdef(cls)`).
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "w_list_getitem_inner")
@@ -123915,7 +123915,7 @@ mod tests {
     fn checked_sub_constructs_real_some_in_peekvalue_maybe_none() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "peekvalue_maybe_none")
@@ -123956,7 +123956,7 @@ mod tests {
     fn wtf8_as_str_lowers_to_runtime_tagged_string_result() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -125183,7 +125183,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "py_repr_wtf8").expect("lower py_repr_wtf8");
@@ -125456,7 +125456,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let residual_vec_indexes = |fname: &str| {
@@ -125514,7 +125514,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "exception_descr_str_wtf8")
@@ -125544,7 +125544,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "check_surrogate").expect("lower check_surrogate");
@@ -125584,7 +125584,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -125624,7 +125624,7 @@ mod tests {
     fn pyerror_exc_object_registry_retains_instance_ref() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let (_, _, fields, _, _, _, _, _) = super::derive_program_metadata(
@@ -125673,7 +125673,7 @@ mod tests {
         use crate::model::{LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::error::<Impl>::new")
@@ -125713,7 +125713,7 @@ mod tests {
         use crate::model::{CallTarget, LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(
@@ -125770,7 +125770,7 @@ mod tests {
         use crate::model::{CallTarget, LinkArg, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -125816,7 +125816,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
         let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::buffer_bytes")
@@ -125871,7 +125871,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real interpreter LLBC");
         let program =
@@ -125966,7 +125966,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function_with_static_addrs(
@@ -126009,7 +126009,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         for fname in ["read_bytes", "parse_length_prefixed_protocols"] {
@@ -126043,7 +126043,7 @@ mod tests {
         use crate::model::{CallTarget, ExitSwitch, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         // `lower_function`'s default host table names NO error carrier, and
@@ -126119,7 +126119,7 @@ mod tests {
         use crate::model::{CallTarget, OpKind};
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function_with_static_addrs(
@@ -126179,7 +126179,7 @@ mod tests {
     fn check_len_result_uint_format_template_collapses() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -126216,7 +126216,7 @@ mod tests {
     fn fixed_array_for_loop_has_no_residual_into_iter_next() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "memoryview_is_native_buffer_descr")
@@ -126248,7 +126248,7 @@ mod tests {
     fn native_lock_and_method_metadata_leaves_are_residual() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let residuals = super::dont_look_inside_set_of(&llbc);
@@ -126276,7 +126276,7 @@ mod tests {
     fn prebuilt_strategy_holder_keeps_its_instance_repr() {
         let llbc = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         ))
         .expect("load object LLBC");
         let addr = 0x1234_5678;
@@ -126358,7 +126358,7 @@ mod tests {
     fn bool_singleton_accessor_lowers_to_prebuilt_constants() {
         let llbc = Llbc::load(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         ))
         .expect("load object LLBC");
         let (w_true, w_false) = (0x1234_5678, 0x1234_9abc);
@@ -126420,7 +126420,7 @@ mod tests {
     fn elidable_declaration_keeps_a_functiondesc_without_a_lowered_body() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
@@ -126457,7 +126457,7 @@ mod tests {
     fn getset_direct_residual_keeps_a_functiondesc_without_a_jitcode_body() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
@@ -126499,7 +126499,7 @@ mod tests {
     fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
@@ -126541,7 +126541,7 @@ mod tests {
 
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         for name in [
@@ -126597,7 +126597,7 @@ mod tests {
     fn hash_long_has_no_residual_constant_accessors() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph = super::lower_function(&llbc, "_hash_long").expect("lower _hash_long");
@@ -126632,7 +126632,7 @@ mod tests {
     fn try_typed_items_block_layout_branches_on_usize_discriminant() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
         let graph = super::lower_function(&llbc, "try_typed_items_block_layout")
@@ -126738,7 +126738,7 @@ mod tests {
     fn x_mul_ptwotable_is_a_prebuilt_int_array() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/majit-rlib.ullbc"
+            "/../../target/llbc/majit-rlib.ullbc"
         );
         let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
         let graph = super::lower_function(&llbc, "_x_mul").expect("lower _x_mul");
@@ -126790,7 +126790,7 @@ mod tests {
     fn slice_hash_has_no_residual_rotate_left() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-interpreter.ullbc"
+            "/../../target/llbc/pyre-interpreter.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real LLBC");
         let graph =
@@ -126831,7 +126831,7 @@ mod tests {
     fn method_root_scan_uses_rpython_range_iterator() {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../build/llbc/pyre-object.ullbc"
+            "/../../target/llbc/pyre-object.ullbc"
         );
         let llbc = Llbc::load(path).expect("load real object LLBC");
         let graph = super::lower_function(&llbc, "pyre_object::function::w_method_new")

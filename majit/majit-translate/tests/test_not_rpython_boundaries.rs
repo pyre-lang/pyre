@@ -10,7 +10,7 @@ use majit_translate::front::llbc_hints::harvest_hints_from_llbcs;
 
 const INTERPRETER_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-interpreter.ullbc"
+    "/../../target/llbc/pyre-interpreter.ullbc"
 );
 
 #[test]

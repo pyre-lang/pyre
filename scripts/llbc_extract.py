@@ -1799,7 +1799,7 @@ def llbc_store_max_age_days() -> int:
     raw = os.environ.get("LLBC_STORE_MAX_AGE_DAYS")
     if raw:
         return int(raw)
-    return 14
+    return 3
 
 
 def llbc_store_dir(root: Path) -> tuple[Path | None, str]:
@@ -2770,7 +2770,7 @@ def finish_charon_pass(proc: subprocess.Popen, command: list[str], dest: Path) -
     if proc.wait() != 0:
         raise subprocess.CalledProcessError(proc.returncode, command)
     # Fail loud rather than letting a missing artefact surface later
-    # as an opaque build.rs panic ("build/llbc/ is missing …").
+    # as an opaque build.rs panic ("target/llbc/ is missing …").
     if not dest.exists() or dest.stat().st_size == 0:
         raise SystemExit(
             f"extract-llbc.py: Charon emitted no artefact at {dest}\n"
@@ -4138,7 +4138,7 @@ def run_cli(
         type=int,
         default=None,
         help="with --prune-store: drop entries unused longer than N days "
-        "(default LLBC_STORE_MAX_AGE_DAYS or 14)",
+        "(default LLBC_STORE_MAX_AGE_DAYS or 3)",
     )
     modes.add_argument(
         "--check",

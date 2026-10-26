@@ -13,7 +13,7 @@
 //! reads, so a new translator workspace dep, a new `#[path]` include, or a
 //! new live `pyre_interpreter` function sample joins the key without a
 //! hand-maintained list. Interpreter, object, and jit *bodies* still reach
-//! the prepass only through `build/llbc/*.ullbc`; `fail_if_llbc_stale` is
+//! the prepass only through `target/llbc/*.ullbc`; `fail_if_llbc_stale` is
 //! the source-vs-artefact gate.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,10 +47,10 @@ pub const LLBC_CRATES: &[&str] = &[
 #[cfg(not(feature = "pyre-module"))]
 pub const LLBC_CRATES: &[&str] = &["majit-rlib", "pyre-object", "pyre-interpreter", "pyre-jit"];
 
-/// Directory under `build/` holding the artefacts `LLBC_CRATES` names. The
+/// Directory under `target/` holding the artefacts `LLBC_CRATES` names. The
 /// core reads the product set's artefacts for its crates: none of them
 /// depends on `pyre-module`.
-#[allow(dead_code)] // build/llbc artefact directory
+#[allow(dead_code)] // target/llbc artefact directory
 pub const LLBC_SUBDIR: &str = "llbc";
 
 /// Build-dependencies the manifest declares but this translation never links:

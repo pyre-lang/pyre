@@ -14,7 +14,7 @@ use majit_translate::model::{
 
 const OBJECT_LLBC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../build/llbc/pyre-object.ullbc"
+    "/../../target/llbc/pyre-object.ullbc"
 );
 
 /// `None` means the artefact is absent. A checkout that has not extracted
