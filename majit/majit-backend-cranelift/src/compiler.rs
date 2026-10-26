@@ -3315,6 +3315,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             &cur_fail_descrs,
             cur_num_ref_roots,
             cur_max_output_slots,
+            0,
             &FrameInputs::Ints(&current_inputs),
             attachments,
             cur_dispatch_key,
@@ -3894,6 +3895,29 @@ fn call_assembler_frame_outputs(frame_ptr: i64, outputs_ptr: *const i64) -> *con
     }
 }
 
+/// `compile.py must_compile`'s `cpu.get_value_direct(deadframe, index)` for
+/// a GUARD_VALUE exit. The index is a fail-argument position, read
+/// through `rd_locs`, or the trace's counter slot past them
+/// (`counter_slot_for`), a raw frame slot; `JitFrameDeadFrame::slot_of`
+/// resolves it the same way. `None` when the guard keeps no per-value
+/// counter.
+///
+/// # Safety
+/// `frame` is the live jitframe the guard exited with.
+unsafe fn guard_value_operand_in_frame(
+    descr: &dyn FailDescr,
+    frame: *const majit_backend::jitframe::JitFrame,
+) -> Option<i64> {
+    let index = majit_backend::guard_value_counter_slot(descr)?;
+    let slot = match descr.rd_locs().get(index) {
+        Some(&pos) if pos != 0xFFFF => pos as usize,
+        Some(_) => return Some(0),
+        None => index,
+    };
+    let frame = unsafe { JitFrame::resolve(frame as *mut JitFrame) };
+    Some(unsafe { majit_backend::llmodel::get_int_value_direct(frame, slot) as i64 })
+}
+
 /// direct call_assembler path. Ultra-lightweight: just increments
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
@@ -4111,11 +4135,13 @@ fn call_assembler_guard_failure_inner(
     // compile bridge. The bridge is attached to fail_descr for fast
     // dispatch on subsequent guard failures.  Skipped on giveup (None).
     if let (Some(_jct), Some(bridge_fn)) = (owning_jct.as_ref(), CALL_ASSEMBLER_BRIDGE_FN.get()) {
+        let guard_value_operand =
+            unsafe { guard_value_operand_in_frame(fail_descr, frame_ptr as *const _) };
         if let Some(result) = bridge_fn(
             frame_ptr as *mut majit_backend::jitframe::JitFrame,
             fail_descr_ptr as usize,
-            0,
-            false,
+            guard_value_operand.unwrap_or(0),
+            guard_value_operand.is_some(),
         ) {
             // compile.py handle_fail: the must_compile arm raises;
             // do not resume_in_blackhole.
@@ -10759,6 +10785,7 @@ fn run_compiled_code(
     fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
+    frame_info_depth: usize,
     inputs: &FrameInputs<'_>,
     attachments: &'static CpuDescrAttachments,
     dispatch_key: u32,
@@ -10774,6 +10801,7 @@ fn run_compiled_code(
         fail_descrs,
         num_ref_roots,
         max_output_slots,
+        frame_info_depth,
         inputs,
         attachments,
         dispatch_key,
@@ -10892,6 +10920,7 @@ fn run_compiled_code_inner(
     fail_descrs: &[DescrRef],
     num_ref_roots: usize,
     max_output_slots: usize,
+    frame_info_depth: usize,
     inputs: &FrameInputs<'_>,
     attachments: &'static CpuDescrAttachments,
     dispatch_key: u32,
@@ -10900,7 +10929,10 @@ fn run_compiled_code_inner(
     // jitframe.py: jitframe_allocate(frame_info)
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
-    let frame_depth = depth + num_ref_roots;
+    // llmodel.py execute_token: malloc_jitframe(clt.frame_info). A bridge
+    // grows clt.frame_info (assemble_bridge update_frame_depth); 0 when the
+    // caller has no token (external-JUMP re-entry, bridge dispatch).
+    let frame_depth = (depth + num_ref_roots).max(frame_info_depth);
     // Read once per entry, ahead of the run: the compiled call between the
     // sites below is opaque to the optimizer, so asking again after it
     // re-reads.
@@ -12043,9 +12075,17 @@ impl CraneliftBackend {
     /// fails with a bridge, switch to the bridge trace and continue.
     /// When a bridge FINISH with loop_reentry fires, switch back to the
     /// main loop.
-    fn execute_with_inputs(compiled: &CompiledLoop, inputs: FrameInputs<'_>) -> DeadFrame {
+    fn execute_with_inputs(
+        compiled: &CompiledLoop,
+        frame_info_depth: usize,
+        inputs: FrameInputs<'_>,
+    ) -> DeadFrame {
         expect_deadframe(Self::execute_with_inputs_at_dispatch_key(
-            compiled, inputs, 0, false,
+            compiled,
+            frame_info_depth,
+            inputs,
+            0,
+            false,
         ))
     }
 
@@ -12062,6 +12102,7 @@ impl CraneliftBackend {
     /// `Ok`.
     fn execute_with_inputs_at_dispatch_key(
         compiled: &CompiledLoop,
+        frame_info_depth: usize,
         inputs: FrameInputs<'_>,
         dispatch_key: u32,
         release_ref_finish: bool,
@@ -12077,6 +12118,7 @@ impl CraneliftBackend {
         let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
+        let mut cur_frame_info_depth = frame_info_depth;
         // Held in whatever form the caller already has, for the same reason
         // `cur_fail_descrs` is borrowed: the loop only READS the entry inputs,
         // and the one writer is the external-JUMP re-entry below, which brings
@@ -12110,6 +12152,7 @@ impl CraneliftBackend {
                 &cur_fail_descrs,
                 cur_num_ref_roots,
                 cur_max_output_slots,
+                cur_frame_info_depth,
                 &cur_inputs,
                 attachments,
                 cur_dispatch_key,
@@ -12137,6 +12180,7 @@ impl CraneliftBackend {
                     cur_num_ref_roots = num_ref_roots;
                     cur_inputs = FrameInputs::OwnedInts(inputs);
                     cur_max_output_slots = max_output_slots;
+                    cur_frame_info_depth = 0;
                 }
             }
         } // end loop
@@ -12180,6 +12224,7 @@ impl CraneliftBackend {
             &bridge.fail_descrs,
             bridge.num_ref_roots,
             bridge.max_output_slots,
+            0,
             &FrameInputs::Ints(&bridge_inputs),
             attachments,
             0, // bridge entry (br_table preamble slot)
@@ -21785,6 +21830,14 @@ fn collect_terminal_exit_layouts(
     Ok(layouts)
 }
 
+/// `clt.frame_info.jfi_frame_depth` of `token`, or 0 when it has no
+/// compiled loop token.
+fn clt_frame_depth(token: &JitCellToken) -> usize {
+    token.compiled_loop_token().map_or(0, |clt| unsafe {
+        (*clt.frame_info.data_ptr()).depth() as usize
+    })
+}
+
 fn update_published_frame_depth(token: &JitCellToken, frame_depth: usize) {
     let baseofs = JF_FRAME_ITEM0_OFS as i64 + GcHeader::SIZE as i64;
     if let Some(clt) = token.compiled_loop_token() {
@@ -22071,8 +22124,7 @@ impl CraneliftBackend {
         // prologue `_check_frame_depth` when a baked JUMP target is
         // wider (`guaranteed_frame_depth`); that miss is
         // `cranelift_realloc_frame` on every call.
-        let clt = unsafe { &*token.compiled_loop_token_ptr() };
-        let fi_depth = unsafe { (*clt.frame_info.data_ptr()).depth() as usize };
+        let fi_depth = clt_frame_depth(token);
         let own = compiled.max_output_slots.max(args.len()).max(1) + compiled.num_ref_roots;
         let num_slots = fi_depth.max(own);
         let facts = self.jitframe_facts;
@@ -22162,6 +22214,7 @@ impl CraneliftBackend {
                         &cur_fail_descrs,
                         num_ref_roots,
                         cur_max_output_slots,
+                        0,
                         &cur_inputs,
                         attachments,
                         dispatch_key,
@@ -22675,7 +22728,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("compiled data is not CompiledLoop")
             .current();
 
-        Self::execute_with_inputs(compiled, FrameInputs::Values(args))
+        Self::execute_with_inputs(compiled, clt_frame_depth(token), FrameInputs::Values(args))
     }
 
     /// `warmstate.py execute_assembler` ref exit. See
@@ -22692,7 +22745,13 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop")
             .current();
-        Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), 0, true)
+        Self::execute_with_inputs_at_dispatch_key(
+            compiled,
+            clt_frame_depth(token),
+            FrameInputs::Values(args),
+            0,
+            true,
+        )
     }
 
     /// `llmodel.py` `execute_token` / `warmstate.py execute_assembler` ref
@@ -22751,6 +22810,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // happens in `FrameInputs::write_into`, against the frame.
         expect_deadframe(Self::execute_with_inputs_at_dispatch_key(
             compiled,
+            clt_frame_depth(token),
             FrameInputs::Values(args),
             dispatch_key,
             false,
@@ -22770,7 +22830,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("compiled data is not CompiledLoop")
             .current();
 
-        Self::execute_with_inputs(compiled, FrameInputs::Ints(args))
+        Self::execute_with_inputs(compiled, clt_frame_depth(token), FrameInputs::Ints(args))
     }
 
     fn execute_token_ints_raw(
@@ -22809,6 +22869,7 @@ impl majit_backend::Backend for CraneliftBackend {
         let mut cur_fail_descrs: Cow<'_, [DescrRef]> = Cow::Borrowed(&compiled.fail_descrs);
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
+        let mut cur_frame_info_depth = clt_frame_depth(token);
         let mut cur_inputs = args.to_vec();
         // External-JUMP re-entry LABEL selector (host_reentry_dispatch_key);
         // 0 only for the initial entry — every external-JUMP re-entry,
@@ -22822,6 +22883,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 &cur_fail_descrs,
                 cur_num_ref_roots,
                 cur_max_output_slots,
+                cur_frame_info_depth,
                 &FrameInputs::Ints(&cur_inputs),
                 attachments,
                 cur_dispatch_key,
@@ -22887,6 +22949,8 @@ impl majit_backend::Backend for CraneliftBackend {
                         }
                     }
                 }
+                let guard_value_operand = majit_backend::guard_value_counter_slot(descr)
+                    .map(|slot| self.get_value_direct(&frame, slot));
                 return majit_backend::RawExecResult {
                     outputs: result,
                     typed_outputs: typed_result,
@@ -22898,7 +22962,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     is_finish: descr.is_finish(),
                     is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
                     status: descr.get_status(),
-                    guard_value_operand: None,
+                    guard_value_operand,
                     descr_arc,
                 };
             }
@@ -22948,6 +23012,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 cur_num_ref_roots = target_entry.num_ref_roots;
                 cur_max_output_slots = target_entry.max_output_slots;
                 cur_inputs = outputs;
+                cur_frame_info_depth = 0;
                 continue;
             }
 
@@ -23027,6 +23092,9 @@ impl majit_backend::Backend for CraneliftBackend {
 
             let exit_arity = fail_descr_fd.fail_arg_types().len();
             outputs = overlay_rd_locs_on_dense(&frame_slots, fail_descr_fd.rd_locs(), exit_arity);
+            // compile.py must_compile: get_value_direct(deadframe, index).
+            let guard_value_operand =
+                unsafe { guard_value_operand_in_frame(fail_descr_fd, exec.jf_gcref.0 as *const _) };
             let mut typed_outputs = Vec::with_capacity(exit_arity);
             for (&raw, &tp) in outputs.iter().zip(fail_descr_fd.fail_arg_types().iter()) {
                 match tp {
@@ -23050,7 +23118,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 is_finish: false,
                 is_exit_frame_with_exception: fail_descr_fd.is_exit_frame_with_exception(),
                 status: fail_descr_fd.get_status(),
-                guard_value_operand: None,
+                guard_value_operand,
                 descr_arc: fail_descr.to_arc(),
             };
         }
