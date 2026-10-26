@@ -2912,14 +2912,13 @@ pub fn build_ll_jit_append_helper_graph(
 /// ll_builder.current_buf.chars[pos] = char
 /// ```
 ///
-/// `jit.conditional_call(cond, func, *args)` rtypes to the single
-/// `jit_conditional_call` op (`jit.py`); the op is complete
-/// on its own (the backend performs the guarded call), so no
-/// `we_are_jitted()` wrapper is emitted — same shape as
-/// [`build_ll_strhash_helper_graph`]'s `jit_conditional_call_value`.
-/// `ll_grow_by` is the `direct_call`-style funcptr const. `current_pos`
-/// is re-read after the conditional call since `ll_grow_by` may reset
-/// it. Returns `Void`.
+/// `jit.conditional_call` is `_always_inline_ = 'try'` (`rlib/jit.py
+/// conditional_call`), so the call is the inlined `we_are_jitted()`
+/// switch: true → `jit_conditional_call`; false → `if cond:
+/// direct_call(ll_grow_by, ll_builder, 1)`. Both arms continue to the
+/// write-char tail. `ll_grow_by` is the `direct_call`-style funcptr
+/// const. `current_pos` is re-read after the conditional call since
+/// `ll_grow_by` may reset it. Returns `Void`.
 pub fn build_ll_append_char_helper_graph(
     name: &str,
     builder_ptr_lltype: LowLevelType,
@@ -2936,8 +2935,16 @@ pub fn build_ll_append_char_helper_graph(
         ))
     };
 
-    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype);
-    let char = variable_with_lltype("char", char_lltype);
+    let bool_case = |b: bool| {
+        Some(constant_with_lltype(
+            ConstValue::Bool(b),
+            LowLevelType::Bool,
+        ))
+    };
+    let one = || constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed);
+
+    let ll_builder = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let char = variable_with_lltype("char", char_lltype.clone());
     let startblock = Block::shared(vec![
         Hlvalue::Variable(ll_builder.clone()),
         Hlvalue::Variable(char.clone()),
@@ -2948,6 +2955,38 @@ pub fn build_ll_append_char_helper_graph(
         startblock.clone(),
         Hlvalue::Variable(return_var),
     );
+
+    let llb_jit = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let char_jit = variable_with_lltype("char", char_lltype.clone());
+    let cond_jit = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_jit = Block::shared(vec![
+        Hlvalue::Variable(llb_jit.clone()),
+        Hlvalue::Variable(char_jit.clone()),
+        Hlvalue::Variable(cond_jit.clone()),
+    ]);
+
+    let llb_interp_if = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let char_interp_if = variable_with_lltype("char", char_lltype.clone());
+    let cond_interp_if = variable_with_lltype("cond", LowLevelType::Bool);
+    let block_interp_if = Block::shared(vec![
+        Hlvalue::Variable(llb_interp_if.clone()),
+        Hlvalue::Variable(char_interp_if.clone()),
+        Hlvalue::Variable(cond_interp_if.clone()),
+    ]);
+
+    let llb_interp_direct = variable_with_lltype("ll_builder", builder_ptr_lltype.clone());
+    let char_interp_direct = variable_with_lltype("char", char_lltype.clone());
+    let block_interp_direct = Block::shared(vec![
+        Hlvalue::Variable(llb_interp_direct.clone()),
+        Hlvalue::Variable(char_interp_direct.clone()),
+    ]);
+
+    let llb_tail = variable_with_lltype("ll_builder", builder_ptr_lltype);
+    let char_tail = variable_with_lltype("char", char_lltype);
+    let block_tail = Block::shared(vec![
+        Hlvalue::Variable(llb_tail.clone()),
+        Hlvalue::Variable(char_tail.clone()),
+    ]);
 
     // cond = (ll_builder.current_pos == ll_builder.current_end).
     let pos0 = variable_with_lltype("pos", LowLevelType::Signed);
@@ -2975,42 +3014,123 @@ pub fn build_ll_append_char_helper_graph(
         Hlvalue::Variable(cond.clone()),
     ));
 
-    // jit.conditional_call(cond, ll_grow_by, ll_builder, 1).
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    // `rlib/jit.py conditional_call` is always inlined, so this is the
+    // identity-bearing `we_are_jitted()` SpecTag exitswitch (true link
+    // first, matching `build_ll_list_resize_ge_graph`): true →
+    // jit_conditional_call; false → if cond: direct_call.
+    startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder.clone()),
+                Hlvalue::Variable(char.clone()),
+                Hlvalue::Variable(cond.clone()),
+            ],
+            Some(block_jit.clone()),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(ll_builder),
+                Hlvalue::Variable(char),
+                Hlvalue::Variable(cond),
+            ],
+            Some(block_interp_if.clone()),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    block_jit.borrow_mut().operations.push(SpaceOperation::new(
         "jit_conditional_call",
         vec![
-            Hlvalue::Variable(cond),
-            Hlvalue::Constant(grow_by_fn),
-            Hlvalue::Variable(ll_builder.clone()),
-            constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+            Hlvalue::Variable(cond_jit),
+            Hlvalue::Constant(grow_by_fn.clone()),
+            Hlvalue::Variable(llb_jit.clone()),
+            one(),
         ],
         Hlvalue::Variable(void_result()),
     ));
+    block_jit.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(llb_jit), Hlvalue::Variable(char_jit)],
+            Some(block_tail.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    block_interp_if.borrow_mut().exitswitch = Some(Hlvalue::Variable(cond_interp_if));
+    block_interp_if.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(llb_interp_if.clone()),
+                Hlvalue::Variable(char_interp_if.clone()),
+            ],
+            Some(block_interp_direct.clone()),
+            bool_case(true),
+        )
+        .into_ref(),
+        Link::new(
+            vec![
+                Hlvalue::Variable(llb_interp_if),
+                Hlvalue::Variable(char_interp_if),
+            ],
+            Some(block_tail.clone()),
+            bool_case(false),
+        )
+        .into_ref(),
+    ]);
+
+    block_interp_direct
+        .borrow_mut()
+        .operations
+        .push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                Hlvalue::Constant(grow_by_fn),
+                Hlvalue::Variable(llb_interp_direct.clone()),
+                one(),
+            ],
+            Hlvalue::Variable(void_result()),
+        ));
+    block_interp_direct.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(llb_interp_direct),
+                Hlvalue::Variable(char_interp_direct),
+            ],
+            Some(block_tail.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
 
     // pos = ll_builder.current_pos (re-read after possible grow).
     let pos = variable_with_lltype("pos", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
         vec![
-            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(llb_tail.clone()),
             void_field_const("current_pos"),
         ],
         Hlvalue::Variable(pos.clone()),
     ));
     // ll_builder.current_pos = pos + 1.
     let newpos = variable_with_lltype("newpos", LowLevelType::Signed);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "int_add",
-        vec![
-            Hlvalue::Variable(pos.clone()),
-            constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
-        ],
+        vec![Hlvalue::Variable(pos.clone()), one()],
         Hlvalue::Variable(newpos.clone()),
     ));
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "setfield",
         vec![
-            Hlvalue::Variable(ll_builder.clone()),
+            Hlvalue::Variable(llb_tail.clone()),
             void_field_const("current_pos"),
             Hlvalue::Variable(newpos),
         ],
@@ -3019,16 +3139,13 @@ pub fn build_ll_append_char_helper_graph(
 
     // ll_builder.current_buf.chars[pos] = char.
     let buf = variable_with_lltype("buf", buf_lltype);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "getfield",
-        vec![
-            Hlvalue::Variable(ll_builder),
-            void_field_const("current_buf"),
-        ],
+        vec![Hlvalue::Variable(llb_tail), void_field_const("current_buf")],
         Hlvalue::Variable(buf.clone()),
     ));
     let chars = variable_with_lltype("chars", chars_array_ptr_lltype);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "getsubstruct",
         vec![
             Hlvalue::Variable(buf),
@@ -3036,17 +3153,17 @@ pub fn build_ll_append_char_helper_graph(
         ],
         Hlvalue::Variable(chars.clone()),
     ));
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
+    block_tail.borrow_mut().operations.push(SpaceOperation::new(
         "setarrayitem",
         vec![
             Hlvalue::Variable(chars),
             Hlvalue::Variable(pos),
-            Hlvalue::Variable(char),
+            Hlvalue::Variable(char_tail),
         ],
         Hlvalue::Variable(void_result()),
     ));
 
-    startblock.closeblock(vec![
+    block_tail.closeblock(vec![
         Link::new(vec![none_const()], Some(graph.returnblock.clone()), None).into_ref(),
     ]);
 
@@ -4097,7 +4214,7 @@ pub fn build_ll_jit_try_append_slice_helper_graph(
 /// exit's `exitcase` and its `last_exception` / `last_exc_value` extravars.
 /// `exc_args` must differ from `[class, instance]` so `make_exception_link`
 /// routes to `exc_target` instead of taking its bare-reraise fast path.
-fn close_ovfcheck_block(
+pub(crate) fn close_ovfcheck_block(
     block: &BlockRef,
     overflow_error: &[Hlvalue],
     normal_target: &BlockRef,
@@ -7444,21 +7561,55 @@ mod tests {
         assert_eq!(
             ops,
             vec![
-                "getfield",             // current_pos (for ==)
-                "getfield",             // current_end
-                "int_eq",               // current_pos == current_end
-                "jit_conditional_call", // conditional_call(cond, ll_grow_by, ...)
-                "getfield",             // current_pos (re-read)
-                "int_add",              // pos + 1
-                "setfield",             // current_pos = pos + 1
-                "getfield",             // current_buf
-                "getsubstruct",         // buf.chars
-                "setarrayitem",         // chars[pos] = char
+                "getfield", // current_pos (for ==)
+                "getfield", // current_end
+                "int_eq",   // current_pos == current_end
             ]
         );
-        // Single straight-line block + returnblock.
-        assert_eq!(startblock.exits.len(), 1);
+        match &startblock.exitswitch {
+            Some(Hlvalue::Constant(c)) => assert_eq!(
+                c.value,
+                super::ConstValue::SpecTag(super::WE_ARE_JITTED_TAG_ID)
+            ),
+            other => panic!("exitswitch must be the SpecTag constant, got {other:?}"),
+        }
+        assert_eq!(startblock.exits.len(), 2);
+        let jit_exit = startblock.exits[0].borrow();
+        assert!(
+            matches!(
+                &jit_exit.exitcase,
+                Some(Hlvalue::Constant(c)) if c.value == super::ConstValue::Bool(true)
+            ),
+            "true (jitted) link is first"
+        );
+        let jit_block = jit_exit.target.as_ref().unwrap().clone();
+        drop(jit_exit);
         drop(startblock);
+        let jit_borrow = jit_block.borrow();
+        let jit_ops: Vec<&str> = jit_borrow
+            .operations
+            .iter()
+            .map(|o| o.opname.as_str())
+            .collect();
+        assert_eq!(jit_ops, vec!["jit_conditional_call"]);
+        drop(jit_borrow);
+        let (count, all_ops) = walk_ops(&inner.startblock);
+        // start, jit, interp-if, interp-direct, tail, returnblock.
+        assert_eq!(count, 6);
+        assert_eq!(
+            all_ops
+                .iter()
+                .filter(|o| o.as_str() == "jit_conditional_call")
+                .count(),
+            1
+        );
+        assert_eq!(
+            all_ops
+                .iter()
+                .filter(|o| o.as_str() == "direct_call")
+                .count(),
+            1
+        );
         let Hlvalue::Variable(ret) = &inner.returnblock.borrow().inputargs[0] else {
             panic!("returnblock inputarg must be a Variable");
         };

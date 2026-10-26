@@ -25,10 +25,11 @@ use std::sync::LazyLock;
 
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
-    BlockRef, ConstValue, Constant, FunctionGraph, GraphRef, Hlvalue, LinkRef, SpaceOperation,
-    Variable,
+    BlockRef, ConstValue, Constant, FunctionGraph, GraphRef, Hlvalue, HostObject, LinkRef,
+    SpaceOperation, Variable,
 };
 use crate::tool::ansi_print::AnsiLogger;
+use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
@@ -238,7 +239,21 @@ fn const_to_llvalue(c: &Constant) -> LLValue {
         ConstValue::None => LLValue::Void,
         ConstValue::LLPtr(p) => LLValue::Ptr(p.clone()),
         ConstValue::LLAddress(a) => LLValue::Address(a.clone()),
+        // `_we_are_jitted` is `CDefinedIntSymbolic(default=0)`;
+        // the llinterp runs the non-jitted arm.
+        ConstValue::SpecTag(tag) if *tag == WE_ARE_JITTED_TAG_ID => match &c.concretetype {
+            Some(LowLevelType::Bool) => LLValue::Bool(false),
+            _ => LLValue::Int(0),
+        },
         other => LLValue::Const(other.clone()),
+    }
+}
+
+/// HostObject class carried on an etype / `llexitcase` Constant.
+fn host_class_object(value: &ConstValue) -> Option<&HostObject> {
+    match value {
+        ConstValue::HostObject(obj) if obj.is_class() => Some(obj),
+        _ => None,
     }
 }
 
@@ -1175,29 +1190,78 @@ impl LLFrame {
         })
     }
 
-    /// Upstream `op_direct_call(exdata.fn_exception_match, cls,
-    /// link.llexitcase)` at `llinterp.py`. The full port routes
-    /// through the typer's `exceptiondata.fn_exception_match` runtime
-    /// function — that helper is itself a generated graph and is not
-    /// yet ported. Until then the local implementation matches by
-    /// `host_class_name` qualname equality, which is sound for the
-    /// rtyper-built graphs the test suite exercises (concrete
-    /// exception classes, no class-hierarchy walks).
+    /// Upstream `LLFrame.eval_block` calls
+    /// `op_direct_call(exdata.fn_exception_match, cls, link.llexitcase)`.
+    /// `exceptiondata.fn_exception_match` is `rclass.py ll_issubclass` over
+    /// rtyped class vtables; etype / `llexitcase` Constants here carry
+    /// HostObject classes, so the same subclass test runs on those.
     fn exception_link_matches(&self, llexitcase: Option<&Hlvalue>, etype: &LLValue) -> bool {
         let Some(llexitcase) = llexitcase else {
             return false;
         };
-        let case_name = match llexitcase {
-            Hlvalue::Constant(c) => c.value.host_class_name().map(str::to_owned),
+        let exitcase = match llexitcase {
+            Hlvalue::Constant(c) => host_class_object(&c.value),
             _ => None,
         };
-        let etype_name = match etype {
-            LLValue::Const(c) => c.host_class_name().map(str::to_owned),
+        let cls = match etype {
+            LLValue::Const(c) => host_class_object(c),
             _ => None,
         };
-        match (case_name, etype_name) {
-            (Some(a), Some(b)) => a == b,
+        match (cls, exitcase) {
+            (Some(cls), Some(exitcase)) => self.fn_exception_match(cls, exitcase),
             _ => false,
+        }
+    }
+
+    /// `exceptiondata.fn_exception_match` / `rclass.py ll_issubclass`.
+    /// True when `cls` is a subclass of `exitcase` (a superclass handler
+    /// catches a subclass).
+    fn fn_exception_match(&self, cls: &HostObject, exitcase: &HostObject) -> bool {
+        cls.is_subclass_of(exitcase)
+    }
+
+    /// `LLFrame.make_llexception`: store the standard exception
+    /// class/instance as `pending_exception` so `eval_block` routes it
+    /// through `dispatch_exception`. The pair is the same
+    /// `exception_args` HostObject class/instance
+    /// `close_ovfcheck_block` puts on an OverflowError exit, so
+    /// `fn_exception_match` walks the HostObject class hierarchy.
+    fn make_llexception(&mut self, name: &str) -> Result<(), TaskError> {
+        let args =
+            crate::translator::rtyper::rtyper::exception_args(name).map_err(|e| TaskError {
+                message: format!("LLFrame.make_llexception: {e}"),
+            })?;
+        let (etype, evalue) = match args.as_slice() {
+            [Hlvalue::Constant(cls), Hlvalue::Constant(inst)] => {
+                (const_to_llvalue(cls), const_to_llvalue(inst))
+            }
+            _ => {
+                return Err(TaskError {
+                    message: format!(
+                        "LLFrame.make_llexception: {name} did not yield class/instance"
+                    ),
+                });
+            }
+        };
+        self.pending_exception = Some((etype, evalue));
+        Ok(())
+    }
+
+    /// `LLFrame.op_int_add_ovf` / `op_int_sub_ovf` / `op_int_mul_ovf`:
+    /// `ovfcheck` then `make_llexception` on overflow. The result is
+    /// `exceptiontransform.default_error_value` for Signed (0).
+    fn op_int_ovf(
+        &mut self,
+        opname: &str,
+        vals: &[LLValue],
+        op: fn(i64, i64) -> Option<i64>,
+    ) -> Result<LLValue, TaskError> {
+        match op(vals[0].as_i64(opname)?, vals[1].as_i64(opname)?) {
+            Some(n) => Ok(LLValue::Int(n)),
+            None => {
+                self.make_llexception("OverflowError")?;
+                Ok(LLValue::Int(0))
+            }
         }
     }
 
@@ -1252,7 +1316,11 @@ impl LLFrame {
 
     /// Upstream `getoperationhandler` at `llinterp.py`, with
     /// only the local primitive fold subset installed.
-    fn getoperationhandler(&self, opname: &str, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+    fn getoperationhandler(
+        &mut self,
+        opname: &str,
+        vals: &[LLValue],
+    ) -> Result<LLValue, TaskError> {
         match opname {
             "same_as" => vals.first().cloned().ok_or_else(|| TaskError {
                 message: "llinterp.py:405 same_as expected one argument".to_string(),
@@ -1262,6 +1330,18 @@ impl LLFrame {
                     .as_i64(opname)?
                     .wrapping_add(vals[1].as_i64(opname)?),
             )),
+            "int_add_ovf" => self.op_int_ovf(opname, vals, i64::checked_add),
+            "int_add_nonneg_ovf" => {
+                let y = vals[1].as_i64(opname)?;
+                debug_assert!(
+                    y >= 0,
+                    "LLFrame.op_int_add_nonneg_ovf: y must be nonnegative"
+                );
+                let _ = y;
+                self.op_int_ovf(opname, vals, i64::checked_add)
+            }
+            "int_sub_ovf" => self.op_int_ovf(opname, vals, i64::checked_sub),
+            "int_mul_ovf" => self.op_int_ovf(opname, vals, i64::checked_mul),
             "int_sub" => Ok(LLValue::Int(
                 vals[0]
                     .as_i64(opname)?
@@ -1643,6 +1723,7 @@ impl LLFrame {
             "hint" => vals.first().cloned().ok_or_else(|| TaskError {
                 message: "llinterp.py LLFrame.op_hint expected a value".to_string(),
             }),
+            "jit_conditional_call" => self.op_jit_conditional_call(vals),
             "jit_conditional_call_value" => self.op_jit_conditional_call_value(vals),
             _ => Err(TaskError {
                 message: format!(
@@ -1807,23 +1888,22 @@ impl LLFrame {
         lowlevel_to_llvalue(current, "getinteriorfield")
     }
 
-    /// Non-jitted `conditional_call_elidable`: if `value` is nonzero
-    /// return it, otherwise `direct_call(function, *args)`. Helper graphs
-    /// emit `jit_conditional_call_value` as that residual form
-    /// (`LLHelpers.ll_strhash`).
-    fn op_jit_conditional_call_value(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
-        if vals.len() < 2 {
-            return Err(TaskError {
-                message:
-                    "llinterp.py LLFrame.op_jit_conditional_call_value expected value, function"
-                        .to_string(),
-            });
-        }
-        if vals[0].truth() {
-            Ok(vals[0].clone())
-        } else {
-            self.op_direct_call(&vals[1..])
-        }
+    /// `LLFrame.op_jit_conditional_call` (`llinterp.py`): the jitted
+    /// arm of inlined `conditional_call`. llinterp takes the
+    /// non-jitted arm.
+    fn op_jit_conditional_call(&self, _vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        Err(TaskError {
+            message: "NotImplementedError: should not be called while not jitted".to_string(),
+        })
+    }
+
+    /// `LLFrame.op_jit_conditional_call_value` (`llinterp.py`): the
+    /// jitted arm of inlined `conditional_call_elidable`. llinterp
+    /// takes the non-jitted arm.
+    fn op_jit_conditional_call_value(&self, _vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        Err(TaskError {
+            message: "NotImplementedError: should not be called while not jitted".to_string(),
+        })
     }
 }
 
@@ -2043,7 +2123,7 @@ impl _address_of_thread_local {
 mod tests {
     use super::*;
     use crate::annotator::annrpython::RPythonAnnotator;
-    use crate::flowspace::model::{Block, BlockRefExt, Link};
+    use crate::flowspace::model::{Block, BlockRefExt, HOST_ENV, Link};
     use crate::translator::rtyper::lltypesystem::lltype::{
         _getconcretetype, Array, FuncType, LowLevelType, Ptr, functionptr,
         functionptr_for_graph_with_type, getfunctionptr, nullptr,
@@ -2698,6 +2778,246 @@ mod tests {
         assert_eq!(*out.downcast::<i64>().expect("Signed return"), 42);
     }
 
+    #[test]
+    fn exception_link_matches_a_superclass_handler() {
+        // `exceptiondata.fn_exception_match` / `rclass.py ll_issubclass`:
+        // a superclass handler catches a subclass.
+        let frame = dummy_frame();
+        let zdiv = HOST_ENV
+            .lookup_exception_class("ZeroDivisionError")
+            .expect("ZeroDivisionError");
+        let exception = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let type_error = HOST_ENV
+            .lookup_exception_class("TypeError")
+            .expect("TypeError");
+
+        let etype = LLValue::Const(ConstValue::HostObject(zdiv));
+        let super_case = Hlvalue::Constant(Constant::new(ConstValue::HostObject(exception)));
+        let unrelated = Hlvalue::Constant(Constant::new(ConstValue::HostObject(type_error)));
+
+        assert!(frame.exception_link_matches(Some(&super_case), &etype));
+        assert!(!frame.exception_link_matches(Some(&unrelated), &etype));
+    }
+
+    fn pending_overflow_name(frame: &LLFrame) -> Option<String> {
+        match &frame.pending_exception {
+            Some((LLValue::Const(c), _)) => c.host_class_name().map(str::to_owned),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn int_add_ovf_returns_sum_and_raises_overflowerror() {
+        // `LLFrame.op_int_add_ovf`: ovfcheck(x + y); OverflowError becomes
+        // pending_exception via `make_llexception`.
+        let mut frame = dummy_frame();
+        let sum = frame
+            .getoperationhandler("int_add_ovf", &[LLValue::Int(40), LLValue::Int(2)])
+            .expect("int_add_ovf sum");
+        assert_eq!(sum, LLValue::Int(42));
+        assert!(frame.pending_exception.is_none());
+
+        let overflowed = frame
+            .getoperationhandler("int_add_ovf", &[LLValue::Int(i64::MAX), LLValue::Int(1)])
+            .expect("int_add_ovf overflow returns default_error_value");
+        assert_eq!(overflowed, LLValue::Int(0));
+        assert_eq!(
+            pending_overflow_name(&frame).as_deref(),
+            Some("OverflowError")
+        );
+
+        frame.pending_exception = None;
+        let nonneg = frame
+            .getoperationhandler("int_add_nonneg_ovf", &[LLValue::Int(3), LLValue::Int(4)])
+            .expect("int_add_nonneg_ovf sum");
+        assert_eq!(nonneg, LLValue::Int(7));
+        assert!(frame.pending_exception.is_none());
+
+        let sub = frame
+            .getoperationhandler("int_sub_ovf", &[LLValue::Int(i64::MIN), LLValue::Int(1)])
+            .expect("int_sub_ovf overflow");
+        assert_eq!(sub, LLValue::Int(0));
+        assert_eq!(
+            pending_overflow_name(&frame).as_deref(),
+            Some("OverflowError")
+        );
+
+        frame.pending_exception = None;
+        let mul = frame
+            .getoperationhandler("int_mul_ovf", &[LLValue::Int(i64::MAX), LLValue::Int(2)])
+            .expect("int_mul_ovf overflow");
+        assert_eq!(mul, LLValue::Int(0));
+        assert_eq!(
+            pending_overflow_name(&frame).as_deref(),
+            Some("OverflowError")
+        );
+    }
+
+    fn malloc_resized_signed_list(list_lltype: &LowLevelType, items: &[i64]) -> _ptr {
+        let LowLevelType::Ptr(ptr) = list_lltype else {
+            panic!("ListRepr lltype is Ptr");
+        };
+        let PtrTarget::Struct(body) = &ptr.TO else {
+            panic!("ListRepr Ptr target is Struct");
+        };
+        let items_t = body._flds.get("items").expect("items field").clone();
+        let LowLevelType::Ptr(items_ptr) = &items_t else {
+            panic!("items field is Ptr");
+        };
+        let PtrTarget::Array(arr_t) = &items_ptr.TO else {
+            panic!("items TO is Array");
+        };
+        let mut header = malloc(
+            LowLevelType::Struct(Box::new(body.clone())),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("list header");
+        let mut arr = malloc(
+            LowLevelType::Array(Box::new(arr_t.clone())),
+            Some(items.len()),
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("list items");
+        for (i, v) in items.iter().enumerate() {
+            arr.setitem(i, LowLevelValue::Signed(*v)).expect("setitem");
+        }
+        header
+            .setattr("length", LowLevelValue::Signed(items.len() as i64))
+            .expect("length");
+        header
+            .setattr("items", LowLevelValue::Ptr(Box::new(arr)))
+            .expect("items field");
+        header
+    }
+
+    fn list_signed_contents(list: &_ptr) -> Vec<i64> {
+        let length = match list.getattr("length").expect("length") {
+            LowLevelValue::Signed(n) => n as usize,
+            other => panic!("length is Signed, got {other:?}"),
+        };
+        let items = match list.getattr("items").expect("items") {
+            LowLevelValue::Ptr(p) => p,
+            other => panic!("items is Ptr, got {other:?}"),
+        };
+        (0..length)
+            .map(|i| match items.getitem(i).expect("getitem") {
+                LowLevelValue::Signed(n) => n,
+                other => panic!("item is Signed, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ll_extend_runs_in_llinterp() {
+        // Mint `ll_extend` the way `rlist` tests mint `rtype_method("append")`,
+        // then `eval_funcptr` two small Signed lists.
+        use std::sync::Arc;
+
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeInteger, SomeList, SomeValue};
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rlist::ListRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let list_repr: Arc<ListRepr> =
+            Arc::new(ListRepr::new(&rtyper, r_int).expect("ListRepr::new"));
+        let list_lltype = list_repr.lowleveltype().clone();
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let v_l1 = Variable::new();
+        v_l1.set_concretetype(Some(list_lltype.clone()));
+        let v_l2 = Variable::new();
+        v_l2.set_concretetype(Some(list_lltype.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Void));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call".to_string(),
+                vec![Hlvalue::Variable(v_l1), Hlvalue::Variable(v_l2)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                true,
+                true,
+            ))),
+            SomeValue::List(SomeList::new(ListDef::new(
+                None,
+                SomeValue::Integer(SomeInteger::new(false, false)),
+                true,
+                true,
+            ))),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(list_repr.clone() as Arc<dyn Repr>),
+            Some(list_repr.clone() as Arc<dyn Repr>),
+        ]);
+
+        list_repr
+            .rtype_method("extend", &hop)
+            .unwrap_or_else(|err| panic!("list extend: {err:?}"));
+        let fptr = {
+            let ops = llops.borrow();
+            assert_eq!(ops.ops[0].opname, "direct_call");
+            let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+                panic!("expected Constant funcptr as direct_call arg 0");
+            };
+            match &c.value {
+                ConstValue::LLPtr(p) => (**p).clone(),
+                other => panic!("expected LLPtr funcptr, got {other:?}"),
+            }
+        };
+
+        let l1 = malloc_resized_signed_list(&list_lltype, &[1, 2]);
+        let l2 = malloc_resized_signed_list(&list_lltype, &[3, 4]);
+        eval_funcptr(
+            &fptr,
+            &[
+                LowLevelValue::Ptr(Box::new(l1.clone())),
+                LowLevelValue::Ptr(Box::new(l2)),
+            ],
+        )
+        .expect("ll_extend eval_funcptr");
+        assert_eq!(list_signed_contents(&l1), vec![1, 2, 3, 4]);
+        let _keep = ann;
+    }
+
+    #[test]
+    fn jit_intrinsic_funcptr_runs_its_false_body() {
+        // `rlib/jit.py isconstant`: GRAPH is `return NonConstant(False)`;
+        // `LLFrame.perform_call` runs `_ptr._obj.graph`.
+        use crate::translator::rtyper::lltypesystem::rstr::jit_isconstant_intrinsic_funcptr;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let c = jit_isconstant_intrinsic_funcptr(&rtyper, LowLevelType::Signed)
+            .expect("jit_isconstant_intrinsic_funcptr");
+        let fptr = match &c.value {
+            ConstValue::LLPtr(p) => (**p).clone(),
+            other => panic!("expected LLPtr funcptr, got {other:?}"),
+        };
+        let out = eval_funcptr(&fptr, &[LowLevelValue::Signed(0)]).expect("eval_funcptr");
+        assert_eq!(out, LowLevelValue::Bool(false));
+        let _keep = ann;
+    }
+
     fn add_graph() -> GraphRef {
         let x = Variable::named("x");
         x.set_concretetype(Some(LowLevelType::Signed));
@@ -2893,6 +3213,97 @@ mod tests {
     }
 
     #[test]
+    fn ll_strhash_llinterp_takes_non_jitted_arm() {
+        use crate::translator::rtyper::lltypesystem::rstr::{ll_strhash_value, llstr};
+        use crate::translator::rtyper::rstr::string_repr;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let llfn = string_repr()
+            .get_ll_hash_function(&rtyper)
+            .expect("ll_strhash helper")
+            .expect("Some");
+        let fptr = funcptr_for_hash_helper(llfn);
+
+        let bytes = b"hello";
+        let s = llstr(bytes).expect("llstr hash=0");
+        assert_eq!(
+            s.getattr("hash").expect("hash field"),
+            LowLevelValue::Signed(0)
+        );
+        let expected = ll_strhash_value(bytes);
+        let h = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(s.clone()))])
+            .expect("ll_strhash miss");
+        assert_eq!(h, LowLevelValue::Signed(expected));
+        assert_eq!(
+            s.getattr("hash").expect("hash field after miss"),
+            LowLevelValue::Signed(expected)
+        );
+
+        let mut cached = llstr(bytes).expect("llstr cached");
+        cached
+            .setattr("hash", LowLevelValue::Signed(12345))
+            .expect("set hash");
+        let h_cached = eval_funcptr(&fptr, &[LowLevelValue::Ptr(Box::new(cached.clone()))])
+            .expect("ll_strhash hit");
+        assert_eq!(h_cached, LowLevelValue::Signed(12345));
+        assert_eq!(
+            cached.getattr("hash").expect("hash field after hit"),
+            LowLevelValue::Signed(12345)
+        );
+    }
+
+    #[test]
+    fn jit_conditional_call_value_raises_while_not_jitted() {
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::Signed));
+        let f = Variable::named("f");
+        f.set_concretetype(Some(LowLevelType::Signed));
+        let result = Variable::named("result");
+        result.set_concretetype(Some(LowLevelType::Signed));
+
+        let start = Block::shared(vec![x.clone().into(), f.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_conditional_call_value",
+            vec![x.into(), f.into()],
+            result.clone().into(),
+        ));
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "bare_jit_conditional_call_value",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![result.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let err = interp
+            .eval_graph(
+                graph as Rc<dyn Any>,
+                vec![Rc::new(0_i64) as Rc<dyn Any>, Rc::new(0_i64) as Rc<dyn Any>],
+                false,
+            )
+            .expect_err("jit_conditional_call_value is refused while not jitted");
+        assert!(
+            err.message.contains("NotImplementedError"),
+            "{}",
+            err.message
+        );
+        assert!(
+            err.message
+                .contains("should not be called while not jitted"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
     fn eval_funcptr_rejects_arity_and_type_mismatch_then_runs_matching_call() {
         let graph = add_graph();
         let arity_ft = FuncType {
@@ -3004,7 +3415,7 @@ mod tests {
 
     #[test]
     fn char_eq_rejects_non_char() {
-        let frame = dummy_frame();
+        let mut frame = dummy_frame();
         let err = frame
             .getoperationhandler("char_eq", &[LLValue::Int(1), LLValue::Str("a".into())])
             .expect_err("non-char");
@@ -3058,7 +3469,7 @@ mod tests {
     fn getfield_of_container_field_raises() {
         // `LLFrame.op_getfield`: container field (inlined sub-struct) is
         // `AssertionError`, not a value.
-        let frame = dummy_frame();
+        let mut frame = dummy_frame();
         let p = nested_struct_ptr();
         let err = frame
             .getoperationhandler(
@@ -3073,7 +3484,7 @@ mod tests {
     fn getinteriorfield_of_interior_pointer_raises() {
         // `LLFrame.op_getinteriorfield`: walking to an inlined Raw sub-struct
         // of a Gc parent lands on `_interior_ptr`.
-        let frame = dummy_frame();
+        let mut frame = dummy_frame();
         let p = nested_struct_ptr();
         let err = frame
             .getoperationhandler(

@@ -28,6 +28,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
+use crate::translator::rtyper::lltypesystem::rbuilder::close_ovfcheck_block;
 use crate::translator::rtyper::lltypesystem::rstr::{
     jit_isconstant_intrinsic_funcptr, jit_isvirtual_intrinsic_funcptr, sub_helper_funcptr_constant,
 };
@@ -4715,7 +4716,10 @@ pub(crate) fn build_ll_append_helper_graph(
 /// def ll_extend(l1, l2):
 ///     len1 = l1.ll_length()
 ///     len2 = l2.ll_length()
-///     newlength = ovfcheck(len1 + len2)   # OverflowError -> MemoryError
+///     try:
+///         newlength = ovfcheck(len1 + len2)
+///     except OverflowError:
+///         raise MemoryError
 ///     l1._ll_resize_ge(newlength)
 ///     ll_arraycopy(l2, l1, 0, len1, len2)
 /// ```
@@ -4728,9 +4732,9 @@ pub(crate) fn build_ll_append_helper_graph(
 /// BEFORE the resize (which overwrites `l1.length`), and `l1.items` AFTER
 /// (the resize may reallocate it). The copy lands the source elements at
 /// `l1.items[len1 ..]` via the general [`build_ll_arraycopy_general_helper_graph`].
-/// `ovfcheck(len1 + len2)` is modelled: both addends are non-negative list
-/// lengths, so the signed sum overflows iff `newlength < len1`, which branches
-/// to a MemoryError raise. `rtype_method_extend` still declares
+/// `ovfcheck(len1 + len2)` is an `int_add_ovf` closing its block on
+/// `c_last_exception`; the OverflowError exit raises MemoryError.
+/// `rtype_method_extend` still declares
 /// `exception_cannot_occur` — MemoryError is an implicit (always-possible)
 /// exception, not a Python-level one the caller's flow graph handles.
 #[expect(
@@ -4776,29 +4780,19 @@ fn build_ll_extend_helper_graph(
     ));
     // len2 = l2 length (per layout).
     let len2 = emit_list_length_read(&startblock, l2_layout, &l2_arg);
-    // newlength = len1 + len2.
+    // newlength = ovfcheck(len1 + len2). Trailing `int_add_ovf` of startblock
+    // so the OverflowError catch can attach (`close_ovfcheck_block`).
     let newlength = variable_with_lltype("newlength", LowLevelType::Signed);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "int_add",
+        "int_add_ovf",
         vec![
             Hlvalue::Variable(len1.clone()),
             Hlvalue::Variable(len2.clone()),
         ],
         Hlvalue::Variable(newlength.clone()),
     ));
-    // ovfcheck(len1 + len2): len1/len2 are list lengths (>= 0), so the signed
-    // sum overflows iff it wraps below len1 — that path raises MemoryError.
-    let overflow = variable_with_lltype("overflow", LowLevelType::Bool);
-    startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "int_lt",
-        vec![
-            Hlvalue::Variable(newlength.clone()),
-            Hlvalue::Variable(len1.clone()),
-        ],
-        Hlvalue::Variable(overflow.clone()),
-    ));
 
-    // continue block (overflow false): resize l1 + copy l2 into it.
+    // continue block (no overflow): resize l1 + copy l2 into it.
     let l1_c = variable_with_lltype("l1", ptr_lltype.clone());
     let l2_c = variable_with_lltype("l2", l2_lltype.clone());
     let len1_c = variable_with_lltype("len1", LowLevelType::Signed);
@@ -4812,29 +4806,31 @@ fn build_ll_extend_helper_graph(
         Hlvalue::Variable(newlength_c.clone()),
     ]);
 
-    // overflow true -> raise MemoryError; false -> block_continue.
-    let exc_args = exception_args("MemoryError")?;
-    startblock.borrow_mut().exitswitch = Some(Hlvalue::Variable(overflow));
-    startblock.closeblock(vec![
+    // except OverflowError: raise MemoryError. The handler has no ops and
+    // a single link to the graph exceptblock carrying MemoryError.
+    let block_raise_memory_error = Block::shared(vec![]);
+    block_raise_memory_error.closeblock(vec![
         Link::new(
-            exc_args,
+            exception_args("MemoryError")?,
             Some(graph.exceptblock.clone()),
-            Some(bool_const(true)),
-        )
-        .into_ref(),
-        Link::new(
-            vec![
-                Hlvalue::Variable(l1_arg),
-                Hlvalue::Variable(l2_arg),
-                Hlvalue::Variable(len1),
-                Hlvalue::Variable(len2),
-                Hlvalue::Variable(newlength),
-            ],
-            Some(block_continue.clone()),
-            Some(bool_const(false)),
+            None,
         )
         .into_ref(),
     ]);
+    close_ovfcheck_block(
+        &startblock,
+        &exception_args("OverflowError")?,
+        &block_continue,
+        vec![
+            Hlvalue::Variable(l1_arg),
+            Hlvalue::Variable(l2_arg),
+            Hlvalue::Variable(len1),
+            Hlvalue::Variable(len2),
+            Hlvalue::Variable(newlength),
+        ],
+        &block_raise_memory_error,
+        vec![],
+    );
 
     // _ll_list_resize_ge(l1, newlength) — sets l1.length = newlength, grows items.
     let resize_void = variable_with_lltype("v", LowLevelType::Void);
@@ -10347,7 +10343,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::annotator::listdef::ListDef;
     use crate::annotator::model::{SomeInteger, SomeList, SomeValue};
-    use crate::flowspace::model::{Variable, checkgraph};
+    use crate::flowspace::model::{Variable, c_last_exception, checkgraph};
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rint::{IntegerRepr, signed_repr, unsigned_repr};
     use crate::translator::rtyper::rmodel::{inputconst, rtyper_makerepr};
@@ -14382,6 +14378,126 @@ mod tests {
                 "append must mint `{expected}`, got {names:?}"
             );
         }
+        let _keep = ann;
+    }
+
+    /// `ll_extend` (`rlist.py` `ll_extend`): `ovfcheck(len1 + len2)` is the
+    /// trailing `int_add_ovf` of startblock, switched on `c_last_exception`;
+    /// the OverflowError exit raises MemoryError.
+    #[test]
+    fn ll_extend_ovfcheck_is_int_add_ovf_on_last_exception() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let repr = ListRepr::new(&rtyper, r_int).expect("ListRepr::new");
+        let ptr = repr.lowleveltype().clone();
+        let item = LowLevelType::Signed;
+        let items_ptr = items_array_ptr_lltype(&item);
+        let arraycopy_grow = {
+            let item = item.clone();
+            rtyper
+                .lowlevel_helper_function_with_builder(
+                    "ll_arraycopy".to_string(),
+                    vec![items_ptr.clone(), items_ptr.clone(), LowLevelType::Signed],
+                    LowLevelType::Void,
+                    move |_r, _a, _res| {
+                        build_ll_arraycopy_helper_graph("ll_arraycopy", item.clone())
+                    },
+                )
+                .expect("ll_arraycopy")
+        };
+        let resize_ge = {
+            let ptr = ptr.clone();
+            let item = item.clone();
+            rtyper
+                .lowlevel_helper_function_with_builder(
+                    "_ll_list_resize_ge".to_string(),
+                    vec![ptr.clone(), LowLevelType::Signed],
+                    LowLevelType::Void,
+                    move |rtyper, _a, _res| {
+                        build_ll_list_resize_ge_helper_graph(
+                            rtyper,
+                            "_ll_list_resize_ge",
+                            ptr.clone(),
+                            item.clone(),
+                            &arraycopy_grow,
+                        )
+                    },
+                )
+                .expect("_ll_list_resize_ge")
+        };
+        let arraycopy_range = {
+            let item = item.clone();
+            let items = items_ptr.clone();
+            rtyper
+                .lowlevel_helper_function_with_builder(
+                    "ll_arraycopy".to_string(),
+                    vec![
+                        items_ptr.clone(),
+                        items_ptr,
+                        LowLevelType::Signed,
+                        LowLevelType::Signed,
+                        LowLevelType::Signed,
+                    ],
+                    LowLevelType::Void,
+                    move |_r, _a, _res| {
+                        build_ll_arraycopy_general_helper_graph(
+                            "ll_arraycopy",
+                            item.clone(),
+                            items.clone(),
+                        )
+                    },
+                )
+                .expect("ll_arraycopy general")
+        };
+        let helper = build_ll_extend_helper_graph(
+            &rtyper,
+            "ll_extend",
+            ptr.clone(),
+            ptr,
+            ListLayout::Resized,
+            item,
+            &resize_ge,
+            &arraycopy_range,
+        )
+        .expect("build_ll_extend_helper_graph");
+        let inner = helper.graph.borrow();
+        let start = inner.startblock.borrow();
+        let start_ops: Vec<&str> = start.operations.iter().map(|o| o.opname.as_str()).collect();
+        assert_eq!(*start_ops.last().expect("startblock ops"), "int_add_ovf");
+        assert!(
+            !start_ops.iter().any(|op| *op == "int_lt"),
+            "startblock ovfcheck is int_add_ovf, got {start_ops:?}"
+        );
+        assert_eq!(
+            start.exitswitch,
+            Some(Hlvalue::Constant(c_last_exception()))
+        );
+        assert_eq!(start.exits.len(), 2);
+        let raise_block = start.exits[1]
+            .borrow()
+            .target
+            .clone()
+            .expect("overflow exit target");
+        drop(start);
+        let raise = raise_block.borrow();
+        assert_eq!(raise.inputargs.len(), 0);
+        assert_eq!(raise.exits.len(), 1);
+        let except_target = raise.exits[0]
+            .borrow()
+            .target
+            .clone()
+            .expect("MemoryError raise target");
+        drop(raise);
+        assert!(Rc::ptr_eq(&except_target, &inner.exceptblock));
+        let (_, all_ops) = walk_ops(&inner.startblock);
+        let n = |name: &str| all_ops.iter().filter(|o| o.as_str() == name).count();
+        assert_eq!(n("int_add_ovf"), 1);
+        assert_eq!(n("int_lt"), 0);
+        assert_eq!(n("int_add"), 0);
         let _keep = ann;
     }
 }

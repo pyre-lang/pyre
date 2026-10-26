@@ -963,7 +963,43 @@ fn transduce_op(
                 .map(|a| materialize(out, block, a))
                 .collect();
             let result = expect_var(&op.result);
-            emit_conditional_call_oopspec(out, block, cond, &callee, extra_args, result);
+            emit_conditional_call_oopspec_named(
+                out,
+                block,
+                cond,
+                &callee,
+                extra_args,
+                result,
+                "conditional_call",
+            );
+        }
+        // `rlib/jit.py conditional_call_elidable` inlines to
+        // `jit_conditional_call_value` on the `we_are_jitted()` true arm.
+        // `jtransform.py Transformer.rewrite_op_jit_conditional_call_value`
+        // / `_rewrite_op_cond_call` rewrites the interpreter-facing
+        // `majit_rlib::jit::conditional_call_elidableN` Call (`oopspec
+        // jit.conditional_call_value`) to `OpKind::ConditionalCallValue`.
+        "jit_conditional_call_value" => {
+            assert!(
+                op.args.len() >= 2,
+                "jtransform_opname::lower_graph: jit_conditional_call_value needs value and fnptr"
+            );
+            let value = materialize(out, block, &op.args[0]);
+            let callee = callee_name_from_funcptr(&op.args[1]);
+            let extra_args: Vec<FVar> = op.args[2..]
+                .iter()
+                .map(|a| materialize(out, block, a))
+                .collect();
+            let result = expect_var(&op.result);
+            emit_conditional_call_oopspec_named(
+                out,
+                block,
+                value,
+                &callee,
+                extra_args,
+                result,
+                "conditional_call_elidable",
+            );
         }
         // `jtransform.py Transformer.rewrite_op_debug_assert` returns [].
         "debug_assert" => {}
@@ -985,7 +1021,41 @@ pub(crate) fn emit_conditional_call_oopspec(
     extra_args: Vec<FVar>,
     result: FVar,
 ) {
+    emit_conditional_call_oopspec_named(
+        out,
+        block,
+        cond,
+        callee_name,
+        extra_args,
+        result,
+        "conditional_call",
+    )
+}
+
+/// Interpreter-facing `oopspec("jit.conditional_call")` /
+/// `oopspec("jit.conditional_call_value")` Call.
+///
+/// `_rewrite_op_cond_call` reads args[0] as the condition/value, args[1] as
+/// the function (`fn_const_target_of` of a 0-arg `__fn_const` Call),
+/// and args[2:] as the callee arguments. The helper leaf is
+/// `{helper_prefix}{n}`: `conditional_callN` (`is_jit_conditional_call_path`)
+/// or `conditional_call_elidableN`. Only `conditional_call_elidable1` exists
+/// in majit-rlib.
+fn emit_conditional_call_oopspec_named(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    cond: FVar,
+    callee_name: &str,
+    extra_args: Vec<FVar>,
+    result: FVar,
+    helper_prefix: &str,
+) {
     let n = extra_args.len();
+    if helper_prefix == "conditional_call_elidable" && n != 1 {
+        panic!(
+            "jtransform_opname::lower_graph: missing majit_rlib::jit::conditional_call_elidable{n} helper"
+        );
+    }
     let fn_target = CallTarget::function_path(
         std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
     );
@@ -1001,7 +1071,7 @@ pub(crate) fn emit_conditional_call_oopspec(
         )
         .expect("__fn_const produces a result var");
     fn_var.set_concretetype(Some(LowLevelType::Signed));
-    let helper = format!("conditional_call{n}");
+    let helper = format!("{helper_prefix}{n}");
     let target = CallTarget::function_path(["majit_rlib", "jit", helper.as_str()]);
     let mut args = Vec::with_capacity(2 + extra_args.len());
     args.push(cond);
@@ -3420,6 +3490,61 @@ mod tests {
             cond_calls,
             vec![5],
             "one conditional_call3 Call (cond, fn, l, newsize, True), got {cond_calls:?}"
+        );
+        let has_fn_const = model.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    target
+                        .path_segments()
+                        .is_some_and(|segs| segs.first() == Some(&crate::model::FN_CONST_HEAD))
+                        && args.is_empty()
+                }
+                _ => false,
+            })
+        });
+        assert!(has_fn_const, "function arg is a 0-arg __fn_const Call");
+    }
+
+    /// `ll_strhash` inlines `rlib/jit.py conditional_call_elidable` to a
+    /// `jit_conditional_call_value` llop. `lower_graph` emits the interpreter-facing
+    /// `majit_rlib::jit::conditional_call_elidable1` Call `_rewrite_op_cond_call` rewrites.
+    #[test]
+    fn lower_graph_lowers_jit_conditional_call_value_in_ll_strhash() {
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rstr::string_repr;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let llfn = string_repr()
+            .get_ll_hash_function(&rtyper)
+            .expect("ll_strhash helper")
+            .expect("Some");
+        let graph = llfn.graph.as_ref().expect("ll_strhash graph");
+        let model = lower_graph(&graph.graph.borrow());
+        let cond_calls: Vec<_> = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    let segs = target.path_segments()?;
+                    if segs == ["majit_rlib", "jit", "conditional_call_elidable1"] {
+                        assert!(
+                            op.result.is_some(),
+                            "conditional_call_elidable1 result var is the op result"
+                        );
+                        Some(args.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cond_calls,
+            vec![3],
+            "one conditional_call_elidable1 Call (value, fn, s), got {cond_calls:?}"
         );
         let has_fn_const = model.blocks.iter().any(|block| {
             block.operations.iter().any(|op| match &op.kind {

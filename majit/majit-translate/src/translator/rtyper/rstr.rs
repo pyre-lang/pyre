@@ -3889,8 +3889,8 @@ mod tests {
         assert_eq!(llfn.args, vec![STRPTR.clone()]);
         assert_eq!(llfn.result, LowLevelType::Signed);
 
-        // Sanity: helper graph emits the NULL guard + getfield +
-        // jit_conditional_call_value pattern.
+        // Sanity: helper graph starts with the NULL guard; the lookup
+        // block holds the inlined `conditional_call_elidable` switch.
         let graph = llfn.graph.as_ref().unwrap();
         let inner = graph.graph.borrow();
         let startblock = inner.startblock.borrow();
