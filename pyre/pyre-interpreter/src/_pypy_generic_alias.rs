@@ -1790,20 +1790,33 @@ pub(crate) unsafe fn repr_item(
     if is_typing_generic_alias(current_item())? {
         return unsafe { crate::display::py_repr_wtf8(current_item()) };
     }
-    // `getattr(it, "__qualname__")` / `getattr(it, "__module__")`.
-    if let Ok(w_qualname) = crate::baseobjspace::getattr_str(current_item(), "__qualname__")
-        && let Ok(qualname) = crate::baseobjspace::text_w(w_qualname)
-    {
-        let qualname = qualname.to_string();
-        let module = crate::baseobjspace::getattr_str(current_item(), "__module__")
-            .ok()
-            .and_then(|w| crate::baseobjspace::text_w(w).ok().map(str::to_string));
-        return Ok(rustpython_wtf8::Wtf8Buf::from_string(match module {
-            Some(m) if m != "builtins" => format!("{m}.{qualname}"),
-            _ => qualname,
-        }));
-    }
-    unsafe { crate::display::py_repr_wtf8(current_item()) }
+    // `_pypy_generic_alias.py _repr_item`: `getattr` of `__qualname__` /
+    // `__module__`, and only `AttributeError` falls through to `repr`.
+    let w_qualname = match crate::baseobjspace::getattr_str(current_item(), "__qualname__") {
+        Ok(w_qualname) => w_qualname,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            return unsafe { crate::display::py_repr_wtf8(current_item()) };
+        }
+        Err(e) => return Err(e),
+    };
+    let Ok(qualname) = crate::baseobjspace::text_w(w_qualname) else {
+        return unsafe { crate::display::py_repr_wtf8(current_item()) };
+    };
+    let qualname = qualname.to_string();
+    let w_module = match crate::baseobjspace::getattr_str(current_item(), "__module__") {
+        Ok(w_module) => w_module,
+        Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
+            return unsafe { crate::display::py_repr_wtf8(current_item()) };
+        }
+        Err(e) => return Err(e),
+    };
+    let module = crate::baseobjspace::text_w(w_module)
+        .ok()
+        .map(str::to_string);
+    Ok(rustpython_wtf8::Wtf8Buf::from_string(match module {
+        Some(m) if m != "builtins" => format!("{m}.{qualname}"),
+        _ => qualname,
+    }))
 }
 
 fn is_collections_abc_callable(origin: PyObjectRef) -> Result<bool, crate::PyError> {

@@ -439,7 +439,6 @@ fn owned_arg_as_call_arg(arg: &OwnedArg) -> CallArg<'_> {
             buffer: buf.as_slice(),
         },
         OwnedArg::Int(v) => CallArg::Int(*v),
-        OwnedArg::Double(v) => CallArg::Double(*v),
         OwnedArg::Pointer(v) => CallArg::Pointer(*v),
         OwnedArg::Aggregate(layout, buf) => CallArg::Aggregate {
             layout,
@@ -1354,7 +1353,6 @@ pub(super) fn store_funcptr_addr(
 enum OwnedArg {
     Typed(TypeCode, Vec<u8>),
     Int(i32),
-    Double(f64),
     Pointer(usize),
     /// A by-value aggregate: its recursive layout and a copy of its bytes.
     Aggregate(CTypeLayout, Vec<u8>),
@@ -3358,7 +3356,8 @@ fn marshal_simple_arg(
     Ok(OwnedArg::Typed(tc, buf))
 }
 
-/// Marshal one argument with no explicit `argtype` (ConvParam defaults).
+/// Marshal one argument with no explicit `argtype` (ConvParam / `_conv_param`
+/// defaults: None, bytes, str, int).
 fn marshal_default_arg(
     arg: PyObjectRef,
     keepalive: &mut Vec<Vec<u8>>,
@@ -3404,10 +3403,6 @@ fn marshal_default_arg(
         Ok(OwnedArg::Pointer(bytes_pointer_addr(arg, keepalive)))
     } else if unsafe { pyre_object::is_str(arg) } {
         Ok(OwnedArg::Pointer(wstr_pointer_addr(arg, keepalive)))
-    } else if unsafe { pyre_object::is_float(arg) } {
-        Ok(OwnedArg::Double(pyre_interpreter::baseobjspace::float_w(
-            arg,
-        )?))
     } else if unsafe { pyre_object::is_int(arg) } {
         Ok(OwnedArg::Int(
             pyre_interpreter::baseobjspace::int_w(arg)? as i32
@@ -3437,7 +3432,6 @@ pub(super) fn conv_param_pointer(
         OwnedArg::Pointer(addr) => addr,
         OwnedArg::Typed(_, buf) | OwnedArg::Aggregate(_, buf) => word_of(&buf),
         OwnedArg::Int(value) => value as isize as usize,
-        OwnedArg::Double(value) => value.to_bits() as usize,
     })
 }
 

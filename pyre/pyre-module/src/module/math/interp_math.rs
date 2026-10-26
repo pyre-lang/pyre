@@ -1069,28 +1069,30 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
             "dist() takes exactly 2 arguments",
         ));
     }
-    let collect_coords = |obj: PyObjectRef| -> Result<Vec<f64>, pyre_interpreter::PyError> {
-        let items = pyre_interpreter::builtins::collect_iterable(obj)?;
-        // Conversion can call an element's `__float__`, so publish the whole
-        // materialized sequence before converting any member. `pin_roots`
-        // writes every pointer before the first forwarding query; a
-        // per-item `pin_root` would let that query collect the rest.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let items_base = pyre_object::gc_roots::pin_roots(&items);
-        (0..items.len())
-            .map(|index| {
-                try_get_double(pyre_object::gc_roots::shadow_stack_get(items_base + index))
-            })
-            .collect()
-    };
+    // `interp_math.py dist`: unpack both sequences, then compare lengths,
+    // then `_get_double` per coordinate. Conversion can call `__float__`.
     let w_p = args[0];
     let mut w_q = args[1];
-    let p = pyre_object::with_roots!(w_q => collect_coords(w_p))?;
-    let q = collect_coords(w_q)?;
-    if p.len() != q.len() {
+    let p_items =
+        pyre_object::with_roots!(w_q => pyre_interpreter::builtins::collect_iterable(w_p))?;
+    let q_items = pyre_interpreter::builtins::collect_iterable(w_q)?;
+    if p_items.len() != q_items.len() {
         return Err(pyre_interpreter::PyError::value_error(
             "both points must have the same number of dimensions",
         ));
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let p_base = pyre_object::gc_roots::pin_roots(&p_items);
+    let q_base = pyre_object::gc_roots::pin_roots(&q_items);
+    let mut p = Vec::with_capacity(p_items.len());
+    let mut q = Vec::with_capacity(q_items.len());
+    for index in 0..p_items.len() {
+        p.push(try_get_double(pyre_object::gc_roots::shadow_stack_get(
+            p_base + index,
+        ))?);
+        q.push(try_get_double(pyre_object::gc_roots::shadow_stack_get(
+            q_base + index,
+        ))?);
     }
     Ok(floatobject::w_float_new(pymath::math::dist(&p, &q)))
 }
