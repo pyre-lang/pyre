@@ -4620,7 +4620,7 @@ pub(crate) fn build_ll_list_resize_ge_helper_graph(
     build_ll_list_resize_ge_graph(name, ptr_lltype, item_lltype, hint_really_fn, isconstant_fn)
 }
 
-/// Synthesise `ll_append` (`lltypesystem/rlist.py:588`):
+/// Synthesise `ll_append` (`rtyper/rlist.py` `ll_append`):
 ///
 /// ```python
 /// def ll_append(l, newitem):

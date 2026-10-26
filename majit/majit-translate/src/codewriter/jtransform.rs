@@ -16109,7 +16109,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
             OopSpecIndex::RawMallocVarsizeChar
         }
         "raw_free" => OopSpecIndex::RawFree,
-        // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
+        // jtransform.py Transformer.handle_builtin_call: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
     }

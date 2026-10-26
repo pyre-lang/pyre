@@ -2076,7 +2076,9 @@ impl _address_of_local_var_accessor {
         {
             LLValue::Ptr(p) => Ok(self.unwrap_possible_weakref(llmemory::cast_ptr_to_adr(&p))),
             other => Err(TaskError {
-                message: format!("llinterp.py:1447 expected local Ptr, got {other:?}"),
+                message: format!(
+                    "_address_of_local_var_accessor.__getitem__: expected local Ptr, got {other:?}"
+                ),
             }),
         }
     }

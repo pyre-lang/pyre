@@ -12389,8 +12389,8 @@ pub fn get_ll_dictiter(DICTPTR: LowLevelType) -> LowLevelType {
 /// RPython `class DictIteratorRepr(AbstractDictIteratorRepr)`
 /// (`lltypesystem/rordereddict.py`).
 ///
-/// Upstream stores the whole `r_dict` (`DictIteratorRepr.__init__`,
-/// `:1206-1215`) and reaches `r_dict.recast_key`/`recast_value` through it.
+/// Upstream stores the whole `r_dict` (`DictIteratorRepr.__init__`)
+/// and reaches `r_dict.recast_key`/`recast_value` through it.
 /// Rust has no single owned/`Arc`-shared `OrderedDictRepr` to stash at
 /// `make_iterator_repr` time (mirroring how `ListIteratorRepr`/
 /// `RangeIteratorRepr` decompose their container repr into the specific
@@ -12596,7 +12596,7 @@ impl Repr for DictIteratorRepr {
     }
 
     /// RPython `AbstractDictIteratorRepr.rtype_next(self, hop)`
-    /// (`rdict.py:75-93`):
+    /// (`rdict.py` `AbstractDictIteratorRepr.rtype_next`):
     ///
     /// ```python
     /// def rtype_next(self, hop):
