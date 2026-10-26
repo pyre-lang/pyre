@@ -1535,6 +1535,13 @@ fn update_catch_landing_state(
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         Some(edge_state.copy(&mut fresh))
     };
+    // `flowcontext.py mergeblock`: a union that `matches` the landing's
+    // state links to the existing block unchanged.
+    if let (Some(existing), Some(state)) = (existing_state.as_ref(), new_state.as_ref())
+        && state.matches(existing)
+    {
+        return;
+    }
     // `flowcontext.py` `egg = EggBlock(vars2, block, case)` — the
     // catch landing's inputargs receive the exception edge's incoming
     // values.  Single-source case (above) keeps the alias today;
@@ -2574,6 +2581,7 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     unwind_memo: &mut Vec<SharedUnwindEntry>,
     depth_at_pc: &[u16],
     all_walker_blocks: &mut Vec<SpamBlockRef>,
+    arm_blocks: &mut Vec<super::flow::BlockRef>,
 ) -> SpamBlockRef {
     let debugdata_var = emit_vable_getfield_ref(
         graph,
@@ -2589,11 +2597,14 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         debugdata_var,
         all_walker_blocks,
     );
+    arm_blocks.push(dd_null.block());
+    arm_blocks.push(dd_nonnull.block());
 
     let join_state = current_state.clone();
     let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
     join.block().borrow_mut().inputargs = join_state.getvariables();
     all_walker_blocks.push(join.clone());
+    arm_blocks.push(join.block());
 
     link_to_join(&dd_null, current_state, &join);
 
@@ -2615,6 +2626,9 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         w_f_trace,
         all_walker_blocks,
     );
+    arm_blocks.push(tr_null.block());
+    arm_blocks.push(tr_armed.block());
+
     link_to_join(&tr_null, current_state, &join);
 
     let _ = record_residual_call_graph_op(
@@ -3903,22 +3917,59 @@ struct SharedUnwindEntry {
     raising_depth: u16,
     lasti_int: Option<super::flow::Variable>,
     landing: SpamBlockRef,
+    /// The landing body has been emitted.
+    processed: bool,
 }
 
 fn lookup_or_create_shared_unwind(
     graph: &mut super::flow::FunctionGraph,
     memo: &mut Vec<SharedUnwindEntry>,
     site: &ExceptionCatchSite,
+    edge_state: &FrameState,
     target: &SpamBlockRef,
     raising_depth: u16,
 ) -> (SpamBlockRef, Option<super::flow::Variable>) {
-    if let Some(entry) = memo.iter().find(|entry| {
+    if let Some(index) = memo.iter().position(|entry| {
         entry.handler_py_pc == site.handler_py_pc
             && entry.site_stack_depth == site.stack_depth
             && entry.push_lasti == site.push_lasti
             && entry.raising_depth == raising_depth
     }) {
-        return (entry.landing.clone(), entry.lasti_int);
+        let entry = &memo[index];
+        if !entry.processed {
+            return (entry.landing.clone(), entry.lasti_int);
+        }
+        // `flowcontext.py mergeblock`: an emitted landing whose state
+        // already covers this edge is reused; otherwise the edge gets a
+        // new landing carrying the generalized state, queued for emission.
+        // The emitted landing keeps its body for its existing predecessors.
+        let generalized = entry.landing.framestate().and_then(|existing| {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            existing
+                .union(edge_state, &mut fresh)
+                .map(|state| (state.matches(&existing), state))
+        });
+        if let Some((true, _)) = &generalized {
+            return (entry.landing.clone(), entry.lasti_int);
+        }
+        let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+        if let Some((false, state)) = generalized {
+            landing.block().borrow_mut().inputargs = state.getvariables();
+            landing.set_framestate(state);
+        }
+        let lasti_int = site.push_lasti.then(|| graph.fresh_variable(Kind::Int));
+        if let Some(lasti_int) = lasti_int {
+            landing
+                .block()
+                .borrow_mut()
+                .inputargs
+                .push(lasti_int.into());
+        }
+        let entry = &mut memo[index];
+        entry.landing = landing.clone();
+        entry.lasti_int = lasti_int;
+        entry.processed = false;
+        return (landing, lasti_int);
     }
     let landing = if memo.iter().any(|entry| entry.landing == *target) {
         SpamBlockRef::new(graph.new_block(Vec::new()), None)
@@ -3946,6 +3997,7 @@ fn lookup_or_create_shared_unwind(
         raising_depth,
         lasti_int,
         landing: landing.clone(),
+        processed: false,
     });
     (landing, lasti_int)
 }
@@ -4054,8 +4106,14 @@ fn attach_catch_exception_edge(
             .copied()
             .unwrap_or(site.stack_depth),
     );
-    let (landing, lasti_int) =
-        lookup_or_create_shared_unwind(graph, unwind_memo, site, target, raising_depth);
+    let (landing, lasti_int) = lookup_or_create_shared_unwind(
+        graph,
+        unwind_memo,
+        site,
+        &edge_state,
+        target,
+        raising_depth,
+    );
     let extra_link_args: Vec<super::flow::FlowValue> = if lasti_int.is_some() {
         vec![super::flow::Constant::signed(site.lasti_py_pc as i64).into()]
     } else {
@@ -7585,6 +7643,7 @@ impl CodeWriter {
         // blocks deterministically (HashMap iteration order would
         // otherwise diverge bridge-fallback Variable colors).
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
+        let mut arm_blocks: Vec<super::flow::BlockRef> = Vec::new();
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
@@ -9189,7 +9248,6 @@ impl CodeWriter {
         // A handler block drained after the first landing pass can itself
         // expose a nested cleanup landing; a one-shot pass leaves that
         // regular block live with inputargs but no exits.
-        let mut shared_unwinds_processed: Vec<bool> = Vec::new();
         loop {
             while let Some(pending_block) = pendingblocks.pop_front() {
                 if pending_block.dead() {
@@ -9739,6 +9797,7 @@ impl CodeWriter {
                                 &mut unwind_memo,
                                 &depth_at_pc,
                                 &mut all_walker_blocks,
+                                &mut arm_blocks,
                             );
                             if let Some(state) = current_block.framestate() {
                                 current_state = state;
@@ -15146,17 +15205,14 @@ impl CodeWriter {
             // drain.  Handler code can discover another exception edge,
             // making a later shared unwind reachable only after an
             // earlier landing has been processed.
-            while shared_unwinds_processed.len() < unwind_memo.len() {
-                shared_unwinds_processed.push(false);
-            }
             let mut emitted_catch_landing = false;
             for entry_index in 0..unwind_memo.len() {
-                if shared_unwinds_processed[entry_index]
+                if unwind_memo[entry_index].processed
                     || unwind_memo[entry_index].landing.framestate().is_none()
                 {
                     continue;
                 }
-                shared_unwinds_processed[entry_index] = true;
+                unwind_memo[entry_index].processed = true;
                 emitted_catch_landing = true;
                 let landing = unwind_memo[entry_index].landing.clone();
                 let handler_py_pc = unwind_memo[entry_index].handler_py_pc;
@@ -15630,11 +15686,34 @@ impl CodeWriter {
         // `flatten.py insert_exits` emits `-live-` before `goto_if_not*`
         // and switch, and `jtransform.py handle_residual_call` emits one
         // after a residual call.  Neither emits a marker at the head of a
-        // plain block or before a `goto`.  Arm-internal blocks from
-        // `emit_dispatch_bytecode_jitted_trace_arm` share the PC's first
-        // op already recorded in `pc_first_insn_pos`, so they are not
-        // Python-pc resume points and must not get a block-head marker.
+        // plain block or before a `goto`.  The blocks of
+        // `emit_dispatch_bytecode_jitted_trace_arm` (`arm_blocks`) get none
+        // unless they open a PC's first op: they share that PC's first op
+        // already recorded in `pc_first_insn_pos`, and a guard in the opcode
+        // body resumes at the PC's own marker, which re-runs the arm from
+        // the `debugdata` read.  Every other label keeps the block-entry
+        // marker.  A guard in a marker-less arm block resumes at the opcode-start
+        // marker: the walker drops its `-live-` anchor after every branch
+        // (`jitcode_dispatch/mod.rs`).
         {
+            let mut arm_ptrs: Vec<*const std::cell::RefCell<super::flow::Block>> = arm_blocks
+                .iter()
+                .map(|b| b.as_ptr_addr() as *const std::cell::RefCell<super::flow::Block>)
+                .collect();
+            arm_ptrs.sort();
+            let mut arm_label_names: Vec<&str> = spliced
+                .label_blocks
+                .iter()
+                .filter(|(_, block)| {
+                    arm_ptrs
+                        .binary_search(
+                            &(block.as_ptr_addr() as *const std::cell::RefCell<super::flow::Block>),
+                        )
+                        .is_ok()
+                })
+                .map(|(name, _)| name.as_str())
+                .collect();
+            arm_label_names.sort();
             let insn_len = spliced.insns.len();
             let mut is_pc_first = vec![false; insn_len];
             for &(_, pos) in &spliced.pc_first_insn_pos {
@@ -15652,6 +15731,12 @@ impl CodeWriter {
             let mut insns = std::mem::take(&mut spliced.insns).into_iter().peekable();
             while let Some(insn) = insns.next() {
                 shift.push(inserted);
+                let is_arm_label = match &insn {
+                    super::flatten::Insn::Label(label) => {
+                        arm_label_names.binary_search(&label.name.as_str()).is_ok()
+                    }
+                    _ => false,
+                };
                 let is_label = matches!(insn, super::flatten::Insn::Label(_));
                 new_insns.push(insn);
                 if is_label {
@@ -15661,7 +15746,7 @@ impl CodeWriter {
                     });
                     let next_is_pc_resume =
                         next_old_pos < is_pc_first.len() && is_pc_first[next_old_pos];
-                    if !next_blocks_marker && next_is_pc_resume {
+                    if !next_blocks_marker && (next_is_pc_resume || !is_arm_label) {
                         new_insns.push(super::flatten::Insn::live(Vec::new()));
                         inserted += 1;
                     }

@@ -80,6 +80,9 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
 /// the opcode-start twin then re-executes the residual before the jump
 /// (`bhimpl_goto_if_not` must re-run only the jump). When `op_pc` is still
 /// the instruction after a `-live-`, [`preceding_live_marker`] recovers it.
+/// The opcode-start marker of a loop-header floor is past its `jit_merge_point`
+/// (`jtransform.py handle_jit_marker__jit_merge_point` op2 `-live-`), the
+/// point the opcode body re-executes from.
 pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: usize) -> i32 {
     let op_live = crate::state::op_live();
     if payload.jitcode.can_decode_live_vars(op_pc, op_live)
@@ -89,7 +92,12 @@ pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: u
     } else {
         preceding_live_marker(payload, op_pc)
             .or_else(|| payload.resume_marker_for_jitcode_pc(op_pc))
-            .map(|m| m as i32)
+            .map(|m| {
+                jit_merge_point_pc_in_containing_floor(payload, op_pc)
+                    .filter(|&merge_pc| m < merge_pc && merge_pc < op_pc)
+                    .and_then(|merge_pc| resume_pc_past_merge_point(payload, merge_pc))
+                    .unwrap_or(m) as i32
+            })
             .unwrap_or(op_pc as i32)
     }
 }
@@ -185,29 +193,6 @@ pub(super) fn jit_merge_point_pc_in_containing_floor(
         pc = op.next_pc;
     }
     None
-}
-
-/// True when `op_pc` sits in a loop-header floor *before* that floor's
-/// `jit_merge_point`.
-///
-/// `emit_portal_is_being_profiled_read` lowers `get_is_being_profiled`'s
-/// `debugdata` null-test in that prefix (`interp_jit.py` `dispatch` computes
-/// the green before `jit_merge_point`). `_establish_nullity` at that goto
-/// would record `GUARD_ISNULL` with a resume in the preamble, and the
-/// `dispatch_bytecode` jitted arm after `last_instr` would then see the
-/// heapcache and record none. Defer the guard to the arm so its
-/// `generate_guard(resumepc=orgpc)` is the opcode-body `-live-` after the
-/// merge (`pyopcode.py` jitted arm).
-pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-) -> bool {
-    walked_snapshot_jitcode(ctx)
-        .and_then(|jc| {
-            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
-                .map(|merge_pc| op_pc < merge_pc)
-        })
-        .unwrap_or(false)
 }
 
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise

@@ -144,6 +144,12 @@ pub struct SSARepr {
     /// Synthetic ops (`offset < 0`) start no run: they belong to whichever PC
     /// was last anchored, which is what leaving the run open expresses.
     pub pc_run_insn_pos: Vec<(usize, i64)>,
+    /// Pyre-only side-table: `(label name, block)` for every `Label` the
+    /// flattener emits — the block a `Label(block)` opens, or the target
+    /// block of a `Label(link)`.  The codewriter's block-entry `-live-`
+    /// pass reads it to tell the `dispatch_bytecode` jitted arm's labels
+    /// apart from every other branch target.
+    pub label_blocks: Vec<(String, super::flow::BlockRef)>,
     /// Per-kind fresh-Variable counter. RPython has no analog
     /// because RPython's `Variable()` constructor produces objects with
     /// implicit identity and `regalloc.py` numbers them densely after
@@ -168,6 +174,7 @@ impl SSARepr {
             pc_first_insn_pos: Vec::new(),
             abort_permanent_insn_pos: Vec::new(),
             pc_run_insn_pos: Vec::new(),
+            label_blocks: Vec::new(),
             next_var_idx: [0; 3],
         }
     }
@@ -1489,11 +1496,19 @@ impl<'a> GraphFlattener<'a> {
     }
 
     fn label_for_block(&mut self, block: &BlockRef) -> Insn {
-        Insn::Label(Label::new(self.label_name_for_block(block)))
+        let name = self.label_name_for_block(block);
+        self.ssarepr
+            .label_blocks
+            .push((name.clone(), block.clone()));
+        Insn::Label(Label::new(name))
     }
 
     fn label_for_link(&mut self, link: &LinkRef) -> Insn {
-        Insn::Label(Label::new(self.label_name_for_link(link)))
+        let name = self.label_name_for_link(link);
+        if let Some(target) = link.borrow().target.clone() {
+            self.ssarepr.label_blocks.push((name.clone(), target));
+        }
+        Insn::Label(Label::new(name))
     }
 
     fn flow_kind(value: &FlowValue) -> Option<Kind> {

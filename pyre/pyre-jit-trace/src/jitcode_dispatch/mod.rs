@@ -5049,6 +5049,17 @@ pub fn step<Sym: WalkSym>(
             )))
         });
     }
+    if let Ok((DispatchOutcome::Continue, _)) = &result {
+        if op.opname == "goto" || op.opname.starts_with("goto_if") || op.opname == "switch" {
+            // A `-live-` before a branch is that branch's `resumepc`
+            // (`pyjitpl.py opimpl_goto_if_not` / `_establish_nullity`). Past the
+            // branch it no longer names the registers: a successor block with a
+            // block-entry marker re-anchors at once, a marker-less one (the
+            // `dispatch_bytecode` jitted arm's blocks) falls back to the opcode-start
+            // marker in `plain_guard_resume_jitcode_pc`.
+            ctx.live_before_jit_pc = usize::MAX;
+        }
+    }
     result
 }
 
@@ -14070,15 +14081,6 @@ fn establish_nullity<Sym: WalkSym>(
         });
     };
     let value = bits != 0;
-    // `get_is_being_profiled` (`pyframe.py`) runs before `jit_merge_point`
-    // (`interp_jit.py` `dispatch`). Its `debugdata` null-test must not
-    // `generate_guard` here: the resume would be the preamble `-live-`, and
-    // heapcache would silence the `dispatch_bytecode` jitted arm after
-    // `last_instr`. Branch on the concrete pointer; the arm's
-    // `goto_if_not_ptr_iszero` records the `GUARD_ISNULL`.
-    if ptr_iszero_is_before_merge_in_floor(ctx, op.pc) {
-        return Ok(value);
-    }
     if value {
         // A known class already implies non-null, so the guard is redundant.
         if !ctx.trace_ctx.heap_cache().is_class_known(boxref) {
