@@ -21641,10 +21641,7 @@ fn try_typed_items_block_layout_branches_on_usize_discriminant() {
 
 #[test]
 fn charpsize2str_cp_input_is_ccharp() {
-    let path = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../target/llbc/majit-rlib.ullbc"
-    );
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
     let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
     let graph = super::lower_function(&llbc, "charpsize2str").expect("lower charpsize2str");
     let mut cp_root = None;
