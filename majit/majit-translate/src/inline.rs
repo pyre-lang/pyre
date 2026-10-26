@@ -683,6 +683,7 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::RawMalloc {
             owner,
+            TYPE: malloc_type,
             zero,
             track_allocation,
             add_memory_pressure,
@@ -690,6 +691,7 @@ pub(crate) fn remap_op_kind(
             length,
         } => OpKind::RawMalloc {
             owner: owner.clone(),
+            TYPE: malloc_type.clone(),
             zero: *zero,
             track_allocation: *track_allocation,
             add_memory_pressure: *add_memory_pressure,

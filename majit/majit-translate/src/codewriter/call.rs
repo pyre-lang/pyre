@@ -14455,6 +14455,24 @@ fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
     }
 }
 
+/// `_rewrite_raw_malloc` `TYPE = op.args[0].value`.
+fn effect_malloc_type(
+    hlv: &crate::flowspace::model::Hlvalue,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => (**lltype).clone(),
+            other => panic!(
+                "effect_graph_from_rtyped_helper: malloc first operand is not a LowLevelType const: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("effect_graph_from_rtyped_helper: malloc first operand is a Variable")
+        }
+    }
+}
+
 fn effect_malloc_array_type_id(hlv: &crate::flowspace::model::Hlvalue) -> Option<String> {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -14747,6 +14765,7 @@ fn effect_transduce_op(
                     effect_malloc_raw_flags(&op.args[1]);
                 OpKind::raw_malloc_with_flags(
                     owner,
+                    Some(effect_malloc_type(&op.args[0])),
                     zero,
                     track_allocation,
                     add_memory_pressure,
@@ -14768,6 +14787,7 @@ fn effect_transduce_op(
                     block,
                     OpKind::raw_malloc_with_flags(
                         effect_malloc_owner(&op.args[0]),
+                        Some(effect_malloc_type(&op.args[0])),
                         zero,
                         track_allocation,
                         add_memory_pressure,
