@@ -26,7 +26,7 @@ scripts/install-charon.py
 ../.pyre-build/charon/<platform>/<version>/charon toolchain-path  # one-time nightly install (~1 min)
 ```
 
-The script pins `CHARON_VERSION_DEFAULT="nightly-2026.10.04"` and installs
+The script pins `CHARON_VERSION_DEFAULT="nightly-2026.10.25"` and installs
 to a shared cache at `../.pyre-build/charon/<platform>/<version>` by default,
 so sibling worktrees on the same pin reuse the binary and an older pin keeps
 its own directory. Override with `PYRE_SHARED_BUILD=/path/to/cache` or

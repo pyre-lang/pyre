@@ -64,14 +64,15 @@ fn zst_closure_and_then() -> Llbc {
                     "body": [
                         {"statements": [{"span": span, "kind": {"Assign": [place(2, &closure_ty),
                             {"Aggregate": [{"Adt": [1, null, null, generics]}, []]}]}}],
+                         "kind": "Regular",
                          "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [{"Move": place(1, &option_ty)}, {"Move": place(2, &closure_ty)}],
                                 "dest": place(0, &option_ty)},
                             "target": 1, "on_unwind": 2
                         }}}},
-                        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                     ]
                  }}},
                 {"def_id": 1, "item_meta": meta(vec![ident("core"), ident("option"), ident("Option"), impl_seg, ident("and_then")]),

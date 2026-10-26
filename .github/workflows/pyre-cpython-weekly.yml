@@ -36,7 +36,7 @@ jobs:
     timeout-minutes: 300
     env:
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.10.04
+      CHARON_VERSION: nightly-2026.10.25
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:
@@ -128,7 +128,7 @@ jobs:
       # The sandbox `pyre` binary still pulls pyre-jit, whose build needs the
       # extracted LLBC.
       PYRE_SHARED_BUILD: ${{ github.workspace }}/.pyre-build
-      CHARON_VERSION: nightly-2026.10.04
+      CHARON_VERSION: nightly-2026.10.25
     steps:
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:

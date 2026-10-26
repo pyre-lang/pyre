@@ -1811,10 +1811,12 @@ mod tests {
                                 ]
                             }))
                         ],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Call": {
                             "call": {
                                 "func": {"Regular": {
@@ -1837,14 +1839,17 @@ mod tests {
                                 "BinaryOp": ["Add", copy(5, &usize_ty), usize_lit("1")]
                             }))
                         ],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": "Return"}
                     }
                 ]

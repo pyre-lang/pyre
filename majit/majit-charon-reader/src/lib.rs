@@ -1383,10 +1383,11 @@ mod tests {
                 "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
             })
         };
-        let ret = serde_json::json!({"statements": [], "terminator": {"kind": "Return"}});
+        let ret = serde_json::json!({"statements": [], "kind": "Regular", "terminator": {"kind": "Return"}});
         let fun = |id: u64, name: &str, term: serde_json::Value, extra: Vec<serde_json::Value>| {
-            let mut body =
-                vec![serde_json::json!({"statements": [], "terminator": {"kind": term}})];
+            let mut body = vec![
+                serde_json::json!({"statements": [], "kind": "Regular", "terminator": {"kind": term}}),
+            ];
             body.extend(extra);
             serde_json::json!({
                 "def_id": id,
@@ -1454,5 +1455,70 @@ mod tests {
                       "translated":{"crate_name":"c","fun_decls":[]}}"#;
         let l = Llbc::from_slice(doc.as_bytes()).expect("loads without a files table");
         assert_eq!(l.file_path(0), None);
+    }
+
+    #[test]
+    fn opaque_typeid_constant_kind_is_the_opaque_string() {
+        // `simplify_constants` turns a pointer into a TypeId into
+        // `ConstantExprKind::Opaque("pointer into a `TypeId`")`. The
+        // reader does not type `Byte` / `GlobalProvenance`; the Opaque
+        // string is the kind `decode_constant` already forwards.
+        let l = Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .expect("empty artefact");
+        let expr = serde_json::json!([
+            {"Opaque": "pointer into a `TypeId`"},
+            {"RawPtr": ["Erased", {"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Const"]}
+        ]);
+        let kind = l.const_expr_kind(&expr).expect("kind");
+        assert_eq!(
+            kind.get("Opaque").and_then(serde_json::Value::as_str),
+            Some("pointer into a `TypeId`")
+        );
+        assert!(l.const_expr_literal(&expr).is_none());
+    }
+
+    #[test]
+    fn raw_memory_provenance_byte_keeps_the_pointee_offset() {
+        // Charon 0.1.298 `Byte::Provenance(GlobalProvenance, IntegerValue, u8)`
+        // and `GlobalProvenance::TypeId(Ty)`. The reader never decodes
+        // raw-memory bytes; the JSON stays on the ConstantExprKind so a
+        // later consumer can see the offset.
+        let l = Llbc::from_slice(
+            br#"{"charon_version":"t","has_errors":false,"translated":{"crate_name":"c","fun_decls":[]}}"#,
+        )
+        .expect("empty artefact");
+        let expr = serde_json::json!([
+            {"RawMemory": [
+                {"Uninit": null},
+                {"Value": 7},
+                {"Provenance": [
+                    {"TypeId": {"Deduplicated": 0}},
+                    {"Unsigned": ["Usize", "8"]},
+                    0
+                ]}
+            ]},
+            {"RawPtr": ["Erased", {"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Const"]}
+        ]);
+        let kind = l.const_expr_kind(&expr).expect("kind");
+        let bytes = kind
+            .get("RawMemory")
+            .and_then(serde_json::Value::as_array)
+            .expect("RawMemory bytes");
+        assert_eq!(bytes.len(), 3);
+        let provenance = bytes[2]
+            .get("Provenance")
+            .and_then(serde_json::Value::as_array)
+            .expect("Provenance triple");
+        assert_eq!(provenance.len(), 3, "pointee offset is the third field");
+        assert!(provenance[0].get("TypeId").is_some());
+        assert_eq!(
+            provenance[1]
+                .get("Unsigned")
+                .and_then(serde_json::Value::as_array),
+            Some(&vec![serde_json::json!("Usize"), serde_json::json!("8")])
+        );
+        assert_eq!(provenance[2].as_u64(), Some(0));
     }
 }

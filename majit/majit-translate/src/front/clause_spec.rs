@@ -104,6 +104,7 @@ pub(crate) fn decl_is_generic(fd: &FunDecl) -> bool {
 /// including an empty list. Used while lowering a spec copy, where a
 /// callee may have no trait clauses.
 pub(crate) fn concrete_trait_refs_or_empty(generics: &Value, llbc: &Llbc) -> Option<Vec<Value>> {
+    let generics = peel_generic_args(generics);
     let refs = generics
         .get("trait_refs")
         .and_then(Value::as_array)
@@ -124,6 +125,7 @@ pub(crate) fn concrete_trait_refs_or_empty(generics: &Value, llbc: &Llbc) -> Opt
 /// function path, trait refs, types and const generics, so the spelling
 /// carries no extraction-local id.
 pub(crate) fn spec_leaf(leaf: &str, fn_id: u64, generics: &Value, llbc: &Llbc) -> String {
+    let generics = peel_generic_args(generics);
     let fn_name = llbc
         .fn_by_id(fn_id)
         .map(|fd| spec_fn_name(&fd.item_meta, llbc))
@@ -241,6 +243,7 @@ pub(crate) fn concrete_type_args(
     generics: &Value,
     llbc: &Llbc,
 ) -> Option<(Vec<Value>, Vec<Value>)> {
+    let generics = peel_generic_args(generics);
     let types = generics
         .get("types")
         .and_then(Value::as_array)
@@ -397,37 +400,105 @@ fn resolve_trait_ref(v: &Value, llbc: &Llbc, depth: usize) -> Option<Value> {
     resolve_trait_ref(implied.get(index)?, llbc, depth + 1)
 }
 
-/// A trait ref behind its `Deduplicated` / `Value` hash-cons wrapper.
+/// A trait ref behind its `Deduplicated` / `Value` hash-cons wrapper
+/// and any `RegionBinder` / `Binder` (`PolyTraitRef`).
 fn unwrap_ref<'a>(v: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<&'a Value> {
+    unwrap_ref_binders(v, llbc, depth).map(|(inner, _)| inner)
+}
+
+/// Same unwrap as [`unwrap_ref`], plus how many `skip_binder` layers were
+/// peeled. `TraitParam::identity_tref_at_depth` stores a function-level
+/// `Clause` as `Bound(depth.incr(), id)` under a `PolyTraitRef`
+/// (`RegionBinder<TraitRef>`), so that count is the De Bruijn depth of
+/// the item binder at the inner `TraitRef`.
+fn unwrap_ref_binders<'a>(v: &'a Value, llbc: &'a Llbc, depth: usize) -> Option<(&'a Value, u64)> {
+    unwrap_ref_binders_at(v, llbc, depth, 0)
+}
+
+fn unwrap_ref_binders_at<'a>(
+    v: &'a Value,
+    llbc: &'a Llbc,
+    depth: usize,
+    binders: u64,
+) -> Option<(&'a Value, u64)> {
     if depth > 8 {
         return None;
     }
     let obj = v.as_object()?;
     if let Some(id) = obj.get("Deduplicated").and_then(Value::as_u64) {
-        return unwrap_ref(llbc.dedup_trait_body(id)?, llbc, depth + 1);
+        return unwrap_ref_binders_at(llbc.dedup_trait_body(id)?, llbc, depth + 1, binders);
     }
     if let Some(arr) = obj.get("Value").and_then(Value::as_array)
         && arr.len() == 2
     {
-        return unwrap_ref(&arr[1], llbc, depth + 1);
+        return unwrap_ref_binders_at(&arr[1], llbc, depth + 1, binders);
     }
-    Some(v)
+    // `PolyTraitRef` is `RegionBinder<TraitRef>`; `Binder<T>` uses `params`.
+    // Any `skip_binder` is one De Bruijn step (`move_under_binder`).
+    if let Some(inner) = obj.get("skip_binder") {
+        return unwrap_ref_binders_at(inner, llbc, depth + 1, binders + 1);
+    }
+    Some((v, binders))
 }
 
-fn clause_index(v: &Value, llbc: &Llbc, space: Space) -> Option<usize> {
+/// `RegionBinder<T>` (`regions` + `skip_binder`) or `Binder<T>` (`params`).
+fn is_poly_binder(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("skip_binder") && (obj.contains_key("regions") || obj.contains_key("params"))
+}
+
+/// `GenericArgs` body, peeling a `RegionBinder<GenericArgs>` (`FunDecl.as_fn_ptr`
+/// late-bound regions, or a `PolyTraitRef` mistaken for args).
+fn peel_generic_args(generics: &Value) -> &Value {
+    let Some(obj) = generics.as_object() else {
+        return generics;
+    };
+    if is_poly_binder(obj) {
+        obj.get("skip_binder").unwrap_or(generics)
+    } else {
+        generics
+    }
+}
+
+/// Predicate a `TraitRef` proves (`TraitDeclRef`). Charon stores it
+/// unbound; a `RegionBinder` still peels `skip_binder`.
+pub(crate) fn trait_decl_pred(tref: &Value) -> Option<&Value> {
+    let decl = tref.get("trait_decl_ref")?;
+    Some(decl.get("skip_binder").unwrap_or(decl))
+}
+
+fn clause_index(v: &Value, llbc: &Llbc, space: Space, binder_depth: u64) -> Option<usize> {
     if space != Space::TraitRef {
         return None;
     }
-    let obj = unwrap_ref(v, llbc, 0)?;
-    let bound = obj.get("kind")?.get("Clause")?.get("Bound")?.as_array()?;
-    if bound.first()?.as_u64()? != 0 {
+    let (obj, extra) = unwrap_ref_binders(v, llbc, 0)?;
+    // `TraitRefKind::Clause(ClauseDbVar, RegionArgs)`.
+    let (depth, index) = clause_var(obj.get("kind")?.get("Clause")?)?;
+    if depth != binder_depth + extra {
         return None;
     }
-    Some(bound.get(1)?.as_u64()? as usize)
+    Some(index)
+}
+
+/// `ClauseDbVar`: `{"Bound":[d, i]}` / `{"Free": i}`, or the 10.24 pair
+/// `[ClauseDbVar, RegionArgs]`.
+fn clause_var(clause: &Value) -> Option<(u64, usize)> {
+    if let Some(arr) = clause.as_array() {
+        return debruijn_var(arr.first()?);
+    }
+    debruijn_var(clause)
+}
+
+fn debruijn_var(var: &Value) -> Option<(u64, usize)> {
+    if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
+        return Some((bound.first()?.as_u64()?, bound.get(1)?.as_u64()? as usize));
+    }
+    var.get("Free")
+        .and_then(Value::as_u64)
+        .map(|index| (0, index as usize))
 }
 
 fn mentions_own_clause(v: &Value, llbc: &Llbc, space: Space) -> bool {
-    mentions_own_clause_at(v, llbc, space, None, 0)
+    mentions_own_clause_at(v, llbc, space, None, 0, 0)
 }
 
 fn mentions_own_clause_at(
@@ -436,38 +507,56 @@ fn mentions_own_clause_at(
     space: Space,
     key: Option<&str>,
     depth: usize,
+    binder_depth: u64,
 ) -> bool {
     if depth > 64 {
         return false;
     }
-    if clause_index(v, llbc, space).is_some() {
+    if clause_index(v, llbc, space, binder_depth).is_some() {
         return true;
     }
     if let Some(body) = indirect_body(v, llbc, space) {
-        return mentions_own_clause_at(&body, llbc, space, None, depth + 1);
+        return mentions_own_clause_at(&body, llbc, space, None, depth + 1, binder_depth);
     }
     match v {
         Value::Array(items) => items.iter().enumerate().any(|(i, item)| {
-            mentions_own_clause_at(item, llbc, space.element(key, i), None, depth + 1)
+            mentions_own_clause_at(
+                item,
+                llbc,
+                space.element(key, i),
+                None,
+                depth + 1,
+                binder_depth,
+            )
         }),
-        Value::Object(map) => map.iter().any(|(k, item)| {
-            mentions_own_clause_at(item, llbc, space.field(k), Some(k), depth + 1)
-        }),
+        Value::Object(map) => {
+            let bump = u64::from(is_poly_binder(map));
+            map.iter().any(|(k, item)| {
+                let next_binder = if k == "skip_binder" {
+                    binder_depth + bump
+                } else {
+                    binder_depth
+                };
+                mentions_own_clause_at(item, llbc, space.field(k), Some(k), depth + 1, next_binder)
+            })
+        }
         _ => false,
     }
 }
 
-/// Replace depth-0 type variables with `types[i]` and depth-0 const-generic
-/// variables with `const_generics[i]`. A `Deduplicated` / `Value`
-/// node whose resolved body contains such a variable is replaced by the
-/// substituted plain node. The shared dedup table is not written.
+/// Replace type variables at the current binder depth with `types[i]` and
+/// const-generic variables at that depth with `const_generics[i]`. A
+/// `Deduplicated` / `Value` node whose resolved body contains any type or
+/// const variable is replaced by the substituted plain node so a Bound[1]
+/// `TypeVar` hash-consed under `skip_binder` (`move_under_binder`) is
+/// visible to `type_var_index_at`. The shared dedup table is not written.
 pub(crate) fn substitute_type_vars(
     body: &mut Value,
     llbc: &Llbc,
     types: &[Value],
     const_generics: &[Value],
 ) {
-    subst_vars(body, llbc, types, const_generics, Space::Ty, None, 0);
+    subst_vars(body, llbc, types, const_generics, Space::Ty, None, 0, 0);
 }
 
 /// `fd.signature` with the same depth-0 substitution as the copied body.
@@ -508,17 +597,18 @@ fn subst_vars(
     space: Space,
     key: Option<&str>,
     depth: usize,
+    binder_depth: u64,
 ) {
     if depth > 64 {
         return;
     }
-    if let Some(index) = type_var_index(v)
+    if let Some(index) = type_var_index_at(v, binder_depth)
         && let Some(replacement) = types.get(index)
     {
         *v = replacement.clone();
         return;
     }
-    if let Some(index) = const_var_index(v, space, key)
+    if let Some(index) = const_var_index_at(v, space, key, binder_depth)
         && let Some(replacement) = const_generics.get(index)
     {
         *v = replacement.clone();
@@ -533,6 +623,7 @@ fn subst_vars(
             space,
             None,
             depth + 1,
+            binder_depth,
         );
         *v = plain;
         return;
@@ -549,12 +640,19 @@ fn subst_vars(
                     item_space,
                     None,
                     depth + 1,
+                    binder_depth,
                 );
             }
         }
         Value::Object(map) => {
+            let bump = u64::from(is_poly_binder(map));
             for (k, item) in map.iter_mut() {
                 let item_space = space.field(k);
+                let next_binder = if k == "skip_binder" {
+                    binder_depth + bump
+                } else {
+                    binder_depth
+                };
                 subst_vars(
                     item,
                     llbc,
@@ -563,6 +661,7 @@ fn subst_vars(
                     item_space,
                     Some(k),
                     depth + 1,
+                    next_binder,
                 );
             }
         }
@@ -573,12 +672,19 @@ fn subst_vars(
 /// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
 /// `{"TypeVar":{"Free": i}}`.
 fn type_var_index(v: &Value) -> Option<usize> {
+    type_var_index_at(v, 0)
+}
+
+fn type_var_index_at(v: &Value, binder_depth: u64) -> Option<usize> {
     let var = v.as_object()?.get("TypeVar")?;
     if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
-        if bound.first()?.as_u64()? != 0 {
+        if bound.first()?.as_u64()? != binder_depth {
             return None;
         }
         return Some(bound.get(1)?.as_u64()? as usize);
+    }
+    if binder_depth != 0 {
+        return None;
     }
     var.get("Free")
         .and_then(Value::as_u64)
@@ -591,13 +697,23 @@ fn type_var_index(v: &Value) -> Option<usize> {
 /// or `[{"Var":{"Free": i}}, ty]` when visited in `Space::Const` under a
 /// key other than `"regions"` (a two-element region list has the same
 /// `Var` shape).
+#[allow(dead_code)]
 fn const_var_index(v: &Value, space: Space, key: Option<&str>) -> Option<usize> {
+    const_var_index_at(v, space, key, 0)
+}
+
+fn const_var_index_at(
+    v: &Value,
+    space: Space,
+    key: Option<&str>,
+    binder_depth: u64,
+) -> Option<usize> {
     if let Some(var) = v
         .as_object()
         .and_then(|obj| obj.get("kind"))
         .and_then(|kind| kind.get("Var"))
     {
-        return var_index(var);
+        return var_index_at(var, binder_depth);
     }
     if space != Space::Const || key == Some("regions") {
         return None;
@@ -606,20 +722,57 @@ fn const_var_index(v: &Value, space: Space, key: Option<&str>) -> Option<usize> 
     if arr.len() != 2 {
         return None;
     }
-    var_index(arr.first()?.as_object()?.get("Var")?)
+    var_index_at(arr.first()?.as_object()?.get("Var")?, binder_depth)
 }
 
 /// Index of a `Var` object: `{"Bound":[0, i]}` or `{"Free": i}`.
+#[allow(dead_code)]
 fn var_index(var: &Value) -> Option<usize> {
+    var_index_at(var, 0)
+}
+
+fn var_index_at(var: &Value, binder_depth: u64) -> Option<usize> {
     if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
-        if bound.first()?.as_u64()? != 0 {
+        if bound.first()?.as_u64()? != binder_depth {
             return None;
         }
         return Some(bound.get(1)?.as_u64()? as usize);
     }
+    if binder_depth != 0 {
+        return None;
+    }
     var.get("Free")
         .and_then(Value::as_u64)
         .map(|index| index as usize)
+}
+
+/// True when `v` is a type or const variable at any De Bruijn depth.
+/// Hash-consed Bound[1] TypeVars (`Value[23]` under a `PolyTraitRef`
+/// `skip_binder`) must unwrap; `type_var_index` only matches Bound[0], so
+/// a Bound[1] body would otherwise stay a `Deduplicated` id and never be
+/// substituted.
+fn is_open_var(v: &Value, space: Space, key: Option<&str>) -> bool {
+    if v.as_object().is_some_and(|obj| obj.contains_key("TypeVar")) {
+        return true;
+    }
+    if v.as_object()
+        .and_then(|obj| obj.get("kind"))
+        .and_then(|kind| kind.get("Var"))
+        .is_some()
+    {
+        return true;
+    }
+    if space != Space::Const || key == Some("regions") {
+        return false;
+    }
+    let Some(arr) = v.as_array() else {
+        return false;
+    };
+    arr.len() == 2
+        && arr
+            .first()
+            .and_then(Value::as_object)
+            .is_some_and(|obj| obj.contains_key("Var"))
 }
 
 fn contains_depth0_var(
@@ -632,7 +785,7 @@ fn contains_depth0_var(
     if depth > 64 {
         return false;
     }
-    if type_var_index(v).is_some() || const_var_index(v, space, key).is_some() {
+    if is_open_var(v, space, key) {
         return true;
     }
     if let Some(body) = indirect_body(v, llbc, space) {
@@ -649,8 +802,9 @@ fn contains_depth0_var(
     }
 }
 
-/// Resolved body of a dedup wrapper when that body contains a depth-0
-/// variable. `None` when `v` is not a wrapper or the body has no such variable.
+/// Resolved body of a dedup wrapper when that body contains a type or
+/// const variable. `None` when `v` is not a wrapper or the body has no
+/// such variable.
 fn indirect_body_with_var(v: &Value, llbc: &Llbc, space: Space) -> Option<Value> {
     let body = indirect_body(v, llbc, space)?;
     if contains_depth0_var(&body, llbc, space, None, 0) {
@@ -754,14 +908,16 @@ impl Space {
 }
 
 fn substitute_clauses(v: &mut Value, llbc: &Llbc, trait_refs: &[Value]) {
-    substitute_clauses_at(v, llbc, trait_refs, Space::Ty, None, 0);
+    substitute_clauses_at(v, llbc, trait_refs, Space::Ty, None, 0, 0);
 }
 
-/// Same shape as [`subst_vars`]: a depth-0 `Clause` is replaced in place;
-/// a `Deduplicated` / `Value` wrapper whose resolved body
+/// Same shape as [`subst_vars`]: a function-level `Clause` is replaced in
+/// place; a `Deduplicated` / `Value` wrapper whose resolved body
 /// mentions one is replaced by a plain copy of that body (the shared
 /// dedup table is not written) and the copy is walked. Anything else is
-/// walked through its children.
+/// walked through its children. `binder_depth` is the number of
+/// `RegionBinder` / `Binder` wrappers already entered; a `PolyTraitRef`
+/// clause is `Bound(1, id)` at depth 0 (`TraitParam::identity_tref`).
 fn substitute_clauses_at(
     v: &mut Value,
     llbc: &Llbc,
@@ -769,18 +925,27 @@ fn substitute_clauses_at(
     space: Space,
     key: Option<&str>,
     depth: usize,
+    binder_depth: u64,
 ) {
     if depth > 64 {
         return;
     }
-    if let Some(index) = clause_index(v, llbc, space)
+    if let Some(index) = clause_index(v, llbc, space, binder_depth)
         && let Some(replacement) = trait_refs.get(index)
     {
         *v = replacement.clone();
         return;
     }
     if let Some(mut plain) = indirect_body_with_clause(v, llbc, space) {
-        substitute_clauses_at(&mut plain, llbc, trait_refs, space, None, depth + 1);
+        substitute_clauses_at(
+            &mut plain,
+            llbc,
+            trait_refs,
+            space,
+            None,
+            depth + 1,
+            binder_depth,
+        );
         *v = plain;
         return;
     }
@@ -788,13 +953,35 @@ fn substitute_clauses_at(
         Value::Array(items) => {
             for (i, item) in items.iter_mut().enumerate() {
                 let item_space = space.element(key, i);
-                substitute_clauses_at(item, llbc, trait_refs, item_space, None, depth + 1);
+                substitute_clauses_at(
+                    item,
+                    llbc,
+                    trait_refs,
+                    item_space,
+                    None,
+                    depth + 1,
+                    binder_depth,
+                );
             }
         }
         Value::Object(map) => {
+            let bump = u64::from(is_poly_binder(map));
             for (k, item) in map.iter_mut() {
                 let item_space = space.field(k);
-                substitute_clauses_at(item, llbc, trait_refs, item_space, Some(k), depth + 1);
+                let next_binder = if k == "skip_binder" {
+                    binder_depth + bump
+                } else {
+                    binder_depth
+                };
+                substitute_clauses_at(
+                    item,
+                    llbc,
+                    trait_refs,
+                    item_space,
+                    Some(k),
+                    depth + 1,
+                    next_binder,
+                );
             }
         }
         _ => {}
@@ -821,6 +1008,12 @@ fn indirect_body_with_clause(v: &Value, llbc: &Llbc, space: Space) -> Option<Val
 pub(crate) fn spec_type_name(v: &Value, llbc: &Llbc, depth: usize, expand_aliases: bool) -> String {
     if depth > 32 {
         return "deep".to_string();
+    }
+    if let Some(obj) = v.as_object()
+        && is_poly_binder(obj)
+        && let Some(inner) = obj.get("skip_binder")
+    {
+        return spec_type_name(inner, llbc, depth + 1, expand_aliases);
     }
     if let Some(obj) = v.as_object()
         && obj.len() == 1
@@ -1543,6 +1736,109 @@ mod tests {
         );
     }
 
+    /// A `RegionBinder<Ty>` (`types_outlive` / `skip_binder`) is the inner
+    /// type. Dumping the binder object would put `types_outlive` in the
+    /// spec leaf.
+    #[test]
+    fn spec_type_name_peels_region_binder() {
+        let llbc = empty_llbc();
+        let inner = json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let binder = json!({
+            "regions": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "skip_binder": inner,
+        });
+        let named = spec_type_name(&binder, &llbc, 0, false);
+        assert_eq!(named, spec_type_name(&inner, &llbc, 0, false));
+        assert!(!named.contains("types_outlive"), "{named}");
+        let wrapped = json!({"types": [binder], "trait_refs": [], "const_generics": []});
+        let plain = json!({"types": [inner], "trait_refs": [], "const_generics": []});
+        assert_eq!(
+            spec_leaf("with_lock", 7, &wrapped, &llbc),
+            spec_leaf("with_lock", 7, &plain, &llbc)
+        );
+    }
+
+    /// TypeVars under a `RegionBinder` are `Bound(1, i)` (`move_under_binder`).
+    #[test]
+    fn substitute_type_vars_replaces_bound1_under_skip_binder() {
+        let llbc = empty_llbc();
+        let replacement = json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let mut wrapped = json!({
+            "regions": [],
+            "types_outlive": [],
+            "skip_binder": {"TypeVar": {"Bound": [1, 0]}},
+        });
+        substitute_type_vars(&mut wrapped, &llbc, &[replacement.clone()], &[]);
+        assert_eq!(
+            wrapped.pointer("/skip_binder"),
+            Some(&replacement),
+            "{wrapped}"
+        );
+    }
+
+    /// Hash-consed Bound[1] TypeVars (`Deduplicated` of a type-table
+    /// `TypeVar Bound[1, 0]`) unwrap under `skip_binder` and substitute.
+    #[test]
+    fn substitute_type_vars_replaces_deduplicated_bound1_under_skip_binder() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let bound1 = json!({"TypeVar": {"Bound": [1, 0]}});
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [],
+                        "output": {"Value": [23, bound1]}
+                    },
+                    "body": null
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert_eq!(llbc.dedup_body(23), Some(&bound1));
+        let replacement = json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let mut wrapped = json!({
+            "regions": [],
+            "types_outlive": [],
+            "skip_binder": {"Deduplicated": 23},
+        });
+        substitute_type_vars(&mut wrapped, &llbc, &[replacement.clone()], &[]);
+        assert_eq!(
+            wrapped.pointer("/skip_binder"),
+            Some(&replacement),
+            "{wrapped}"
+        );
+    }
+
+    /// A Bound[1] TypeVar is still open: specializing it would name `spec_v0`.
+    #[test]
+    fn concrete_type_args_rejects_bound1_type_var() {
+        let llbc = empty_llbc();
+        let bound0 = json!({"types": [{"TypeVar": {"Bound": [0, 0]}}], "const_generics": []});
+        let bound1 = json!({"types": [{"TypeVar": {"Bound": [1, 0]}}], "const_generics": []});
+        let i64_ty = json!({
+            "types": [{"Scalar": {"Integer": {"Signed": "I64"}}}],
+            "const_generics": []
+        });
+        assert!(concrete_type_args(&bound0, &llbc).is_none());
+        assert!(concrete_type_args(&bound1, &llbc).is_none());
+        assert!(concrete_type_args(&i64_ty, &llbc).is_some());
+    }
+
     /// `fn f<const N: usize>()` is generic even with no type params or clauses,
     /// so `f::<4>` and `f::<8>` are two spec copies.
     #[test]
@@ -1609,7 +1905,7 @@ mod tests {
                         {"index": 1, "name": null, "span": span, "ty": {"Value": [11, wrapper]}}
                     ]
                 },
-                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+                "body": [{"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
             }
         });
         let file = json!({
@@ -1653,6 +1949,97 @@ mod tests {
         assert!(value_has_depth0_type_var(&shared) && value_has_depth0_clause(&shared));
     }
 
+    /// `GenericArgs.trait_refs` is `PolyTraitRef` = `RegionBinder<TraitRef>`.
+    /// `TraitParam::identity_tref_at_depth` stores the function-level clause
+    /// as `Bound(1, id)` under `skip_binder`; the copy still replaces it.
+    #[test]
+    fn clause_subst_replaces_poly_trait_ref_bound1() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let poly_clause = json!({
+            "regions": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "skip_binder": {
+                "kind": {"Clause": [{"Bound": [1, 0]}, {"regions": []}]},
+                "trait_decl_ref": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }
+        });
+        let generics = json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [],
+            "trait_refs": [poly_clause]
+        });
+        let wrapper = json!({"Adt": {"id": 0, "generics": generics}});
+        let impl_ref = json!({
+            "regions": [],
+            "regions_outlive": [],
+            "types_outlive": [],
+            "skip_binder": {
+                "kind": {"TraitImpl": {"id": 7, "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }}},
+                "trait_decl_ref": {"id": 0, "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }}
+            }
+        });
+        let body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [
+                        {"index": 0, "name": null, "span": span, "ty": {"Value": [11, wrapper]}}
+                    ]
+                },
+                "body": [{"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Scalar": {"Integer": {"Signed": "I64"}}}},
+                    "body": body
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied = substituted_unstructured(fd, &llbc, &[impl_ref.clone()], &[], &[])
+            .expect("substituted body");
+        let ty = match &copied.locals.locals[0].ty {
+            majit_charon_reader::ullbc::TyRef::Other(ty) => ty,
+            other => panic!("expected inline ty, got {other:?}"),
+        };
+        assert!(
+            ty.pointer("/Adt/generics/trait_refs/0/skip_binder/kind/TraitImpl/id")
+                .and_then(Value::as_u64)
+                == Some(7),
+            "PolyTraitRef Bound[1] clause was not replaced: {ty}"
+        );
+    }
+
     /// A span is hash-consed in a table of its own. A span id equal to a
     /// type id whose body holds a depth-0 variable stays a span in the copy.
     #[test]
@@ -1668,7 +2055,7 @@ mod tests {
                     "arg_count": 0,
                     "locals": [{"index": 0, "name": null, "span": span, "ty": {"Value": [11, wrapper]}}]
                 },
-                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+                "body": [{"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
             }
         });
         let file = json!({
@@ -1721,7 +2108,7 @@ mod tests {
         let const_body = json!([{"Bool": false}, bool_ty]);
         let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let local = |index, ty| json!({"index": index, "name": null, "span": span, "ty": ty});
-        let ret = json!({"statements": [], "terminator": {"span": span, "kind": "Return"}});
+        let ret = json!({"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}});
         let body = json!({
             "Unstructured": {
                 "span": span,
@@ -1741,6 +2128,7 @@ mod tests {
                                 {"Use": [{"Const": {"Value": [11, const_body]}}, "Yes"]}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {
                             "span": span,
                             "kind": {"Switch": {
@@ -1754,7 +2142,7 @@ mod tests {
                         }
                     },
                     ret,
-                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
                 ]
             }
         });
@@ -1849,8 +2237,8 @@ mod tests {
                     "locals": [{"index": 0, "name": null, "span": span, "ty": i64_ty}]
                 },
                 "body": [
-                    {"statements": [], "terminator": {"span": span, "kind": "Return"}, "is_cleanup": false},
-                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}, "is_cleanup": true}
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}, "kind": "Regular"},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}, "kind": "Cleanup"}
                 ]
             }
         });

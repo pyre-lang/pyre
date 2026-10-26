@@ -194,7 +194,7 @@ fn a_panic_terminator_raises_implicitly_like_abort() {
                 "body": [{
                     "statements": [],
                     "terminator": {"span": span, "kind": term},
-                    "is_cleanup": false
+                    "kind": "Regular"
                 }]
             }}
         })
@@ -334,6 +334,7 @@ fn generic_one_arm_switchint_panic_default_lowers() {
                                     {"Discriminant": place(1, &enum_ty)}
                                 ]}
                             }],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": {"Switch": {
                                 "discr": {"Copy": place(2, &i64_ty)},
                                 "targets": {"SwitchInt": [
@@ -342,7 +343,7 @@ fn generic_one_arm_switchint_panic_default_lowers() {
                                     2
                                 ]}
                             }}},
-                            "is_cleanup": false
+                            "kind": "Regular"
                         },
                         {
                             "statements": [{
@@ -353,12 +354,12 @@ fn generic_one_arm_switchint_panic_default_lowers() {
                                 ]}
                             }],
                             "terminator": {"span": span, "kind": "Return"},
-                            "is_cleanup": false
+                            "kind": "Regular"
                         },
                         {
                             "statements": [],
                             "terminator": {"span": span, "kind": {"Abort": "UndefinedBehavior"}},
-                            "is_cleanup": false
+                            "kind": "Regular"
                         }
                     ]
                 }}

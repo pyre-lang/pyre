@@ -34,18 +34,18 @@ fn mem_forget_returns_a_defined_unit_value() {
                         {"index": 2, "name": "unit", "span": span, "ty": unit}
                     ]},
                     "body": [
-                        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [{"Move": place(1, &word)}], "dest": place(2, &unit)},
                             "target": 1, "on_unwind": 2
                         }}}},
-                        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                                 "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
                             "target": 3, "on_unwind": 2
                         }}}},
-                        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                        {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
                     ]
                  }}},
                 {"def_id": 1, "item_meta": meta(&["core", "mem", "forget"]),
@@ -108,19 +108,19 @@ fn icf_identity_token_is_erased_to_a_defined_unit_value() {
                         {"index": 2, "name": "unit", "span": span, "ty": unit}
                     ]},
                     "body": [
-                        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1},
                                 "generics": generics}},
                                 "args": [], "dest": place(2, &unit)},
                             "target": 1, "on_unwind": 2
                         }}}},
-                        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                                 "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
                             "target": 3, "on_unwind": 2
                         }}}},
-                        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                        {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
                     ]
                  }}},
                 {"def_id": 1, "item_meta": meta(&["majit_ir", "icf", "icf_identity_token"]),

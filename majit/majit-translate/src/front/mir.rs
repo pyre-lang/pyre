@@ -684,7 +684,8 @@ fn is_known_lowering_gap(msg: &str) -> bool {
     // back-edge — into it, so the header read resolves to the inputarg
     // regardless of processing order.  The only requirement is that
     // `compute_mir_liveness` mark every local the lowering reads; see
-    // `mark_projection_index_offset_use` for the `place[idx]` case.
+    // `mark_projection_index_offset_use` for the `place[idx]` and
+    // `Offset.bytes` cases.
     if msg.contains("uninitialised local") {
         return true;
     }
@@ -8834,10 +8835,11 @@ mod reachable_mask_tests {
     }
 
     fn bb(kind: Value, is_cleanup: bool) -> Value {
+        let unwind = if is_cleanup { "Cleanup" } else { "Regular" };
         json!({
             "statements": [],
             "terminator": {"span": span(), "kind": kind},
-            "is_cleanup": is_cleanup
+            "kind": unwind
         })
     }
 
@@ -13164,7 +13166,7 @@ impl<'a> Lowering<'a> {
             // from operand types alone also wraps `AtomicPtr::from_ptr` of
             // `PyCode.w_globals`, which must stay a `FieldRead` so Acquire
             // load folds to `record_quasiimmut_field`.
-            CallFunc::Dynamic(_) | CallFunc::Unknown => None,
+            CallFunc::Dynamic(..) | CallFunc::Unknown => None,
         }
     }
 
@@ -13970,7 +13972,8 @@ impl<'a> Lowering<'a> {
                 self.operand_hides_spill_alias(operand, groups, depth)
             }
             Rvalue::UnaryOp(op, operand)
-                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+                if unary_op_is_cast(op)
+                    && cast_preserves_spill_address(op, Some(result_ty), self.llbc) =>
             {
                 self.operand_hides_spill_alias(operand, groups, depth)
             }
@@ -14089,7 +14092,10 @@ impl<'a> Lowering<'a> {
                     continue;
                 }
                 saw = true;
-                found = merge_address_source(found, self.rvalue_address_source(&rvalue, depth + 1));
+                found = merge_address_source(
+                    found,
+                    self.rvalue_address_source(&rvalue, depth + 1, Some(&dest.ty)),
+                );
                 if matches!(found, Some(SpillAddressSource::Unknown)) {
                     return SpillAddressSource::Unknown;
                 }
@@ -14142,7 +14148,7 @@ impl<'a> Lowering<'a> {
                     }
                     found = merge_address_source(
                         found,
-                        self.rvalue_field_source(&rvalue, path, depth + 1),
+                        self.rvalue_field_source(&rvalue, path, depth + 1, Some(&dest.ty)),
                     );
                     if matches!(found, Some(SpillAddressSource::Unknown)) {
                         return SpillAddressSource::Unknown;
@@ -14160,9 +14166,14 @@ impl<'a> Lowering<'a> {
                 }
                 let stored_path = stored_path.as_slice();
                 let next = if stored_path == path {
-                    self.rvalue_address_source(&rvalue, depth + 1)
+                    self.rvalue_address_source(&rvalue, depth + 1, Some(&dest.ty))
                 } else if path.starts_with(stored_path) {
-                    self.rvalue_field_source(&rvalue, &path[stored_path.len()..], depth + 1)
+                    self.rvalue_field_source(
+                        &rvalue,
+                        &path[stored_path.len()..],
+                        depth + 1,
+                        Some(&dest.ty),
+                    )
                 } else if stored_path.starts_with(path) {
                     return SpillAddressSource::Unknown;
                 } else {
@@ -14177,7 +14188,12 @@ impl<'a> Lowering<'a> {
         found.unwrap_or(SpillAddressSource::Unknown)
     }
 
-    fn rvalue_address_source(&self, rvalue: &Rvalue, depth: u8) -> SpillAddressSource {
+    fn rvalue_address_source(
+        &self,
+        rvalue: &Rvalue,
+        depth: u8,
+        dest_ty: Option<&TyRef>,
+    ) -> SpillAddressSource {
         if depth > 8 {
             return SpillAddressSource::Unknown;
         }
@@ -14189,7 +14205,7 @@ impl<'a> Lowering<'a> {
                 self.spill_address_source(op, depth + 1)
             }
             Rvalue::UnaryOp(op, operand)
-                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, dest_ty, self.llbc) =>
             {
                 self.spill_address_source(operand, depth + 1)
             }
@@ -14205,12 +14221,13 @@ impl<'a> Lowering<'a> {
         rvalue: &Rvalue,
         path: &[usize],
         depth: u8,
+        dest_ty: Option<&TyRef>,
     ) -> SpillAddressSource {
         if depth > 8 {
             return SpillAddressSource::Unknown;
         }
         if path.is_empty() {
-            return self.rvalue_address_source(rvalue, depth);
+            return self.rvalue_address_source(rvalue, depth, dest_ty);
         }
         match rvalue {
             Rvalue::Aggregate(_, operands) => {
@@ -14229,7 +14246,7 @@ impl<'a> Lowering<'a> {
                 self.operand_field_source(op, path, depth + 1)
             }
             Rvalue::UnaryOp(op, operand)
-                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, dest_ty, self.llbc) =>
             {
                 self.operand_field_source(operand, path, depth + 1)
             }
@@ -14306,7 +14323,7 @@ impl<'a> Lowering<'a> {
                 if index as usize != local {
                     continue;
                 }
-                let place = self.rvalue_pointer_place(&rvalue, depth)?;
+                let place = self.rvalue_pointer_place(&rvalue, depth, Some(&dest.ty))?;
                 if found.is_some() {
                     return None;
                 }
@@ -14316,7 +14333,12 @@ impl<'a> Lowering<'a> {
         found.map(|place| self.concrete_borrow_place(place))
     }
 
-    fn rvalue_pointer_place(&self, rvalue: &Rvalue, depth: u8) -> Option<Place> {
+    fn rvalue_pointer_place(
+        &self,
+        rvalue: &Rvalue,
+        depth: u8,
+        dest_ty: Option<&TyRef>,
+    ) -> Option<Place> {
         match rvalue {
             Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => Some(place.clone()),
             Rvalue::Use(op, _) => self.operand_pointer_place(op, depth),
@@ -14326,7 +14348,7 @@ impl<'a> Lowering<'a> {
                 self.operand_pointer_place(op, depth)
             }
             Rvalue::UnaryOp(op, operand)
-                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, dest_ty, self.llbc) =>
             {
                 self.operand_pointer_place(operand, depth)
             }
@@ -21568,6 +21590,40 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Charon `ProjectionElem::Offset`: `ptr.offset(n)` is `&raw (*ptr).offset(bytes)`
+    /// with `bytes` already `n * size_of::<T>()` (`offset_projection`).
+    /// The old `BinOp::Offset` result was that address; emit unscaled
+    /// `direct_ptradd` (Char item, byte shift) of the pointer plus `bytes`.
+    fn resolve_offset_place(
+        &mut self,
+        mir_bb: usize,
+        inner: Place,
+        offset: &serde_json::Value,
+    ) -> Result<Variable, LowerError> {
+        let bytes_v = offset.get("bytes").ok_or_else(|| {
+            LowerError::Schema(format!(
+                "bb{mir_bb}: Offset projection missing bytes: {offset}"
+            ))
+        })?;
+        let bytes_op: Operand = serde_json::from_value(bytes_v.clone())
+            .map_err(|e| LowerError::Schema(format!("bb{mir_bb}: Offset bytes decode: {e}")))?;
+        let bytes = self.resolve_operand(mir_bb, bytes_op)?;
+        let ptr = match inner.kind {
+            PlaceKind::Projection(ptr_place, ProjectionElem::Atom(ref s)) if s == "Deref" => {
+                self.resolve_place(mir_bb, *ptr_place)?
+            }
+            _ => self.resolve_place(mir_bb, inner)?,
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        Ok(push_direct_ptradd(
+            &mut self.graph,
+            bb_id,
+            ptr,
+            bytes,
+            &item_lltype_for_size(1),
+        ))
+    }
+
     fn resolve_place(&mut self, mir_bb: usize, place: Place) -> Result<Variable, LowerError> {
         self.resolve_place_as(mir_bb, place, false)
     }
@@ -22804,6 +22860,11 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(res);
+                }
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(offset) = v.get("Offset")
+                {
+                    return self.resolve_offset_place(mir_bb, *inner, offset);
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
@@ -26275,7 +26336,7 @@ impl<'a> Lowering<'a> {
         // spells a `&[T]` parameter.
         let passes_pairs_indirectly = matches!(
             (&class, &call.func),
-            (CallClass::Dynamic, CallFunc::Dynamic(_))
+            (CallClass::Dynamic, CallFunc::Dynamic(..))
         );
         // `<[u8]>::to_vec` by representation, before the pair-ABI match: a
         // W3 window is `rffi.charpsize2str`, not a pair call of `to_vec`.
@@ -31842,7 +31903,7 @@ impl<'a> Lowering<'a> {
                     }
                 }
             }
-            (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand)) => {
+            (CallClass::Dynamic, CallFunc::Dynamic(dyn_operand, _)) => {
                 // `dyn Trait` virtual call.  The inline-dispatch form reads
                 // the method fn-ptr straight out of the receiver's vtable
                 // (`(*recv).vtable.method_<name>`), so the operand's
@@ -35903,11 +35964,10 @@ impl<'a> Lowering<'a> {
         let want = self.tyref_adt_def_id(ty)?;
         let refs = reg.generics.get("trait_refs")?.as_array()?;
         for raw in refs {
-            let node = peel_hashcons_value(self.llbc, raw);
-            let Some(obj) = node.as_object() else {
+            let Some(node) = traitref_unwrap(raw, self.llbc, 0) else {
                 continue;
             };
-            let Some(impl_id) = obj
+            let Some(impl_id) = node
                 .get("kind")
                 .and_then(|kind| kind.get("TraitImpl"))
                 .and_then(|impl_row| impl_row.get("id"))
@@ -35915,10 +35975,8 @@ impl<'a> Lowering<'a> {
             else {
                 continue;
             };
-            let Some(trait_id) = obj
-                .get("trait_decl_ref")
-                .and_then(|decl| decl.get("skip_binder"))
-                .and_then(|binder| binder.get("id"))
+            let Some(trait_id) = crate::front::clause_spec::trait_decl_pred(node)
+                .and_then(|pred| pred.get("id"))
                 .and_then(serde_json::Value::as_u64)
             else {
                 continue;
@@ -41959,10 +42017,7 @@ impl<'a> Lowering<'a> {
             let Some(tref) = traitref_unwrap(tref, self.llbc, 0) else {
                 continue;
             };
-            let Some(decl) = tref
-                .get("trait_decl_ref")
-                .and_then(|d| d.get("skip_binder"))
-            else {
+            let Some(decl) = crate::front::clause_spec::trait_decl_pred(tref) else {
                 continue;
             };
             let Some(decl_id) = decl.get("id").and_then(serde_json::Value::as_u64) else {
@@ -49534,7 +49589,7 @@ fn ref_temp_is_sole_append_arg(
                         .map(|(acc, piece)| if accumulator { acc } else { piece }),
                     _ => None,
                 };
-                if let CallFunc::Dynamic(op) = &call.func
+                if let CallFunc::Dynamic(op, _) = &call.func
                     && operand_reads_local(op, rt)
                 {
                     other += 1;
@@ -49681,7 +49736,7 @@ fn clean_accumulator_ref_temps_scan(
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func
+                if let CallFunc::Dynamic(op, _) = &call.func
                     && c_operand_kind(op, c).is_some()
                 {
                     return None;
@@ -49766,7 +49821,7 @@ fn ref_temp_is_sole_take_arg(body: &Unstructured, llbc: &Llbc, rt: usize) -> boo
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func
+                if let CallFunc::Dynamic(op, _) = &call.func
                     && operand_reads_local(op, rt)
                 {
                     other += 1;
@@ -49846,7 +49901,7 @@ fn take_receiver_of_borrow(body: &Unstructured, llbc: &Llbc, rt: usize) -> Optio
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func
+                if let CallFunc::Dynamic(op, _) = &call.func
                     && operand_reads_local(op, rt)
                 {
                     other += 1;
@@ -49945,7 +50000,7 @@ fn ref_temp_is_sole_identity_arg(
         }
         match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func
+                if let CallFunc::Dynamic(op, _) = &call.func
                     && operand_reads_local(op, rt)
                 {
                     other += 1;
@@ -50160,7 +50215,7 @@ fn sole_string_alias_successor_scan(
                 } else {
                     other += reads;
                 }
-                if let CallFunc::Dynamic(op) = &call.func {
+                if let CallFunc::Dynamic(op, _) = &call.func {
                     other += usize::from(operand_reads_local(op, source));
                 }
             }
@@ -50252,7 +50307,7 @@ fn append_arg_of_borrow_scan(
         // terminator (the append call receives `recv`, not `rt`).
         match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func
+                if let CallFunc::Dynamic(op, _) = &call.func
                     && operand_reads_local(op, rt)
                 {
                     other += 1;
@@ -51586,7 +51641,7 @@ fn call_observes_divmod_result(call: &CallPayload, llbc: &Llbc, alias: &[usize])
         }
         receiver_only = true;
     }
-    if let CallFunc::Dynamic(op) = &call.func
+    if let CallFunc::Dynamic(op, _) = &call.func
         && operand_mentions_alias(op, alias)
     {
         return true;
@@ -52758,7 +52813,7 @@ fn dest_deref_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> DestDeref
                 &mut census.other,
             ),
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func {
+                if let CallFunc::Dynamic(op, _) = &call.func {
                     bump_dest_ref(
                         operand_dest_ref(op, dest),
                         &mut census.read_derefs,
@@ -52959,7 +53014,7 @@ fn struct_field_census(llbc: &Llbc, body: &Unstructured, dest: usize) -> StructF
                 &mut census.other,
             ),
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func {
+                if let CallFunc::Dynamic(op, _) = &call.func {
                     bump_struct_field_use(
                         operand_struct_field_use(op, dest),
                         &mut census.fields,
@@ -53188,7 +53243,7 @@ fn term_has_struct_field_value_use(term: &TermKind, dest: usize) -> bool {
             );
         }
         TermKind::Call { call, .. } => {
-            if let CallFunc::Dynamic(op) = &call.func {
+            if let CallFunc::Dynamic(op, _) = &call.func {
                 bump_struct_field_use(operand_struct_field_use(op, dest), &mut fields, &mut other);
             }
             for arg in &call.args {
@@ -53564,7 +53619,7 @@ fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -
             &mut other,
         ),
         Ok(TermKind::Call { call, .. }) => {
-            if let CallFunc::Dynamic(op) = &call.func {
+            if let CallFunc::Dynamic(op, _) = &call.func {
                 bump_struct_field_use(operand_struct_field_use(op, dest), &mut fields, &mut other);
             }
             for arg in &call.args {
@@ -54141,7 +54196,7 @@ impl<'a> RootStackAnalyzer<'a> {
                                             .any(|op| self.analyze_fn_operand(op, seen))
                                 }
                                 // `dyn Trait` dispatch: the pointer arm's reasoning.
-                                CallFunc::Dynamic(_) => false,
+                                CallFunc::Dynamic(..) => false,
                                 CallFunc::Unknown => true,
                             }
                         }
@@ -54867,7 +54922,7 @@ fn root_bracket_stack_effects_are_known(
                     CallFunc::Regular(reg) => reg,
                     // `dyn Trait` dispatch: see `RootStackAnalyzer`'s
                     // pointer arm.
-                    CallFunc::Dynamic(_) => {
+                    CallFunc::Dynamic(..) => {
                         work.extend(block_successors(llbc, body, bb));
                         continue;
                     }
@@ -58971,7 +59026,7 @@ fn vec_transfer_term(
             if call.args.iter().any(|op| operand_moves_local(op, local)) {
                 s = VEC_UNINIT;
             }
-            if let CallFunc::Dynamic(op) = &call.func
+            if let CallFunc::Dynamic(op, _) = &call.func
                 && operand_moves_local(op, local)
             {
                 s = VEC_UNINIT;
@@ -59933,7 +59988,7 @@ fn mark_call_uses(
     defs: &bit_set::BitSet,
     n_locals: usize,
 ) {
-    if let CallFunc::Dynamic(op) = &call.func {
+    if let CallFunc::Dynamic(op, _) = &call.func {
         mark_operand_use(op, uses, defs, n_locals);
     }
     for arg in &call.args {
@@ -60014,16 +60069,19 @@ fn mark_place_write(
     }
 }
 
-/// A place whose projection chain contains an `Index { offset, .. }`
-/// reads the offset operand's local at lowering time — `resolve_place`
-/// (read) and `emit_projection_write` (write) both route the offset
-/// through `index_offset_var` → `resolve_operand`.  The offset lives in
-/// the projection element, not in `inner`, so the surrounding
+/// A place whose projection chain contains an `Index { offset, .. }` or
+/// an `Offset { bytes, .. }` reads that operand's local at lowering
+/// time — `resolve_place` / `emit_projection_write` route `Index.offset`
+/// through `index_offset_var` → `resolve_operand`, and
+/// `resolve_offset_place` does the same for `Offset.bytes`.  The operand
+/// lives in the projection element, not in `inner`, so the surrounding
 /// `mark_place_use` / `mark_place_write` recursion (which descends only
 /// into `inner`) would miss it.  Mark it as a use so a loop-carried
-/// index local receives a block inputarg and threads across the
-/// back-edge, instead of failing loud as an uninitialised local at the
-/// loop header.  `from_end` is ignored, matching `index_offset_var`.
+/// index or byte-count local receives a block inputarg and threads
+/// across the back-edge, instead of failing loud as an uninitialised
+/// local at the loop header.  `from_end` is ignored, matching
+/// `index_offset_var`.  Upstream `_compute_liveness_must_continue`
+/// marks every register argument alive.
 fn mark_projection_index_offset_use(
     elem: &ProjectionElem,
     uses: &mut bit_set::BitSet,
@@ -60033,12 +60091,20 @@ fn mark_projection_index_offset_use(
     let ProjectionElem::Tagged(v) = elem else {
         return;
     };
-    let Some(offset) = v
-        .as_object()
-        .and_then(|m| m.get("Index"))
-        .and_then(|idx| idx.as_object())
+    let obj = match v.as_object() {
+        Some(m) => m,
+        None => return,
+    };
+    let operand = obj
+        .get("Index")
+        .and_then(serde_json::Value::as_object)
         .and_then(|m| m.get("offset"))
-    else {
+        .or_else(|| {
+            obj.get("Offset")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|m| m.get("bytes"))
+        });
+    let Some(offset) = operand else {
         return;
     };
     if let Ok(op) = serde_json::from_value::<Operand>(offset.clone()) {
@@ -60516,7 +60582,8 @@ fn trait_impl_match_for_receiver(
     let trait_id = trait_ref_decl_id(arr.first()?, llbc)?;
     let method_idx = arr.get(1)?.as_u64()?;
     let call_types = traitref_unwrap(arr.first()?, llbc, 0)
-        .and_then(|resolved| resolved.pointer("/trait_decl_ref/skip_binder/generics/types"))
+        .and_then(crate::front::clause_spec::trait_decl_pred)
+        .and_then(|pred| pred.pointer("/generics/types"))
         .and_then(serde_json::Value::as_array);
     let mut found = None;
     for (i, row) in llbc.trait_impls_raw().iter().enumerate() {
@@ -62017,9 +62084,9 @@ fn store_through_referent(
         mark_local_address(llbc, depths, &local_place, value, rvalue, projections);
         return;
     }
-    let field_direct =
-        value.bits & 1 != 0 && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
-    let field_referent = rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc));
+    let field_direct = value.bits & 1 != 0
+        && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc, Some(place_ty)));
+    let field_referent = rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc, Some(place_ty)));
     if depths
         .iter()
         .any(|slot| slot.local == referent.local && slot.split)
@@ -62509,7 +62576,7 @@ fn mark_local_address(
         let tainted = value.bits != 0 || value.condition > 0 || slots.iter().any(field_is_tainted);
         let direct = !split
             && value.bits & 1 != 0
-            && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
+            && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc, Some(&place.ty)));
         // `q = &bits` while `bits` is still clean. Dropping `q` before
         // `rvalue_referent` records the name would make a later
         // `bits = p as usize` invisible through `*q`.
@@ -62519,7 +62586,7 @@ fn mark_local_address(
         let referent = if split {
             None
         } else {
-            rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc))
+            rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc, Some(&place.ty)))
         };
         // `s = &array as &[T]` is clean apart from this length. Dropping
         // `s` would make `Len(*s)` look untracked.
@@ -62565,9 +62632,9 @@ fn mark_local_address(
         });
         return true;
     }
-    let field_direct =
-        value.bits & 1 != 0 && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
-    let field_referent = rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc));
+    let field_direct = value.bits & 1 != 0
+        && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc, Some(&place.ty)));
+    let field_referent = rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc, Some(&place.ty)));
     let field_path = constant_field_path(place, llbc);
     if depths.iter().any(|slot| slot.local == dest && slot.split) {
         if let Some((root, path)) = &field_path
@@ -62628,7 +62695,7 @@ fn mark_local_address(
 
 fn indirect_target_address(func: &CallFunc, depths: &[LocalAddress], llbc: &Llbc) -> AddressValue {
     match func {
-        CallFunc::Dynamic(op) => operand_address(op, depths, llbc),
+        CallFunc::Dynamic(op, _) => operand_address(op, depths, llbc),
         CallFunc::Regular(reg) => match &reg.kind {
             CallKind::Ptr(value) => value_address(value, depths, 0, llbc),
             _ => AddressValue {
@@ -62807,7 +62874,8 @@ fn untracked_projection_carries_referent(
     {
         return false;
     }
-    let stored = rvalue.is_some_and(|rv| rvalue_carries_referent(rv, depths, llbc));
+    let stored =
+        rvalue.is_some_and(|rv| rvalue_carries_referent(rv, depths, llbc, Some(&place.ty)));
     let cleared = depths
         .iter()
         .any(|slot| slot.local == dest && slot.split && slots_have_referent(&slot.slots));
@@ -62816,8 +62884,13 @@ fn untracked_projection_carries_referent(
 
 /// `q` itself, or a value that nests `q`. A cast that keeps the name
 /// is already `rvalue_referent`.
-fn rvalue_carries_referent(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> bool {
-    if rvalue_referent(rvalue, depths, llbc).is_some() {
+fn rvalue_carries_referent(
+    rvalue: &Rvalue,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+    dest_ty: Option<&TyRef>,
+) -> bool {
+    if rvalue_referent(rvalue, depths, llbc, dest_ty).is_some() {
         return true;
     }
     match rvalue {
@@ -63024,7 +63097,12 @@ fn place_stores_through_pointer(place: &Place) -> bool {
 /// `q = p` keeps the spill pointer. A cast keeps it when the
 /// destination holds every address bit, and so does `&*p`. Arithmetic
 /// and `p as u8` do not: `*q` then reads a value selected by those bits.
-fn rvalue_is_direct_pointer(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> bool {
+fn rvalue_is_direct_pointer(
+    rvalue: &Rvalue,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+    dest_ty: Option<&TyRef>,
+) -> bool {
     match rvalue {
         Rvalue::Use(op, _) => operand_is_direct_pointer(op, depths, llbc),
         Rvalue::Cast(kind, op, target_ty) => {
@@ -63033,7 +63111,7 @@ fn rvalue_is_direct_pointer(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llb
         }
         Rvalue::UnaryOp(op, operand) if unary_op_is_cast(op) => {
             operand_is_direct_pointer(operand, depths, llbc)
-                && cast_preserves_spill_address(op, None, llbc)
+                && cast_preserves_spill_address(op, dest_ty, llbc)
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
             reborrow_of_direct(place, depths, llbc)
@@ -63051,7 +63129,8 @@ fn cast_preserves_spill_address(
     llbc: &Llbc,
 ) -> bool {
     let kind = kind.get("Cast").unwrap_or(kind);
-    let from_pair = cast_pair_dest(kind).map(|ty| json_type_holds_full_address(ty, llbc));
+    let from_pair = cast_pair_dest(kind)
+        .map(|ty| json_type_holds_full_address(ty, llbc) || scalar_ty_holds_full_address(ty));
     let from_target = target_ty.map(|ty| type_holds_full_address(ty, llbc));
     match (from_pair, from_target) {
         (Some(pair), Some(target)) => pair && target,
@@ -63062,19 +63141,45 @@ fn cast_preserves_spill_address(
     }
 }
 
+/// Dest type of a dest-only `CastKind` (`Remove the target types of casts`).
+/// `RawPtr` / `PtrWithExposedProvenance` carry a `Ty`; `Scalar` a `ScalarTy`.
 fn cast_pair_dest(kind: &serde_json::Value) -> Option<&serde_json::Value> {
     let obj = kind.as_object()?;
-    let payload = obj.get("Scalar").or_else(|| obj.get("RawPtr"))?;
-    let arr = payload.as_array()?;
-    if arr.len() == 2 { Some(&arr[1]) } else { None }
+    obj.get("RawPtr")
+        .or_else(|| obj.get("Scalar"))
+        .or_else(|| obj.get("PtrWithExposedProvenance"))
+}
+
+/// Word-sized integer `ScalarTy` (`Isize`/`Usize`, or `I64`/`U64` on 64-bit).
+fn scalar_ty_holds_full_address(ty: &serde_json::Value) -> bool {
+    let word = crate::layout::target_word_size();
+    let Some(int) = ty.get("Integer") else {
+        return false;
+    };
+    let Some(name) = int
+        .get("Signed")
+        .or_else(|| int.get("Unsigned"))
+        .and_then(serde_json::Value::as_str)
+    else {
+        return false;
+    };
+    matches!(
+        (name, word),
+        ("Isize" | "Usize", _) | ("I64" | "U64", 8) | ("I32" | "U32", 4)
+    )
 }
 
 fn cast_kind_is_address_cast(kind: &serde_json::Value) -> bool {
-    kind.as_str()
-        .is_some_and(|tag| tag == "Scalar" || tag == "RawPtr")
-        || kind
-            .as_object()
-            .is_some_and(|obj| obj.contains_key("Scalar") || obj.contains_key("RawPtr"))
+    kind.as_str().is_some_and(|tag| {
+        matches!(
+            tag,
+            "Scalar" | "RawPtr" | "PtrExposeProvenance" | "PtrWithExposedProvenance"
+        )
+    }) || kind.as_object().is_some_and(|obj| {
+        obj.contains_key("Scalar")
+            || obj.contains_key("RawPtr")
+            || obj.contains_key("PtrWithExposedProvenance")
+    })
 }
 
 /// A thin pointer is one word. An integer holds the address when it is
@@ -63233,6 +63338,7 @@ fn rvalue_referent(
     rvalue: &Rvalue,
     depths: &[LocalAddress],
     llbc: &Llbc,
+    dest_ty: Option<&TyRef>,
 ) -> Option<AddressReferent> {
     match rvalue {
         Rvalue::Use(op, _) => operand_referent(op, depths, llbc),
@@ -63247,8 +63353,8 @@ fn rvalue_referent(
         }
         Rvalue::UnaryOp(op, operand)
             if unary_op_is_cast(op)
-                && cast_preserves_spill_address(op, None, llbc)
-                && cast_covers_referent_pointee(operand, None, op, llbc) =>
+                && cast_preserves_spill_address(op, dest_ty, llbc)
+                && cast_covers_referent_pointee(operand, dest_ty, op, llbc) =>
         {
             operand_referent(operand, depths, llbc)
         }
@@ -63399,7 +63505,7 @@ fn cast_covers_referent_pointee(
     let dst_ty = if let Some(ty) = target_ty {
         ty
     } else {
-        // `UnaryOp` carries `{"Cast": {"Scalar": [src, dst]}}`.
+        // `UnaryOp` carries dest-only `{"Cast": {"RawPtr": dest_ty}}`.
         let kind = kind.get("Cast").unwrap_or(kind);
         let Some(json) = cast_pair_dest(kind) else {
             return false;
@@ -64086,9 +64192,10 @@ fn place_address(place: &Place, depths: &[LocalAddress], llbc: &Llbc) -> Address
     }
 }
 
-/// `Index { offset, from_end }` reads `offset`. A comparison used as
-/// that offset stays a condition on the element. An offset that does
-/// not decode is the address.
+/// `Index { offset, from_end }` reads `offset`. `Offset { bytes, .. }`
+/// reads `bytes` the same way. A comparison used as that operand stays
+/// a condition on the element. An operand that does not decode is the
+/// address.
 fn projection_index_address(
     elem: &ProjectionElem,
     depths: &[LocalAddress],
@@ -64102,7 +64209,7 @@ fn projection_index_address(
             invariant: false,
         };
     };
-    let Some(index) = v.as_object().and_then(|obj| obj.get("Index")) else {
+    let Some(obj) = v.as_object() else {
         return AddressValue {
             bits: 0,
             condition: 0,
@@ -64110,7 +64217,19 @@ fn projection_index_address(
             invariant: false,
         };
     };
-    let Some(offset) = index.get("offset") else {
+    let operand = if let Some(index) = obj.get("Index") {
+        index.get("offset")
+    } else if let Some(offset) = obj.get("Offset") {
+        offset.get("bytes")
+    } else {
+        return AddressValue {
+            bits: 0,
+            condition: 0,
+            overflows: false,
+            invariant: false,
+        };
+    };
+    let Some(offset) = operand else {
         return AddressValue {
             bits: 1,
             condition: 0,
@@ -65048,7 +65167,7 @@ fn binop_label(v: &serde_json::Value) -> Result<String, LowerError> {
 
 /// Charon's `UnaryOp` tag → canonical RPython unary opname.  Plain
 /// atoms (`"Neg"`, `"Not"`) share `binop_label`'s mapping; tagged
-/// `{"Cast": {...}}` payloads encode the source/dest scalar shape and
+/// `{"Cast": {...}}` payloads encode the dest-only CastKind and
 /// project onto `cast_int_to_float` / `cast_float_to_int` /
 /// `cast_int_to_ptr` / `cast_ptr_to_int` per `blackhole.py bhimpl_cast_ptr_to_int`.
 /// Cast shapes the JIT models as identity (RawPtr→RawPtr,
@@ -65152,13 +65271,14 @@ fn int_cast_action(
 }
 
 /// Translate a Charon `CastKind` JSON payload into a canonical RPython
-/// cast opname.  `Scalar([Int, Float])` (and the float-to-int reverse)
-/// drive `bhimpl_cast_int_to_float` / `bhimpl_cast_float_to_int`; ptr
-/// casts go through `bhimpl_cast_{int_to_ptr,ptr_to_int}`.  Same-repr
-/// casts (RawPtr→RawPtr, same-width Int↔UInt, Unsize) are JIT-no-ops
-/// → `same_as` (the assembler's per-kind copy fallback).  Variants the
-/// JIT does not model (`VTable` / `VTableUpcast`) remain identifiable
-/// in the unwired diagnostic via the lower-cased default.
+/// cast opname.  Dest-only `Scalar(Float)` drives `cast_int_to_float`;
+/// the float-to-int reverse is recovered from the assign destination in
+/// the UnaryOp Cast arm.  Ptr casts go through
+/// `bhimpl_cast_{int_to_ptr,ptr_to_int}`.  Same-repr casts (RawPtr→RawPtr,
+/// same-width Int↔UInt, Unsize) are JIT-no-ops → `same_as` (the
+/// assembler's per-kind copy fallback).  Variants the JIT does not model
+/// remain identifiable in the unwired diagnostic via the lower-cased
+/// default.
 fn cast_label_from_payload(payload: &serde_json::Value) -> String {
     let Some(obj) = payload.as_object() else {
         return "same_as".into();
@@ -65167,23 +65287,21 @@ fn cast_label_from_payload(payload: &serde_json::Value) -> String {
         return "same_as".into();
     };
     match kind.as_str() {
-        // `Scalar([src, dst])` — int↔float crossings surface as the
-        // canonical RPython cast opnames; int↔uint of any width is a
-        // JIT-no-op (`same_as` copies the i64 carrier).
+        // Dest-only `CastKind::Scalar(ScalarTy)` — int↔float crossings
+        // surface as the canonical RPython cast opnames; int↔uint of
+        // any width is a JIT-no-op (`same_as` copies the i64 carrier).
         "Scalar" => {
-            let arr = match inner.as_array() {
-                Some(a) if a.len() == 2 => a,
-                _ => return "same_as".into(),
-            };
-            let src_is_float = scalar_is_float(&arr[0]);
-            let dst_is_float = scalar_is_float(&arr[1]);
-            match (src_is_float, dst_is_float) {
-                (true, false) => "cast_float_to_int".into(),
-                (false, true) => "cast_int_to_float".into(),
-                _ => "same_as".into(),
+            // Dest-only `CastKind::Scalar(ScalarTy)`. Int↔float uses the
+            // destination: a float dest is `cast_int_to_float`; a float
+            // source with an integer dest is recovered from the assign
+            // destination in the UnaryOp Cast arm.
+            if scalar_is_float(inner) {
+                "cast_int_to_float".into()
+            } else {
+                "same_as".into()
             }
         }
-        // `RawPtr([_, _])` — pointer-to-pointer reinterpret; same i64
+        // `RawPtr(Ty)` — pointer-to-pointer reinterpret; same i64
         // machine repr, so the JIT copies through `same_as`.
         "RawPtr" => "same_as".into(),
         // `Unsize` produces a fat pointer at the source level; the JIT
@@ -73380,8 +73498,8 @@ fn charon_fn_ptr_to_ast_string(node: &serde_json::Value, llbc: &Llbc, depth: usi
 /// Resolve a `TraitType [traitref, assoc, generics]` projection through the
 /// trait's unique impl, rendering the bound concrete type.
 ///
-/// `traitref` names the trait via `trait_decl_ref.skip_binder.id`
-/// (possibly behind `Value`/`Deduplicated` indirections);
+/// `traitref` names the trait via `trait_decl_ref.id`
+/// (possibly behind `Value`/`Deduplicated` / `skip_binder` indirections);
 /// `assoc` selects the associated item (an index in current Charon
 /// output).  Returns `None` — keeping the caller's `??TraitType`
 /// fallback — when the trait id cannot be recovered, when zero or
@@ -73523,46 +73641,25 @@ fn trait_impl_assoc_value<'a>(
 }
 
 /// Recover the trait decl id a `TraitRef` names —
-/// `trait_decl_ref.skip_binder.id`, behind the usual
-/// `Value` / `Deduplicated` indirections.
+/// `trait_decl_ref.id`, behind the usual
+/// `Value` / `Deduplicated` / `skip_binder` indirections.
 fn traitref_decl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<u64> {
-    if depth > 8 {
-        return None;
-    }
-    let obj = v.as_object()?;
-    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        return traitref_decl_id(llbc.dedup_trait_body(id)?, llbc, depth + 1);
-    }
-    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
-        && arr.len() == 2
-    {
-        return traitref_decl_id(&arr[1], llbc, depth + 1);
-    }
-    obj.get("trait_decl_ref")?
-        .get("skip_binder")?
+    crate::front::clause_spec::trait_decl_pred(traitref_unwrap(v, llbc, depth)?)?
         .get("id")?
         .as_u64()
 }
 
 /// Recover the trait *impl* id a resolved `TraitRef` selected —
-/// `kind.TraitImpl.id`, behind the usual `Value` /
-/// `Deduplicated` indirections.  `None` when the ref is still a
-/// clause/builtin obligation rather than a selected impl.
+/// `kind.TraitImpl.id`, behind `Value` / `Deduplicated` and a
+/// `PolyTraitRef` `skip_binder` (`Distinguish higher-ranked trait proofs`).
+/// `None` when the ref is still a clause/builtin obligation rather than
+/// a selected impl.
 fn traitref_impl_id(v: &serde_json::Value, llbc: &Llbc, depth: usize) -> Option<u64> {
-    if depth > 8 {
-        return None;
-    }
-    let obj = v.as_object()?;
-    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-        let body = llbc.dedup_trait_body(id)?;
-        return traitref_impl_id(body, llbc, depth + 1);
-    }
-    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
-        && arr.len() == 2
-    {
-        return traitref_impl_id(&arr[1], llbc, depth + 1);
-    }
-    obj.get("kind")?.get("TraitImpl")?.get("id")?.as_u64()
+    traitref_unwrap(v, llbc, depth)?
+        .get("kind")?
+        .get("TraitImpl")?
+        .get("id")?
+        .as_u64()
 }
 
 /// Unwrap a `TraitRef`'s `Value` / `Deduplicated` indirections
@@ -73584,6 +73681,9 @@ fn traitref_unwrap<'a>(
         && arr.len() == 2
     {
         return traitref_unwrap(&arr[1], llbc, depth + 1);
+    }
+    if let Some(inner) = obj.get("skip_binder") {
+        return traitref_unwrap(inner, llbc, depth + 1);
     }
     Some(v)
 }
@@ -74672,8 +74772,8 @@ fn trait_clone_self_node<'l>(
 ) -> Option<&'l serde_json::Value> {
     let arr = v.as_array()?;
     let tref = traitref_unwrap(arr.first()?, llbc, 0)?;
-    let ty = tref
-        .pointer("/trait_decl_ref/skip_binder/generics/types")?
+    let ty = crate::front::clause_spec::trait_decl_pred(tref)?
+        .pointer("/generics/types")?
         .as_array()?
         .first()?;
     let node = strip_ty_indirections(ty, llbc)?;
@@ -74691,8 +74791,8 @@ fn trait_clone_self_node<'l>(
 
 fn trait_ref_decl_id(trait_ref: &serde_json::Value, llbc: &Llbc) -> Option<u64> {
     let resolved = traitref_unwrap(trait_ref, llbc, 0)?;
-    resolved
-        .pointer("/trait_decl_ref/skip_binder/id")
+    crate::front::clause_spec::trait_decl_pred(resolved)
+        .and_then(|pred| pred.get("id"))
         .and_then(serde_json::Value::as_u64)
 }
 
@@ -76419,7 +76519,7 @@ fn const_struct_uses_are_field_reads(llbc: &Llbc, body: &Unstructured, dest: usi
                 &mut other,
             ),
             Ok(TermKind::Call { call, .. }) => {
-                if let CallFunc::Dynamic(op) = &call.func {
+                if let CallFunc::Dynamic(op, _) = &call.func {
                     bump_const_struct_use(
                         operand_const_struct_use(op, &aliases),
                         &mut fields,
@@ -77130,10 +77230,11 @@ fn const_eval_unop(kind: &serde_json::Value, v: ConstLit) -> Option<ConstLit> {
         _ => None,
     };
     if let ("Cast", Some(bits)) = (name, cast_bits) {
-        // Truncate / re-extend to the target width so `expr as uN` folds
-        // exactly.
-        let scalar = kind.as_object()?.get("Cast")?.get("Scalar")?.as_array()?;
-        return const_cast_int(bits, scalar.get(1)?).map(ConstLit::Int);
+        // Truncate / re-extend to the dest width so `expr as uN` folds
+        // exactly. `CastKind::Scalar` is dest-only (`ScalarTy`); the
+        // source type is the operand's (`Remove the target types of casts`).
+        let dest = kind.as_object()?.get("Cast")?.get("Scalar")?;
+        return const_cast_int(bits, dest).map(ConstLit::Int);
     }
     match (name, v) {
         ("Neg", ConstLit::Int(n)) => n.checked_neg().map(ConstLit::Int),
@@ -77434,8 +77535,86 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
         })?;
         return Ok(DecodedConst::UInt(n));
     }
+    // `ConstantExprKind::Cast(expr, CastKind)`.  Upstream
+    // `lltype.cast_primitive` / `rint.IntegerRepr.convert_const` convert
+    // to the target type; identity-folding the inner drops that cast.
+    if let Some(cast) = kind.get("Cast") {
+        return fold_cast_constant(llbc, cast);
+    }
+    // `ConstantExprKind::Ptr` is a raw pointer.  10.04 `decode_constant`
+    // (e6797c) had no Ptr arm; `Llbc::const_expr_literal` is Integer /
+    // Bool / Char / Float / Str / ByteStr only.  Upstream
+    // `rptr.PtrRepr.convert_const` keeps a pointer.  Peeling the
+    // pointee would turn `*const u8` of 7 into the integer 7.  Reject.
+    if kind.get("Ptr").is_some() {
+        return Err(LowerError::Unsupported(format!(
+            "raw pointer constant: {value}"
+        )));
+    }
+    // `ConstantExprKind::Ref` is a shared reference.  10.04
+    // `decode_constant` had no Ref arm either, so `&T` constants never
+    // decoded to the pointee.  Keep that convention; do not peel.
+    if kind.get("Ref").is_some() {
+        return Err(LowerError::Unsupported(format!(
+            "reference constant: {value}"
+        )));
+    }
     Err(LowerError::Unsupported(format!(
         "Operand::Const kind not yet handled: {value}"
+    )))
+}
+
+/// Fold `ConstantExprKind::Cast(expr, CastKind)`.
+///
+/// Integer `Scalar` targets go through `const_cast_int` (same width /
+/// signedness rule as `const_narrow_to_target`).  Same-width float
+/// `Scalar` (`Float`↔F64, `SingleFloat`↔F32) is identity.  Everything
+/// else — int↔float, float width change, 128-bit, Bool, RawPtr, FnPtr,
+/// Unsize, Transmute, unknown — is `Unsupported`; no silent identity.
+fn fold_cast_constant(llbc: &Llbc, cast: &Value) -> Result<DecodedConst, LowerError> {
+    let arr = cast.as_array().ok_or_else(|| {
+        LowerError::Unsupported(format!("Cast constant missing inner expr: {cast}"))
+    })?;
+    let inner = arr.first().ok_or_else(|| {
+        LowerError::Unsupported(format!("Cast constant missing inner expr: {cast}"))
+    })?;
+    let cast_kind = arr
+        .get(1)
+        .ok_or_else(|| LowerError::Unsupported(format!("Cast constant not folded: {cast}")))?;
+    let decoded = decode_constant(llbc, inner)?;
+    if let Some(target) = cast_kind.get("Scalar") {
+        if target.get("Integer").is_some() {
+            let raw = match decoded {
+                DecodedConst::Int(n) => n,
+                DecodedConst::UInt(n) => n as i64,
+                _ => {
+                    return Err(LowerError::Unsupported(format!(
+                        "Cast constant not folded: {cast}"
+                    )));
+                }
+            };
+            let narrowed = const_cast_int(raw, target).ok_or_else(|| {
+                LowerError::Unsupported(format!("Cast constant not folded: {cast}"))
+            })?;
+            let unsigned = target
+                .get("Integer")
+                .and_then(Value::as_object)
+                .is_some_and(|int| int.contains_key("Unsigned"));
+            return Ok(if unsigned {
+                DecodedConst::UInt(narrowed as u64)
+            } else {
+                DecodedConst::Int(narrowed)
+            });
+        }
+        let float_width = target.get("Float").and_then(Value::as_str);
+        match (&decoded, float_width) {
+            (DecodedConst::Float(_), Some("F64")) => return Ok(decoded),
+            (DecodedConst::SingleFloat(_), Some("F32")) => return Ok(decoded),
+            _ => {}
+        }
+    }
+    Err(LowerError::Unsupported(format!(
+        "Cast constant not folded: {cast}"
     )))
 }
 
@@ -90637,7 +90816,7 @@ mod tests {
                         {"index": 1, "name": "self", "span": span, "ty": {"Value": [1, self_ty]}}
                     ]
                 },
-                "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+                "body": [{"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
             }
         });
         let file = serde_json::json!({
@@ -90977,6 +91156,149 @@ mod tests {
             const_narrow_to_target(Some(&bool_ty), ConstLit::Bool(true)),
             ConstLit::Bool(true)
         ));
+    }
+
+    fn const_expr_integer(signed: bool, width: &str, text: &str) -> serde_json::Value {
+        let int = if signed {
+            serde_json::json!({"Signed": [width, text]})
+        } else {
+            serde_json::json!({"Unsigned": [width, text]})
+        };
+        let ty_int = if signed {
+            serde_json::json!({"Signed": width})
+        } else {
+            serde_json::json!({"Unsigned": width})
+        };
+        serde_json::json!([
+            {"Integer": int},
+            {"Scalar": {"Integer": ty_int}}
+        ])
+    }
+
+    fn const_expr_cast(
+        inner: serde_json::Value,
+        cast_kind: serde_json::Value,
+        dest_ty: serde_json::Value,
+    ) -> serde_json::Value {
+        serde_json::json!([{"Cast": [inner, cast_kind]}, dest_ty])
+    }
+
+    #[test]
+    fn decode_constant_cast_narrows_integer_and_rejects_lossy() {
+        use super::{DecodedConst, LowerError, decode_constant};
+
+        let llbc = fixture_llbc();
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let narrowed = decode_constant(
+            &llbc,
+            &const_expr_cast(
+                const_expr_integer(true, "I32", "300"),
+                serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}),
+                u8_ty,
+            ),
+        );
+        assert!(
+            matches!(narrowed, Ok(DecodedConst::UInt(44))),
+            "300 as u8 is 44"
+        );
+
+        let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+        let sign = decode_constant(
+            &llbc,
+            &const_expr_cast(
+                const_expr_integer(true, "I64", "-1"),
+                serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}}),
+                u32_ty,
+            ),
+        );
+        assert!(
+            matches!(sign, Ok(DecodedConst::UInt(4_294_967_295))),
+            "-1 i64 as u32 is 4294967295"
+        );
+
+        let f64_ty = serde_json::json!({"Scalar": {"Float": "F64"}});
+        let int_to_float = decode_constant(
+            &llbc,
+            &const_expr_cast(
+                const_expr_integer(true, "I32", "300"),
+                serde_json::json!({"Scalar": {"Float": "F64"}}),
+                f64_ty,
+            ),
+        );
+        assert!(
+            matches!(
+                int_to_float,
+                Err(LowerError::Unsupported(ref msg)) if msg.contains("Cast constant not folded")
+            ),
+            "int→float Cast must not identity-fold"
+        );
+
+        let raw_ptr = decode_constant(
+            &llbc,
+            &const_expr_cast(
+                const_expr_integer(true, "I64", "0"),
+                serde_json::json!({"RawPtr": {"Deduplicated": 0}}),
+                serde_json::json!({"RawPtr": {"Deduplicated": 0}}),
+            ),
+        );
+        assert!(
+            matches!(
+                raw_ptr,
+                Err(LowerError::Unsupported(ref msg)) if msg.contains("Cast constant not folded")
+            ),
+            "RawPtr Cast must not identity-fold"
+        );
+    }
+
+    #[test]
+    fn decode_constant_ptr_is_not_the_pointee_and_ref_matches_10_04() {
+        use super::{LowerError, decode_constant};
+
+        let llbc = fixture_llbc();
+        let seven = const_expr_integer(false, "U8", "7");
+        let ptr = serde_json::json!([
+            {"Ptr": [{"kind": {"Value": seven.clone()}}]},
+            {"RawPtr": ["Erased", {"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Const"]}
+        ]);
+        let ptr_decoded = decode_constant(&llbc, &ptr);
+        assert!(
+            matches!(
+                ptr_decoded,
+                Err(LowerError::Unsupported(ref msg)) if msg.contains("raw pointer constant")
+            ),
+            "Ptr must stay a pointer (`PtrRepr.convert_const`)"
+        );
+
+        let shared = serde_json::json!([
+            {"Ref": [{"kind": {"Value": seven}}]},
+            {"Ref": ["Erased", {"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Shared"]}
+        ]);
+        let ref_decoded = decode_constant(&llbc, &shared);
+        assert!(
+            matches!(
+                ref_decoded,
+                Err(LowerError::Unsupported(ref msg)) if msg.contains("reference constant")
+            ),
+            "10.04 decode_constant had no Ref peel"
+        );
+    }
+
+    #[test]
+    fn decode_constant_opaque_typeid_pointer_is_the_opaque_path() {
+        use super::{DecodedConst, decode_constant};
+
+        let llbc = fixture_llbc();
+        let expr = serde_json::json!([
+            {"Opaque": "pointer into a `TypeId`"},
+            {"RawPtr": ["Erased", {"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Const"]}
+        ]);
+        match decode_constant(&llbc, &expr) {
+            Ok(DecodedConst::Str(s)) => {
+                assert_eq!(s, "opaque:pointer into a `TypeId`")
+            }
+            Ok(_) => panic!("Opaque TypeId must take the Opaque path, got a non-Str constant"),
+            Err(err) => panic!("Opaque TypeId must take the Opaque path, got {err}"),
+        }
     }
 
     #[test]
@@ -94749,7 +95071,7 @@ mod tests {
                     ]}}
                 ],
                 "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
-                "is_cleanup": false
+                "kind": "Regular"
             }]
         }))
         .expect("promoted-const wrapper fixture parses");
@@ -94781,7 +95103,7 @@ mod tests {
                         ]}}
                     ],
                     "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
-                    "is_cleanup": false
+                    "kind": "Regular"
                 }]
             }))
             .expect("promoted-const literal wrapper fixture parses");
@@ -94839,7 +95161,7 @@ mod tests {
         serde_json::json!({
             "statements": statements,
             "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
-            "is_cleanup": false
+            "kind": "Regular"
         })
     }
 
@@ -94891,7 +95213,7 @@ mod tests {
         let entry = serde_json::json!({
             "statements": [],
             "terminator": {"span": {"Deduplicated": 0}, "kind": "Return"},
-            "is_cleanup": false
+            "kind": "Regular"
         });
         let body = promoted_const_unstructured(serde_json::json!([entry, unreachable]));
         assert!(super::promoted_const_copied_global(&body).is_none());
@@ -96187,6 +96509,7 @@ mod tests {
                                 {"Use": [{"Copy": metadata_place}, "No"]}
                             ]}}
                         ],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": "Return"}
                     }
                 ]
@@ -96376,10 +96699,12 @@ mod tests {
         (
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": window_span(), "kind": "UnwindResume"}
             }),
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": window_span(), "kind": "Return"}
             }),
         )
@@ -96432,6 +96757,7 @@ mod tests {
                             {"Use": [{"Copy": slot_place}, "No"]}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": "Return"}
                 }]
             }}
@@ -96511,6 +96837,7 @@ mod tests {
                             {"Ref": {"place": deref, "kind": "Shared", "ptr_metadata": null}}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": window_span(), "kind": "Return"}
                 }]
             }}
@@ -96597,6 +96924,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -96687,6 +97015,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -96705,6 +97034,7 @@ mod tests {
                                 {"Ref": {"place": view_place, "kind": "Shared", "ptr_metadata": null}}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": "Return"}
                     }
                 ]
@@ -96776,6 +97106,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -96794,6 +97125,7 @@ mod tests {
                                 {"Use": [one, "No"]}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": "Return"}
                     }
                 ]
@@ -96856,6 +97188,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -96918,6 +97251,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -96959,6 +97293,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97230,6 +97565,7 @@ mod tests {
                                 {"Ref": {"place": deref, "kind": "Shared", "ptr_metadata": null}}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97454,6 +97790,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97588,6 +97925,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Switch": {
                             "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                             "targets": {"If": [2, 3]}
@@ -97596,6 +97934,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97610,6 +97949,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97723,6 +98063,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97831,6 +98172,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97852,6 +98194,7 @@ mod tests {
                                 ]}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": "Return"}
                     }
                 ]
@@ -97958,6 +98301,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -97970,6 +98314,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98074,6 +98419,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98086,6 +98432,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98217,6 +98564,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98229,6 +98577,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98421,6 +98770,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98433,6 +98783,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98551,6 +98902,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98572,6 +98924,7 @@ mod tests {
                                 ]}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98586,6 +98939,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 3},
@@ -98679,6 +99033,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Switch": {
                             "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)},
                             "targets": {"If": [2, 3]}
@@ -98687,6 +99042,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98698,6 +99054,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98777,6 +99134,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Switch": {
                             "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                             "targets": {"If": [2, 3]}
@@ -98802,6 +99160,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98895,6 +99254,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -98907,6 +99267,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -98918,6 +99279,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 3},
@@ -98942,6 +99304,7 @@ mod tests {
                                 ]}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": "Return"}
                     },
                     ret
@@ -99023,6 +99386,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Switch": {
                             "discr": {"Copy": window_place(serde_json::json!({"Local": 1}), &bool_ty)},
                             "targets": {"If": [2, 3]}
@@ -99031,6 +99395,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -99045,6 +99410,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -99148,6 +99514,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -99160,6 +99527,7 @@ mod tests {
                     unwind,
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": window_span(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 2},
@@ -99548,17 +99916,18 @@ mod tests {
                             {"span": span, "kind": {"Assign": [
                                 place(serde_json::json!({"Local": 3}), &fn_ptr),
                                 {"UnaryOp": [
-                                    {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
+                                    {"Cast": {"RawPtr": fn_ptr.clone()}},
                                     {"Copy": slot_field}
                                 ]}
                             ]}}
                         ],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Call": {
                             "call": {
-                                "func": {"Dynamic": {"Copy": place(
+                                "func": {"Dynamic": [{"Copy": place(
                                     serde_json::json!({"Local": 3}),
                                     &fn_ptr
-                                )}},
+                                )}, {"regions": []}]},
                                 "args": [{"Move": place(
                                     serde_json::json!({"Local": 2}),
                                     &fat_ty
@@ -99569,8 +99938,8 @@ mod tests {
                             "on_unwind": 2
                         }}}
                     },
-                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                 ]
             }}
         });
@@ -99771,6 +100140,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Switch": {
                             "discr": {"Copy": place(serde_json::json!({"Local": 2}), &bool_ty)},
                             "targets": {"If": [1, 2]}
@@ -99786,6 +100156,7 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}
                     },
                     {
@@ -99798,10 +100169,10 @@ mod tests {
                         ]}}],
                         "terminator": {"span": span, "kind": {"Call": {
                             "call": {
-                                "func": {"Dynamic": {"Copy": place(
+                                "func": {"Dynamic": [{"Copy": place(
                                     serde_json::json!({"Local": 4}),
                                     &fn_ptr
-                                )}},
+                                )}, {"regions": []}]},
                                 "args": [{"Move": place(
                                     serde_json::json!({"Local": 3}),
                                     &fat_ty
@@ -99812,8 +100183,8 @@ mod tests {
                             "on_unwind": 6
                         }}}
                     },
-                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                 ]
             }}
         });
@@ -100751,6 +101122,7 @@ mod tests {
                 "locals": {"arg_count": 1, "locals": method_locals},
                 "body": [{
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span.clone(), "kind": "Return"}
                 }]
             }
@@ -100802,6 +101174,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span.clone(),
                                 "kind": {
@@ -100832,10 +101205,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span.clone(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span.clone(), "kind": "Return"}
                         }
                     ]
@@ -101118,6 +101493,7 @@ mod tests {
                         "body": [
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {
                                     "span": span(),
                                     "kind": {
@@ -101147,10 +101523,12 @@ mod tests {
                             },
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "UnwindResume"}
                             },
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "Return"}
                             }
                         ]
@@ -101467,6 +101845,7 @@ mod tests {
                         "body": [
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {
                                     "span": span(),
                                     "kind": {
@@ -101492,10 +101871,12 @@ mod tests {
                             },
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "UnwindResume"}
                             },
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "Return"}
                             }
                         ]
@@ -101649,6 +102030,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": {
@@ -101678,10 +102060,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -101808,6 +102192,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": {
@@ -101830,10 +102215,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -101950,6 +102337,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": {
@@ -101974,10 +102362,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -102060,18 +102450,18 @@ mod tests {
                             {"index": 2, "name": "unit", "span": span, "ty": unit}
                         ]},
                         "body": [
-                            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": token_generics}},
                                     "args": [], "dest": place(2, &unit)},
                                 "target": 1, "on_unwind": 2
                             }}}},
-                            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                                     "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
                                 "target": 3, "on_unwind": 2
                             }}}},
-                            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                            {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
                         ]
                      }}},
                     {"def_id": 1, "item_meta": meta(&["majit_ir", "icf", "icf_identity_token"]),
@@ -102613,6 +103003,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": {
@@ -102643,10 +103034,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -102854,6 +103247,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span,
                                 "kind": {
@@ -102887,10 +103281,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": "Return"}
                         }
                     ]
@@ -104307,6 +104703,7 @@ mod tests {
                     "body": [
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": {
@@ -104329,10 +104726,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": {
@@ -104355,10 +104754,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -104569,10 +104970,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -104741,6 +105144,7 @@ mod tests {
                                     }
                                 }))
                             ],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": call(1, serde_json::json!([mv(2, &obj_ref)]), 3, &slice_ref, 2)
@@ -104748,10 +105152,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span(),
                                 "kind": call(2, serde_json::json!([copy(3, &slice_ref)]), 0, &unit, 3)
@@ -104759,6 +105165,7 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -104988,10 +105395,12 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "UnwindResume"}
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span(), "kind": "Return"}
                         }
                     ]
@@ -106537,6 +106946,7 @@ mod tests {
                         "body": [
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {
                                     "span": span(),
                                     "kind": {
@@ -106569,10 +106979,12 @@ mod tests {
                             },
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "UnwindResume"}
                             },
                             {
                                 "statements": [],
+                                "kind": "Regular",
                                 "terminator": {"span": span(), "kind": "Return"}
                             }
                         ]
@@ -106937,8 +107349,10 @@ mod tests {
                                     ]}
                                 ]}
                             }],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": "Return"}},
                             {"statements": [],
+                             "kind": "Regular",
                              "terminator": {"span": span, "kind": "UnwindResume"}}
                         ]
                     }}
@@ -106969,8 +107383,10 @@ mod tests {
                                     {"Discriminant": deref_enum}
                                 ]}
                             }],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": "Return"}},
                             {"statements": [],
+                             "kind": "Regular",
                              "terminator": {"span": span, "kind": "UnwindResume"}}
                         ]
                     }}
@@ -107241,6 +107657,7 @@ mod tests {
                 ]},
                 "body": [{
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "Return"}
                 }]
             }}
@@ -107322,6 +107739,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [stmt(copy(len_local, 3, ty.clone())), stmt(cast(3, 4))],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": call(
                             1,
                             serde_json::json!([{"Move": {"kind": {"Local": 4}, "ty": ty}}]),
@@ -107332,6 +107750,7 @@ mod tests {
                     },
                     {
                         "statements": [stmt(copy(1, 6, ty.clone())), stmt(cast(6, 7))],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": call(
                             2,
                             serde_json::json!([
@@ -107348,6 +107767,7 @@ mod tests {
                     },
                     {
                         "statements": [stmt(copy(5, 9, usize_t.clone()))],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": call(
                             3,
                             serde_json::json!([
@@ -107364,10 +107784,12 @@ mod tests {
                             {"kind": {"Local": 0}, "ty": ty},
                             {"Use": [{"Move": {"kind": {"Local": 10}, "ty": ty}}, "No"]}
                         ]}))],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "Return"}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "UnwindResume"}
                     }
                 ]
@@ -107420,6 +107842,7 @@ mod tests {
                         ]})),
                         assign(3, serde_json::json!({"Use": [slot, "No"]}))
                     ],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "Return"}
                 }]
             }}
@@ -107534,6 +107957,7 @@ mod tests {
                 "body": [
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -107551,10 +107975,12 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "UnwindResume"}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "Return"}
                     }
                 ]
@@ -107697,6 +108123,7 @@ mod tests {
                                 ]}
                             ]}
                         }],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": {"Call": {"call": {
                             "func": {"Regular": {
                                 "kind": {"Fun": 1},
@@ -107714,10 +108141,12 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "UnwindResume"}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "Return"}
                     }
                 ]
@@ -107850,10 +108279,12 @@ mod tests {
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "UnwindResume"}
                     },
                     {
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span_json(), "kind": "Return"}
                     }
                 ]
@@ -107968,6 +108399,7 @@ mod tests {
                         {"Use": [{"Const": unsigned_const("U32", value)}, "No"]}
                     ]}
                 }],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }]
         }})
@@ -107992,6 +108424,7 @@ mod tests {
                         ]}
                     ]}
                 }],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }]
         }})
@@ -108006,6 +108439,7 @@ mod tests {
             ]},
             "body": [{
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
@@ -108020,6 +108454,7 @@ mod tests {
                 }}}
             }, {
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }]
         }})
@@ -108073,6 +108508,7 @@ mod tests {
             ]},
             "body": [{
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
@@ -108092,9 +108528,11 @@ mod tests {
                 }}}
             }, {
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "UnwindResume"}
             }, {
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }]
         }})
@@ -108110,6 +108548,7 @@ mod tests {
             ]},
             "body": [{
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
@@ -108139,6 +108578,7 @@ mod tests {
                         ]}
                     ]}
                 }],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }]
         }})
@@ -108193,6 +108633,7 @@ mod tests {
                             }}, "No"]}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "Return"}
                 }]
             }}
@@ -108248,6 +108689,7 @@ mod tests {
                             }}, "No"]}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "Return"}
                 }]
             }}
@@ -108559,6 +109001,7 @@ mod tests {
                         {"Aggregate": [{"Adt": [adt, 5, null]}, []]}
                     ]}
                 }],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
@@ -108604,9 +109047,11 @@ mod tests {
                 }}}
             }, {
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }, {
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "UnwindResume"}
             }]
         }});
@@ -109645,7 +110090,7 @@ mod tests {
     fn cast_kind_raw_ptr_recognizes_atom_and_object_forms() {
         assert!(cast_kind_is_raw_ptr(&serde_json::json!("RawPtr")));
         assert!(cast_kind_is_raw_ptr(
-            &serde_json::json!({"RawPtr": ["x", "y"]})
+            &serde_json::json!({"RawPtr": {"Deduplicated": 0}})
         ));
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!("Unsize")));
         assert!(!cast_kind_is_raw_ptr(&serde_json::json!({"Scalar": []})));
@@ -109757,6 +110202,7 @@ mod tests {
                             ]}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": span, "kind": "Return"}
                 }]
             }}
@@ -110626,6 +111072,7 @@ mod tests {
                             ]}
                         ]}
                     }],
+                    "kind": "Regular",
                     "terminator": {"span": span, "kind": "Return"}
                 }]
             }}
@@ -112543,10 +112990,12 @@ mod tests {
             "statements": [stmt(serde_json::json!({
                 "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
             }))],
+            "kind": "Regular",
             "terminator": {"kind": {"Goto": {"target": 1}}}
         });
         let bb1 = serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"kind": {"Drop": {
                 "place": place_local(1),
                 "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
@@ -112556,6 +113005,7 @@ mod tests {
         });
         let bb2 = serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"kind": "Return"}
         });
         let body_json = serde_json::json!({
@@ -112615,6 +113065,7 @@ mod tests {
             "statements": [stmt(serde_json::json!({
                 "Assign": [place_local(2), {"Use": [{"Const": null}, "No"]}]
             }))],
+            "kind": "Regular",
             "terminator": {"kind": {"Goto": {"target": 1}}}
         });
         // bb1:  _3 = _1[_2];  _2 = _3;  goto bb1   (self-loop)
@@ -112635,6 +113086,7 @@ mod tests {
         }));
         let bb1 = serde_json::json!({
             "statements": [read_index, carry],
+            "kind": "Regular",
             "terminator": {"kind": {"Goto": {"target": 1}}}
         });
         let body_json = serde_json::json!({
@@ -112667,6 +113119,83 @@ mod tests {
     }
 
     #[test]
+    fn liveness_marks_offset_bytes_local_as_live_in() {
+        use majit_charon_reader::ullbc::Unstructured;
+        // `_2` is defined in bb0 and read only as `Offset.bytes` in bb1
+        // (`_3 = (*_1).offset(_2)`).  The byte count lives in the
+        // projection element, not in `inner`, so a liveness pass that
+        // only walks `Index.offset` misses it: `_2` is not a live-in of
+        // bb1 and lowering mints no block inputarg.  Upstream
+        // `_compute_liveness_must_continue` marks every register
+        // argument alive.  `mark_projection_index_offset_use` must
+        // treat `Offset.bytes` like `Index.offset`.
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 0, "col": 0},
+                    "end": {"line": 0, "col": 0}
+                },
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place_local = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy_local = |i: u64| serde_json::json!({"Copy": place_local(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let bb0 = serde_json::json!({
+            "statements": [stmt(serde_json::json!({
+                "Assign": [place_local(2), {"Use": [{"Const": null}, "No"]}]
+            }))],
+            "kind": "Regular",
+            "terminator": {"kind": {"Goto": {"target": 1}}}
+        });
+        let read_offset = stmt(serde_json::json!({
+            "Assign": [
+                place_local(3),
+                {"Use": [{"Copy": {
+                    "kind": {"Projection": [
+                        place_local(1),
+                        {"Offset": {"bytes": copy_local(2), "in_bounds": true, "ty_is_sized": true}}
+                    ]},
+                    "ty": ty()
+                }}, "No"]}
+            ]
+        }));
+        let bb1 = serde_json::json!({
+            "statements": [read_offset],
+            "kind": "Regular",
+            "terminator": {"kind": "Return"}
+        });
+        let body_json = serde_json::json!({
+            "span": span(),
+            "locals": {
+                "arg_count": 1,
+                "locals": [local(0), local(1), local(2), local(3)]
+            },
+            "body": [bb0, bb1]
+        });
+        let body: Unstructured =
+            serde_json::from_value(body_json).expect("fixture Unstructured parses");
+        let live =
+            super::compute_mir_liveness(&fixture_llbc(), &body, &[], &bit_set::BitSet::new());
+        assert!(
+            live[1].contains(2),
+            "Offset.bytes local _2 must be live-in at bb1"
+        );
+        assert!(
+            live[1].contains(1),
+            "pointer base _1 must be live-in at bb1"
+        );
+        assert!(
+            !live[1].contains(3),
+            "temp _3 is block-local, not live-in at bb1"
+        );
+    }
+
+    #[test]
     fn a_move_operand_typed_unlike_the_local_is_not_a_move_of_it() {
         use majit_charon_reader::ullbc::Unstructured;
         let span = || {
@@ -112690,6 +113219,7 @@ mod tests {
                         "comments_before": [],
                         "span": span()
                     }],
+                    "kind": "Regular",
                     "terminator": {"kind": "Return"}
                 }]
             }))
@@ -113090,7 +113620,7 @@ mod tests {
             "an on_unwind UnwindResume does not keep the bracket"
         );
 
-        // Charon 0.1.281 spells the former `Abort("UndefinedBehavior")` as
+        // Charon 0.1.297 spells the former `Abort("UndefinedBehavior")` as
         // a first-class terminator. It is a never-returning sink and does
         // not change the stack.
         let undefined_behavior: Unstructured = serde_json::from_value(serde_json::json!({
@@ -115528,7 +116058,7 @@ mod tests {
                 "on_unwind": 99
             }})
         };
-        let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
+        let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "kind": "Regular", "terminator": {"kind": terminator}});
         let body = |blocks: Vec<serde_json::Value>| {
             serde_json::json!({
                 "span": span(),
@@ -115636,7 +116166,7 @@ mod tests {
                 "on_unwind": 99
             }})
         };
-        let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "terminator": {"kind": terminator}});
+        let block = |terminator: serde_json::Value| serde_json::json!({"statements": [], "kind": "Regular", "terminator": {"kind": terminator}});
         let body = |blocks: Vec<serde_json::Value>| {
             serde_json::json!({
                 "span": span(),
@@ -118208,7 +118738,7 @@ mod tests {
                                 {"index": 3, "name": null, "span": span, "ty": bool_ty.clone()}
                             ]},
                             "body": [
-                                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                                     "call": {
                                         "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                         "args": [
@@ -118226,7 +118756,7 @@ mod tests {
                                         {"Use": [{"Copy": place(3, &bool_ty)}, "Yes"]}
                                     ]}
                                 }], "terminator": {"span": span, "kind": "Return"}},
-                                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                             ]
                         }}
                     },
@@ -118421,7 +118951,7 @@ mod tests {
                                         {"Use": [{"Copy": place(6, &bool_ty)}, "Yes"]}
                                     ]}
                                 }], "terminator": {"span": span, "kind": "Return"}},
-                                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                             ]
                         }}
                     },
@@ -119382,6 +119912,7 @@ mod tests {
                     },
                     "body": [{
                         "statements": [],
+                        "kind": "Regular",
                         "terminator": {"span": span, "kind": "Return"}
                     }]
                 }
@@ -119437,6 +119968,7 @@ mod tests {
                                     }}
                                 ]}
                             }],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span,
                                 "kind": {
@@ -119464,6 +119996,7 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": "UnwindResume"}
                         },
                         {
@@ -119478,6 +120011,7 @@ mod tests {
                                     }}
                                 ]}
                             }],
+                            "kind": "Regular",
                             "terminator": {
                                 "span": span,
                                 "kind": {
@@ -119505,6 +120039,7 @@ mod tests {
                         },
                         {
                             "statements": [],
+                            "kind": "Regular",
                             "terminator": {"span": span, "kind": "Return"}
                         }
                     ]
@@ -120976,8 +121511,8 @@ mod tests {
                         {"Use": [{"Copy": place(2, &objptr)}, "No"]}
                     ]}}
                 ], "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
             ]
         }});
         let file = serde_json::json!({
@@ -121073,6 +121608,7 @@ mod tests {
         args.extend(extra_args);
         let mut body_blocks = vec![serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span, "kind": {"Call": {
                 "call": {
                     "func": {"Regular": {"kind": {"Fun": callee_id}, "generics": generics}},
@@ -121086,10 +121622,12 @@ mod tests {
         body_blocks.extend(extra_blocks);
         body_blocks.push(serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span, "kind": "Return"}
         }));
         body_blocks.push(serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span, "kind": "UnwindResume"}
         }));
         let meta = |path: &[&str]| fixture_item_meta(ident_path(path));
@@ -121283,7 +121821,7 @@ mod tests {
                 local(3, Some("slice"), &slice_ty),
             ]},
             "body": [
-                {"statements": [init_ret], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [init_ret], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                         "args": [{"Copy": place(2, &vec_mut)}],
@@ -121292,7 +121830,7 @@ mod tests {
                     "target": 1,
                     "on_unwind": 3
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                         "args": [
@@ -121304,8 +121842,8 @@ mod tests {
                     "target": 2,
                     "on_unwind": 3
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
             ]
         }});
         let file = serde_json::json!({
@@ -124052,6 +124590,7 @@ mod tests {
     ) -> serde_json::Value {
         serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {
                 "span": span_json(),
                 "kind": {
@@ -124230,10 +124769,12 @@ mod tests {
         ));
         body.push(serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span_json(), "kind": "UnwindResume"}
         }));
         body.push(serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span_json(), "kind": "Return"}
         }));
         let caller = serde_json::json!({
@@ -124308,6 +124849,7 @@ mod tests {
         let body = vec![
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {
                     "span": span_json(),
                     "kind": {
@@ -124326,6 +124868,7 @@ mod tests {
                         {"Aggregate": ["Tuple", []]}
                     ]}
                 }],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "Return"}
             }),
             regular_call_block(1, vec![copy(2, &i64_ty)], dest(3, &argument_ty), 3, unwind),
@@ -124340,6 +124883,7 @@ mod tests {
             regular_call_block(4, vec![copy(5, &str_ty)], dest(0, &unit), 1, unwind),
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span_json(), "kind": "UnwindResume"}
             }),
         ];
@@ -124410,10 +124954,12 @@ mod tests {
         );
         body.push(serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span_json(), "kind": "Return"}
         }));
         body.push(serde_json::json!({
             "statements": [],
+            "kind": "Regular",
             "terminator": {"span": span_json(), "kind": "UnwindResume"}
         }));
         let caller = serde_json::json!({
@@ -130814,6 +131360,7 @@ mod tests {
                     "statements": [stmt(serde_json::json!({
                         "Assign": [place_local(1), {"Use": [{"Const": null}, "No"]}]
                     }))],
+                    "kind": "Regular",
                     "terminator": {
                         "kind": {
                             "Call": {
@@ -130869,6 +131416,7 @@ mod tests {
                 ]},
                 "body": [{
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": {"Call": {
                         "call": {
                             "func": {"Regular": {
@@ -130883,9 +131431,11 @@ mod tests {
                     }}}
                 }, {
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "UnwindResume"}
                 }, {
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "Return"}
                 }]
             }}
@@ -131164,6 +131714,7 @@ mod tests {
                 ]},
                 "body": [{
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": {"Call": {
                         "call": {
                             "func": {"Regular": {
@@ -131178,9 +131729,11 @@ mod tests {
                     }}}
                 }, {
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "UnwindResume"}
                 }, {
                     "statements": [],
+                    "kind": "Regular",
                     "terminator": {"span": span_json(), "kind": "Return"}
                 }]
             }}

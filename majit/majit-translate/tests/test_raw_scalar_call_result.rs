@@ -691,8 +691,8 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(ret_local, &ret_place_ty)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
     let params = vec![flag.clone(), sink_param.clone()];
@@ -1194,8 +1194,8 @@ fn lower_two_borrows(alias: BorrowAlias) -> FunctionGraph {
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(ret_local, &ret_ty)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
     let params = vec![ptr.clone(), ptr.clone()];
@@ -1683,8 +1683,8 @@ fn lower_raw_alias(
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
     let (sink_extra, sink_statements): (Vec<Value>, Vec<Value>) = match alias {
@@ -2303,8 +2303,8 @@ fn lower_packed_alias(
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
     let sink_inputs = vec![ptr.clone(), second_ty.clone()];
@@ -2814,7 +2814,7 @@ fn lower_traced_int(
     }}}});
     let body = if matches!(kind, TracedInt::CallResult) {
         json!([
-            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics.clone()}},
                     "args": [], "dest": place(3, &bits)},
                 "target": 1, "on_unwind": 3
@@ -2823,8 +2823,8 @@ fn lower_traced_int(
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ])
     } else {
         json!([
@@ -2832,8 +2832,8 @@ fn lower_traced_int(
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ])
     };
     let caller = fun(
@@ -3024,7 +3024,7 @@ fn lower_field_out() -> FunctionGraph {
                 {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
                     "place": field, "kind": "Mut", "ptr_metadata": null
                 }}]}}
-            ], "terminator": {"span": span, "kind": {"Call": {
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                     "args": [{"Move": borrow}], "dest": place(3, &ret)},
                 "target": 1, "on_unwind": 2
@@ -3032,8 +3032,8 @@ fn lower_field_out() -> FunctionGraph {
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, &ret),
                 {"Use": [{"Copy": place(3, &ret)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
     let params = vec![raw_ptr(&word, "Mut")];
@@ -3205,7 +3205,7 @@ fn lower_returned_address_sink(
                 {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
                     "place": place(1, &word), "kind": "Shared", "ptr_metadata": null
                 }}]}}
-            ], "terminator": {"span": span, "kind": {"Call": {
+            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                 "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                     "args": [{"Move": borrow}], "dest": place(3, result_ty)},
                 "target": 1, "on_unwind": 2
@@ -3213,8 +3213,8 @@ fn lower_returned_address_sink(
             {"statements": [{"span": span, "kind": {"Assign": [
                 place(0, result_ty),
                 {"Use": [{"Copy": place(3, result_ty)}, "Yes"]}
-            ]}}], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
     let sink = fun(
@@ -3661,12 +3661,28 @@ fn sink_unstructured(result_ty: &Value, ptr_ty: &Value, statements: Vec<Value>) 
     }})
 }
 
+/// Dest-only `CastKind` (`Remove the target types of casts`).
+fn dest_only_cast_kind(src_ty: &Value, dest_ty: &Value) -> Value {
+    let is_ptr = |ty: &Value| ty.get("RawPtr").is_some() || ty.get("Ref").is_some();
+    if is_ptr(dest_ty) && is_ptr(src_ty) {
+        json!({"RawPtr": dest_ty})
+    } else if is_ptr(dest_ty) {
+        json!({"PtrWithExposedProvenance": dest_ty})
+    } else if is_ptr(src_ty) {
+        json!("PtrExposeProvenance")
+    } else if let Some(scalar) = dest_ty.get("Scalar") {
+        json!({"Scalar": scalar})
+    } else {
+        json!({"Scalar": dest_ty})
+    }
+}
+
 fn assign_scalar_cast(dest: u64, src: u64, src_ty: &Value, dest_ty: &Value) -> Value {
     let (span, _, _, _) = probe_parts();
     json!({"span": span, "kind": {"Assign": [
         place(dest, dest_ty),
         {"UnaryOp": [
-            {"Cast": {"Scalar": [src_ty, dest_ty]}},
+            {"Cast": dest_only_cast_kind(src_ty, dest_ty)},
             {"Copy": place(src, src_ty)}
         ]}
     ]}})
@@ -3805,7 +3821,7 @@ fn idle_body(output: &Value, inputs: &[Value]) -> Value {
     json!({"Unstructured": {
         "span": span,
         "locals": {"arg_count": inputs.len() as u64, "locals": locals},
-        "body": [{"statements": [], "terminator": {"span": span, "kind": "Return"}}]
+        "body": [{"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
     }})
 }
 
@@ -3823,13 +3839,13 @@ fn call_into_return(result: &Value, ptr: &Value, callee: u64) -> Value {
     let (span, generics, _, _) = probe_parts();
     let mut body = sink_unstructured(result, ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": callee}, "generics": generics}},
                 "args": [{"Move": place(1, ptr)}], "dest": place(0, result)},
             "target": 1, "on_unwind": 2
         }}}},
-        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     body
 }
@@ -4237,7 +4253,7 @@ fn joined_reference_overwrite(rename: bool) -> Value {
         ref_assign(2, &q_ty, place(1, &ptr))
     };
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [ref_assign(2, &q_ty, place(1, &ptr))],
@@ -4247,7 +4263,7 @@ fn joined_reference_overwrite(rename: bool) -> Value {
         {"statements": [
             assign_to(deref_place(place(2, &q_ty), &ptr), const_use()),
             assign_scalar_cast(0, 1, &ptr, &result)
-        ], "terminator": {"span": span, "kind": "Return"}}
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
     ]);
     body
 }
@@ -4279,7 +4295,7 @@ fn reference_overwrite_then_the_reload_still_frees() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Cast": "PtrExposeProvenance"},
                     {"Copy": deref_place(place(2, &q_ty), &ptr)}
                 ]}
             ]}}),
@@ -4348,7 +4364,7 @@ fn store_of_the_address_through_the_pointer_is_not_lowered() {
             let (span, _, _, _) = probe_parts();
             let _ = span;
             json!({"UnaryOp": [
-                {"Cast": {"Scalar": [&ptr, &word]}},
+                {"Cast": "PtrExposeProvenance"},
                 {"Copy": place(1, &ptr)}
             ]})
         })],
@@ -4385,7 +4401,7 @@ fn out_param_case(
     let stored = json!({"kind": {"Projection": [place(1, &bits_ref), "Deref"]}, "ty": word});
     let stored_value = if store_address {
         json!({"UnaryOp": [
-            {"Cast": {"Scalar": [ptr, word]}},
+            {"Cast": "PtrExposeProvenance"},
             {"Copy": place(2, &ptr)}
         ]})
     } else {
@@ -4401,7 +4417,7 @@ fn out_param_case(
         "body": [{"statements": [
             {"span": span, "kind": {"Assign": [stored, stored_value]}},
             {"span": span, "kind": {"Assign": [place(0, &word), const_use()]}}
-        ], "terminator": {"span": span, "kind": "Return"}}]
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
     }});
     let inner = probe_fun(
         2,
@@ -4425,7 +4441,7 @@ fn out_param_case(
                 place(3, &bits_ref),
                 {"Ref": {"place": place(2, &word), "kind": "Mut", "ptr_metadata": null}}
             ]}}
-        ], "terminator": {"span": span, "kind": {"Call": {
+        ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(3, &bits_ref)}, {"Copy": place(1, &ptr)}],
                 "dest": place(4, &word)},
@@ -4436,8 +4452,8 @@ fn out_param_case(
                 place(0, &word),
                 {"Use": [{"Copy": place(2, &word)}, "Yes"]}
             ]}}
-        ], "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     lower_returned_address_sink(&word, &[], None, Some(&outer), &[inner])
 }
@@ -4453,15 +4469,15 @@ fn opaque_call_then_a_status_is_not_lowered() {
         .expect("locals")
         .push(local(2, Some("status"), &word));
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [
             {"span": span, "kind": {"Assign": [place(0, &word), const_use()]}}
-        ], "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     let expose = probe_fun(2, &["probe", "expose"], vec![ptr], &word, json!("Opaque"));
     let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[expose])
@@ -4600,7 +4616,7 @@ fn read_through_clean_alias(kind: AliasCallee) -> (Value, Value) {
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": late, "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     let helper_body = match kind {
         AliasCallee::Constant => sink_unstructured(
@@ -4683,13 +4699,13 @@ fn compare_through_clean_alias(op: &str) -> (Value, Value) {
             assign_to(place(2, &word), const_use()),
             raw_const_assign(3, &ptr, place(2, &word)),
             compare_with_zero(op, 2, &word, 1, &ptr)
-        ], "terminator": {"span": span, "kind": {"Call": {
+        ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Copy": place(3, &ptr)}], "dest": place(0, &word)},
             "target": 1, "on_unwind": 2
         }}}},
-        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     let helper = probe_fun(
         2,
@@ -4821,8 +4837,8 @@ fn pair_holding_clean_alias(kind: PackedAlias) -> (Value, Option<Value>) {
                     "args": [{"Copy": place(4, &pair_ty)}], "dest": place(0, &result)},
                 "target": 1, "on_unwind": 2
             }}}},
-            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
         ]);
     }
     (body, helper)
@@ -4905,7 +4921,7 @@ fn address_reloaded_through_a_reference_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Cast": "PtrExposeProvenance"},
                     {"Copy": deref_place(place(2, &q_ty), &ptr)}
                 ]}
             ]}}),
@@ -4934,7 +4950,7 @@ fn address_reloaded_through_a_copied_reference_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Cast": "PtrExposeProvenance"},
                     {"Copy": deref_place(place(3, &q_ty), &ptr)}
                 ]}
             ]}}),
@@ -4961,7 +4977,7 @@ fn address_reloaded_through_two_references_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Cast": "PtrExposeProvenance"},
                     {"Copy": deref_place(deref_place(place(3, &s_ty), &q_ty), &ptr)}
                 ]}
             ]}}),
@@ -4988,7 +5004,7 @@ fn integer_reloaded_through_a_reference_is_not_lowered() {
             json!({"span": span, "kind": {"Assign": [
                 place(2, &result),
                 {"UnaryOp": [
-                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Cast": "PtrExposeProvenance"},
                     {"Copy": place(1, &ptr)}
                 ]}
             ]}}),
@@ -5036,7 +5052,7 @@ fn address_of_the_pointer_local_still_frees() {
             json!({"span": span, "kind": {"Assign": [
                 place(0, &result),
                 {"UnaryOp": [
-                    {"Cast": {"Scalar": [&q_ty, &result]}},
+                    {"Cast": "PtrExposeProvenance"},
                     {"Copy": place(2, &q_ty)}
                 ]}
             ]}}),
@@ -5082,8 +5098,9 @@ fn assign_to(dest: Value, rvalue: Value) -> Value {
 }
 
 fn ptr_cast(src: Value, src_ty: &Value, dest_ty: &Value) -> Value {
+    let _ = src_ty;
     json!({"UnaryOp": [
-        {"Cast": {"Scalar": [src_ty, dest_ty]}},
+        {"Cast": {"RawPtr": dest_ty}},
         {"Copy": src}
     ]})
 }
@@ -5092,7 +5109,7 @@ fn status_return_after_drop(result: &Value, ptr: &Value, dropped: Value, glue: u
     let (span, generics, _, _) = probe_parts();
     let mut body = sink_unstructured(result, ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Drop": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Drop": {
             "place": dropped,
             "fn_ptr": {"kind": {"Fun": glue}, "generics": generics},
             "target": 1,
@@ -5100,7 +5117,7 @@ fn status_return_after_drop(result: &Value, ptr: &Value, dropped: Value, glue: u
         }}}},
         {"statements": [assign_to(place(0, result), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     body
 }
@@ -5223,7 +5240,7 @@ fn drop_glue_that_saves_the_address_is_not_lowered() {
                 global_place(&saved),
                 ptr_cast(deref_place(place(1, &slot), &ptr), &ptr, &saved),
             )
-        ], "terminator": {"span": span, "kind": "Return"}}]
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
     }});
     let glue = probe_fun(2, &["probe", "drop_ptr"], vec![slot], &word, glue_body);
     let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
@@ -5300,14 +5317,14 @@ fn pointer_comparison_used_as_a_switch_is_not_lowered() {
         .expect("locals")
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
-        {"statements": [comparison_assign(2, &word, 1, &ptr)], "terminator": {"span": span, "kind": {
+        {"statements": [comparison_assign(2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_escapes(&word, &body);
 }
@@ -5323,14 +5340,14 @@ fn null_check_used_as_a_switch_still_frees() {
         .expect("locals")
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
-        {"statements": [compare_with_zero("Eq", 2, &word, 1, &ptr)], "terminator": {"span": span, "kind": {
+        {"statements": [compare_with_zero("Eq", 2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_frees(&word, &body);
 }
@@ -5354,12 +5371,12 @@ fn assertion_of_the_address_is_not_lowered() {
         .expect("locals")
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
-        {"statements": [comparison_assign(2, &word, 1, &ptr)], "terminator": {"span": span, "kind":
+        {"statements": [comparison_assign(2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind":
             assert_term(json!({"Copy": place(2, &word)}), 1, 2)
         }},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_escapes(&word, &body);
 }
@@ -5397,12 +5414,12 @@ fn null_check_used_as_an_assertion_still_frees() {
         .expect("locals")
         .push(local(2, Some("flag"), &word));
     body["Unstructured"]["body"] = json!([
-        {"statements": [compare_with_zero("Ne", 2, &word, 1, &ptr)], "terminator": {"span": span, "kind":
+        {"statements": [compare_with_zero("Ne", 2, &word, 1, &ptr)], "kind": "Regular", "terminator": {"span": span, "kind":
             assert_term(json!({"Copy": place(2, &word)}), 1, 2)
         }},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_frees(&word, &body);
 }
@@ -5436,12 +5453,12 @@ fn assertion_of_a_status_still_frees() {
     let ptr = raw_ptr(&word, "Const");
     let mut body = sink_unstructured(&word, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind":
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind":
             assert_term(json!({"Const": null}), 1, 2)
         }},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_frees(&word, &body);
 }
@@ -5486,7 +5503,7 @@ fn indirect_call_body(tainted: bool, func: Value) -> Value {
         }},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     body
 }
@@ -5494,14 +5511,20 @@ fn indirect_call_body(tainted: bool, func: Value) -> Value {
 #[test]
 fn dynamic_call_through_the_address_is_not_lowered() {
     let word = i64_ty();
-    let body = indirect_call_body(true, json!({"Dynamic": {"Copy": place(4, &word)}}));
+    let body = indirect_call_body(
+        true,
+        json!({"Dynamic": [{"Copy": place(4, &word)}, {"regions": []}]}),
+    );
     assert_sink_escapes(&word, &body);
 }
 
 #[test]
 fn dynamic_call_through_a_clean_pointer_still_frees() {
     let word = i64_ty();
-    let body = indirect_call_body(false, json!({"Dynamic": {"Copy": place(4, &word)}}));
+    let body = indirect_call_body(
+        false,
+        json!({"Dynamic": [{"Copy": place(4, &word)}, {"regions": []}]}),
+    );
     assert_sink_frees(&word, &body);
 }
 
@@ -5603,13 +5626,13 @@ fn field_of_pair_passed_to_helper(field: u64) -> (Value, Value) {
                 json!({"Copy": place(2, &result)}),
                 json!({"Const": null})
             ]))
-        ], "terminator": {"span": span, "kind": {"Call": {
+        ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(3, &result)}], "dest": place(0, &result)},
             "target": 1, "on_unwind": 2
         }}}},
-        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     let helper = probe_fun(
         2,
@@ -5657,17 +5680,17 @@ fn comparison_helper_switch(op: &str) -> (Value, Value) {
     let ptr = raw_ptr(&word, "Const");
     let mut body = sink_unstructured(&word, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
             "target": 1, "on_unwind": 3
         }}}},
-        {"statements": [], "terminator": {"span": span, "kind": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [2, 2]}}
         }}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     body["Unstructured"]["locals"]["locals"]
         .as_array_mut()
@@ -6026,7 +6049,7 @@ fn drop_glue_that_publishes_a_comparison_is_not_lowered() {
         ]},
         "body": [{"statements": [
             assign_to(global_place(&word), copy_use(deref_place(place(1, &slot), &word)))
-        ], "terminator": {"span": span, "kind": "Return"}}]
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
     }});
     let glue = probe_fun(2, &["probe", "drop_flag"], vec![slot], &word, glue_body);
     let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
@@ -6084,7 +6107,7 @@ fn drop_glue_switching_on(
             local(1, Some("slot"), &slot)
         ]},
         "body": [
-            {"statements": [], "terminator": {"span": span, "kind": {"Switch": {
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Switch": {
                 "discr": {"Copy": deref_place(place(1, &slot), &word)},
                 "targets": {"If": [1, 2]}
             }}}},
@@ -6282,14 +6305,14 @@ fn call_through(dest: Value, inner_returns_address: bool) -> (Value, Value) {
     );
     let mut body = sink_unstructured(&word, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(1, &ptr)}], "dest": dest},
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     (body, inner)
 }
@@ -6374,17 +6397,17 @@ fn address_kept_on_another_path_is_not_lowered() {
         vec![],
     );
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [
             assign_scalar_cast(2, 1, &ptr, &result),
             assign_to(place(0, &result), copy_use(place(2, &result)))
-        ], "terminator": {"span": span, "kind": "Return"}},
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
         {"statements": [
             assign_to(place(2, &result), const_use()),
             assign_to(place(0, &result), copy_use(place(2, &result)))
-        ], "terminator": {"span": span, "kind": "Return"}}
+        ], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
     ]);
     assert_sink_escapes(&result, &body);
 }
@@ -6710,7 +6733,7 @@ fn mixed_address_join(return_pair: bool) -> Value {
         assign_to(place(0, &result), const_use())
     };
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [
@@ -6719,11 +6742,11 @@ fn mixed_address_join(return_pair: bool) -> Value {
                 json!({"Copy": place(2, &result)}),
                 json!({"Const": null})
             ]))
-        ], "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        ], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
         {"statements": [
             assign_scalar_cast(3, 1, &ptr, &result)
-        ], "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
-        {"statements": [ret], "terminator": {"span": span, "kind": "Return"}}
+        ], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [ret], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
     ]);
     body
 }
@@ -7441,7 +7464,7 @@ fn call_with_an_unknown_place_is_not_lowered() {
     let ptr = raw_ptr(&word, "Const");
     let mut body = sink_unstructured(&word, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {
                 "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Copy": unknown_place(&word)}],
@@ -7452,7 +7475,7 @@ fn call_with_an_unknown_place_is_not_lowered() {
         }}}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_escapes(&word, &body);
 }
@@ -7464,7 +7487,7 @@ fn drop_of_an_unknown_place_is_not_lowered() {
     let ptr = raw_ptr(&word, "Const");
     let mut body = sink_unstructured(&word, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Drop": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Drop": {
             "place": unknown_place(&word),
             "fn_ptr": {"kind": {"Fun": 2}, "generics": generics},
             "target": 1,
@@ -7472,7 +7495,7 @@ fn drop_of_an_unknown_place_is_not_lowered() {
         }}}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_escapes(&word, &body);
 }
@@ -7670,7 +7693,7 @@ fn cast_into(dest: Value, src: u64, src_ty: &Value, dest_ty: &Value) -> Value {
     assign_to(
         dest,
         json!({"UnaryOp": [
-            {"Cast": {"Scalar": [src_ty, dest_ty]}},
+            {"Cast": dest_only_cast_kind(src_ty, dest_ty)},
             {"Copy": place(src, src_ty)}
         ]}),
     )
@@ -7860,7 +7883,7 @@ fn alias_in_wrapper_drop(store_address: bool) -> Value {
         }}}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     body
 }
@@ -8045,7 +8068,7 @@ fn nested_alias_in_wrapper_drop(store_address: bool) -> Value {
         }}}},
         {"statements": [assign_to(place(0, &word), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     body
 }
@@ -8126,7 +8149,7 @@ fn pair_field_return(field: u64) -> (Value, Value) {
                 json!({"Copy": place(2, &bits)}),
                 json!({"Const": null})
             ]))
-        ], "terminator": {"span": helper_span, "kind": "Return"}}]
+        ], "kind": "Regular", "terminator": {"span": helper_span, "kind": "Return"}}]
     }});
     pair_field_against(field, helper_body)
 }
@@ -8145,8 +8168,8 @@ fn pair_assigned_in_a_later_block() -> Value {
             helper_local(2, Some("bits"), &bits)
         ]},
         "body": [
-            {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}},
-            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
             {"statements": [
                 assign_scalar_cast(2, 1, &ptr, &bits),
                 assign_to(place(0, &bits), tuple_of(vec![
@@ -8169,7 +8192,7 @@ fn pair_field_against(field: u64, helper_body: Value) -> (Value, Value) {
         .expect("locals")
         .push(local(2, Some("pair"), &bits));
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(1, &ptr)}], "dest": place(2, &bits)},
             "target": 1, "on_unwind": 2
@@ -8177,8 +8200,8 @@ fn pair_field_against(field: u64, helper_body: Value) -> (Value, Value) {
         {"statements": [assign_to(
             place(0, &bits),
             copy_use(field_place(2, &bits, field, &bits)),
-        )], "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        )], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     let helper = probe_fun(2, &["probe", "pair"], vec![ptr], &bits, helper_body);
     (body, helper)
@@ -8249,8 +8272,8 @@ fn identity_assigned_in_a_later_block() -> Value {
     let ptr = raw_ptr(&i64_ty(), "Const");
     let mut body = sink_unstructured(&ptr, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}},
-        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
         {"statements": [assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
             "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}}
     ]);
@@ -8267,14 +8290,14 @@ fn returned_pointer_against(op: &str, helper_body: Value) -> (Value, Value) {
         .expect("locals")
         .push(local(2, Some("q"), &ptr));
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
             "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
                 "args": [{"Move": place(1, &ptr)}], "dest": place(2, &ptr)},
             "target": 1, "on_unwind": 2
         }}}},
         {"statements": [compare_with_zero(op, 0, &word, 2, &ptr)],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     let helper = probe_fun(
         2,
@@ -8344,7 +8367,7 @@ fn pointer_cleared_on_a_backward_chain() -> Value {
     let ptr = raw_ptr(&i64_ty(), "Const");
     let mut body = sink_unstructured(&ptr, &ptr, vec![]);
     body["Unstructured"]["body"] = json!([
-        {"statements": [], "terminator": {"span": span, "kind": {
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {
             "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
         }}},
         {"statements": [assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
@@ -8353,9 +8376,9 @@ fn pointer_cleared_on_a_backward_chain() -> Value {
             "terminator": {"span": span, "kind": {"Goto": {"target": 6}}}},
         {"statements": [assign_to(place(0, &ptr), const_use())],
             "terminator": {"span": span, "kind": "Return"}},
-        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
-        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}},
-        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 5}}}}
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}},
+        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Goto": {"target": 5}}}}
     ]);
     body
 }

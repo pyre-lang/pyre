@@ -322,7 +322,7 @@ pub fn trait_ref_kind(llbc: &majit_charon_reader::Llbc, tref: &serde_json::Value
     }
 }
 
-/// The first `trait_decl_ref.skip_binder.id` anywhere under `v`.
+/// The first `trait_decl_ref.id` anywhere under `v`.
 ///
 /// Both spellings of a virtual call carry the trait the same way — the
 /// `CallKind::Trait` payload and the fat pointer's `DynTrait` type — just at
@@ -330,7 +330,11 @@ pub fn trait_ref_kind(llbc: &majit_charon_reader::Llbc, tref: &serde_json::Value
 fn first_trait_id(v: &serde_json::Value) -> Option<u64> {
     if let Some(map) = v.as_object() {
         if let Some(r) = map.get("trait_decl_ref")
-            && let Some(id) = r.pointer("/skip_binder/id").and_then(|x| x.as_u64())
+            && let Some(id) = r
+                .get("skip_binder")
+                .unwrap_or(r)
+                .get("id")
+                .and_then(|x| x.as_u64())
         {
             return Some(id);
         }
@@ -790,7 +794,7 @@ pub fn dynamic_call_sources(llbc: &majit_charon_reader::Llbc) -> HashMap<String,
             let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
                 continue;
             };
-            let CallFunc::Dynamic(op) = &call.func else {
+            let CallFunc::Dynamic(op, _) = &call.func else {
                 continue;
             };
             let mut cur = op_local(op);
@@ -1003,7 +1007,7 @@ pub fn build(llbc: &majit_charon_reader::Llbc) -> CallGraph {
                         opaque.unknown += 1;
                     }
                 },
-                CallFunc::Dynamic(op) => {
+                CallFunc::Dynamic(op, _) => {
                     indirect.insert(id);
                     // A fat pointer's type is as often a dedup id as an inline
                     // body; resolving it is what keeps `dyn Trait` out of the
@@ -1411,7 +1415,7 @@ mod tests {
         let call_bb = |fun: u64, target: u64, on_unwind: u64, is_cleanup: bool| {
             serde_json::json!({
                 "statements": [],
-                "is_cleanup": is_cleanup,
+                "kind": if is_cleanup { "Cleanup" } else { "Regular" },
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
@@ -1434,11 +1438,11 @@ mod tests {
                 ]},
                 "body": [
                     call_bb(1, 1, 2, false),
-                    {"statements": [], "is_cleanup": false, "terminator": {
+                    {"statements": [], "kind": "Regular", "terminator": {
                         "span": span.clone(), "kind": "Return"
                     }},
                     call_bb(2, 3, 3, true),
-                    {"statements": [], "is_cleanup": true, "terminator": {
+                    {"statements": [], "kind": "Cleanup", "terminator": {
                         "span": span.clone(), "kind": "UnwindResume"
                     }}
                 ]
@@ -1573,10 +1577,10 @@ mod tests {
                     {"index": 0, "name": null, "span": span.clone(), "ty": scalar.clone()}
                 ]},
                 "body": [
-                    {"statements": [], "is_cleanup": false, "terminator": {
+                    {"statements": [], "kind": "Regular", "terminator": {
                         "span": span.clone(), "kind": "InlineAsm"
                     }},
-                    {"statements": [], "is_cleanup": false, "terminator": {"span": span.clone(), "kind": {"Call": {
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Call": {
                         "call": {
                             "func": {"Regular": {"kind": {"Fun": 1}, "generics": gens.clone()}},
                             "args": [],
@@ -1585,7 +1589,7 @@ mod tests {
                         "target": 2,
                         "on_unwind": 2
                     }}}},
-                    {"statements": [], "is_cleanup": false, "terminator": {
+                    {"statements": [], "kind": "Regular", "terminator": {
                         "span": span.clone(), "kind": "Return"
                     }}
                 ]

@@ -4372,6 +4372,7 @@ mod tests {
                     target: u64| {
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
@@ -4397,13 +4398,13 @@ mod tests {
                 "body": [
                     call(2, serde_json::json!([{"Copy": place(2, &payload_ty)}]), 1, &scalar, 1),
                     call(1, serde_json::json!([]), 0, &scalar, 2),
-                    {"statements": [], "terminator": {"span": span.clone(), "kind": {"Drop": {
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": {"Drop": {
                         "place": place(2, &payload_ty),
                         "fn_ptr": {"kind": {"Fun": 1}, "generics": gens.clone()},
                         "target": 3,
                         "on_unwind": 3
                     }}}},
-                    {"statements": [], "terminator": {"span": span.clone(), "kind": "Return"}}
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span.clone(), "kind": "Return"}}
                 ]
             }}
         });
@@ -4687,7 +4688,7 @@ mod tests {
                        is_cleanup: bool| {
             serde_json::json!({
                 "statements": [],
-                "is_cleanup": is_cleanup,
+                "kind": if is_cleanup { "Cleanup" } else { "Regular" },
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
@@ -4711,11 +4712,11 @@ mod tests {
                 ]},
                 "body": [
                     call_bb(1, 0, &scalar, 1, 2, false),
-                    {"statements": [], "is_cleanup": false, "terminator": {
+                    {"statements": [], "kind": "Regular", "terminator": {
                         "span": span.clone(), "kind": "Return"
                     }},
                     call_bb(2, 0, &scalar, 3, 3, true),
-                    {"statements": [], "is_cleanup": true, "terminator": {
+                    {"statements": [], "kind": "Cleanup", "terminator": {
                         "span": span.clone(), "kind": "UnwindResume"
                     }}
                 ]
@@ -4850,7 +4851,7 @@ mod tests {
                        statements: serde_json::Value| {
             serde_json::json!({
                 "statements": statements,
-                "is_cleanup": false,
+                "kind": "Regular",
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
@@ -4912,10 +4913,10 @@ mod tests {
                         4,
                         serde_json::json!([])
                     ),
-                    {"statements": [], "is_cleanup": false, "terminator": {
+                    {"statements": [], "kind": "Regular", "terminator": {
                         "span": span.clone(), "kind": "Return"
                     }},
-                    {"statements": [], "is_cleanup": true, "terminator": {
+                    {"statements": [], "kind": "Cleanup", "terminator": {
                         "span": span.clone(), "kind": "UnwindResume"
                     }}
                 ]
@@ -5071,7 +5072,7 @@ mod tests {
                        target: u64| {
             serde_json::json!({
                 "statements": [],
-                "is_cleanup": false,
+                "kind": "Regular",
                 "terminator": {"span": span.clone(), "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {"kind": {"Fun": fun}, "generics": gens.clone()}},
@@ -5112,10 +5113,10 @@ mod tests {
                         &scalar,
                         4
                     ),
-                    {"statements": [], "is_cleanup": false, "terminator": {
+                    {"statements": [], "kind": "Regular", "terminator": {
                         "span": span.clone(), "kind": "Return"
                     }},
-                    {"statements": [], "is_cleanup": true, "terminator": {
+                    {"statements": [], "kind": "Cleanup", "terminator": {
                         "span": span.clone(), "kind": {"Goto": {"target": 2}}
                     }}
                 ]

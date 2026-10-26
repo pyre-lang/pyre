@@ -71,7 +71,7 @@ env:
   # MUST mirror CHARON_VERSION_DEFAULT in scripts/install-charon.py: it
   # drives the cache keys and install-charon.py's .installed-version
   # stamp, so a pin bump here misses the cache and re-installs.
-  CHARON_VERSION: nightly-2026.10.04
+  CHARON_VERSION: nightly-2026.10.25
 
 jobs:
   pre-commit:

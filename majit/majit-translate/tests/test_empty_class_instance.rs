@@ -50,14 +50,15 @@ fn empty_class_call() -> Llbc {
                     "body": [
                         {"statements": [{"span": span, "kind": {"Assign": [place(1, &marker_ty),
                             {"Aggregate": [{"Adt": [0, null, null, generics]}, []]}]}}],
+                         "kind": "Regular",
                          "terminator": {"span": span, "kind": {"Call": {
                             "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
                                 "args": [{"Move": place(1, &marker_ty)}],
                                 "dest": place(0, &word)},
                             "target": 1, "on_unwind": 2
                         }}}},
-                        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                        {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                     ]
                  }}},
                 {"def_id": 1, "item_meta": meta(vec![ident("fixture"), ident("pass_marker")]),

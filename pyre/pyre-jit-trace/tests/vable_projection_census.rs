@@ -381,7 +381,7 @@ fn walk_body(
                 for arg in &call.args {
                     walk_operand(arg, fn_name, llbc, pyframe_ids, vable, census);
                 }
-                if let CallFunc::Dynamic(operand) = &call.func {
+                if let CallFunc::Dynamic(operand, _) = &call.func {
                     walk_operand(operand, fn_name, llbc, pyframe_ids, vable, census);
                 }
             }

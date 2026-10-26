@@ -58,7 +58,7 @@ pub struct FunDecl {
     #[serde(skip)]
     first_arg_local_name: OnceLock<Option<String>>,
     /// Inlinable promoted-constant initializers for this artefact, indexed
-    /// by global decl id. Charon 0.1.281 emits each promoted constant as
+    /// by global decl id. Charon 0.1.298 emits each promoted constant as
     /// its own item; [`FunDecl::unstructured`] splices the initializer at
     /// every read, the shape 0.1.273 emitted inline. `None` when this
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
@@ -99,7 +99,7 @@ impl FunDecl {
 
     /// Return the `Unstructured` (basic-block CFG) body if present.
     ///
-    /// Charon 0.1.281 emits promoted constants as their own global items.
+    /// Charon 0.1.298 emits promoted constants as their own global items.
     /// When this declaration was loaded with the artefact table, each read
     /// of an inlinable promoted constant is replaced by the initializer's
     /// statements, the shape 0.1.273 emitted at the use site.
@@ -1309,18 +1309,61 @@ pub struct Local {
     pub ty: TyRef,
 }
 
+/// Where a block runs relative to unwinding (`UnwindKind` on the Charon block).
+/// Cleanup and Terminate are both unwind blocks; Regular is not.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default, Deserialize)]
+pub enum UnwindKind {
+    #[default]
+    Regular,
+    Cleanup,
+    Terminate,
+}
+
+impl UnwindKind {
+    /// rustc unwind cleanup or terminating-unwind block.
+    pub fn is_cleanup(self) -> bool {
+        matches!(self, UnwindKind::Cleanup | UnwindKind::Terminate)
+    }
+}
+
 #[derive(Debug, Deserialize)]
+struct BasicBlockDe {
+    statements: Vec<Statement>,
+    terminator: Terminator,
+    /// Charon 0.1.298 always emits this; handwritten fixtures that omit
+    /// it are Regular, the same default `is_cleanup: false` had.
+    #[serde(default)]
+    kind: UnwindKind,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(from = "BasicBlockDe")]
 pub struct BasicBlock {
     pub statements: Vec<Statement>,
     pub terminator: Terminator,
-    /// rustc unwind cleanup block (`is_cleanup` on the Charon block).
-    #[serde(default)]
+    /// Charon `UnwindKind` (`Regular` / `Cleanup` / `Terminate`).
+    pub kind: UnwindKind,
+    /// rustc unwind cleanup or terminating-unwind block
+    /// (`UnwindKind::Cleanup` / `Terminate` on the Charon block).
     pub is_cleanup: bool,
     /// First successful or failed projection of [`terminator`](Self::terminator).
     /// Later [`term`](Self::term) calls clone this value instead of parsing
     /// the raw JSON again.
     #[serde(skip)]
     term_cache: OnceLock<Result<TermKind, String>>,
+}
+
+impl From<BasicBlockDe> for BasicBlock {
+    fn from(raw: BasicBlockDe) -> Self {
+        let is_cleanup = raw.kind.is_cleanup();
+        BasicBlock {
+            statements: raw.statements,
+            terminator: raw.terminator,
+            kind: raw.kind,
+            is_cleanup,
+            term_cache: OnceLock::new(),
+        }
+    }
 }
 
 impl BasicBlock {
@@ -1401,6 +1444,7 @@ pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
             span: first_cleanup_span,
             value_cache: OnceLock::new(),
         },
+        kind: UnwindKind::Regular,
         is_cleanup: false,
         term_cache: OnceLock::new(),
     });
@@ -1410,7 +1454,7 @@ pub fn strip_cleanup_blocks(mut body: Unstructured) -> Unstructured {
 
 /// Inlinable promoted-constant initializer, keyed by global decl id.
 ///
-/// Charon 0.1.281 emits each promoted constant as its own `AnonConst`
+/// Charon 0.1.298 emits each promoted constant as its own `AnonConst`
 /// item whose last name segment is `PromotedConst`. The reader splices
 /// this initializer at every read so the body matches the inline shape
 /// 0.1.273 emitted.
@@ -2333,7 +2377,9 @@ pub struct CallPayload {
 
 /// Charon's `Call.func` is one of two top-level variants:
 ///   - `Regular { kind, generics }`   — statically resolved
-///   - `Dynamic <operand>`            — `dyn Trait` virtual call
+///   - `Dynamic(operand, RegionArgs)` — function-pointer / `dyn Trait`
+///     call (`FnOperand::Dynamic`). The operand is the pointer; the
+///     region args instantiate higher-kinded regions at the call.
 ///
 /// The inner `kind` of `Regular` further distinguishes `Fun(Regular n)`
 /// (monomorphized direct call), `Fun(Trait …)` (trait-bound generic
@@ -2341,9 +2387,9 @@ pub struct CallPayload {
 #[derive(Debug, Clone, Deserialize)]
 pub enum CallFunc {
     Regular(RegularCall),
-    /// `dyn Trait` virtual call. The operand carries the fat pointer
-    /// the dispatch reads from.
-    Dynamic(Operand),
+    /// Function-pointer / `dyn Trait` call. First field is the pointer
+    /// operand; second is Charon `RegionArgs`.
+    Dynamic(Operand, Value),
     #[serde(other)]
     Unknown,
 }
@@ -2436,7 +2482,7 @@ impl CallFunc {
                 CallKind::Ptr(_) => CallClass::Ptr,
                 CallKind::Unknown => CallClass::Unknown,
             },
-            CallFunc::Dynamic(_) => CallClass::Dynamic,
+            CallFunc::Dynamic(..) => CallClass::Dynamic,
             CallFunc::Unknown => CallClass::Unknown,
         }
     }
@@ -2936,10 +2982,11 @@ mod tests {
     }
 
     fn bb(kind: Value, is_cleanup: bool, term_span: u64) -> Value {
+        let unwind = if is_cleanup { "Cleanup" } else { "Regular" };
         serde_json::json!({
             "statements": [],
             "terminator": {"span": span(term_span), "kind": kind},
-            "is_cleanup": is_cleanup
+            "kind": unwind
         })
     }
 
@@ -3057,10 +3104,11 @@ mod tests {
             })
         };
         let bb = |statements: serde_json::Value, kind: serde_json::Value, is_cleanup: bool| {
+            let unwind = if is_cleanup { "Cleanup" } else { "Regular" };
             serde_json::json!({
                 "statements": statements,
                 "terminator": {"span": span, "kind": kind},
-                "is_cleanup": is_cleanup
+                "kind": unwind
             })
         };
         let assign_global = serde_json::json!({
@@ -3168,14 +3216,17 @@ mod tests {
         let decl = fun_decl_from_blocks(vec![
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span(0), "kind": call_term(1, 2)}
             }),
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span(0), "kind": drop_term(2, 2)}
             }),
             serde_json::json!({
                 "statements": [],
+                "kind": "Regular",
                 "terminator": {"span": span(0), "kind": "Return"}
             }),
         ]);
@@ -3189,7 +3240,7 @@ mod tests {
         );
     }
 
-    /// Darwin Charon 0.1.281 emits a pointer-identity Switch arm as a
+    /// Darwin Charon 0.1.298 emits a pointer-identity Switch arm as a
     /// `Ref` / `DynTrait` place, not a ConstantExpr literal. Keep that
     /// JSON as `SwitchInt` so `lower_niche_option_switch` can close it
     /// as a `ptr_nonzero` If (`rptr.py` `rtype_bool`); decode must not

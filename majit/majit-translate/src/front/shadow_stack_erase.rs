@@ -47,7 +47,7 @@ use std::collections::{HashMap, VecDeque};
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
     FunDecl, Operand, Place, PlaceKind, ProjectionElem, Rvalue, SpanRef, StmtKind, TermKind, TyRef,
-    Unstructured,
+    Unstructured, UnwindKind,
 };
 use serde_json::{Value, json};
 
@@ -1308,7 +1308,11 @@ fn unstructured_json_from_body(body: &Unstructured) -> Value {
                     "span": bb.terminator.span.as_ref().map(span_ref_json),
                     "kind": bb.terminator.kind_value().clone(),
                 },
-                "is_cleanup": bb.is_cleanup,
+                "kind": match bb.kind {
+                    UnwindKind::Regular => "Regular",
+                    UnwindKind::Cleanup => "Cleanup",
+                    UnwindKind::Terminate => "Terminate",
+                },
             })
         })
         .collect();
@@ -2633,7 +2637,7 @@ mod tests {
             json!({
                 "statements": [],
                 "terminator": {"span": span(), "kind": kind},
-                "is_cleanup": false
+                "kind": "Regular"
             })
         };
         let open = json!({"Call": {
@@ -2713,10 +2717,11 @@ mod tests {
         let local = |i: u64| json!({"index": i, "name": null, "span": span(), "ty": ty});
         let stmt = |kind: Value| json!({"span": span(), "kind": kind});
         let bb = |statements: Vec<Value>, kind: Value, is_cleanup: bool| {
+            let unwind = if is_cleanup { "Cleanup" } else { "Regular" };
             json!({
                 "statements": statements,
                 "terminator": {"span": span(), "kind": kind},
-                "is_cleanup": is_cleanup
+                "kind": unwind
             })
         };
         let call = |fun: u64, args: Vec<Value>, dest: u64, target: u64, on_unwind: u64| {
@@ -2831,7 +2836,7 @@ mod tests {
         json!({
             "statements": [],
             "terminator": {"span": span(), "kind": kind},
-            "is_cleanup": false
+            "kind": "Regular"
         })
     }
 
@@ -2839,7 +2844,7 @@ mod tests {
         json!({
             "statements": [],
             "terminator": {"span": span(), "kind": kind},
-            "is_cleanup": true
+            "kind": "Cleanup"
         })
     }
 
@@ -3016,7 +3021,7 @@ mod tests {
         json!({
             "statements": statements,
             "terminator": {"span": span(), "kind": kind},
-            "is_cleanup": false
+            "kind": "Regular"
         })
     }
 
@@ -3044,7 +3049,7 @@ mod tests {
                 json!({
                     "statements": [assign_local(1, use_copy0)],
                     "terminator": {"span": span(), "kind": "UnwindResume"},
-                    "is_cleanup": true
+                    "kind": "Cleanup"
                 }),
             ],
         );

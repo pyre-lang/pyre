@@ -90,7 +90,7 @@ The annotator/rtyper prepass and the `PYRE_RTYPER_VERBOSE` census read
 live over the frozen bodies.
 
 Charon is shared and pre-installed at `../.pyre-build/charon/<platform>/<version>/charon`
-(pinned `nightly-2026.10.04`), **not on `PATH`** — `which charon` finding nothing
+(pinned `nightly-2026.10.25`), **not on `PATH`** — `which charon` finding nothing
 does not mean it is missing.
 
 ```bash

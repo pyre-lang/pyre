@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 
-CHARON_VERSION_DEFAULT = "nightly-2026.10.04"
+CHARON_VERSION_DEFAULT = "nightly-2026.10.25"
 
 
 def default_charon_dest(shared: Path, platform_key: str, version: str) -> Path:
@@ -150,6 +150,20 @@ def main() -> None:
                 check=True,
             )
             subprocess.run(["git", "-C", str(charon_src), "checkout", "-q", version], check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(charon_src),
+                    "submodule",
+                    "update",
+                    "--init",
+                    "--recursive",
+                    "--depth",
+                    "1",
+                ],
+                check=True,
+            )
         else:
             print(f"cloning charon {version} into {charon_src}")
             subprocess.run(
@@ -160,6 +174,8 @@ def main() -> None:
                     "1",
                     "--branch",
                     version,
+                    "--recurse-submodules",
+                    "--shallow-submodules",
                     "https://github.com/AeneasVerif/charon.git",
                     str(charon_src),
                 ],

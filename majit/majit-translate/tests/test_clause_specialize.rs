@@ -914,13 +914,13 @@ fn mk_fixture_llbc() -> String {
                 "span": span,
                 "locals": {"arg_count": 0, "locals": [{"index": 0, "name": null, "span": span, "ty": ret}]},
                 "body": [
-                    {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                         "call": {"func": func, "args": [], "dest": {"kind": {"Local": 0}, "ty": ret}},
                         "target": 2,
                         "on_unwind": 1
                     }}}},
-                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                    {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
                 ]
             }
         })
@@ -1041,7 +1041,7 @@ fn put_fixture_llbc() -> String {
                 "locals": [local(0, None, &tvar), local(1, Some("slot"), &slot_ty), local(2, Some("v"), &tvar)]
             },
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1058,7 +1058,7 @@ fn put_fixture_llbc() -> String {
                 ]
             },
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
@@ -1070,8 +1070,8 @@ fn put_fixture_llbc() -> String {
                     "target": 2,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Fun": 2},
@@ -1083,7 +1083,7 @@ fn put_fixture_llbc() -> String {
                     "target": 3,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1092,7 +1092,7 @@ fn put_fixture_llbc() -> String {
             "span": span,
             "locals": {"arg_count": 0, "locals": [local(0, None, &unit)]},
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Fun": 3},
@@ -1104,8 +1104,8 @@ fn put_fixture_llbc() -> String {
                     "target": 2,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1114,7 +1114,7 @@ fn put_fixture_llbc() -> String {
             "span": span,
             "locals": {"arg_count": 0, "locals": [local(0, None, &unit)]},
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Fun": 2},
@@ -1126,8 +1126,8 @@ fn put_fixture_llbc() -> String {
                     "target": 2,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1144,7 +1144,7 @@ fn put_fixture_llbc() -> String {
                 "locals": [local(0, None, &tvar), local(1, Some("v"), &tvar)]
             },
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1153,7 +1153,7 @@ fn put_fixture_llbc() -> String {
             "span": span,
             "locals": {"arg_count": 0, "locals": [local(0, None, &unit)]},
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Fun": 6},
@@ -1165,8 +1165,8 @@ fn put_fixture_llbc() -> String {
                     "target": 2,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1307,7 +1307,7 @@ fn unit_field_fixture_llbc() -> String {
                                     place(3, &unit),
                                     {"Aggregate": [{"Adt": ["Tuple", null, null, empty_g]}, []]}
                                 ]}}
-                            ], "terminator": {"span": span, "kind": {"Call": {
+                            ], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                                 "call": {
                                     "func": {"Regular": {
                                         "kind": {"Fun": 1},
@@ -1319,8 +1319,8 @@ fn unit_field_fixture_llbc() -> String {
                                 "target": 1,
                                 "on_unwind": 2
                             }}}},
-                            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
-                            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
                         ]
                     }}
                 },
@@ -1390,7 +1390,7 @@ fn malloc_typed_fixture_llbc() -> String {
                 "span": span,
                 "locals": {"arg_count": 0, "locals": [{"index": 0, "name": null, "span": span, "ty": ty}]},
                 "body": [
-                    {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
                 ]
             }
         })
@@ -1405,7 +1405,7 @@ fn malloc_typed_fixture_llbc() -> String {
                 "locals": [local(0, &i64_ty), local(1, &i64_ty)]
             },
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Trait": [{"kind": {"Clause": {"Bound": [0, 0]}}}, 0]},
@@ -1417,8 +1417,8 @@ fn malloc_typed_fixture_llbc() -> String {
                     "target": 2,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Fun": 2},
@@ -1430,7 +1430,7 @@ fn malloc_typed_fixture_llbc() -> String {
                     "target": 3,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
@@ -1439,7 +1439,7 @@ fn malloc_typed_fixture_llbc() -> String {
             "span": span,
             "locals": {"arg_count": 0, "locals": [local(0, &i64_ty)]},
             "body": [
-                {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
                     "call": {
                         "func": {"Regular": {
                             "kind": {"Fun": 3},
@@ -1451,8 +1451,8 @@ fn malloc_typed_fixture_llbc() -> String {
                     "target": 2,
                     "on_unwind": 1
                 }}}},
-                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
-                {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}
             ]
         }
     });
