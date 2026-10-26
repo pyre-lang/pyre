@@ -3483,20 +3483,29 @@ impl TraceCtx {
     }
 
     /// Merge-point driver spec (`jitdrivers_sd[jdindex]._green_args_spec`).
-    /// Read from `driver_descriptor` when the trace has one, else from
-    /// `metainterp_sd.jitdrivers_sd[jdindex]`. A descriptor whose spec is
-    /// empty is a zero-green driver and yields an empty spec. Never the
-    /// back-edge `green_key_values.types` / `close_typed_key.types`.
+    ///
+    /// 1. `metainterp_sd.jitdrivers_sd[jdindex]` → `jd.green_args_spec()`
+    ///    (`opimpl_jit_merge_point`'s `jitdrivers_sd[jdindex]`) unless
+    ///    that slot is the placeholder shell `make_enter_function`
+    ///    pushes — no stamped `index` and no `vars`. A registered
+    ///    zero-green driver keeps its empty spec.
+    /// 2. Else `driver_descriptor` → `descriptor.green_args_spec()`.
+    /// 3. Else the typed greens this trace started with
+    ///    (`green_key_values.types`). Steps 2-3 apply only to that
+    ///    placeholder shell.
     pub(crate) fn merge_point_green_spec(&self, jdindex: usize) -> Vec<GreenType> {
-        match self.driver_descriptor.as_ref() {
-            Some(descriptor) => descriptor.green_args_spec(),
-            None => self
-                .metainterp_sd
-                .jitdrivers_sd
-                .get(jdindex)
-                .map(|jd| jd.green_args_spec())
-                .unwrap_or_default(),
+        if let Some(jd) = self.metainterp_sd.jitdrivers_sd.get(jdindex)
+            && (jd.index.is_some() || !jd.vars.is_empty())
+        {
+            return jd.green_args_spec();
         }
+        if let Some(descriptor) = self.driver_descriptor.as_ref() {
+            return descriptor.green_args_spec();
+        }
+        self.green_key_values
+            .as_ref()
+            .map(|k| k.types.to_vec())
+            .unwrap_or_default()
     }
 
     /// Re-read merge-point red registers off a live frame (`prepare_list_of_boxes`).
@@ -8970,6 +8979,47 @@ mod tests {
             .expect("empty spec is a zero-green key");
         assert!(empty.values.is_empty());
         assert!(empty.types.is_empty());
+
+        // A registered `jitdrivers_sd[jdindex]` wins over a trace
+        // descriptor with a different spec (`opimpl_jit_merge_point`
+        // `jitdrivers_sd[jdindex]`).
+        let mut sd = crate::MetaInterpStaticData::new();
+        let mut registered = JitDriverStaticData::new(vec![("x", Type::Int)], vec![]);
+        registered.index = Some(0);
+        sd.jitdrivers_sd.push(registered);
+        let mut ctx = TraceCtx::with_green_key(
+            Trace::new(),
+            key.get_uhash(),
+            key.clone(),
+            std::sync::Arc::new(sd),
+        );
+        ctx.set_driver_descriptor(JitDriverStaticData::new(
+            vec![("a", Type::Int), ("b", Type::Ref)],
+            vec![],
+        ));
+        assert_eq!(
+            ctx.merge_point_green_spec(0),
+            vec![GreenType::Int],
+            "a registered driver at jdindex wins over the trace descriptor"
+        );
+
+        // Unstamped table entry with vars is a real driver (`opimpl_jit_merge_point`).
+        let mut sd = crate::MetaInterpStaticData::new();
+        sd.jitdrivers_sd.push(JitDriverStaticData::new(
+            vec![("a", Type::Int), ("b", Type::Ref)],
+            vec![],
+        ));
+        let ctx = TraceCtx::with_green_key(
+            Trace::new(),
+            key.get_uhash(),
+            key.clone(),
+            std::sync::Arc::new(sd),
+        );
+        assert_eq!(
+            ctx.merge_point_green_spec(0),
+            vec![GreenType::Int, GreenType::Ref],
+            "an unregistered entry with declared vars keeps its own schema"
+        );
     }
 
     #[test]

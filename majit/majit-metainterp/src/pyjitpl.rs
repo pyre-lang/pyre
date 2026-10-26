@@ -13746,7 +13746,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key_raw: (usize, usize),
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
-        self.function_entry_step_on_driver(0, cell_key, green_key_hash, green_key_raw, reds)
+        self.function_entry_step_on_driver(0, cell_key, green_key_hash, green_key_raw, None, reds)
     }
 
     /// `warmstate.py maybe_compile_and_run` with
@@ -13757,6 +13757,7 @@ impl<M: Clone> MetaInterp<M> {
         cell_key: u64,
         green_key_hash: u64,
         green_key_raw: (usize, usize),
+        greenargs: Option<(&[i64], &[majit_ir::GreenType])>,
         reds: &[Value],
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
@@ -13767,6 +13768,17 @@ impl<M: Clone> MetaInterp<M> {
             return warm_state.function_entry_step(
                 cell_key,
                 None,
+                || compiled_loops.contains_key(&(jd_no, cell_key)),
+                engine_is_tracing,
+                reds,
+            );
+        }
+        if let Some((values, types)) = greenargs {
+            // The hook receives the invocation's declared greens (`maybe_compile_and_run` `confirm_enter_jit(*args)`).
+            let key = majit_ir::GreenKey::from_greenargs(values, types);
+            return warm_state.function_entry_step(
+                cell_key,
+                Some(&key),
                 || compiled_loops.contains_key(&(jd_no, cell_key)),
                 engine_is_tracing,
                 reds,
@@ -28342,8 +28354,14 @@ mod metainterp_static_data_tests {
             },
         );
 
-        let on_entry =
-            meta.function_entry_step_on_driver(idx1, key.get_uhash(), key.get_uhash(), (0, 0), &[]);
+        let on_entry = meta.function_entry_step_on_driver(
+            idx1,
+            key.get_uhash(),
+            key.get_uhash(),
+            (0, 0),
+            None,
+            &[],
+        );
         assert!(
             matches!(
                 on_entry,
@@ -28351,8 +28369,14 @@ mod metainterp_static_data_tests {
             ),
             "function-entry on jd1 reads that driver's compiled cell"
         );
-        let on_portal =
-            meta.function_entry_step_on_driver(0, key.get_uhash(), key.get_uhash(), (0, 0), &[]);
+        let on_portal = meta.function_entry_step_on_driver(
+            0,
+            key.get_uhash(),
+            key.get_uhash(),
+            (0, 0),
+            None,
+            &[],
+        );
         assert!(
             !matches!(
                 on_portal,
@@ -35987,11 +36011,7 @@ mod tests {
         meta.bound_reached(green_key, (code, pc), None, None, &[Value::Int(0)]);
         let closed = {
             let ctx = meta.trace_ctx().expect("bound_reached started tracing");
-            let spec = ctx
-                .green_key_values()
-                .expect("bound_reached stored the typed green key")
-                .types
-                .clone();
+            let spec = ctx.merge_point_green_spec(0);
             ctx.merge_point_green_key(&[pc as i64, 0], &[code as i64], &[], &spec)
                 .expect("portal banks must rebuild the pypyjit green key")
         };

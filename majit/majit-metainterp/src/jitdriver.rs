@@ -3920,6 +3920,7 @@ impl<S: JitState> JitDriver<S> {
             .back_edge_internal(
                 key,
                 None,
+                false,
                 None,
                 resume_pc,
                 state,
@@ -5854,6 +5855,7 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(
             target_pc as u64,
             None,
+            false,
             None,
             target_pc,
             state,
@@ -5876,7 +5878,7 @@ impl<S: JitState> JitDriver<S> {
             return handled.map(continue_at_pc);
         }
         self.back_edge_internal(
-            green_key, None, None, target_pc, state, env, None, None, pre_run,
+            green_key, None, false, None, target_pc, state, env, None, None, pre_run,
         )
     }
 
@@ -5936,6 +5938,7 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(
             green_key_hash,
             greenargs,
+            false,
             None,
             target_pc,
             state,
@@ -5960,8 +5963,10 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// `greenargs` is this invocation's greens when the caller holds them
     /// (`warmstate.py maybe_compile_and_run` `confirm_enter_jit(*args)`).
-    /// `function_entry_internal` passes `Some`; hash-only doors pass `None`
-    /// and compiled-entry confirm falls back to `cell.current_greens()`.
+    /// A door holding the invocation's greens passes `Some`; hash-only doors
+    /// pass `None` and compiled-entry confirm falls back to
+    /// `cell.current_greens()`. `function_entry_internal` confirms in its
+    /// decision and enters through [`Self::run_confirmed_entry`].
     ///
     /// `cell_key` must be a [`Self::resolve_cell_key`] result and
     /// `procedure_token` must be the token read from THAT key — normally
@@ -5986,6 +5991,7 @@ impl<S: JitState> JitDriver<S> {
         self.back_edge_internal(
             cell_key,
             greenargs,
+            false,
             Some(procedure_token),
             target_pc,
             state,
@@ -5993,6 +5999,31 @@ impl<S: JitState> JitDriver<S> {
             None,
             None,
             pre_run,
+        )
+    }
+
+    /// [`Self::back_edge_resolved`] for a door whose `maybe_compile_and_run`
+    /// decision already ran `confirm_enter_jit` (`warmstate.py` calls it once,
+    /// before `EnterJitAssembler`).
+    fn run_confirmed_entry(
+        &mut self,
+        cell_key: u64,
+        procedure_token: std::sync::Arc<majit_backend::JitCellToken>,
+        target_pc: usize,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<PortalResume> {
+        self.back_edge_internal(
+            cell_key,
+            None,
+            true,
+            Some(procedure_token),
+            target_pc,
+            state,
+            env,
+            None,
+            None,
+            || {},
         )
     }
 
@@ -6885,6 +6916,7 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         green_key_hash: u64,
         greenargs: Option<(&[i64], &[GreenType])>,
+        confirmed: bool,
         carried_procedure_token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
         target_pc: usize,
         state: &mut S,
@@ -7046,14 +7078,16 @@ impl<S: JitState> JitDriver<S> {
             // greens otherwise. `direct_live_values` is live after the hook
             // (`scratch.live_values.extend`); root it only across confirm
             // (`get_livevars_for_roots` / `push_roots`) and drop the
-            // extra-area before the Vec is consumed.
+            // extra-area before the Vec is consumed. A caller whose
+            // `maybe_compile_and_run_decision` already confirmed passes
+            // `confirmed`, so the hook runs once.
             let jd_no = self.index().unwrap_or(0);
             let needs_confirm = self
                 .meta
                 .warm_state_ref_for_driver(jd_no)
                 .is_some_and(|warm| warm.has_confirm_enter_jit());
             let mut direct_live_values = direct_live_values;
-            if needs_confirm {
+            if needs_confirm && !confirmed {
                 let _direct_confirm_roots = direct_live_values
                     .as_mut()
                     .map(|values| crate::warmstate::root_confirm_ref_values(values));
@@ -10242,6 +10276,7 @@ impl<S: JitState> JitDriver<S> {
             cell_key,
             green_key_hash,
             green_key_raw,
+            None,
             reds,
         )
     }
@@ -10904,24 +10939,18 @@ impl<S: JitState> JitDriver<S> {
             FunctionEntryStep::Proceed
         } else {
             let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
-            self.function_entry_step(
+            self.meta.function_entry_step_on_driver(
+                self.index().unwrap_or(0),
                 cell_key,
                 green_key_hash,
                 (state.code_ptr(), target_pc),
+                Some((green_values, green_types)),
                 &confirm_reds,
             )
         };
         match step {
             FunctionEntryStep::RunCompiled(token) => self
-                .back_edge_resolved(
-                    cell_key,
-                    token,
-                    Some((green_values, green_types)),
-                    target_pc,
-                    state,
-                    env,
-                    || {},
-                )
+                .run_confirmed_entry(cell_key, token, target_pc, state, env)
                 .and_then(|resume| self.resume_pc_recycling(resume)),
             FunctionEntryStep::Proceed => {
                 if !state.can_trace() {
@@ -12909,6 +12938,7 @@ mod tests {
         let label_outcome = driver.back_edge_internal(
             hash,
             None,
+            false,
             Some(token),
             19,
             &mut label_state,
@@ -13020,6 +13050,53 @@ mod tests {
             "the hook sees the live green bits, not the cell's stored word"
         );
         assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 4);
+    }
+
+    /// `warmstate.py maybe_compile_and_run` calls `confirm_enter_jit(*args)`
+    /// once, before `EnterJitAssembler`. Compiled function-entry uses the
+    /// invocation's declared greens and must not confirm again in
+    /// `back_edge_internal`.
+    #[test]
+    fn confirm_enter_jit_runs_once_on_compiled_function_entry() {
+        static CONFIRMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static SEEN_GREEN: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        fn allow(args: &[Value]) -> bool {
+            CONFIRMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            SEEN_GREEN.store(args[0].as_int(), std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        CONFIRMS.store(0, std::sync::atomic::Ordering::Relaxed);
+        SEEN_GREEN.store(0, std::sync::atomic::Ordering::Relaxed);
+        let x = 10i64;
+        let (mut driver, hash, key) = confirm_enter_jit_hook_compiled_loop(x);
+        driver
+            .meta
+            .warm_state_for_driver(0)
+            .set_confirm_enter_jit(Some(allow));
+
+        let mut state = TypedRestoreState {
+            live_values: vec![4],
+            ..Default::default()
+        };
+        let _outcome = driver.function_entry_structured(
+            hash,
+            &key.values,
+            (GreenSlotInt,),
+            0,
+            &mut state,
+            &(),
+        );
+        assert_eq!(
+            CONFIRMS.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "confirm_enter_jit runs once per compiled function entry"
+        );
+        assert_eq!(
+            SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed),
+            x,
+            "the hook sees the declared green value"
+        );
     }
 
     #[test]

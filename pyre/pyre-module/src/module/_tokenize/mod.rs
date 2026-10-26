@@ -228,11 +228,6 @@ impl W_TokenizerIter {
             ));
         }
         let mut readline = readline;
-        if !pyre_interpreter::baseobjspace::callable_w(readline) {
-            return Err(pyre_interpreter::PyError::type_error(
-                "source must be callable",
-            ));
-        }
         let mut encoding_root = encoding;
         let mut extra_root = extra_tokens;
         let extra_tokens = pyre_object::with_roots!(
