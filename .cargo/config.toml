@@ -16,8 +16,12 @@ RUST_MIN_STACK = "16777216"
 # wasmtime runner reads the `__indirect_function_table` export. Without this
 # flag the table stays module-internal and indirect residual calls cannot be
 # dispatched.
+# The wasm32 shadow stack (linear memory below the data segment) defaults to
+# 1 MiB. The codewriter's `flatten.rs` `make_link` / `make_bytecode_block`
+# recursion follows one link per block, so a long function's jitcode needs
+# more; 8 MiB matches the native main-thread stack, as on Windows below.
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "link-arg=--export-table"]
+rustflags = ["-C", "link-arg=--export-table", "-C", "link-arg=-zstack-size=8388608"]
 
 # The PE default main-thread reserve is 1 MiB. `RUST_MIN_STACK` only
 # applies to threads Rust itself spawns, so a recursive CALL_ASSEMBLER

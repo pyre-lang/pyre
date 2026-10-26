@@ -35,7 +35,7 @@ fi
 # `--growable-table` drops its fixed maximum so the glue can append compiled
 # trace functions; unlike the wasm-host build, web does not use getrandom's
 # `custom` backend.
-RUSTFLAGS='-C link-arg=--export-table -C link-arg=--growable-table' \
+RUSTFLAGS='-C link-arg=--export-table -C link-arg=--growable-table -C link-arg=-zstack-size=8388608' \
     cargo build --release -p pyre-wasm \
     --target wasm32-unknown-unknown \
     --no-default-features --features web
