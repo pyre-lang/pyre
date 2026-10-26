@@ -5382,12 +5382,12 @@ pub fn publish_walk_abort_handoff(
         // (`last_mp_green_pc`).
         if let Some(pc) = stub_resume_pc {
             let bits = pc as i64;
-            if let Some((ints, _, _)) = ctx.live_portal_greens.as_mut()
+            if let Some((ints, _, _, _)) = ctx.live_portal_greens.as_mut()
                 && let Some(slot) = ints.first_mut()
             {
                 *slot = bits;
             }
-            if let Some((ints, _, _)) = ctx.close_greens.as_mut()
+            if let Some((ints, _, _, _)) = ctx.close_greens.as_mut()
                 && let Some(slot) = ints.first_mut()
             {
                 *slot = bits;

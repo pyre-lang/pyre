@@ -1613,15 +1613,18 @@ impl GreenKey {
 
     /// history.py `ConstPtr.value` — a `GreenType::Ref` slot is a GC pointer
     /// copied into this key; the walker rewrites the address after a move.
-    /// Null is skipped. `Str` / `Unicode` are frontend string slots, not
-    /// moving GC pointers (`hash_whatever` hashes their content).
+    /// Null and `GcRef::NO_CONCRETE` are skipped (`walk_bridge_carrier_concrete_refs`).
+    /// `Str` / `Unicode` are frontend string slots, not moving GC pointers
+    /// (`hash_whatever` hashes their content).
     pub fn walk_refs(&mut self, visitor: &mut impl FnMut(&mut GcRef)) {
         for i in 0..self.values.len() {
             let tp = self.types.get(i).copied().unwrap_or(GreenType::Int);
-            if tp == GreenType::Ref && self.values[i] != 0 {
+            if tp == GreenType::Ref {
                 let mut gcref = GcRef(self.values[i] as usize);
-                visitor(&mut gcref);
-                self.values[i] = gcref.0 as i64;
+                if !gcref.is_null() && gcref != GcRef::NO_CONCRETE {
+                    visitor(&mut gcref);
+                    self.values[i] = gcref.0 as i64;
+                }
             }
         }
     }

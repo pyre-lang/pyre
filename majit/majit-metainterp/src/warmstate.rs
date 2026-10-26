@@ -827,6 +827,69 @@ fn value_from_green_word(word: i64, tp: GreenType) -> Value {
     }
 }
 
+/// Slice identity for a `Value` extra-area walk. The collector updates
+/// `Value::Ref` payloads in place so a slice live across a collecting call
+/// keeps forwarded addresses (`get_livevars_for_roots` / `push_roots`).
+/// LABEL `direct_live_values` are not green Str/Unicode slots: every
+/// `Value::Ref` is a GC ref.
+struct ConfirmValueSlice {
+    ptr: *mut Value,
+    len: usize,
+}
+
+unsafe fn walk_confirm_value_refs(data: *const (), visitor: &mut dyn FnMut(&mut GcRef)) {
+    let slice = unsafe { &*data.cast::<ConfirmValueSlice>() };
+    let values = unsafe { std::slice::from_raw_parts_mut(slice.ptr, slice.len) };
+    for value in values {
+        if let Value::Ref(r) = value
+            && !r.is_null()
+            && *r != GcRef::NO_CONCRETE
+        {
+            visitor(r);
+        }
+    }
+}
+
+/// Extra-area roots for a `Value` slice live across a collecting call.
+/// `_area` is declared first so it drops before `_walk` (`root_with`).
+/// The guard holds the exclusive borrow of `values`, so the slice cannot
+/// be moved, reallocated, or read elsewhere while the collector may rewrite it.
+pub(crate) struct ConfirmRefRoots<'a> {
+    _area: Option<majit_gc::shadow_stack::MutatorExtraAreaGuard>,
+    _walk: Option<Box<ConfirmValueSlice>>,
+    _values: std::marker::PhantomData<&'a mut [Value]>,
+}
+
+/// Root `values` for the duration of the returned guard (`push_roots` /
+/// `pop_roots`). The guard holds the exclusive borrow of `values`, so the
+/// slice cannot be moved, reallocated, or read elsewhere while the
+/// collector may rewrite it.
+pub(crate) fn root_confirm_ref_values<'a>(values: &'a mut [Value]) -> ConfirmRefRoots<'a> {
+    if values.is_empty() || !majit_gc::shadow_stack::mutator_is_registered() {
+        return ConfirmRefRoots {
+            _area: None,
+            _walk: None,
+            _values: std::marker::PhantomData,
+        };
+    }
+    let walk = Box::new(ConfirmValueSlice {
+        ptr: values.as_mut_ptr(),
+        len: values.len(),
+    });
+    let area = unsafe {
+        majit_gc::shadow_stack::MutatorExtraAreaGuard::new(
+            walk_confirm_value_refs,
+            &*walk as *const ConfirmValueSlice as *const (),
+            "confirm_enter_jit",
+        )
+    };
+    ConfirmRefRoots {
+        _area: Some(area),
+        _walk: Some(walk),
+        _values: std::marker::PhantomData,
+    }
+}
+
 impl WarmEnterState {
     /// `warmstate.py maybe_compile_and_run`: a `JC_DONT_TRACE_HERE` cell that
     /// has never seen a procedure token is retried — immediately the first
@@ -2393,6 +2456,8 @@ impl WarmEnterState {
             args.push(value_from_green_word(word, tp));
         }
         args.extend_from_slice(reds);
+        // Packed `args` is dead after `hook(&args)` (`get_livevars_for_roots`).
+        // The hook is the callee and roots its own locals.
         hook(&args)
     }
 

@@ -4086,6 +4086,7 @@ where
         // `pyjitpl.py MIFrame.opimpl_jit_merge_point`:
         // `jitdriver_sd = staticdata.jitdrivers_sd[jdindex]`.
         let no_loop_header_jd = ctx.metainterp_sd().jitdrivers_sd[jdindex].no_loop_header;
+        let mp_green_spec = ctx.merge_point_green_spec(jdindex);
         // 5 — register-byte bounds.  Each of the six
         // register lists encodes `[len:u8][reg:u8 * N]` with
         // greens/reds split by kind in `(I, R, F, I, R, F)`
@@ -4314,6 +4315,7 @@ where
                 mp_green_ints.to_vec(),
                 mp_green_refs.to_vec(),
                 mp_green_floats.to_vec(),
+                mp_green_spec.clone(),
             ));
         }
         // pyjitpl.py MIFrame.opimpl_jit_merge_point — a jit_merge_point reached INSIDE an
@@ -4486,7 +4488,12 @@ where
                 // enters, auto-stamp here, and close with nothing but
                 // the green-promotion ops recorded.
                 let has_targets = ctx
-                    .merge_point_green_key_hash(&mp_green_ints, &mp_green_refs, &mp_green_floats)
+                    .merge_point_green_key_hash(
+                        &mp_green_ints,
+                        &mp_green_refs,
+                        &mp_green_floats,
+                        &mp_green_spec,
+                    )
                     .zip(ctx.has_compiled_targets_fn.as_ref())
                     .is_some_and(|(key, f)| f(key));
                 depth_zero && has_targets
@@ -4507,6 +4514,7 @@ where
                 mp_green_ints.to_vec(),
                 mp_green_refs.to_vec(),
                 mp_green_floats.to_vec(),
+                mp_green_spec.clone(),
             ));
         }
         // pyjitpl.py opimpl_jit_merge_point close-loop
@@ -4740,7 +4748,7 @@ where
                     Some(key) => key == ctx.green_key,
                     None => true,
                 }
-            } else if let Some((h_ints, h_refs, h_floats)) = ctx.header_greens.as_ref() {
+            } else if let Some((h_ints, h_refs, h_floats, _)) = ctx.header_greens.as_ref() {
                 mp_green_ints.as_slice() == h_ints.as_slice()
                     && mp_green_refs.as_slice() == h_refs.as_slice()
                     && mp_green_floats.as_slice() == h_floats.as_slice()
@@ -4769,6 +4777,7 @@ where
                     mp_green_ints.to_vec(),
                     mp_green_refs.to_vec(),
                     mp_green_floats.to_vec(),
+                    mp_green_spec.clone(),
                 );
                 ctx.close_greens = Some(close_greens.clone());
                 ctx.close_green_pc = mp_green_pc;
@@ -4945,7 +4954,12 @@ where
                 // segmenting consumers, which install cell flags and
                 // so need a key a chain walk can match, not a bucket.
                 let Some(inner_key_typed) =
-                    ctx.merge_point_green_key(&mp_green_ints, &mp_green_refs, &mp_green_floats)
+                    ctx.merge_point_green_key(
+                        &mp_green_ints,
+                        &mp_green_refs,
+                        &mp_green_floats,
+                        &mp_green_spec,
+                    )
                 else {
                     return TraceAction::Continue;
                 };
@@ -4992,6 +5006,7 @@ where
                         mp_green_ints.to_vec(),
                         mp_green_refs.to_vec(),
                         mp_green_floats.to_vec(),
+                        mp_green_spec.clone(),
                     ));
                     ctx.close_green_pc = Some(pc);
                     ctx.close_jump_into_key = Some(inner_key);
@@ -5043,6 +5058,7 @@ where
                         mp_green_ints.to_vec(),
                         mp_green_refs.to_vec(),
                         mp_green_floats.to_vec(),
+                        mp_green_spec.clone(),
                     ));
                     ctx.close_green_pc = Some(pc);
                     if capture_walk_reds {

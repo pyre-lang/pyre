@@ -5958,6 +5958,11 @@ impl<S: JitState> JitDriver<S> {
     /// entry point pays for two cell resolutions per warm call and, on a
     /// chained bucket, can decide about one cell's token and enter another's.
     ///
+    /// `greenargs` is this invocation's greens when the caller holds them
+    /// (`warmstate.py maybe_compile_and_run` `confirm_enter_jit(*args)`).
+    /// `function_entry_internal` passes `Some`; hash-only doors pass `None`
+    /// and compiled-entry confirm falls back to `cell.current_greens()`.
+    ///
     /// `cell_key` must be a [`Self::resolve_cell_key`] result and
     /// `procedure_token` must be the token read from THAT key — normally
     /// [`Self::runnable_procedure_token`] asked with this same `cell_key`.
@@ -5972,6 +5977,7 @@ impl<S: JitState> JitDriver<S> {
         &mut self,
         cell_key: u64,
         procedure_token: std::sync::Arc<majit_backend::JitCellToken>,
+        greenargs: Option<(&[i64], &[GreenType])>,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
@@ -5979,7 +5985,7 @@ impl<S: JitState> JitDriver<S> {
     ) -> Option<PortalResume> {
         self.back_edge_internal(
             cell_key,
-            None,
+            greenargs,
             Some(procedure_token),
             target_pc,
             state,
@@ -7037,13 +7043,20 @@ impl<S: JitState> JitDriver<S> {
             // copied Value::Ref in the assembler buffer. LABEL-ordered
             // direct_live_values stay assembler-only. The hook gets the
             // invocation's greens when the door holds them, the cell's
-            // greens otherwise.
+            // greens otherwise. `direct_live_values` is live after the hook
+            // (`scratch.live_values.extend`); root it only across confirm
+            // (`get_livevars_for_roots` / `push_roots`) and drop the
+            // extra-area before the Vec is consumed.
             let jd_no = self.index().unwrap_or(0);
             let needs_confirm = self
                 .meta
                 .warm_state_ref_for_driver(jd_no)
                 .is_some_and(|warm| warm.has_confirm_enter_jit());
+            let mut direct_live_values = direct_live_values;
             if needs_confirm {
+                let _direct_confirm_roots = direct_live_values
+                    .as_mut()
+                    .map(|values| crate::warmstate::root_confirm_ref_values(values));
                 let confirm_types = self.confirm_enter_jit_green_types(greenargs);
                 let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
                 if !self
@@ -10557,7 +10570,7 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
     ) -> SteadyCompiledEntry {
         SteadyCompiledEntry::Done(
-            self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+            self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
                 .and_then(|resume| self.resume_pc_recycling(resume)),
         )
     }
@@ -10615,7 +10628,7 @@ impl<S: JitState> JitDriver<S> {
         if token.inputarg_types().len() > have {
             self.entry_scratch_out(scratch);
             return SteadyCompiledEntry::Done(
-                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
                     .and_then(|resume| self.resume_pc_recycling(resume)),
             );
         }
@@ -10660,7 +10673,7 @@ impl<S: JitState> JitDriver<S> {
         let _ = state.fill_entry_reds_without_meta(&mut scratch.live_values);
         self.entry_scratch_out(scratch);
         SteadyCompiledEntry::Done(
-            self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+            self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
                 .and_then(|resume| self.resume_pc_recycling(resume)),
         )
     }
@@ -10810,7 +10823,7 @@ impl<S: JitState> JitDriver<S> {
             self.compiled_function_token(green_key_hash, green_values, green_spec)
         {
             return Some(
-                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
                     .and_then(|resume| self.resume_pc_recycling(resume)),
             );
         }
@@ -10900,7 +10913,15 @@ impl<S: JitState> JitDriver<S> {
         };
         match step {
             FunctionEntryStep::RunCompiled(token) => self
-                .back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                .back_edge_resolved(
+                    cell_key,
+                    token,
+                    Some((green_values, green_types)),
+                    target_pc,
+                    state,
+                    env,
+                    || {},
+                )
                 .and_then(|resume| self.resume_pc_recycling(resume)),
             FunctionEntryStep::Proceed => {
                 if !state.can_trace() {
@@ -12872,6 +12893,19 @@ mod tests {
             ..Default::default()
         };
         let mut label_pre_ran = false;
+        struct UnregisterMutator;
+        impl Drop for UnregisterMutator {
+            fn drop(&mut self) {
+                majit_gc::shadow_stack::unregister_mutator();
+            }
+        }
+        let _mutator = if !majit_gc::shadow_stack::mutator_is_registered() {
+            majit_gc::shadow_stack::register_mutator();
+            Some(UnregisterMutator)
+        } else {
+            None
+        };
+        const LABEL_LIVE_REF: usize = 0xBEEF_0000;
         let label_outcome = driver.back_edge_internal(
             hash,
             None,
@@ -12880,7 +12914,7 @@ mod tests {
             &mut label_state,
             &(),
             None,
-            Some(vec![Value::Int(999)]),
+            Some(vec![Value::Int(999), Value::Ref(GcRef(LABEL_LIVE_REF))]),
             || label_pre_ran = true,
         );
         assert_eq!(label_outcome, None);
@@ -12893,6 +12927,16 @@ mod tests {
             SEEN_RED.load(std::sync::atomic::Ordering::Relaxed),
             3,
             "the hook sees portal reds, not LABEL-ordered direct_live_values"
+        );
+        let mut label_ref_still_rooted = false;
+        majit_gc::shadow_stack::walk_my_extra_areas(|root| {
+            if root.0 == LABEL_LIVE_REF {
+                label_ref_still_rooted = true;
+            }
+        });
+        assert!(
+            !label_ref_still_rooted,
+            "confirm extra-area drops before direct_live_values is consumed"
         );
     }
 
@@ -12941,6 +12985,40 @@ mod tests {
         );
         assert!(even_pre_ran);
         assert_eq!(SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed), x);
+        assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 4);
+
+        // function_entry_internal forwards live greens into back_edge_resolved
+        // (`warmstate.py maybe_compile_and_run` *args), not cell.current_greens().
+        let token = driver
+            .runnable_procedure_token(hash)
+            .expect("the compiled cell still has a procedure token");
+        let live_green = [x.wrapping_neg()];
+        SEEN_GREEN.store(0, std::sync::atomic::Ordering::Relaxed);
+        SEEN_RED.store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut fe_state = TypedRestoreState {
+            live_values: vec![4],
+            ..Default::default()
+        };
+        let mut fe_pre_ran = false;
+        let fe_outcome = driver.back_edge_resolved(
+            hash,
+            token,
+            Some((&live_green, &[GreenType::Int])),
+            19,
+            &mut fe_state,
+            &(),
+            || fe_pre_ran = true,
+        );
+        assert!(
+            fe_outcome.is_some(),
+            "function-entry live greens reach compiled entry through back_edge_resolved"
+        );
+        assert!(fe_pre_ran);
+        assert_eq!(
+            SEEN_GREEN.load(std::sync::atomic::Ordering::Relaxed),
+            live_green[0],
+            "the hook sees the live green bits, not the cell's stored word"
+        );
         assert_eq!(SEEN_RED.load(std::sync::atomic::Ordering::Relaxed), 4);
     }
 
@@ -13859,6 +13937,7 @@ mod tests {
         let result = driver.back_edge_resolved(
             key.get_uhash(),
             std::sync::Arc::clone(&token),
+            None,
             0,
             &mut state,
             &(),
@@ -16934,11 +17013,18 @@ mod tests {
 mod cross_loop_cut_close_tests {
     use super::*;
     use crate::test_greens::{gk, gk_with_uhash};
-    use majit_ir::{OpCode, OpRef};
+    use majit_ir::{GreenType, OpCode, OpRef};
 
     /// Greens the compiled inner loop is registered under.
-    fn inner_greens() -> (Vec<i64>, Vec<i64>, Vec<i64>) {
-        (vec![4242], vec![], vec![])
+    /// Matches `cut_close_driver` `_green_args_spec` / `gk_with_uhash`
+    /// (two Int greens). `merge_point_green_key` reads that spec first.
+    fn inner_greens() -> (Vec<i64>, Vec<i64>, Vec<i64>, Vec<GreenType>) {
+        (
+            vec![4242, 0],
+            vec![],
+            vec![],
+            vec![GreenType::Int, GreenType::Int],
+        )
     }
 
     /// A trace whose closing JUMP carries ONE int, matching the inner loop's
