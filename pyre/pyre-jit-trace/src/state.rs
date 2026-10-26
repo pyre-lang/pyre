@@ -9401,7 +9401,8 @@ fn reconstruct_inline_recipe(
     // (`load_local_value` / `stack_slot_reg_idx` /
     // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
     // by `locals_cells_stack_w` slot). Otherwise every live color is placed
-    // by the `pcdep_entries` color → slot inversion below.
+    // by the `pcdep_entries` color → slot inversion below, or declined
+    // as LiveRefColorUnmapped when a live color has no slot.
     if maps.pcdep_entries.is_empty() {
         crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
         return None;
@@ -9469,6 +9470,17 @@ fn reconstruct_inline_recipe(
         if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
             registers_r[s] = by_color_r[c];
             concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
+        }
+    }
+    // resume.py `_callback_r` writes every live register. The slot-indexed
+    // recipe banks have nowhere to put a color without a slot, so such a
+    // frame declines instead of dropping the value.
+    for &reg_idx in &reg_indices.ref_ {
+        let mapped = maps.pcdep_entries.iter().any(|&(bank, c, s)| {
+            bank == 1 && c as usize == reg_idx as usize && (s as usize) < valuestackdepth
+        });
+        if !mapped {
+            decline!("LiveRefColorUnmapped");
         }
     }
 
