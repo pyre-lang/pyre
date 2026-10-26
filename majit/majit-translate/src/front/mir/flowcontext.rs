@@ -3739,10 +3739,11 @@ impl<'a> Lowering<'a> {
                     );
                 }
                 // A `SwitchInt` on a one-word niche `Option` discriminant
-                // switches on the pointer null-test `ne(base, null)` — a
-                // `SomeBool`, not an `Int` tag.  RPython never switches on a
-                // bool: `None`/`Some` on a maybe-null `Ptr` is a True/False
-                // `If` (`ptr_nonzero`).  Route it through `set_branch` so the
+                // switches on a pointer null-test (`bool(p)` /
+                // `ne(base, null)`) — a `SomeBool`, not an `Int` tag.
+                // RPython never switches on a bool: `None`/`Some` on a
+                // maybe-null `Ptr` is a True/False `If` (`ptr_nonzero`).
+                // Route it through `set_branch` so the
                 // bool exitswitch closes with `ExitCase::Bool`, matching the
                 // `If` terminator path; a `SwitchInt` here would emit
                 // `ExitCase::Const(Int)`, which rtype rejects against the
@@ -4097,13 +4098,17 @@ impl<'a> Lowering<'a> {
     }
 
     /// Close a `SwitchInt` whose discriminant is a one-word niche `Option`
-    /// null-test (`ne(base, null)`, a `SomeBool`) as a True/False `If` via
-    /// [`FunctionGraph::set_branch`], so the bool exitswitch closes with
-    /// `ExitCase::Bool` instead of `ExitCase::Const(Int)`.  `Some` = tag 1 =
-    /// non-null → the `if_true` arm; `None` = tag 0 = null → the `if_false`
-    /// arm.  A two-variant match lowers to one explicit `(scalar, bb)` arm
-    /// plus a `default` covering the complementary tag, so whichever of {0,1}
-    /// is absent from `arms` is taken from `default` (the same 0/1/default
+    /// null-test as a True/False `If` via [`FunctionGraph::set_branch`], so
+    /// the bool exitswitch closes with `ExitCase::Bool` instead of
+    /// `ExitCase::Const(Int)`.  Every niche Discriminant is Some=1
+    /// (`bool(p)` / `ne` / `eq(is_none, false)`) at the value; `set_branch`
+    /// then peels a switch-only `eq(is_none, false)` (`flowcontext.py`
+    /// `FlowContext.not_` / `guessbool`) so the closed block switches on
+    /// `is_none` with swapped exits (`Some` = tag 1 passed as `if_true`,
+    /// then swapped).  `None` = tag 0 = null is the complementary arm.
+    /// A two-variant match lowers to one explicit `(scalar, bb)` arm plus a
+    /// `default` covering the complementary tag, so whichever of {0,1} is
+    /// absent from `arms` is taken from `default` (the same 0/1/default
     /// triage as [`crate::front::result_exc::split_diamond_exits`]); a
     /// both-explicit shape (`arms.len() == 2`, no live default) is tolerated.
     pub(in crate::front::mir) fn lower_niche_option_switch(
@@ -4146,14 +4151,16 @@ impl<'a> Lowering<'a> {
         }
         let some_bb = some_bb.expect("some arm resolved above");
         let none_bb = none_bb.expect("none arm resolved above");
-        let true_args = self.edge_args(mir_bb, some_bb as usize)?;
-        let false_args = self.edge_args(mir_bb, none_bb as usize)?;
+        // Discriminant value is Some=1 (`bool(p)` / `ne` / `eq(is_none, false)`).
+        let (true_bb, false_bb) = (some_bb, none_bb);
+        let true_args = self.edge_args(mir_bb, true_bb as usize)?;
+        let false_args = self.edge_args(mir_bb, false_bb as usize)?;
         self.graph.set_branch(
             bb_id,
             discr_var,
-            self.block_id[some_bb as usize],
+            self.block_id[true_bb as usize],
             true_args,
-            self.block_id[none_bb as usize],
+            self.block_id[false_bb as usize],
             false_args,
         );
         Ok(())

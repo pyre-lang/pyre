@@ -5935,10 +5935,10 @@ unsafe fn fbw_bind_star_kwargs(
     let dstrategy = unsafe { (*(kwargs as *const pyre_object::W_DictObject)).dstrategy };
     if !std::ptr::eq(
         dstrategy,
-        &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF,
+        pyre_object::dictmultiobject::unicode_dict_strategy_ref(),
     ) && !std::ptr::eq(
         dstrategy,
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
     ) {
         return None;
     }
@@ -5970,7 +5970,7 @@ unsafe fn fbw_bind_star_kwargs(
     let _ = roots.pin_root(kwargs);
     let lookup = if std::ptr::eq(
         dstrategy,
-        &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+        pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
     ) {
         pyre_object::kwargsdict::w_dict_lookup_or_null_kwargs_strategy
     } else {
@@ -10269,7 +10269,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[len_op, expected])?;
         let lookup = if std::ptr::eq(
             kw.strategy,
-            &pyre_object::kwargsdict::KWARGS_DICT_STRATEGY_REF,
+            pyre_object::kwargsdict::kwargs_dict_strategy_ref(),
         ) {
             crate::helpers::jit_dict_exact_kwargs_lookup_or_null as *const ()
         } else {
@@ -22462,7 +22462,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 // helper latch (`finish_helper_abort_latch`); a failed splice
                 // discarded the staged image and either kept executing or
                 // returned this leftover `TraceTooLong`.
-                Err(error @ DispatchError::TraceTooLong { .. }) => {
+                // `ABORT_FORCE_QUASIIMMUT` is the same unwind
+                // (`opimpl_jit_force_quasi_immutable`): splice ran in
+                // `prepare_force_quasi_immutable_abort`.
+                Err(error @ DispatchError::TraceTooLong { .. })
+                | Err(error @ DispatchError::ForceQuasiImmutable { .. }) => {
                     self.exchange.completed.clear();
                     while !self.frames.is_empty() {
                         let _ = self.pop_frame();
@@ -23960,7 +23964,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // register image is the resume coordinate, so do not mark the
             // abort as a callee-pc capability gap: that flag declines
             // single-frame adopt.
-            if !matches!(error, DispatchError::TraceTooLong { .. }) {
+            // `ABORT_FORCE_QUASIIMMUT` is the same unwind
+            // (`opimpl_jit_force_quasi_immutable`). A failed helper splice
+            // discarded the image so the enclosing Python CALL may latch
+            // (`mod2730`); the flag would decline that single-frame adopt.
+            if !matches!(
+                error,
+                DispatchError::TraceTooLong { .. } | DispatchError::ForceQuasiImmutable { .. }
+            ) {
                 ctx.session.borrow_mut().crossed_inline_subwalk = true;
             }
             if fbw_debug_abort_enabled() {

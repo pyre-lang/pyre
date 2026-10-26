@@ -393,6 +393,13 @@ pub struct StructFieldRegistry {
     /// GC header is absent, so a pointer to it stays an instance.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub(crate) raw_word_owners: std::collections::HashSet<String>,
+    /// `StructId`s whose declared `_gckind` is `Gc` (`GcType` impl,
+    /// field-0 fixpoint). Harvest inserts every spelling of those
+    /// owners (`note_declared_gc_owner`); a hand-built fixture is
+    /// empty, so a two-field `{integer, [T; 0]}` stays a Struct with
+    /// `_arrayfld` until a test seeds the declared fact.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub(crate) gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
     /// Crate roots of FunDecls that lowered a body and are not local
     /// alias roots. Intern and field lookup strip these prefixes
     /// (`bookkeeper.py` `getuniqueclassdef`). Owned by this harvested
@@ -800,6 +807,20 @@ impl StructFieldRegistry {
         }
         let key = self.unique_suffix_owner_key(owner)?;
         self.fields.get(key).map(Vec::as_slice)
+    }
+
+    /// Seed a declared-`Gc` identity from a harvested or fixture name.
+    /// Inserts the spelling and its leaf so annotation lookup from either
+    /// hits (`note_declared_gc_owner`).
+    #[cfg(test)]
+    pub(crate) fn note_declared_gc_name(&mut self, name: &str) {
+        self.gc_struct_ids
+            .insert(majit_ir::descr::StructId::from_canonical(name));
+        let leaf = name.rsplit("::").next().unwrap_or(name);
+        if leaf != name {
+            self.gc_struct_ids
+                .insert(majit_ir::descr::StructId::from_canonical(leaf));
+        }
     }
 
     /// Record a FunDecl crate root when that FunDecl has a body and the

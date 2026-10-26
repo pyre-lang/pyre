@@ -14311,6 +14311,23 @@ pub(in crate::front::mir) fn rows(spec: &[(&str, &str)]) -> Vec<crate::front::se
         .collect()
 }
 
+pub(in crate::front::mir) fn opaque_type_decl(def_id: u64, path: &[&str]) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": "Opaque"
+    })
+}
+
 pub(in crate::front::mir) fn code_struct(def_id: u64, path: &[&str]) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
@@ -18505,6 +18522,131 @@ fn empty_dict_get_empty_storage_production_recasts_gcref() {
     );
 }
 
+/// `std::ptr::null_mut::<TypedItemsBlock>()` of a declared two-field
+/// `{integer, [T; 0]}` GcArray is `lltype.nullptr(GcArray(ITEM))`:
+/// `cast_int_to_ptr(Ptr(GcArray(ITEM)), 0)` (`ann_cast_int_to_ptr`).
+/// Residual `ptr_null_constant` is a classdef-less Instance and must
+/// not remain; dest recast through `__cast_instance_intrinsic` is
+/// skipped when the Call dest already names that root.
+#[test]
+fn null_mut_of_typed_items_block_is_gcarray_nullptr() {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    let usize_ty = interior_usize();
+    let items = interior_array_zero(interior_u64());
+    let block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[("capacity", usize_ty), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let ptr = interior_raw_mut(interior_adt(0));
+    let caller = interior_caller(
+        "null_gcarray_ptr",
+        0,
+        vec![],
+        ptr.clone(),
+        vec![interior_local(0, None, &ptr)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &ptr), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let null_mut = interior_opaque(1, &["std", "ptr", "null_mut"], vec![], ptr);
+    let llbc = llbc_with_declared_gc("fixture", vec![block], vec![caller, null_mut], &[0]);
+    let graph = lower_interior(&llbc, "null_gcarray_ptr");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    let casts: Vec<_> = ops
+        .iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        casts.len(),
+        1,
+        "GcArray null_mut is one cast_int_to_ptr(PTRTYPE, 0); ops={ops:?}"
+    );
+    let OpKind::Call {
+        args, result_ty, ..
+    } = &casts[0].kind
+    else {
+        panic!("cast_int_to_ptr is a Call");
+    };
+    assert_eq!(args.len(), 2, "cast_int_to_ptr(PTRTYPE, 0); args={args:?}");
+    assert_eq!(
+        result_ty,
+        &crate::model::ValueType::Ref(None),
+        "GcArray Ptr getkind is ref; ops={ops:?}"
+    );
+    let LinkArg::Const(ptrt) = &args[0] else {
+        panic!("PtrT is the GcArray Ptr constant, got {:?}", args[0]);
+    };
+    let crate::flowspace::model::ConstValue::LowLevelType(ll) = &ptrt.value else {
+        panic!("PtrT.const is a LowLevelType, got {:?}", ptrt.value);
+    };
+    let LowLevelType::Ptr(ptr) = ll.as_ref() else {
+        panic!("PtrT.const is a Ptr, got {ll:?}");
+    };
+    let PtrTarget::Array(arr) = &ptr.TO else {
+        panic!("nullptr dest is GcArray, got {:?}", ptr.TO);
+    };
+    assert_eq!(arr._gckind, GcKind::Gc, "nullptr is GcArray, not raw Array");
+    assert_eq!(
+        arr.OF,
+        LowLevelType::Unsigned,
+        "TypedItemsBlock [u64; 0] ITEM follows scalar_lltype(u64), got {:?}",
+        arr.OF
+    );
+    match &args[1] {
+        LinkArg::Const(c) => assert_eq!(
+            c.value,
+            crate::flowspace::model::ConstValue::Int(0),
+            "oddint == 0 is nullptr"
+        ),
+        other => panic!("expected Const Int(0), got {other:?}"),
+    }
+    let null_var = casts[0]
+        .result
+        .as_ref()
+        .expect("cast_int_to_ptr produces a result");
+    assert!(
+        ops.iter()
+            .all(|op| crate::model::cast_instance_of(&op.kind, null_var).is_none()),
+        "GcArray nullptr must not be followed by __cast_instance_intrinsic; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().all(|op| {
+            !matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.as_slice()
+                    == ["core", "ptr", "null_mut"]
+                    || segments.as_slice() == ["std", "ptr", "null_mut"]
+                    || segments.as_slice() == ["core", "ptr", "null"]
+                    || segments.as_slice() == ["std", "ptr", "null"]
+            )
+        }),
+        "GcArray null_mut must not remain as ptr_null_constant; ops={ops:?}"
+    );
+}
+
 #[test]
 fn niche_option_raw_nominal_ptr_without_layout_is_null_test() {
     use crate::model::OpKind;
@@ -18904,6 +19046,845 @@ fn option_u8_window_discriminant_is_pointer_null_test() {
     }
 }
 
+fn option_ref_niche_fixture_types() -> (serde_json::Value, serde_json::Value, serde_json::Value) {
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let pointee = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [], "types": [],
+                "const_generics": [], "trait_refs": []
+            }
+        }
+    });
+    let payload = serde_json::json!({"Ref": ["Erased", pointee, "Shared"]});
+    let option_ty = option_adt_node(0, payload);
+    let pointee_struct = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "FrameDebugData"], false),
+        "kind": {"Struct": [
+            {"name": "w_locals", "ty": {"Scalar": {"Integer": {"Signed": "I64"}}}, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"transparent": false}
+            }
+        }]
+    });
+    (disc_ty, option_ty, pointee_struct)
+}
+
+/// `Rvalue::Discriminant` of a niche-optimized `Option<&T>` (sized
+/// pointee) is `is_(p, None)` (`rnone.py` `rtype_is_None`). A SwitchInt
+/// on that discriminant is `flowcontext.py FlowContext.not_` / `guessbool`:
+/// the closed block switches on `is_none` and `optimize_goto_if_not`
+/// fuses the hop to `goto_if_not_ptr_iszero`.
+#[test]
+fn option_ref_niche_discriminant_is_ptr_nonzero() {
+    use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+    use crate::model::{ExitCase, ExitSwitch, OpKind};
+
+    let (disc_ty, option_ty, pointee_struct) = option_ref_niche_fixture_types();
+    let opt_place = window_place(serde_json::json!({"Local": 1}), &option_ty);
+    let disc_place = window_place(serde_json::json!({"Local": 2}), &disc_ty);
+    let ret_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &ret_ty);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "option_ref_disc"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_ty.clone()],
+            "output": ret_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &ret_ty),
+                window_local(1, &option_ty),
+                window_local(2, &disc_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                ret_place.clone(),
+                                {"Use": [{"Const": [
+                                    {"Integer": {"Signed": ["I64", "99"]}},
+                                    ret_ty.clone()
+                                ]}, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                disc_place.clone(),
+                                {"Discriminant": opt_place.clone()}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": disc_place.clone()},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                            ],
+                            2
+                        ]}
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "1"]}},
+                                ret_ty.clone()
+                            ]}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "0"]}},
+                                ret_ty.clone()
+                            ]}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![option_enum(0), pointee_struct], vec![caller]);
+    let graph = super::lower_function(&llbc, "option_ref_disc")
+        .unwrap_or_else(|err| panic!("lower Discriminant: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+        "pointer-niche Discriminant is rnone.py rtype_is_None; graph={}",
+        graph.dump()
+    );
+    let is_none_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::BinOp { op: name, .. } if name == "is_" => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !is_none_ids.is_empty(),
+        "pointer-niche Discriminant is is_(p, None); graph={}",
+        graph.dump()
+    );
+    let false_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstBool(false) => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    let some_eq = ops.iter().any(|op| match &op.kind {
+        OpKind::BinOp {
+            op: name, lhs, rhs, ..
+        } => {
+            name == "eq"
+                && ((is_none_ids.contains(&lhs.id()) && false_ids.contains(&rhs.id()))
+                    || (is_none_ids.contains(&rhs.id()) && false_ids.contains(&lhs.id())))
+        }
+        _ => false,
+    });
+    assert!(
+        !some_eq,
+        "switch-only Discriminant must not keep eq(is_none, False); graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            .count(),
+        0,
+        "pointer-niche Discriminant must not read __discriminant; graph={}",
+        graph.dump()
+    );
+
+    // SwitchInt tag 1 = Some returns 1; tag 0 = None returns 0.
+    // `set_branch` peels `not_` (`flowcontext.py FlowContext.not_` /
+    // `guessbool`): the closed block switches on is_none, so Bool(true)
+    // is the None arm.
+    let mut saw_none_true = false;
+    for block in &graph.blocks {
+        let Some(ExitSwitch::Value(sw)) = &block.exitswitch else {
+            continue;
+        };
+        let switches_on_is_none = block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(sw)
+                && match &op.kind {
+                    OpKind::UnaryOp {
+                        op: name, operand, ..
+                    } => name == "bool" && is_none_ids.contains(&operand.id()),
+                    OpKind::BinOp { op: name, .. } if name == "is_" => {
+                        is_none_ids.contains(&sw.id())
+                    }
+                    _ => false,
+                }
+        });
+        if !switches_on_is_none {
+            continue;
+        }
+        for link in &block.exits {
+            match &link.exitcase {
+                Some(ExitCase::Bool(true)) => {
+                    let target = &graph.blocks[link.target.0];
+                    let returns_zero = target
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(0)));
+                    assert!(
+                        returns_zero,
+                        "is_none true must take the None arm (0); graph={}",
+                        graph.dump()
+                    );
+                    saw_none_true = true;
+                }
+                Some(ExitCase::Bool(false)) => {
+                    let target = &graph.blocks[link.target.0];
+                    let returns_one = target
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(1)));
+                    assert!(
+                        returns_one,
+                        "is_none false must take the Some arm (1); graph={}",
+                        graph.dump()
+                    );
+                }
+                other => {
+                    panic!("pointer-niche switch must close with ExitCase::Bool, got {other:?}")
+                }
+            }
+        }
+    }
+    assert!(
+        saw_none_true,
+        "expected a niche is_none switch block; graph={}",
+        graph.dump()
+    );
+
+    let config = GraphTransformConfig::default();
+    let transformed = Transformer::new(&config).transform(&graph);
+    // This fixture's pointee is a plain Struct, so `push_niche_is_some`
+    // uses int-bank `null_raw`. HEAD `rewrite_op` only folds `is_` to
+    // `ptr_iszero` when the other operand is Void `None` (`rnone.py`
+    // `rtype_is_None`); `get_w_locals` is that ConstNone path and is
+    // pinned by `const_none_niche_switch_fuses_ptr_iszero_without_residual`.
+    let leftover_eq = transformed.graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::BinOp { op, .. } if op == "eq" => true,
+            OpKind::ConstBool(false) => true,
+            _ => false,
+        })
+    });
+    assert!(
+        !leftover_eq,
+        "peeled switch must not keep eq(is_none, False); graph={}",
+        transformed.graph.dump()
+    );
+    let mut true_returns_zero = false;
+    for block in &transformed.graph.blocks {
+        let is_switch = matches!(
+            &block.exitswitch,
+            Some(ExitSwitch::Value(_)) | Some(ExitSwitch::Fused { .. })
+        );
+        if !is_switch {
+            continue;
+        }
+        true_returns_zero |= block.exits.iter().any(|link| {
+            link.exitcase == Some(ExitCase::Bool(true))
+                && transformed.graph.blocks[link.target.0]
+                    .operations
+                    .iter()
+                    .any(|op| matches!(&op.kind, OpKind::ConstInt(0)))
+        });
+    }
+    assert!(
+        true_returns_zero,
+        "is_none true is None=0; graph={}",
+        transformed.graph.dump()
+    );
+}
+
+/// `UnOp::Not` of a bool used as a branch condition is
+/// `flowcontext.py FlowContext.not_` / `guessbool`: switch on the
+/// un-negated bool with swapped exits and no negation op.
+#[test]
+fn not_of_bool_as_branch_switches_on_unnegated_with_swapped_exits() {
+    use crate::model::{ExitCase, ExitSwitch, OpKind};
+
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let ret_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let b_place = window_place(serde_json::json!({"Local": 1}), &bool_ty);
+    let not_place = window_place(serde_json::json!({"Local": 2}), &bool_ty);
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &ret_ty);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "not_bool_branch"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [bool_ty.clone()],
+            "output": ret_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &ret_ty),
+                window_local(1, &bool_ty),
+                window_local(2, &bool_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            not_place.clone(),
+                            {"UnaryOp": ["Not", {"Copy": b_place.clone()}]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": not_place.clone()},
+                        "targets": {"If": [1, 2]}
+                    }}}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "1"]}},
+                                ret_ty.clone()
+                            ]}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            ret_place.clone(),
+                            {"Use": [{"Const": [
+                                {"Integer": {"Signed": ["I64", "0"]}},
+                                ret_ty.clone()
+                            ]}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![], vec![caller]);
+    let graph = super::lower_function(&llbc, "not_bool_branch")
+        .unwrap_or_else(|err| panic!("lower Not-of-bool branch: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        !ops.iter().any(|op| match &op.kind {
+            OpKind::BinOp { op, .. } if op == "eq" => true,
+            OpKind::UnaryOp { op, .. } if op == "invert" || op == "not" || op == "bool_not" => {
+                true
+            }
+            OpKind::ConstBool(false) => true,
+            _ => false,
+        }),
+        "Not-of-bool as branch must emit no negation op; graph={}",
+        graph.dump()
+    );
+    let mut saw_swapped = false;
+    for block in &graph.blocks {
+        let Some(ExitSwitch::Value(_)) = &block.exitswitch else {
+            continue;
+        };
+        let mut true_returns_zero = false;
+        let mut false_returns_one = false;
+        for link in &block.exits {
+            match &link.exitcase {
+                Some(ExitCase::Bool(true)) => {
+                    true_returns_zero = graph.blocks[link.target.0]
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(0)));
+                }
+                Some(ExitCase::Bool(false)) => {
+                    false_returns_one = graph.blocks[link.target.0]
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(1)));
+                }
+                other => panic!("Not-of-bool branch must close with ExitCase::Bool, got {other:?}"),
+            }
+        }
+        if true_returns_zero && false_returns_one {
+            saw_swapped = true;
+        }
+    }
+    assert!(
+        saw_swapped,
+        "Not-of-bool as branch switches on the un-negated bool with swapped exits; graph={}",
+        graph.dump()
+    );
+}
+
+/// `invert` of an Int is `rint.py rtype_invert` (`~x`), not
+/// `flowcontext.py FlowContext.not_`. `set_branch` keeps the op and
+/// the exit order.
+#[test]
+fn invert_of_int_as_branch_keeps_op_and_exit_order() {
+    use crate::model::{ExitCase, ExitSwitch, FunctionGraph, OpKind, ValueType};
+
+    let mut g = FunctionGraph::new("invert_int_branch");
+    let n = g.startblock;
+    let x = g
+        .push_op_var(
+            n,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    let inv = g
+        .push_op_var(
+            n,
+            OpKind::UnaryOp {
+                op: "invert".into(),
+                operand: x,
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .unwrap();
+    let (if_true, _) = g.create_block_with_arg_vars(0);
+    g.push_op_var(if_true, OpKind::ConstInt(1), true)
+        .expect("ConstInt 1");
+    g.set_return(if_true, None);
+    let (if_false, _) = g.create_block_with_arg_vars(0);
+    g.push_op_var(if_false, OpKind::ConstInt(0), true)
+        .expect("ConstInt 0");
+    g.set_return(if_false, None);
+    g.set_branch(n, inv, if_true, Vec::new(), if_false, Vec::new());
+
+    let kept_invert = g.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "invert"
+            )
+        })
+    });
+    assert!(kept_invert, "invert of Int must remain; graph={}", g.dump());
+    let mut true_returns_one = false;
+    let mut false_returns_zero = false;
+    for block in &g.blocks {
+        let Some(ExitSwitch::Value(_)) = &block.exitswitch else {
+            continue;
+        };
+        for link in &block.exits {
+            match &link.exitcase {
+                Some(ExitCase::Bool(true)) => {
+                    true_returns_one = g.blocks[link.target.0]
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(1)));
+                }
+                Some(ExitCase::Bool(false)) => {
+                    false_returns_zero = g.blocks[link.target.0]
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(0)));
+                }
+                other => panic!("invert-int branch must close with ExitCase::Bool, got {other:?}"),
+            }
+        }
+    }
+    assert!(
+        true_returns_one && false_returns_zero,
+        "invert of Int must keep exit order; graph={}",
+        g.dump()
+    );
+}
+
+/// `eq(int, ConstBool(false))` is not a bool negation
+/// (`flowcontext.py FlowContext.not_`). `set_branch` does not peel it.
+#[test]
+fn eq_int_const_bool_false_as_branch_is_not_peeled() {
+    use crate::model::{ExitCase, ExitSwitch, FunctionGraph, OpKind, ValueType};
+
+    let mut g = FunctionGraph::new("eq_int_false_branch");
+    let n = g.startblock;
+    let x = g
+        .push_op_var(
+            n,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    let false_var = g.push_op_var(n, OpKind::ConstBool(false), true).unwrap();
+    let eq = g
+        .push_op_var(
+            n,
+            OpKind::BinOp {
+                op: "eq".into(),
+                lhs: x,
+                rhs: false_var,
+                result_ty: ValueType::Int,
+            },
+            true,
+        )
+        .unwrap();
+    let (if_true, _) = g.create_block_with_arg_vars(0);
+    g.push_op_var(if_true, OpKind::ConstInt(1), true)
+        .expect("ConstInt 1");
+    g.set_return(if_true, None);
+    let (if_false, _) = g.create_block_with_arg_vars(0);
+    g.push_op_var(if_false, OpKind::ConstInt(0), true)
+        .expect("ConstInt 0");
+    g.set_return(if_false, None);
+    g.set_branch(n, eq, if_true, Vec::new(), if_false, Vec::new());
+
+    let kept_eq = g.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "eq"))
+    });
+    let kept_false = g.blocks.iter().any(|block| {
+        block
+            .operations
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::ConstBool(false)))
+    });
+    assert!(
+        kept_eq && kept_false,
+        "eq(int, ConstBool(false)) must remain; graph={}",
+        g.dump()
+    );
+    let mut true_returns_one = false;
+    let mut false_returns_zero = false;
+    for block in &g.blocks {
+        let Some(ExitSwitch::Value(_)) = &block.exitswitch else {
+            continue;
+        };
+        for link in &block.exits {
+            match &link.exitcase {
+                Some(ExitCase::Bool(true)) => {
+                    true_returns_one = g.blocks[link.target.0]
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(1)));
+                }
+                Some(ExitCase::Bool(false)) => {
+                    false_returns_zero = g.blocks[link.target.0]
+                        .operations
+                        .iter()
+                        .any(|op| matches!(&op.kind, OpKind::ConstInt(0)));
+                }
+                other => {
+                    panic!("eq-int-false branch must close with ExitCase::Bool, got {other:?}")
+                }
+            }
+        }
+    }
+    assert!(
+        true_returns_one && false_returns_zero,
+        "eq(int, ConstBool(false)) must keep exit order; graph={}",
+        g.dump()
+    );
+}
+
+/// Instance-pointer `is_(p, ConstNone)` as a branch (`rnone.py`
+/// `rtype_is_None`) is the `get_w_locals` shape. `set_branch` peels
+/// `eq(is_none, False)` (`flowcontext.py FlowContext.not_` / `guessbool`);
+/// jtransform then fuses `ptr_iszero` with no residual value op.
+#[test]
+fn const_none_niche_switch_fuses_ptr_iszero_without_residual() {
+    use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+    use crate::model::{ExitCase, ExitSwitch, FunctionGraph, OpKind, ValueType};
+
+    let mut g = FunctionGraph::new("const_none_niche_switch");
+    let n = g.startblock;
+    let opt = g
+        .push_op_var(
+            n,
+            OpKind::Input {
+                name: "opt".into(),
+                ty: ValueType::Ref(Some("FrameDebugData".into())),
+                class_root: Some("FrameDebugData".into()),
+            },
+            true,
+        )
+        .unwrap();
+    let disc = g.alloc_value_var();
+    g.push_niche_is_some(n, opt.clone(), None, None, disc.clone());
+    let (some_t, _) = g.create_block_with_arg_vars(0);
+    g.push_op_var(some_t, OpKind::ConstInt(1), true)
+        .expect("ConstInt 1");
+    g.set_return(some_t, None);
+    let (none_t, _) = g.create_block_with_arg_vars(0);
+    g.push_op_var(none_t, OpKind::ConstInt(0), true)
+        .expect("ConstInt 0");
+    g.set_return(none_t, None);
+    g.set_branch(n, disc, some_t, Vec::new(), none_t, Vec::new());
+
+    let ops: Vec<&crate::model::SpaceOperation> = g
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter().any(|op| matches!(&op.kind, OpKind::ConstNone)),
+        "instance-pointer None is ConstNone; graph={}",
+        g.dump()
+    );
+    assert!(
+        !ops.iter().any(|op| match &op.kind {
+            OpKind::BinOp { op, .. } if op == "eq" => true,
+            OpKind::ConstBool(false) => true,
+            _ => false,
+        }),
+        "switch-only not_ must drop eq(is_none, False); graph={}",
+        g.dump()
+    );
+
+    let config = GraphTransformConfig::default();
+    let transformed = Transformer::new(&config).transform(&g);
+    let fused = transformed
+        .graph
+        .blocks
+        .iter()
+        .find_map(|block| match &block.exitswitch {
+            Some(ExitSwitch::Fused { opname, args })
+                if opname == "ptr_iszero" || opname == "ptr_nonzero" =>
+            {
+                Some((opname.as_str(), args.clone(), block))
+            }
+            _ => None,
+        });
+    let Some((opname, args, block)) = fused else {
+        panic!(
+            "jtransform must fuse is_(p, ConstNone) to ptr_iszero / ptr_nonzero; graph={}",
+            transformed.graph.dump()
+        );
+    };
+    assert_eq!(
+        args.len(),
+        1,
+        "{opname} takes the pointer; graph={}",
+        transformed.graph.dump()
+    );
+    assert_eq!(
+        args[0],
+        opt,
+        "{opname} operand is the option pointer; graph={}",
+        transformed.graph.dump()
+    );
+    let residual_ptr_iszero = transformed.graph.blocks.iter().any(|b| {
+        b.operations
+            .iter()
+            .any(|op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "ptr_iszero"))
+    });
+    assert!(
+        !residual_ptr_iszero,
+        "{opname} must not leave a residual ptr_iszero value op; graph={}",
+        transformed.graph.dump()
+    );
+    let true_returns_zero = block.exits.iter().any(|link| {
+        link.exitcase == Some(ExitCase::Bool(true))
+            && transformed.graph.blocks[link.target.0]
+                .operations
+                .iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(0)))
+    });
+    assert!(
+        true_returns_zero,
+        "{opname} true is None=0; graph={}",
+        transformed.graph.dump()
+    );
+}
+
+/// A pointer-niche Discriminant used by `Eq(d, 1)` (not a SwitchInt) keeps
+/// Some=1: the compared value is `eq(is_(p, null), False)`, so `d == 1`
+/// is the Some arm.
+#[test]
+fn option_ref_niche_discriminant_eq_one_is_some() {
+    use crate::model::OpKind;
+
+    let (disc_ty, option_ty, pointee_struct) = option_ref_niche_fixture_types();
+    let opt_place = window_place(serde_json::json!({"Local": 1}), &option_ty);
+    let disc_place = window_place(serde_json::json!({"Local": 2}), &disc_ty);
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let ret_place = window_place(serde_json::json!({"Local": 0}), &bool_ty);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "option_ref_disc_eq"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [option_ty.clone()],
+            "output": bool_ty.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &bool_ty),
+                window_local(1, &option_ty),
+                window_local(2, &disc_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                disc_place.clone(),
+                                {"Discriminant": opt_place.clone()}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                ret_place.clone(),
+                                {"BinaryOp": [
+                                    "Eq",
+                                    {"Copy": disc_place.clone()},
+                                    {"Const": [
+                                        {"Integer": {"Signed": ["Isize", "1"]}},
+                                        disc_ty.clone()
+                                    ]}
+                                ]}
+                            ]}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![option_enum(0), pointee_struct], vec![caller]);
+    let graph = super::lower_function(&llbc, "option_ref_disc_eq")
+        .unwrap_or_else(|err| panic!("lower Discriminant Eq: {err}"));
+    let ops: Vec<&crate::model::SpaceOperation> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_")),
+        "Eq(d, 1) Discriminant is rnone.py rtype_is_None; graph={}",
+        graph.dump()
+    );
+    let is_none_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::BinOp { op: name, .. } if name == "is_" => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    let false_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstBool(false) => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    let some_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } if name == "eq"
+                && ((is_none_ids.contains(&lhs.id()) && false_ids.contains(&rhs.id()))
+                    || (is_none_ids.contains(&rhs.id()) && false_ids.contains(&lhs.id()))) =>
+            {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !some_ids.is_empty(),
+        "Eq(d, 1) Discriminant Some=1 is eq(is_none, False); graph={}",
+        graph.dump()
+    );
+    let one_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::ConstInt(1) | OpKind::ConstUInt(1) => op.result.as_ref().map(|v| v.id()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !one_ids.is_empty(),
+        "Eq(d, 1) must materialise constant 1; graph={}",
+        graph.dump()
+    );
+    let eq_on_some_and_one = ops.iter().any(|op| match &op.kind {
+        OpKind::BinOp {
+            op: name, lhs, rhs, ..
+        } if name == "eq" => {
+            (some_ids.contains(&lhs.id()) && one_ids.contains(&rhs.id()))
+                || (some_ids.contains(&rhs.id()) && one_ids.contains(&lhs.id()))
+        }
+        _ => false,
+    });
+    assert!(
+        eq_on_some_and_one,
+        "Eq(d, 1) must compare Some=1 with 1; graph={}",
+        graph.dump()
+    );
+}
+
 /// `match opt { Some(w) => w, None => default }` over `Option<&[u8]>`
 /// (and Charon's `Option<[u8]>` spelling): the `Some` payload is the
 /// Option's window, not a tagged `Option<[u8]>::Some` instance.
@@ -19039,17 +20020,18 @@ fn option_u8_window_some_payload_is_the_window() {
             "{name}: Some arm must not emit cast_int_to_ptr; graph={}",
             graph.dump()
         );
-        // The niche `is_some` switch's true arm is `Some`. After the
-        // branch the data word is the successor's first inputarg
-        // (SSA-renamed `arg1`), not the startblock's `arg1_0`.
+        // The niche switch-only `not_` peels `eq(is_none, false)`:
+        // true is None (`is_none`), false is Some. After the branch the
+        // data word is the successor's first inputarg (SSA-renamed
+        // `arg1`), not the startblock's `arg1_0`.
         let start = graph.block(graph.startblock);
         let some_link = start
             .exits
             .iter()
-            .find(|link| link.exitcase == Some(ExitCase::Bool(true)))
+            .find(|link| link.exitcase == Some(ExitCase::Bool(false)))
             .unwrap_or_else(|| {
                 panic!(
-                    "{name}: Some is the true arm of the niche is_some switch; graph={}",
+                    "{name}: Some is the false arm of the niche is_none switch; graph={}",
                     graph.dump()
                 )
             });
@@ -20302,10 +21284,10 @@ fn niche_option_match_switch_closes_with_bool_exitcase() {
     let graph = crate::test_support::lower_function(llbc, "object_functionstr_type_name")
         .expect("lower object_functionstr_type_name");
 
-    // The niche match's Some-discriminant is `not (base is None)`. It is
-    // routed through the `If` path (`set_branch`), which may wrap the final
-    // bool in an idempotent `bool` UnaryOp. Locate switches on that final
-    // `eq(is_none, false)` value (or its wrapper).
+    // The niche match's discriminant is `p is None` (`is_(p, ConstNone)`).
+    // Routed through the `If` path (`set_branch`), which may wrap the final
+    // bool in an idempotent `bool` UnaryOp. Locate switches on that `is_`
+    // value (or its wrapper).
     let is_result_ids: std::collections::HashSet<u64> = graph
         .blocks
         .iter()
@@ -20315,34 +21297,18 @@ fn niche_option_match_switch_closes_with_bool_exitcase() {
             _ => None,
         })
         .collect();
-    let some_result_ids: std::collections::HashSet<u64> = graph
-        .blocks
-        .iter()
-        .flat_map(|b| b.operations.iter())
-        .filter_map(|op| match &op.kind {
-            OpKind::BinOp { op: name, lhs, .. }
-                if name == "eq" && is_result_ids.contains(&lhs.id()) =>
-            {
-                op.result.as_ref().map(|v| v.id())
-            }
-            _ => None,
-        })
-        .collect();
     let mut checked = 0usize;
     for b in &graph.blocks {
         let Some(ExitSwitch::Value(sw)) = &b.exitswitch else {
             continue;
         };
-        // The exitswitch is a `bool(ne)` wrap (set_branch) or the raw `ne`.
         let switches_on_nulltest = b.operations.iter().any(|op| {
             op.result.as_ref() == Some(sw)
                 && match &op.kind {
-                    OpKind::BinOp { op: name, lhs, .. } => {
-                        name == "eq" && is_result_ids.contains(&lhs.id())
-                    }
+                    OpKind::BinOp { op: name, .. } => name == "is_",
                     OpKind::UnaryOp {
                         op: name, operand, ..
-                    } => name == "bool" && some_result_ids.contains(&operand.id()),
+                    } => name == "bool" && is_result_ids.contains(&operand.id()),
                     _ => false,
                 }
         });
@@ -28720,10 +29686,11 @@ pub(in crate::front::mir) enum OptionRecvRepr {
     Aggregate,
 }
 
-/// Pointer niche rtypes `is_` to `ptr_nonzero` (`rnone.py`
-/// `rtype_is_None` / `CanBeNull.rtype_bool`). Scalar niche rtypes
-/// `ne` 0 to `int_is_true` (`rint.py` `IntegerRepr.rtype_bool`).
-/// Aggregate keeps `__discriminant` and `Some.__pos_0`.
+/// Pointer niche rtypes `is_` (`rnone.py` `rtype_is_None`). A switch
+/// peels `eq(is_none, false)` (`flowcontext.py FlowContext.not_` /
+/// `guessbool`) to `ptr_iszero`. Scalar niche rtypes `ne` 0 to
+/// `int_is_true` (`rint.py` `IntegerRepr.rtype_bool`). Aggregate keeps
+/// `__discriminant` and `Some.__pos_0`.
 pub(in crate::front::mir) fn assert_option_recv_repr(
     graph: &FunctionGraph,
     repr: OptionRecvRepr,
@@ -29039,8 +30006,19 @@ fn check_option_filter_repr(repr: OptionRecvRepr) {
         }
     }
 
-    let some = bool_exit_target(&graph, start, true);
-    let none = bool_exit_target(&graph, start, false);
+    // Pointer niche: `set_branch` peels `eq(is_none, false)`
+    // (`flowcontext.py FlowContext.not_` / `guessbool`), so Bool(true)
+    // is None. Scalar `ne` 0 and aggregate `__discriminant` stay Some=1.
+    let (some, none) = match repr {
+        OptionRecvRepr::PointerNiche => (
+            bool_exit_target(&graph, start, false),
+            bool_exit_target(&graph, start, true),
+        ),
+        _ => (
+            bool_exit_target(&graph, start, true),
+            bool_exit_target(&graph, start, false),
+        ),
+    };
     assert_eq!(
         graph.blocks[some.0].exits.len(),
         2,
@@ -29449,6 +30427,10 @@ pub(in crate::front::mir) fn interior_usize() -> serde_json::Value {
 
 fn interior_u32() -> serde_json::Value {
     serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}})
+}
+
+fn interior_u8() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
 }
 
 fn interior_adt(id: u64) -> serde_json::Value {
@@ -32386,6 +33368,90 @@ fn items_base_call<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a SpaceOperati
     })
 }
 
+fn typed_items_base_call<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a SpaceOperation> {
+    ops.iter().copied().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("typed_items_block_items_base")
+        )
+    })
+}
+
+/// `typed_items_block_items_base` on a scalar `_arrayfld` GcArray is
+/// `ll_fixed_items`: the call is dropped and the operand flows onward.
+#[test]
+fn typed_items_block_items_base_on_a_gcarray_is_the_operand() {
+    let usize_ty = interior_usize();
+    let items = interior_array_zero(interior_u64());
+    let block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[("capacity", usize_ty), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let block_ptr = interior_raw_mut(interior_adt(0));
+    let u8_ptr = mut_u8_ty_json();
+    let caller = interior_caller(
+        "call_typed_items_base",
+        1,
+        vec![block_ptr.clone()],
+        u8_ptr.clone(),
+        vec![
+            interior_local(0, None, &u8_ptr),
+            interior_local(1, Some("block"), &block_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &block_ptr))],
+                    interior_place(0, &u8_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let callee = interior_opaque(
+        1,
+        &[
+            "majit_rlib",
+            "lltypesystem",
+            "rlist",
+            "typed_items_block_items_base",
+        ],
+        vec![block_ptr],
+        u8_ptr,
+    );
+    let llbc = llbc_with_declared_gc("fixture", vec![block], vec![caller, callee], &[0]);
+    let graph = lower_interior(&llbc, "call_typed_items_base");
+    let ops = graph_ops(&graph);
+    assert!(
+        typed_items_base_call(&ops).is_none(),
+        "scalar GcArray typed_items_block_items_base must be dropped; ops={ops:?}"
+    );
+    let input = ops
+        .iter()
+        .find_map(|op| match (&op.result, &op.kind) {
+            (Some(result), OpKind::Input { .. }) => Some(result),
+            _ => None,
+        })
+        .expect("caller has an Input");
+    assert!(
+        link_carries(&graph, input),
+        "the GcArray operand itself must flow onward; graph={}",
+        graph.dump()
+    );
+}
+
 /// `items_block_items_base` on a fixed-list GcArray is `ll_fixed_items`:
 /// the call is dropped and the operand flows onward. The same callee
 /// on an `ItemsBlock` header stays a call.
@@ -32542,6 +33608,479 @@ fn items_block_capacity_on_a_fixed_list_is_arraylen() {
     }
 }
 
+fn interior_u64() -> serde_json::Value {
+    serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}})
+}
+
+fn interior_array_zero(elem: serde_json::Value) -> serde_json::Value {
+    let array_len = serde_json::json!([
+        {"Integer": {"Unsigned": ["Usize", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    serde_json::json!({"Array": [elem, array_len, null]})
+}
+
+fn llbc_with_declared_gc(
+    crate_name: &str,
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    gc_self_ids: &[u64],
+) -> Llbc {
+    let trait_impls = gc_self_ids.iter().copied().map(gctype_impl_row).collect();
+    llbc_with_types_traits(
+        crate_name,
+        types,
+        funs,
+        vec![gctype_trait_decl()],
+        trait_impls,
+    )
+}
+
+/// `(*block).capacity` of a `{usize, [T; 0]}` GcArray body is
+/// `ll_fixed_length` / `arraylen_gc`, not `getattr` of a named header.
+fn typed_items_block_header_llbc() -> Llbc {
+    let usize_ty = interior_usize();
+    let items = interior_array_zero(interior_u64());
+    let block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[("capacity", usize_ty.clone()), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let block_ty = interior_adt(0);
+    let block_ptr = interior_raw_mut(block_ty.clone());
+    let caller = interior_caller(
+        "read_typed_items_block_capacity",
+        1,
+        vec![block_ptr.clone()],
+        usize_ty.clone(),
+        vec![
+            interior_local(0, None, &usize_ty),
+            interior_local(1, Some("block"), &block_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &usize_ty),
+                interior_use(interior_field(1, &block_ptr, &block_ty, &usize_ty, 0)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc("fixture", vec![block], vec![caller], &[0])
+}
+
+#[test]
+fn typed_items_block_header_read_is_arraylen() {
+    let llbc = typed_items_block_header_llbc();
+    let graph = lower_interior(&llbc, "read_typed_items_block_capacity");
+    let ops = graph_ops(&graph);
+    let len = ops.iter().copied().find(|op| {
+        matches!(
+            &op.kind,
+            OpKind::ArrayLen {
+                array_type_id: Some(id),
+                nolength: false,
+                ..
+            } if id == super::LIST_INT_ITEMS_ARRAY
+        )
+    });
+    assert!(
+        len.is_some(),
+        "offset-0 usize before [T; 0] must be ArrayLen(GcArray<i64>); ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::FieldRead { .. })),
+        "the length header must not stay a FieldRead; ops={ops:?}"
+    );
+}
+
+fn typed_items_block_header_write_llbc() -> Llbc {
+    let usize_ty = interior_usize();
+    let items = interior_array_zero(interior_u64());
+    let block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[("capacity", usize_ty.clone()), ("items", items)],
+        8,
+        &[0, 8],
+        false,
+    );
+    let block_ty = interior_adt(0);
+    let block_ptr = interior_raw_mut(block_ty.clone());
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "write_typed_items_block_capacity",
+        2,
+        vec![block_ptr.clone(), usize_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("block"), &block_ptr),
+            interior_local(2, Some("n"), &usize_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &block_ptr, &block_ty, &usize_ty, 0),
+                interior_use(interior_place(2, &usize_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_declared_gc("fixture", vec![block], vec![caller], &[0])
+}
+
+#[test]
+fn typed_items_block_header_write_is_unsupported() {
+    let llbc = typed_items_block_header_write_llbc();
+    let err = super::lower_function(&llbc, "write_typed_items_block_capacity")
+        .expect_err("GcArray length header write must be reported");
+    match err {
+        super::LowerError::Unsupported(msg) => {
+            assert!(
+                msg.contains("GcArray length header"),
+                "expected length-header write report, got {msg}"
+            );
+        }
+        other => panic!("expected Unsupported, got {other:?}"),
+    }
+}
+
+/// `{hash, length, chars:[u8;0]}` — a GcStruct with `_arrayfld`, not
+/// the two-field GcArray wrapper. Offset 0 is a prefix field.
+fn hashed_chars_block() -> serde_json::Value {
+    let hash_ty = interior_i64();
+    let len_ty = interior_usize();
+    let chars = interior_array_zero(interior_u8());
+    interior_struct(
+        0,
+        &["storage", "HashedChars"],
+        &[("hash", hash_ty), ("length", len_ty), ("chars", chars)],
+        16,
+        &[0, 8, 16],
+        false,
+    )
+}
+
+fn hashed_chars_offset0_read_llbc() -> Llbc {
+    let hash_ty = interior_i64();
+    let block = hashed_chars_block();
+    let block_ty = interior_adt(0);
+    let block_ptr = interior_raw_mut(block_ty.clone());
+    let caller = interior_caller(
+        "read_hashed_chars_hash",
+        1,
+        vec![block_ptr.clone()],
+        hash_ty.clone(),
+        vec![
+            interior_local(0, None, &hash_ty),
+            interior_local(1, Some("block"), &block_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &hash_ty),
+                interior_use(interior_field(1, &block_ptr, &block_ty, &hash_ty, 0)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_types("fixture", vec![block], vec![caller])
+}
+
+#[test]
+fn hashed_chars_offset0_read_is_field_read() {
+    let llbc = hashed_chars_offset0_read_llbc();
+    let graph = lower_interior(&llbc, "read_hashed_chars_hash");
+    let ops = graph_ops(&graph);
+    let field = ops
+        .iter()
+        .copied()
+        .find(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "hash"));
+    assert!(
+        field.is_some(),
+        "offset-0 prefix field of a three-field [T; 0] struct must stay FieldRead; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. })),
+        "offset-0 prefix field must not become ArrayLen; ops={ops:?}"
+    );
+}
+
+fn hashed_chars_offset0_write_llbc() -> Llbc {
+    let hash_ty = interior_i64();
+    let block = hashed_chars_block();
+    let block_ty = interior_adt(0);
+    let block_ptr = interior_raw_mut(block_ty.clone());
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "write_hashed_chars_hash",
+        2,
+        vec![block_ptr.clone(), hash_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("block"), &block_ptr),
+            interior_local(2, Some("h"), &hash_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &block_ptr, &block_ty, &hash_ty, 0),
+                interior_use(interior_place(2, &hash_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_types("fixture", vec![block], vec![caller])
+}
+
+#[test]
+fn hashed_chars_offset0_write_is_accepted() {
+    let llbc = hashed_chars_offset0_write_llbc();
+    let graph = lower_interior(&llbc, "write_hashed_chars_hash");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if field.name == "hash"
+        )),
+        "offset-0 prefix field write must be FieldWrite; ops={ops:?}"
+    );
+}
+
+/// Two-field `{u8, [T; 0]}` without a `GcType` impl is a Struct with
+/// `_arrayfld`, not `GcArray`. Offset 0 stays getattr / setattr.
+fn marker_tail_block() -> serde_json::Value {
+    let marker_ty = interior_u8();
+    let tail = interior_array_zero(interior_u64());
+    interior_struct(
+        0,
+        &["storage", "MarkerBuf"],
+        &[("marker", marker_ty), ("tail", tail)],
+        8,
+        &[0, 8],
+        false,
+    )
+}
+
+fn marker_tail_offset0_read_llbc() -> Llbc {
+    let marker_ty = interior_u8();
+    let block = marker_tail_block();
+    let block_ty = interior_adt(0);
+    let block_ptr = interior_raw_mut(block_ty.clone());
+    let caller = interior_caller(
+        "read_marker_buf_marker",
+        1,
+        vec![block_ptr.clone()],
+        marker_ty.clone(),
+        vec![
+            interior_local(0, None, &marker_ty),
+            interior_local(1, Some("block"), &block_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &marker_ty),
+                interior_use(interior_field(1, &block_ptr, &block_ty, &marker_ty, 0)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_types("fixture", vec![block], vec![caller])
+}
+
+#[test]
+fn undeclared_two_field_flexible_header_read_is_field_read() {
+    let llbc = marker_tail_offset0_read_llbc();
+    let graph = lower_interior(&llbc, "read_marker_buf_marker");
+    let ops = graph_ops(&graph);
+    let field = ops
+        .iter()
+        .copied()
+        .find(|op| matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "marker"));
+    assert!(
+        field.is_some(),
+        "offset-0 field of an undeclared two-field [T; 0] struct must stay FieldRead; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. })),
+        "undeclared two-field [T; 0] header must not become ArrayLen; ops={ops:?}"
+    );
+}
+
+fn marker_tail_offset0_write_llbc() -> Llbc {
+    let marker_ty = interior_u8();
+    let block = marker_tail_block();
+    let block_ty = interior_adt(0);
+    let block_ptr = interior_raw_mut(block_ty.clone());
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "write_marker_buf_marker",
+        2,
+        vec![block_ptr.clone(), marker_ty.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("block"), &block_ptr),
+            interior_local(2, Some("m"), &marker_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_field(1, &block_ptr, &block_ty, &marker_ty, 0),
+                interior_use(interior_place(2, &marker_ty)),
+            )],
+            interior_return(),
+        )],
+    );
+    llbc_with_types("fixture", vec![block], vec![caller])
+}
+
+#[test]
+fn undeclared_two_field_flexible_header_write_is_accepted() {
+    let llbc = marker_tail_offset0_write_llbc();
+    let graph = lower_interior(&llbc, "write_marker_buf_marker");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if field.name == "marker"
+        )),
+        "offset-0 field write of an undeclared two-field [T; 0] struct must be FieldWrite; ops={ops:?}"
+    );
+}
+
+fn str_layout_header_block() -> serde_json::Value {
+    let hash_ty = interior_i64();
+    let len_ty = interior_usize();
+    interior_struct(
+        0,
+        &["pyre_object", "lowlevel_string", "LowlevelStringHeader"],
+        &[("hash", hash_ty), ("length", len_ty)],
+        16,
+        &[0, 8],
+        false,
+    )
+}
+
+fn op_restores_str_ptr(op: &crate::model::SpaceOperation) -> bool {
+    use crate::model::{CallTarget, OpKind, ValueType};
+    match &op.kind {
+        OpKind::Call {
+            result_ty: ValueType::Str,
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
+                || segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+        }
+        _ => false,
+    }
+}
+
+/// `(*mut u8).cast::<STR>()` is dest-Str restore / `cast_int_to_ptr(Ptr(STR))`.
+/// Aliasing keeps CCHARP `Ptr(Array)` on a `SomeString` dest.
+#[test]
+fn raw_byte_ptr_identity_cast_to_str_layout_restores_str() {
+    let header = str_layout_header_block();
+    let header_ptr = interior_raw_mut(interior_adt(0));
+    let u8_ptr = interior_raw_mut(interior_u8());
+    let caller = interior_caller(
+        "cast_u8_to_header",
+        1,
+        vec![u8_ptr.clone()],
+        header_ptr.clone(),
+        vec![
+            interior_local(0, None, &header_ptr),
+            interior_local(1, Some("p"), &u8_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &u8_ptr))],
+                    interior_place(0, &header_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let cast = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "cast"],
+        vec![u8_ptr],
+        header_ptr,
+    );
+    let llbc = llbc_with_types("fixture", vec![header], vec![caller, cast]);
+    let graph = lower_interior(&llbc, "cast_u8_to_header");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().copied().any(op_restores_str_ptr),
+        "*mut u8 identity-cast onto an rstr STR layout must dest-Str restore or cast_int_to_ptr; ops={ops:?}"
+    );
+}
+
+/// `p as *mut STR` of a `*mut u8` is the same dest-Str / `cast_int_to_ptr`
+/// path as the identity-cast method.
+#[test]
+fn raw_byte_ptr_rvalue_cast_to_str_layout_restores_str() {
+    let header = str_layout_header_block();
+    let header_ptr = interior_raw_mut(interior_adt(0));
+    let u8_ptr = interior_raw_mut(interior_u8());
+    let caller = interior_caller(
+        "rvalue_u8_to_header",
+        1,
+        vec![u8_ptr.clone()],
+        header_ptr.clone(),
+        vec![
+            interior_local(0, None, &header_ptr),
+            interior_local(1, Some("p"), &u8_ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &header_ptr),
+                serde_json::json!({"Cast": [
+                    "RawPtr",
+                    {"Move": interior_place(1, &u8_ptr)},
+                    header_ptr.clone()
+                ]}),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![header], vec![caller]);
+    let graph = lower_interior(&llbc, "rvalue_u8_to_header");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().copied().any(op_restores_str_ptr),
+        "*mut u8 Rvalue::Cast onto an rstr STR layout must dest-Str restore or cast_int_to_ptr; ops={ops:?}"
+    );
+}
+
+#[test]
+fn float_array_block_item_is_float_via_as_slice_spelling() {
+    // Wrapper ITEM is the `as_slice` narrowing (`numeric_array_slice_view_owner`),
+    // not a published `[f64]` row on `FloatArray.block` (that row is
+    // `*mut TypedItemsBlock` → `SomePtr(GcArray(Signed))`).
+    assert_eq!(
+        super::numeric_array_slice_spelling("FloatArray"),
+        Some("[f64]")
+    );
+    assert_eq!(
+        super::numeric_array_slice_spelling("IntArray"),
+        Some("[i64]")
+    );
+    assert_eq!(
+        super::numeric_array_slice_spelling("pyre_object::float_array::FloatArray"),
+        Some("[f64]")
+    );
+}
+
 #[test]
 fn items_block_capacity_on_an_items_block_stays_a_call() {
     let llbc = items_capacity_operand_llbc(&["listobject", "W_ListObject"], "items");
@@ -32604,6 +34143,628 @@ fn float_array_slice_len_reads_logical_len() {
         !has_arraylen,
         "view length is ll_length, not ll_fixed_length; ops={ops:?}"
     );
+}
+
+/// `w_str_from_storage` reads `utf8_payload_bytes(value).len()`. That
+/// length is `rstr.py` `LLHelpers.ll_strlen` (`len(s.chars)` /
+/// getarraysize), not getattr `__len__` on a `PyObject` instance.
+#[test]
+fn w_str_from_storage_payload_len_is_strlen() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+
+    let graph = lower_object_fn("pyre_object::unicodeobject::w_str_from_storage");
+    let ops = graph_ops(&graph);
+    let inputs: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::Input {
+                name,
+                ty,
+                class_root,
+            } => Some((name.clone(), format!("{ty:?}"), class_root.clone())),
+            _ => None,
+        })
+        .collect();
+    let has_strlen = calls_leaf(&graph, "__strlen");
+    let has_arraylen = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }));
+    let has_len_call = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            segments.last().map(String::as_str) == Some("__len")
+                || segments.last().map(String::as_str) == Some("__len__")
+                || (segments.len() == 4
+                    && segments[0] == "core"
+                    && segments[1] == "slice"
+                    && segments[2] == "<Impl>"
+                    && segments[3] == "len")
+        }
+        _ => false,
+    });
+    let input_is_str = inputs.iter().any(|(_, ty, root)| {
+        ty.contains("Str")
+            || root
+                .as_deref()
+                .is_some_and(crate::front::mir::is_str_family_class_root)
+    });
+    assert!(
+        input_is_str,
+        "value: *mut UnicodeValueStorage must input as Str / str-family; inputs={inputs:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_strlen || has_arraylen,
+        "utf8_payload_bytes(value).len() must be __strlen/ArrayLen; inputs={inputs:?} graph={}",
+        graph.dump()
+    );
+    assert!(
+        !has_len_call,
+        "payload length must not residualize slice::len / object-list __len; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !calls_leaf(&graph, "__len"),
+        "STR payload length is ll_strlen, not object-list ll_length; graph={}",
+        graph.dump()
+    );
+    let has_dest_str_cast = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                result_ty: ValueType::Str,
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
+        )
+    });
+    assert!(
+        has_dest_str_cast,
+        "*mut→*const UnicodeValueStorage must dest-Str restore; graph={}",
+        graph.dump()
+    );
+}
+
+/// `utf8_payload_bytes(p).len()` of a str-family payload is
+/// `LLHelpers.ll_strlen`. The length annotates `SomeInteger`; it is not
+/// getattr `__len__` on a `PyObject` instance.
+#[test]
+fn str_family_payload_slice_len_annotates_someinteger() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::model::{CallTarget, OpKind};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ptr = serde_json::json!({"RawPtr": [utf8_adt.clone(), "Mut"]});
+    let shared = window_shared_slice();
+    let n = window_usize();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n.clone(), "attr_info": null},
+            {"name": "chars", "ty": window_slice(), "attr_info": null}
+        ]}
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let payload = window_opaque_fun(
+        1,
+        &["pyre_object", "unicodeobject", "utf8_payload_bytes"],
+        vec![serde_json::json!({"RawPtr": [utf8_adt.clone(), "Const"]})],
+        shared.clone(),
+    );
+    let slice_len = serde_json::json!({
+        "def_id": 2,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["slice", 0]},
+                {"Impl": {"kind": "InherentImplBlock"}},
+                {"Ident": ["len", 0]}
+            ],
+            "span": window_span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "signature": {"is_unsafe": true, "inputs": [shared.clone()], "output": n.clone()},
+        "body": "Opaque"
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "payload_len"], true),
+        "signature": {"is_unsafe": true, "inputs": [utf8_ptr.clone()], "output": n.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &n),
+                window_local(1, &utf8_ptr),
+                window_local(2, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ptr)}],
+                        "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                        "dest": window_place(serde_json::json!({"Local": 0}), &n)
+                    }, "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller, payload, slice_len]);
+    let graph =
+        super::lower_function(&llbc, "payload_len").expect("lower utf8_payload_bytes(p).len()");
+    let ops = graph_ops(&graph);
+    let has_strlen = calls_leaf(&graph, "__strlen");
+    let has_arraylen = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }));
+    let residual_slice_len = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            segments.len() == 4
+                && segments[0] == "core"
+                && segments[1] == "slice"
+                && segments[2] == "<Impl>"
+                && segments[3] == "len"
+        }
+        _ => false,
+    });
+    assert!(
+        has_strlen || has_arraylen,
+        "str-family payload .len() must be __strlen/ArrayLen; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !residual_slice_len,
+        "str-family payload .len() must not residualize slice::len; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !calls_leaf(&graph, "__len"),
+        "STR payload length is ll_strlen, not object-list ll_length; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted =
+        function_graph_to_flowspace(&graph, &registry).expect("lift utf8_payload_bytes(p).len()");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&graph, Some(&ann.bookkeeper))
+        .expect("typed Input ops must project to definite SomeValue cells");
+    assert!(
+        cells
+            .iter()
+            .any(|cell| matches!(cell, SomeValue::String(_))),
+        "Utf8Str Input must seed SomeString; cells={cells:?}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .expect("str-family payload length must annotate as string length");
+    let has_getattr_len = lifted.graph.borrow().iterblocks().iter().any(|block| {
+        block.borrow().operations.iter().any(|op| {
+            op.opname == "getattr"
+                && op.args.iter().any(|arg| match arg {
+                    crate::flowspace::model::Hlvalue::Constant(c) => {
+                        matches!(
+                            &c.value,
+                            crate::flowspace::model::ConstValue::ByteStr(bytes)
+                                if bytes.as_slice() == b"__len__"
+                        )
+                    }
+                    _ => false,
+                })
+        })
+    });
+    assert!(
+        !has_getattr_len,
+        "payload length must not getattr __len__; graph={}",
+        graph.dump()
+    );
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    assert!(
+        matches!(s_ret, SomeValue::Integer(_)),
+        "payload length must annotate as SomeInteger (`SomeString.len`), got {s_ret:?}"
+    );
+}
+
+/// Two-phase may seed `w_str_from_storage`'s Input as
+/// `SomeInstance(PyObject)`. The `*mut`→`*const` STR cast dest-Str
+/// restores, so `utf8_payload_bytes(p).len()` is still `ll_strlen`.
+#[test]
+fn str_family_payload_cast_len_annotates_someinteger_from_instance_input() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::classdesc::ClassDef;
+    use crate::annotator::model::{SomeInstance, SomeValue};
+    use crate::model::{CallTarget, OpKind, ValueType};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_mut = serde_json::json!({"RawPtr": [utf8_adt.clone(), "Mut"]});
+    let utf8_const = serde_json::json!({"RawPtr": [utf8_adt.clone(), "Const"]});
+    let shared = window_shared_slice();
+    let n = window_usize();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n.clone(), "attr_info": null},
+            {"name": "chars", "ty": window_slice(), "attr_info": null}
+        ]}
+    });
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let payload = window_opaque_fun(
+        1,
+        &["pyre_object", "unicodeobject", "utf8_payload_bytes"],
+        vec![utf8_const.clone()],
+        shared.clone(),
+    );
+    let slice_len = serde_json::json!({
+        "def_id": 2,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["slice", 0]},
+                {"Impl": {"kind": "InherentImplBlock"}},
+                {"Ident": ["len", 0]}
+            ],
+            "span": window_span(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "signature": {"is_unsafe": true, "inputs": [shared.clone()], "output": n.clone()},
+        "body": "Opaque"
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "payload_cast_len"], true),
+        "signature": {"is_unsafe": true, "inputs": [utf8_mut.clone()], "output": n.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &n),
+                window_local(1, &utf8_mut),
+                window_local(2, &utf8_const),
+                window_local(3, &shared)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &utf8_const),
+                            {"Cast": [
+                                "PtrToPtr",
+                                {"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_mut)},
+                                utf8_const.clone()
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &utf8_const)}],
+                        "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
+                        "dest": window_place(serde_json::json!({"Local": 0}), &n)
+                    }, "target": 3, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller, payload, slice_len]);
+    let graph = super::lower_function(&llbc, "payload_cast_len")
+        .expect("lower (*mut STR as *const).payload.len()");
+    let ops = graph_ops(&graph);
+    let has_strlen = calls_leaf(&graph, "__strlen");
+    let has_arraylen = ops
+        .iter()
+        .any(|op| matches!(&op.kind, OpKind::ArrayLen { .. }));
+    let has_dest_str_cast = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                result_ty: ValueType::Str,
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
+        )
+    });
+    assert!(
+        has_dest_str_cast,
+        "*mut→*const Utf8Str must dest-Str restore; graph={}",
+        graph.dump()
+    );
+    assert!(
+        has_strlen || has_arraylen,
+        "str-family payload .len() must be __strlen/ArrayLen; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !calls_leaf(&graph, "__len"),
+        "STR payload length is ll_strlen, not object-list ll_length; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry)
+        .expect("lift (*mut STR as *const).payload.len()");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let s_obj = SomeValue::Instance(SomeInstance::new(
+        Some(ClassDef::new_standalone("pyobject::PyObject", None)),
+        false,
+        Default::default(),
+    ));
+    let start = lifted.graph.borrow().startblock.clone();
+    ann.addpendingblock(&lifted.graph, &start, &[Some(s_obj)]);
+    ann.complete_pending_blocks().expect(
+        "str-family payload length must annotate as string length even when two-phase seeds PyObject",
+    );
+    let has_getattr_len = lifted.graph.borrow().iterblocks().iter().any(|block| {
+        block.borrow().operations.iter().any(|op| {
+            op.opname == "getattr"
+                && op.args.iter().any(|arg| match arg {
+                    crate::flowspace::model::Hlvalue::Constant(c) => {
+                        matches!(
+                            &c.value,
+                            crate::flowspace::model::ConstValue::ByteStr(bytes)
+                                if bytes.as_slice() == b"__len__"
+                        )
+                    }
+                    _ => false,
+                })
+        })
+    });
+    assert!(
+        !has_getattr_len,
+        "payload length must not getattr __len__ on a PyObject-seeded Input; graph={}",
+        graph.dump()
+    );
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    assert!(
+        matches!(s_ret, SomeValue::Integer(_)),
+        "payload length must annotate as SomeInteger (`SomeString.len`), got {s_ret:?}"
+    );
+}
+
+/// Object-list length stays `rlist.py` `ll_length` (the LIST.length
+/// field), not `ll_strlen` of a str-family payload.
+#[test]
+fn object_list_len_reads_list_length_field() {
+    use crate::model::OpKind;
+
+    let graph = lower_object_fn("pyre_object::listobject::w_list_len");
+    let ops = graph_ops(&graph);
+    let has_list_length = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "length"
+                    && !field.owner_root.as_deref().is_some_and(|root| {
+                        crate::front::mir::is_str_length_field_class_root(root)
+                            || crate::front::mir::is_str_family_class_root(root)
+                    })
+        )
+    });
+    let has_strlen = calls_leaf(&graph, "__strlen");
+    let has_live_len = ops.iter().any(|op| match &op.kind {
+        OpKind::Call {
+            target: crate::model::CallTarget::Method { name, .. },
+            ..
+        } => name == "live_len",
+        _ => false,
+    });
+    assert!(
+        has_list_length || calls_leaf(&graph, "__len") || has_live_len,
+        "w_list_len must read LIST.length / __len / live_len; graph={}",
+        graph.dump()
+    );
+    assert!(
+        !has_strlen,
+        "object-list length must not rewrite to __strlen; graph={}",
+        graph.dump()
+    );
+}
+
+/// Option-shaped getitem of a str-family pointer: Some returns the live
+/// STR, None is `null_mut()` of dest `*mut Utf8Str`. The merge is
+/// `unionof(SomeString, s_None)` → `SomeString(can_be_None=True)`
+/// (`annmodel.SomeString.noneify`); it must not raise UnionError.
+#[test]
+fn str_family_getitem_option_none_annotates_somestring_can_be_none() {
+    use crate::annotator::annrpython::RPythonAnnotator;
+    use crate::annotator::model::SomeValue;
+    use crate::model::{CallTarget, OpKind, ValueType};
+    use crate::translator::rtyper::call_registry::CallRegistry;
+    use crate::translator::rtyper::flowspace_adapter::{
+        derive_subject_inputcells, function_graph_to_flowspace,
+    };
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ptr = serde_json::json!({"RawPtr": [utf8_adt.clone(), "Mut"]});
+    let idx_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null},
+            {"name": "chars", "ty": window_slice(), "attr_info": null}
+        ]}
+    });
+    let unwind = serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": "UnwindResume"}
+    });
+    let ret = serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": "Return"}
+    });
+    let null_mut = window_opaque_fun(1, &["core", "ptr", "null_mut"], vec![], utf8_ptr.clone());
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "getitem"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [utf8_ptr.clone(), idx_ty.clone()],
+            "output": utf8_ptr.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &utf8_ptr),
+                window_local(1, &utf8_ptr),
+                window_local(2, &idx_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Switch": {
+                        "discr": {"Copy": window_place(serde_json::json!({"Local": 2}), &idx_ty)},
+                        "targets": {"SwitchInt": [
+                            null,
+                            [[{"Scalar": {"Signed": ["I64", "0"]}}, 2]],
+                            3
+                        ]}
+                    }}}
+                },
+                unwind,
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &utf8_ptr),
+                            {"Use": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ptr)}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [],
+                        "dest": window_place(serde_json::json!({"Local": 0}), &utf8_ptr)
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller, null_mut]);
+    let graph =
+        super::lower_function(&llbc, "getitem").expect("lower Option-shaped str-family getitem");
+    let ops = graph_ops(&graph);
+    let has_dest_str_cast = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                result_ty: ValueType::Str,
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE]
+        )
+    });
+    assert!(
+        has_dest_str_cast,
+        "null_mut of *mut Utf8Str must dest-Str restore; graph={}",
+        graph.dump()
+    );
+
+    let ann = RPythonAnnotator::new(None, None, None, false);
+    let registry = CallRegistry::new(ann.bookkeeper.clone());
+    let lifted = function_graph_to_flowspace(&graph, &registry)
+        .expect("lift Option-shaped str-family getitem");
+    crate::translator::simplify::simplify_graph(&lifted.graph.borrow(), None);
+    let cells = derive_subject_inputcells(&graph, Some(&ann.bookkeeper))
+        .expect("typed Input ops must project to definite SomeValue cells");
+    assert!(
+        cells
+            .iter()
+            .any(|cell| matches!(cell, SomeValue::String(_))),
+        "Utf8Str Input must seed SomeString; cells={cells:?}"
+    );
+    let start = lifted.graph.borrow().startblock.clone();
+    let opt_cells: Vec<Option<SomeValue>> = cells.into_iter().map(Some).collect();
+    ann.addpendingblock(&lifted.graph, &start, &opt_cells);
+    ann.complete_pending_blocks()
+        .expect("str-family getitem None arm must union as SomeString(can_be_None)");
+    let ret = lifted.graph.borrow().getreturnvar();
+    let s_ret = ann.binding(&ret);
+    match s_ret {
+        SomeValue::String(s) => assert!(
+            s.inner.can_be_none,
+            "getitem return must be SomeString(can_be_None=True); got {s:?}"
+        ),
+        other => panic!("getitem return must annotate as SomeString(can_be_None), got {other:?}"),
+    }
 }
 
 /// `[PyObject]` narrowing follows the ARRAY identity

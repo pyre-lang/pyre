@@ -68,7 +68,7 @@ const _: () = {
 #[cfg(test)]
 pub(crate) fn alloc_immortal_str(bytes: &[u8]) -> majit_ir::GcRef {
     let payload = STR_CHARS_OFFSET + bytes.len() + 1;
-    let ptr = majit_gc::header::alloc_varsize_with_gc_header_immortal(payload, 0);
+    let ptr = majit_gc::header::alloc_varsize_with_gc_header(payload, 0);
     assert!(!ptr.is_null());
     unsafe {
         (ptr as *mut isize).write(0);
@@ -107,7 +107,8 @@ pub(crate) unsafe fn free_immortal_str(llobj: majit_ir::GcRef, nbytes: usize) {
 /// When `majit_gc::lowlevel_str_type_id` is published and a nursery
 /// allocator is installed (`gc_allocator_installed` /
 /// `ACTIVE_ALLOC_NURSERY_TYPED`), the block is `alloc_nursery_typed`.
-/// No hook or `tid == 0` uses an immortal `init_gc_object_immortal` block.
+/// No hook or `tid == 0` uses a reclaimable `init_gc_object_immortal` block
+/// (`rstr.py` `mallocstr` is `malloc(STR, length)`, not a prebuilt).
 /// A hook that answers null is [`crate::rffi::MemoryError`].
 pub fn mallocstr(length: usize) -> Result<majit_ir::GcRef, crate::rffi::MemoryError> {
     let size = STR_CHARS_OFFSET
@@ -116,7 +117,7 @@ pub fn mallocstr(length: usize) -> Result<majit_ir::GcRef, crate::rffi::MemoryEr
         .ok_or(crate::rffi::MemoryError)?;
     let tid = majit_gc::lowlevel_str_type_id();
     let gcref = if tid == 0 || !majit_gc::gc_allocator_installed() {
-        let ptr = majit_gc::header::alloc_varsize_with_gc_header_immortal(size, tid);
+        let ptr = majit_gc::header::alloc_varsize_with_gc_header(size, tid);
         if ptr.is_null() {
             return Err(crate::rffi::MemoryError);
         }

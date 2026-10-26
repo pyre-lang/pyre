@@ -423,6 +423,33 @@ impl<'a> Lowering<'a> {
         )
     }
 
+    /// Length receiver whose annotation is rstr `STR` (`SomeString`),
+    /// not a GcArray / object list. `rstr.py` `LLHelpers.ll_strlen`
+    /// (`len(s.chars)` / getarraysize). Decides from the bound value and
+    /// the receiver's declared type, never a function or field name. A
+    /// shared `&[u8]` window is not this family on its own — that is a
+    /// byte view only when already bound as STR
+    /// (`string_byte_view_locals` / [`Self::var_is_str_repr`]).
+    pub(in crate::front::mir) fn var_is_str_family_len_receiver(
+        &self,
+        var: &Variable,
+        recv_ty: Option<&TyRef>,
+    ) -> bool {
+        if self.var_is_str_repr(var) || self.var_has_str_value_type(var) {
+            return true;
+        }
+        let Some(ty) = recv_ty else {
+            return false;
+        };
+        if tyref_is_string_value(ty, self.llbc)
+            || tyref_raw_ptr_pointee_is_string_value(ty, self.llbc)
+        {
+            return true;
+        }
+        tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves)
+            .is_some_and(|root| is_str_family_class_root(&root))
+    }
+
     pub(in crate::front::mir) fn rvalue_is_str_view_source(&self, rvalue: &Rvalue) -> bool {
         match rvalue {
             Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {

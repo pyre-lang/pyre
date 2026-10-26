@@ -699,23 +699,19 @@ fn link_arg_concrete_type(src: &LinkArg) -> ConcreteType {
     }
 }
 
-/// A raw `Ptr(Array)` (`CArrayPtr` / `CCHARP`) or `Ptr(FuncType)`
-/// (`lltype.FuncType` / `getfunctionptr`) is the stamped concretetype.
-/// `history.getkind` of both is `'int'`. A later kind-only commit
-/// (`Signed` from `somevalue_to_valuetype` of `Ptr(FuncType)`, or
-/// `GcRef` from a non-function `SomePtr`) must not replace it with
-/// the canonical scalar.
+/// A stamped raw `Ptr` (`CArrayPtr` / `CCHARP`, `Ptr(FuncType)`,
+/// `Ptr(Struct)` spill cell, `Ptr(Array(Char))` varsize cell) is the
+/// `ann_malloc` / `ann_cast_int_to_ptr` concretetype.
+/// `history.getkind` of a raw `Ptr` is `'int'`. A later kind-only
+/// commit (`Signed` from `infer_op_type` `RawMalloc`, or `GcRef` from
+/// `somevalue_to_valuetype` of a non-function `SomePtr`) must not
+/// replace it with the canonical scalar.
 fn commit_concretetype(var: &Variable, concrete: ConcreteType) {
     if var.concretetype().as_ref().is_some_and(|ty| {
         matches!(
             ty,
-            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr)
-                if matches!(
-                    ptr.TO,
-                    crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Array(_)
-                        | crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Func(_)
-                )
-        )
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_)
+        ) && crate::model::try_getkind(ty, true, true, true) == Ok(ConcreteType::Signed)
     }) {
         return;
     }
@@ -989,6 +985,53 @@ mod tests {
         assert!(
             matches!(ct, LowLevelType::Ptr(ref p) if matches!(p.TO, PtrTarget::Func(_))),
             "commit_concretetype must keep Ptr(FuncType), got {ct:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_types_keeps_raw_malloc_struct_ptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        // `ann_malloc` of the spill Struct is `SomePtr(Ptr(Tuple<i64>))`.
+        // `infer_op_type` RawMalloc overlays Signed (`getkind` of a raw
+        // Ptr). `commit_concretetype` must keep the stamped Ptr(Struct).
+        let spill = LowLevelType::Struct(Box::new(Struct::new(
+            "Tuple<i64>",
+            vec![("item0".to_string(), LowLevelType::Signed)],
+        )));
+        let expected = Ptr::from_container_type(spill.clone()).expect("spill Struct");
+        let mut graph = FunctionGraph::new("raw_malloc_struct_keep");
+        let entry = graph.startblock;
+        let v = graph
+            .push_op_var(
+                entry,
+                OpKind::raw_malloc_with_flags(
+                    "Tuple<i64>",
+                    Some(spill),
+                    false,
+                    true,
+                    false,
+                    Vec::new(),
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(v.clone()));
+
+        annotate::annotate(&graph);
+        resolve_types(&graph, &HashSet::new());
+        assert_eq!(FunctionGraph::concretetype_of(&v), ConcreteType::Signed);
+        let ct = v.concretetype().expect("raw malloc stamp kept");
+        assert!(
+            matches!(ct, LowLevelType::Ptr(ref p) if p.as_ref() == &expected),
+            "commit_concretetype must keep Ptr(Struct Tuple<i64>), got {ct:?}"
+        );
+        assert!(
+            matches!(ct, LowLevelType::Ptr(ref p) if matches!(p.TO, PtrTarget::Struct(_))),
+            "TO is the spill Struct, got {ct:?}"
         );
     }
 

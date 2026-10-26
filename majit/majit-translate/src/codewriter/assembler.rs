@@ -13,7 +13,7 @@
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 
-use crate::call::{CallControl, extract_element_type_from_str};
+use crate::call::{CallControl, array_type_id_of_lltype, extract_element_type_from_str};
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use majit_jitcode::jitcode::{LABEL_TARGET_MAX, push_label_placeholder, write_label_at};
 
@@ -6609,6 +6609,24 @@ fn interiorfield_bh_descr(
     crate::jitcode::BhDescr::from_interior_field_descr(ifd)
 }
 
+/// Pool spelling of `cpu.arraydescrof(ARRAY)`. `descr.py get_array_descr`
+/// keys one ARRAY; RPython has no second dump name. Stamp
+/// `array_type_id_of_lltype(ARRAY)` when the interned ARRAY is present
+/// (the same string `arraydescrof_concrete` hashed into `cache_key`).
+/// Dump-only mints still join `[i64]` / `GcArray<i64>` through
+/// `canonical_array_type_id`.
+fn bh_array_pool_type_id(
+    array: &Option<crate::translator::rtyper::lltypesystem::lltype::Array>,
+    dump: &Option<String>,
+) -> Option<String> {
+    if let Some(arr) = array {
+        Some(array_type_id_of_lltype(arr))
+    } else {
+        dump.as_ref()
+            .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned())
+    }
+}
+
 /// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
 ///
 /// Determines the full ArrayDescr shape from the array element type.
@@ -6659,12 +6677,12 @@ fn arraydescrof(
             // ei_index across the BhDescr boundary so make_descr_from_bh
             // republishes it on the runtime SimpleArrayDescr.
             ei_index: descr.get_ei_index(),
-            // `cpu.arraydescrof` keys one ARRAY. `[i64]` / `GcArray<i64>`
-            // (and the f64 pair) are that one lltype, so the pool string
-            // is the canonical spelling `get_array_descr` hashed.
-            array_type_id: array_type_id
-                .as_ref()
-                .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
+            // `cpu.arraydescrof` keys one ARRAY. Stamp
+            // `array_type_id_of_lltype(ARRAY)` — the same string
+            // `arraydescrof_concrete` hashed into `cache_key`
+            // (`descr.py get_array_descr`). RPython has no second dump
+            // name. Dump-only mints still join `[i64]` / `GcArray<i64>`.
+            array_type_id: bh_array_pool_type_id(array, array_type_id),
             interior_fields: super::jitcode::bh_interior_field_specs_from_array_descr(array_descr),
             is_gc_managed: array_descr.is_gc_managed(),
             // `descr.py get_array_descr` returns the cached descr for the
@@ -6673,8 +6691,8 @@ fn arraydescrof(
         };
     }
 
-    // Primary path: extract element type from the array type identity
-    // (our equivalent of `ARRAY.OF` in RPython).
+    // Primary path: extract element type from the interned ARRAY
+    // identity (our equivalent of `ARRAY.OF` in RPython), else the dump.
     //
     // `get_array_descr` keeps `get_type_flag`'s flag and, when OF is
     // SingleFloat or Float, sets `concrete_type = 'f'`.
@@ -6682,37 +6700,43 @@ fn arraydescrof(
     // `BhDescr::Array` has no `concrete_type` slot, so this fallback
     // records only the flag from `type_flag_from_str`: an `f32` element
     // is int-kind, unsigned, size 4 — the same shape as `u32`.
-    let (flag, item_type, itemsize) = if let Some(elem) = array_type_id
-        .as_deref()
-        .and_then(extract_element_type_from_str)
+    let pool_id = bh_array_pool_type_id(array, array_type_id);
+    let (flag, item_type, mut itemsize) =
+        if let Some(elem) = pool_id.as_deref().and_then(extract_element_type_from_str) {
+            type_flag_from_str(elem.as_str(), &std::collections::HashSet::new())
+        } else {
+            match ty {
+                crate::model::ValueType::Int => (
+                    majit_ir::descr::ArrayFlag::Signed,
+                    majit_ir::value::Type::Int,
+                    8,
+                ),
+                crate::model::ValueType::Float => (
+                    majit_ir::descr::ArrayFlag::Float,
+                    majit_ir::value::Type::Float,
+                    8,
+                ),
+                crate::model::ValueType::Ref(_) => (
+                    majit_ir::descr::ArrayFlag::Pointer,
+                    majit_ir::value::Type::Ref,
+                    // Pointer elements stride by the target word, not the
+                    // build host's.
+                    crate::layout::target_word_size(),
+                ),
+                _ => (
+                    majit_ir::descr::ArrayFlag::Unsigned,
+                    majit_ir::value::Type::Int,
+                    8,
+                ),
+            }
+        };
+    // `symbolic.get_array_token` itemsize is `sizeof(ARRAY.OF)` on the
+    // target (`descr.py get_array_descr`).
+    if let Some(arr) = array
+        && let Some(sz) = crate::call::array_item_size_of_lltype(&arr.OF)
     {
-        type_flag_from_str(elem.as_str(), &std::collections::HashSet::new())
-    } else {
-        match ty {
-            crate::model::ValueType::Int => (
-                majit_ir::descr::ArrayFlag::Signed,
-                majit_ir::value::Type::Int,
-                8,
-            ),
-            crate::model::ValueType::Float => (
-                majit_ir::descr::ArrayFlag::Float,
-                majit_ir::value::Type::Float,
-                8,
-            ),
-            crate::model::ValueType::Ref(_) => (
-                majit_ir::descr::ArrayFlag::Pointer,
-                majit_ir::value::Type::Ref,
-                // Pointer elements stride by the target word, not the
-                // build host's.
-                crate::layout::target_word_size(),
-            ),
-            _ => (
-                majit_ir::descr::ArrayFlag::Unsigned,
-                majit_ir::value::Type::Int,
-                8,
-            ),
-        }
-    };
+        itemsize = sz;
+    }
     // descr.py:354/359-362 + symbolic.get_array_token — basesize follows
     // the lltype's nolength flag: nolength → items at offset 0;
     // length-prefixed → items past the header at len_offset + WORD.
@@ -6741,11 +6765,8 @@ fn arraydescrof(
         // path that needs EffectInfo heap invalidation must pass CallControl
         // so `arraydescrof_for_type` can publish the real `ei_index`.
         ei_index: u32::MAX,
-        // Same canonical spelling as the CallControl path: `[i64]` and
-        // `GcArray<i64>` (and the f64 pair) are one ARRAY.
-        array_type_id: array_type_id
-            .as_ref()
-            .map(|id| crate::front::typestr::canonical_array_type_id(id).into_owned()),
+        // Same interned-ARRAY spelling as the CallControl path.
+        array_type_id: pool_id,
         interior_fields: Vec::new(),
         // Shape-only fallback is for GC arrays; the raw `pool_arrays`
         // base is minted only via `add_ptr_array_descr`.
@@ -7889,6 +7910,44 @@ mod tests {
             crate::jitcode::BhDescr::Array {
                 load_is_acquire, ..
             } => assert!(load_is_acquire),
+            other => panic!("arraydescrof must mint a BhDescr::Array, got {other:?}"),
+        }
+    }
+
+    /// `descr.py get_array_descr` keys one ARRAY. A dump alias of
+    /// `LIST_INT_ITEMS_ARRAY` on interned `GcArray(Unsigned)` must not
+    /// become the pool spelling: `cache_key` is
+    /// `path_hash(array_type_id_of_lltype(ARRAY))`.
+    #[test]
+    fn arraydescrof_stamps_interned_array_spelling_not_dump_alias() {
+        use crate::call::{CallControl, array_type_id_of_lltype};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        use majit_ir::descr::path_hash;
+        use majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
+
+        let cc = CallControl::new();
+        let dump = Some(LIST_INT_ITEMS_ARRAY.to_string());
+        let array = Array::gc(LowLevelType::Unsigned);
+        let interned = array_type_id_of_lltype(&array);
+        let descr = arraydescrof(
+            &crate::model::ValueType::Ref(None),
+            &dump,
+            &Some(array),
+            Some(0),
+            Some(&cc),
+        );
+        match descr {
+            crate::jitcode::BhDescr::Array {
+                array_type_id,
+                type_id,
+                itemsize,
+                ..
+            } => {
+                assert_eq!(array_type_id.as_deref(), Some(interned.as_str()));
+                assert_ne!(array_type_id.as_deref(), Some(LIST_INT_ITEMS_ARRAY));
+                assert_eq!(type_id, path_hash(&interned));
+                assert_eq!(itemsize, crate::layout::target_signed_size());
+            }
             other => panic!("arraydescrof must mint a BhDescr::Array, got {other:?}"),
         }
     }

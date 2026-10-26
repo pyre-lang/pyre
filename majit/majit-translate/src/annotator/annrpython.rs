@@ -2872,6 +2872,22 @@ impl RPythonAnnotator {
                                 crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
                             ),
                         ),
+                        // `lltype.py` `ann_malloc`: `SomePtr(Ptr(s_T.const))`
+                        // even for flavor `'raw'`. `from_opname` has no
+                        // `malloc`; TYPE is args[0]. `history.py` `getkind`
+                        // of a raw `Ptr` is `'int'` at the codewriter.
+                        "malloc" if sp.args.len() == 2 => {
+                            Some(ann_malloc_from_type_arg(self, &sp.args[0]))
+                        }
+                        "malloc_varsize" if sp.args.len() == 3 => {
+                            Some(ann_malloc_from_type_arg(self, &sp.args[0]))
+                        }
+                        // `lltype.free(p, flavor='raw')` → `free` llop.
+                        "free" if sp.args.len() == 2 => Some(
+                            crate::translator::rtyper::llannotation::lltype_to_annotation(
+                                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+                            ),
+                        ),
                         _ => None,
                     }
                 };
@@ -3374,6 +3390,19 @@ impl RPythonAnnotator {
             added.insert(bkey, Rc::clone(block));
         }
         Ok(())
+    }
+}
+
+/// `lltype.py` `ann_malloc`: TYPE is a constant container lltype.
+fn ann_malloc_from_type_arg(ann: &RPythonAnnotator, type_arg: &Hlvalue) -> SomeValue {
+    let s = ann
+        .annotation(type_arg)
+        .unwrap_or_else(|| panic!("ann_malloc: s_T is unbound"));
+    match s.const_() {
+        Some(crate::flowspace::model::ConstValue::LowLevelType(ll)) => {
+            crate::translator::rtyper::llannotation::ann_malloc_result_annotation((**ll).clone())
+        }
+        other => panic!("ann_malloc: s_T must be a constant TYPE, got {other:?}"),
     }
 }
 

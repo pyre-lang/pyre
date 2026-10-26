@@ -833,9 +833,8 @@ enum RewriteResult {
     /// alias into the rename map. `optimize_block` `None` return.
     Identity(crate::flowspace::model::Variable),
     /// Fold the result to a Constant. `optimize_block` `isinstance(op1, Constant)`.
-    /// Production rewrites Identity a `Const*` producer Variable; this
-    /// arm is hit by the test fold `__test_fold_to_const_int`.
-    #[cfg_attr(not(test), expect(dead_code))]
+    /// Used for a Constant `v_input` of `cast_int_to_ptr` whose dest is
+    /// int-kind (`history.getkind` of a raw Ptr).
     Constant(crate::flowspace::model::Constant),
     /// Keep the op unchanged
     Keep,
@@ -10412,51 +10411,101 @@ impl<'a> Transformer<'a> {
                 }
                 return rewritten;
             }
+            // `rbuiltin.py rtype_cast_int_to_ptr`: drop the Void PTRTYPE
+            // constant (`hop.inputargs(lltype.Void, lltype.Signed)`) and
+            // genop unary `cast_int_to_ptr` with `v_input`. The 2-arg
+            // front-end Call (`emit_typed_nullptr`) still has that
+            // marker; production feeds this rich MIR graph rather than
+            // the rtyped flowspace hop, so do the same drop here — for
+            // Ref results as for Int results.
             if is_lltype_cast_path(segments, "cast_int_to_ptr")
-                && args.len() == 1
-                && matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
+                && let Some(input) = cast_int_to_ptr_v_input(op, args)
             {
-                let arg = resolve_alias(&args[0], &self.aliases);
-                // A raw-flavor dest is int-kind (`history.getkind`).
-                // Stamp Signed and keep the int word before the
-                // `cast_ptr_to_int` round-trip fold
-                // (`rewrite_op_cast_ptr_to_int`); that fold would
-                // restore the GC source.
-                if self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref()) {
-                    self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
-                    return RewriteResult::Identity(arg);
+                match input {
+                    CastIntToPtrInput::Var(v_input) => {
+                        let arg = resolve_alias(&v_input, &self.aliases);
+                        // A raw-flavor dest is int-kind (`history.getkind`).
+                        // Stamp Signed and keep the int word before the
+                        // `cast_ptr_to_int` round-trip fold
+                        // (`rewrite_op_cast_ptr_to_int`); that fold would
+                        // restore the GC source.
+                        if matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+                            || self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref())
+                        {
+                            self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                            return RewriteResult::Identity(arg);
+                        }
+                        if matches!(result_ty, ValueType::Ref(_) | ValueType::Str) {
+                            if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
+                                return RewriteResult::Identity(src);
+                            }
+                            if self.get_value_kind_var(&arg) == 'i' {
+                                // Stamp the operand Signed so flatten emits
+                                // `cast_int_to_ptr/i>r` (`insns.rs`), not an
+                                // unwired `/r>r` from an unstamped Unknown.
+                                self.stamp_value_kind(
+                                    graph,
+                                    Some(arg.clone()),
+                                    crate::codewriter::type_state::ConcreteType::Signed,
+                                );
+                                self.stamp_value_kind_from_value_type(
+                                    graph,
+                                    op.result.clone(),
+                                    result_ty,
+                                );
+                                return rewrite_as_unary_llop(
+                                    op,
+                                    &v_input,
+                                    "cast_int_to_ptr",
+                                    result_ty.clone(),
+                                );
+                            }
+                            return RewriteResult::Identity(arg);
+                        }
+                    }
+                    CastIntToPtrInput::Const(c) => {
+                        if matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+                            || self.cast_int_to_ptr_is_int_identity(result_ty, op.result.as_ref())
+                        {
+                            self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                            return RewriteResult::Constant(c);
+                        }
+                        if matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
+                            && let Some(n) = c.value.as_int()
+                        {
+                            // A Constant integer is not a Variable slot.
+                            // Materialize it, then the unary llop
+                            // `rtype_cast_int_to_ptr` would have emitted.
+                            let v_input = graph.alloc_value_var_with_type(
+                                crate::codewriter::type_state::ConcreteType::Signed,
+                            );
+                            self.stamp_value_kind(
+                                graph,
+                                Some(v_input.clone()),
+                                crate::codewriter::type_state::ConcreteType::Signed,
+                            );
+                            self.stamp_value_kind_from_value_type(
+                                graph,
+                                op.result.clone(),
+                                result_ty,
+                            );
+                            return RewriteResult::Replace(vec![
+                                SpaceOperation {
+                                    result: Some(v_input.clone()),
+                                    kind: OpKind::ConstInt(n),
+                                },
+                                SpaceOperation {
+                                    result: op.result.clone(),
+                                    kind: OpKind::UnaryOp {
+                                        op: "cast_int_to_ptr".into(),
+                                        operand: v_input,
+                                        result_ty: result_ty.clone(),
+                                    },
+                                },
+                            ]);
+                        }
+                    }
                 }
-                if let Some(src) = self.cast_ptr_to_int_src.get(&arg).cloned() {
-                    return RewriteResult::Identity(src);
-                }
-                if self.get_value_kind_var(&arg) == 'i' {
-                    // Stamp the operand Signed so flatten emits
-                    // `cast_int_to_ptr/i>r` (`insns.rs`), not an unwired
-                    // `/r>r` from an unstamped Unknown.
-                    self.stamp_value_kind(
-                        graph,
-                        Some(arg.clone()),
-                        crate::codewriter::type_state::ConcreteType::Signed,
-                    );
-                    self.stamp_value_kind_from_value_type(graph, op.result.clone(), result_ty);
-                    return rewrite_as_unary_llop(
-                        op,
-                        &args[0],
-                        "cast_int_to_ptr",
-                        result_ty.clone(),
-                    );
-                }
-                return RewriteResult::Identity(arg);
-            }
-            // A raw-pointer dest (`*const T`) is int-kind
-            // (`history.getkind`), so the cast is `rewrite_op_force_cast`'s
-            // same-size `_int_to_int_cast`: the result aliases the int word.
-            if is_lltype_cast_path(segments, "cast_int_to_ptr")
-                && args.len() == 1
-                && matches!(result_ty, ValueType::Int | ValueType::Unsigned)
-            {
-                self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
-                return RewriteResult::Identity(resolve_alias(&args[0], &self.aliases));
             }
             if args.len() == 1
                 && path_segments_end_with(segments, &["longlong2float", "float2longlong"])
@@ -17523,8 +17572,59 @@ fn raw_list_header_store(
     });
 }
 
+/// Operand of a front-end `lltype.cast_int_to_ptr` Call after dropping
+/// the Void PTRTYPE marker (`rbuiltin.py rtype_cast_int_to_ptr`).
+enum CastIntToPtrInput {
+    Var(crate::flowspace::model::Variable),
+    Const(crate::flowspace::model::Constant),
+}
+
+/// `rbuiltin.py rtype_cast_int_to_ptr`:
+/// `v_type, v_input = hop.inputargs(lltype.Void, lltype.Signed)` then
+/// `hop.genop('cast_int_to_ptr', [v_input], resulttype=PTRTYPE)`.
+///
+/// The front-end Call is 2-arg `(PTRTYPE, int)` (`emit_typed_nullptr`).
+/// `call_arg_vars` already drops a Constant PTRTYPE, so a Variable
+/// integer arrives as `args.len() == 1`. A Constant integer (`0`) is
+/// dropped too; recover it from the original Call args.
+fn cast_int_to_ptr_v_input(
+    op: &SpaceOperation,
+    args: &[crate::flowspace::model::Variable],
+) -> Option<CastIntToPtrInput> {
+    if let OpKind::Call {
+        args: call_args, ..
+    } = &op.kind
+    {
+        let v_input = if call_args.len() == 2
+            && matches!(
+                &call_args[0],
+                LinkArg::Const(c)
+                    if matches!(
+                        c.value,
+                        crate::flowspace::model::ConstValue::LowLevelType(_)
+                    )
+            ) {
+            Some(&call_args[1])
+        } else if call_args.len() == 1 {
+            Some(&call_args[0])
+        } else {
+            None
+        };
+        if let Some(v_input) = v_input {
+            return match v_input {
+                LinkArg::Value(v) => Some(CastIntToPtrInput::Var(v.clone())),
+                LinkArg::Const(c) => Some(CastIntToPtrInput::Const(c.clone())),
+            };
+        }
+    }
+    match args {
+        [v] => Some(CastIntToPtrInput::Var(v.clone())),
+        _ => None,
+    }
+}
+
 /// Project a 1-arg host call to the unary llop the rtyper would have
-/// emitted (`Float2LongLongEntry.specialize_call`,
+/// emitted (`rtype_cast_int_to_ptr`, `Float2LongLongEntry.specialize_call`,
 /// `rewrite_op_cast_ptr_to_int`).
 fn rewrite_as_unary_llop(
     op: &SpaceOperation,
@@ -36457,6 +36557,80 @@ mod tests {
         }
     }
 
+    /// `rbuiltin.py rtype_cast_int_to_ptr` drops the Void PTRTYPE
+    /// constant and genops unary `cast_int_to_ptr`. The 2-arg front-end
+    /// Call (`emit_typed_nullptr`: PTRTYPE + Const Int(0), result Ref)
+    /// must become that llop (kind r), not a residual symbolic fnaddr.
+    #[test]
+    fn lltype_cast_int_to_ptr_two_arg_gc_nullptr_becomes_unop() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("cast_int_to_ptr_gc_nullptr");
+        let ptr_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Unsigned)),
+        }));
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        result.set_concretetype(Some(ptr_ty.clone()));
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(result.clone()),
+                kind: OpKind::Call {
+                    target: CallTarget::function_path([
+                        "rpython",
+                        "rtyper",
+                        "lltypesystem",
+                        "lltype",
+                        "cast_int_to_ptr",
+                    ]),
+                    args: vec![
+                        LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                        LinkArg::from(ConstValue::Int(0)),
+                    ],
+                    result_ty: ValueType::Ref(None),
+                },
+            });
+        graph.set_return(graph.startblock, Some(result.clone()));
+        let out = Transformer::new(&config).transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().all(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => !is_lltype_cast_path(segments, "cast_int_to_ptr"),
+                _ => true,
+            }),
+            "2-arg Call must not remain; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp {
+                    op,
+                    result_ty: ValueType::Ref(_),
+                    ..
+                } if op == "cast_int_to_ptr"
+            )),
+            "GC 2-arg form becomes unary cast_int_to_ptr with Ref kind; ops={ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::GcRef,
+            "GC Ptr getkind is ref"
+        );
+    }
+
     /// `rewrite_op_force_cast` / `_int_to_int_cast`: CCHARP →
     /// CArrayPtr(Signed) is same-size raw, so the UnaryOp aliases.
     #[test]
@@ -40564,6 +40738,7 @@ mod tests {
                 ("items".to_string(), "[u64; 0]".to_string()),
             ],
         );
+        struct_fields.note_declared_gc_name("TypedItemsBlock");
         let mut cc = crate::call::CallControl::new();
         cc.set_struct_fields(struct_fields);
 

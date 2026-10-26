@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=entry-bridge:ForArm,entry-bridge:WhileArm
+# pyre-check: selfcheck-compiles=loop:bump,loop:bump_while
 # Regression guard: a class statement in a loop body must keep the rest of
 # that iteration, even when an earlier opcode of the same body has already
 # mutated the heap.
@@ -11,10 +11,12 @@
 #      raises the R1 "body effect since consume" signal;
 #   3. `JitPolicy.look_inside_graph` residualizes `build_class` because the
 #      graph contains loops (`compiling.py build_class` builds keyword-name
-#      lists with comprehensions) and is not `unroll_safe`.  The class body's
-#      own portal entry may start a separate trace;
-#   4. that inner trace aborts on ABORT_FORCE_QUASIIMMUT when its STORE_NAME
-#      mutates the class namespace's `ModuleDictStrategy.version?`;
+#      lists with comprehensions) and is not `unroll_safe`;
+#   4. the class body's own trace aborts on ABORT_FORCE_QUASIIMMUT (as PyPy
+#      does, 12 aborts) when its STORE_NAME mutates the class namespace's
+#      `ModuleDictStrategy.version?`.  The guarded shape is the two enclosing
+#      loops `bump` / `bump_while`, which is where the in-flight FOR_ITER item
+#      lives;
 #   5. a declined flush would need the consumed FOR_ITER item pushed back, and
 #      `fbw_foriter_inflight_take` refuses to deliver it while R1 stands -- a
 #      re-run of the body would apply the step-2 store a second time.

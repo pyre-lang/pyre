@@ -2518,7 +2518,7 @@ pub(crate) fn registration_decline(canonical_strip: &[String]) -> Option<&'stati
     {
         return Some(SKIP_PTR_COPY_NONOVERLAPPING);
     }
-    // `majit_gc::header::alloc_varsize_with_gc_header_immortal[_zeroed]`
+    // `majit_gc::header::alloc_varsize_with_gc_header[_immortal][_zeroed]`
     // / `dealloc_varsize_with_gc_header` are `malloc_varsize` operations
     // (`init_gc_object_immortal`), not graphs. Their bodies walk
     // `std::alloc::Layout` / `GcHeader::write`, which poisons every
@@ -2610,7 +2610,7 @@ fn registration_decline_graph_origin(
     })
 }
 
-/// Residual `majit_gc::header::alloc_varsize_with_gc_header_immortal*` /
+/// Residual `majit_gc::header::alloc_varsize_with_gc_header*` /
 /// `dealloc_varsize_with_gc_header`. `canonical_dedup_key` keeps `majit_gc`
 /// (not a local extract crate), so both `["majit_gc","header",leaf]` and
 /// the crate-stripped `["header",leaf]` / leaf-only aliases name the same
@@ -2626,7 +2626,10 @@ fn is_varsize_gc_header_alloc(canonical_strip: &[String]) -> bool {
     };
     matches!(
         leaf,
-        "alloc_varsize_with_gc_header_immortal"
+        "alloc_varsize_with_gc_header"
+            | "alloc_varsize_with_gc_header_zeroed"
+            | "alloc_varsize_reclaimable_zeroed_flag"
+            | "alloc_varsize_with_gc_header_immortal"
             | "alloc_varsize_with_gc_header_immortal_zeroed"
             | "alloc_varsize_with_gc_header_immortal_zeroed_flag"
             | "dealloc_varsize_with_gc_header"
@@ -2660,8 +2663,12 @@ fn publish_source_signature(graph: &LegacyGraph, entry: &FunctionEntry) {
 /// Project the callee's declared LLBC fn-ptr signature onto its entry
 /// before any body is lifted (see the pre-pass in
 /// [`populate_call_registry_from_call_graphs`]).
-fn seed_declared_funcptr_type(graph: &LegacyGraph, entry: &FunctionEntry) {
-    if let Some(ft) = declared_funcptr_type_from_legacy(graph) {
+fn seed_declared_funcptr_type(
+    graph: &LegacyGraph,
+    entry: &FunctionEntry,
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
+) {
+    if let Some(ft) = declared_funcptr_type_from_legacy(graph, bookkeeper) {
         entry.set_declared_funcptr_type(ft);
     }
 }
@@ -3070,7 +3077,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             if !seeded.insert(Rc::as_ptr(entry)) {
                 continue;
             }
-            seed_declared_funcptr_type(graph, entry);
+            seed_declared_funcptr_type(graph, entry, Some(registry.bookkeeper()));
         }
     }
     for (key, graph, entry, signature, body) in &pending {
@@ -3127,7 +3134,7 @@ fn describe_declared_funcobj(
     );
     alias_graphstore_spellings(Some(store), registry, key, &entry);
     publish_source_signature(&graph, &entry);
-    seed_declared_funcptr_type(&graph, &entry);
+    seed_declared_funcptr_type(&graph, &entry, Some(registry.bookkeeper()));
     let body = store.body(&path).expect("a declared path names a funcobj");
     install_source_graph(registry, key, &graph, &entry, &signature, &body);
     Some(entry)
@@ -3277,7 +3284,7 @@ fn alias_opaque_stub_keys_onto_graphstore(
         );
         alias_graphstore_spellings(Some(store), registry, &key, &entry);
         publish_source_signature(&header, &entry);
-        seed_declared_funcptr_type(&header, &entry);
+        seed_declared_funcptr_type(&header, &entry, Some(registry.bookkeeper()));
         if let Some(body) = store.body(&path) {
             install_source_graph(registry, &canonical_key, &header, &entry, &signature, &body);
         }
@@ -3934,6 +3941,17 @@ fn declared_return_annotation(
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
         return Some(cell);
     }
+    // A `GcStruct._arrayfld` class root is the array itself
+    // (`lltype.py` `GcArray`, `rlist.py` `FixedSizeListRepr`). Interning
+    // a ClassDef would rtype the residual as `InstanceRepr` of `object`
+    // and then fail convert from the body's `Ptr(GcArray)`.
+    let projected = bk.project_struct_field_type(root);
+    if matches!(
+        projected,
+        crate::annotator::model::SomeValue::Ptr(_) | crate::annotator::model::SomeValue::List(_)
+    ) {
+        return Some(projected);
+    }
     let classdef = bk
         .getuniqueclassdef(&bk.intern_class_by_qualname(root))
         .ok()?;
@@ -4077,6 +4095,23 @@ pub(crate) fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLev
     })
 }
 
+/// `Ptr(GcArray(ITEM))` when `root` is a scalar `_arrayfld` block
+/// (`TypedItemsBlock`). `None` for every other class root, including a
+/// `FixedSizeListRepr` list (`ItemsBlock` / `GcEntries`).
+fn arrayfld_ptr_lltype(
+    bookkeeper: &Rc<crate::annotator::bookkeeper::Bookkeeper>,
+    root: &str,
+) -> Option<LowLevelType> {
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    match bookkeeper.project_struct_field_type(root) {
+        SomeValue::Ptr(p) if matches!(p.ll_ptrtype.TO, PtrTarget::Array(_)) => {
+            Some(p.ll_ptrtype.clone().into())
+        }
+        _ => None,
+    }
+}
+
 /// Project a callee's declared fn-ptr `FuncType` from its `FunctionGraph`
 /// startblock `Input` ValueTypes (in `inputargs` order) + return token,
 /// mirroring `derive_subject_inputcells`'s startblock reading.  Returns
@@ -4089,6 +4124,7 @@ pub(crate) fn valuetype_to_lltype(vt: &crate::model::ValueType) -> Option<LowLev
 )]
 fn declared_funcptr_type_from_legacy(
     legacy: &LegacyGraph,
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::FuncType> {
     use crate::model::OpKind;
     let startblock = legacy.blocks.iter().find(|b| b.id == legacy.startblock)?;
@@ -4113,6 +4149,11 @@ fn declared_funcptr_type_from_legacy(
                     )
             }) {
                 crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+            } else if let Some(ll) = class_root
+                .as_deref()
+                .and_then(|root| bookkeeper.and_then(|bk| arrayfld_ptr_lltype(bk, root)))
+            {
+                ll
             } else {
                 valuetype_to_lltype(ty)?
             },
@@ -4128,6 +4169,12 @@ fn declared_funcptr_type_from_legacy(
             || majit_ir::descr::is_option_of_u8_window_spelling(s)
     }) {
         crate::annotator::bookkeeper::two_word_fat_struct("&[u8]")?
+    } else if let Some(ll) = legacy
+        .return_class_root
+        .as_deref()
+        .and_then(|root| bookkeeper.and_then(|bk| arrayfld_ptr_lltype(bk, root)))
+    {
+        ll
     } else {
         return_token_to_lltype(legacy.return_type.as_deref())?
     };
@@ -8944,11 +8991,14 @@ mod tests {
     #[test]
     fn varsize_gc_header_allocs_are_declined_and_host_env_wins() {
         let public_leaves = [
+            "alloc_varsize_with_gc_header",
+            "alloc_varsize_with_gc_header_zeroed",
             "alloc_varsize_with_gc_header_immortal",
             "alloc_varsize_with_gc_header_immortal_zeroed",
             "dealloc_varsize_with_gc_header",
         ];
         let private_leaves = [
+            "alloc_varsize_reclaimable_zeroed_flag",
             "alloc_varsize_with_gc_header_immortal_zeroed_flag",
             "varsize_immortal_layout",
         ];
@@ -18119,7 +18169,7 @@ mod tests {
         };
         assert!(ns.inner.can_be_none);
         graph.return_can_be_none = false;
-        let ft = declared_funcptr_type_from_legacy(&graph)
+        let ft = declared_funcptr_type_from_legacy(&graph, None)
             .expect("a no-arg STR-returning graph has a declared fn type");
         assert_eq!(
             ft.result,
@@ -18137,7 +18187,7 @@ mod tests {
             matches!(declared, SomeValue::Tuple(_)),
             "shared &[u8] residual is a window, got {declared:?}"
         );
-        let ft = declared_funcptr_type_from_legacy(&graph)
+        let ft = declared_funcptr_type_from_legacy(&graph, None)
             .expect("a no-arg window-returning graph has a declared fn type");
         assert_eq!(
             ft.result,
@@ -18422,6 +18472,131 @@ mod tests {
             declared_return_annotation(&registry, &graph),
             None,
             "a present return_type is not replaced by the residual token"
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_typed_items_block_is_gcarray_ptr() {
+        use std::rc::Rc;
+
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+        let owner = "lltypesystem::rlist::TypedItemsBlock";
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        fields.note_declared_gc_name(owner);
+        registry.set_struct_fields(Rc::new(fields));
+
+        let mut graph = LegacyGraph::new("int_ll_newlist");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(owner.into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a TypedItemsBlock residual declares its annotation");
+        let SomeValue::Ptr(ptr) = declared else {
+            panic!("TypedItemsBlock result is SomePtr(GcArray), got {declared:?}");
+        };
+        assert!(
+            matches!(ptr.ll_ptrtype.TO, PtrTarget::Array(_)),
+            "TypedItemsBlock result must be Ptr(GcArray), got {:?}",
+            ptr.ll_ptrtype.TO
+        );
+    }
+
+    #[test]
+    fn declared_funcptr_typed_items_block_is_gcarray_ptr() {
+        use std::rc::Rc;
+
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::model::{OpKind, ValueType};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+
+        let owner = "lltypesystem::rlist::TypedItemsBlock";
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u64; 0]".to_string()),
+            ],
+        );
+        fields.note_declared_gc_name(owner);
+        bk.set_struct_fields(Rc::new(fields));
+
+        let mut graph = LegacyGraph::new("typed_items_block_items_base");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(owner.into());
+        let entry = graph.startblock;
+        let receiver = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "block".to_string(),
+                    ty: ValueType::Ref(None),
+                    class_root: Some(owner.to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, receiver);
+
+        let ft = declared_funcptr_type_from_legacy(&graph, Some(&bk))
+            .expect("TypedItemsBlock graph has a declared fn type");
+        assert_eq!(ft.args.len(), 1);
+        assert!(
+            matches!(&ft.args[0], LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Array(_))),
+            "TypedItemsBlock arg is Ptr(GcArray), got {:?}",
+            ft.args[0]
+        );
+        assert!(
+            matches!(&ft.result, LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Array(_))),
+            "TypedItemsBlock result is Ptr(GcArray), got {:?}",
+            ft.result
+        );
+    }
+
+    #[test]
+    fn declared_return_annotation_erased_byte_array_is_instance() {
+        use std::rc::Rc;
+
+        use crate::annotator::model::SomeValue;
+        use crate::front::StructFieldRegistry;
+
+        let owner = "object_array::GcTypedArray";
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = CallRegistry::new(ann.bookkeeper.clone());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            owner.to_string(),
+            vec![
+                ("len".to_string(), "usize".to_string()),
+                ("items".to_string(), "[u8; 0]".to_string()),
+            ],
+        );
+        registry.set_struct_fields(Rc::new(fields));
+
+        let mut graph = LegacyGraph::new("gcarray_from_pyobject_vec");
+        graph.return_type = Some("ref".into());
+        graph.return_class_root = Some(owner.into());
+        let declared = declared_return_annotation(&registry, &graph)
+            .expect("a GcTypedArray residual declares its annotation");
+        let SomeValue::Instance(inst) = declared else {
+            panic!("GcTypedArray result intern's as SomeInstance, got {declared:?}");
+        };
+        assert!(
+            inst.classdef.is_some(),
+            "GcTypedArray must keep its ClassDef, not declare List of the storage byte"
         );
     }
 

@@ -11,17 +11,18 @@ use pyre_object::*;
 use rustpython_wtf8::Wtf8;
 
 /// `classdict.py ClassDictStrategy`.
-pub struct ClassDictStrategy {
-    /// The holder `W_DictObject.dstrategy` points at. A field of the
-    /// fromcache / prebuilt-space instance, not a naked module-static read.
-    pub strategy_ref: &'static DictStrategyRef,
-}
+pub struct ClassDictStrategy {}
 
 impl ClassDictStrategy {
     pub const fn new() -> Self {
-        Self {
-            strategy_ref: &CLASS_DICT_STRATEGY_REF,
-        }
+        Self {}
+    }
+
+    /// The process-wide prebuilt holder `W_DictObject.dstrategy` points at.
+    /// Reached through the fromcache instance so a translated read is a
+    /// method of `space.fromcache(ClassDictStrategy)`, not a module-static.
+    pub fn strategy_ref(&self) -> &'static DictStrategyRef {
+        class_dict_strategy_ref()
     }
 
     pub fn walk_roots(&self, _forward: &mut dyn FnMut(&mut PyObjectRef)) {}
@@ -94,12 +95,12 @@ impl DictStrategy for ClassDictStrategySlot {
 
 static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
 
-/// The [`DictStrategyRef`] holder a class-dict's `dstrategy` slot points at.
-pub static CLASS_DICT_STRATEGY_REF: DictStrategyRef = DictStrategyRef {
-    kind: pyre_object::dictmultiobject::StrategyKind::Class,
-    imp: &CLASS_DICT_SLOT,
-    owner: std::ptr::null_mut(),
-};
+pyre_object::define_prebuilt_dict_strategy_ref!(
+    CLASS_DICT_STRATEGY_REF,
+    class_dict_strategy_ref,
+    pyre_object::dictmultiobject::StrategyKind::Class,
+    &CLASS_DICT_SLOT
+);
 
 struct ClassDictMethods;
 
@@ -461,7 +462,7 @@ pub(crate) unsafe fn uncell_type_namespace(w_type: PyObjectRef) {
 pub fn class_dict_for_type(w_type: PyObjectRef) -> PyObjectRef {
     let space = crate::baseobjspace::object_space();
     pyre_object::w_dict_new_with(
-        space.class_dict_strategy().strategy_ref,
+        space.class_dict_strategy().strategy_ref(),
         w_type as pyre_object::gc_hook::GCREF,
     )
 }

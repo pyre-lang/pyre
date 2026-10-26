@@ -43,7 +43,7 @@ use crate::flowspace::model::{
 };
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
 use crate::translator::rtyper::lltypesystem::rbytearray::{
     BYTEARRAYPTR, build_ll_str2bytearray_helper_graph,
 };
@@ -66,7 +66,7 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_unichr2str_helper_graph, const_str_cache_llstr, null_str_ptr, temp_ptr_lltype,
 };
 use crate::translator::rtyper::rlist::build_ll_alloc_and_set_isconstant_helper_graph;
-use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
+use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, hop_arg_const_string};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
     constant_with_lltype, functionptr_const, helper_pygraph_from_graph, variable_with_lltype,
@@ -185,6 +185,73 @@ impl Default for StringRepr {
     }
 }
 
+/// `PtrRepr.rtype_setattr` (`rptr.py`) on `StringRepr.lowleveltype = Ptr(STR)`
+/// (`rstr.py`). High-level strings have no setattr; pyre dest-Str unifies a
+/// `Ptr(STR)` allocation with `SomeString`, so `mallocstr`'s `r.hash = 0` and
+/// the varsize length word of `_arrayfld` (`len(s.chars)`) arrive here.
+fn rtype_str_gcstruct_setattr(repr: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
+    let attr = hop_arg_const_string(hop, 1)?;
+    let value_is_integer = hop
+        .args_s
+        .borrow()
+        .get(2)
+        .is_some_and(|s| matches!(s, SomeValue::Integer(_)));
+    let field_type = str_gcstruct_setattr_field_type(repr.lowleveltype(), &attr, value_is_integer)?;
+    assert!(
+        !field_type.is_container_type(),
+        "StringRepr.rtype_setattr: field {attr:?} is a container"
+    );
+    let r_value = hop
+        .args_r
+        .borrow()
+        .get(2)
+        .and_then(|r| r.as_ref())
+        .cloned()
+        .ok_or_else(|| TyperError::message("StringRepr.rtype_setattr missing value repr"))?;
+    let void = LowLevelType::Void;
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::from(repr),
+        ConvertedTo::from(&void),
+        ConvertedTo::from(&r_value),
+    ])?;
+    hop.genop("setfield", vlist, GenopResult::Void);
+    Ok(None)
+}
+
+fn str_gcstruct_setattr_field_type(
+    lltype: &LowLevelType,
+    attr: &str,
+    value_is_integer: bool,
+) -> Result<LowLevelType, TyperError> {
+    let LowLevelType::Ptr(ptr) = lltype else {
+        return Err(TyperError::message(format!(
+            "StringRepr.rtype_setattr expected Ptr, got {lltype:?}"
+        )));
+    };
+    let struct_t = match &ptr.TO {
+        PtrTarget::Struct(s) => s.clone(),
+        PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(LowLevelType::Struct(s)) => *s,
+            _ => {
+                return Err(TyperError::message(ptr._nofield(attr)));
+            }
+        },
+        _ => return Err(TyperError::message(ptr._nofield(attr))),
+    };
+    if let Some(field_type) = struct_t.getattr_field_type(attr) {
+        return Ok(field_type);
+    }
+    // rstr STR/UNICODE = `{hash, chars: Array}`; the Array length word is
+    // `len(s.chars)` (`ll_strlen`), not a `_flds` name. Pyre's overlay
+    // stores that word as `length` (`LowlevelStringHeader.length` /
+    // `Utf8Str.length`). `PtrRepr.rtype_setattr` (`rptr.py`) looks up
+    // the declared field and rejects every other name.
+    if attr == "length" && struct_t._arrayfld.is_some() && value_is_integer {
+        return Ok(LowLevelType::Unsigned);
+    }
+    Err(TyperError::message(struct_t._nofield(attr)))
+}
+
 impl Repr for StringRepr {
     fn lowleveltype(&self) -> &LowLevelType {
         &self.lltype
@@ -229,6 +296,11 @@ impl Repr for StringRepr {
     /// RPython `AbstractStringRepr.rtype_len(self, hop)` (`rstr.py`).
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_len(self, hop, "ll_strlen", STRPTR.clone())
+    }
+
+    /// `PtrRepr.rtype_setattr` on `Ptr(STR)` (`rptr.py` / `mallocstr`).
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_str_gcstruct_setattr(self, hop)
     }
 
     /// RPython `AbstractStringRepr.rtype_bool(self, hop)`
@@ -546,6 +618,11 @@ impl Repr for UnicodeRepr {
     /// pointer lltype (`Ptr(UNICODE)`).
     fn rtype_len(&self, hop: &HighLevelOp) -> RTypeResult {
         rtype_abstract_string_len(self, hop, "ll_unilen", UNICODEPTR.clone())
+    }
+
+    /// `PtrRepr.rtype_setattr` on `Ptr(UNICODE)` (`rptr.py` / `mallocunicode`).
+    fn rtype_setattr(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_str_gcstruct_setattr(self, hop)
     }
 
     /// RPython `AbstractUnicodeRepr.rtype_bool` inherits
@@ -3993,6 +4070,119 @@ mod tests {
         );
         let r2 = string_repr();
         assert!(Arc::ptr_eq(&r, &r2));
+    }
+
+    fn string_setattr_hop(
+        attr: &str,
+        value_unsigned: bool,
+    ) -> (
+        HighLevelOp,
+        std::rc::Rc<std::cell::RefCell<LowLevelOpList>>,
+        std::sync::Arc<StringRepr>,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::model::{SomeInteger, SomeString};
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rint::{signed_repr, unsigned_repr};
+        use crate::translator::rtyper::rmodel::impossible_repr;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let r_str = string_repr();
+        let r_int: std::sync::Arc<dyn Repr> = if value_unsigned {
+            unsigned_repr()
+        } else {
+            signed_repr()
+        };
+        let v_s = Variable::new();
+        v_s.set_concretetype(Some(STRPTR.clone()));
+        let v_n = Variable::new();
+        v_n.set_concretetype(Some(if value_unsigned {
+            LowLevelType::Unsigned
+        } else {
+            LowLevelType::Signed
+        }));
+        let args = vec![
+            Hlvalue::Variable(v_s),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str(attr),
+                LowLevelType::Void,
+            )),
+            Hlvalue::Variable(v_n),
+        ];
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "setattr".to_string(),
+                args.clone(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(args);
+        hop.args_s.borrow_mut().extend([
+            SomeValue::String(SomeString::new(false, true)),
+            {
+                let mut s_attr = SomeString::new(false, false);
+                s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(attr)));
+                SomeValue::String(s_attr)
+            },
+            SomeValue::Integer(SomeInteger::new(value_unsigned, value_unsigned)),
+        ]);
+        hop.args_r.borrow_mut().extend([
+            Some(r_str.clone() as std::sync::Arc<dyn Repr>),
+            Some(impossible_repr() as std::sync::Arc<dyn Repr>),
+            Some(r_int),
+        ]);
+        (hop, llops, r_str)
+    }
+
+    /// `mallocstr` `r.hash = 0` (`rstr.py`): `StringRepr.lowleveltype` is
+    /// `Ptr(STR)`, so setattr of the GcStruct prefix is `setfield`.
+    #[test]
+    fn string_repr_rtype_setattr_hash_emits_setfield() {
+        let (hop, llops, r) = string_setattr_hop("hash", false);
+        assert!(r.rtype_setattr(&hop).unwrap().is_none());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "setfield");
+        assert_eq!(ops.ops[0].args.len(), 3);
+    }
+
+    /// Varsize length word of `_arrayfld` (`len(s.chars)` / `ll_strlen`).
+    /// rstr STR does not name it in `_flds`; the store is still `setfield`.
+    #[test]
+    fn string_repr_rtype_setattr_arrayfld_length_emits_setfield() {
+        let (hop, llops, r) = string_setattr_hop("length", true);
+        assert!(r.rtype_setattr(&hop).unwrap().is_none());
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "setfield");
+        assert_eq!(ops.ops[0].args.len(), 3);
+    }
+
+    /// `PtrRepr.rtype_setattr` (`rptr.py`): `getattr(TO, attr)` rejects
+    /// a name that is neither a declared `_flds` field nor the mapped
+    /// `length` word of `_arrayfld`.
+    #[test]
+    fn string_repr_rtype_setattr_unknown_attr_is_nofield() {
+        let (hop, llops, r) = string_setattr_hop("not_a_field", true);
+        let err = r
+            .rtype_setattr(&hop)
+            .expect_err("unknown STR field must not emit setfield");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("has no field") && msg.contains("not_a_field"),
+            "got {msg}"
+        );
+        assert!(llops.borrow().ops.is_empty());
     }
 
     /// `lltypesystem/rstr.py` — `unicode_repr = UnicodeRepr()`

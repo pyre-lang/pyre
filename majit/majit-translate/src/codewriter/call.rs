@@ -2415,6 +2415,10 @@ pub(crate) enum DecoratorAttr {
     AroundstateTarget(String, i64),
     Elidable,
     CannotRaise,
+    /// `#[jit_may_force]` — harvested `_MAJIT_MAY_FORCE_`. RPython has
+    /// no wrapper attribute; `graphanalyze.py` `analyze` returns
+    /// `top_result()` for an `indirect_call` whose graph set is None.
+    MayForce,
     MemerrorOnly,
     LoopInvariant,
     CloseStack,
@@ -2456,6 +2460,7 @@ impl DecoratorAttr {
         Some(match hint {
             "elidable" => Self::Elidable,
             "elidable_cannot_raise" | "cannot_raise" => Self::CannotRaise,
+            "may_force" => Self::MayForce,
             "elidable_or_memerror" => Self::MemerrorOnly,
             "loopinvariant" => Self::LoopInvariant,
             "close_stack" => Self::CloseStack,
@@ -2508,6 +2513,10 @@ impl FuncObjAttrs {
                          already marked memerror-only, cannot also mark cannot-raise"
                     );
                     func.cannot_raise_assertion = true;
+                    None
+                }
+                DecoratorAttr::MayForce => {
+                    func.may_force_assertion = true;
                     None
                 }
                 DecoratorAttr::MemerrorOnly => {
@@ -3592,6 +3601,7 @@ fn func_effects_marks(effects: &crate::model::FuncEffects) -> Vec<String> {
         (!effects.canraise, "canraise=false"),
         (effects.canmallocgc, "canmallocgc"),
         (effects.cannot_raise_assertion, "cannot_raise_assertion"),
+        (effects.may_force_assertion, "may_force_assertion"),
         (effects.memerror_only_assertion, "memerror_only_assertion"),
         (effects.elidable, "elidable"),
         (effects.loop_invariant, "loop_invariant"),
@@ -5521,7 +5531,7 @@ impl CallControl {
         // descr.py — itemsize from symbolic.get_array_token().
         // descr.py — ArrayDescr(basesize, itemsize, ..., flag).
         // Even for struct(struct), itemsize is correct from symbolic.
-        let (flag, item_size, item_type) = if is_struct {
+        let (flag, mut item_size, item_type) = if is_struct {
             (
                 majit_ir::descr::ArrayFlag::Struct,
                 elem_ref
@@ -5550,6 +5560,18 @@ impl CallControl {
                 ir_type,
             )
         };
+        // `descr.py get_array_descr`: `basesize, itemsize =
+        // symbolic.get_array_token(ARRAY)` = `llmemory.sizeof(ARRAY.OF)`
+        // / `rffi.sizeof(ARRAY.OF)` on the target. A spelling round-trip
+        // through `get_type_flag("usize")` uses the pointer word, which
+        // is 4 on wasm32, while `rffi.sizeof(Unsigned)` is
+        // `target_signed_size()` (8).
+        if !is_struct
+            && let Some(arr) = arr
+            && let Some(sz) = array_item_size_of_lltype(&arr.OF)
+        {
+            item_size = sz;
+        }
         // descr.py — `concrete_type='f'` when the element OF is
         // Float or SingleFloat.  A SingleFloat (`f32`) array element is
         // int-banked (`Type::Int`, `get_type_flag`) but keeps the `'f'`
@@ -7049,18 +7071,12 @@ impl CallControl {
     /// `call.py getfunctionptr(graph)` parity for `<Type>::method`
     /// and `<Type as Trait>::method`.
     ///
-    /// NOTE: this `ImplFnAddrBindings` channel is test-only.  Every
-    /// production entry point passes `&[]` for `impl_fnaddr_bindings`, so
-    /// this runs only under the macro tests
-    /// (`majit-macros/tests/jit_module_test.rs`).  Production impl-method
-    /// helpers are registered as flat full-path keys via
-    /// `register_macro_helper_trace_fnaddr`, and `CallTarget::Method`
-    /// lookups resolve through `resolved_path` / the impl-method
-    /// leaf-index — neither consults `impl_type_as_written`.  The macro
-    /// only sees the surface `impl`-header spelling, so this key is
-    /// non-canonical by design (it cannot recover a `use`-aliased owner's
-    /// defining module); do not wire it into a production caller without
-    /// canonicalising the owner root against `front::mir`'s `self_ty_root`.
+    /// Inherent `&self` trampolines published through
+    /// `HelperFnAddr::new_impl_method` (and `#[jit_module]`'s
+    /// `__majit_helper_impl_trace_fnaddrs`) feed this entry point. The
+    /// `impl` header / `type_name::<Self>()` spelling is the owner root
+    /// `CallPath::for_impl_method` uses; a `use`-aliased owner still
+    /// cannot recover a defining module other than that spelling.
     pub fn register_macro_impl_helper_trace_fnaddr(
         &mut self,
         module_path_with_crate: &str,
@@ -7092,7 +7108,29 @@ impl CallControl {
             .map(Self::strip_raw_ident_sigil)
             .collect::<Vec<_>>()
             .join("::");
-        self.register_function_fnaddr(CallPath::for_impl_method(&impl_type_joined, method), fnaddr);
+        let path = CallPath::for_impl_method(&impl_type_joined, method);
+        // Reloc key is the first `HelperFnAddr::impl_method_fnaddr_paths`
+        // spelling (`module_path!()::Type::method`). `merge_macro_helper_fnaddrs`
+        // keeps a hand-listed `jit_trace_fnaddrs` address on that key; a later
+        // HelperFnAddr trampoline is a second copy of an `#[inline]` method
+        // (`RootScope::get`). Binding the trampoline here would store that
+        // copy under the hand-listed reloc path, so the provenance patcher
+        // (path → hand-listed runtime) would disagree with a value remap of
+        // the trampoline word.
+        let registry_key = format!("{module_path_with_crate}::{impl_type_as_written}::{method}");
+        let fnaddr = self
+            .address_for_registry_key(&registry_key)
+            .unwrap_or(fnaddr);
+        self.fnaddr_registry_keys.insert(path.clone(), registry_key);
+        self.register_function_fnaddr(path, fnaddr);
+    }
+
+    /// Address already bound to `registry_key` by a prior
+    /// [`Self::register_macro_helper_trace_fnaddr`] (or another impl row).
+    fn address_for_registry_key(&self, registry_key: &str) -> Option<i64> {
+        self.fnaddr_registry_keys.iter().find_map(|(bound, key)| {
+            (*key == registry_key).then(|| self.function_fnaddrs.get(bound).copied())?
+        })
     }
 
     /// Drop the `r#` sigil from one path segment.  A registry key spelled
@@ -10921,6 +10959,13 @@ impl CallControl {
         self.func_effects_mut(&path).cannot_raise_assertion = true;
     }
 
+    /// Register a target carrying `#[jit_may_force]`. Harvested as
+    /// `_MAJIT_MAY_FORCE_` the same way `_jit_cannot_raise_` is harvested
+    /// for `dont_look_inside_cannot_raise`.
+    pub fn mark_may_force_assertion(&mut self, path: CallPath) {
+        self.func_effects_mut(&path).may_force_assertion = true;
+    }
+
     /// Check whether an elidable target has an executable cannot-raise
     /// assertion.
     ///
@@ -10970,6 +11015,18 @@ impl CallControl {
         self.path_or_alias_marked_cannot_raise(&path)
     }
 
+    /// Harvested `#[jit_may_force]` on this residual, read the way
+    /// `_jit_cannot_raise_` is: `getcalldescr` extraeffect of *this*
+    /// callee, not a `GraphAnalyzer` early-return that infects callers.
+    /// `graphanalyze.py` `analyze` returns `top_result()` for an
+    /// `indirect_call` whose graph set is None.
+    fn declares_may_force(&self, target: &CallTarget) -> bool {
+        let Some(path) = self.resolved_direct_path(target) else {
+            return false;
+        };
+        self.path_or_alias_marked_may_force(&path)
+    }
+
     /// The harvested mark often lives on the crate-stripped spelling
     /// (`typedef::tuple_from_exact_list`) while the call site and its
     /// graph use `pyre_interpreter::typedef::tuple_from_exact_list`.
@@ -10993,6 +11050,17 @@ impl CallControl {
         self.path_user_or_crate_strip_marked(path)
     }
 
+    fn path_or_alias_marked_may_force(&self, path: &CallPath) -> bool {
+        let rendered = path.canonical_key();
+        if let Some(inner) = rendered
+            .strip_prefix("indirect[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            return self.indirect_family_marked_may_force(inner);
+        }
+        self.path_user_or_crate_strip_pred(path, Self::path_marked_may_force)
+    }
+
     /// `indirect[a::b,c::d]` — every member, and never an empty family.
     fn indirect_family_marked_cannot_raise(&self, inner: &str) -> bool {
         if inner.is_empty() {
@@ -11004,18 +11072,45 @@ impl CallControl {
         })
     }
 
+    /// `indirect[a::b,c::d]` — any member (forces is a top effect).
+    fn indirect_family_marked_may_force(&self, inner: &str) -> bool {
+        if inner.is_empty() {
+            return false;
+        }
+        inner.split(',').any(|member| {
+            let path = CallPath::from_segments(member.split("::").filter(|seg| !seg.is_empty()));
+            !path.segments.is_empty()
+                && self.path_user_or_crate_strip_pred(&path, Self::path_marked_may_force)
+        })
+    }
+
+    fn family_declares_may_force(&self, graphs: Option<&[CallPath]>) -> bool {
+        graphs.is_some_and(|gs| {
+            gs.iter()
+                .any(|p| self.path_user_or_crate_strip_pred(p, Self::path_marked_may_force))
+        })
+    }
+
     /// Mark on `path`, on the user function behind a call-target trampoline,
     /// or on the crate-stripped spelling of either.
     fn path_user_or_crate_strip_marked(&self, path: &CallPath) -> bool {
+        self.path_user_or_crate_strip_pred(path, Self::path_marked_cannot_raise)
+    }
+
+    fn path_user_or_crate_strip_pred(
+        &self,
+        path: &CallPath,
+        marked: fn(&Self, &CallPath) -> bool,
+    ) -> bool {
         if path.segments.first().map(String::as_str) == Some(crate::model::FN_CONST_HEAD) {
             let rest = path.with_segments(path.segments[1..].iter().cloned());
-            return self.path_user_or_crate_strip_marked(&rest);
+            return self.path_user_or_crate_strip_pred(&rest, marked);
         }
-        if self.path_marked_cannot_raise(path) {
+        if marked(self, path) {
             return true;
         }
         if let Some(user) = user_path_behind_majit_call_target(path)
-            && self.path_user_or_crate_strip_marked(&user)
+            && self.path_user_or_crate_strip_pred(&user, marked)
         {
             return true;
         }
@@ -11030,11 +11125,11 @@ impl CallControl {
                 || root.starts_with(|c: char| c.is_ascii_lowercase() || c == '_');
             if crate_like {
                 let stripped = path.with_segments(path.segments[1..].iter().cloned());
-                if self.path_marked_cannot_raise(&stripped) {
+                if marked(self, &stripped) {
                     return true;
                 }
                 if let Some(user) = user_path_behind_majit_call_target(&stripped) {
-                    return self.path_user_or_crate_strip_marked(&user);
+                    return self.path_user_or_crate_strip_pred(&user, marked);
                 }
             }
         }
@@ -11048,6 +11143,15 @@ impl CallControl {
             || self
                 .external_funcobj(path)
                 .is_some_and(|effects| effects.cannot_raise_assertion)
+    }
+
+    fn path_marked_may_force(&self, path: &CallPath) -> bool {
+        self.function_graphs
+            .get(path)
+            .is_some_and(|graph| graph.func.may_force_assertion)
+            || self
+                .external_funcobj(path)
+                .is_some_and(|effects| effects.may_force_assertion)
     }
 
     /// Pyre extension: register a target as carrying the
@@ -11145,6 +11249,7 @@ impl CallControl {
                 }
                 DecoratorAttr::Elidable => self.mark_elidable(path),
                 DecoratorAttr::CannotRaise => self.mark_cannot_raise_assertion(path),
+                DecoratorAttr::MayForce => self.mark_may_force_assertion(path),
                 DecoratorAttr::MemerrorOnly => self.mark_memerror_only_assertion(path),
                 DecoratorAttr::LoopInvariant => self.mark_loopinvariant(path),
                 DecoratorAttr::CloseStack => self.mark_close_stack(path),
@@ -11665,6 +11770,8 @@ impl CallControl {
             Some(g) => g,
             // RPython: external call → analyze_external_call → bottom_result (False).
             // VirtualizableAnalyzer does not override analyze_external_call.
+            // `#[jit_may_force]` is read in `getcalldescr` (`declares_may_force`),
+            // the way `_jit_cannot_raise_` is, not as an analyzer early-return.
             None => return false,
         };
         if !seen.enter(path.clone(), analyzed) {
@@ -12558,9 +12665,13 @@ impl CallControl {
         // RPython call.py:286-303: determine extraeffect when not caller-set.
         if extraeffect.is_none() {
             let forces_vable = match shape {
-                CallShape::Direct(target) => self.cached_forces_virtualizable(target, cache),
+                CallShape::Direct(target) => {
+                    self.declares_may_force(target)
+                        || self.cached_forces_virtualizable(target, cache)
+                }
                 CallShape::Indirect(graphs) => {
-                    self.cached_forces_virtualizable_family(graphs, cache)
+                    self.family_declares_may_force(graphs)
+                        || self.cached_forces_virtualizable_family(graphs, cache)
                 }
             };
             extraeffect = Some(if forces_vable {
@@ -16076,6 +16187,17 @@ fn try_array_type_id_of_lltype(
     }
 }
 
+/// `symbolic.get_array_token` itemsize: `llmemory.sizeof(T.OF)` /
+/// `rffi.sizeof(ARRAY.OF)` on the target (`descr.py get_array_descr`).
+pub(crate) fn array_item_size_of_lltype(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<usize> {
+    match crate::translator::rtyper::lltypesystem::rffi::sizeof(of) {
+        Ok(crate::flowspace::model::ConstValue::Int(n)) if n > 0 => Some(n as usize),
+        _ => None,
+    }
+}
+
 /// Element spelling of `ARRAY.OF` after `lltype.build_number` identity.
 /// `descr.py get_type_flag` reads this spelling: a Ptr whose
 /// `TO._gckind == 'gc'` is FLAG_POINTER, independent of the containing
@@ -17167,6 +17289,29 @@ mod tests {
             get_type_flag("usize", &HashSet::new()).0,
             majit_ir::descr::ArrayFlag::Unsigned
         );
+    }
+
+    /// `descr.py get_array_descr` / `symbolic.get_array_token`: a
+    /// `GcArray(Unsigned)` strides by `rffi.sizeof(Unsigned)`
+    /// (`target_signed_size()`), not `get_type_flag("usize")`.
+    #[test]
+    fn arraydescrof_gcarray_unsigned_uses_sizeof_unsigned() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let cc = CallControl::new();
+        let arr = Array::gc(LowLevelType::Unsigned);
+        let descr = cc.arraydescrof_array(&arr);
+        let ad = descr
+            .as_array_descr()
+            .expect("arraydescrof_array must answer an ArrayDescr");
+        let item = crate::layout::target_signed_size();
+        let word = crate::layout::target_word_size();
+        assert_eq!(ad.item_size(), item);
+        assert_eq!(
+            ad.item_size(),
+            array_item_size_of_lltype(&LowLevelType::Unsigned).expect("sizeof Unsigned")
+        );
+        assert_eq!(ad.base_size(), array_items_base(word, item));
+        assert!(!ad.is_item_signed());
     }
 
     /// `rffi.UCHAR` / `USHORT` spell as `u8` / `u16`. `rffi.UINT` spells
@@ -23503,6 +23648,63 @@ mod tests {
     }
 
     #[test]
+    fn impl_method_fnaddr_keeps_hand_listed_address_for_same_reloc_key() {
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("testcrate::sub::Owner::leaf", 0x1111);
+        cc.register_macro_impl_helper_trace_fnaddr("testcrate::sub", "Owner", "leaf", 0x2222);
+        let impl_path = CallPath::for_impl_method("sub::Owner", "leaf");
+        assert_eq!(cc.lookup_function_fnaddr(&impl_path), Some(0x1111));
+        cc.register_function_graph(impl_path.clone(), FunctionGraph::new("leaf"));
+        let jitcode = cc.get_jitcode(&impl_path);
+        assert_eq!(jitcode.fnaddr, 0x1111);
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: "testcrate::sub::Owner::leaf".to_string(),
+                symbolic: false,
+            })
+        );
+    }
+
+    #[test]
+    fn impl_method_fnaddr_does_not_cross_bind_free_function_spelling() {
+        const METHOD: &str = "_orig__getdictvalue_no_unwrapping_pure_unlikely_name";
+        let method_path = CallPath::from_segments(["celldict", "ModuleDictStrategy", METHOD]);
+
+        let mut cc_impl = CallControl::new();
+        cc_impl.register_macro_impl_helper_trace_fnaddr(
+            "pyre_object::celldict",
+            "ModuleDictStrategy",
+            METHOD,
+            0x1111,
+        );
+        assert_eq!(cc_impl.lookup_function_fnaddr(&method_path), Some(0x1111));
+        assert_eq!(
+            cc_impl.fnaddr_for_target(&CallTarget::function_path([
+                "celldict",
+                "ModuleDictStrategy",
+                METHOD
+            ])),
+            0x1111
+        );
+
+        let mut cc_free = CallControl::new();
+        cc_free.register_macro_helper_trace_fnaddr(
+            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            0x2222,
+        );
+        assert_eq!(cc_free.lookup_function_fnaddr(&method_path), None);
+        assert_ne!(
+            cc_free.fnaddr_for_target(&CallTarget::function_path([
+                "celldict",
+                "ModuleDictStrategy",
+                METHOD
+            ])),
+            0x2222
+        );
+    }
+
+    #[test]
     fn register_macro_impl_helper_qualifies_bare_type_with_module_prefix() {
         // `impl Adder { fn add() }` at `mod impl_module` — macro emits
         // `impl_type_as_written = "Adder"` (bare), and
@@ -23522,6 +23724,16 @@ mod tests {
         assert_eq!(
             cc.fnaddr_for_target(&CallTarget::function_path(["impl_module", "Adder", "add"])),
             0xfeed_beef
+        );
+        let path = CallPath::from_segments(["impl_module", "Adder", "add"]);
+        cc.register_function_graph(path.clone(), FunctionGraph::new("add"));
+        let jitcode = cc.get_jitcode(&path);
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: "testcrate::impl_module::Adder::add".to_string(),
+                symbolic: false,
+            })
         );
     }
 
@@ -24377,6 +24589,143 @@ mod tests {
         assert_eq!(
             descriptor.extra_info.extraeffect,
             ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+    }
+
+    #[test]
+    fn declared_may_force_on_opaque_stub_is_forces() {
+        // `#[jit_may_force]` residual whose body does not lower (thread-local
+        // hook trampoline): no `VableForce` op, but the harvested marker
+        // still records `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`.
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("hash_w_hooked");
+        graph.set_return(graph.startblock, None);
+        let path = CallPath::from_segments(["hash_w_hooked"]);
+        cc.register_function_graph(path.clone(), graph);
+        cc.mark_may_force_assertion(path);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["hash_w_hooked"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+    }
+
+    #[test]
+    fn crate_prefixed_residual_honours_may_force_assertion() {
+        let mut cc = CallControl::new();
+        cc.mark_may_force_assertion(CallPath::from_segments(["dict_eq_hook", "hash_w_hooked"]));
+        let target = CallTarget::function_path(["pyre_object", "dict_eq_hook", "hash_w_hooked"]);
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            let mut cache = AnalysisCache::default();
+            let descriptor = cc.getcalldescr(
+                &direct_call_op(target),
+                vec![Type::Ref],
+                Type::Int,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            );
+            assert_eq!(
+                descriptor.extra_info.extraeffect,
+                ExtraEffect::ForcesVirtualOrVirtualizable
+            );
+        });
+    }
+
+    #[test]
+    fn mark_decorator_hints_may_force_stamps_forces() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["eq_w_hooked"]);
+        cc.mark_decorator_hints(&path, &["may_force".into()]);
+        let mut cache = AnalysisCache::default();
+        let descriptor = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["eq_w_hooked"])),
+            vec![Type::Ref, Type::Ref],
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            descriptor.extra_info.extraeffect,
+            ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+    }
+
+    #[test]
+    fn elidable_caller_does_not_inherit_callee_may_force_assertion() {
+        // `_jit_cannot_raise_` is `getcalldescr` extraeffect of that residual.
+        // `#[jit_may_force]` is the same: the residual is Forces; a
+        // looked-inside elidable caller is not rewritten to Forces.
+        let mut cc = CallControl::new();
+        let hook_path = CallPath::from_segments(["hash_w_hooked"]);
+        cc.register_function_graph(hook_path.clone(), simple_graph("hash_w_hooked"));
+        cc.mark_may_force_assertion(hook_path);
+
+        let mut caller = FunctionGraph::new("pure_lookup");
+        let result = caller
+            .push_op_var(
+                caller.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["hash_w_hooked"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        caller.set_return(caller.startblock, Some(result));
+        let caller_path = CallPath::from_segments(["pure_lookup"]);
+        register_int_result_graph(&mut cc, caller_path.clone(), caller);
+        cc.mark_elidable(caller_path);
+        cc.find_all_graphs_for_tests();
+
+        let mut cache = AnalysisCache::default();
+        let hook_descr = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["hash_w_hooked"])),
+            Vec::new(),
+            Type::Void,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert_eq!(
+            hook_descr.extra_info.extraeffect,
+            ExtraEffect::ForcesVirtualOrVirtualizable
+        );
+
+        let caller_descr = cc.getcalldescr(
+            &direct_call_op(CallTarget::function_path(["pure_lookup"])),
+            Vec::new(),
+            Type::Int,
+            OopSpecIndex::None,
+            None,
+            &mut cache,
+            None,
+        );
+        assert!(
+            matches!(
+                caller_descr.extra_info.extraeffect,
+                ExtraEffect::ElidableCannotRaise
+                    | ExtraEffect::ElidableCanRaise
+                    | ExtraEffect::ElidableOrMemoryError
+            ),
+            "elidable caller extraeffect={:?}",
+            caller_descr.extra_info.extraeffect
         );
     }
 

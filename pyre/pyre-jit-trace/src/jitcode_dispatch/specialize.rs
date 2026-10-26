@@ -2434,7 +2434,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             ctx,
             op_pc,
             dict_op,
-            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
+            pyre_interpreter::objspace::std::mapdict::map_dict_strategy_ref() as *const _ as i64,
         )?;
 
         let carrier_op =
@@ -6485,7 +6485,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             ctx,
             op_pc,
             strategy,
-            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
+            pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64,
         )?;
         walker_guard_exact_str(ctx, op_pc, key_op)?;
 
@@ -10770,7 +10770,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
         canonical_dict,
     )?;
 
-    let strategy_ref = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64;
+    let strategy_ref = pyre_object::dictmultiobject::unicode_dict_strategy_ref() as *const _ as i64;
     let lookup_helper = pyre_interpreter::residual_word_addr!(
         2,
         crate::helpers::jit_dict_exact_unicode_lookup_or_null
@@ -10903,7 +10903,7 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         ctx,
         op_pc,
         dict_op,
-        &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
+        pyre_object::dictmultiobject::int_dict_strategy_ref() as *const _ as i64,
     )?;
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     walker_guard_exact_instance(
@@ -16673,6 +16673,14 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             )
         }
     };
+    // `_opimpl_setfield_vable` already left the abort-point scalars on the
+    // vable (`pyjitpl.py`); do not rewrite them for the helper walk (#245).
+    // Record the pair on the paused portal `LiveFrameRegs` so a
+    // ForceQuasiImmutable multi-frame blackhole can resume the CALL
+    // (`blackhole.py _setup_return_value_*` / `_copy_data_from_miframe`).
+    if !nested_helper && sym.owns_virtualizable_shadow() {
+        super::vable_ops::record_paused_portal_abort_point(ctx.session, ctx.trace_ctx);
+    }
     let active = if nested_helper {
         ctx.frame_state.borrow().outer_active_boxes.clone()
     } else {
@@ -16738,6 +16746,9 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
+    if !nested_helper && sym.owns_virtualizable_shadow() {
+        super::vable_ops::clear_paused_portal_abort_point(ctx.session);
+    }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class
     // as a symbolic residual (`try_execute_residual_call_via_executor_inner` →

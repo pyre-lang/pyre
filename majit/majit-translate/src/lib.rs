@@ -2381,6 +2381,7 @@ fn analyze_pipeline_from_module_paths(
                         call_control.mark_cannot_raise_assertion(path.clone())
                     }
                     "cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
+                    "may_force" => call_control.mark_may_force_assertion(path.clone()),
                     "elidable_or_memerror" => {
                         call_control.mark_memerror_only_assertion(path.clone())
                     }
@@ -2406,6 +2407,7 @@ fn analyze_pipeline_from_module_paths(
                             call_control.mark_cannot_raise_assertion(dp.clone())
                         }
                         "cannot_raise" => call_control.mark_cannot_raise_assertion(dp.clone()),
+                        "may_force" => call_control.mark_may_force_assertion(dp.clone()),
                         "elidable_or_memerror" => {
                             call_control.mark_memerror_only_assertion(dp.clone())
                         }
@@ -2576,6 +2578,7 @@ fn analyze_pipeline_from_module_paths(
                     call_control.mark_cannot_raise_assertion(direct_path.clone())
                 }
                 "cannot_raise" => call_control.mark_cannot_raise_assertion(direct_path.clone()),
+                "may_force" => call_control.mark_may_force_assertion(direct_path.clone()),
                 "elidable_or_memerror" => {
                     call_control.mark_memerror_only_assertion(direct_path.clone())
                 }
@@ -2629,6 +2632,7 @@ fn analyze_pipeline_from_module_paths(
                 "elidable" => call_control.mark_elidable(path.clone()),
                 "elidable_cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
                 "cannot_raise" => call_control.mark_cannot_raise_assertion(path.clone()),
+                "may_force" => call_control.mark_may_force_assertion(path.clone()),
                 "elidable_or_memerror" => call_control.mark_memerror_only_assertion(path.clone()),
                 "loopinvariant" => call_control.mark_loopinvariant(path.clone()),
                 "close_stack" => call_control.mark_close_stack(path.clone()),
@@ -2651,6 +2655,23 @@ fn analyze_pipeline_from_module_paths(
             fnaddr,
         );
     }
+    majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+        let addr = desc.get() as i64;
+        if addr == 0 {
+            return;
+        }
+        let Some((module_path_with_crate, impl_type_as_written, method)) =
+            desc.impl_fnaddr_binding()
+        else {
+            return;
+        };
+        call_control.register_macro_impl_helper_trace_fnaddr(
+            module_path_with_crate,
+            impl_type_as_written,
+            method,
+            addr,
+        );
+    });
     // RPython: GC transformer sets _gctransformer_hint_close_stack_,
     // _gctransformer_hint_cannot_collect_ on functions, and
     // random_effects_on_gcobjs on external function objects.

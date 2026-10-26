@@ -520,6 +520,106 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// Dest-Str restore of `null_mut()` / `null()` whose dest is an rstr
+    /// `STR` pointer (`*mut Utf8Str`). Residual `core::ptr::null_mut`
+    /// annotates classdef-less `SomeInstance` (`ptr_null_constant`); the
+    /// live STR arm is `SomeString` after dest-Str restore
+    /// (`ptr_cast_marker`). Their return merge is
+    /// `String ∪ Instance(classdef-less)`.
+    ///
+    /// RPython: `lltype.nullptr(STR)` unions as
+    /// `unionof(SomeString, s_None)` → `SomeString(can_be_None=True)`
+    /// (`annmodel.SomeString.noneify`, `rstr.py` nullable STR). Same
+    /// dest-Str paint [`FunctionGraph::push_niche_null`] already applies
+    /// to a string-value Option None (`option_niche_null_cast`).
+    pub(in crate::front::mir) fn str_family_ptr_null_cast(
+        &self,
+        dest_ty: &TyRef,
+    ) -> Option<(String, ValueType)> {
+        if !tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc) {
+            return None;
+        }
+        let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
+        is_rstr_str_layout_declaration(&root).then_some((root, ValueType::Str))
+    }
+
+    /// `core::ptr::null_mut` / `null` (and the `std::ptr` re-exports)
+    /// whose dest is an rstr `STR` pointer. A GC pointee is not
+    /// [`Self::try_lower_raw_adt_ptr_null`]; without dest-Str the
+    /// residual stays classdef-less.
+    pub(in crate::front::mir) fn try_lower_str_family_ptr_null(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !call.args.is_empty() {
+            return Ok(false);
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !is_core_ptr_null_fun_path(&path) {
+            return Ok(false);
+        }
+        let Some(cast) = self.str_family_ptr_null_cast(&call.dest.ty) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let res = self.graph.push_niche_null(bb_id, Some(&cast));
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `core::ptr::null_mut` / `null` whose dest is a declared two-field
+    /// `{integer, [T; 0]}` GcArray wrapper (`TypedItemsBlock`). Residual
+    /// `ptr_null_constant` is a classdef-less Instance; dest recast is
+    /// skipped when `result_ty` already names that root. The live malloc
+    /// arm is `SomePtr(GcArray)` (`flexible_gcarray_block_annotation`),
+    /// and `pairtype(SomePtr, SomeObject).union` is UnionError
+    /// (`llannotation.py`).
+    ///
+    /// RPython: `lltype.nullptr(GcArray(ITEM))` is
+    /// `cast_int_to_ptr(Ptr(GcArray(ITEM)), 0)` when `oddint == 0`
+    /// (`lltype.py` `ann_cast_int_to_ptr` → `SomePtr(PTRTYPE)`).
+    pub(in crate::front::mir) fn try_lower_gcarray_ptr_null(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !call.args.is_empty() {
+            return Ok(false);
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(path) = regular_call_name_path(reg, self.llbc) else {
+            return Ok(false);
+        };
+        if !is_core_ptr_null_fun_path(&path) {
+            return Ok(false);
+        }
+        let Some(item) = self.tyref_scalar_flexible_gcarray_item(&call.dest.ty) else {
+            return Ok(false);
+        };
+        let bb_id = self.emit_bb(mir_bb);
+        let res = emit_typed_nullptr(&mut self.graph, bb_id, ptr_gcarray_lltype(item));
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     /// Class-root argument of `null_raw` (`lltype.nullptr(T)`), or `None`
     /// to keep the GC `null_mut` lowering.
     ///
@@ -879,7 +979,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
         let bb_id = self.emit_bb(mir_bb);
@@ -1086,8 +1186,11 @@ impl<'a> Lowering<'a> {
             },
         });
         self.local_var[dest_local] = Some(LocalValue::One(result.clone()));
-        let suffix =
-            crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc);
+        let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
+            dest_ty,
+            self.llbc,
+            self.tombstoned_leaves,
+        );
         self.toint_call_results
             .push((result, suffix, ValueType::Int));
         let target_bb = self.block_id[target];
@@ -1152,7 +1255,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -1385,7 +1488,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let tuple_owner = format!("Tuple{suffix}");
         let bb_id = self.emit_bb(mir_bb);
@@ -1527,7 +1630,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc, self.tombstoned_leaves)
         );
         let arg = arg.clone();
         if src_is_signed_word {
@@ -1705,7 +1808,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
@@ -1907,7 +2010,7 @@ impl<'a> Lowering<'a> {
         let owner = format!(
             "{}{}",
             td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(result_ty, self.llbc)
+            tyref_enum_instantiation_suffix(result_ty, self.llbc, self.tombstoned_leaves)
         );
         let bb_id = self.emit_bb(mir_bb);
         let disc = self
