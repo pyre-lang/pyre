@@ -14209,13 +14209,17 @@ fn walker_guard_stamped_ref_pin<Sym: WalkSym>(
 }
 
 /// Pin a concrete int a fold baked in (strategy word, length, version tag).
-/// These boxes are getfield results, so the guard always records.
+/// A box the heapcache already replaced by a constant records nothing
+/// (`pyjitpl.py MIFrame.implement_guard_value`).
 fn walker_guard_fold_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     op: OpRef,
     value: i64,
 ) -> Result<(), DispatchError> {
+    if op.is_constant() {
+        return Ok(());
+    }
     let expected = ctx.trace_ctx.const_int(value);
     ctx.trace_ctx
         .record_guard(OpCode::GuardValue, &[op, expected], 0);

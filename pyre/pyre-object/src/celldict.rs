@@ -307,7 +307,7 @@ pub unsafe fn write_cell(
     let write =
         crate::with_roots!(w_cell_word, w_value => classify_cell_write(w_cell_word, w_value));
     match write {
-        CellWrite::InPlaceObject(_) => {
+        CellWrite::InPlaceObject => {
             let cell = w_cell_word;
             // Barrier before the store, the `remember_young_pointer` order. A
             // cell the collector does not own dirties the prebuilt walk. An
@@ -316,8 +316,9 @@ pub unsafe fn write_cell(
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
-        CellWrite::InPlaceInt(_, intvalue) => {
-            (*(w_cell_word as *mut IntMutableCell)).intvalue = intvalue;
+        CellWrite::InPlaceInt => {
+            (*(w_cell_word as *mut IntMutableCell)).intvalue =
+                crate::listobject::plain_int_w(w_value);
             None
         }
         CellWrite::Unchanged => None,
@@ -340,8 +341,8 @@ pub unsafe fn write_cell(
 enum CellWrite {
     /// Write through the existing cell; the stored pointer, and therefore
     /// `version?`, stands.
-    InPlaceObject(PyObjectRef),
-    InPlaceInt(PyObjectRef, i64),
+    InPlaceObject,
+    InPlaceInt,
     /// The slot already holds this exact value.
     Unchanged,
     /// No cell yet: store the value itself, without a level of indirection.
@@ -359,10 +360,10 @@ unsafe fn classify_cell_write(w_cell: PyObjectRef, w_value: PyObjectRef) -> Cell
         return CellWrite::StoreBare;
     }
     if is_object_mutable_cell(w_cell) {
-        return CellWrite::InPlaceObject(w_cell);
+        return CellWrite::InPlaceObject;
     }
     if is_int_mutable_cell(w_cell) && crate::listobject::is_plain_int1(w_value) {
-        return CellWrite::InPlaceInt(w_cell, crate::listobject::plain_int_w(w_value));
+        return CellWrite::InPlaceInt;
     }
     // If the new value and the current value are the same, don't
     // create a level of indirection, or mutate the version.
