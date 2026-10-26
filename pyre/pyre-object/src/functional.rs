@@ -1028,7 +1028,7 @@ pub fn w_range_new(
     let start = crate::gc_roots::shadow_stack_get(start_slot);
     let stop = crate::gc_roots::shadow_stack_get(stop_slot);
     let step = crate::gc_roots::shadow_stack_get(step_slot);
-    W_Range::allocate_stable(W_Range {
+    W_Range::allocate(W_Range {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -1526,7 +1526,7 @@ pub fn w_long_range_iter_new(
     let start = crate::gc_roots::shadow_stack_get(start_slot);
     let step = crate::gc_roots::shadow_stack_get(step_slot);
     let len = crate::gc_roots::shadow_stack_get(len_slot);
-    W_LongRangeIterator::allocate_stable(W_LongRangeIterator {
+    W_LongRangeIterator::allocate(W_LongRangeIterator {
         ob: PyObject {
             ob_type: std::ptr::null(),
             w_class: std::ptr::null_mut(),
@@ -1551,9 +1551,17 @@ pub unsafe fn is_long_range_iter(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_LongRangeIterator`.
 pub unsafe fn w_long_range_iter_len(obj: PyObjectRef) -> BigInt {
     unsafe {
-        let it = obj as *const W_LongRangeIterator;
-        let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
-        let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let len = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(slot) as *const W_LongRangeIterator)).len,
+        ));
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let index = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(slot) as *const W_LongRangeIterator)).index,
+        ));
         let rem = RBigIntGcRoot::new(len.sub(&index));
         if rem.int_lt(0) {
             BigInt::from(0)
@@ -1594,9 +1602,17 @@ pub unsafe fn w_long_range_iter_set_index(obj: PyObjectRef, index: PyObjectRef) 
 /// `obj` must point to a valid `W_LongRangeIterator`.
 pub unsafe fn w_long_range_iter_has_next(obj: PyObjectRef) -> bool {
     unsafe {
-        let it = obj as *const W_LongRangeIterator;
-        let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
-        let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
+        let _roots = crate::gc_roots::push_roots();
+        let slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(obj);
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let index = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(slot) as *const W_LongRangeIterator)).index,
+        ));
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let len = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(slot) as *const W_LongRangeIterator)).len,
+        ));
         *index < *len
     }
 }
@@ -1615,12 +1631,21 @@ pub unsafe fn w_long_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
         let obj = crate::gc_roots::pin_root(obj);
         let it = obj as *mut W_LongRangeIterator;
         let index = RBigIntGcRoot::new(range_obj_to_bigint((*it).index));
-        let len = RBigIntGcRoot::new(range_obj_to_bigint((*it).len));
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let len = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(iter_slot) as *const W_LongRangeIterator)).len,
+        ));
         if *index >= *len {
             return None;
         }
-        let start = RBigIntGcRoot::new(range_obj_to_bigint((*it).start));
-        let step = RBigIntGcRoot::new(range_obj_to_bigint((*it).step));
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let start = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(iter_slot) as *const W_LongRangeIterator)).start,
+        ));
+        // gct_fv_gc_malloc reloads live refs after `range_obj_to_bigint`.
+        let step = RBigIntGcRoot::new(range_obj_to_bigint(
+            (*(crate::gc_roots::shadow_stack_get(iter_slot) as *const W_LongRangeIterator)).step,
+        ));
         // `w_result = self.w_index * self.w_step + self.w_start`, then
         // `self.w_index = self.w_index + 1` (wrapped, arbitrary precision).
         // `next_index` is wrapped before `value`; that first allocation may
@@ -1643,7 +1668,7 @@ mod range_obj_tests {
 
     #[test]
     fn w_range_object_size_matches_descr() {
-        // Auto-id `allocate_stable` (GC-managed): the tid is assigned at JIT
+        // Auto-id `allocate` (GC-managed): the tid is assigned at JIT
         // init, so there is no compile-time `W_RANGE_GC_TYPE_ID` to check.
         assert_eq!(
             <W_Range as crate::lltype::GcType>::SIZE,
@@ -1684,6 +1709,33 @@ mod range_obj_tests {
             assert_eq!(crate::intobject::w_int_get_value(v1), 7);
             let v2 = w_long_range_iter_next(it).unwrap();
             assert_eq!(crate::intobject::w_int_get_value(v2), 9);
+            assert!(w_long_range_iter_next(it).is_none());
+        }
+    }
+
+    #[test]
+    fn long_range_iter_len_has_next_next_machine_ints() {
+        // Machine-int fields so `range_obj_to_bigint` allocates digits.
+        let it = w_long_range_iter_new(
+            crate::intobject::w_int_new(5),
+            crate::intobject::w_int_new(2),
+            crate::intobject::w_int_new(3),
+        );
+        unsafe {
+            assert_eq!(w_long_range_iter_len(it), BigInt::from(3));
+            assert!(w_long_range_iter_has_next(it));
+            let v0 = w_long_range_iter_next(it).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(v0), 5);
+            assert_eq!(w_long_range_iter_len(it), BigInt::from(2));
+            assert!(w_long_range_iter_has_next(it));
+            let v1 = w_long_range_iter_next(it).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(v1), 7);
+            assert_eq!(w_long_range_iter_len(it), BigInt::from(1));
+            assert!(w_long_range_iter_has_next(it));
+            let v2 = w_long_range_iter_next(it).unwrap();
+            assert_eq!(crate::intobject::w_int_get_value(v2), 9);
+            assert_eq!(w_long_range_iter_len(it), BigInt::from(0));
+            assert!(!w_long_range_iter_has_next(it));
             assert!(w_long_range_iter_next(it).is_none());
         }
     }
