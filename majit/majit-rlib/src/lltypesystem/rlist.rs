@@ -533,13 +533,28 @@ fn rlist_overallocate_signed(newsize: i64) -> i64 {
     newsize.wrapping_add(some)
 }
 
+/// `_ll_prebuilt_empty_array(GcArray(Signed))` (`rlist.py`, `specialize:memo`):
+/// the prebuilt empty items array lives in the binary's data, like the
+/// translated constant.
+static LL_PREBUILT_EMPTY_SIGNED_ITEMS: TypedItemsBlock = TypedItemsBlock {
+    capacity: 0,
+    items: [],
+};
+
 fn ll_prebuilt_empty_signed_items_block() -> *mut TypedItemsBlock {
-    static PREBUILT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *PREBUILT.get_or_init(|| unsafe {
-        let block = alloc_typed_items_block_immortal(0);
-        (*block).capacity = 0;
-        block as usize
-    }) as *mut TypedItemsBlock
+    std::ptr::addr_of!(LL_PREBUILT_EMPTY_SIGNED_ITEMS) as *mut TypedItemsBlock
+}
+
+/// `_ll_prebuilt_empty_array(GcArray(Float))` (`rlist.py`, `specialize:memo`):
+/// the prebuilt empty items array lives in the binary's data, like the
+/// translated constant.
+static LL_PREBUILT_EMPTY_FLOAT_ITEMS: TypedItemsBlock = TypedItemsBlock {
+    capacity: 0,
+    items: [],
+};
+
+fn ll_prebuilt_empty_float_items_block() -> *mut TypedItemsBlock {
+    std::ptr::addr_of!(LL_PREBUILT_EMPTY_FLOAT_ITEMS) as *mut TypedItemsBlock
 }
 
 fn clamp_repeat_count(count: i64) -> usize {
@@ -558,17 +573,21 @@ unsafe fn fill_typed_items_block<T: Copy>(block: *mut TypedItemsBlock, count: us
     }
 }
 
-/// Residual CondCall target of `_ll_list_resize_ge` (`rlist.py
-/// _ll_list_resize_hint_really`) for the Signed GC `ListRepr`.
-/// `dont_look_inside` publishes this to `HELPER_FNADDRS`.
-#[majit_macros::dont_look_inside]
-pub fn _ll_list_resize_hint_really(l: *mut GcList, newsize: i64, overallocate: bool) {
+/// `_ll_list_resize_hint_really` body shared by the 8-byte-item `GcArray`
+/// specializations; the copy is a word copy.
+unsafe fn ll_list_resize_hint_really_words(
+    l: *mut GcList,
+    newsize: i64,
+    overallocate: bool,
+    type_id: u32,
+    empty: *mut TypedItemsBlock,
+) {
     unsafe {
         if newsize <= 0 {
             debug_assert!(newsize == 0, "negative list length");
             (*l).length = 0;
             majit_gc::gc_write_barrier(majit_ir::GcRef(l as usize));
-            (*l).items = ll_prebuilt_empty_signed_items_block();
+            (*l).items = empty;
             return;
         }
         let new_allocated = if overallocate {
@@ -577,15 +596,17 @@ pub fn _ll_list_resize_hint_really(l: *mut GcList, newsize: i64, overallocate: b
             newsize
         };
         if new_allocated <= 0 {
-            std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>());
+            // Overflowed overallocation is negative and `malloc` raises.
+            majit_gc::raise_memory_error();
+            return;
         }
         let mut roots = [majit_ir::GcRef(l as usize)];
-        let newitems = try_alloc_typed_items_block_nursery_rooted(
-            new_allocated as usize,
-            gc_int_array_gc_type_id(),
-            &mut roots,
-        )
-        .unwrap_or_else(|| std::alloc::handle_alloc_error(Layout::new::<TypedItemsBlock>()));
+        let Some(newitems) =
+            try_alloc_typed_items_block_nursery_rooted(new_allocated as usize, type_id, &mut roots)
+        else {
+            majit_gc::raise_memory_error();
+            return;
+        };
         let l = roots[0].0 as *mut GcList;
         let before_len = (*l).length;
         if before_len != 0 {
@@ -605,6 +626,38 @@ pub fn _ll_list_resize_hint_really(l: *mut GcList, newsize: i64, overallocate: b
         }
         majit_gc::gc_write_barrier(majit_ir::GcRef(l as usize));
         (*l).items = newitems;
+    }
+}
+
+/// Residual CondCall target of `_ll_list_resize_ge` (`rlist.py
+/// _ll_list_resize_hint_really`) for the Signed GC `ListRepr`.
+/// `dont_look_inside` publishes this to `HELPER_FNADDRS`.
+#[majit_macros::dont_look_inside]
+pub fn _ll_list_resize_hint_really(l: *mut GcList, newsize: i64, overallocate: bool) {
+    unsafe {
+        ll_list_resize_hint_really_words(
+            l,
+            newsize,
+            overallocate,
+            gc_int_array_gc_type_id(),
+            ll_prebuilt_empty_signed_items_block(),
+        )
+    }
+}
+
+/// Residual CondCall target of `_ll_list_resize_ge` (`rlist.py
+/// _ll_list_resize_hint_really`) for the Float GC `ListRepr`.
+/// `dont_look_inside` publishes this to `HELPER_FNADDRS`.
+#[majit_macros::dont_look_inside]
+pub fn _ll_list_resize_hint_really_f(l: *mut GcList, newsize: i64, overallocate: bool) {
+    unsafe {
+        ll_list_resize_hint_really_words(
+            l,
+            newsize,
+            overallocate,
+            gc_float_array_gc_type_id(),
+            ll_prebuilt_empty_float_items_block(),
+        )
     }
 }
 
@@ -733,6 +786,7 @@ mod tests {
             "_ll_fixed_alloc_and_set_nonnull_i_trampoline",
             "_ll_fixed_alloc_and_set_nonnull_f_trampoline",
             "_ll_list_resize_hint_really",
+            "_ll_list_resize_hint_really_f",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
@@ -772,6 +826,45 @@ mod tests {
     }
 
     #[test]
+    fn hint_really_grows_float_list() {
+        if majit_gc::gc_allocator_installed() {
+            return;
+        }
+        let items = _ll_fixed_alloc_and_set_nonnull_f_trampoline(3, 0.0);
+        unsafe {
+            let base = typed_items_block_items_base(items) as *mut f64;
+            *base = 10.0;
+            *base.add(1) = 20.0;
+            *base.add(2) = 30.0;
+        }
+        let list = Box::into_raw(Box::new(GcList { length: 3, items }));
+        _ll_list_resize_hint_really_f(list, 10, true);
+        unsafe {
+            assert_eq!((*list).length, 3);
+            let grown = (*list).items;
+            assert!(typed_items_block_capacity(grown) > 3);
+            let base = typed_items_block_items_base(grown) as *const f64;
+            assert_eq!(*base, 10.0);
+            assert_eq!(*base.add(1), 20.0);
+            assert_eq!(*base.add(2), 30.0);
+            let _ = Box::from_raw(list);
+        }
+    }
+
+    #[test]
+    fn ll_list_resize_hint_really_to_zero_uses_static_empty_block() {
+        let mut l = GcList {
+            length: 3,
+            items: core::ptr::NonNull::<TypedItemsBlock>::dangling().as_ptr(),
+        };
+        _ll_list_resize_hint_really(&mut l, 0, true);
+        assert_eq!(l.length, 0);
+        assert_eq!(l.items, ll_prebuilt_empty_signed_items_block());
+        _ll_list_resize_hint_really(&mut l, 0, true);
+        assert_eq!(l.items, ll_prebuilt_empty_signed_items_block());
+    }
+
+    #[test]
     fn hint_really_newsize_zero_resets_to_prebuilt_empty() {
         if majit_gc::gc_allocator_installed() {
             return;
@@ -788,5 +881,27 @@ mod tests {
             assert_eq!(empty1, empty2);
             let _ = Box::from_raw(list);
         }
+    }
+
+    #[test]
+    fn ll_list_resize_hint_really_negative_size_raises_memory_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static HITS: AtomicUsize = AtomicUsize::new(0);
+        fn hook() {
+            HITS.fetch_add(1, Ordering::SeqCst);
+        }
+        static RAISE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        HITS.store(0, Ordering::SeqCst);
+        majit_gc::set_active_raise_memory_error(Some(hook));
+        let mut l = GcList {
+            length: 0,
+            items: core::ptr::null_mut(),
+        };
+        _ll_list_resize_hint_really(&mut l, i64::MAX, true);
+        majit_gc::set_active_raise_memory_error(None);
+        assert_eq!(HITS.load(Ordering::SeqCst), 1);
+        assert!(l.items.is_null());
+        assert_eq!(l.length, 0);
     }
 }

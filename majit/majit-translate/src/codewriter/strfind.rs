@@ -59,6 +59,7 @@ pub const SEARCH_ELIDABLE: &str = "_search_elidable";
 pub const SEARCH_NORMAL: &str = "_search_normal";
 /// `rlist.py _ll_list_resize_hint_really` original body.
 const LL_LIST_RESIZE_HINT_REALLY: &str = "_ll_list_resize_hint_really";
+const LL_LIST_RESIZE_HINT_REALLY_F: &str = "_ll_list_resize_hint_really_f";
 /// `look_inside_iff` wrapper residualized by `_ll_list_resize_ge`.
 const LL_LIST_RESIZE_HINT_REALLY_WRAPPER: &str = "_ll_list_resize_hint_really_look_inside_iff";
 /// `dont_look_inside` trampoline the wrapper's false arm `direct_call`s.
@@ -87,6 +88,11 @@ fn search_normal_fnaddr_path() -> String {
 #[cfg(test)]
 fn ll_list_resize_hint_really_fnaddr_path() -> String {
     format!("majit_rlib::lltypesystem::rlist::{LL_LIST_RESIZE_HINT_REALLY}")
+}
+
+#[cfg(test)]
+fn ll_list_resize_hint_really_f_fnaddr_path() -> String {
+    format!("majit_rlib::lltypesystem::rlist::{LL_LIST_RESIZE_HINT_REALLY_F}")
 }
 
 /// `description.py FunctionDesc.cachedgraph` `nameof` on one lltype.
@@ -725,9 +731,12 @@ fn ll_list_resize_hint_really_fnaddr_key() -> CallPath {
     CallPath::from_segments(["lltypesystem", "rlist", LL_LIST_RESIZE_HINT_REALLY])
 }
 
+fn ll_list_resize_hint_really_f_fnaddr_key() -> CallPath {
+    CallPath::from_segments(["lltypesystem", "rlist", LL_LIST_RESIZE_HINT_REALLY_F])
+}
+
 /// Alias a synthesized `_ll_list_resize_hint_really*` CallPath onto the
-/// Signed `HELPER_FNADDRS` row (`bind_kind_trampoline_fnaddr`). A
-/// non-Signed ITEM has no native row.
+/// `HELPER_FNADDRS` row of its ITEM (`Signed` or `Float`).
 fn bind_ll_list_resize_hint_really_fnaddr(
     cc: &mut CallControl,
     dest: &CallPath,
@@ -748,16 +757,18 @@ fn bind_ll_list_resize_hint_really_fnaddr(
                 .unwrap_or_else(|| "missing".to_string())
         );
     };
-    if item != LowLevelType::Signed {
-        panic!(
+    // One native body per `typeOf(l).TO.items.TO` specialization.
+    let src = match item {
+        LowLevelType::Signed => ll_list_resize_hint_really_fnaddr_key(),
+        LowLevelType::Float => ll_list_resize_hint_really_f_fnaddr_key(),
+        other => panic!(
             "_ll_list_resize_hint_really has no native row for item lltype {}",
-            item.short_name()
-        );
-    }
+            other.short_name()
+        ),
+    };
     if cc.lookup_function_fnaddr(dest).is_some() {
         return;
     }
-    let src = ll_list_resize_hint_really_fnaddr_key();
     if cc.lookup_function_fnaddr(&src).is_some() {
         cc.alias_function_fnaddr(dest.clone(), &src);
     }
@@ -2378,11 +2389,11 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "_ll_list_resize_hint_really has no native row")]
-    fn ll_list_resize_hint_really_non_signed_item_has_no_native_row() {
+    fn ll_list_resize_hint_really_char_item_has_no_native_row() {
         use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, Struct};
 
         let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Array(Array::gc(LowLevelType::Float)),
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Char)),
         }));
         let list = Struct::gc(
             "list",
@@ -2419,6 +2430,38 @@ mod tests {
         LowLevelType::Ptr(Box::new(Ptr {
             TO: PtrTarget::Struct(list),
         }))
+    }
+
+    fn float_list_ptr() -> LowLevelType {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, Struct};
+
+        let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Float)),
+        }));
+        let list = Struct::gc(
+            "list",
+            vec![
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items_ptr),
+            ],
+        );
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(list),
+        }))
+    }
+
+    #[test]
+    fn ll_list_resize_hint_really_float_item_binds_float_row() {
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr(&ll_list_resize_hint_really_fnaddr_path(), 0x5000);
+        cc.register_macro_helper_trace_fnaddr(&ll_list_resize_hint_really_f_fnaddr_path(), 0x6000);
+        let dest = CallPath::from_segments([LL_LIST_RESIZE_HINT_REALLY_WRAPPER]);
+        bind_ll_list_resize_hint_really_fnaddr(
+            &mut cc,
+            &dest,
+            &[float_list_ptr(), LowLevelType::Signed, LowLevelType::Bool],
+        );
+        assert_eq!(cc.lookup_function_fnaddr(&dest), Some(0x6000));
     }
 
     /// A residual synthesized helper with no `HELPER_FNADDRS` family is a

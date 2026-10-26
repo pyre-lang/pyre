@@ -323,11 +323,14 @@ fn install_gc_box(mut gc: Box<dyn GcAllocator>) -> JitframeDescrFacts {
 
 /// `transform.py _ll_malloc_fixedsize` OOM: `jit_exc_raise` of the
 /// prebuilt MemoryError singleton, then the allocator returns NULL.
+/// A zero singleton means the runtime cannot raise (`debug.py fatalerror`).
 fn raise_memory_error() {
     let v = majit_backend::memory_error_singleton_ref();
-    if v != 0 {
-        jit_exc_raise(v);
+    if v == 0 {
+        eprintln!("fatal error: MemoryError raised with no runtime installed");
+        std::process::abort();
     }
+    jit_exc_raise(v);
 }
 
 /// Register all backend-agnostic `majit_gc::set_active_*` hooks to the
