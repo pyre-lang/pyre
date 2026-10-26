@@ -3525,17 +3525,16 @@ fn emit_frontend_store_name(
 ) {
     // pyopcode.py STORE_NAME ->
     // `setitem_str(getorcreatedebug().w_locals, varname, w_newvalue)`.
-    // Frame-receiver call shape like `emit_frontend_load_name`; lowers
-    // to `bh_store_name_fn(frame, w_name, value)`
-    // (`flatten::lower_store_name_hlop_to_insn`).  See
-    // `emit_frontend_setitem` for the void-result rationale.
-    record_graph_op(
-        block,
-        "store_name",
-        vec![frame.into(), name.into(), value.into()],
-        None,
-        offset,
-    );
+    // When `store_name_value_w` is fully bound, record the named graph
+    // op flatten lowers to `inline_call_r_v` of that interpreter body
+    // (`celldict.py ModuleDictStrategy.setitem_str`). Otherwise keep
+    // the `bh_store_name_fn` residual (`flatten::lower_store_name_hlop_to_insn`).
+    let args = vec![frame.into(), name.into(), value.into()];
+    if fully_bound_callee_body(inline_call_targets::STORE_NAME_VALUE_W).is_some() {
+        emit_graph_op_void(block, "store_name", args, offset);
+    } else {
+        record_graph_op(block, "store_name", args, None, offset);
+    }
 }
 
 fn emit_frontend_store_global(
@@ -3547,17 +3546,17 @@ fn emit_frontend_store_global(
     offset: i64,
 ) {
     // pyopcode.py STORE_GLOBAL — writes the value directly into
-    // `w_globals`, bypassing `w_locals`.  Frame-receiver call shape like
-    // `emit_frontend_store_name`; lowers to `bh_store_global_fn(frame,
-    // w_name, value)` (`flatten::lower_store_global_hlop_to_insn`).  See
-    // `emit_frontend_setitem` for the void-result rationale.
-    record_graph_op(
-        block,
-        "store_global",
-        vec![frame.into(), name.into(), value.into()],
-        None,
-        offset,
-    );
+    // `w_globals`, bypassing `w_locals`.  When `store_global_value_w` is
+    // fully bound, record the named graph op flatten lowers to
+    // `inline_call_r_v` of that interpreter body (`celldict.py
+    // ModuleDictStrategy.setitem_str`). Otherwise keep the
+    // `bh_store_global_fn` residual (`flatten::lower_store_global_hlop_to_insn`).
+    let args = vec![frame.into(), name.into(), value.into()];
+    if fully_bound_callee_body(inline_call_targets::STORE_GLOBAL_VALUE_W).is_some() {
+        emit_graph_op_void(block, "store_global", args, offset);
+    } else {
+        record_graph_op(block, "store_global", args, None, offset);
+    }
 }
 
 /// `LOAD_LOCALS` / `LOAD_BUILD_CLASS` — the two class-body frame methods whose
@@ -11965,9 +11964,9 @@ impl CodeWriter {
                         Instruction::StoreName { namei } => {
                             // pyopcode.py STORE_NAME — pops the value
                             // and writes it into `w_locals` via the
-                            // `store_name` HLOp → `bh_store_name_fn(frame,
-                            // w_name, value)` residual call, which the
-                            // full-body walker traces.
+                            // `store_name` HLOp.  Flatten inlines
+                            // `store_name_value_w` when that body is
+                            // fully bound, else `bh_store_name_fn`.
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());
@@ -11985,11 +11984,11 @@ impl CodeWriter {
                         Instruction::StoreGlobal { namei } => {
                             // pyopcode.py STORE_GLOBAL — pops the value and
                             // writes it directly into `w_globals` (bypassing
-                            // `w_locals`) via the `store_global` HLOp →
-                            // `bh_store_global_fn(frame, w_name, value)`
-                            // residual call, which the full-body walker traces.
-                            // Same void 3-Ref shape as the
-                            // StoreName arm.
+                            // `w_locals`) via the `store_global` HLOp.
+                            // Flatten inlines `store_global_value_w` when
+                            // that body is fully bound, else
+                            // `bh_store_global_fn`. Same void 3-Ref shape
+                            // as the StoreName arm.
                             let name_idx = namei.get(op_arg) as usize;
                             let attr_name =
                                 super::flow::Constant::string(code.names[name_idx].as_str());

@@ -682,6 +682,10 @@ fn i64_ty() -> Value {
     json!({"Scalar": {"Integer": {"Signed": "I64"}}})
 }
 
+fn bool_ty() -> Value {
+    json!({"Scalar": "Bool"})
+}
+
 fn u64_ty() -> Value {
     json!({"Scalar": {"Integer": {"Unsigned": "U64"}}})
 }
@@ -739,6 +743,12 @@ enum Pass {
     Direct { ret_local: u64 },
     /// Copy the word, then pass `&mut` of the original, then return the copy.
     CopyThenMutBorrow,
+    /// `_p = &raw mut word`, then pass `_p`.
+    RawPtrOfLocal { ret_local: u64 },
+    /// `_b = &mut word; _p = &raw mut *_b`, then pass `_p`.
+    RawReborrow { ret_local: u64 },
+    /// `_b = &mut word; _p = _b as *mut T`, then pass `_p`.
+    CastMutToRaw { ret_local: u64 },
 }
 
 fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass) -> FunctionGraph {
@@ -812,6 +822,61 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                 vec![json!({"Copy": place(1, &flag)}), json!({"Move": borrow})],
                 place(5, &ret),
                 3,
+            )
+        }
+        Pass::RawPtrOfLocal { ret_local } => {
+            let ptr_ty = raw_ptr(word_ty, "Mut");
+            locals.push(local(3, None, &ptr_ty));
+            locals.push(local(4, None, &ret));
+            let word = place(2, word_ty);
+            let raw = place(3, &ptr_ty);
+            (
+                vec![raw_mut_assign(3, &ptr_ty, word)],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
+                place(4, &ret),
+                ret_local,
+            )
+        }
+        Pass::RawReborrow { ret_local } => {
+            let borrowed = borrow_ty(word_ty, "Mut");
+            let ptr_ty = raw_ptr(word_ty, "Mut");
+            locals.push(local(3, None, &borrowed));
+            locals.push(local(4, None, &ptr_ty));
+            locals.push(local(5, None, &ret));
+            let word = place(2, word_ty);
+            let borrow = place(3, &borrowed);
+            let raw = place(4, &ptr_ty);
+            (
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word.clone(), "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    raw_mut_assign(4, &ptr_ty, deref_place(borrow, word_ty)),
+                ],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
+                place(5, &ret),
+                ret_local,
+            )
+        }
+        Pass::CastMutToRaw { ret_local } => {
+            let borrowed = borrow_ty(word_ty, "Mut");
+            let ptr_ty = raw_ptr(word_ty, "Mut");
+            locals.push(local(3, None, &borrowed));
+            locals.push(local(4, None, &ptr_ty));
+            locals.push(local(5, None, &ret));
+            let word = place(2, word_ty);
+            let borrow = place(3, &borrowed);
+            let raw = place(4, &ptr_ty);
+            (
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_to(raw.clone(), ptr_cast(borrow, &borrowed, &ptr_ty)),
+                ],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw})],
+                place(5, &ret),
+                ret_local,
             )
         }
     };
@@ -933,8 +998,19 @@ fn assert_no_raw_address(graph: &FunctionGraph, label: &str) {
 }
 
 fn assert_address_spill(graph: &FunctionGraph, copy_out: bool, return_is_reload: bool) {
+    assert_address_spill_word(graph, "keyhash", 8, true, copy_out, return_is_reload);
+}
+
+fn assert_address_spill_word(
+    graph: &FunctionGraph,
+    word_name: &str,
+    itemsize: usize,
+    is_item_signed: bool,
+    copy_out: bool,
+    return_is_reload: bool,
+) {
     let flag = input_var(graph, "flag");
-    let keyhash = input_var(graph, "keyhash");
+    let word = input_var(graph, word_name);
     let mallocs = raw_ops(graph, |kind| matches!(kind, OpKind::RawMalloc { .. }));
     assert_eq!(
         mallocs.len(),
@@ -962,15 +1038,19 @@ fn assert_address_spill(graph: &FunctionGraph, copy_out: bool, return_is_reload:
             offset,
             value,
             item_ty: ValueType::Int,
-            itemsize: 8,
-            is_item_signed: true,
-        } if base == ptr && value == keyhash => {
+            itemsize: store_size,
+            is_item_signed: store_signed,
+        } if base == ptr
+            && value == word
+            && *store_size == itemsize
+            && *store_signed == is_item_signed =>
+        {
             assert!(
                 matches!(defining_op(graph, offset), Some(OpKind::ConstInt(0))),
                 "store offset is the zero constant"
             );
         }
-        other => panic!("store must write keyhash through the spill, got {other:?}"),
+        other => panic!("store must write {word_name} through the spill, got {other:?}"),
     }
     let call = sink_call(graph);
     assert_eq!(call_arg(call, 0), flag, "flag stays the first argument");
@@ -1021,9 +1101,9 @@ fn assert_address_spill(graph: &FunctionGraph, copy_out: bool, return_is_reload:
                 base,
                 offset,
                 item_ty: ValueType::Int,
-                itemsize: 8,
-                is_item_signed: true,
-            } if base == ptr => {
+                itemsize: load_size,
+                is_item_signed: load_signed,
+            } if base == ptr && *load_size == itemsize && *load_signed == is_item_signed => {
                 assert!(matches!(
                     defining_op(graph, offset),
                     Some(OpKind::ConstInt(0))
@@ -1046,19 +1126,15 @@ fn assert_address_spill(graph: &FunctionGraph, copy_out: bool, return_is_reload:
             Some(OpKind::RawLoad {
                 base,
                 item_ty: ValueType::Int,
-                itemsize: 8,
-                is_item_signed: true,
+                itemsize: load_size,
+                is_item_signed: load_signed,
                 ..
-            }) if base == ptr => {}
+            }) if base == ptr && *load_size == itemsize && *load_signed == is_item_signed => {}
             other => panic!("the caller must observe the reloaded word, got {other:?}"),
         }
     } else {
         match returned {
-            Some(OpKind::Input {
-                name,
-                ty: ValueType::Int,
-                ..
-            }) if name == "keyhash" => {}
+            Some(OpKind::Input { name, .. }) if name == word_name => {}
             other => panic!("the returned word must stay the pre-call input, got {other:?}"),
         }
     }
@@ -1077,6 +1153,54 @@ fn mut_borrow_of_i64_passed_to_raw_pointer_reloads_the_word() {
         },
     );
     assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn raw_mut_of_i64_local_passed_as_pointer_reloads_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::RawPtrOfLocal { ret_local: 2 },
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn raw_reborrow_of_i64_local_passed_as_pointer_reloads_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::RawReborrow { ret_local: 2 },
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn cast_mut_i64_local_to_raw_pointer_reloads_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::CastMutToRaw { ret_local: 2 },
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+#[test]
+fn raw_reborrow_of_bool_local_passed_as_pointer_reloads_the_word() {
+    let word = bool_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::RawReborrow { ret_local: 2 },
+    );
+    assert_address_spill_word(&graph, "keyhash", 1, false, true, true);
 }
 
 #[test]
@@ -1919,18 +2043,36 @@ fn raw_pointer_to_the_spilled_place_uses_that_address() {
 }
 
 #[test]
-fn raw_pointer_to_another_place_stays_put() {
-    let graph = lower_raw_alias(RawAlias::OtherPlace).unwrap_or_else(|err| {
-        panic!("a raw pointer of another place must still free the spill: {err}")
-    });
+fn raw_pointer_to_another_place_gets_its_own_address() {
+    let graph = lower_raw_alias(RawAlias::OtherPlace)
+        .unwrap_or_else(|err| panic!("a raw pointer of another bare local must spill: {err}"));
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert_eq!(
+        ptrs.len(),
+        2,
+        "one address per bare local\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(&ptrs[0], &ptrs[1]);
     let call = sink_call(&graph);
-    assert_eq!(call_arg(call, 0), &ptrs[0]);
-    assert_ne!(call_arg(call, 1), &ptrs[0]);
+    let arg0 = call_arg(call, 0);
+    let arg1 = call_arg(call, 1);
+    assert_ne!(arg0, arg1, "the two places do not share an address");
     assert!(
-        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+        ptrs.iter().any(|ptr| ptr == arg0),
+        "first argument is a spill address\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ptrs.iter().any(|ptr| ptr == arg1),
+        "second argument is a spill address\n{}",
+        op_lines(&graph)
+    );
+    let frees = raw_ops(&graph, |kind| matches!(kind, OpKind::RawFree { .. }));
+    assert_eq!(
+        frees.len(),
+        2,
+        "each spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
@@ -8573,6 +8715,412 @@ fn two_null_checks_still_free() {
 #[test]
 fn null_check_beside_an_ordering_is_not_lowered() {
     assert_sink_escapes(&i64_ty(), &two_returned_comparisons("Lt"));
+}
+
+fn gcref_ty() -> Value {
+    adt_ty(0, vec![])
+}
+
+fn gcref_decl() -> Value {
+    gcref_decl_at(0)
+}
+
+fn gcref_decl_at(id: u64) -> Value {
+    named_decl(
+        id,
+        &["majit_ir", "value", "GcRef"],
+        json!({"Struct": [field_decl("0", &usize_ty())]}),
+    )
+}
+
+/// Pointer-niche `Option` so `tyref_is_niche_option_ptr` sees a one-word
+/// nullable payload. `size` 8 with no `Branch` tag is that layout.
+fn option_niche_decl() -> Value {
+    decl_with_layout(
+        0,
+        &["core", "option", "Option"],
+        json!({"Enum": [
+            {"name": "None", "fields": []},
+            {"name": "Some", "fields": [field_decl("0", &json!({"TypeVar": {"Bound": [0, 0]}}))]}
+        ]}),
+        json!([{"key": "host", "value": {"size": 8, "align": 8}}]),
+    )
+}
+
+fn bool_true_use() -> Value {
+    json!({"Use": [{"Const": [{"Bool": true}, {"Scalar": "Bool"}]}, "Yes"]})
+}
+
+/// `f(tid, size, &mut flag) -> GcRef` with a function-local `flag`.
+/// `size` is a `usize` parameter; the callee is bodyless.
+fn lower_fresh_cell_gcref(
+    extra_address_take: bool,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    lower_fresh_cell_into(&gcref_ty(), vec![gcref_decl()], extra_address_take)
+}
+
+/// Bodyless `fn(u32, usize, *mut bool) -> ret` with a fresh `&mut bool` local.
+fn lower_fresh_cell_into(
+    ret: &Value,
+    type_decls: Vec<Value>,
+    extra_address_take: bool,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    lower_fresh_cell_into_sink(
+        ret,
+        type_decls,
+        extra_address_take,
+        json!("Opaque"),
+        &[],
+        &[],
+        None,
+    )
+}
+
+/// `fn(u32, usize, *mut bool, ...extra) -> ret` with a fresh `&mut bool` local.
+fn lower_fresh_cell_into_sink(
+    ret: &Value,
+    type_decls: Vec<Value>,
+    extra_address_take: bool,
+    sink_body: Value,
+    extra_funs: &[Value],
+    extra_sink_inputs: &[Value],
+    extra_caller_param: Option<&Value>,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, generics, _, local) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let flag_ty = bool_ty();
+    let borrowed = borrow_ty(&flag_ty, "Mut");
+    let raw_flag = raw_ptr(&flag_ty, "Mut");
+    let ret = ret.clone();
+    let flag_local = if extra_caller_param.is_some() {
+        4u64
+    } else {
+        3
+    };
+    let borrow_local = flag_local + 1;
+    let extra_take_local = borrow_local + 1;
+    let dest_local = if extra_address_take {
+        extra_take_local + 1
+    } else {
+        extra_take_local
+    };
+    let arg_count = if extra_caller_param.is_some() {
+        3u64
+    } else {
+        2
+    };
+    let mut locals = vec![
+        local(0, None, &ret),
+        local(1, Some("tid"), &tid_ty),
+        local(2, Some("size"), &size_ty),
+    ];
+    if let Some(ty) = extra_caller_param {
+        locals.push(local(3, Some("slot"), ty));
+    }
+    locals.push(local(flag_local, Some("flag"), &flag_ty));
+    locals.push(local(borrow_local, None, &borrowed));
+    if extra_address_take {
+        locals.push(local(extra_take_local, Some("extra"), &raw_flag));
+    }
+    locals.push(local(dest_local, None, &ret));
+    let mut statements = vec![
+        assign_to(place(flag_local, &flag_ty), bool_true_use()),
+        ref_assign_mut(borrow_local, &borrowed, place(flag_local, &flag_ty)),
+    ];
+    if extra_address_take {
+        statements.push(raw_mut_assign(
+            extra_take_local,
+            &raw_flag,
+            place(flag_local, &flag_ty),
+        ));
+    }
+    let mut call_args = vec![
+        json!({"Copy": place(1, &tid_ty)}),
+        json!({"Copy": place(2, &size_ty)}),
+        json!({"Move": place(borrow_local, &borrowed)}),
+    ];
+    if let Some(ty) = extra_caller_param {
+        call_args.push(json!({"Copy": place(3, ty)}));
+    }
+    let mut caller_inputs = vec![tid_ty.clone(), size_ty.clone()];
+    if let Some(ty) = extra_caller_param {
+        caller_inputs.push(ty.clone());
+    }
+    let caller = probe_fun(
+        0,
+        &["probe", "place_flag"],
+        caller_inputs,
+        &ret,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
+            {"statements": statements, "kind": "Regular", "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args, "dest": place(dest_local, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(dest_local, &ret)}, "Yes"]}
+            ]}}], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let mut sink_inputs = vec![tid_ty, size_ty, raw_flag];
+    sink_inputs.extend(extra_sink_inputs.iter().cloned());
+    let sink = probe_fun(1, &["probe", "sink_pair"], sink_inputs, &ret, sink_body);
+    let mut fun_decls = vec![caller, sink];
+    fun_decls.extend(extra_funs.iter().cloned());
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": type_decls,
+            "fun_decls": fun_decls,
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "place_flag")
+}
+
+fn fresh_cell_gcref_sink(
+    sink_body: Value,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    lower_fresh_cell_into_sink(
+        &gcref_ty(),
+        vec![gcref_decl()],
+        false,
+        sink_body,
+        &[],
+        &[],
+        None,
+    )
+}
+
+/// Unstructured `fn(u32, usize, *mut bool, ...extra_args) -> ret`.
+fn fresh_cell_sink_body(
+    ret: &Value,
+    extra_arg_tys: &[Value],
+    extra_locals: Vec<Value>,
+    statements: Vec<Value>,
+) -> Value {
+    let (span, _, _, local) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let raw_flag = raw_ptr(&bool_ty(), "Mut");
+    let mut locals = vec![
+        local(0, None, ret),
+        local(1, Some("tid"), &tid_ty),
+        local(2, Some("size"), &size_ty),
+        local(3, Some("p"), &raw_flag),
+    ];
+    for ty in extra_arg_tys {
+        let index = locals.len() as u64;
+        locals.push(local(index, None, ty));
+    }
+    locals.extend(extra_locals);
+    json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 3 + extra_arg_tys.len() as u64, "locals": locals},
+        "body": [{"statements": statements, "kind": "Regular", "terminator": {"span": span, "kind": "Return"}}]
+    }})
+}
+
+#[test]
+fn fresh_cell_usize_beside_bool_spill_into_gcref_lowers() {
+    let graph = lower_fresh_cell_gcref(false).unwrap_or_else(|err| {
+        panic!("a fresh-cell bool spill beside a usize size into GcRef must lower: {err}")
+    });
+    assert_fresh_cell_bool_spill_lowers(&graph);
+}
+
+#[test]
+fn fresh_cell_address_taken_elsewhere_stays_unlowered() {
+    let err = lower_fresh_cell_gcref(true)
+        .expect_err("a usize beside a spill whose address is taken elsewhere must stay unlowered");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("unspilled raw argument") || msg.contains("spill address would escape"),
+        "{msg}"
+    );
+}
+
+fn assert_fresh_cell_bool_spill_lowers(graph: &FunctionGraph) {
+    let ptrs = malloc_ptrs(graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one spill for the flag cell\n{}",
+        op_lines(graph)
+    );
+    let call = sink_call(graph);
+    assert_ne!(
+        call_arg(call, 0),
+        &ptrs[0],
+        "tid stays the caller's value\n{}",
+        op_lines(graph)
+    );
+    assert_ne!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "size stays the caller's usize\n{}",
+        op_lines(graph)
+    );
+    assert_eq!(
+        call_arg(call, 2),
+        &ptrs[0],
+        "the out-parameter receives the spill address\n{}",
+        op_lines(graph)
+    );
+    let loads = raw_ops(graph, |kind| matches!(kind, OpKind::RawLoad { .. }));
+    assert_eq!(
+        loads.len(),
+        1,
+        "mutable out-parameter copies the word back\n{}",
+        op_lines(graph)
+    );
+    match &loads[0].kind {
+        OpKind::RawLoad {
+            base,
+            itemsize: 1,
+            is_item_signed: false,
+            ..
+        } if base == &ptrs[0] => {}
+        other => panic!("copy-out loads the bool cell, got {other:?}"),
+    }
+    assert!(
+        ops(graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(graph)
+    );
+}
+
+#[test]
+fn fresh_cell_bool_spill_into_option_gcref_lowers() {
+    let graph = lower_fresh_cell_into(
+        &option_of(&adt_ty(1, vec![])),
+        vec![option_niche_decl(), gcref_decl_at(1)],
+        false,
+    )
+    .unwrap_or_else(|err| panic!("a fresh-cell bool spill into Option<GcRef> must lower: {err}"));
+    assert_fresh_cell_bool_spill_lowers(&graph);
+}
+
+#[test]
+fn fresh_cell_bool_spill_into_option_raw_u64_stays_unlowered() {
+    let err = lower_fresh_cell_into(
+        &option_of(&raw_ptr(&u64_ty(), "Mut")),
+        vec![option_niche_decl()],
+        false,
+    )
+    .expect_err("a fresh-cell bool spill into Option<*mut u64> must stay unlowered");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn fresh_cell_gcref_store_into_global_stays_unlowered() {
+    let raw_flag = raw_ptr(&bool_ty(), "Mut");
+    let body = fresh_cell_sink_body(
+        &gcref_ty(),
+        &[],
+        vec![],
+        vec![assign_to(
+            global_place(&raw_flag),
+            copy_use(place(3, &raw_flag)),
+        )],
+    );
+    let err = fresh_cell_gcref_sink(body).expect_err(
+        "a fresh-cell GcRef sink that stores the spill into a global must stay unlowered",
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn fresh_cell_gcref_store_through_derived_pointer_stays_unlowered() {
+    let raw_flag = raw_ptr(&bool_ty(), "Mut");
+    let out_ty = raw_ptr(&raw_flag, "Mut");
+    let body = fresh_cell_sink_body(
+        &gcref_ty(),
+        &[out_ty.clone()],
+        vec![],
+        vec![assign_to(
+            deref_place(place(4, &out_ty), &raw_flag),
+            copy_use(place(3, &raw_flag)),
+        )],
+    );
+    let err = lower_fresh_cell_into_sink(
+        &gcref_ty(),
+        vec![gcref_decl()],
+        false,
+        body,
+        &[],
+        &[out_ty.clone()],
+        Some(&out_ty),
+    )
+    .expect_err(
+        "a fresh-cell GcRef sink that stores the spill through *mut *mut bool must stay unlowered",
+    );
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn fresh_cell_gcref_pointee_store_lowers() {
+    let raw_flag = raw_ptr(&bool_ty(), "Mut");
+    let body = fresh_cell_sink_body(
+        &gcref_ty(),
+        &[],
+        vec![],
+        vec![assign_to(
+            deref_place(place(3, &raw_flag), &bool_ty()),
+            bool_true_use(),
+        )],
+    );
+    let graph = fresh_cell_gcref_sink(body).unwrap_or_else(|err| {
+        panic!("a fresh-cell GcRef sink that only writes *p must lower: {err}")
+    });
+    assert_fresh_cell_bool_spill_lowers(&graph);
+}
+
+#[test]
+fn fresh_cell_gcref_function_pointer_hook_lowers() {
+    let (span, generics, _, local) = probe_parts();
+    let tid_ty = u32_ty();
+    let size_ty = usize_ty();
+    let raw_flag = raw_ptr(&bool_ty(), "Mut");
+    let ret = gcref_ty();
+    let fp_ty = i64_ty();
+    let body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 3, "locals": [
+            local(0, None, &ret),
+            local(1, Some("tid"), &tid_ty),
+            local(2, Some("size"), &size_ty),
+            local(3, Some("p"), &raw_flag),
+            local(4, Some("hook"), &fp_ty)
+        ]},
+        "body": [
+            {"statements": [assign_to(place(4, &fp_ty), const_use())],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": {"Call": {
+                    "call": {"func": {"Regular": {"kind": {"Ptr": {"Copy": place(4, &fp_ty)}}, "generics": generics}},
+                        "args": [{"Copy": place(3, &raw_flag)}],
+                        "dest": place(0, &ret)},
+                    "target": 1, "on_unwind": 2
+                }}}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]
+    }});
+    let graph = fresh_cell_gcref_sink(body).unwrap_or_else(|err| {
+        panic!("a fresh-cell GcRef sink that forwards through a function pointer must lower: {err}")
+    });
+    assert_fresh_cell_bool_spill_lowers(&graph);
 }
 
 #[test]

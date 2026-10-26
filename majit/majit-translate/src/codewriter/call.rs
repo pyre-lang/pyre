@@ -6589,18 +6589,12 @@ impl CallControl {
     /// `call.py getfunctionptr(graph)` parity for `<Type>::method`
     /// and `<Type as Trait>::method`.
     ///
-    /// NOTE: this `ImplFnAddrBindings` channel is test-only.  Every
-    /// production entry point passes `&[]` for `impl_fnaddr_bindings`, so
-    /// this runs only under the macro tests
-    /// (`majit-macros/tests/jit_module_test.rs`).  Production impl-method
-    /// helpers are registered as flat full-path keys via
-    /// `register_macro_helper_trace_fnaddr`, and `CallTarget::Method`
-    /// lookups resolve through `resolved_path` / the impl-method
-    /// leaf-index — neither consults `impl_type_as_written`.  The macro
-    /// only sees the surface `impl`-header spelling, so this key is
-    /// non-canonical by design (it cannot recover a `use`-aliased owner's
-    /// defining module); do not wire it into a production caller without
-    /// canonicalising the owner root against `front::mir`'s `self_ty_root`.
+    /// Inherent `&self` trampolines published through
+    /// `HelperFnAddr::new_impl_method` (and `#[jit_module]`'s
+    /// `__majit_helper_impl_trace_fnaddrs`) feed this entry point. The
+    /// `impl` header / `type_name::<Self>()` spelling is the owner root
+    /// `CallPath::for_impl_method` uses; a `use`-aliased owner still
+    /// cannot recover a defining module other than that spelling.
     pub fn register_macro_impl_helper_trace_fnaddr(
         &mut self,
         module_path_with_crate: &str,
@@ -6632,7 +6626,29 @@ impl CallControl {
             .map(Self::strip_raw_ident_sigil)
             .collect::<Vec<_>>()
             .join("::");
-        self.register_function_fnaddr(CallPath::for_impl_method(&impl_type_joined, method), fnaddr);
+        let path = CallPath::for_impl_method(&impl_type_joined, method);
+        // Reloc key is the first `HelperFnAddr::impl_method_fnaddr_paths`
+        // spelling (`module_path!()::Type::method`). `merge_macro_helper_fnaddrs`
+        // keeps a hand-listed `jit_trace_fnaddrs` address on that key; a later
+        // HelperFnAddr trampoline is a second copy of an `#[inline]` method
+        // (`RootScope::get`). Binding the trampoline here would store that
+        // copy under the hand-listed reloc path, so the provenance patcher
+        // (path → hand-listed runtime) would disagree with a value remap of
+        // the trampoline word.
+        let registry_key = format!("{module_path_with_crate}::{impl_type_as_written}::{method}");
+        let fnaddr = self
+            .address_for_registry_key(&registry_key)
+            .unwrap_or(fnaddr);
+        self.fnaddr_registry_keys.insert(path.clone(), registry_key);
+        self.register_function_fnaddr(path, fnaddr);
+    }
+
+    /// Address already bound to `registry_key` by a prior
+    /// [`Self::register_macro_helper_trace_fnaddr`] (or another impl row).
+    fn address_for_registry_key(&self, registry_key: &str) -> Option<i64> {
+        self.fnaddr_registry_keys.iter().find_map(|(bound, key)| {
+            (*key == registry_key).then(|| self.function_fnaddrs.get(bound).copied())?
+        })
     }
 
     /// Drop the `r#` sigil from one path segment.  A registry key spelled
@@ -22040,6 +22056,63 @@ mod tests {
     }
 
     #[test]
+    fn impl_method_fnaddr_keeps_hand_listed_address_for_same_reloc_key() {
+        let mut cc = CallControl::new();
+        cc.register_macro_helper_trace_fnaddr("testcrate::sub::Owner::leaf", 0x1111);
+        cc.register_macro_impl_helper_trace_fnaddr("testcrate::sub", "Owner", "leaf", 0x2222);
+        let impl_path = CallPath::for_impl_method("sub::Owner", "leaf");
+        assert_eq!(cc.lookup_function_fnaddr(&impl_path), Some(0x1111));
+        cc.register_function_graph(impl_path.clone(), FunctionGraph::new("leaf"));
+        let jitcode = cc.get_jitcode(&impl_path);
+        assert_eq!(jitcode.fnaddr, 0x1111);
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: "testcrate::sub::Owner::leaf".to_string(),
+                symbolic: false,
+            })
+        );
+    }
+
+    #[test]
+    fn impl_method_fnaddr_does_not_cross_bind_free_function_spelling() {
+        const METHOD: &str = "_orig__getdictvalue_no_unwrapping_pure_unlikely_name";
+        let method_path = CallPath::from_segments(["celldict", "ModuleDictStrategy", METHOD]);
+
+        let mut cc_impl = CallControl::new();
+        cc_impl.register_macro_impl_helper_trace_fnaddr(
+            "pyre_object::celldict",
+            "ModuleDictStrategy",
+            METHOD,
+            0x1111,
+        );
+        assert_eq!(cc_impl.lookup_function_fnaddr(&method_path), Some(0x1111));
+        assert_eq!(
+            cc_impl.fnaddr_for_target(&CallTarget::function_path([
+                "celldict",
+                "ModuleDictStrategy",
+                METHOD
+            ])),
+            0x1111
+        );
+
+        let mut cc_free = CallControl::new();
+        cc_free.register_macro_helper_trace_fnaddr(
+            "pyre_object::celldict::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            0x2222,
+        );
+        assert_eq!(cc_free.lookup_function_fnaddr(&method_path), None);
+        assert_ne!(
+            cc_free.fnaddr_for_target(&CallTarget::function_path([
+                "celldict",
+                "ModuleDictStrategy",
+                METHOD
+            ])),
+            0x2222
+        );
+    }
+
+    #[test]
     fn register_macro_impl_helper_qualifies_bare_type_with_module_prefix() {
         // `impl Adder { fn add() }` at `mod impl_module` — macro emits
         // `impl_type_as_written = "Adder"` (bare), and
@@ -22059,6 +22132,16 @@ mod tests {
         assert_eq!(
             cc.fnaddr_for_target(&CallTarget::function_path(["impl_module", "Adder", "add"])),
             0xfeed_beef
+        );
+        let path = CallPath::from_segments(["impl_module", "Adder", "add"]);
+        cc.register_function_graph(path.clone(), FunctionGraph::new("add"));
+        let jitcode = cc.get_jitcode(&path);
+        assert_eq!(
+            jitcode.fnaddr_reloc,
+            Some(crate::jitcode::ConstIRelocKind::FnAddr {
+                path: "testcrate::impl_module::Adder::add".to_string(),
+                symbolic: false,
+            })
         );
     }
 

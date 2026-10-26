@@ -760,6 +760,15 @@ pub(crate) struct LiveFrameRegs {
     pub(crate) registers_i: RegisterBank,
     pub(crate) registers_f: RegisterBank,
     frame_state: WalkFrameState,
+    /// Portal jitcode `last_instr` / `valuestackdepth` as of the CALL that
+    /// paused this frame (`_opimpl_setfield_vable` /
+    /// `_opimpl_setarrayitem_vable` before the helper). Guard snapshots
+    /// during the helper walk use the opcode-entry image mirrored onto
+    /// `virtualizable_boxes`; a ForceQuasiImmutable abort resumes this
+    /// MIFrame at the CALL's `next_pc` (`blackhole.py
+    /// _setup_return_value_*`) and needs this abort-point pair.
+    abort_point_valuestackdepth: Option<usize>,
+    abort_point_last_instr: Option<isize>,
 }
 
 impl LiveFrameRegs {
@@ -774,7 +783,16 @@ impl LiveFrameRegs {
             registers_i: registers_i.clone(),
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
+            abort_point_valuestackdepth: None,
+            abort_point_last_instr: None,
         }
+    }
+
+    pub(crate) fn abort_point_scalars(&self) -> (Option<usize>, Option<isize>) {
+        (
+            self.abort_point_valuestackdepth,
+            self.abort_point_last_instr,
+        )
     }
 
     pub(crate) fn frame_state(&self) -> &WalkFrameState {

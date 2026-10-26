@@ -1019,7 +1019,12 @@ impl<'a> Lowering<'a> {
                     // recursion; `jtransform.py rewrite_op_getsubstruct`).
                     // The typeptr leaf stays for `rewrite_op_setfield` /
                     // `is_typeptr_getset` to drop on a vtable object.
-                    if let Some(nested) = tyref_by_value_struct_decl(dest_ty, self.llbc) {
+                    // An integer newtype (`VersionTag(u64)`) is one word
+                    // (`history.getkind`): leaf-copy would GETFIELD
+                    // `__pos_0` with that Int as the base.
+                    if let Some(nested) =
+                        tyref_by_value_struct_decl(dest_ty, self.llbc, self.gc_struct_ids)
+                    {
                         let src = value.as_variable().cloned().ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
@@ -5437,8 +5442,15 @@ impl<'a> Lowering<'a> {
                     }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
-                    // word. The only projection that view emits is `__pos_0`.
-                    if field_name == "__pos_0"
+                    // word. Charon spells the positional field `_0`
+                    // (`is_positional`); the front names it `__pos_0`.
+                    // A by-value integer newtype (`VersionTag(u64)`) is
+                    // the same word (`history.getkind`).
+                    // A `&Newtype` is an address: `(*self).0` loads that
+                    // integer (`history.getkind` of the field). Aliasing
+                    // the deref would return the Ref receiver as the
+                    // payload.
+                    if (field_name == "__pos_0" || field_name == "_0")
                         && tyref_transparent_inner_value_type(
                             &inner.ty,
                             self.llbc,
@@ -5448,9 +5460,26 @@ impl<'a> Lowering<'a> {
                         )
                         .is_some()
                     {
-                        let wrapper_ty = clone_tyref(&inner.ty);
-                        let base = self.resolve_place(mir_bb, *inner)?;
-                        return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                        let load_from_address = match &inner.kind {
+                            PlaceKind::Projection(pre, ProjectionElem::Atom(atom))
+                                if atom == "Deref" =>
+                            {
+                                tyref_transparent_inner_value_type(
+                                    &pre.ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                    self.gc_struct_ids,
+                                    &self.raw_alloc_flavor_structs,
+                                )
+                                .is_none()
+                            }
+                            _ => false,
+                        };
+                        if !load_from_address {
+                            let wrapper_ty = clone_tyref(&inner.ty);
+                            let base = self.resolve_place(mir_bb, *inner)?;
+                            return Ok(self.cast_off_error_carrier(mir_bb, &wrapper_ty, base));
+                        }
                     }
                     // A one-word niche `Option` is represented by its payload
                     // pointer, so the

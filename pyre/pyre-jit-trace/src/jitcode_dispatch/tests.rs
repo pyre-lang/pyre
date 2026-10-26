@@ -23529,3 +23529,209 @@ fn exception_string_override_straight_line_accepts_load_fast_unbound_check() {
         "goto src must be the getarrayitem_vable_r dest"
     );
 }
+
+/// Portal jitcode pops before the helper CALL. Helper-entry mirroring then
+/// rewrites `valuestackdepth` to the opcode-entry image for guard snapshots.
+/// The abort-point pair recorded on the paused portal `LiveFrameRegs` is
+/// what a ForceQuasiImmutable latch must publish (`_copy_data_from_miframe`).
+#[test]
+fn paused_portal_mirror_uses_abort_point_not_entry_vstack() {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let nlocals = 2usize;
+    let array_len = 5usize;
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a static vable field");
+    let last_idx = info
+        .static_field_index_by_name("last_instr")
+        .expect("last_instr is a static vable field");
+    let nstatic = info.num_static_extra_boxes;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let vable = tc.const_ref(1);
+    let iter = tc.const_ref(0xA11);
+    let companion = tc.const_null();
+    let leftover_tos = tc.const_ref(0xDEAD);
+    let local0 = tc.const_ref(0x10);
+    let local1 = tc.const_ref(0x20);
+    let mut boxes = vec![tc.const_null(); nstatic + array_len];
+    let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic + array_len];
+    boxes[last_idx] = tc.const_int(7);
+    values[last_idx] = Value::Int(7);
+    boxes[vsd_idx] = tc.const_int(4);
+    values[vsd_idx] = Value::Int(4);
+    boxes[nstatic] = local0;
+    values[nstatic] = Value::Ref(majit_ir::GcRef(0x10));
+    boxes[nstatic + 1] = local1;
+    values[nstatic + 1] = Value::Ref(majit_ir::GcRef(0x20));
+    boxes[nstatic + 2] = iter;
+    values[nstatic + 2] = Value::Ref(majit_ir::GcRef(0xA11));
+    boxes[nstatic + 3] = companion;
+    values[nstatic + 3] = Value::Ref(majit_ir::GcRef::NULL);
+    boxes[nstatic + 4] = leftover_tos;
+    values[nstatic + 4] = Value::Ref(majit_ir::GcRef(0xDEAD));
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        vable,
+        Value::Ref(majit_ir::GcRef(1)),
+        &boxes,
+        &values,
+        &[array_len],
+    );
+
+    let mut snapshot_sym = crate::state::PyreSym::new_uninit(OpRef::NONE);
+    snapshot_sym.nlocals = nlocals;
+    let mut mode = test_fbw_mode();
+    mode.snapshot_sym = &snapshot_sym;
+    mode.inline_caller_py_pc = Some(12);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let stale_entry = vec![OpRef::NONE, leftover_tos, leftover_tos];
+    let frame_state = WalkFrameState::new(WalkFrameStateData {
+        vstack_boxes: stale_entry,
+        ..Default::default()
+    });
+    let regs_r = RegisterBank::default();
+    let regs_i = RegisterBank::default();
+    let regs_f = RegisterBank::default();
+    let mut portal = InlineFrame::portal();
+    portal.live = Some(LiveFrameRegs::new(&regs_r, &regs_i, &regs_f, &frame_state));
+    session.borrow_mut().framestack.push(portal);
+    super::vable_ops::record_paused_portal_abort_point(&session, &tc);
+    // Helper-entry mirroring: opcode-entry `valuestackdepth` (nlocals + 3).
+    let entry_vsd = tc.const_int(5);
+    tc.set_virtualizable_entry_at(vsd_idx, entry_vsd, Value::Int(5));
+    let wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        fbw_mode: mode,
+        session: &session,
+        registers_r: &regs_r,
+        registers_i: &regs_i,
+        registers_f: &regs_f,
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let mirror = capture_paused_portal_mirror_stack(&wc, "test-vable-abort")
+        .expect("paused portal publishes the abort-point stack");
+    drop(wc);
+    std::hint::black_box(&mut snapshot_sym);
+    assert_eq!(mirror.py_pc, 12);
+    assert_eq!(mirror.valuestackdepth, Some(4));
+    assert_eq!(mirror.last_instr, Some(7));
+    assert_eq!(
+        mirror.slots.iter().map(|&p| p as usize).collect::<Vec<_>>(),
+        vec![0xA11, 0],
+        "opcode-entry vstack_boxes (TOS present) must not win over the abort-point",
+    );
+}
+
+/// Portal jitcode stores `setfield_vable_i_imm` as a PerFn `VableField`.
+/// `vable_field_descr` maps that index through the active vinfo so
+/// `_opimpl_setfield_vable` writes `virtualizable_boxes`.
+#[test]
+fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
+    use majit_jitcode::jitcode::BhDescr;
+    use majit_metainterp::jitcode::RuntimeBhDescr;
+
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let vsd_idx = info
+        .static_field_index_by_name("valuestackdepth")
+        .expect("valuestackdepth is a static vable field");
+    let nstatic = info.num_static_extra_boxes;
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let standard = tc.const_ref(1);
+    let mut boxes = vec![tc.const_null(); nstatic];
+    let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic];
+    boxes[vsd_idx] = tc.const_int(3);
+    values[vsd_idx] = Value::Int(3);
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &boxes,
+        &values,
+        &[0],
+    );
+    let vable = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(1)));
+
+    let byte = *insns_opname_to_byte()
+        .get("setfield_vable_i_imm/rdd")
+        .expect("`setfield_vable_i_imm/rdd` must be in insns table");
+    let code = [byte, 0x00, 0x02, 0x00, 0x00, 0x00];
+    let raw_pool = vec![RuntimeBhDescr::Descr(Box::new(BhDescr::VableField {
+        index: vsd_idx,
+    }))];
+    let descr_pool: Vec<DescrRef> = Vec::new();
+    let regs_r = vec![vable];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let op = DecodedOp {
+        key: "setfield_vable_i_imm/rdd",
+        opname: "setfield_vable_i_imm",
+        argcodes: "rdd",
+        pc: 0,
+        next_pc: 6,
+    };
+    let (outcome, next_pc) =
+        setfield_vable_int_imm(&code, &op, &mut wc).expect("setfield_vable_i_imm must dispatch");
+    assert_eq!(outcome, DispatchOutcome::Continue);
+    assert_eq!(next_pc, 6);
+    drop(wc);
+    assert_eq!(
+        tc.virtualizable_entry_at(vsd_idx).map(|entry| entry.1),
+        Some(Value::Int(2)),
+        "emit_vsd's setfield_vable_i_imm must store valuestackdepth into \
+         virtualizable_boxes (`_opimpl_setfield_vable`)",
+    );
+}

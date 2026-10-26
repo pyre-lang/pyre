@@ -16663,6 +16663,15 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     };
     let saved_vable = if !nested_helper && sym.owns_virtualizable_shadow() {
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
+        // The saved pair is the abort-point image portal jitcode wrote
+        // (`_opimpl_setfield_vable` / `_opimpl_setarrayitem_vable` before
+        // this CALL). Guard snapshots during the helper walk need the
+        // opcode-entry `last_instr` / `valuestackdepth` mirrored below;
+        // a ForceQuasiImmutable multi-frame blackhole resumes this
+        // MIFrame at the CALL's `next_pc` (`blackhole.py
+        // _setup_return_value_*`) and reads the abort-point off the
+        // paused portal `LiveFrameRegs`.
+        super::vable_ops::record_paused_portal_abort_point(ctx.session, ctx.trace_ctx);
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
         crate::trace_opcode::mirror_vable_static_to_boxes(
@@ -16749,6 +16758,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.sub_jitcode_lookup = saved_lookup;
     if let Some(saved) = saved_vable {
         crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved);
+        super::vable_ops::clear_paused_portal_abort_point(ctx.session);
     }
 
     // `abort/` in a helper body is an un-lowered `OpKind` — the same class

@@ -48,16 +48,88 @@ pub(super) fn bind_paused_caller_regs(
     registers_f: &RegisterBank,
     frame_state: &WalkFrameState,
 ) {
-    let live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
+    let mut live = LiveFrameRegs::new(registers_r, registers_i, registers_f, frame_state);
     let mut session = session.borrow_mut();
     if session.framestack.is_empty() {
         session.framestack.push(InlineFrame::portal());
     }
-    session
+    let frame = session
         .framestack
         .last_mut()
-        .expect("portal occupies framestack[0]")
-        .live = Some(live);
+        .expect("portal occupies framestack[0]");
+    // `run_orthodox_helper_subwalk` records the abort-point scalars on a
+    // placeholder live before this bind. Keep them: the banks change, the
+    // CALL-`next_pc` resume image does not (`_copy_data_from_miframe`).
+    if let Some(paused) = frame.live.as_ref() {
+        let (vsd, last) = paused.abort_point_scalars();
+        live.abort_point_valuestackdepth = vsd;
+        live.abort_point_last_instr = last;
+    }
+    frame.live = Some(live);
+}
+
+/// Portal jitcode `last_instr` / `valuestackdepth` as `_opimpl_setfield_vable`
+/// left them, before helper-entry mirroring rewrites the boxes to the
+/// opcode-entry image.
+fn portal_abort_point_scalars(ctx: &TraceCtx) -> (Option<usize>, Option<isize>) {
+    let vable_int = |name: &str| {
+        ctx.virtualizable_info()
+            .and_then(|info| info.static_field_index_by_name(name))
+            .and_then(|idx| ctx.virtualizable_entry_at(idx))
+            .and_then(|(_, value)| match value {
+                majit_ir::Value::Int(value) => Some(value),
+                _ => None,
+            })
+    };
+    let valuestackdepth =
+        vable_int("valuestackdepth").and_then(|depth| usize::try_from(depth).ok());
+    let last_instr = vable_int("last_instr").and_then(|pc| isize::try_from(pc).ok());
+    (valuestackdepth, last_instr)
+}
+
+/// Store the abort-point scalars on the paused portal `LiveFrameRegs`
+/// (`framestack[0].live`) for the helper walk.
+pub(crate) fn record_paused_portal_abort_point(
+    session: &std::cell::RefCell<WalkSession>,
+    ctx: &TraceCtx,
+) {
+    let (vsd, last) = portal_abort_point_scalars(ctx);
+    let mut session = session.borrow_mut();
+    if session.framestack.is_empty() {
+        session.framestack.push(InlineFrame::portal());
+    }
+    let frame = session
+        .framestack
+        .last_mut()
+        .expect("portal occupies framestack[0]");
+    match frame.live.as_mut() {
+        Some(live) => {
+            live.abort_point_valuestackdepth = vsd;
+            live.abort_point_last_instr = last;
+        }
+        None => {
+            let mut live = LiveFrameRegs::new(
+                &RegisterBank::default(),
+                &RegisterBank::default(),
+                &RegisterBank::default(),
+                &WalkFrameState::new(WalkFrameStateData::default()),
+            );
+            live.abort_point_valuestackdepth = vsd;
+            live.abort_point_last_instr = last;
+            frame.live = Some(live);
+        }
+    }
+}
+
+/// Drop the abort-point scalars when helper-entry mirroring is restored.
+pub(crate) fn clear_paused_portal_abort_point(session: &std::cell::RefCell<WalkSession>) {
+    let mut session = session.borrow_mut();
+    if let Some(frame) = session.framestack.last_mut()
+        && let Some(live) = frame.live.as_mut()
+    {
+        live.abort_point_valuestackdepth = None;
+        live.abort_point_last_instr = None;
+    }
 }
 
 pub(super) fn push_helper_live(
@@ -1043,7 +1115,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
             'f' => read_float_reg(code, op, 1, ctx)?,
             _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
         };
-        let descr = read_descr(code, op, 2, ctx)?;
+        let descr = vable_static_field_descr_from_jitcode(code, op, 2, ctx)?;
         if let (Some(Value::Int(value)), Some(field_index), Some(shadow)) = (
             vable_value_concrete(code, op, 1, ctx, value_bank, value),
             ctx.trace_ctx
@@ -1076,7 +1148,7 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         'f' => read_float_reg(code, op, 1, ctx)?,
         _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
     };
-    let descr = read_descr(code, op, 2, ctx)?;
+    let descr = vable_static_field_descr_from_jitcode(code, op, 2, ctx)?;
     let concrete = vable_value_concrete(code, op, 1, ctx, value_bank, value);
     let inline_field_index = ctx
         .trace_ctx
@@ -1121,7 +1193,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     let imm = (code[op.pc + 2] as u16 | ((code[op.pc + 3] as u16) << 8)) as i64;
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
-        let descr = read_descr(code, op, 3, ctx)?;
+        let descr = vable_static_field_descr_from_jitcode(code, op, 3, ctx)?;
         if let (Some(field_index), Some(shadow)) = (
             ctx.trace_ctx
                 .virtualizable_info()
@@ -1145,7 +1217,7 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     if obj.is_none() {
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
-    let descr = read_descr(code, op, 3, ctx)?;
+    let descr = vable_static_field_descr_from_jitcode(code, op, 3, ctx)?;
     let concrete = Some(Value::Int(imm));
     let inline_field_index = ctx
         .trace_ctx
@@ -1171,6 +1243,53 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
     }
     let _ = write;
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Resolve a `VableField` jitcode descr-pool index to
+/// `virtualizable.py static_field_descrs[index]` on the active vinfo.
+///
+/// `MIFrame.read_vable_setfield_imm` (`pyjitpl/frame.rs`) reads
+/// `BhDescr::VableField { index }`. `pyjitpl/dispatch.rs vable_field_descr`
+/// maps that index through `VirtualizableInfo.static_field_descrs`.
+/// `blackhole.rs read_descr_vable_field` does the same for the interpreter.
+/// The walker must use the vinfo descr (not the raw jitcode-pool descr)
+/// because `_nonstandard_virtualizable` compares `vinfo is fielddescr.get_vinfo()`
+/// and `_opimpl_setfield_vable` keys `static_field_by_descr` on descr identity
+/// — the same reason [`vable_array_descrs_from_jitcode`] remaps `VableArray`.
+pub(crate) fn vable_static_field_descr_from_jitcode<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    descr_offset: usize,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Result<DescrRef, DispatchError> {
+    let lo = code[op.pc + 1 + descr_offset] as usize;
+    let hi = code[op.pc + 1 + descr_offset + 1] as usize;
+    let pool_idx = lo | (hi << 8);
+    crate::jitcode_runtime::record_descr_demand(pool_idx);
+    // `pyjitpl/dispatch.rs vable_field_descr` maps a VableField index
+    // through the active vinfo. Production FBW bodies store that marker
+    // in the per-fn pool (`assembler.rs add_vable_field_descr`). Tests
+    // and `make_descr_from_bh` already put a FieldDescr in `descr_refs`;
+    // without a VableField marker (or without vinfo) `_opimpl_setfield_vable`
+    // still receives that descr for the SETFIELD_GC fallback.
+    if let Some(majit_jitcode::jitcode::BhDescr::VableField { index }) =
+        ctx.raw_descrs.bh_descr_at(pool_idx)
+        && let Some(info) = ctx.trace_ctx.virtualizable_info()
+    {
+        return info.static_field_descrs().get(*index).cloned().ok_or(
+            DispatchError::VableArrayIndexOutOfRange {
+                pc: op.pc,
+                index: *index,
+            },
+        );
+    }
+    ctx.descr_refs
+        .at(pool_idx)
+        .ok_or(DispatchError::DescrIndexOutOfRange {
+            pc: op.pc,
+            index: pool_idx,
+            len: ctx.descr_refs.len(),
+        })
 }
 
 /// Resolve the `(fdescr, adescr)` virtualizable-array descr pair from a

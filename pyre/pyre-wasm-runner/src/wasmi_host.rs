@@ -377,11 +377,9 @@ fn build_linker(engine: &Engine) -> Result<Linker<Host>, String> {
         .func_wrap(
             "majit_host",
             "jit_call_host",
-            |mut caller: Caller<'_, Host>, frame_ptr: u32| {
-                if let Err(e) = jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32)
-                {
-                    eprintln!("[jit_call_host] {e}");
-                }
+            |mut caller: Caller<'_, Host>, frame_ptr: u32| -> Result<(), wasmi::Error> {
+                jit_call_trampoline(&mut caller, frame_ptr, CALL_RESULT_OFS as u32)
+                    .map_err(wasmi::Error::new)
             },
         )
         .map_err(estr)?;

@@ -4301,6 +4301,29 @@ fn raw_ptr_field(pointee: u64) -> serde_json::Value {
     }])
 }
 
+fn u64_field() -> serde_json::Value {
+    serde_json::json!([{
+        "name": null,
+        "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+        "attr_info": null
+    }])
+}
+
+fn two_i64_fields() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        },
+        {
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }
+    ])
+}
+
 fn adt_body(def_id: u64) -> serde_json::Value {
     serde_json::json!({"Adt": {"id": def_id, "generics": {"types": []}}})
 }
@@ -4735,6 +4758,202 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
         ValueType::Ref(Some("Handle".into()))
     );
     assert_handle_class(&llbc, &ty, Some("Handle"));
+}
+
+/// A by-value Copy newtype around one integer word is that integer
+/// even without `repr(transparent)` (`history.getkind` /
+/// `call.py getcalldescr`). `VersionTag(u64)` is this shape.
+#[test]
+fn by_value_integer_newtype_types_as_the_inner_integer() {
+    let mut decls = pointer_handle_decls();
+    decls.push((
+        6,
+        struct_decl(6, ident_path(&["fixture", "Word"]), i64_field(), false),
+    ));
+    decls.push((
+        7,
+        struct_decl(7, ident_path(&["fixture", "Serial"]), u64_field(), false),
+    ));
+    decls.push((
+        8,
+        struct_decl(8, ident_path(&["fixture", "Pair"]), two_i64_fields(), false),
+    ));
+    let (llbc, word_ty) = load_handle(decls.clone(), serde_json::json!([null]), 6);
+    let gc_struct_ids = crate::front::mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert_eq!(super::tyref_to_value_type(&word_ty, &llbc), ValueType::Int);
+    assert_eq!(
+        super::tyref_to_field_layout_string(
+            &word_ty,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        "i64"
+    );
+    let (llbc, serial_ty) = load_handle(decls.clone(), serde_json::json!([null]), 7);
+    let gc_struct_ids = crate::front::mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert_eq!(
+        super::tyref_to_value_type(&serial_ty, &llbc),
+        ValueType::Unsigned
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(
+            &serial_ty,
+            &llbc,
+            &gc_struct_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        "u64"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&word_ty, &llbc, &gc_struct_ids).is_none(),
+        "integer newtype is one word, not an inlined STRUCT"
+    );
+    assert!(super::tyref_by_value_struct_decl(&serial_ty, &llbc, &gc_struct_ids).is_none());
+    let (llbc, pair_ty) = load_handle(decls.clone(), serde_json::json!([null]), 8);
+    let gc_struct_ids = crate::front::mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert!(
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, &gc_struct_ids).is_some(),
+        "a two-field struct stays an inlined STRUCT"
+    );
+    assert_eq!(
+        paint_handle(decls.clone(), serde_json::json!([null]), 8),
+        ValueType::Ref(None)
+    );
+
+    decls.push((
+        9,
+        struct_decl(
+            9,
+            ident_path(&["core", "ops", "range", "RangeFrom"]),
+            serde_json::json!([{
+                "name": "start",
+                "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+                "attr_info": null
+            }]),
+            false,
+        ),
+    ));
+    let (llbc, range_ty) = load_handle(decls.clone(), serde_json::json!([null]), 9);
+    let gc_struct_ids = crate::front::mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    assert_eq!(
+        super::tyref_to_value_type(&range_ty, &llbc),
+        ValueType::Ref(None),
+        "RangeFrom.start is a named field, not a newtype wrap"
+    );
+    assert!(super::tyref_by_value_struct_decl(&range_ty, &llbc, &gc_struct_ids).is_some());
+
+    let mut gc_int = pointer_handle_decls();
+    gc_int[0] = (
+        1,
+        struct_decl(1, ident_path(&["fixture", "PyObject"]), i64_field(), false),
+    );
+    assert_eq!(
+        paint_handle(gc_int, serde_json::json!([null]), 1),
+        ValueType::Ref(None)
+    );
+}
+
+/// `&self` of a one-integer tuple struct is an address. `self.0` is
+/// that integer (`history.getkind` of the field), not the Ref receiver.
+#[test]
+fn integer_newtype_shared_ref_method_returns_the_inner_integer() {
+    let span = fixture_span();
+    let empty_generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let word_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+    });
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let word_ref = serde_json::json!({"Ref": ["Erased", word_adt, "Shared"]});
+    let word_decl = struct_decl(0, ident_path(&["fixture", "Word"]), i64_field(), false);
+    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+    let field_place = place(
+        serde_json::json!({"Projection": [
+            place(
+                serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &word_ref),
+                    "Deref"
+                ]}),
+                &word_adt
+            ),
+            {"Field": [null, 0]}
+        ]}),
+        &i64_ty,
+    );
+    let as_raw = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "Word", "as_raw"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word_ref],
+            "output": i64_ty
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 1,
+                "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": i64_ty},
+                    {"index": 1, "name": "self", "span": span, "ty": word_ref}
+                ]
+            },
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        place(serde_json::json!({"Local": 0}), &i64_ty),
+                        {"Use": [{"Copy": field_place}, "No"]}
+                    ]}
+                }],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [word_decl],
+            "fun_decls": [as_raw],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let word_ty = TyRef::Other(word_adt);
+    let ref_ty = TyRef::Other(word_ref);
+    assert_eq!(super::tyref_to_value_type(&word_ty, &llbc), ValueType::Int);
+    assert!(
+        matches!(
+            super::tyref_to_value_type(&ref_ty, &llbc),
+            ValueType::Ref(_)
+        ),
+        "&Word is an address, got {:?}",
+        super::tyref_to_value_type(&ref_ty, &llbc)
+    );
+    let graph = crate::front::mir::lower_function(&llbc, "as_raw").expect("lower as_raw");
+    let reads: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, ty: ValueType::Int, .. }
+                    if field.name == "__pos_0" || field.name == "_0"
+            )
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        1,
+        "(*self).0 of &Word must be a FieldRead of the integer, graph={}",
+        graph.dump()
+    );
 }
 
 fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {
@@ -7871,6 +8090,89 @@ fn declared_gc_field0_closure_follows_struct_not_enum() {
     assert!(gc.contains(&p_sid), "plain struct P is field 0 of GcType T");
     assert_eq!(kinds.get("S"), Some(&GcKind::Gc));
     assert_eq!(kinds.get("T"), Some(&GcKind::Gc));
+}
+
+/// A `GcType` struct whose field 0 is a by-value one-integer newtype
+/// does not mark that newtype Gc. `history.getkind` of the FIELD is the
+/// inner integer (`descr.py get_field_descr`).
+#[test]
+fn declared_gc_field0_closure_skips_integer_newtype() {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |segs: &[&str]| {
+        serde_json::json!({
+            "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Value": [id, {"Adt": {"id": id, "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}}]
+        })
+    };
+    let v_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Serial"]),
+        "kind": {"Struct": [{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Unsigned": "U64"}}},
+            "attr_info": null
+        }]}
+    });
+    let m_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "Owner"]),
+        "kind": {"Struct": [{"name": "version", "ty": adt(0)}]}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [v_decl, m_decl],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["majit_gc", "header", "GcType"])
+            }],
+            "trait_impls": [
+                {"impl_trait": {"id": 0, "generics": {"types": [adt(1)]}}}
+            ]
+        }
+    });
+    let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+        .expect("fixture Llbc parses");
+    let kinds = super::declared_gckind_by_name(std::slice::from_ref(&llbc));
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let v_sid = super::struct_id_for_type_decl(llbc.type_by_id(0).expect("Serial decl"));
+    assert_eq!(kinds.get("Serial"), Some(&GcKind::Raw));
+    assert!(
+        !gc.contains(&v_sid),
+        "one-integer newtype is not a Struct._first_struct parent"
+    );
+    assert_eq!(kinds.get("Owner"), Some(&GcKind::Gc));
+    let serial_ty = serde_json::from_value::<TyRef>(adt(0)).expect("Serial TyRef");
+    assert_eq!(
+        super::tyref_to_value_type(&serial_ty, &llbc),
+        ValueType::Unsigned
+    );
+    assert_eq!(
+        super::tyref_to_field_layout_string(
+            &serial_ty,
+            &llbc,
+            &gc,
+            &std::collections::HashSet::<String>::new()
+        ),
+        "u64"
+    );
 }
 
 /// A transparent handle wrapping an alias of `*mut Header` is a GC

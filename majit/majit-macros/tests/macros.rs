@@ -1132,6 +1132,15 @@ mod helper_fnaddr_registry {
         x + 1
     }
 
+    struct ProbeRecv;
+
+    impl ProbeRecv {
+        #[elidable_promote]
+        fn probe_method(&self, x: i64) -> i64 {
+            x + 7
+        }
+    }
+
     #[test]
     fn registered_float_abi_trampolines_are_callable_through_published_address() {
         let mut found_ff = false;
@@ -1247,5 +1256,155 @@ mod helper_fnaddr_registry {
             found_wrapper,
             "elidable_promote wrapper path was not also published"
         );
+    }
+
+    #[test]
+    fn elidable_promote_method_emits_associated_self_trampoline() {
+        let probe = ProbeRecv;
+        assert_eq!(
+            ProbeRecv::__majit_call_target__orig_probe_method_unlikely_name(
+                &probe as *const ProbeRecv as i64,
+                4,
+            ),
+            11
+        );
+        assert_eq!(probe.probe_method(4), 11);
+
+        let mut found_orig = false;
+        let mut found_wrapper = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let Some((module, impl_type, method)) = desc.impl_fnaddr_binding() else {
+                return;
+            };
+            if impl_type != "ProbeRecv" || !module.ends_with("::helper_fnaddr_registry") {
+                return;
+            }
+            let f: extern "C" fn(i64, i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+            assert_eq!(f(&probe as *const ProbeRecv as i64, 4), 11);
+            if method == "_orig_probe_method_unlikely_name" {
+                found_orig = true;
+            }
+            if method == "probe_method" {
+                found_wrapper = true;
+            }
+        });
+        assert!(
+            found_orig,
+            "elidable_promote method orig path was not published as impl binding"
+        );
+        assert!(
+            found_wrapper,
+            "elidable_promote method wrapper path was not published as impl binding"
+        );
+    }
+
+    struct SameNameA;
+    struct SameNameB;
+
+    impl SameNameA {
+        #[dont_look_inside]
+        fn value(&self) -> i64 {
+            11
+        }
+    }
+
+    impl SameNameB {
+        #[dont_look_inside]
+        fn value(&self) -> i64 {
+            22
+        }
+    }
+
+    #[test]
+    fn same_named_impl_methods_register_distinct_addresses() {
+        let a = SameNameA;
+        let b = SameNameB;
+        let mut addr_a = None;
+        let mut addr_b = None;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let Some((module, impl_type, method)) = desc.impl_fnaddr_binding() else {
+                return;
+            };
+            if method != "value" || !module.ends_with("::helper_fnaddr_registry") {
+                return;
+            }
+            if impl_type == "SameNameA" {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(&a as *const SameNameA as i64), 11);
+                addr_a = Some(desc.get());
+            }
+            if impl_type == "SameNameB" {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(&b as *const SameNameB as i64), 22);
+                addr_b = Some(desc.get());
+            }
+        });
+        let addr_a = addr_a.expect("SameNameA::value must be registered");
+        let addr_b = addr_b.expect("SameNameB::value must be registered");
+        assert_ne!(addr_a, addr_b);
+    }
+
+    struct FloatRetOwner;
+
+    impl FloatRetOwner {
+        #[dont_look_inside]
+        fn value(&self) -> f64 {
+            1.25
+        }
+    }
+
+    #[test]
+    fn float_returning_impl_method_is_registered_and_callable() {
+        let owner = FloatRetOwner;
+        assert_eq!(
+            FloatRetOwner::__majit_call_target_value(&owner as *const FloatRetOwner as i64),
+            1.25
+        );
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let Some((module, impl_type, method)) = desc.impl_fnaddr_binding() else {
+                return;
+            };
+            if impl_type != "FloatRetOwner"
+                || method != "value"
+                || !module.ends_with("::helper_fnaddr_registry")
+            {
+                return;
+            }
+            let f: extern "C" fn(i64) -> f64 = unsafe { std::mem::transmute(desc.get()) };
+            assert_eq!(f(&owner as *const FloatRetOwner as i64), 1.25);
+            found = true;
+        });
+        assert!(found, "FloatRetOwner::value trampoline was not registered");
+    }
+
+    struct FloatArgOwner;
+
+    impl FloatArgOwner {
+        #[dont_look_inside]
+        fn value(&self, x: f64) -> i64 {
+            x as i64
+        }
+    }
+
+    #[test]
+    fn float_argument_impl_method_is_registered_and_callable() {
+        let owner = FloatArgOwner;
+        let mut found = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let Some((module, impl_type, method)) = desc.impl_fnaddr_binding() else {
+                return;
+            };
+            if impl_type != "FloatArgOwner"
+                || method != "value"
+                || !module.ends_with("::helper_fnaddr_registry")
+            {
+                return;
+            }
+            let f: extern "C" fn(i64, f64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+            assert_eq!(f(&owner as *const FloatArgOwner as i64, 3.9), 3);
+            found = true;
+        });
+        assert!(found, "FloatArgOwner::value trampoline was not registered");
     }
 }

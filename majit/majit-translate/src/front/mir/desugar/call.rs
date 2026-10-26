@@ -582,7 +582,8 @@ impl<'a> Lowering<'a> {
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
-        let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
+        let raw_scalar_spills =
+            self.raw_scalar_borrow_spills(&call.func, &call_arg_tys, &arg_locals);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var

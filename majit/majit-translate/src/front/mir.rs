@@ -4323,7 +4323,15 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
         return None;
     }
     match &inner.kind {
-        TypeDeclKind::Struct(_) => Some(struct_id_for_type_decl(inner)),
+        TypeDeclKind::Struct(_) => {
+            // `lltype.py Struct._install_extras` / `_first_struct`: only a
+            // field-0 container of the same `_gckind` is an inlined parent;
+            // a by-value integer struct is a raw Signed value.
+            if type_decl_is_by_value_integer_newtype(inner, llbc) {
+                return None;
+            }
+            Some(struct_id_for_type_decl(inner))
+        }
         _ => None,
     }
 }

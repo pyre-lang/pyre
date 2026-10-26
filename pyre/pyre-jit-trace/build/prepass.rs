@@ -1214,6 +1214,20 @@ fn real_main() {
                     "baseobjspace",
                     "dict_display_setitem",
                 ]),
+                // STORE_NAME / STORE_GLOBAL `inline_call` targets
+                // (`flatten.rs inline_call_targets`). The production portal
+                // is the bytecode frontend, so the portal closure never
+                // names these interpreter stores.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "eval",
+                    "store_name_value_w",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "eval",
+                    "store_global_value_w",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

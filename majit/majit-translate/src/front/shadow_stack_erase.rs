@@ -78,6 +78,14 @@ enum Leaf {
     ItemsGet,
     /// `RootedItems` drop / `drop_in_place`.
     ItemsClose,
+    /// `DictOperationGuard::new`: Open plus publish of the dict and the
+    /// refs slice. The constructor returns the bracket it opened
+    /// (`harvest_scope_owning_identities`); one leaf so a caller that also
+    /// has its own `with_roots!` (`w_module_dict_setitem_str_internal`) can
+    /// erase. Upstream: `ShadowStackFrameworkGCTransformer.push_roots`.
+    GuardNew,
+    /// `DictOperationGuard::root(k)`: Get of the k-th slot this guard published.
+    GuardRoot,
     /// Touches the stack in a way this pass does not model.
     Unmodeled,
 }
@@ -94,9 +102,6 @@ fn classify_call(
 ) -> Option<(Leaf, bool)> {
     let path = callee_path(call, llbc)?;
     let segments: Vec<&str> = path.split("::").collect();
-    if !segments.contains(&super::ROOT_SCOPE_MODULE) {
-        return None;
-    }
     let leaf = *segments.last()?;
     let names_type = |ty: &majit_charon_reader::ullbc::TyRef, name: &str| {
         super::tyref_class_root(ty, llbc).is_some_and(|root| root.rsplit("::").next() == Some(name))
@@ -105,6 +110,27 @@ fn classify_call(
         Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
         _ => None,
     };
+    // `DictOperationGuard` lives in `dictmultiobject`, not `gc_roots`.
+    // Charon names the constructor `dictmultiobject::<Impl>::new`, so the
+    // type is read off the destination (and the receiver for `root`).
+    if (names_type(&call.dest.ty, "DictOperationGuard") && leaf == "new")
+        || (leaf == "new" && segments.contains(&"DictOperationGuard"))
+    {
+        return Some((Leaf::GuardNew, false));
+    }
+    if receiver_ty.is_some_and(|ty| names_type(ty, "DictOperationGuard"))
+        || segments.contains(&"DictOperationGuard")
+    {
+        match leaf {
+            "root" => return Some((Leaf::GuardRoot, true)),
+            "drop" | "drop_in_place" => return Some((Leaf::Close, true)),
+            "new" => {}
+            _ => {}
+        }
+    }
+    if !segments.contains(&super::ROOT_SCOPE_MODULE) {
+        return None;
+    }
     let is_method =
         segments.contains(&super::ROOT_SCOPE_TYPE) || segments.iter().any(|s| s.starts_with('<'));
     if is_method {
@@ -334,6 +360,14 @@ fn copy_operand_json(op: &Value) -> Value {
         Some(m) if m.contains_key("Move") => json!({ "Copy": m["Move"].clone() }),
         _ => op.clone(),
     }
+}
+
+fn operand_json_ty(value: &Value) -> Option<Value> {
+    value
+        .as_object()
+        .and_then(|m| m.values().next())
+        .and_then(|p| p.get("ty"))
+        .cloned()
 }
 
 fn local_place_json(local: usize, ty: &Value) -> Value {
@@ -777,8 +811,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                 let arg0 = usize::from(method);
                 let guard = if method {
                     let receiver = call.args.first().and_then(operand_local);
-                    match receiver.and_then(|l| plan.specials.get(&l)) {
-                        Some(Special::Alias(g)) => Some(*g),
+                    match receiver.and_then(|l| plan.specials.get(&l).map(|s| (l, s))) {
+                        Some((_, Special::Alias(g))) => Some(*g),
+                        Some((l, Special::Guard(_))) => Some(l),
                         _ => return Err("receiver-not-a-guard-borrow"),
                     }
                 } else {
@@ -804,6 +839,42 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     Leaf::Open => {
                         let dest = dest.ok_or("guard-dest-projected")?;
                         bind(&mut plan.specials, dest, Special::Guard(depth))?;
+                    }
+                    Leaf::GuardNew => {
+                        let dest = dest.ok_or("guard-dest-projected")?;
+                        bind(&mut plan.specials, dest, Special::Guard(depth))?;
+                        let obj = args_json.get(0).ok_or("pin-value-untyped")?;
+                        let ty = operand_json_ty(obj).ok_or("pin-value-untyped")?;
+                        plan.slot_ty.get_or_insert(ty.clone());
+                        stmts.push(assign_json(
+                            local_place_json(slot_local(depth), &ty),
+                            json!({ "Use": [copy_operand_json(obj), "Yes"] }),
+                        ));
+                        let extra = match call.args.get(1).and_then(operand_local) {
+                            Some(slice) => {
+                                let (agg_si, operands) =
+                                    resolve_published_array(block, Some(slice))
+                                        .ok_or("publish-array-unresolved")?;
+                                let mut inserted = Vec::new();
+                                for (i, element) in operands.iter().enumerate() {
+                                    let ty = operand_json_ty(element)
+                                        .ok_or("publish-element-untyped")?;
+                                    plan.slot_ty.get_or_insert(ty.clone());
+                                    inserted.push(assign_json(
+                                        local_place_json(slot_local(depth + 1 + i), &ty),
+                                        json!({ "Use": [copy_operand_json(element), "Yes"] }),
+                                    ));
+                                }
+                                plan.inserted_after
+                                    .entry((bb, agg_si))
+                                    .or_default()
+                                    .extend(inserted);
+                                operands.len()
+                            }
+                            None => 0,
+                        };
+                        depth += 1 + extra;
+                        plan.slot_count = plan.slot_count.max(depth);
                     }
                     Leaf::Close => {
                         let d = guard_depth(guard.ok_or("close-without-guard")?)?;
@@ -893,6 +964,27 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         stmts.push(assign_json(
                             dest_json.clone(),
                             json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                        ));
+                    }
+                    Leaf::GuardRoot => {
+                        let d = guard_depth(guard.ok_or("receiver-not-a-guard-borrow")?)?;
+                        let k = call
+                            .args
+                            .get(1)
+                            .and_then(|op| {
+                                const_usize(op, llbc).or_else(|| {
+                                    operand_local(op).and_then(|l| const_locals.get(&l).copied())
+                                })
+                            })
+                            .ok_or("index-not-static")?;
+                        let slot = d.checked_add(k).ok_or("get-above-depth")?;
+                        if slot >= depth {
+                            return Err("get-above-depth");
+                        }
+                        let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
+                        stmts.push(assign_json(
+                            dest_json.clone(),
+                            json!({ "Use": [{ "Copy": local_place_json(slot_local(slot), &ty) }, "Yes"] }),
                         ));
                     }
                     Leaf::Set => {
@@ -2009,11 +2101,20 @@ fn stack_walk(
                                 .or_else(|| guards.contains_key(&l).then_some(l))
                         });
                         match leaf {
-                            Leaf::Open | Leaf::ItemsOpen => {
+                            Leaf::Open | Leaf::ItemsOpen | Leaf::GuardNew => {
                                 saw_open = true;
                                 if let Some(dest) = place_local(&call.dest) {
                                     let entry = guards.entry(dest).or_insert(depth);
                                     *entry = entry.join(depth);
+                                }
+                                if matches!(leaf, Leaf::GuardNew) {
+                                    depth = depth.add(1);
+                                    let slice = call.args.get(1).and_then(operand_local);
+                                    match resolve_published_array_len(block, slice) {
+                                        Some(n) => depth = depth.add(n),
+                                        None if call.args.get(1).is_none() => {}
+                                        None => depth = depth.after_unknown_push(),
+                                    }
                                 }
                             }
                             Leaf::Close | Leaf::ItemsClose => {
@@ -2066,6 +2167,12 @@ fn stack_walk(
                             }
                             Leaf::ItemsGet => {
                                 if items_guard.and_then(|g| guards.get(&g).copied()).is_none() {
+                                    reads_below = true;
+                                    why = format!("index-not-own bb{bb}");
+                                }
+                            }
+                            Leaf::GuardRoot => {
+                                if guard.and_then(|g| guards.get(&g).copied()).is_none() {
                                     reads_below = true;
                                     why = format!("index-not-own bb{bb}");
                                 }
@@ -3818,5 +3925,46 @@ mod tests {
             assert_is_slot_index_bounds_check(&assert, &specials, &HashMap::new(), &fixture_llbc()),
             "index 0 of a 3-slot erased array is true by construction"
         );
+    }
+
+    /// `w_module_dict_setitem_str_internal` used to refuse
+    /// `calls-stack-sensitive-fn` on `DictOperationGuard::new` (`ReturnsIndex`)
+    /// and leave the module-strategy `with_roots!` as residual `push_roots`.
+    #[test]
+    fn w_module_dict_setitem_str_internal_bracket_is_scalar_replaced() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        );
+        if !std::path::Path::new(path).is_file() {
+            return;
+        }
+        let llbc = Llbc::load(path).expect("load pyre-object llbc");
+        ensure_stack_sensitive_fns(&llbc);
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .ends_with("::w_module_dict_setitem_str_internal")
+            })
+            .expect("w_module_dict_setitem_str_internal present");
+        let body = fd.unstructured().expect("body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected a bracket to erase"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        for block in &erased.body {
+            let Ok(TermKind::Call { call, .. }) = block.term_ref(&llbc) else {
+                continue;
+            };
+            if callee_path(call, &llbc)
+                .as_deref()
+                .is_some_and(|p| p.rsplit("::").next() == Some("push_roots"))
+            {
+                panic!("push_roots survived erase of w_module_dict_setitem_str_internal");
+            }
+        }
     }
 }

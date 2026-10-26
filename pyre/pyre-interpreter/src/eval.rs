@@ -3446,6 +3446,7 @@ fn store_name_into_dict(w_ns: PyObjectRef, name: &str, hash: i64, value: PyObjec
 ///
 /// # Safety
 /// `w_name` must point to a valid `str` object.
+#[inline(never)]
 pub unsafe fn store_name_value_w(
     frame: &mut PyFrame,
     w_name: PyObjectRef,
@@ -3522,6 +3523,7 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
 ///
 /// # Safety
 /// `w_name` must point to a valid `str` object.
+#[inline(never)]
 pub unsafe fn store_global_value_w(
     frame: &mut PyFrame,
     w_name: PyObjectRef,

@@ -6411,12 +6411,14 @@ pub(crate) fn capture_frame_stack_for_publish(
 /// before the walk ran.  Locals are unaffected — `write_back_outer_locals`
 /// takes those from the virtualizable shadow.
 ///
-/// The mirror reflects the depth ON ENTRY to the opcode at `py_pc`, so it pairs
-/// with `last_instr = py_pc - 1`, the same coordinate
-/// [`flush_walk_end_state_to_frame_with_full_stack`] stores for its own
-/// full-stack override.  The height is checked against the forward analysis for
-/// the same reason that override is: a mirror describing another coordinate
-/// must decline, not publish a shifted stack.
+/// The walker's opcode-entry mirror pairs with `last_instr = py_pc - 1`,
+/// the same coordinate [`flush_walk_end_state_to_frame_with_full_stack`]
+/// stores for its own full-stack override. An abort-point image from
+/// `virtualizable_boxes` may already be the post-pop height
+/// (`_opimpl_setfield_vable` ran before the CALL); that height is
+/// admitted when it matches the synchronized `valuestackdepth` and does
+/// not exceed the forward-analysis entry height. A mirror describing
+/// another coordinate must decline, not publish a shifted stack.
 ///
 /// The virtualizable's synchronized scalars win over the entry coordinate
 /// (`synchronize_virtualizable`): a stop inside the opcode has already run its
@@ -6476,8 +6478,23 @@ pub(crate) fn capture_frame_stack_from_mirror(
         .depth_at_py_pc()
         .get(py_pc)
         .copied()?;
-    if depth as usize != stack.len() {
-        return None;
+    let live_height = depth as usize;
+    if stack.len() != live_height {
+        // Abort-point image: `_opimpl_setarrayitem_vable` /
+        // `_opimpl_setfield_vable` already ran the pop before the CALL
+        // whose `next_pc` is the MIFrame resume coordinate, so the slots
+        // are already the post-pop height. Accept that height when it is
+        // the synchronized `valuestackdepth` and does not exceed the
+        // opcode-entry height.
+        let Some(synced) = synced_valuestackdepth else {
+            return None;
+        };
+        if synced != valuestackdepth
+            || stack.len() != valuestackdepth - stack_base
+            || stack.len() > live_height
+        {
+            return None;
+        }
     }
     Some(CapturedFrameStack {
         stack_base,

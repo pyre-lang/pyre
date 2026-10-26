@@ -2609,6 +2609,23 @@ fn analyze_pipeline_from_module_paths(
             fnaddr,
         );
     }
+    majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+        let addr = desc.get() as i64;
+        if addr == 0 {
+            return;
+        }
+        let Some((module_path_with_crate, impl_type_as_written, method)) =
+            desc.impl_fnaddr_binding()
+        else {
+            return;
+        };
+        call_control.register_macro_impl_helper_trace_fnaddr(
+            module_path_with_crate,
+            impl_type_as_written,
+            method,
+            addr,
+        );
+    });
     // RPython: GC transformer sets _gctransformer_hint_close_stack_,
     // _gctransformer_hint_cannot_collect_ on functions, and
     // random_effects_on_gcobjs on external function objects.

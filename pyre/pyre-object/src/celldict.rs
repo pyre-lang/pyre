@@ -740,14 +740,11 @@ fn cache_set_cell(
 
 /// `caches_get` plus `cache.cell =` under the registry lock so a
 /// concurrent `delitem` cannot drop the entry and then have this
-/// store resurrect it.
+/// store resurrect it. Reads `self.caches` off the strategy
+/// (`celldict.py _setitem_str_cell_known` / `delitem`).
 #[majit_macros::dont_look_inside]
-fn caches_set_cell(
-    caches: &parking_lot::Mutex<Option<GlobalCacheRegistry>>,
-    key: &str,
-    cell: Option<PyObjectRef>,
-) {
-    let guard = caches.lock();
+fn caches_set_cell(strategy: &ModuleDictStrategy, key: &str, cell: Option<PyObjectRef>) {
+    let guard = strategy.caches.lock();
     if let Some(cache) = guard
         .as_ref()
         .and_then(|registry| registry.get(key))
@@ -1176,7 +1173,7 @@ impl ModuleDictStrategy {
         // with the new stored value so subsequent LOAD_GLOBAL through
         // the cache reads the fresh entry without an invalidation
         // round-trip.
-        caches_set_cell(&self.caches, key, Some(w_to_store));
+        caches_set_cell(self, key, Some(w_to_store));
     }
 
     /// `celldict.py length`:
@@ -1216,7 +1213,7 @@ impl ModuleDictStrategy {
         // `celldict.py:117-121`: zero out the per-key cache
         // so LOAD_GLOBAL falls through to the builtins
         // fallback (or NameError) on the next read.
-        caches_set_cell(&self.caches, key, None);
+        caches_set_cell(self, key, None);
         self.mutated();
         Some(removed)
     }

@@ -20165,7 +20165,11 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 // helper latch (`finish_helper_abort_latch`); a failed splice
                 // discarded the staged image and either kept executing or
                 // returned this leftover `TraceTooLong`.
-                Err(error @ DispatchError::TraceTooLong { .. }) => {
+                // `ABORT_FORCE_QUASIIMMUT` is the same unwind
+                // (`opimpl_jit_force_quasi_immutable`): splice ran in
+                // `prepare_force_quasi_immutable_abort`.
+                Err(error @ DispatchError::TraceTooLong { .. })
+                | Err(error @ DispatchError::ForceQuasiImmutable { .. }) => {
                     self.exchange.completed.clear();
                     while !self.frames.is_empty() {
                         let _ = self.pop_frame();
@@ -21048,7 +21052,14 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             // register image is the resume coordinate, so do not mark the
             // abort as a callee-pc capability gap: that flag declines
             // single-frame adopt.
-            if !matches!(error, DispatchError::TraceTooLong { .. }) {
+            // `ABORT_FORCE_QUASIIMMUT` is the same unwind
+            // (`opimpl_jit_force_quasi_immutable`). A failed helper splice
+            // discarded the image so the enclosing Python CALL may latch
+            // (`mod2730`); the flag would decline that single-frame adopt.
+            if !matches!(
+                error,
+                DispatchError::TraceTooLong { .. } | DispatchError::ForceQuasiImmutable { .. }
+            ) {
                 ctx.session.borrow_mut().crossed_inline_subwalk = true;
             }
             if fbw_debug_abort_enabled() {

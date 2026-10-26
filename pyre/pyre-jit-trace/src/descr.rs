@@ -2899,6 +2899,49 @@ pub fn object_mutable_cell_value_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP, 0)
 }
 
+/// `typeobject.py IntMutableCell`. One SizeDescr per STRUCT
+/// (`descr.py get_size_descr`); the vtable is
+/// `heaptracker.py get_vtable_for_gcstruct` /
+/// `setup_cache_gcstruct2vtable` so a field-parent mint is born
+/// `is_object()`. `intvalue` is written in place by `write_cell`, so
+/// it stays MUTABLE. Cell identity is what the `version?`
+/// quasi-immutable guard protects.
+///
+/// `descr.index()` is the reserved [`INT_MUTABLE_CELL_VALUE_INDEX`]:
+/// `stable_field_index` for `(offset 16, size 8, Int)` collides with
+/// `W_IntObject.intval` / `W_ListObject.length` in the runtime
+/// `HeapCache` (`CELL_DESCR_TAG`).
+static W_INT_MUTABLE_CELL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::celldict::{
+        INT_MUTABLE_CELL_TYPE, IntMutableCell, W_INT_MUTABLE_CELL_GC_TYPE_ID,
+        W_INT_MUTABLE_CELL_OBJECT_SIZE,
+    };
+    build_object_descr_group_with_field_indices(
+        W_INT_MUTABLE_CELL_OBJECT_SIZE,
+        W_INT_MUTABLE_CELL_GC_TYPE_ID,
+        &INT_MUTABLE_CELL_TYPE as *const _ as usize,
+        &[(
+            "intvalue",
+            std::mem::offset_of!(IntMutableCell, intvalue),
+            8,
+            Type::Int,
+            true,
+            false,
+            false,
+        )],
+        "IntMutableCell",
+        "celldict::IntMutableCell",
+        &[INT_MUTABLE_CELL_VALUE_INDEX],
+    )
+});
+
+/// `typeobject.py IntMutableCell.intvalue`. Mutable: `write_cell` rewrites
+/// the payload in place and does not move `_version_tag`. The cell pointer is
+/// the constant; this field is a live `getfield`.
+pub fn int_mutable_cell_value_descr() -> DescrRef {
+    field_descr_from_group(&W_INT_MUTABLE_CELL_DESCR_GROUP, 0)
+}
+
 /// `nestedscope.py Cell` field layout — `contents`, `family`.
 ///
 /// `contents` is MUTABLE: `w_cell_set` rewrites it in place on every rebinding
@@ -4610,38 +4653,6 @@ pub fn super_header_w_class_descr() -> DescrRef {
 /// `w_class` are `SetfieldGc`'d after.
 pub fn w_super_size_descr() -> DescrRef {
     W_SUPER_DESCR_GROUP.size_descr.clone()
-}
-
-/// `typeobject.py IntMutableCell.intvalue` — the unboxed `Signed`
-/// payload of a module-global int cell, read LIVE on the cell fast path.
-/// `write_cell` rewrites it in place when a hot int global is reassigned to
-/// another int (no strategy-version bump), so this descriptor is mutable
-/// (not immutable / quasi-immutable); the `version?` guard protects cell
-/// identity, not the payload. Reassigning to a non-int replaces the cell,
-/// bumping the version and invalidating the fold.
-/// Descriptor for `IntMutableCell.intvalue`.  Index is the reserved
-/// [`INT_MUTABLE_CELL_VALUE_INDEX`] rather than `stable_field_index`
-/// because that field's `(offset 16, size 8, Int)` layout collides with
-/// `W_IntObject.intval` / `W_ListObject.length` in the runtime `HeapCache`
-/// key space (which keys by `descr.index()`; see [`CELL_DESCR_TAG`]).
-///
-/// `descr.py get_field_descr` caches by `(STRUCT, fieldname)` so the
-/// LOAD `getfield_gc_i` and STORE `setfield_gc_i` share one Arc.
-/// Signed `i64` payload, mutable (`write_cell` rewrites `intvalue` in
-/// place for an int->int reassign with no version bump).
-pub fn int_mutable_cell_value_descr() -> DescrRef {
-    gc_cached_field_descr(
-        "celldict::IntMutableCell",
-        "intvalue",
-        "IntMutableCell.intvalue",
-        core::mem::offset_of!(pyre_object::celldict::IntMutableCell, intvalue),
-        8,
-        Type::Int,
-        true,
-        false,
-        false,
-        INT_MUTABLE_CELL_VALUE_INDEX,
-    )
 }
 
 /// Size descriptor for `W_ListObject` allocation via NewWithVtable.
@@ -9919,6 +9930,68 @@ mod tests {
         );
     }
 
+    /// `typeobject.py IntMutableCell` / `ObjectMutableCell` are hand
+    /// `GcType` W_Root structs. `heaptracker.py get_vtable_for_gcstruct`
+    /// / `setup_cache_gcstruct2vtable` covers every vtable class before
+    /// any descr is minted, so even a field-parent SizeDescr is born
+    /// `is_object()`. Forcing the DECLARED_GROUPS row is that census.
+    #[test]
+    fn declared_groups_make_mutable_cell_parents_objects() {
+        for (_, force) in DECLARED_GROUPS {
+            force();
+        }
+        let int_key = majit_ir::descr::path_hash("celldict::IntMutableCell");
+        let obj_key = majit_ir::descr::path_hash("celldict::ObjectMutableCell");
+        let int_vtable = &pyre_object::celldict::INT_MUTABLE_CELL_TYPE as *const _ as usize;
+        let obj_vtable = &pyre_object::celldict::OBJECT_MUTABLE_CELL_TYPE as *const _ as usize;
+        let mut gc = majit_ir::descr::gc_cache().lock();
+        let int_parent = gc.get_size_descr(
+            majit_ir::descr::LLType::Struct(int_key),
+            pyre_object::celldict::W_INT_MUTABLE_CELL_OBJECT_SIZE,
+            0,
+            false,
+        );
+        let obj_parent = gc.get_size_descr(
+            majit_ir::descr::LLType::Struct(obj_key),
+            pyre_object::celldict::W_OBJECT_MUTABLE_CELL_OBJECT_SIZE,
+            0,
+            false,
+        );
+        drop(gc);
+
+        let int_sd = int_parent
+            .as_size_descr()
+            .expect("IntMutableCell SizeDescr");
+        assert!(
+            int_sd.is_object(),
+            "IntMutableCell parent must carry the pytype vtable"
+        );
+        assert_eq!(int_sd.vtable(), int_vtable);
+        let intvalue = int_mutable_cell_value_descr();
+        let intvalue_parent = intvalue
+            .as_field_descr()
+            .expect("intvalue FieldDescr")
+            .get_parent_descr()
+            .expect("intvalue parent");
+        assert!(Arc::ptr_eq(&intvalue_parent, &int_parent));
+
+        let obj_sd = obj_parent
+            .as_size_descr()
+            .expect("ObjectMutableCell SizeDescr");
+        assert!(
+            obj_sd.is_object(),
+            "ObjectMutableCell parent must carry the pytype vtable"
+        );
+        assert_eq!(obj_sd.vtable(), obj_vtable);
+        let w_value = object_mutable_cell_value_descr();
+        let w_value_parent = w_value
+            .as_field_descr()
+            .expect("w_value FieldDescr")
+            .get_parent_descr()
+            .expect("w_value parent");
+        assert!(Arc::ptr_eq(&w_value_parent, &obj_parent));
+    }
+
     /// Kind-0 packed parents of unpublished `#[pyre_class]` STRUCTs mint
     /// through `publish_borrowed_struct_layout` with the serialized
     /// `vtable=0`. That path must inject `_cache_gcstruct2vtable` the way
@@ -14906,6 +14979,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("celldict::ObjectMutableCell", || {
         LazyLock::force(&W_OBJECT_MUTABLE_CELL_DESCR_GROUP);
+    }),
+    ("celldict::IntMutableCell", || {
+        LazyLock::force(&W_INT_MUTABLE_CELL_DESCR_GROUP);
     }),
     ("nestedscope::Cell", || {
         LazyLock::force(&W_CELL_DESCR_GROUP);

@@ -3542,14 +3542,16 @@ pub struct LoweringContext {
     pub load_name_fn_idx: u16,
     /// `store_name_fn` descrs-pool index.  STORE_NAME family (single
     /// HLOp opname `store_name`, the `pyopcode.py` frame-receiver
-    /// shape) lowers to `residual_call_r_v` (three Ref inputs `[frame,
-    /// w_name, value]`, void result) via
+    /// shape) lowers to `inline_call_r_v` of `store_name_value_w` when
+    /// that body is fully bound, else `residual_call_r_v` (three Ref
+    /// inputs `[frame, w_name, value]`, void result) via
     /// [`lower_store_name_hlop_to_insn`].
     pub store_name_fn_idx: u16,
     /// `store_global_fn` descrs-pool index.  STORE_GLOBAL family (single
     /// HLOp opname `store_global`, the `pyopcode.py` frame-receiver
-    /// shape) lowers to `residual_call_r_v` (three Ref inputs `[frame,
-    /// w_name, value]`, void result) via
+    /// shape) lowers to `inline_call_r_v` of `store_global_value_w` when
+    /// that body is fully bound, else `residual_call_r_v` (three Ref
+    /// inputs `[frame, w_name, value]`, void result) via
     /// [`lower_store_global_hlop_to_insn`].
     pub store_global_fn_idx: u16,
     /// `delete_name_fn` descrs-pool index. DELETE_NAME lowers to a void
@@ -4565,12 +4567,14 @@ where
 
 /// Lower a `STORE_NAME` pre-rtype HLOp `store_name(frame, w_name,
 /// value)` → void (the `pyopcode.py STORE_NAME` frame-receiver
-/// shape recorded by `emit_frontend_store_name`) to the post-rtype
-/// `residual_call_r_v(ConstInt(store_name_fn_idx), ListR([frame,
-/// w_name, value]), Descr)` Insn — the same void 3-Ref shape as
-/// SETITEM.  `bh_store_name_fn(frame: Ref, w_name: Ref, value: Ref)`
-/// delegates to the interpreter `store_name_value`.
-/// `CallFlavor::Plain` like [`lower_load_name_hlop_to_insn`].
+/// shape recorded by `emit_frontend_store_name`) to
+/// `inline_call_r_v` of `eval::store_name_value_w` when this build
+/// binds that body fully, else `residual_call_r_v(ConstInt(store_name_fn_idx),
+/// ListR([frame, w_name, value]), Descr)` — the BUILD_MAP
+/// `dict_display_setitem` void 3-Ref shape.  `bh_store_name_fn` stays
+/// the blackhole/deopt residual.  A mapping-locals `__setitem__` may
+/// raise; `inline_call_*` always records the trailing `-live-` /
+/// `GUARD_NO_EXCEPTION`, matching the residual `CallFlavor::Plain`.
 pub fn lower_store_name_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -4593,6 +4597,17 @@ where
     let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
     let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
+    // pyopcode.py STORE_NAME → `space.setitem_str(w_locals, varname, w_value)`.
+    if let Some(insn) = build_orthodox_inline_call_r_v(
+        inline_call_targets::STORE_NAME_VALUE_W,
+        vec![
+            frame_operand.clone(),
+            name_operand.clone(),
+            value_operand.clone(),
+        ],
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.store_name_fn_idx,
         vec![frame_operand, name_operand, value_operand],
@@ -4605,13 +4620,13 @@ where
 
 /// Lower a `STORE_GLOBAL` pre-rtype HLOp `store_global(frame, w_name,
 /// value)` → void (the `pyopcode.py STORE_GLOBAL` frame-receiver
-/// shape recorded by `emit_frontend_store_global`) to the post-rtype
-/// `residual_call_r_v(ConstInt(store_global_fn_idx), ListR([frame,
-/// w_name, value]), Descr)` Insn — the same void 3-Ref shape as
-/// `lower_store_name_hlop_to_insn`.  `bh_store_global_fn(frame: Ref,
-/// w_name: Ref, value: Ref)` delegates to the interpreter
-/// `store_global_value`.  `CallFlavor::Plain` like
-/// [`lower_store_name_hlop_to_insn`].
+/// shape recorded by `emit_frontend_store_global`) to
+/// `inline_call_r_v` of `eval::store_global_value_w` when this build
+/// binds that body fully, else `residual_call_r_v` — the same void
+/// 3-Ref shape as [`lower_store_name_hlop_to_insn`].  `bh_store_global_fn`
+/// stays the blackhole/deopt residual.  A mapping `__setitem__` may
+/// raise; `inline_call_*` always records the trailing `-live-` /
+/// `GUARD_NO_EXCEPTION`, matching the residual `CallFlavor::Plain`.
 pub fn lower_store_global_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -4634,6 +4649,17 @@ where
     let frame_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
     let name_operand = flatten_arg_with_lowering(&op.args[1], get_register, lower_constant);
     let value_operand = flatten_arg_with_lowering(&op.args[2], get_register, lower_constant);
+    // pyopcode.py STORE_GLOBAL writes straight into `w_globals`.
+    if let Some(insn) = build_orthodox_inline_call_r_v(
+        inline_call_targets::STORE_GLOBAL_VALUE_W,
+        vec![
+            frame_operand.clone(),
+            name_operand.clone(),
+            value_operand.clone(),
+        ],
+    ) {
+        return Some(insn);
+    }
     Some(build_residual_call_r_v_insn_from_operands(
         ctx.store_global_fn_idx,
         vec![frame_operand, name_operand, value_operand],
@@ -6716,6 +6742,10 @@ pub(crate) mod inline_call_targets {
     pub const DICT_DISPLAY_NEW: &str = "pyre_object::dictmultiobject::w_dict_new";
     /// BUILD_MAP insert — `lower_tuple_build_hlop_to_insn`.
     pub const DICT_DISPLAY_SETITEM: &str = "pyre_interpreter::baseobjspace::dict_display_setitem";
+    /// STORE_NAME — `lower_store_name_hlop_to_insn`.
+    pub const STORE_NAME_VALUE_W: &str = "pyre_interpreter::eval::store_name_value_w";
+    /// STORE_GLOBAL — `lower_store_global_hlop_to_insn`.
+    pub const STORE_GLOBAL_VALUE_W: &str = "pyre_interpreter::eval::store_global_value_w";
     /// UNARY_NEGATIVE — `lower_unary_negative_hlop_to_insn`.
     pub const NEG: &str = "pyre_interpreter::objspace::descroperation::neg";
     /// UNARY_INVERT — `lower_unary_invert_hlop_to_insn`.
