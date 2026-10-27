@@ -193,6 +193,7 @@ impl Layout {
 ///
 /// PyPy: pypy/objspace/std/typeobject.py W_TypeObject
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("flag_heaptype", "flag_cpython_heaptype")]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
     /// `W_TypeObject._cpy_ref` (`cpyext/pyobject.py:add_direct_pyobj_storage`).
@@ -236,7 +237,10 @@ pub struct W_TypeObject {
     /// read types as `SomeList(SomeInstance(PyObjectRef))`. Heap types
     /// store a nursery block; immortal builtins keep the stable twin.
     pub mro_w: *mut crate::object_array::FixedObjectArray,
-    /// typeobject.py:184 `flag_heaptype` — immutable after creation.
+    /// typeobject.py `flag_heaptype`, listed in `_immutable_fields_`.
+    ///
+    /// `PyType_Freeze` (cpyext) clears it once.  A trace that read `true`
+    /// before that keeps the live `version_tag` arm, which stays correct.
     pub flag_heaptype: bool,
     /// [3.14-spec] CPython's public `Py_TPFLAGS_HEAPTYPE` ownership axis.
     ///
@@ -246,6 +250,7 @@ pub struct W_TypeObject {
     /// `PyType_FromModuleAndSpec`, so they publish HEAPTYPE while remaining
     /// PyPy-style builtin TypeDefs internally.  Keep that observable owner
     /// bit separate rather than changing the load-bearing PyPy field above.
+    /// Set at construction only; a JIT-immutable field like `flag_heaptype`.
     pub flag_cpython_heaptype: bool,
     /// CPython-internal `_Py_TPFLAGS_STATIC_BUILTIN` (bit 1).  This is not the
     /// inverse of HEAPTYPE: a legacy extension type readied through the public

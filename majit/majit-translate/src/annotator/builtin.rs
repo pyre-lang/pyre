@@ -1900,44 +1900,50 @@ fn ll_arraymove_intrinsic(
     Ok(s_none())
 }
 
-/// ClassDef interned for the unsuffixed template of an instantiated
-/// variant, when that template is a registered owner.
+/// True when `instantiated_name` is a generic instantiation of the enum
+/// variant declaration `root` names (`result::Result<i32,PyError>::Ok` of
+/// `Result::Ok`).
 ///
-/// `strip_generic_args` keeps the `::variant` tail
-/// (`result::Result<i32,PyError>::Ok` → `result::Result::Ok`).
-/// [`crate::front::StructFieldRegistry::registered_owner_key`] is the
-/// registry lookup that maps a dual-published qualified spelling onto
-/// the FieldRead leaf (`Result::Ok`);
-/// [`Bookkeeper::getuniqueclassdef_for_struct_root`] interns that key.
-/// None when the template is not a registered owner — does not mint a
-/// ClassDef for an unknown spelling.
-fn registered_template_classdef(
+/// `bookkeeper.py` `getdesc` keys the class object, never a spelling.  The
+/// declaration identity here is the name -> `StructId` table
+/// ([`majit_ir::descr::struct_template_id_for_name`]): every spelling of one
+/// declaration resolves to one id, and a spelling two declarations share
+/// resolves to none, so an unknown or ambiguous spelling never matches.
+fn instantiates_variant_declaration(
     bk: &Rc<Bookkeeper>,
     instantiated_name: &str,
-) -> Option<Rc<RefCell<ClassDef>>> {
+    root: &str,
+) -> bool {
     if !instantiated_name.contains('<') {
-        return None;
+        return false;
     }
     let template = majit_ir::descr::strip_generic_args(instantiated_name);
     if template.as_ref() == instantiated_name {
-        return None;
+        return false;
     }
-    let (parent, variant) = template.rsplit_once("::")?;
+    let Some((parent, variant)) = template.rsplit_once("::") else {
+        return false;
+    };
     if variant.is_empty() {
-        return None;
+        return false;
     }
-    let key = {
+    {
         let guard = bk.struct_fields.borrow();
-        let reg = guard.as_ref()?;
-        // A generic enum (`result::Result<i32,E>`) strips to
-        // `result::Result`; `rsplit_once` then yields `("result", "Result")`.
+        let Some(reg) = guard.as_ref() else {
+            return false;
+        };
         // The parent of a variant template is a registered enum base.
         if reg.enum_base_registry_key(parent).is_none() && !reg.is_enum_base(parent) {
-            return None;
+            return false;
         }
-        reg.registered_owner_key(template.as_ref())?
-    };
-    bk.getuniqueclassdef_for_struct_root(&key).ok()
+    }
+    match (
+        majit_ir::descr::struct_template_id_for_name(template.as_ref()),
+        majit_ir::descr::struct_template_id_for_name(root),
+    ) {
+        (Some(operand_id), Some(root_id)) => operand_id == root_id,
+        _ => false,
+    }
 }
 
 /// Analyzer for `__cast_instance_intrinsic` — the front-end pointer-downcast
@@ -2255,14 +2261,12 @@ fn cast_instance_intrinsic(
     // makes `SomeInstance.getattr("__pos_0")` read the `??TypeVar` row
     // (`s_ImpossibleValue`), `consider_op` raises `BlockedInference`
     // (`annrpython.py`), and `follow_link` never sees the success
-    // successor.  Keep the instantiation only when the operand's
-    // unsuffixed template interns as the same ClassDef as `root`
-    // (`registered_template_classdef`).
+    // successor.  Keep the instantiation only when the operand's template
+    // and `root` are the same declaration (`instantiates_variant_declaration`).
     let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
     if let SomeValue::Instance(inst) = operand
         && let Some(cd) = inst.classdef.as_ref()
-        && let Some(template_cd) = registered_template_classdef(bk, &cd.borrow().name)
-        && std::rc::Rc::ptr_eq(&template_cd, &classdef)
+        && instantiates_variant_declaration(bk, &cd.borrow().name, &root)
     {
         return Ok(SomeValue::Instance(SomeInstance::new(
             inst.classdef.clone(),
@@ -3740,6 +3744,14 @@ mod tests {
         use std::collections::HashMap;
 
         let bk = bk();
+        let ok_id = majit_ir::descr::StructId::from_canonical("result::Result::Ok");
+        let enum_id = majit_ir::descr::StructId::from_canonical("result::Result");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            ("result::Result".to_string(), Some(enum_id)),
+            ("Result".to_string(), Some(enum_id)),
+            ("result::Result::Ok".to_string(), Some(ok_id)),
+            ("Result::Ok".to_string(), Some(ok_id)),
+        ]));
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(
             "result::Result".to_string(),
@@ -3798,19 +3810,16 @@ mod tests {
             !std::rc::Rc::ptr_eq(&ok_cd, &dest_cd),
             "instantiation and template are distinct ClassDefs"
         );
-        let template_cd = registered_template_classdef(&bk, &ok_cd.borrow().name)
-            .expect("template of instantiated Ok is registered");
         assert!(
-            std::rc::Rc::ptr_eq(&template_cd, &dest_cd),
-            "template ClassDef must be the dest Result::Ok, got {:?}",
-            template_cd.borrow().name
+            instantiates_variant_declaration(&bk, &ok_cd.borrow().name, "Result::Ok"),
+            "instantiated Ok is an instantiation of the Result::Ok declaration"
         );
         assert!(
-            registered_template_classdef(&bk, "Result::Ok").is_none(),
+            !instantiates_variant_declaration(&bk, "Result::Ok", "Result::Ok"),
             "template-to-template is not an instantiated keep"
         );
         assert!(
-            registered_template_classdef(&bk, "result::Result<i32,PyError>").is_none(),
+            !instantiates_variant_declaration(&bk, "result::Result<i32,PyError>", "Result::Ok"),
             "enum instantiation is not the Ok variant"
         );
     }
@@ -3824,6 +3833,13 @@ mod tests {
         use std::collections::HashMap;
 
         let bk = bk();
+        let a_ok = majit_ir::descr::StructId::from_canonical("a::Result::Ok");
+        let b_ok = majit_ir::descr::StructId::from_canonical("b::Result::Ok");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            ("a::Result::Ok".to_string(), Some(a_ok)),
+            ("b::Result::Ok".to_string(), Some(b_ok)),
+            ("Result::Ok".to_string(), None),
+        ]));
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(
             "a::Result".to_string(),
@@ -3896,6 +3912,78 @@ mod tests {
                 .as_ref()
                 .is_some_and(|cd| !std::rc::Rc::ptr_eq(cd, &ok_cd)),
             "cast must not keep a::Result<i32,E>::Ok"
+        );
+    }
+
+    /// Distinct declarations `a::Result::Ok` and `outer::a::Result::Ok` are suffix-related.
+    /// Casting `a::Result<i32,E>::Ok` to its own `a::Result::Ok` keeps the instantiation.
+    #[test]
+    fn cast_instance_keeps_instantiation_when_a_longer_declaration_shares_the_suffix() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let a_ok = majit_ir::descr::StructId::from_canonical("a::Result::Ok");
+        let outer_ok = majit_ir::descr::StructId::from_canonical("outer::a::Result::Ok");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            ("a::Result::Ok".to_string(), Some(a_ok)),
+            ("outer::a::Result::Ok".to_string(), Some(outer_ok)),
+            ("Result::Ok".to_string(), None),
+        ]));
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        reg.fields.insert(
+            "outer::a::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "outer::a::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        let inst = "a::Result<i32,E>";
+        reg.fields.insert(
+            inst.to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            format!("{inst}::Ok"),
+            vec![("__pos_0".to_string(), "i32".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant("a::Result<i32,E>", "Ok")
+            .expect("a::Result<i32,E>::Ok");
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let mut s_root = crate::annotator::model::s_str0();
+        s_root.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::byte_str("a::Result::Ok"),
+        ));
+        let out = cast_instance_intrinsic(&bk, &[Some(s_ok), Some(s_root)], &HashMap::new())
+            .expect("cast of a::Result Ok to a::Result::Ok");
+        let SomeValue::Instance(inst_out) = out else {
+            panic!("expected SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst_out
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| std::rc::Rc::ptr_eq(cd, &ok_cd)),
+            "cast must keep a::Result<i32,E>::Ok"
         );
     }
 
