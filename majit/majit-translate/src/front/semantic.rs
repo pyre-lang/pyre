@@ -843,6 +843,14 @@ impl StructFieldRegistry {
         })
     }
 
+    /// Registered keys whose last `::` segment is `leaf`, in no particular order.
+    pub(crate) fn keys_with_last_segment(&self, leaf: &str) -> Vec<String> {
+        self.ensure_field_path_index();
+        let index = self.field_path_index.borrow();
+        let index = index.as_ref().expect("path index built");
+        index.by_last.get(leaf).cloned().unwrap_or_default()
+    }
+
     fn unique_suffix_owner_key<'a>(&'a self, owner: &str) -> Option<&'a str> {
         // Two path-suffix-related keys share their last `::` segment, so
         // the bucket is the full candidate set. More than one match is

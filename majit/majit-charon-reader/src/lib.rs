@@ -147,6 +147,13 @@ pub struct Llbc {
     /// `trait_impls` is immutable after parse, so the set is built once.
     /// See [`Llbc::has_explicit_drop_impl`].
     drop_impl_owners: std::sync::OnceLock<Vec<u64>>,
+    /// `(trait decl id, row index)` of every `trait_impls` row that names its trait in
+    /// `impl_trait.id`, sorted. `trait_impls` is immutable after parse, so the index is built
+    /// once. See [`Llbc::trait_impls_of`].
+    trait_impl_rows_by_trait: std::sync::OnceLock<Vec<(u64, usize)>>,
+    /// One value the translator derives from this artefact and reuses across queries.
+    /// [`Llbc::type_decls_mut`] drops it, since editing a type declaration can change it.
+    derived: std::sync::OnceLock<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Register-bank shape of a `#[repr(transparent)]` scalar wrapper.
@@ -340,6 +347,8 @@ impl Llbc {
             stack_returns_index_fns: parking_lot::RwLock::new(Vec::new()),
             trait_assoc_index: std::sync::OnceLock::new(),
             drop_impl_owners: std::sync::OnceLock::new(),
+            trait_impl_rows_by_trait: std::sync::OnceLock::new(),
+            derived: std::sync::OnceLock::new(),
         })
     }
 
@@ -831,6 +840,49 @@ impl Llbc {
     /// type in its `types[].skip_binder.value`.
     pub fn trait_impls_raw(&self) -> &[serde_json::Value] {
         &self.file.translated.trait_impls
+    }
+
+    /// The `trait_impls` rows whose `impl_trait.id` is `trait_decl_id`, in table order.
+    /// Same rows, in the same order, as filtering [`Llbc::trait_impls_raw`] on that id.
+    pub fn trait_impls_of(
+        &self,
+        trait_decl_id: u64,
+    ) -> impl Iterator<Item = &serde_json::Value> + '_ {
+        let index = self.trait_impl_rows_by_trait.get_or_init(|| {
+            let mut index: Vec<(u64, usize)> = self
+                .file
+                .translated
+                .trait_impls
+                .iter()
+                .enumerate()
+                .filter_map(|(row_index, row)| {
+                    let trait_id = row.get("impl_trait")?.get("id")?.as_u64()?;
+                    Some((trait_id, row_index))
+                })
+                .collect();
+            index.sort_unstable();
+            index
+        });
+        let start = index.partition_point(|&(id, _)| id < trait_decl_id);
+        let end = index.partition_point(|&(id, _)| id <= trait_decl_id);
+        index[start..end]
+            .iter()
+            .map(|&(_, row_index)| &self.file.translated.trait_impls[row_index])
+    }
+
+    /// The translator's derived value for this artefact, computed by `init` on first use.
+    /// One artefact holds one derived type; asking for another type panics.
+    pub fn derived<T: std::any::Any + Send + Sync>(&self, init: impl FnOnce() -> T) -> &T {
+        self.derived
+            .get_or_init(|| Box::new(init()))
+            .downcast_ref::<T>()
+            .expect("Llbc::derived holds one type")
+    }
+
+    /// Mutable access to the type declarations. Drops the [`Llbc::derived`] value.
+    pub fn type_decls_mut(&mut self) -> impl Iterator<Item = &mut TypeDecl> + '_ {
+        self.derived = std::sync::OnceLock::new();
+        self.file.translated.type_decls.iter_mut().flatten()
     }
 
     /// The type value the unique impl of `trait_decl_id` binds `assoc` to.

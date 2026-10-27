@@ -274,6 +274,10 @@ pub struct TypeDecl {
     /// schema-drift policy above). `None` when Charon emitted no layout.
     #[serde(default)]
     pub layout: Option<Box<RawValue>>,
+    /// [`Self::layout`] parsed into its per-target entries on first use; `None` when the layout
+    /// is absent or does not parse.
+    #[serde(skip)]
+    layout_entries: std::sync::OnceLock<Option<Vec<TargetLayout>>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
     /// closure environment is the object `{"Closure": …}`; an ordinary ADT
     /// is the string `"Normal"`. Kept raw so an
@@ -289,14 +293,14 @@ pub struct TypeDecl {
 }
 
 /// One `{key, value}` entry of [`TypeDecl::layout`].
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TargetLayout {
     pub key: String,
     pub value: TypeLayout,
 }
 
 /// Resolved memory layout of a single concrete type for one target.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TypeLayout {
     /// Byte size. Charon spells this as a bare integer or as
     /// `{"chosen": <u64 | const expr>}`; a `Deduplicated` chosen value is
@@ -319,14 +323,14 @@ pub struct TypeLayout {
 }
 
 /// Representation properties that affect the low-level value shape.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct TypeRepr {
     #[serde(default)]
     pub transparent: bool,
 }
 
 /// Per-variant field offsets within [`TypeLayout`].
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct VariantLayout {
     /// Byte offset of each field, indexed by the variant's field
     /// declaration order (matches [`VariantDecl::fields`] / a struct's
@@ -355,6 +359,16 @@ impl VariantLayout {
 }
 
 impl TypeDecl {
+    /// The parsed [`Self::layout`] entries, parsed once.
+    fn layout_entries(&self) -> Option<&[TargetLayout]> {
+        self.layout_entries
+            .get_or_init(|| {
+                let raw = self.layout.as_ref()?;
+                serde_json::from_str::<Vec<TargetLayout>>(raw.get()).ok()
+            })
+            .as_deref()
+    }
+
     /// Project the per-target layout, selecting the entry whose target
     /// triple equals `target`, or the sole entry when exactly one is
     /// present (single-target extraction). Returns `None` when layout is
@@ -365,8 +379,7 @@ impl TypeDecl {
     /// are resolved through `llbc`'s const table.
     pub fn layout_for_target(&self, llbc: &crate::Llbc, target: &str) -> Option<TypeLayout> {
         let raw = self.layout.as_ref()?;
-        let entries: Vec<TargetLayout> = serde_json::from_str(raw.get()).ok()?;
-        let mut layout = select_target_layout(entries, target)?;
+        let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
             layout.size = layout_measure(llbc, raw.get(), target, "size");
         }
@@ -404,8 +417,7 @@ impl TypeDecl {
         target: &str,
     ) -> Option<(Option<u64>, Option<u64>)> {
         let raw = self.layout.as_ref()?;
-        let entries: Vec<TargetLayout> = serde_json::from_str(raw.get()).ok()?;
-        let mut layout = select_target_layout(entries, target)?;
+        let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
             layout.size = layout_measure(llbc, raw.get(), target, "size");
         }
@@ -417,10 +429,7 @@ impl TypeDecl {
 
     /// Whether every emitted target layout records `#[repr(transparent)]`.
     pub fn is_repr_transparent(&self) -> bool {
-        let Some(raw) = self.layout.as_ref() else {
-            return false;
-        };
-        let Ok(entries) = serde_json::from_str::<Vec<TargetLayout>>(raw.get()) else {
+        let Some(entries) = self.layout_entries() else {
             return false;
         };
         !entries.is_empty()
@@ -434,17 +443,13 @@ impl TypeDecl {
     }
 }
 
-/// Pick the [`TargetLayout`] matching `target`, or the sole entry when
-/// exactly one is present. Returns `None` for an empty list or a
-/// multi-target list with no match.
-fn select_target_layout(mut entries: Vec<TargetLayout>, target: &str) -> Option<TypeLayout> {
-    if let Some(pos) = entries.iter().position(|e| e.key == target) {
-        return Some(entries.swap_remove(pos).value);
-    }
-    if entries.len() == 1 {
-        return Some(entries.swap_remove(0).value);
-    }
-    None
+/// The entry keyed `target`, else the only entry.
+fn select_target_layout<'a>(entries: &'a [TargetLayout], target: &str) -> Option<&'a TypeLayout> {
+    entries
+        .iter()
+        .find(|e| e.key == target)
+        .or_else(|| (entries.len() == 1).then(|| &entries[0]))
+        .map(|e| &e.value)
 }
 
 /// A layout integer written inline: a bare `u64`, `{"chosen": <u64>}`, or a
@@ -1194,30 +1199,52 @@ pub enum SpanRef {
 
 impl<'de> Deserialize<'de> for SpanRef {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let value = Value::deserialize(deserializer)?;
-        span_ref_from_value(&value)
-            .ok_or_else(|| serde::de::Error::custom(format!("span is not a span body: {value}")))
+        deserializer.deserialize_map(SpanRefVisitor)
     }
 }
 
-fn span_ref_from_value(value: &Value) -> Option<SpanRef> {
-    if let Some(data) = value.get("data") {
-        return serde_json::from_value(data.clone())
-            .ok()
-            .map(SpanRef::Inline);
+#[derive(Deserialize)]
+#[serde(field_identifier)]
+enum SpanRefKey {
+    #[serde(rename = "data")]
+    Data,
+    Untagged,
+    Value,
+    Deduplicated,
+    #[serde(other)]
+    Other,
+}
+
+struct SpanRefVisitor;
+
+impl<'de> serde::de::Visitor<'de> for SpanRefVisitor {
+    type Value = SpanRef;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a span body")
     }
-    if let Some(inner) = value.get("Untagged") {
-        return span_ref_from_value(inner);
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<SpanRef, A::Error> {
+        let (mut data, mut untagged, mut value, mut dedup) = (None, None, None, None);
+        while let Some(key) = map.next_key::<SpanRefKey>()? {
+            match key {
+                SpanRefKey::Data => data = Some(map.next_value::<SpanData>()?),
+                SpanRefKey::Untagged => untagged = Some(map.next_value::<SpanRef>()?),
+                SpanRefKey::Value => {
+                    value = Some(map.next_value::<(serde::de::IgnoredAny, SpanRef)>()?.1)
+                }
+                SpanRefKey::Deduplicated => dedup = Some(map.next_value::<u64>()?),
+                SpanRefKey::Other => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+        }
+        data.map(SpanRef::Inline)
+            .or(untagged)
+            .or(value)
+            .or(dedup.map(SpanRef::Deduplicated))
+            .ok_or_else(|| serde::de::Error::custom("span is not a span body"))
     }
-    if let Some(body) = value
-        .get("Value")
-        .and_then(Value::as_array)
-        .and_then(|arr| arr.get(1))
-    {
-        return span_ref_from_value(body);
-    }
-    let id = value.get("Deduplicated").and_then(Value::as_u64)?;
-    Some(SpanRef::Deduplicated(id))
 }
 
 /// `{"data": ...}` body of a hash-consed span. The id's other occurrences
@@ -2919,7 +2946,7 @@ mod tests {
         let entries: Vec<TargetLayout> = serde_json::from_str(two).unwrap();
         // exact match selects the aarch64 entry (offset 8), not the first
         assert_eq!(
-            select_target_layout(entries, "aarch64-apple-darwin")
+            select_target_layout(&entries, "aarch64-apple-darwin")
                 .and_then(|l| l.struct_field_offset(0)),
             Some(8)
         );
@@ -2929,13 +2956,13 @@ mod tests {
         let entries: Vec<TargetLayout> = serde_json::from_str(sole).unwrap();
         // sole entry chosen despite a non-matching requested target
         assert_eq!(
-            select_target_layout(entries, "aarch64-apple-darwin")
+            select_target_layout(&entries, "aarch64-apple-darwin")
                 .and_then(|l| l.struct_field_offset(0)),
             Some(0)
         );
 
         // empty list → None
-        assert!(select_target_layout(Vec::new(), "aarch64-apple-darwin").is_none());
+        assert!(select_target_layout(&[], "aarch64-apple-darwin").is_none());
     }
 
     /// A union body keeps its field list. `#[serde(other)]` turns any tag this

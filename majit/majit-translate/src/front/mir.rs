@@ -9077,6 +9077,12 @@ struct Lowering<'a> {
     /// [`forward_reachable_mask`] of this body. Scans that classify a
     /// local from every assignment consult it and skip the rest.
     forward_reached: Vec<bool>,
+    /// Locals some forward-reached `Call` terminator writes whole, for
+    /// [`Self::local_is_call_dest`]; built on first query.
+    call_dest_locals: std::cell::OnceCell<bit_set::BitSet>,
+    /// Root locals of some forward-reached projected `Assign` destination,
+    /// for [`Self::local_has_projected_store`]; built on first query.
+    projected_store_roots: std::cell::OnceCell<bit_set::BitSet>,
     /// MIR locals that are live when entering each block. Non-entry
     /// blocks receive these through `Block.inputargs`, and predecessor
     /// edges pass the matching current Variables via `Link.args`.
@@ -10192,6 +10198,13 @@ impl<'a> Lowering<'a> {
         }
         // A pair slice's length is live wherever its pointer is, and the
         // return length slot everywhere.
+        let raw_array_storage: Vec<usize> = raw_array
+            .iter()
+            .enumerate()
+            .filter_map(|(local, role)| {
+                matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
+            })
+            .collect();
         for live in &mut block_live_in {
             let lens: Vec<usize> = live
                 .iter()
@@ -10199,9 +10212,7 @@ impl<'a> Lowering<'a> {
                 .collect();
             live.extend(lens);
             live.extend(ret_len_slot_local);
-            live.extend(raw_array.iter().enumerate().filter_map(|(local, role)| {
-                matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
-            }));
+            live.extend(raw_array_storage.iter().copied());
         }
         // Panic-abort blocks stay in the fixpoint above so their uses still
         // flow into the switch that targets them. Only the lowered closure
@@ -10304,6 +10315,8 @@ impl<'a> Lowering<'a> {
             emit_block: block_id.clone(),
             block_id,
             forward_reached,
+            call_dest_locals: std::cell::OnceCell::new(),
+            projected_store_roots: std::cell::OnceCell::new(),
             block_live_in,
             block_entry_local_var,
             input_copied_from: std::collections::HashMap::new(),
@@ -13919,15 +13932,22 @@ impl<'a> Lowering<'a> {
     }
 
     fn local_is_call_dest(&self, local: usize) -> bool {
-        self.body.body.iter().enumerate().any(|(bb_idx, block)| {
-            if !self.forward_reached[bb_idx] {
-                return false;
-            }
-            let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc) else {
-                return false;
-            };
-            matches!(call.dest.kind, PlaceKind::Local(id) if id as usize == local)
-        })
+        self.call_dest_locals
+            .get_or_init(|| {
+                let mut out = bit_set::BitSet::new();
+                for (bb_idx, block) in self.body.body.iter().enumerate() {
+                    if !self.forward_reached[bb_idx] {
+                        continue;
+                    }
+                    if let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc)
+                        && let PlaceKind::Local(id) = call.dest.kind
+                    {
+                        out.insert(id as usize);
+                    }
+                }
+                out
+            })
+            .contains(local)
     }
 
     /// `pair.0 = q` after `pair` was built. The field write is the value
@@ -14121,16 +14141,25 @@ impl<'a> Lowering<'a> {
     }
 
     fn local_has_projected_store(&self, local: usize) -> bool {
-        self.body.body.iter().enumerate().any(|(bb_idx, block)| {
-            self.forward_reached[bb_idx]
-                && block.statements.iter().any(|stmt| {
-                    let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind() else {
-                        return false;
-                    };
-                    matches!(dest.kind, PlaceKind::Projection(..))
-                        && place_root_local(&dest) == Some(local)
-                })
-        })
+        self.projected_store_roots
+            .get_or_init(|| {
+                let mut out = bit_set::BitSet::new();
+                for (bb_idx, block) in self.body.body.iter().enumerate() {
+                    if !self.forward_reached[bb_idx] {
+                        continue;
+                    }
+                    for stmt in &block.statements {
+                        if let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind_ref()
+                            && matches!(dest.kind, PlaceKind::Projection(..))
+                            && let Some(root) = place_root_local(dest)
+                        {
+                            out.insert(root);
+                        }
+                    }
+                }
+                out
+            })
+            .contains(local)
     }
 
     /// Operand stored at `path` inside `root`. A call that writes `root`
@@ -56312,7 +56341,7 @@ pub fn apply_published_structs(llbc: &mut Llbc, rows: &[PublishedStructBody]) {
             .collect();
         updates.insert(td.def_id, fields);
     }
-    for td in llbc.file.translated.type_decls.iter_mut().flatten() {
+    for td in llbc.type_decls_mut() {
         let Some(fields) = updates.remove(&td.def_id) else {
             continue;
         };
@@ -59030,25 +59059,29 @@ fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstructured) {
     if vec_locals.is_empty() {
         return;
     }
+    // `(block, dropped local, Drop/Call target)` for every block whose terminator drops a local.
+    let drop_sites: Vec<(usize, u64, Option<u64>)> = (0..body.body.len())
+        .filter_map(|bb_idx| {
+            let term = body.body[bb_idx].term_ref(llbc).ok()?;
+            let dropped = term_dropped_local(term, &name_of)?;
+            let target = match term {
+                TermKind::Drop { target, .. } | TermKind::Call { target, .. } => Some(*target),
+                _ => None,
+            };
+            Some((bb_idx, dropped, target))
+        })
+        .collect();
     let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();
     for local in vec_locals {
+        let mut sites = drop_sites
+            .iter()
+            .filter(|(_, dropped, _)| *dropped == local as u64)
+            .peekable();
+        if sites.peek().is_none() {
+            continue;
+        }
         let entry = vec_local_entry_bits(body, llbc, local);
-        for bb_idx in 0..body.body.len() {
-            let (dropped, target) = match body.body[bb_idx].term_ref(llbc) {
-                Ok(term) => (
-                    term_dropped_local(term, &name_of),
-                    match term {
-                        TermKind::Drop { target, .. } | TermKind::Call { target, .. } => {
-                            Some(*target)
-                        }
-                        _ => None,
-                    },
-                ),
-                _ => continue,
-            };
-            if dropped != Some(local as u64) {
-                continue;
-            }
+        for &(bb_idx, _, target) in sites {
             let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
             if vec_init_from_bits(at_term) != VecInit::Uninit {
                 continue;
@@ -59074,16 +59107,22 @@ fn definitely_init_vec_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set:
         .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
         .map(|local| local.index as usize)
         .collect();
+    let drop_sites: Vec<(usize, u64)> = (0..body.body.len())
+        .filter_map(|bb_idx| {
+            let term = body.body[bb_idx].term_ref(llbc).ok()?;
+            Some((bb_idx, term_dropped_local(term, &name_of)?))
+        })
+        .collect();
     for local in vec_locals {
+        let mut sites = drop_sites
+            .iter()
+            .filter(|(_, dropped)| *dropped == local as u64)
+            .peekable();
+        if sites.peek().is_none() {
+            continue;
+        }
         let entry = vec_local_entry_bits(body, llbc, local);
-        for bb_idx in 0..body.body.len() {
-            let dropped = match body.body[bb_idx].term_ref(llbc) {
-                Ok(term) => term_dropped_local(term, &name_of),
-                _ => continue,
-            };
-            if dropped != Some(local as u64) {
-                continue;
-            }
+        for &(bb_idx, _) in sites {
             let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
             if vec_init_from_bits(at_term) == VecInit::Init {
                 out.insert(bb_idx);
@@ -67356,16 +67395,44 @@ fn tyref_to_value_type_with(
     ValueType::Ref(None)
 }
 
+/// Per-artefact inputs of [`tyref_to_value_type`]: the declared GC struct ids and the
+/// `_alloc_flavor_ = raw` structs. Both depend only on the artefact.
+struct ValueTypeInputs {
+    gc_struct_ids: std::collections::HashSet<majit_ir::descr::StructId>,
+    raw_alloc_flavor_structs: std::collections::HashSet<String>,
+}
+
+/// Values derived from one artefact and reused across queries; stored in `Llbc::derived`,
+/// which `Llbc::type_decls_mut` drops.
+#[derive(Default)]
+struct LlbcDerived {
+    value_type_inputs: std::sync::OnceLock<ValueTypeInputs>,
+    struct_decls_by_owner: std::sync::OnceLock<StructDeclsByOwner>,
+}
+
+fn llbc_derived(llbc: &Llbc) -> &LlbcDerived {
+    llbc.derived(LlbcDerived::default)
+}
+
+fn value_type_inputs(llbc: &Llbc) -> &ValueTypeInputs {
+    llbc_derived(llbc)
+        .value_type_inputs
+        .get_or_init(|| ValueTypeInputs {
+            gc_struct_ids: harvest_declared_gc_facts(llbc).gc_struct_ids(),
+            raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                std::slice::from_ref(llbc),
+            ),
+        })
+}
+
 fn tyref_to_value_type(ty: &TyRef, llbc: &Llbc) -> ValueType {
-    let gc_struct_ids = harvest_declared_gc_facts(llbc).gc_struct_ids();
-    let raw_alloc_flavor_structs =
-        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
+    let inputs = value_type_inputs(llbc);
     tyref_to_value_type_with(
         ty,
         llbc,
         no_tombstoned_leaves(),
-        &gc_struct_ids,
-        &raw_alloc_flavor_structs,
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
     )
 }
 
@@ -69236,23 +69303,53 @@ fn tyref_by_value_struct_decl<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l Type
     Some(td)
 }
 
+/// `Struct` declarations of one artefact by owner spelling, for [`type_decl_by_owner_root`].
+struct StructDeclsByOwner {
+    /// `(spelling, table position)` for each `Struct` decl's `name_path()` and its
+    /// `strip_crate_prefix` form, sorted; the smallest position per spelling is the first
+    /// decl in table order.
+    exact: Vec<(String, usize)>,
+    /// `(last path segment, table position)` for each `Struct` decl, sorted.
+    leaf: Vec<(String, usize)>,
+}
+
+fn struct_decls_by_owner(llbc: &Llbc) -> &StructDeclsByOwner {
+    llbc_derived(llbc).struct_decls_by_owner.get_or_init(|| {
+        let mut exact = Vec::new();
+        let mut leaf = Vec::new();
+        for (i, td) in llbc.file.translated.type_decls.iter().enumerate() {
+            let Some(td) = td else {
+                continue;
+            };
+            if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+                continue;
+            }
+            let path = td.item_meta.name_path();
+            exact.push((path.clone(), i));
+            exact.push((strip_crate_prefix(&path), i));
+            leaf.push((path.rsplit("::").next().unwrap_or(&path).to_string(), i));
+        }
+        exact.sort_unstable();
+        leaf.sort_unstable();
+        StructDeclsByOwner { exact, leaf }
+    })
+}
+
 fn type_decl_by_owner_root<'l>(llbc: &'l Llbc, owner: &str) -> Option<&'l TypeDecl> {
-    let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
-    let mut leaf_hits = Vec::new();
-    for td in llbc.iter_type_decls() {
-        if !matches!(td.kind, TypeDeclKind::Struct(_)) {
-            continue;
-        }
-        let path = td.item_meta.name_path();
-        if path == owner || strip_crate_prefix(&path) == owner {
-            return Some(td);
-        }
-        if path.rsplit("::").next() == Some(owner_leaf) {
-            leaf_hits.push(td);
+    let index = struct_decls_by_owner(llbc);
+    let start = index.exact.partition_point(|(k, _)| k.as_str() < owner);
+    if let Some((key, pos)) = index.exact.get(start) {
+        if key == owner {
+            return llbc.type_by_id(*pos as u64);
         }
     }
-    match leaf_hits.as_slice() {
-        [td] => Some(*td),
+    let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let start = index.leaf.partition_point(|(k, _)| k.as_str() < owner_leaf);
+    let end = index
+        .leaf
+        .partition_point(|(k, _)| k.as_str() <= owner_leaf);
+    match &index.leaf[start..end] {
+        [(_, pos)] => llbc.type_by_id(*pos as u64),
         _ => None,
     }
 }
@@ -70011,17 +70108,8 @@ fn transparent_deref_target_class(
     }
     let trait_id = deref_trait_decl_id(llbc)?;
     let mut class = None;
-    for row in llbc.trait_impls_raw() {
-        if row.is_null() {
-            continue;
-        }
-        let Some(impl_trait) = row.get("impl_trait") else {
-            continue;
-        };
-        if impl_trait.get("id").and_then(|id| id.as_u64()) != Some(trait_id) {
-            continue;
-        }
-        let Some(self_ty) = impl_trait.pointer("/generics/types/0") else {
+    for row in llbc.trait_impls_of(trait_id) {
+        let Some(self_ty) = row.pointer("/impl_trait/generics/types/0") else {
             continue;
         };
         let Some(self_id) = tyexpr_to_adt_def_id(llbc, self_ty) else {

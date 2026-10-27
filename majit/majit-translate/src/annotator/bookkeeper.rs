@@ -2883,14 +2883,11 @@ impl Bookkeeper {
         if reg.fields.contains_key(root) {
             return None;
         }
-        let mut hit: Option<&String> = None;
-        for k in reg.fields.keys() {
-            let Some((head, leaf)) = k.rsplit_once("::") else {
+        let mut hit: Option<String> = None;
+        for k in reg.keys_with_last_segment(root) {
+            let Some((head, _leaf)) = k.rsplit_once("::") else {
                 continue;
             };
-            if leaf != root {
-                continue;
-            }
             // An `{Enum}::{Variant}` key's tail is a variant name, not a
             // struct leaf — the enum base carries the `__discriminant` row.
             if reg.is_enum_base(head) {
@@ -2901,7 +2898,7 @@ impl Bookkeeper {
             }
             hit = Some(k);
         }
-        hit.cloned()
+        hit
     }
 
     /// `SomeInstance(classdef)` for a struct root already interned, present
