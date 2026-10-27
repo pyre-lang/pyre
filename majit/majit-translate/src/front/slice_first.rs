@@ -6,8 +6,8 @@
 //! LLBC (Charon cannot extract `core`), so the caller emits a residual `first`
 //! call — an unregistered callee the rtyper census Skips.  Its `Self` is the
 //! primitive slice `[T]` (not an ADT), so `lower_call` keeps the raw
-//! `FunctionPath` segments `["core","slice","<Impl>","first"]` (same shape as
-//! `bool::then`), receiver in `args[0]`.  Unlike `bool::then`, the condition is
+//! `FunctionPath` segments `["core","slice","<Impl>","first"]`,
+//! receiver in `args[0]`.  The condition is
 //! not an operand — `first` returns `Some(&slice[0])` iff `slice` is non-empty,
 //! so this pass *synthesizes* the guard `len(slice) > 0`:
 //!
@@ -66,10 +66,10 @@
 //! keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{
+use crate::front::option_map_or::emit_narrow;
+use crate::front::option_variant::{
     close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
 };
-use crate::front::option_map_or::emit_narrow;
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `<[T]>::first(slice)` call site captured during body lowering
@@ -285,7 +285,7 @@ fn rewire_one_slice_first_site(
             let item_index = graph.alloc_value_var();
             if matches!(site.access, SliceAccess::Last) {
                 let len = graph.alloc_value_var();
-                let len_kind = crate::front::bool_then::slice_len_op(
+                let len_kind = crate::front::option_variant::slice_len_op(
                     slice_in_then.clone(),
                     site.object_array_type_id.as_deref(),
                     site.string_byte_view,
@@ -421,7 +421,7 @@ fn rewire_one_slice_first_site(
         graph.blocks[a].operations.remove(ci);
     }
     let len = graph.alloc_value_var();
-    let len_kind = crate::front::bool_then::slice_len_op(
+    let len_kind = crate::front::option_variant::slice_len_op(
         slice.clone(),
         site.object_array_type_id.as_deref(),
         site.string_byte_view,

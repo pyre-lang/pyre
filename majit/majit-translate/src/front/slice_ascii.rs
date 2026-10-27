@@ -142,7 +142,7 @@ pub(crate) fn build_ll_first_non_ascii_char_graph(
     let n = graph.alloc_value_var();
     graph.block_mut(start).operations.push(SpaceOperation {
         result: Some(n.clone()),
-        kind: crate::front::bool_then::slice_len_op(s.clone(), None, string_byte_view),
+        kind: crate::front::option_variant::slice_len_op(s.clone(), None, string_byte_view),
     });
     let i = graph.alloc_value_var();
     graph.block_mut(start).operations.push(SpaceOperation {

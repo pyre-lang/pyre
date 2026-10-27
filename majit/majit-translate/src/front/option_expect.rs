@@ -43,7 +43,7 @@
 //! keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::expect(opt, msg)` call site captured during body
@@ -224,7 +224,7 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         });
         payload
     };
-    let payload_value = crate::front::option_unwrap_or::emit_narrow(graph, then_bb, &cast, payload);
+    let payload_value = crate::front::option_unwrap::emit_narrow(graph, then_bb, &cast, payload);
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &out_var,

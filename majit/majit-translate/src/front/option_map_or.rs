@@ -6,8 +6,8 @@
 //! Opaque in the LLBC (Charon cannot extract `core`), and whose receiver is
 //! the `Option` ADT, so `first_is_self` routes it to a `CallTarget::Method`
 //! (receiver in `args[0]`, `default` in `args[1]`, closure env in `args[2]`),
-//! NOT a raw FunctionPath — the same routing as [`crate::front::option_unwrap_or`].
-//! Like [`crate::front::bool_then`] and unlike [`crate::front::checked_arith`],
+//! NOT a raw FunctionPath — the same routing as [`crate::front::option_unwrap`].
+//! Unlike [`crate::front::checked_arith`],
 //! the combinator's match lives inside the opaque body: at the call site there
 //! is no discriminant switch to rewrite, only `result = map_or(opt, default,
 //! closure)` flowing on.  This pass *creates* the two-way select the
@@ -20,12 +20,10 @@
 //!     else                       { result = default }
 //! ```
 //!
-//! It is a hybrid of the two prior passes: the discriminant branch and the
-//! `None`-arm `default` forward come from `option_unwrap_or`; the `Some`-arm
-//! `call_once` on the closure env comes from `bool_then`.  The one structural
-//! difference from `bool_then` is the argument tuple: `map_or`'s closure is
-//! unary (it receives the unwrapped payload), so the `Args` tuple is `(x,)`
-//! rather than the niladic `()`, and the `call_once` result flows on directly
+//! The discriminant branch and the `None`-arm `default` forward come from a
+//! value-select diamond; the `Some`-arm calls `call_once` on the closure env.
+//! The argument tuple is unary (it receives the unwrapped payload), so the
+//! `Args` tuple is `(x,)`, and the `call_once` result flows on directly
 //! (`map_or` returns the closure's `U`, not `Option<U>`).
 //!
 //! The branch is mandatory — the closure must not run when `opt` is `None`
@@ -55,7 +53,7 @@
 //! keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{
     BlockId, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
 };

@@ -2,14 +2,14 @@
 //!
 //! Recorded from `lower_call` next to `core::intrinsics::transmute`
 //! (`lloperation.py` `LL_OPERATIONS`) and rewritten after the body
-//! lowers — the same post-pass contract as `saturating_mul` / `bool::then`.
+//! lowers — the same post-pass contract as `saturating_mul`.
 //! Signed overflow uses `add_ovf` / `sub_ovf` (`rint.py` `rtype_add_ovf` /
 //! `rtype_sub_ovf`) then MIN/MAX by the receiver sign. Unsigned clamps:
 //! word-sized add wraps and tests `uint_lt(sum, a)`; narrower unsigned add
 //! tests `a > MAX - b`; sub floors at zero via `a < b`.
 
 use crate::flowspace::model::{ConstValue, Variable};
-use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{
     CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
     ValueType,

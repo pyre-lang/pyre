@@ -27,24 +27,33 @@ fn unicode_translate_error_borrow_chain_is_value_lowered() {
     let context = LowerContext::new(&llbc);
     let graph = lower_fun_decl_with_static_addrs(&context, declaration, HostStaticAddrs::default())
         .expect("lower unicode_translate_error_str, not reject the graph");
+    let mut as_ref_calls = 0;
     let mut borrowed_integer_reads = 0;
     for op in graph.blocks.iter().flat_map(|block| &block.operations) {
-        if let OpKind::Call {
-            target:
+        if let OpKind::Call { target, .. } = &op.kind {
+            match target {
                 CallTarget::Method {
                     name,
                     receiver_root,
                     ..
-                },
-            ..
-        } = &op.kind
-        {
-            assert!(
-                !(receiver_root.as_deref() == Some("Result")
-                    && matches!(name.as_str(), "as_ref" | "expect")),
-                "borrowed Result calls must become value branches: {:?}",
-                op.kind
-            );
+                } => {
+                    if name == "as_ref" {
+                        as_ref_calls += 1;
+                    }
+                    assert!(
+                        !(receiver_root.as_deref() == Some("Result") && name == "expect"),
+                        "Result::expect is still the unwrap rewrite: {:?}",
+                        op.kind
+                    );
+                }
+                CallTarget::FunctionPath { segments, .. }
+                    if segments.last().map(String::as_str) == Some("as_ref")
+                        && segments.iter().any(|s| s == "result") =>
+                {
+                    as_ref_calls += 1;
+                }
+                _ => {}
+            }
         }
         if let OpKind::FieldRead { field, ty, .. } = &op.kind
             && field.name == "__pos_0"
@@ -62,7 +71,11 @@ fn unicode_translate_error_borrow_chain_is_value_lowered() {
         }
     }
     assert_eq!(
-        borrowed_integer_reads, 2,
-        "as_ref's Ok copy and nonconstant expect must both read the scalar"
+        as_ref_calls, 1,
+        "caller keeps one regular call to the core as_ref body"
+    );
+    assert_eq!(
+        borrowed_integer_reads, 1,
+        "the as_ref Ok copy lives in the core body; the caller has one remaining __pos_0 Int read from nonconstant expect"
     );
 }

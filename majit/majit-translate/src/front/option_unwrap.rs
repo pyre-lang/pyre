@@ -5,8 +5,8 @@
 //!
 //! `core::{option,result}::<Impl>::unwrap` is a foreign combinator whose body
 //! is Opaque in the LLBC (Charon cannot extract `core`), so the caller emits a
-//! residual `unwrap` call — an unregistered callee the rtyper census Skips. Like
-//! [`crate::front::option_unwrap_or`] the combinator's match lives inside the
+//! residual `unwrap` call — an unregistered callee the rtyper census Skips.
+//! The combinator's match lives inside the
 //! opaque body: at the call site there is only `result = unwrap(opt)` flowing
 //! on.  This pass creates the guard the combinator's semantics imply:
 //!
@@ -41,7 +41,7 @@
 //! keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{close_goto_mixed, map_source, reproduce_exit_args};
+use crate::front::option_variant::{close_goto_mixed, map_source, reproduce_exit_args};
 use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// A recognized `Option::unwrap(opt)` / `Result::unwrap(res)` call site
@@ -130,7 +130,7 @@ fn rewire_one_unwrap_site(
     // The call sits at the block tail, optionally followed by the single
     // `__cast_instance_intrinsic(result)` that restores a returned aggregate's
     // RPython repr identity.  This is the same lower_call shape accepted by
-    // `option_unwrap_or`: the cast is a jitcode identity, but the continuation
+    // the same lower_call shape as other combinator diamonds: the cast is a jitcode identity, but the continuation
     // consumes its result rather than the raw call value, so it must move into
     // the successful arm with the extracted payload.
     let call_idx = graph.blocks[a]
@@ -242,8 +242,7 @@ fn rewire_one_unwrap_site(
         });
         payload
     };
-    let payload_value =
-        crate::front::option_unwrap_or::emit_narrow(graph, payload_bb, &cast, payload);
+    let payload_value = emit_narrow(graph, payload_bb, &cast, payload);
     let payload_link_args = reproduce_exit_args(
         &saved_exit,
         &out_var,
@@ -336,6 +335,27 @@ fn rewire_one_unwrap_site(
         );
     }
     Ok(())
+}
+
+/// Re-emit the `__cast_instance_intrinsic` narrowing the residual call carried into
+/// an arm's `raw` payload value.  `None` (no cast on the original result) is a
+/// pass-through: the raw value flows on unchanged.  The cast is jitcode-identity
+/// (`cast_pointer` → `same_as`), so duplicating it per arm is sound.
+pub(crate) fn emit_narrow(
+    graph: &mut FunctionGraph,
+    bb: crate::model::BlockId,
+    cast: &Option<(String, ValueType)>,
+    raw: Variable,
+) -> Variable {
+    let Some((root, result_ty)) = cast else {
+        return raw;
+    };
+    let narrowed = graph.alloc_value_var();
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(narrowed.clone()),
+        kind: crate::model::cast_instance_call_result(root.clone(), raw, result_ty.clone()),
+    });
+    narrowed
 }
 
 /// Implicit `AssertionError` raise for a non-payload arm (`None` / `Err`).

@@ -82,10 +82,10 @@
 //! the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::bool_then::{
+use crate::front::option_map_or::emit_narrow;
+use crate::front::option_variant::{
     close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
 };
-use crate::front::option_map_or::emit_narrow;
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// `true` iff `path` is the FunDecl `name_path` of `<[T]>::get` or `<[T]>::get_mut`.
@@ -470,7 +470,7 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         graph.blocks[a].operations.remove(ci);
     }
     let len = graph.alloc_value_var();
-    let len_kind = crate::front::bool_then::slice_len_op(
+    let len_kind = crate::front::option_variant::slice_len_op(
         slice,
         site.object_array_type_id.as_deref(),
         // A byte-view receiver never reaches here: the site capture in

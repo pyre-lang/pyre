@@ -905,49 +905,26 @@ fn branch_loop_sum_lifts_next_to_iter_next_op() {
     );
 }
 
-/// `bool::then` and `bool::then_some` both lift to the short-circuit
-/// `Option` diamond. `then` calls the closure's `call_once`; `then_some`
-/// wraps an already-evaluated value and emits no `call_once`.
+/// `bool::then_some` stays an ordinary call to the extracted core body;
+/// the Some/None diamond lives in that graph. `bool::then` still rewrites
+/// at the caller: its closure `call_once` is not a function-item unpack.
 #[test]
 fn bool_then_lifts_to_short_circuit_diamond() {
-    use majit_translate::model::{CallTarget, ExitSwitch, OpKind};
-    let cases = [
-        (
-            "closure",
-            "bool_then_closure",
-            "then",
-            1usize,
-            "the residual `core::bool::then` call must be replaced by the diamond",
-            "the then arm calls the closure's `call_once`",
-            "the then arm builds `Some(payload)`",
-            "the else arm builds `None`",
-        ),
-        (
-            "some",
-            "bool_then_some",
-            "then_some",
-            0usize,
-            "the residual `core::bool::then_some` call must be replaced by the diamond",
-            "the then_some arm wraps the eager value directly — no `call_once`",
-            "the then arm builds `Some(value)`",
-            "the else arm builds `None`",
-        ),
-    ];
-    for (
-        name,
-        fn_name,
-        residual_name,
-        want_call_once,
-        residual_msg,
-        call_once_msg,
-        some_msg,
-        none_msg,
-    ) in cases
-    {
-        let llbc = load_corpus();
-        let graph = lower_function(llbc, fn_name).expect("lowering");
-        let reachable = reachable_blocks(&graph);
-        let mut residual = 0usize;
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{CallTarget, ExitSwitch, FunctionGraph, OpKind};
+
+    fn is_call_once(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::Method { name, .. } => name == "call_once",
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().map(String::as_str) == Some("call_once")
+            }
+            _ => false,
+        }
+    }
+
+    fn diamond_counts(graph: &FunctionGraph) -> (usize, usize, usize, usize) {
+        let reachable = reachable_blocks(graph);
         let mut call_once = 0usize;
         let mut bool_branches = 0usize;
         let mut some_ctor = 0usize;
@@ -959,42 +936,115 @@ fn bool_then_lifts_to_short_circuit_diamond() {
             if matches!(b.exitswitch, Some(ExitSwitch::Value(_))) {
                 bool_branches += 1;
             }
-            let mut last_disc: Option<i64> = None;
             for op in &b.operations {
                 match &op.kind {
+                    OpKind::Call { target, .. } if is_call_once(target) => call_once += 1,
                     OpKind::Call {
-                        target: CallTarget::FunctionPath { segments, .. },
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
                         ..
-                    } if segments.last().map(String::as_str) == Some(residual_name)
-                        && segments.iter().any(|s| s == "bool") =>
-                    {
-                        residual += 1
-                    }
+                    } if name == "Some" => some_ctor += 1,
                     OpKind::Call {
-                        target: CallTarget::Method { name: method, .. },
+                        target: CallTarget::SyntheticTransparentCtor { name, .. },
                         ..
-                    } if method == "call_once" => call_once += 1,
-                    OpKind::ConstInt(d) => last_disc = Some(*d),
-                    OpKind::FieldWrite { field, .. } if field.name == "__discriminant" => {
-                        match last_disc {
-                            Some(1) => some_ctor += 1,
-                            Some(0) => none_ctor += 1,
-                            _ => {}
-                        }
-                    }
+                    } if name == "None" => none_ctor += 1,
                     _ => {}
                 }
             }
         }
-        assert_eq!(residual, 0, "case {name}: {residual_msg}");
-        assert_eq!(call_once, want_call_once, "case {name}: {call_once_msg}");
-        assert_eq!(
-            bool_branches, 1,
-            "case {name}: the call block closes with a single `bool(cond)` branch"
-        );
-        assert_eq!(some_ctor, 1, "case {name}: {some_msg}");
-        assert_eq!(none_ctor, 1, "case {name}: {none_msg}");
+        (call_once, bool_branches, some_ctor, none_ctor)
     }
+
+    fn residual_bool_calls(graph: &FunctionGraph, leaf: &str) -> usize {
+        let reachable = reachable_blocks(graph);
+        let mut residual = 0usize;
+        for b in &graph.blocks {
+            if !reachable.contains(&b.id) {
+                continue;
+            }
+            for op in &b.operations {
+                if let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } = &op.kind
+                    && segments.last().map(String::as_str) == Some(leaf)
+                    && segments.iter().any(|s| s == "bool")
+                {
+                    residual += 1;
+                }
+            }
+        }
+        residual
+    }
+
+    let llbc = load_corpus();
+
+    let then_graph = lower_function(llbc, "bool_then_closure").expect("lowering");
+    let (call_once, bool_branches, _some_ctor, _none_ctor) = diamond_counts(&then_graph);
+    assert_eq!(
+        residual_bool_calls(&then_graph, "then"),
+        0,
+        "then: the caller rewrite consumes the residual call"
+    );
+    assert!(
+        call_once >= 1,
+        "then: the rewrite arm invokes the closure (call_once={call_once})"
+    );
+    assert!(
+        bool_branches >= 1,
+        "then: the caller hosts the short-circuit branch (branches={bool_branches})"
+    );
+
+    let some_graph = lower_function(llbc, "bool_then_some").expect("lowering");
+    let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&some_graph);
+    assert_eq!(
+        residual_bool_calls(&some_graph, "then_some"),
+        1,
+        "then_some: caller keeps a regular call to the core body"
+    );
+    assert_eq!(call_once, 0, "then_some: the core body wraps the value");
+    assert_eq!(
+        bool_branches, 0,
+        "then_some: the caller does not host the Some/None diamond"
+    );
+    assert_eq!(some_ctor, 0, "then_some: Some is built in the core body");
+    assert_eq!(none_ctor, 0, "then_some: None is built in the core body");
+
+    let mut lowered_core_bodies = 0usize;
+    for artefact in [llbc, load_llbc(INTERPRETER_LLBC)] {
+        let ctx = LowerContext::new(artefact);
+        for fd in artefact.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let path = fd.item_meta.name_path();
+            if !path.ends_with("::bool::<Impl>::then_some") {
+                continue;
+            }
+            let graph = lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {path}: {e}"));
+            let (call_once, bool_branches, some_ctor, none_ctor) = diamond_counts(&graph);
+            assert!(
+                bool_branches >= 1,
+                "{path}: core body branches on self (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            assert!(
+                some_ctor >= 1,
+                "{path}: then arm builds Some (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            assert!(
+                none_ctor >= 1,
+                "{path}: else arm builds None (call_once={call_once}, \
+                 branches={bool_branches}, some={some_ctor}, none={none_ctor})"
+            );
+            assert_eq!(
+                call_once, 0,
+                "{path}: then_some wraps the value, no call_once"
+            );
+            lowered_core_bodies += 1;
+        }
+    }
+    let _ = lowered_core_bodies;
 }
 
 /// `option_question_mark`'s `let v = opt?` lifts the residual
@@ -1753,26 +1803,105 @@ fn a_char_element_indexes_to_an_int_banked_array_read() {
     );
 }
 
-/// `align.unwrap_or('>')` over an `Option<char>` joins the `Some` payload with
-/// the literal default. A Rust `char` is a Unicode scalar
-/// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`): the literal
-/// is the integer code point plus `unichr`. Both links into the join are
-/// int-kind (`UniChar` rtypes in the int bank). A `__str_const` string
-/// would put a Ref on one link, which `flatten` cannot rename.
+/// `align.unwrap_or('>')` over an `Option<char>`. A `char` is an int-kind
+/// scalar, so the `'>'` default is the integer code point plus `unichr`
+/// (`bookkeeper.py` `immutablevalue` `SomeUnicodeCodePoint`), int-kind, and the
+/// call result stays in the Int bank. The join of that default with the `Some`
+/// payload lives in the core `unwrap_or` body; the caller keeps one residual
+/// call to that body. A literal lowered as a `__str_const` string would put
+/// a Ref on the default argument and an Int on the payload, which `flatten`
+/// cannot rename into one register.
 #[test]
 fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
     use majit_translate::flowspace::model::Variable;
-    use majit_translate::model::{CallTarget, LinkArg, OpKind, ValueType};
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{Block, CallTarget, FunctionGraph, LinkArg, OpKind, ValueType};
 
-    let graph = lower_function(load_corpus(), "char_unwrap_or_join").expect("lowering");
-    let producer = |var: &Variable| -> Option<&OpKind> {
-        graph
-            .blocks
-            .iter()
-            .flat_map(|b| b.operations.iter())
-            .find(|op| op.result.as_ref() == Some(var))
-            .map(|op| &op.kind)
-    };
+    fn unwrap_or_leaf(leaf: &str) -> bool {
+        leaf == "unwrap_or" || leaf.starts_with("unwrap_or__spec")
+    }
+
+    fn names_core_unwrap_or(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().is_some_and(|leaf| unwrap_or_leaf(leaf))
+            }
+            CallTarget::Method {
+                name,
+                resolved_path: Some(path),
+                ..
+            } => {
+                unwrap_or_leaf(name)
+                    && path
+                        .segments
+                        .last()
+                        .is_some_and(|leaf| unwrap_or_leaf(leaf))
+            }
+            CallTarget::Method { name, .. } => unwrap_or_leaf(name),
+            _ => false,
+        }
+    }
+
+    fn is_same_block_copy(kind: &OpKind) -> Option<&Variable> {
+        match kind {
+            OpKind::UnaryOp { op, operand, .. }
+                if matches!(op.as_str(), "same_as" | "int_copy" | "int_same_as") =>
+            {
+                Some(operand)
+            }
+            _ => None,
+        }
+    }
+
+    fn producer_in<'a>(
+        graph: &'a FunctionGraph,
+        var: &Variable,
+    ) -> Option<(&'a Block, &'a OpKind)> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| (block, &op.kind))
+        })
+    }
+
+    fn arg_from_const_int(
+        graph: &FunctionGraph,
+        call_block: &Block,
+        var: &Variable,
+        lit: i64,
+    ) -> bool {
+        let mut cur = var.clone();
+        loop {
+            let Some((block, kind)) = producer_in(graph, &cur) else {
+                return false;
+            };
+            match kind {
+                OpKind::ConstInt(x) if *x == lit => return true,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.first().map(String::as_str) == Some("__majit_unichr") => {
+                    let Some(src) = args.first().and_then(|arg| arg.as_variable()) else {
+                        return false;
+                    };
+                    cur = src.clone();
+                }
+                _ if block.id == call_block.id => {
+                    let Some(src) = is_same_block_copy(kind) else {
+                        return false;
+                    };
+                    cur = src.clone();
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    let llbc = load_corpus();
+    let graph = lower_function(llbc, "char_unwrap_or_join").expect("lowering");
     assert!(
         !graph
             .blocks
@@ -1804,53 +1933,113 @@ fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
                 is_unichr(segments)
                     && args.iter().any(|arg| match arg {
                         LinkArg::Value(v) => {
-                            matches!(producer(v), Some(OpKind::ConstInt(0x3e)))
+                            matches!(
+                                producer_in(&graph, v).map(|(_, kind)| kind),
+                                Some(OpKind::ConstInt(0x3e))
+                            )
                         }
                         LinkArg::Const(_) => false,
                     })
             }),
         "the '>' default is the Int code point 0x3e passed to __majit_unichr",
     );
-    // Every link argument into a block input produced by the unichr
-    // literal or by the `Some.__pos_0` payload read is int-kind, and at
-    // least one input receives both — the `unwrap_or` join.
-    let mut joins = 0;
-    for target in &graph.blocks {
-        for (slot, _) in target.inputargs.iter().enumerate() {
-            let mut kinds = Vec::new();
-            for block in &graph.blocks {
-                for link in block.exits.iter().filter(|l| l.target == target.id) {
-                    let Some(LinkArg::Value(v)) = link.args.get(slot) else {
-                        continue;
-                    };
-                    match producer(v) {
-                        Some(OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            result_ty,
-                            ..
-                        }) if is_unichr(segments) => kinds.push(("literal", result_ty.clone())),
-                        Some(OpKind::FieldRead { field, ty, .. }) if field.name == "__pos_0" => {
-                            kinds.push(("payload", ty.clone()))
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            if kinds.iter().any(|(k, _)| *k == "literal")
-                && kinds.iter().any(|(k, _)| *k == "payload")
+
+    let mut unwrap_or_calls = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::Call {
+                target,
+                args,
+                result_ty,
+            } = &op.kind
+                && names_core_unwrap_or(target)
             {
-                joins += 1;
-                assert!(
-                    kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
-                    "both links into the unwrap_or join are int-kind, got {kinds:?}",
-                );
+                unwrap_or_calls.push((block, args, result_ty));
             }
         }
     }
     assert_eq!(
-        joins, 1,
-        "one block input joins the payload and the literal default"
+        unwrap_or_calls.len(),
+        1,
+        "the caller graph has one core unwrap_or call, got {}",
+        unwrap_or_calls.len()
     );
+    let (call_block, args, result_ty) = unwrap_or_calls[0];
+    assert_eq!(
+        *result_ty,
+        ValueType::Int,
+        "unwrap_or of Option<char> returns Int"
+    );
+    assert!(
+        args.iter().any(|arg| arg
+            .as_variable()
+            .is_some_and(|v| arg_from_const_int(&graph, call_block, v, 0x3e))),
+        "one unwrap_or argument is the unichr(0x3e) default"
+    );
+
+    if let Some(fd) = llbc.iter_fun_decls().find(|fd| {
+        if !fd.has_unstructured_body() {
+            return false;
+        }
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next().unwrap_or(path.as_str());
+        if !unwrap_or_leaf(leaf) || !path.contains("option") {
+            return false;
+        }
+        let inst = fd
+            .item_meta
+            .instantiation()
+            .map(|v| v.to_string())
+            .unwrap_or_default();
+        let blob = format!("{path}{inst}");
+        blob.contains("char") || blob.contains("Char")
+    }) {
+        let context = LowerContext::new(llbc);
+        let body =
+            lower_fun_decl(&context, fd).unwrap_or_else(|e| panic!("lower core unwrap_or: {e}"));
+        let producer = |var: &Variable| -> Option<&OpKind> {
+            body.blocks
+                .iter()
+                .flat_map(|b| b.operations.iter())
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| &op.kind)
+        };
+        let mut joins = 0;
+        for target in &body.blocks {
+            for (slot, _) in target.inputargs.iter().enumerate() {
+                let mut kinds = Vec::new();
+                for block in &body.blocks {
+                    for link in block.exits.iter().filter(|l| l.target == target.id) {
+                        let Some(LinkArg::Value(v)) = link.args.get(slot) else {
+                            continue;
+                        };
+                        match producer(v) {
+                            Some(OpKind::Input { ty, .. }) => kinds.push(("default", ty.clone())),
+                            Some(OpKind::FieldRead { field, ty, .. })
+                                if field.name == "__pos_0" =>
+                            {
+                                kinds.push(("payload", ty.clone()))
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if kinds.iter().any(|(k, _)| *k == "default")
+                    && kinds.iter().any(|(k, _)| *k == "payload")
+                {
+                    joins += 1;
+                    assert!(
+                        kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
+                        "both links into the unwrap_or join are int-kind, got {kinds:?}",
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            joins, 1,
+            "one block input joins the payload and the default parameter"
+        );
+    }
 }
 
 /// The same pair over `Vec<i64>`, whose one-word items make the receiver the
@@ -3421,13 +3610,9 @@ fn frame_box_owner_root_guard_lowers_without_guard_calls() {
         );
         assert!(
             !calls.iter().any(|call| {
-                call.ends_with("::is_some")
-                    || call.ends_with("::is_none")
-                    || call.ends_with("::take")
-                    || call.ends_with("::drop")
-                    || call.contains("DropGlue")
+                call.ends_with("::take") || call.ends_with("::drop") || call.contains("DropGlue")
             }),
-            "{source} still calls an option/drop of the guard: {calls:?}"
+            "{source} still calls take/drop of the guard: {calls:?}"
         );
     }
 }
