@@ -195,6 +195,22 @@ pub(super) fn jit_merge_point_pc_in_containing_floor(
     None
 }
 
+/// True when `op_pc` sits in a loop-header floor *before* that floor's
+/// `jit_merge_point`: the `PyFrame.get_is_being_profiled` diamond
+/// (`emit_portal_is_being_profiled_read`) and the green promotes that
+/// `interp_jit.py PyFrame.dispatch` evaluates ahead of `jit_merge_point`.
+pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    walked_snapshot_jitcode(ctx)
+        .and_then(|jc| {
+            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
+                .map(|merge_pc| op_pc < merge_pc)
+        })
+        .unwrap_or(false)
+}
+
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
 /// `op.next_pc` (`jtransform.py handle_jit_marker__jit_merge_point`).
 pub(super) fn resume_pc_past_merge_point(
