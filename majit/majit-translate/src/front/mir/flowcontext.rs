@@ -774,13 +774,18 @@ pub(in crate::front::mir) struct Lowering<'a> {
     pub(in crate::front::mir) gc_root_effects: Option<&'a gc_root_registration::EffectMemo>,
     /// [`gc_root_registration::locals_only_dropped`] for this body.
     pub(in crate::front::mir) gc_root_only_dropped: Option<Vec<bool>>,
+    /// Unsize `VTable(TraitImpl { id }, _)` recorded against the data-word
+    /// [`Variable`] the dest aliases. `local_var` Use / Ref(Deref) copies
+    /// share that Variable, so the key is enough; block-input copies walk
+    /// [`Self::input_copied_from`] (and are copied in
+    /// [`Self::note_copied_block_inputs`]).
+    pub(in crate::front::mir) unsize_vtable_impl: std::collections::HashMap<u64, u64>,
 }
 
 /// `PyGraph.__init__` (`flowspace/pygraph.py`): the startblock of a
 /// declared function, one named inputarg per formal parameter, built from
 /// the code object's locals alone. Returns the local-to-Variable table
 /// with the parameters bound.
-#[cfg(any(test, feature = "mir-frontend"))]
 pub(in crate::front::mir) fn pygraph_initial_block(
     graph: &mut FunctionGraph,
     locals: &majit_charon_reader::ullbc::Locals,
@@ -2477,6 +2482,7 @@ impl<'a> Lowering<'a> {
             guard_word_vars: std::collections::HashSet::new(),
             refcell_payload_vars: Vec::new(),
             pointer_word_arrays: std::collections::HashSet::new(),
+            unsize_vtable_impl: std::collections::HashMap::new(),
             root_scope_moved_locals,
             root_bracket,
             owner_root: analyze_owner_roots(body, llbc),
@@ -2787,6 +2793,9 @@ impl<'a> Lowering<'a> {
                 self.input_copied_from.insert(dst.id(), src.id());
                 // `Variable.copy` (`flowspace/model.py`) keeps `concretetype`.
                 copy_concretetype(src, dst);
+                if let Some(&impl_id) = self.unsize_vtable_impl.get(&src.id()) {
+                    self.unsize_vtable_impl.insert(dst.id(), impl_id);
+                }
             }
             if self.var_is_object_vec_header(src) {
                 self.object_vec_headers.insert(dst.id());
@@ -4214,8 +4223,20 @@ impl<'a> Lowering<'a> {
                         return Ok(());
                     }
                 }
+                let unsize_impl = match &rvalue {
+                    Rvalue::UnaryOp(op, _) if cast_kind_is_unsize(op) => {
+                        unsize_cast_vtable_impl_id(op, self.llbc)
+                    }
+                    Rvalue::Cast(kind, _, _) if cast_kind_is_unsize(kind) => {
+                        unsize_cast_vtable_impl_id(kind, self.llbc)
+                    }
+                    _ => None,
+                };
                 let (op, result_var) =
                     self.build_rvalue(mir_bb, rvalue, &dest_ty, Some(dest_local))?;
+                if let Some(impl_id) = unsize_impl {
+                    self.unsize_vtable_impl.insert(result_var.id(), impl_id);
+                }
                 if let Some(op) = op {
                     let bb_id = self.emit_bb(mir_bb);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {

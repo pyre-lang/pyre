@@ -488,9 +488,7 @@ pub(in crate::front::mir) fn trait_impl_match_for_receiver(
             continue;
         };
         let impl_id = i as u64;
-        let Some(fn_id) = crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
-            .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
-        else {
+        let Some(fn_id) = impl_or_default_method_fn_id(llbc, impl_id, method_idx) else {
             continue;
         };
         let Some(fd) = llbc.fn_by_id(fn_id) else {
@@ -532,13 +530,31 @@ pub(in crate::front::mir) fn trait_method_on_known_receiver(
 ) -> Option<(u64, Vec<String>, serde_json::Value)> {
     let ty = first_arg_ty?;
     let (_, fn_id, impl_generics) = trait_impl_match_for_receiver(ty, payload, llbc)?;
+    let (fn_id, segments) = fun_decl_call_segments(llbc, fn_id)?;
+    Some((fn_id, segments, impl_generics))
+}
+
+/// `spec_segments` path of an impl (or inherited default) FunDecl, the
+/// same `CallTarget::FunctionPath` the concrete-receiver path emits.
+pub(in crate::front::mir) fn impl_method_call_segments(
+    llbc: &Llbc,
+    impl_id: u64,
+    method_idx: u64,
+) -> Option<(u64, Vec<String>)> {
+    fun_decl_call_segments(
+        llbc,
+        impl_or_default_method_fn_id(llbc, impl_id, method_idx)?,
+    )
+}
+
+fn fun_decl_call_segments(llbc: &Llbc, fn_id: u64) -> Option<(u64, Vec<String>)> {
     let fd = llbc.fn_by_id(fn_id)?;
     if !crate::front::clause_spec::decl_has_unstructured_body(fd) {
         return None;
     }
     let path = fd.item_meta.name_path_str();
     let leaf = path.rsplit("::").next().unwrap_or("fn");
-    Some((fn_id, spec_segments(llbc, fd, leaf), impl_generics))
+    Some((fn_id, spec_segments(llbc, fd, leaf)))
 }
 
 /// Unique trait declaration whose `name_path` is `path`.
@@ -1759,7 +1775,7 @@ pub(in crate::front::mir) fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u
 /// (`CallControl.getcalldescr`). A GC strategy stays a GC root
 /// (`walk_bh_regs` / `drag_out_root`). By-value ZST (`From::from`) stays
 /// `Void`. Core/std impls stay peeled
-/// (`trait_impl_trait_path_for_fundecl` is `None` for non-local traits).
+/// (`trait_impl_trait_path_for_fundecl` is `None` for host traits).
 pub(in crate::front::mir) fn fundecl_keeps_zst_self(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -7258,16 +7274,14 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     }
     // A transparent wrapper over a scalar is that scalar's one-word field
     // (`lltype.py` has no substruct for it), so it is not an inlined struct.
-    if matches!(
-        tyref_transparent_inner_value_type(
-            ty,
-            llbc,
-            tombstoned,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        ),
-        Some(ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::Float)
-    ) {
+    if let Some(inner) = tyref_transparent_inner_value_type(
+        ty,
+        llbc,
+        tombstoned,
+        gc_struct_ids,
+        raw_alloc_flavor_structs,
+    ) && value_type_is_transparent_scalar_word(&inner)
+    {
         return None;
     }
     Some(td)
@@ -9327,6 +9341,19 @@ fn one_word_integer_scalar_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueTy
     } else {
         None
     }
+}
+
+pub(in crate::front::mir) fn value_type_is_transparent_scalar_word(ty: &ValueType) -> bool {
+    matches!(
+        ty,
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+            | ValueType::Int128
+            | ValueType::UInt128
+    )
 }
 
 pub(in crate::front::mir) fn transparent_scalar_value_type(
@@ -15976,8 +16003,9 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
 /// …) off the two-phase rtyper.
 
 /// Route inline-Field `dyn Trait` virtual calls through the faithful
-/// `CallTarget::Indirect` vtable pipeline instead of the synthetic
-/// `__dyn_call` residual (see the `(CallClass::Dynamic, ..)` arm).
+/// `{vtable}.method_*` FieldRead plus `IndirectCall { family_key }`
+/// instead of the synthetic `__dyn_call` residual (see the
+/// `(CallClass::Dynamic, ..)` arm).
 ///
 /// `__dyn_call` is not a lowering, it is a placeholder: an unregistered
 /// synthetic path that stops whatever graph reaches it.  Routing through
@@ -16023,7 +16051,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
 /// of its members.  **The `on` column has not been re-measured since**; the
 /// `off` column is unaffected by construction, since this arm emits nothing
 /// with the switch off.  Nothing else moved in the original census: the
-/// vtable-slot calls already on `CallTarget::Indirect` held at 47 / 24, and
+/// vtable-slot calls already on `IndirectCall { family_key }` held at 47 / 24, and
 /// `pyre-interpreter`'s 203 `BuiltinCodeFn` sites kept the `Some([])`
 /// marker in both states.
 ///
@@ -17593,6 +17621,17 @@ pub(in crate::front::mir) fn trait_payload_path_and_method(
         .to_string();
     let trait_path = llbc.trait_by_id(decl_id)?.item_meta.name_path();
     Some((trait_path, method_leaf))
+}
+
+/// Fully-qualified trait declaration path from a `CallKind::Trait` payload.
+/// Sibling of [`trait_payload_owner`]: that helper returns only the leaf.
+pub(in crate::front::mir) fn trait_payload_decl_path(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<String> {
+    let arr = v.as_array()?;
+    let decl_id = trait_ref_decl_id(arr.first()?, llbc)?;
+    Some(llbc.trait_by_id(decl_id)?.item_meta.name_path())
 }
 
 /// `Vec<T>` as trait `Clone::clone` → the `list` builtin
