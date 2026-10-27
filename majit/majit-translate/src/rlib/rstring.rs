@@ -6272,6 +6272,19 @@ fn search_expect_var(hlv: &Hlvalue) -> Variable {
     }
 }
 
+/// Runtime call operands, dropping Void. Void is compile-time only.
+///
+/// `jtransform.py Transformer.make_three_lists` skips `kind == 'void'`
+/// (`add_in_correct_list`); `call.py CallControl.getcalldescr` builds
+/// `NON_VOID_ARGS` the same way. `_rewrite_op_cond_call` routes extra
+/// args through `rewrite_call` → `make_three_lists`.
+fn search_non_void_args(args: &[Hlvalue]) -> impl Iterator<Item = &Hlvalue> {
+    args.iter().filter(|hlv| match hlv {
+        Hlvalue::Variable(v) => !matches!(v.concretetype(), Some(LowLevelType::Void)),
+        Hlvalue::Constant(c) => !matches!(c.concretetype, Some(LowLevelType::Void)),
+    })
+}
+
 fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Variable {
     match hlv {
         Hlvalue::Variable(v) => v.clone(),
@@ -6439,8 +6452,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             // (`rlib/jit.py isconstant`); emit the ordinary Call so
             // analyzers classify the builtin target.
             let target = CallTarget::function_path(callee.split("::").filter(|s| !s.is_empty()));
-            let args: Vec<_> = op.args[1..]
-                .iter()
+            let args: Vec<_> = search_non_void_args(&op.args[1..])
                 .map(|a| search_materialize(out, block, a))
                 .collect();
             out.push_op_with_result_var(
@@ -6464,13 +6476,31 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
             let cond = search_materialize(out, block, &op.args[0]);
             let (callee, _) = search_callee_funcptr(&op.args[1]);
-            let extra_args: Vec<_> = op.args[2..]
-                .iter()
+            let extra_args: Vec<_> = search_non_void_args(&op.args[2..])
                 .map(|a| search_materialize(out, block, a))
                 .collect();
             let result = search_expect_var(&op.result);
             crate::codewriter::jtransform_opname::emit_conditional_call_oopspec(
                 out, block, cond, &callee, extra_args, result,
+            );
+        }
+        "jit_conditional_call_value" => {
+            // Same interpreter-facing Call `lower_graph` emits.
+            // Analyzers treat `oopspec("jit.conditional_call_value")` as a
+            // builtin; callee effects reach through the
+            // `we_are_jitted()`-false `direct_call`.
+            assert!(
+                op.args.len() >= 2,
+                "effect_graph_from_search_helper: jit_conditional_call_value needs value and fnptr"
+            );
+            let value = search_materialize(out, block, &op.args[0]);
+            let (callee, _) = search_callee_funcptr(&op.args[1]);
+            let extra_args: Vec<_> = search_non_void_args(&op.args[2..])
+                .map(|a| search_materialize(out, block, a))
+                .collect();
+            let result = search_expect_var(&op.result);
+            crate::codewriter::jtransform_opname::emit_conditional_call_value_oopspec(
+                out, block, value, &callee, extra_args, result,
             );
         }
         "malloc" => {
@@ -6648,7 +6678,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::checkgraph;
     use crate::translator::rtyper::lltypesystem::rstr::{
-        STRPTR, UNICODEPTR, funcobj_from_funcptr_constant,
+        STRPTR, UNICODEPTR, build_ll_strhash_helper_graph, funcobj_from_funcptr_constant,
     };
     use std::collections::HashMap;
     use std::rc::Rc;
@@ -6808,6 +6838,44 @@ mod tests {
                         == ["majit_rlib", "jit", "conditional_call3"])
             )),
             "effect graph has the jit.conditional_call oopspec Call"
+        );
+    }
+
+    /// `ll_strhash` inlines `conditional_call_elidable` to
+    /// `jit_conditional_call_value`. The effect graph emits the same
+    /// interpreter-facing `conditional_call_elidable1` Call `lower_graph`
+    /// emits.
+    #[test]
+    fn ll_strhash_effect_graph_emits_conditional_call_elidable1() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let helper = build_ll_strhash_helper_graph(
+            &rtyper,
+            "ll_strhash",
+            STRPTR.clone(),
+            "_ll_strhash",
+            "_hash_string",
+        )
+        .expect("ll_strhash");
+        let effect = effect_graph_from_search_helper(&helper.graph.borrow());
+        let leaves: Vec<_> = effect
+            .iter_block_ops()
+            .filter_map(|(_, op)| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    let segs = target.path_segments()?;
+                    if segs == ["majit_rlib", "jit", "conditional_call_elidable1"] {
+                        Some(args.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            leaves,
+            vec![3],
+            "effect graph emits conditional_call_elidable1 (value, fn, s), got {leaves:?}"
         );
     }
 

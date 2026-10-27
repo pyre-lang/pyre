@@ -203,10 +203,6 @@ pub fn ann_cast_opaque_ptr() -> Result<(), TyperError> {
     Err(deferred("ann_cast_opaque_ptr"))
 }
 
-pub fn length_of_simple_gcarray_from_opaque() -> Result<(), TyperError> {
-    Err(deferred("length_of_simple_gcarray_from_opaque"))
-}
-
 pub fn ann_length_of_simple_gcarray_from_opaque() -> Result<(), TyperError> {
     Err(deferred("ann_length_of_simple_gcarray_from_opaque"))
 }
@@ -5483,6 +5479,16 @@ impl _ptr_obj {
         }
     }
 
+    /// `container.getlength()` (`lltype.py length_of_simple_gcarray_from_opaque`).
+    fn container_getlength(&self) -> Result<usize, String> {
+        match self {
+            _ptr_obj::Array(a) => Ok(a.getlength()),
+            _ptr_obj::Subarray(s) => Ok(s.getlength()),
+            _ptr_obj::ArrayLenRef(l) => Ok(l.getlength()),
+            other => Err(format!("{other:?} has no getlength")),
+        }
+    }
+
     /// `self._obj.getbounds()` (lltype.py, :1314) — the `(start, stop)`
     /// the `_ptr.__getitem__`/`__setitem__` bounds check consults before
     /// dispatching to `getitem`/`setitem`. Non-array containers yield `None`.
@@ -5781,6 +5787,49 @@ pub fn cast_opaque_ptr(PTRTYPE: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
             LowLevelType::Ptr(Box::new(PTRTYPE.clone())).short_name(),
         ))
     }
+}
+
+/// RPython `length_of_simple_gcarray_from_opaque(opaque_ptr)` (`lltype.py`):
+///
+/// ```python
+/// def length_of_simple_gcarray_from_opaque(opaque_ptr):
+///     CURTYPE = typeOf(opaque_ptr)
+///     if not isinstance(CURTYPE, Ptr):
+///         raise TypeError("can only cast pointers to other pointers")
+///     if not isinstance(CURTYPE.TO, GcOpaqueType):
+///         raise TypeError("expected a GcOpaqueType")
+///     try:
+///         c = opaque_ptr._obj.container
+///     except AttributeError:
+///         from rpython.rtyper.lltypesystem import rffi
+///         p = rffi.cast(Ptr(GcArray(Signed)), opaque_ptr)
+///         return len(p)
+///     else:
+///         return c.getlength()
+/// ```
+///
+/// `typeOf` on a `_ptr` is always a `Ptr`; the observable guard is that
+/// `TO` is a `GcOpaqueType` (`OpaqueType` with `_gckind = 'gc'`). A hidden
+/// opaque from `cast_opaque_ptr` stows the original array as `.container`;
+/// the AttributeError path recasts to `Ptr(GcArray(Signed))` and takes
+/// `len`, matching the `_llgcopaque` fallback.
+pub fn length_of_simple_gcarray_from_opaque(opaque_ptr: &_ptr) -> Result<i64, String> {
+    let CURTYPE = typeOf(opaque_ptr);
+    match &CURTYPE.TO {
+        PtrTarget::Opaque(opaque_t) if opaque_t._gckind == GcKind::Gc => {}
+        _ => return Err("expected a GcOpaqueType".to_string()),
+    }
+    let obj = obj_of(opaque_ptr)?;
+    if let _ptr_obj::Opaque(opaque) = &obj
+        && let Some(container) = &opaque.container
+    {
+        return container.container_getlength().map(|n| n as i64);
+    }
+    let array_ptr_t = Ptr {
+        TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+    };
+    let recast = _ptr::new_with_solid(array_ptr_t, Ok(Some(obj)), opaque_ptr._solid);
+    recast.len().map(|n| n as i64)
 }
 
 /// `ptr._obj` for a cast — surfaces a delayed pointer as an error rather
@@ -8968,6 +9017,26 @@ mod tests {
         // A separate allocation normalizes to a different container.
         let o3 = make_hidden(&struct_ty);
         assert_ne!(o1, o3);
+    }
+
+    #[test]
+    fn length_of_simple_gcarray_from_opaque_reads_hidden_array_length() {
+        // `lltype.py length_of_simple_gcarray_from_opaque`: a GcArray
+        // hidden behind GCREF reports `container.getlength()`; a non-opaque
+        // pointer is rejected.
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(8), MallocFlavor::Gc, true).unwrap();
+        let LowLevelType::Ptr(gcref_t) = &*GCREF else {
+            panic!("GCREF must be a Ptr");
+        };
+        let opaque = cast_opaque_ptr(gcref_t, &arrayptr).unwrap();
+        assert_eq!(length_of_simple_gcarray_from_opaque(&opaque).unwrap(), 8);
+
+        let err = length_of_simple_gcarray_from_opaque(&arrayptr).unwrap_err();
+        assert!(
+            err.contains("expected a GcOpaqueType"),
+            "non-opaque pointer must be rejected, got {err}"
+        );
     }
 
     #[test]

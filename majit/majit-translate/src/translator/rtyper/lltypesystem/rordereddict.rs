@@ -890,7 +890,7 @@ fn close_keyeq_found_or_paranoia(
     let pi_gcref_old = new_var("indexes_gcref_old", GCREF.clone());
     push(
         &block_para_indexes,
-        "cast_pointer",
+        "cast_opaque_ptr",
         vec![var(&pi_indexes)],
         &pi_gcref_old,
     );
@@ -3255,12 +3255,13 @@ pub fn ll_clear_indexes(d: &mut _ptr, _n: usize) -> Result<(), TyperError> {
 /// ```
 ///
 /// Single-block graph storing `value` into the sparse index array at slot `i`.
-/// `cast_opaque_ptr(INDEXES, d.indexes)` lowers to `cast_pointer` (GCREF ->
-/// INDEXES); `rffi.cast(T, value)` narrows the Signed slot value to the
-/// unsigned index element type via `cast_int_to_uint`. All `DICTINDEX_*` widths
-/// collapse to `Ptr(GcArray(Unsigned))` here, so this one impl serves every
-/// FUNC_* width. The `ll_assert` is a debug-only range check with no runtime
-/// effect after translation and is not modelled.
+/// GCREF -> INDEXES is `cast_opaque_ptr` (`_ll_write_indexes`; `lltype.castable`
+/// rejects `cast_pointer` across an opaque type); `rffi.cast(T, value)` narrows
+/// the Signed slot value to the unsigned index element type via
+/// `cast_int_to_uint`. All `DICTINDEX_*` widths collapse to
+/// `Ptr(GcArray(Unsigned))` here, so this one impl serves every FUNC_* width.
+/// The `ll_assert` is a debug-only range check with no runtime effect after
+/// translation and is not modelled.
 pub fn build_ll_write_indexes_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
@@ -3292,7 +3293,7 @@ pub fn build_ll_write_indexes_helper_graph(
     ));
     let v_indexes = variable_with_lltype("indexes", indexes_ptr_lltype);
     startblock.borrow_mut().operations.push(SpaceOperation::new(
-        "cast_pointer",
+        "cast_opaque_ptr",
         vec![Hlvalue::Variable(v_gcref)],
         Hlvalue::Variable(v_indexes.clone()),
     ));
@@ -3738,7 +3739,8 @@ pub fn build_ll_dict_lookup_helper_graph(
         &gcref,
     );
     let indexes = new_var("indexes", indexes_ptr_lltype.clone());
-    push(&startblock, "cast_pointer", vec![var(&gcref)], &indexes);
+    // `ll_dict_lookup`: `indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)`.
+    push(&startblock, "cast_opaque_ptr", vec![var(&gcref)], &indexes);
     let len = new_var("len", sig());
     push(&startblock, "getarraysize", vec![var(&indexes)], &len);
     let mask = new_var("mask", sig());
@@ -5826,7 +5828,8 @@ pub(crate) fn build_ll_dict_store_clean_helper_graph(
         &gcref,
     );
     let indexes = new_var("indexes", indexes_ptr_lltype.clone());
-    push(&startblock, "cast_pointer", vec![var(&gcref)], &indexes);
+    // `ll_dict_store_clean`: `indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)`.
+    push(&startblock, "cast_opaque_ptr", vec![var(&gcref)], &indexes);
     let len = new_var("len", sig());
     push(&startblock, "getarraysize", vec![var(&indexes)], &len);
     let mask = new_var("mask", sig());
@@ -6199,6 +6202,7 @@ pub(crate) fn build_ll_call_delete_by_entry_index_helper_graph(
 /// replace_with, T)` (`rordereddict.py`):
 ///
 /// ```python
+/// indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)
 /// locate_value = locate_index + VALID_OFFSET
 /// while rffi.cast(lltype.Signed, indexes[i]) != locate_value:
 ///     i = (i << 2) + i + perturb + 1
@@ -6250,7 +6254,8 @@ pub(crate) fn build_ll_dict_delete_by_entry_index_helper_graph(
         &gcref,
     );
     let indexes = new_var("indexes", indexes_ptr_lltype.clone());
-    push(&startblock, "cast_pointer", vec![var(&gcref)], &indexes);
+    // `ll_dict_delete_by_entry_index`: `indexes = lltype.cast_opaque_ptr(INDEXES, d.indexes)`.
+    push(&startblock, "cast_opaque_ptr", vec![var(&gcref)], &indexes);
     let len = new_var("len", sig());
     push(&startblock, "getarraysize", vec![var(&indexes)], &len);
     let mask = new_var("mask", sig());
@@ -6696,7 +6701,6 @@ pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
 
     let must_clear_key = lltype_must_clear_gc_ptr(&key_lltype);
     let must_clear_value = lltype_must_clear_gc_ptr(&value_lltype);
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -7333,18 +7337,11 @@ pub(crate) fn build_ll_dict_remove_deleted_items_helper_graph(
         vec![var(&ri_d), void_field_const("indexes")],
         &indexes_gcref,
     );
-    let indexes = new_var("indexes", indexes_ptr_lltype);
-    push(
-        &block_reindex,
-        "cast_pointer",
-        vec![var(&indexes_gcref)],
-        &indexes,
-    );
     let len_indexes = new_var("len_indexes", sig());
     push(
         &block_reindex,
-        "getarraysize",
-        vec![var(&indexes)],
+        "length_of_simple_gcarray_from_opaque",
+        vec![var(&indexes_gcref)],
         &len_indexes,
     );
     push(
@@ -8071,6 +8068,14 @@ pub(crate) fn build_ll_clear_indexes_helper_graph(
 ///         i += 1
 /// ```
 ///
+/// `_ll_len_of_d_indexes(d)` (`rordereddict.py`):
+///
+/// ```python
+/// def _ll_len_of_d_indexes(d):
+///     # Must only be called by @jit.dont_look_inside functions.
+///     return lltype.length_of_simple_gcarray_from_opaque(d.indexes)
+/// ```
+///
 /// The reuse branch clears the existing array through `ll_clear_indexes`, so
 /// `_ll_dict_rescue`'s call with `_ll_len_of_d_indexes(d)` allocates nothing.
 /// The `fun`/`FUNC_*` 4-way dispatch in the loop collapses to a single
@@ -8094,7 +8099,6 @@ pub(crate) fn build_ll_dict_reindex_helper_graph(
     keyhash_fn: Option<Constant>,
     hash_takes_dict: bool,
 ) -> Result<PyGraph, TyperError> {
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -8172,10 +8176,13 @@ pub(crate) fn build_ll_dict_reindex_helper_graph(
         .into_ref(),
     ]);
 
-    let indexes = new_var("indexes", indexes_ptr_lltype);
-    push(&len_block, "cast_pointer", vec![var(&ln_gcref)], &indexes);
     let n = new_var("n", sig());
-    push(&len_block, "getarraysize", vec![var(&indexes)], &n);
+    push(
+        &len_block,
+        "length_of_simple_gcarray_from_opaque",
+        vec![var(&ln_gcref)],
+        &n,
+    );
     let same = new_var("same", LowLevelType::Bool);
     push(&len_block, "int_eq", vec![var(&n), var(&ln_size)], &same);
     len_block.borrow_mut().exitswitch = Some(var(&same));
@@ -8463,7 +8470,6 @@ pub(crate) fn build_ll_dict_resize_to_helper_graph(
     remove_deleted_items_fn: Constant,
     reindex_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -8593,18 +8599,11 @@ pub(crate) fn build_ll_dict_resize_to_helper_graph(
         vec![var(&cs_d), void_field_const("indexes")],
         &indexes_gcref,
     );
-    let indexes = new_var("indexes", indexes_ptr_lltype);
-    push(
-        &block_check_shrink,
-        "cast_pointer",
-        vec![var(&indexes_gcref)],
-        &indexes,
-    );
     let len_indexes = new_var("len_indexes", sig());
     push(
         &block_check_shrink,
-        "getarraysize",
-        vec![var(&indexes)],
+        "length_of_simple_gcarray_from_opaque",
+        vec![var(&indexes_gcref)],
         &len_indexes,
     );
     let shrink = new_var("shrink", LowLevelType::Bool);
@@ -9592,14 +9591,13 @@ pub(crate) fn build_ll_dict_setdefault_helper_graph(
 ///     ll_dict_reindex(d, _ll_len_of_d_indexes(d))
 /// ```
 ///
-/// `_ll_len_of_d_indexes` is `getfield(indexes)` + `cast_pointer` +
-/// `getarraysize`, matching [`build_ll_dict_resize_to_helper_graph`].
+/// `_ll_len_of_d_indexes` is `getfield(indexes)` then
+/// `length_of_simple_gcarray_from_opaque` (`_ll_len_of_d_indexes`).
 pub(crate) fn build_ll_dict_rescue_helper_graph(
     name: &str,
     dict_ptr_lltype: LowLevelType,
     reindex_fn: Constant,
 ) -> Result<PyGraph, TyperError> {
-    let indexes_ptr_lltype = _ll_ptr_to_array_of(LowLevelType::Unsigned);
     let var = |v: &Variable| Hlvalue::Variable(v.clone());
     let push = |block: &BlockRef, opname: &str, args: Vec<Hlvalue>, result: &Variable| {
         block.borrow_mut().operations.push(SpaceOperation::new(
@@ -9630,18 +9628,11 @@ pub(crate) fn build_ll_dict_rescue_helper_graph(
         vec![var(&d), void_field_const("indexes")],
         &indexes_gcref,
     );
-    let indexes = new_var("indexes", indexes_ptr_lltype);
-    push(
-        &startblock,
-        "cast_pointer",
-        vec![var(&indexes_gcref)],
-        &indexes,
-    );
     let len_indexes = new_var("len_indexes", sig());
     push(
         &startblock,
-        "getarraysize",
-        vec![var(&indexes)],
+        "length_of_simple_gcarray_from_opaque",
+        vec![var(&indexes_gcref)],
         &len_indexes,
     );
     push(
@@ -10670,10 +10661,12 @@ pub(crate) fn build_ll_dict_insert_helper_graph(
 /// PORT STATUS — `newiter`/`rtype_next`/`make_iterator_repr` are now wired
 /// (`OrderedDictRepr::make_iterator_repr`, `DictIteratorRepr::newiter`/
 /// `rtype_next`, `rtype_method_iterkeys`/`itervalues`/`iteritems` — #145).
-/// `rtype_next` `gendirectcall`s this helper, reads `iter.dict.entries`, and
+/// `rtype_next` `gendirectcall`s the `_ll_dictnext_look_inside_iff` wrapper
+/// (`rlib/jit.py look_inside_iff`), reads `iter.dict.entries`, and
 /// recasts through `variant_keys`/`variant_values`/`variant_items`
-/// (`rdict.py:113-148`); `build_ll_dictiter_helper_graph` mints the matching
-/// `newiter` constructor. Still deferred, fail-closed via
+/// (`rdict.py AbstractDictIteratorRepr.rtype_next`);
+/// `build_ll_dictiter_helper_graph` mints the matching `newiter`
+/// constructor. Still deferred, fail-closed via
 /// `ordered_dict_runtime_deferred`: the `reversed(d)` variant
 /// (`ll_dictiter_reversed`/`_ll_dictnext_reversed`) and the `*_with_hash`
 /// variants (need `ll_ensure_indexes`/`entry_hash`). Tracked by the DictRepr
@@ -12671,19 +12664,30 @@ impl Repr for DictIteratorRepr {
         let iter_for_builder = iter_lltype.clone();
         let dict_for_builder = dict_lltype.clone();
         let entries_for_builder = entries_lltype.clone();
-        // `look_inside_iff` is not ported: its predicate reads `iter.dict`, which `LookInsidePred` cannot express.
-        let helper = hop.rtyper.lowlevel_helper_function_with_builder(
-            "_ll_dictnext".to_string(),
+        // `_ll_dictnext`: `@jit.look_inside_iff(lambda iter: jit.isvirtual(iter)
+        // and (iter.dict is None or jit.isvirtual(iter.dict)))`
+        // `@jit.oopspec("odictiter.next(iter)")` (`rordereddict.py _ll_dictnext`).
+        let helper = mint_look_inside_iff(
+            &hop.rtyper,
+            "_ll_dictnext",
+            &["iter"],
             vec![iter_lltype],
             LowLevelType::Signed,
-            move |_rtyper, _args, _result| {
+            move |name| {
                 build_ll_dictnext_helper_graph(
-                    "_ll_dictnext",
+                    name,
                     iter_for_builder.clone(),
                     dict_for_builder.clone(),
                     entries_for_builder.clone(),
                 )
             },
+            &[
+                LookInsidePred::IsVirtual(0),
+                LookInsidePred::FieldNullOrIsVirtual {
+                    arg: 0,
+                    field: "dict",
+                },
+            ],
         )?;
         let v_index = hop.gendirectcall(&helper, v_iter.clone())?.ok_or_else(|| {
             TyperError::message("DictIteratorRepr.rtype_next: _ll_dictnext returned Void")
@@ -13051,7 +13055,8 @@ mod tests {
     }
 
     /// `next(iter)` rtypes through `DictIteratorRepr::rtype_next`
-    /// (`rdict.py`): `direct_call(_ll_dictnext, v_iter)`, then
+    /// (`rdict.py`): `direct_call(_ll_dictnext_look_inside_iff, v_iter)`
+    /// (`rlib/jit.py look_inside_iff` wrapper), then
     /// `getfield(v_iter, 'dict')` / `getfield(v_dict, 'entries')`, then the
     /// `variant_keys` read `getinteriorfield(entries, index, 'key')`.
     #[test]
@@ -13122,8 +13127,39 @@ mod tests {
         };
         let dbg = format!("{:?}", c.value);
         assert!(
-            dbg.contains("_ll_dictnext"),
-            "expected '_ll_dictnext' in {dbg}"
+            dbg.contains("_ll_dictnext_look_inside_iff"),
+            "expected '_ll_dictnext_look_inside_iff' in {dbg}"
+        );
+
+        let find = |name: &str| {
+            ann.translator
+                .graphs
+                .borrow()
+                .iter()
+                .find(|g| g.borrow().name == name)
+                .unwrap_or_else(|| panic!("missing graph {name}"))
+                .clone()
+        };
+        let orig_func = find("_ll_dictnext")
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("orig GraphFunc");
+        assert_eq!(
+            orig_func.oopspec, None,
+            "look_inside_iff deletes orig oopspec (`rlib/jit.py look_inside_iff`)"
+        );
+        let tramp_func = find("_ll_dictnext_trampoline")
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("trampoline GraphFunc");
+        assert_eq!(
+            tramp_func.oopspec.as_deref(),
+            Some("odictiter.next(iter)"),
+            "look_inside_iff moves oopspec onto the trampoline"
         );
     }
 
@@ -13375,7 +13411,7 @@ mod tests {
     }
 
     /// `_ll_write_indexes` is a single-block store: getfield(d,"indexes") ->
-    /// cast_pointer (GCREF->INDEXES) -> cast_int_to_uint(value) ->
+    /// cast_opaque_ptr (GCREF->INDEXES) -> cast_int_to_uint(value) ->
     /// setarrayitem(indexes, i, cast_value), Void return.
     #[test]
     fn build_ll_write_indexes_casts_gcref_then_stores_slot() {
@@ -13398,7 +13434,7 @@ mod tests {
             ops,
             vec![
                 "getfield",
-                "cast_pointer",
+                "cast_opaque_ptr",
                 "cast_int_to_uint",
                 "setarrayitem"
             ]
@@ -13656,7 +13692,7 @@ mod tests {
             vec![
                 "getfield",         // d.entries
                 "getfield",         // d.indexes (GCREF)
-                "cast_pointer",     // cast_opaque_ptr(INDEXES, ...)
+                "cast_opaque_ptr",  // cast_opaque_ptr(INDEXES, ...)
                 "getarraysize",     // len(indexes)
                 "int_sub",          // mask = len - 1
                 "cast_int_to_uint", // mask_u
@@ -13923,6 +13959,88 @@ mod tests {
             ret.concretetype.borrow().clone(),
             Some(LowLevelType::Signed),
             "_ll_dictnext returns Signed"
+        );
+        assert_eq!(
+            helper.func.oopspec.as_deref(),
+            Some("odictiter.next(iter)"),
+            "builder stamps oopspec; mint_look_inside_iff moves it onto the trampoline"
+        );
+    }
+
+    /// `rlib/jit.py look_inside_iff` on `_ll_dictnext`: orig has no oopspec,
+    /// `_ll_dictnext_trampoline` carries `odictiter.next(iter)`, wrapper is
+    /// `_ll_dictnext_look_inside_iff`.
+    #[test]
+    fn ll_dictnext_look_inside_iff_moves_oopspec_onto_trampoline() {
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+        let (dict_ptr, entries_ptr, _key) = sample_dict_lookup_lltypes();
+        let iter_ptr = get_ll_dictiter(dict_ptr.clone());
+        let wrapper = mint_look_inside_iff(
+            &rtyper,
+            "_ll_dictnext",
+            &["iter"],
+            vec![iter_ptr.clone()],
+            LowLevelType::Signed,
+            {
+                let iter_ptr = iter_ptr;
+                let dict_ptr = dict_ptr;
+                let entries_ptr = entries_ptr;
+                move |name| {
+                    build_ll_dictnext_helper_graph(
+                        name,
+                        iter_ptr.clone(),
+                        dict_ptr.clone(),
+                        entries_ptr.clone(),
+                    )
+                }
+            },
+            &[
+                LookInsidePred::IsVirtual(0),
+                LookInsidePred::FieldNullOrIsVirtual {
+                    arg: 0,
+                    field: "dict",
+                },
+            ],
+        )
+        .expect("mint_look_inside_iff");
+        assert_eq!(wrapper.name, "_ll_dictnext_look_inside_iff");
+
+        let find = |name: &str| {
+            ann.translator
+                .graphs
+                .borrow()
+                .iter()
+                .find(|g| g.borrow().name == name)
+                .unwrap_or_else(|| panic!("missing graph {name}"))
+                .clone()
+        };
+        let orig_func = find("_ll_dictnext")
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("orig GraphFunc");
+        assert_eq!(
+            orig_func.oopspec, None,
+            "look_inside_iff deletes orig oopspec (`rlib/jit.py look_inside_iff`)"
+        );
+        let tramp_func = find("_ll_dictnext_trampoline")
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("trampoline GraphFunc");
+        assert_eq!(
+            tramp_func._jit_look_inside_,
+            Some(false),
+            "trampoline is dont_look_inside"
+        );
+        assert_eq!(
+            tramp_func.oopspec.as_deref(),
+            Some("odictiter.next(iter)"),
+            "look_inside_iff moves oopspec onto the trampoline"
         );
     }
 
@@ -14857,6 +14975,7 @@ mod tests {
             "setinteriorfield",
             "setfield",
             "getarraysize",
+            "length_of_simple_gcarray_from_opaque",
             "direct_call",
         ] {
             assert!(
@@ -14915,7 +15034,11 @@ mod tests {
         let inner = helper.graph.borrow();
         assert_eq!(inner.startblock.borrow().inputargs.len(), 2); // d, num_extra
         let (_block_count, ops) = walk_blocks(&inner.startblock);
-        for needed in ["getarraysize", "int_lt", "direct_call"] {
+        for needed in [
+            "length_of_simple_gcarray_from_opaque",
+            "int_lt",
+            "direct_call",
+        ] {
             assert!(
                 ops.iter().any(|o| o == needed),
                 "resize_to CFG must emit {needed}, got {ops:?}"
@@ -14985,6 +15108,15 @@ mod tests {
             "reindex must direct_call ll_malloc_indexes_and_choose_lookup, got {targets:?}"
         );
         let len_block = bool_exit(&inner.startblock, true);
+        assert!(
+            ops.iter()
+                .any(|o| *o == "length_of_simple_gcarray_from_opaque"),
+            "reindex CFG must emit length_of_simple_gcarray_from_opaque, got {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|o| *o == "cast_pointer"),
+            "reindex must not cast GCREF indexes to an array pointer, got {ops:?}"
+        );
         assert!(
             len_block
                 .borrow()

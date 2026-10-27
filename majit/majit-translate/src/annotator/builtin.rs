@@ -497,10 +497,31 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
         jit_conditional_call,
     );
     // `rlib/jit.py ConditionalCallEntry.compute_result_annotation` for
-    // `_jit_conditional_call_value`.
+    // `_jit_conditional_call_value`. One analyzer covers every residual
+    // arity (`conditional_call_elidable0`..`conditional_call_elidable4`).
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call_elidable0",
+        jit_conditional_call_elidable,
+    );
     analyzer_for(
         &mut reg,
         "majit_rlib.jit.conditional_call_elidable1",
+        jit_conditional_call_elidable,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call_elidable2",
+        jit_conditional_call_elidable,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call_elidable3",
+        jit_conditional_call_elidable,
+    );
+    analyzer_for(
+        &mut reg,
+        "majit_rlib.jit.conditional_call_elidable4",
         jit_conditional_call_elidable,
     );
     // `rlib/jit.py` — the `hint` ExtRegistryEntry's
@@ -4208,7 +4229,11 @@ mod tests {
         assert!(is_registered("sys.getdefaultencoding"));
         assert!(is_registered("rarithmetic.intmask"));
         assert!(is_registered("majit_rlib.jit.conditional_call1"));
+        assert!(is_registered("majit_rlib.jit.conditional_call_elidable0"));
         assert!(is_registered("majit_rlib.jit.conditional_call_elidable1"));
+        assert!(is_registered("majit_rlib.jit.conditional_call_elidable2"));
+        assert!(is_registered("majit_rlib.jit.conditional_call_elidable3"));
+        assert!(is_registered("majit_rlib.jit.conditional_call_elidable4"));
         assert!(is_registered(
             crate::runtime_names::modules::ALLOC_VARSIZE_GC_HEADER_IMMORTAL
         ));

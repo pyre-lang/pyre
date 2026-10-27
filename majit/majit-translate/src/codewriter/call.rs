@@ -14472,7 +14472,9 @@ fn effect_interior_field_lltype(
     }
 }
 
-fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
+/// TYPE constant → owner string `_rewrite_raw_malloc` /
+/// `OpKind::raw_malloc_with_flags` carry.
+pub(crate) fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     match hlv {
@@ -14482,30 +14484,26 @@ fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
                 LowLevelType::Array(a) => format!("Array({})", a.OF.short_name()),
                 other => other.short_name(),
             },
-            other => panic!(
-                "effect_graph_from_rtyped_helper: malloc first operand is not a LowLevelType const: {other:?}"
-            ),
+            other => panic!("malloc first operand is not a LowLevelType const: {other:?}"),
         },
         Hlvalue::Variable(_) => {
-            panic!("effect_graph_from_rtyped_helper: malloc first operand is a Variable")
+            panic!("malloc first operand is a Variable")
         }
     }
 }
 
 /// `_rewrite_raw_malloc` `TYPE = op.args[0].value`.
-fn effect_malloc_type(
+pub(crate) fn effect_malloc_type(
     hlv: &crate::flowspace::model::Hlvalue,
 ) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     match hlv {
         Hlvalue::Constant(c) => match &c.value {
             ConstValue::LowLevelType(lltype) => (**lltype).clone(),
-            other => panic!(
-                "effect_graph_from_rtyped_helper: malloc first operand is not a LowLevelType const: {other:?}"
-            ),
+            other => panic!("malloc first operand is not a LowLevelType const: {other:?}"),
         },
         Hlvalue::Variable(_) => {
-            panic!("effect_graph_from_rtyped_helper: malloc first operand is a Variable")
+            panic!("malloc first operand is a Variable")
         }
     }
 }
@@ -14558,7 +14556,7 @@ fn effect_malloc_array_item_ty(
 
 /// `CollectAnalyzer.analyze_simple_operation` (`collectanalyze.py`):
 /// `malloc` / `malloc_varsize` collect only when `flags['flavor'] == 'gc'`.
-fn effect_malloc_flavor_is_raw(flags: &crate::flowspace::model::Hlvalue) -> bool {
+pub(crate) fn effect_malloc_flavor_is_raw(flags: &crate::flowspace::model::Hlvalue) -> bool {
     use crate::flowspace::model::{ConstValue, Hlvalue};
     let Hlvalue::Constant(c) = flags else {
         return false;
@@ -14577,7 +14575,7 @@ fn effect_malloc_flavor_is_raw(flags: &crate::flowspace::model::Hlvalue) -> bool
 /// `track_allocation` (default true), `add_memory_pressure` (default
 /// false). Any other name besides `flavor` is a leftover the rewrite
 /// rejects (`UnsupportedMallocFlags`).
-fn effect_malloc_raw_flags(
+pub(crate) fn effect_malloc_raw_flags(
     flags: &crate::flowspace::model::Hlvalue,
 ) -> (bool, bool, bool, Vec<String>) {
     use crate::flowspace::model::{ConstValue, Hlvalue};
@@ -14746,8 +14744,15 @@ fn effect_transduce_op(
                 result,
             );
         }
-        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not"
-        | "ptr_nonzero" | "ptr_iszero") => {
+        name @ ("int_neg"
+        | "int_invert"
+        | "int_is_true"
+        | "int_is_zero"
+        | "bool_not"
+        | "ptr_nonzero"
+        | "ptr_iszero"
+        | "length_of_simple_gcarray_from_opaque") => {
+            // `lloperation.py`: `length_of_simple_gcarray_from_opaque` is `LLOp(sideeffects=False)`.
             let operand = effect_materialize(out, block, &op.args[0]);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(

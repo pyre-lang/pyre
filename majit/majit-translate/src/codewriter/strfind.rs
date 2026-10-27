@@ -279,7 +279,8 @@ fn graph_arg_lltypes(graph: &FunctionGraph) -> Vec<LowLevelType> {
 /// the unspecialized identity. Helper graphs this walk registers under
 /// that label are relabelled; a graphless funcptr and a HOST_ENV
 /// `rlib/jit.py` builtin keep `func._name`. `jit_conditional_call`
-/// stores the funcptr in args[1] (`rlist.py _ll_list_resize_ge`).
+/// and `jit_conditional_call_value` store the funcptr in args[1]
+/// (`rlist.py _ll_list_resize_ge` / `rstr.py LLHelpers.ll_strhash`).
 ///
 /// When the callee graph already carries a specialized stamped name
 /// (`unspecialized_helper_name(&graph.name) != graph.name`), `func._name`
@@ -291,7 +292,7 @@ fn specialize_direct_call_funcptr_names(graph: &FunctionGraph, rtyper: &RPythonT
         for op in &mut block.borrow_mut().operations {
             let funcptr_idx = match op.opname.as_str() {
                 "direct_call" => 0,
-                "jit_conditional_call" => 1,
+                "jit_conditional_call" | "jit_conditional_call_value" => 1,
                 _ => continue,
             };
             let Some(Hlvalue::Constant(c)) = op.args.get_mut(funcptr_idx) else {
@@ -931,7 +932,9 @@ mod tests {
     use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
     use crate::policy::JitPolicy;
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, Struct, functionptr};
-    use crate::translator::rtyper::lltypesystem::rstr::build_ll_find_helper_graph;
+    use crate::translator::rtyper::lltypesystem::rstr::{
+        build_ll_find_helper_graph, build_ll_strhash_helper_graph, funcobj_from_funcptr_constant,
+    };
     use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
     use majit_ir::descr::ExtraEffect;
 
@@ -2592,6 +2595,76 @@ mod tests {
             !cc.is_candidate(&isc_path),
             "find_all_graphs follows only regular; isconstant is Builtin"
         );
+    }
+
+    /// `ll_strhash` / `ll_unicode_hash` call the same `_ll_strhash` graph
+    /// as `jit_conditional_call_value` and as `direct_call`. After the
+    /// registration/renaming walk both funcptrs share the stamped
+    /// `_func._name` (`specialize_direct_call_funcptr_names`).
+    #[test]
+    fn specialize_keeps_strhash_conditional_call_value_funcptr_name() {
+        for (name, ptr, internal, inner) in [
+            ("ll_strhash", STRPTR.clone(), "_ll_strhash", "_hash_string"),
+            (
+                "ll_unicode_hash",
+                UNICODEPTR.clone(),
+                "_ll_unicode_strhash",
+                "_hash_unicode_string",
+            ),
+        ] {
+            let ann = RPythonAnnotator::new(None, None, None, false);
+            let rtyper = RPythonTyper::new(&ann);
+            let helper =
+                build_ll_strhash_helper_graph(&rtyper, name, ptr, internal, inner).expect(name);
+            let mut cc = CallControl::new();
+            visit_direct_call_callees(
+                &mut cc,
+                &rtyper,
+                &helper.graph.borrow(),
+                false,
+                &mut HashSet::new(),
+            );
+            specialize_direct_call_funcptr_names(&helper.graph.borrow(), &rtyper);
+
+            let mut value_names = Vec::new();
+            let mut direct_names = Vec::new();
+            for block in helper.graph.borrow().iterblocks() {
+                for op in &block.borrow().operations {
+                    match op.opname.as_str() {
+                        "jit_conditional_call_value" => {
+                            if let Some(func) = funcobj_from_funcptr_constant(&op.args[1]) {
+                                value_names.push(func._name);
+                            }
+                        }
+                        "direct_call" => {
+                            if let Some(func) = funcobj_from_funcptr_constant(&op.args[0]) {
+                                direct_names.push(func._name);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(
+                value_names.len(),
+                1,
+                "{name} jit_conditional_call_value funcptr: {value_names:?}"
+            );
+            assert_eq!(
+                direct_names.len(),
+                1,
+                "{name} direct_call funcptr: {direct_names:?}"
+            );
+            assert_eq!(
+                unspecialized_helper_name(&value_names[0]),
+                internal,
+                "{name} value callee stem"
+            );
+            assert_eq!(
+                value_names[0], direct_names[0],
+                "{name} jitted and interpreter arms share the stamped _func._name"
+            );
+        }
     }
 
     /// `_ll_list_resize_ge`'s residual CondCall of the look_inside_iff

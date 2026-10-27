@@ -1054,7 +1054,14 @@ fn lookup_host_object(host: &HostObject) -> Option<ExtRegistryEntry> {
     }
     // rlib/jit.py `ConditionalCallEntry._about_ =
     // _jit_conditional_call, _jit_conditional_call_value`.
-    if host.qualname() == "majit_rlib.jit.conditional_call_elidable1" {
+    if matches!(
+        host.qualname(),
+        "majit_rlib.jit.conditional_call_elidable0"
+            | "majit_rlib.jit.conditional_call_elidable1"
+            | "majit_rlib.jit.conditional_call_elidable2"
+            | "majit_rlib.jit.conditional_call_elidable3"
+            | "majit_rlib.jit.conditional_call_elidable4"
+    ) {
         return Some(ExtRegistryEntry::ConditionalCall { is_value: true });
     }
     if matches!(
@@ -1333,15 +1340,25 @@ mod tests {
             Ok(SomeValue::None_(_))
         ));
 
-        let value_host =
-            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable1");
-        let value_entry = lookup(&ConstValue::HostObject(value_host))
-            .expect("conditional_call_elidable1 must surface an entry");
-        assert!(matches!(
-            value_entry,
-            ExtRegistryEntry::ConditionalCall { is_value: true }
-        ));
-        assert!(value_entry.specialize_call().is_ok());
+        for name in [
+            "majit_rlib.jit.conditional_call_elidable0",
+            "majit_rlib.jit.conditional_call_elidable1",
+            "majit_rlib.jit.conditional_call_elidable2",
+            "majit_rlib.jit.conditional_call_elidable3",
+            "majit_rlib.jit.conditional_call_elidable4",
+        ] {
+            let value_host = HostObject::new_builtin_callable(name);
+            let value_entry = lookup(&ConstValue::HostObject(value_host))
+                .unwrap_or_else(|| panic!("{name} must surface an entry"));
+            assert!(
+                matches!(
+                    value_entry,
+                    ExtRegistryEntry::ConditionalCall { is_value: true }
+                ),
+                "{name}"
+            );
+            assert!(value_entry.specialize_call().is_ok());
+        }
     }
 
     #[test]

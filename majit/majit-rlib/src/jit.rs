@@ -123,11 +123,24 @@ pub fn conditional_call4<A, B, C, D>(
 ///
 /// Translated graphs rewrite a `oopspec("jit.conditional_call_value")` call
 /// to `conditional_call_value_ir_{i,r}` (`jtransform.py`
-/// `rewrite_op_jit_conditional_call_value` / `_jit_conditional_call_value`).
-/// Argument order is `(value, function, *args)`, the same as the void
-/// [`conditional_call1`] helper that reaches `rewrite_op_jit_conditional_call`.
-/// Null is a miss. One function argument is the arity unicode
-/// `_get_index_storage` needs.
+/// `Transformer.rewrite_op_jit_conditional_call_value` /
+/// `_jit_conditional_call_value`). Argument order is
+/// `(value, function, *args)`, the same as the void [`conditional_call0`]
+/// family that reaches `Transformer.rewrite_op_jit_conditional_call`.
+/// Null is a miss. Upstream is one `*args` function with
+/// `_always_inline_ = 'try'`; Rust spells one arity per residual
+/// word-count (`Transformer._rewrite_op_cond_call` rejects more than 4
+/// function arguments).
+#[majit_macros::oopspec("jit.conditional_call_value")]
+pub fn conditional_call_elidable0<T>(value: *mut T, function: unsafe fn() -> *mut T) -> *mut T {
+    if value.is_null() {
+        unsafe { function() }
+    } else {
+        value
+    }
+}
+
+/// [`conditional_call_elidable0`] with one function argument.
 #[majit_macros::oopspec("jit.conditional_call_value")]
 pub fn conditional_call_elidable1<T, A>(
     value: *mut T,
@@ -136,6 +149,54 @@ pub fn conditional_call_elidable1<T, A>(
 ) -> *mut T {
     if value.is_null() {
         unsafe { function(a) }
+    } else {
+        value
+    }
+}
+
+/// [`conditional_call_elidable0`] with two function arguments.
+#[majit_macros::oopspec("jit.conditional_call_value")]
+pub fn conditional_call_elidable2<T, A, B>(
+    value: *mut T,
+    function: unsafe fn(A, B) -> *mut T,
+    a: A,
+    b: B,
+) -> *mut T {
+    if value.is_null() {
+        unsafe { function(a, b) }
+    } else {
+        value
+    }
+}
+
+/// [`conditional_call_elidable0`] with three function arguments.
+#[majit_macros::oopspec("jit.conditional_call_value")]
+pub fn conditional_call_elidable3<T, A, B, C>(
+    value: *mut T,
+    function: unsafe fn(A, B, C) -> *mut T,
+    a: A,
+    b: B,
+    c: C,
+) -> *mut T {
+    if value.is_null() {
+        unsafe { function(a, b, c) }
+    } else {
+        value
+    }
+}
+
+/// [`conditional_call_elidable0`] with four function arguments.
+#[majit_macros::oopspec("jit.conditional_call_value")]
+pub fn conditional_call_elidable4<T, A, B, C, D>(
+    value: *mut T,
+    function: unsafe fn(A, B, C, D) -> *mut T,
+    a: A,
+    b: B,
+    c: C,
+    d: D,
+) -> *mut T {
+    if value.is_null() {
+        unsafe { function(a, b, c, d) }
     } else {
         value
     }
@@ -205,5 +266,31 @@ mod tests {
         let again = conditional_call_elidable1(hit, compute, &mut slot);
         assert!(std::ptr::eq(again, hit));
         assert_eq!(slot, 1);
+    }
+
+    #[test]
+    fn conditional_call_elidable0_computes_on_null() {
+        fn compute() -> *mut i32 {
+            std::ptr::NonNull::<i32>::dangling().as_ptr()
+        }
+        let hit = conditional_call_elidable0(std::ptr::null_mut(), compute);
+        assert!(!hit.is_null());
+        let again = conditional_call_elidable0(hit, compute);
+        assert!(std::ptr::eq(again, hit));
+    }
+
+    #[test]
+    fn conditional_call_elidable2_computes_on_null() {
+        fn compute(flag: &mut i32, add: i32) -> *mut i32 {
+            *flag += add;
+            flag
+        }
+        let mut slot = 0i32;
+        let hit = conditional_call_elidable2(std::ptr::null_mut(), compute, &mut slot, 2);
+        assert!(std::ptr::eq(hit, &mut slot));
+        assert_eq!(slot, 2);
+        let again = conditional_call_elidable2(hit, compute, &mut slot, 2);
+        assert!(std::ptr::eq(again, hit));
+        assert_eq!(slot, 2);
     }
 }
