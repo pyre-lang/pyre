@@ -8467,17 +8467,12 @@ pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     op_pc: usize,
     plain: *const pyre_interpreter::objspace::std::mapdict::PlainAttribute,
 ) -> Result<(), DispatchError> {
-    if plain.is_null() {
-        return Ok(());
-    }
-    let owner = ctx.trace_ctx.const_ref(plain as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
+    super::walker_pin_mapdict_quasi_field(
+        ctx,
+        op_pc,
+        plain as i64,
         crate::descr::plain_attribute_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    )
 }
 
 /// Mirror `opimpl_jit_force_quasi_immutable` for mapdict writes hidden inside

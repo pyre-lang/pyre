@@ -12778,28 +12778,42 @@ fn walker_pin_namespace_version<Sym: WalkSym>(
 /// reach the gcref table because `OptHeap` consumes `QUASIIMMUT_FIELD` before
 /// the GC rewriter runs, exactly as `walker_pin_namespace_version` relies on.
 ///
-/// The owner is the enum variant payload, never `MapNode`: the enum has no
-/// `repr`, while the descr offsets are relative to `Terminator` and
-/// `PlainAttribute`. `CachedAttributeHolder` is already standalone.
+/// Walker `QUASIIMMUT_FIELD` arg0 is the `MapNode` variant payload
+/// (`*const Terminator` / `*const PlainAttribute`) or the standalone
+/// `CachedAttributeHolder`, never the enum start. `MapNode` is `repr(C)`
+/// (tag then payload); descr offsets are `offset_of!` on those structs so
+/// `quasiimmut.py get_current_qmut_instance` (`struct_ptr + mutate offset`)
+/// lands on the `QuasiImmutField`.
 ///
 /// `walker_flush_guard_not_invalidated` drains a pending flag, so consecutive
 /// markers at one fold site emit exactly one `GUARD_NOT_INVALIDATED`.
+pub(crate) fn walker_pin_mapdict_quasi_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    struct_ptr: i64,
+    descr: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
+    if struct_ptr == 0 {
+        return Ok(());
+    }
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("mapdict ? field has mutate_<name>");
+    let owner = ctx.trace_ctx.const_ref(struct_ptr);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, descr, Some(&mutate));
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     term: *const pyre_interpreter::objspace::std::mapdict::Terminator,
 ) -> Result<(), DispatchError> {
-    if term.is_null() {
-        return Ok(());
-    }
-    let owner = ctx.trace_ctx.const_ref(term as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
+    walker_pin_mapdict_quasi_field(
+        ctx,
+        op_pc,
+        term as i64,
         crate::descr::terminator_allow_unboxing_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    )
 }
 
 /// Pin `vm.py AuditHolder._immutable_fields_ = ['hooks_w?[:]']`, the read
@@ -12837,17 +12851,7 @@ fn walker_pin_holder_attr<Sym: WalkSym>(
     op_pc: usize,
     holder: *const pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder,
 ) -> Result<(), DispatchError> {
-    if holder.is_null() {
-        return Ok(());
-    }
-    let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::holder_attr_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    walker_pin_mapdict_quasi_field(ctx, op_pc, holder as i64, crate::descr::holder_attr_descr())
 }
 
 fn walker_pin_holder_typ<Sym: WalkSym>(
@@ -12855,17 +12859,7 @@ fn walker_pin_holder_typ<Sym: WalkSym>(
     op_pc: usize,
     holder: *const pyre_interpreter::objspace::std::mapdict::CachedAttributeHolder,
 ) -> Result<(), DispatchError> {
-    if holder.is_null() {
-        return Ok(());
-    }
-    let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::holder_typ_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    walker_pin_mapdict_quasi_field(ctx, op_pc, holder as i64, crate::descr::holder_typ_descr())
 }
 
 fn walker_record_getfield_gc_r_uncached<Sym: WalkSym>(

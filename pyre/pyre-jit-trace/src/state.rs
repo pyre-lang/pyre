@@ -5522,34 +5522,20 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  Function `?` fields,
-    // `ModuleDictStrategy.version`, and `W_TypeObject.version_tag` / `w_name`
-    // resolve through [`quasi_immut_descr_from_mutate`] (mutate descr
-    // required). The arms below are the remaining STRUCTs: hand-minted
-    // singletons including `GilReadyState.gil_ready` and `PyCode.w_globals`.
+    // `ModuleDictStrategy.version`, `W_TypeObject.version_tag` / `w_name`,
+    // and mapdict `Terminator.allow_unboxing` / `PlainAttribute.ever_mutated`
+    // / `CachedAttributeHolder.attr` / `typ` resolve through
+    // [`quasi_immut_descr_from_mutate`] (mutate descr required). The arms
+    // below are the remaining STRUCTs: hand-minted singletons including
+    // `GilReadyState.gil_ready` and `PyCode.w_globals`.
     // Analyzer `fielddescrof` stamps that field from `pycode.py`
     // `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is the same slot
     // as the reserved `pycode_w_globals_quasi_descr` index.
     let qmut = unsafe {
-        if index == crate::descr::terminator_allow_unboxing_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::terminator_current_allow_unboxing_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::plain_attribute_ever_mutated_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::plain_attribute_current_ever_mutated_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::cell_family_ever_mutated_descr().index() {
+        if index == crate::descr::cell_family_ever_mutated_descr().index() {
             Some(
                 (*(struct_ptr as *const pyre_object::nestedscope::CellFamily))
                     .current_ever_mutated_qmut(),
-            )
-        } else if index == crate::descr::holder_attr_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::holder_current_attr_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::holder_typ_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::holder_current_typ_qmut(
-                struct_ptr as *const _,
             )
         } else if index == crate::descr::audit_holder_hooks_descr().index() {
             pyre_interpreter::module::sys::vm::audit_holder_current_hooks_qmut(

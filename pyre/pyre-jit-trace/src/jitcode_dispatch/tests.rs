@@ -6088,6 +6088,156 @@ fn walker_pin_namespace_version_records_quasiimmut_from_mutate_descr() {
     assert_ne!(qd.qmut().instance_identity(), 0);
 }
 
+fn walker_pin_mapdict_records_quasiimmut_from_mutate(
+    pin: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>),
+    expected_field: DescrRef,
+    live_qmut: impl FnOnce() -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>,
+    field_label: &str,
+) {
+    use crate::state::ConcreteValue;
+
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        pin,
+    );
+    let recorder = tc.into_recorder();
+    let qmut_ops: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .collect();
+    assert_eq!(qmut_ops.len(), 1, "one QUASIIMMUT_FIELD for {field_label}");
+    let qmut_descr = qmut_ops[0]
+        .getdescr()
+        .expect("QUASIIMMUT_FIELD has a descr");
+    let qd = qmut_descr
+        .as_quasi_immut_descr()
+        .expect("QuasiImmutDescr from quasi_immut_descr_from_mutate");
+    assert!(
+        std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_field),
+        "recorded field descr must be {field_label}"
+    );
+    let live = live_qmut();
+    assert_eq!(
+        qd.qmut().instance_identity(),
+        std::sync::Arc::as_ptr(&live) as usize
+    );
+}
+
+#[test]
+fn walker_pin_terminator_allow_unboxing_records_quasiimmut_from_mutate_descr() {
+    // `mapdict.py Terminator._immutable_fields_` `allow_unboxing?`.
+    // `walker_pin_terminator_allow_unboxing` must pass `mutate_allow_unboxing`
+    // so `quasiimmut.py QuasiImmutDescr` is built by
+    // `quasi_immut_descr_from_mutate`.
+    let map = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        pyre_object::PY_NULL,
+        pyre_object::mapdict::TerminatorKind::NoDict,
+    );
+    let term = unsafe { (*map).as_terminator() as *const _ };
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| walker_pin_terminator_allow_unboxing(wc, 0, term).expect("pin"),
+        crate::descr::terminator_allow_unboxing_descr(),
+        || {
+            unsafe {
+                pyre_interpreter::objspace::std::mapdict::terminator_current_allow_unboxing_qmut(
+                    term,
+                )
+            }
+            .expect("Terminator resolves an instance")
+        },
+        "Terminator.allow_unboxing?",
+    );
+}
+
+#[test]
+fn walker_pin_plain_ever_mutated_records_quasiimmut_from_mutate_descr() {
+    // `mapdict.py PlainAttribute._immutable_fields_` `ever_mutated?`.
+    let back = pyre_interpreter::objspace::std::mapdict::new_terminator(
+        pyre_object::PY_NULL,
+        pyre_object::mapdict::TerminatorKind::NoDict,
+    );
+    let map = unsafe {
+        pyre_interpreter::objspace::std::mapdict::new_plain_attribute(
+            rustpython_wtf8::Wtf8Buf::from("x"),
+            0,
+            back,
+            0,
+        )
+    };
+    let plain = unsafe { (*map).as_plain() as *const _ };
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| walker_pin_plain_ever_mutated(wc, 0, plain).expect("pin"),
+        crate::descr::plain_attribute_ever_mutated_descr(),
+        || {
+            unsafe {
+                pyre_interpreter::objspace::std::mapdict::plain_attribute_current_ever_mutated_qmut(
+                    plain,
+                )
+            }
+            .expect("PlainAttribute resolves an instance")
+        },
+        "PlainAttribute.ever_mutated?",
+    );
+}
+
+#[test]
+fn walker_pin_holder_attr_records_quasiimmut_from_mutate_descr() {
+    // `mapdict.py CachedAttributeHolder._immutable_fields_` `attr?`.
+    let holder = Box::into_raw(Box::new(pyre_object::mapdict::CachedAttributeHolder {
+        order: 0,
+        attr: std::cell::Cell::new(std::ptr::null()),
+        mutate_attr: pyre_object::quasiimmut::QuasiImmutField::new(),
+        typ: std::cell::Cell::new(None),
+        mutate_typ: pyre_object::quasiimmut::QuasiImmutField::new(),
+    }));
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| walker_pin_holder_attr(wc, 0, holder).expect("pin"),
+        crate::descr::holder_attr_descr(),
+        || {
+            unsafe { pyre_interpreter::objspace::std::mapdict::holder_current_attr_qmut(holder) }
+                .expect("holder attr resolves an instance")
+        },
+        "CachedAttributeHolder.attr?",
+    );
+}
+
+#[test]
+fn walker_pin_holder_typ_records_quasiimmut_from_mutate_descr() {
+    // `mapdict.py CachedAttributeHolder._immutable_fields_` `typ?`.
+    let holder = Box::into_raw(Box::new(pyre_object::mapdict::CachedAttributeHolder {
+        order: 0,
+        attr: std::cell::Cell::new(std::ptr::null()),
+        mutate_attr: pyre_object::quasiimmut::QuasiImmutField::new(),
+        typ: std::cell::Cell::new(None),
+        mutate_typ: pyre_object::quasiimmut::QuasiImmutField::new(),
+    }));
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| walker_pin_holder_typ(wc, 0, holder).expect("pin"),
+        crate::descr::holder_typ_descr(),
+        || {
+            unsafe { pyre_interpreter::objspace::std::mapdict::holder_current_typ_qmut(holder) }
+                .expect("holder typ resolves an instance")
+        },
+        "CachedAttributeHolder.typ?",
+    );
+}
+
 /// Process-global `HOST_HOOKS` is one slot; save and restore it so this
 /// test cannot overwrite a sibling.
 struct WalkerQmutHookGuard {

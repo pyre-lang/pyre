@@ -27,7 +27,7 @@ pub struct CellFamily {
     pub ever_mutated: std::cell::Cell<bool>,
     /// The hidden watcher field for that `?` declaration, written out because
     /// pyre has no rtyper to synthesise it.  Mirrors
-    /// `PlainAttribute::ever_mutated_watchers`: the owner is a
+    /// `PlainAttribute::mutate_ever_mutated`: the owner is a
     /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
     /// `Drop` is unreachable and its inner box is reclaimed only through
     /// [`QuasiImmutField::invalidate`].

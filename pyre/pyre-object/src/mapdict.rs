@@ -34,7 +34,11 @@ pub enum TerminatorKind {
 /// `AbstractAttribute._attrs_ = ['terminator', ...]` so both variants of
 /// [`MapNode`] put that word at one offset after the enum tag. `w_cls`
 /// is the next word (`Terminator.__init__`).
+///
+/// `mapdict.py Terminator._immutable_fields_ = ['w_cls', 'allow_unboxing?']`.
+/// The `?` entry is declared here; `w_cls` is on [`MapNodeTerminatorView`].
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("allow_unboxing?")]
 pub struct Terminator {
     /// mapdict.py `AbstractAttribute.terminator` — a Terminator points to
     /// itself.
@@ -46,12 +50,13 @@ pub struct Terminator {
     /// differently-typed reassignment freezes them off. [`Self::set_allow_unboxing`]
     /// invalidates watchers before changing it.
     pub allow_unboxing: Cell<bool>,
-    /// The hidden watcher field implementing mapdict.py:305
-    /// `_immutable_fields_ = [..., 'allow_unboxing?']`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub allow_unboxing_watchers: QuasiImmutField,
+    /// Hidden `mutate_allow_unboxing` field (`quasiimmut.py
+    /// get_mutate_field_name` of pyre `allow_unboxing`; `mapdict.py
+    /// Terminator._immutable_fields_ = ['w_cls', 'allow_unboxing?']`). The
+    /// owner is a `Box::into_raw` leak that is never freed, so
+    /// [`QuasiImmutField`]'s `Drop` is unreachable and its inner box is
+    /// reclaimed only through [`QuasiImmutField::invalidate`].
+    pub mutate_allow_unboxing: QuasiImmutField,
     /// Which Terminator subclass this is.
     pub kind: TerminatorKind,
     /// mapdict.py `DictTerminator.devolved_dict_terminator` (null unless
@@ -80,22 +85,22 @@ impl Terminator {
         if self.allow_unboxing.get() == v {
             return;
         }
-        if self.allow_unboxing_watchers.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.allow_unboxing_watchers) };
+        if self.mutate_allow_unboxing.is_installed() {
+            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_allow_unboxing) };
         }
         self.allow_unboxing.set(v);
     }
 
     pub fn current_allow_unboxing_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.allow_unboxing_watchers.get_current_qmut_instance()
+        self.mutate_allow_unboxing.get_current_qmut_instance()
     }
 
     pub fn allow_unboxing_qmut_installed(&self) -> bool {
-        self.allow_unboxing_watchers.is_installed()
+        self.mutate_allow_unboxing.is_installed()
     }
 
     pub fn force_allow_unboxing_qmut(&self) {
-        self.allow_unboxing_watchers.invalidate();
+        self.mutate_allow_unboxing.invalidate();
     }
 }
 
@@ -167,7 +172,13 @@ pub struct UnboxedExtra {
 ///
 /// `terminator` is first so it shares [`Terminator`]'s offset after the
 /// [`MapNode`] enum tag (`AbstractAttribute.terminator`).
+///
+/// `mapdict.py PlainAttribute._immutable_fields_ = ['name', 'attrkind',
+/// 'storageindex', '_num_attributes', 'back', 'ever_mutated?', 'order']`.
+/// The `?` entry is declared here; the non-`?` entries are not yet
+/// (`name`/`attrkind`/`storageindex`/`num_attributes`/`back`/`order`).
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("ever_mutated?")]
 pub struct PlainAttribute {
     /// mapdict.py `AbstractAttribute.terminator` (= `back.terminator`).
     pub terminator: MapRef,
@@ -186,12 +197,13 @@ pub struct PlainAttribute {
     /// been overwritten or deleted. [`Self::set_ever_mutated`] invalidates
     /// watchers before changing it.
     pub ever_mutated: Cell<bool>,
-    /// The hidden watcher field implementing mapdict.py:421
-    /// `_immutable_fields_ = [..., 'ever_mutated?', ...]`. The owner is a
+    /// Hidden `mutate_ever_mutated` field (`quasiimmut.py
+    /// get_mutate_field_name` of pyre `ever_mutated`; `mapdict.py
+    /// PlainAttribute._immutable_fields_` `ever_mutated?`). The owner is a
     /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
     /// `Drop` is unreachable and its inner box is reclaimed only through
     /// [`QuasiImmutField::invalidate`].
-    pub ever_mutated_watchers: QuasiImmutField,
+    pub mutate_ever_mutated: QuasiImmutField,
     /// mapdict.py:431 `order`.
     pub order: usize,
     /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
@@ -210,22 +222,22 @@ impl PlainAttribute {
         if self.ever_mutated.get() == v {
             return;
         }
-        if self.ever_mutated_watchers.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.ever_mutated_watchers) };
+        if self.mutate_ever_mutated.is_installed() {
+            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
         }
         self.ever_mutated.set(v);
     }
 
     pub fn current_ever_mutated_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.ever_mutated_watchers.get_current_qmut_instance()
+        self.mutate_ever_mutated.get_current_qmut_instance()
     }
 
     pub fn ever_mutated_qmut_installed(&self) -> bool {
-        self.ever_mutated_watchers.is_installed()
+        self.mutate_ever_mutated.is_installed()
     }
 
     pub fn force_ever_mutated_qmut(&self) {
-        self.ever_mutated_watchers.invalidate();
+        self.mutate_ever_mutated.invalidate();
     }
 }
 
@@ -345,6 +357,12 @@ impl MapNode {
 /// mapdict.py `CachedAttributeHolder` — caches the child map produced
 /// by adding `(name, attrkind)` to a parent map, so transitions are shared.
 /// Interned/immortal like the map nodes it holds.
+///
+/// `repr(C)` pins field offsets to declaration order so the JIT descr
+/// group's `offset_of!` matches the walker arg0 (the holder itself).
+/// `mapdict.py CachedAttributeHolder._immutable_fields_ = ['attr?', 'typ?']`.
+#[repr(C)]
+#[majit_macros::jit_immutable_fields("attr?", "typ?")]
 pub struct CachedAttributeHolder {
     /// mapdict.py:670 `order` (= number of prior children of `back`).
     pub order: usize,
@@ -352,22 +370,22 @@ pub struct CachedAttributeHolder {
     /// `attr` is the cached child map. [`Self::set_attr`] invalidates watchers
     /// before changing it.
     pub attr: Cell<MapRef>,
-    /// The hidden watcher field implementing mapdict.py:669
-    /// `_immutable_fields_ = ['attr?', 'typ?']` for `attr?`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub attr_watchers: QuasiImmutField,
+    /// Hidden `mutate_attr` field (`quasiimmut.py get_mutate_field_name` of
+    /// pyre `attr`; `mapdict.py CachedAttributeHolder._immutable_fields_ =
+    /// ['attr?', 'typ?']`). The owner is a `Box::into_raw` leak that is
+    /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
+    /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
+    pub mutate_attr: QuasiImmutField,
     /// mapdict.py:669 `_immutable_fields_` declares `typ?`; mapdict.py:676
     /// `typ` is the unbox type (`None` means boxed). [`Self::set_typ`]
     /// invalidates watchers before changing it.
     pub typ: Cell<Option<UnboxType>>,
-    /// The hidden watcher field implementing mapdict.py:669
-    /// `_immutable_fields_ = ['attr?', 'typ?']` for `typ?`. The owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub typ_watchers: QuasiImmutField,
+    /// Hidden `mutate_typ` field (`quasiimmut.py get_mutate_field_name` of
+    /// pyre `typ`; `mapdict.py CachedAttributeHolder._immutable_fields_ =
+    /// ['attr?', 'typ?']`). The owner is a `Box::into_raw` leak that is
+    /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
+    /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
+    pub mutate_typ: QuasiImmutField,
 }
 
 impl CachedAttributeHolder {
@@ -377,8 +395,8 @@ impl CachedAttributeHolder {
         if self.attr.get() == a {
             return;
         }
-        if self.attr_watchers.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.attr_watchers) };
+        if self.mutate_attr.is_installed() {
+            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_attr) };
         }
         self.attr.set(a);
     }
@@ -389,34 +407,34 @@ impl CachedAttributeHolder {
         if self.typ.get() == t {
             return;
         }
-        if self.typ_watchers.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.typ_watchers) };
+        if self.mutate_typ.is_installed() {
+            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_typ) };
         }
         self.typ.set(t);
     }
 
     pub fn current_attr_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.attr_watchers.get_current_qmut_instance()
+        self.mutate_attr.get_current_qmut_instance()
     }
 
     pub fn attr_qmut_installed(&self) -> bool {
-        self.attr_watchers.is_installed()
+        self.mutate_attr.is_installed()
     }
 
     pub fn force_attr_qmut(&self) {
-        self.attr_watchers.invalidate();
+        self.mutate_attr.invalidate();
     }
 
     pub fn current_typ_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.typ_watchers.get_current_qmut_instance()
+        self.mutate_typ.get_current_qmut_instance()
     }
 
     pub fn typ_qmut_installed(&self) -> bool {
-        self.typ_watchers.is_installed()
+        self.mutate_typ.is_installed()
     }
 
     pub fn force_typ_qmut(&self) {
-        self.typ_watchers.invalidate();
+        self.mutate_typ.invalidate();
     }
 }
 
@@ -532,6 +550,22 @@ const _: () = {
         std::mem::offset_of!(MapNodeTerminatorView, w_cls)
             == std::mem::size_of::<isize>() + std::mem::size_of::<MapRef>()
     );
+    assert!(
+        std::mem::offset_of!(CachedAttributeHolder, order)
+            < std::mem::offset_of!(CachedAttributeHolder, attr)
+    );
+    assert!(
+        std::mem::offset_of!(CachedAttributeHolder, attr)
+            < std::mem::offset_of!(CachedAttributeHolder, mutate_attr)
+    );
+    assert!(
+        std::mem::offset_of!(CachedAttributeHolder, mutate_attr)
+            < std::mem::offset_of!(CachedAttributeHolder, typ)
+    );
+    assert!(
+        std::mem::offset_of!(CachedAttributeHolder, typ)
+            < std::mem::offset_of!(CachedAttributeHolder, mutate_typ)
+    );
 };
 
 /// `mapdict.py` `AbstractAttribute.terminator` then `Terminator.w_cls`.
@@ -620,7 +654,7 @@ mod prefix_overlay_tests {
             terminator: std::ptr::null(),
             w_cls,
             allow_unboxing: Cell::new(true),
-            allow_unboxing_watchers: QuasiImmutField::new(),
+            mutate_allow_unboxing: QuasiImmutField::new(),
             kind: TerminatorKind::NoDict,
             devolved_dict_terminator: Cell::new(std::ptr::null()),
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
@@ -644,5 +678,73 @@ mod prefix_overlay_tests {
         let view = unsafe { &*(map as *const MapNodeTerminatorView) };
         assert!(std::ptr::eq(view.w_cls, w_cls));
         assert!(std::ptr::eq(unsafe { map_terminator_w_cls(map) }, w_cls));
+    }
+
+    #[test]
+    fn quasiimmut_arg0_is_the_variant_payload_not_the_enum_start() {
+        // Walker pins pass `*const Terminator` / `*const PlainAttribute`
+        // (the payload after the `MapNode` tag), and descr offsets are
+        // `offset_of!` on those structs. `struct_ptr + mutate offset`
+        // must be the embedded `QuasiImmutField`.
+        let w_cls = 0x2000 as PyObjectRef;
+        let mut term_node = MapNode::Terminator(dummy_terminator(w_cls));
+        let enum_ptr = &term_node as *const MapNode;
+        let term = match &term_node {
+            MapNode::Terminator(t) => t as *const Terminator,
+            MapNode::Plain(_) => unreachable!(),
+        };
+        assert!(
+            (term as usize) > (enum_ptr as usize),
+            "variant payload follows the MapNode tag"
+        );
+        let via_term = (term as *const u8)
+            .wrapping_add(core::mem::offset_of!(Terminator, mutate_allow_unboxing));
+        let direct_term = unsafe { &(*term).mutate_allow_unboxing as *const _ as *const u8 };
+        assert_eq!(via_term, direct_term);
+
+        let plain = PlainAttribute {
+            terminator: std::ptr::null(),
+            name: Wtf8Buf::from("x"),
+            attrkind: 0,
+            storageindex: 0,
+            num_attributes: 1,
+            back: std::ptr::null(),
+            ever_mutated: Cell::new(false),
+            mutate_ever_mutated: QuasiImmutField::new(),
+            order: 0,
+            cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
+            unboxed: None,
+        };
+        let mut plain_node = MapNode::Plain(plain);
+        let plain_enum = &plain_node as *const MapNode;
+        let plain_ptr = match &plain_node {
+            MapNode::Plain(p) => p as *const PlainAttribute,
+            MapNode::Terminator(_) => unreachable!(),
+        };
+        assert!((plain_ptr as usize) > (plain_enum as usize));
+        let via_plain = (plain_ptr as *const u8)
+            .wrapping_add(core::mem::offset_of!(PlainAttribute, mutate_ever_mutated));
+        let direct_plain = unsafe { &(*plain_ptr).mutate_ever_mutated as *const _ as *const u8 };
+        assert_eq!(via_plain, direct_plain);
+
+        let holder = CachedAttributeHolder {
+            order: 0,
+            attr: Cell::new(std::ptr::null()),
+            mutate_attr: QuasiImmutField::new(),
+            typ: Cell::new(None),
+            mutate_typ: QuasiImmutField::new(),
+        };
+        let holder_ptr = &holder as *const CachedAttributeHolder;
+        let via_attr = (holder_ptr as *const u8)
+            .wrapping_add(core::mem::offset_of!(CachedAttributeHolder, mutate_attr));
+        let direct_attr = &holder.mutate_attr as *const _ as *const u8;
+        assert_eq!(via_attr, direct_attr);
+        let via_typ = (holder_ptr as *const u8)
+            .wrapping_add(core::mem::offset_of!(CachedAttributeHolder, mutate_typ));
+        let direct_typ = &holder.mutate_typ as *const _ as *const u8;
+        assert_eq!(via_typ, direct_typ);
+        let _ = enum_ptr;
+        let _ = &mut term_node;
+        let _ = &mut plain_node;
     }
 }
