@@ -34,7 +34,7 @@ fn cond_call_gc_wb_slowpath_reaches_the_gc_and_keeps_live_registers() {
         Vec::new(),
     ));
     let total_size = GcHeader::SIZE + 8 + item_size * LENGTH;
-    let mut alloc_old = |gc: &mut MiniMarkGC| {
+    let alloc_old = |gc: &mut MiniMarkGC| {
         let obj = gc.alloc_in_oldgen_with_cards(array_tid, total_size, LENGTH, true);
         unsafe { *(obj.0 as *mut usize) = LENGTH };
         let hdr = unsafe { &*header_of(obj.0) };

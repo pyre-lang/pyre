@@ -36,7 +36,7 @@ use crate::pyobject::PyObjectRef;
 
 use crate::object_array::{
     TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block, gc_int_array_gc_type_id,
-    typed_items_block_capacity, typed_items_block_items_base,
+    ll_arraycopy_int_items_block, typed_items_block_capacity, typed_items_block_items_base,
 };
 
 pub use crate::rordereddict_entries::{
@@ -682,10 +682,6 @@ impl<K, V, S> RDict<K, V, S> {
         unsafe { alloc_typed_items_block(n, gc_int_array_gc_type_id()) }
     }
 
-    fn index_words_ptr(block: *mut TypedItemsBlock) -> *mut i64 {
-        unsafe { typed_items_block_items_base(block) as *mut i64 }
-    }
-
     /// Install a zeroed probe table, then release the previous one.
     /// `ll_malloc_indexes_and_choose_lookup` allocates before the old
     /// array becomes unreachable.
@@ -746,13 +742,8 @@ impl<K, V, S> RDict<K, V, S> {
         }
         let n = self.index_len();
         let fresh = Self::alloc_index_block(n);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                Self::index_words_ptr(self.indexes),
-                Self::index_words_ptr(fresh),
-                n,
-            );
-        }
+        // `ll_dict_copy`: `rgc.ll_arraycopy(indexes, newindexes, 0, 0, n)`.
+        unsafe { ll_arraycopy_int_items_block(self.indexes, fresh, 0, 0, n as i64) };
         fresh
     }
 
@@ -801,19 +792,23 @@ impl<K, V, S> RDict<K, V, S> {
         (key, value)
     }
 
-    /// `ll_getitem_nonneg` on `d.indexes`. The stored word is an `i64`;
-    /// [`FREE`], [`DELETED`], and `slot + VALID_OFFSET` all fit in `u32`.
+    /// `ll_dict_lookup`'s `indexes[intmask(i)]` on the `DICTINDEX_LONG`
+    /// `GcArray` behind `d.indexes` (`getarrayitem_gc`). [`FREE`],
+    /// [`DELETED`], and `slot + VALID_OFFSET` all fit in `u32`.
     #[inline]
     fn index_at(&self, i: usize) -> u32 {
         debug_assert!(i < self.index_len());
-        unsafe { *Self::index_words_ptr(self.indexes).add(i) as u32 }
+        unsafe { *(typed_items_block_items_base(self.indexes) as *const i64).add(i) as u32 }
     }
 
-    /// `ll_setitem_fast` on `d.indexes`.
+    /// `_ll_write_indexes`: `indexes[i] = rffi.cast(T, value)` on the
+    /// `DICTINDEX_LONG` `GcArray` (`setarrayitem_gc`).
     #[inline]
     fn set_index_at(&mut self, i: usize, value: u32) {
         debug_assert!(i < self.index_len());
-        unsafe { *Self::index_words_ptr(self.indexes).add(i) = i64::from(value) };
+        unsafe {
+            *(typed_items_block_items_base(self.indexes) as *mut i64).add(i) = i64::from(value)
+        };
     }
 
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan

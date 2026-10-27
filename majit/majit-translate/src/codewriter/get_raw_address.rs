@@ -23,8 +23,7 @@
 //! `CollectAnalyzer`.
 
 use crate::codewriter::call::{CallControl, effect_graph_from_rtyped_helper};
-use crate::flowspace::model::Variable;
-use crate::model::{CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
+use crate::model::FunctionGraph;
 use crate::parse::CallPath;
 use crate::runtime_names::shims;
 use crate::translator::rtyper::lltypesystem::rffi::{
@@ -42,6 +41,7 @@ fn native_fnaddr_key(leaf: &str) -> CallPath {
     CallPath::from_segments(["lltypesystem", "rffi", leaf])
 }
 
+#[cfg(test)]
 fn helper_fnaddr_path(leaf: &str) -> String {
     format!("majit_rlib::lltypesystem::rffi::{leaf}")
 }
@@ -158,6 +158,8 @@ fn residual_helper_graph(name: &str) -> FunctionGraph {
 mod tests {
     use super::*;
     use crate::codewriter::call::CallKind;
+    use crate::flowspace::model::Variable;
+    use crate::model::{CallTarget, OpKind, SpaceOperation, ValueType};
 
     fn mint() -> CallControl {
         let mut cc = CallControl::new();

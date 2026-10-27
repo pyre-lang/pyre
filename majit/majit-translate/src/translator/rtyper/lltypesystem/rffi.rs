@@ -74,6 +74,7 @@ pub const NULL: Option<()> = None;
 /// platform-dependent `CompilationError` branch cannot be evaluated in this
 /// static port.
 pub static TYPES: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut types = vec![
         "short",
         "unsigned short",

@@ -2092,6 +2092,10 @@ fn get_native_id() -> i64 {
     {
         return unsafe { libc::syscall(libc::SYS_gettid) } as i64;
     }
+    #[cfg(not(all(
+        not(feature = "sandbox"),
+        any(target_os = "linux", target_os = "android")
+    )))]
     current_ident()
 }
 

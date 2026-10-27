@@ -15263,8 +15263,8 @@ mod tests {
     #[test]
     fn unknown_struct_array_descr_tid_is_walked_after_pre_freeze_register() {
         use majit_ir::descr::{
-            ArrayDescr, ArrayFlag, Descr, FieldDescr, GcCache, LLType, SimpleArrayDescr,
-            SimpleFieldDescr, SimpleInteriorFieldDescr, UNSET_GC_TYPE_ID, try_downcast_arc,
+            ArrayDescr, ArrayFlag, FieldDescr, GcCache, LLType, SimpleArrayDescr, SimpleFieldDescr,
+            SimpleInteriorFieldDescr, UNSET_GC_TYPE_ID, try_downcast_arc,
         };
         use majit_ir::{DescrRef, Type};
         use std::sync::Arc;

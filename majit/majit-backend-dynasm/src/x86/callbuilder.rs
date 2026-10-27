@@ -13,6 +13,7 @@ use dynasmrt::dynasm;
 
 use super::arch::{PASS_ON_MY_FRAME, THREADLOCAL_OFS, WORD};
 use super::assembler::Assembler386;
+#[cfg(target_os = "windows")]
 use super::regloc::imm;
 use super::rx86;
 use crate::jump::{RegallocMoves, remap_frame_layout};

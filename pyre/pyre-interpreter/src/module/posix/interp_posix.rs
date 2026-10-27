@@ -4175,7 +4175,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     Ok(fs_name_obj(bytes_mode, &target))
                 }
-                #[cfg(not(unix))]
+                #[cfg(not(any(
+                    unix,
+                    all(windows, feature = "host_env", not(feature = "sandbox"))
+                )))]
                 match std::fs::read_link(path_from_bytes(&path.as_bytes).as_ref()) {
                     Ok(target) => {
                         let target = target.as_os_str().as_encoded_bytes();

@@ -672,6 +672,7 @@ mod tests {
         assert!(matches!(dd.read_key(None), SomeValue::String(_)));
     }
 
+    #[test]
     fn generalize_key_on_plain_dict_does_not_trip_rdict_stub() {
         // upstream dictdef.py generalize — custom_eq_hash=false path skips
         // emulate_rdict_calls entirely. Same widening on a plain dict

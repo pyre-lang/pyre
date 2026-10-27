@@ -1959,12 +1959,12 @@ fn call_narrow_results_are_sign_or_zero_extended() {
     // on eax. A 32-bit return leaves the high half of rax clear, so a
     // missing extension is visible for every width below a word.
     let runs: Vec<(i64, bool, usize, i64)> = vec![
-        (ret_i8 as usize as i64, true, 1, -42),
-        (ret_u8 as usize as i64, false, 1, 0xFE),
-        (ret_i16 as usize as i64, true, 2, -300),
-        (ret_u16 as usize as i64, false, 2, 0xFFFE),
-        (ret_i32 as usize as i64, true, 4, -2),
-        (ret_u32 as usize as i64, false, 4, 0xFFFF_FFFE),
+        (ret_i8 as *const () as usize as i64, true, 1, -42),
+        (ret_u8 as *const () as usize as i64, false, 1, 0xFE),
+        (ret_i16 as *const () as usize as i64, true, 2, -300),
+        (ret_u16 as *const () as usize as i64, false, 2, 0xFFFE),
+        (ret_i32 as *const () as usize as i64, true, 4, -2),
+        (ret_u32 as *const () as usize as i64, false, 4, 0xFFFF_FFFE),
     ];
     for (func, signed, size, expected) in runs {
         let (backend, token) = compile_call(
@@ -1998,7 +1998,7 @@ fn call_ref_result_is_the_pointer_word() {
     // A pointer-word ref result stays in eax.
     let (backend, token) = compile_call(
         OpCode::CallR,
-        ref_static as usize as i64,
+        ref_static as *const () as usize as i64,
         &[],
         vec![],
         OpRef::ref_op(1),
@@ -2023,7 +2023,7 @@ fn call_float_result_is_read_from_xmm0() {
     // `after_call` bound.
     let (backend, token) = compile_call(
         OpCode::CallF,
-        neg_float as usize as i64,
+        neg_float as *const () as usize as i64,
         &[rb(OpRef::const_float(1.5))],
         vec![Type::Float],
         OpRef::float_op(1),
@@ -2053,7 +2053,7 @@ fn call_singlefloat_movd_does_not_clobber_a_double_source() {
     let neg = Op::new(
         OpCode::CallF,
         &[
-            rb(OpRef::const_int(neg_float as usize as i64)),
+            rb(OpRef::const_int(neg_float as *const () as usize as i64)),
             rb(inputargs[0].opref()),
         ],
     );
@@ -2062,7 +2062,9 @@ fn call_singlefloat_movd_does_not_clobber_a_double_source() {
     let call = Op::new(
         OpCode::CallF,
         &[
-            rb(OpRef::const_int(singlefloat_then_double as usize as i64)),
+            rb(OpRef::const_int(
+                singlefloat_then_double as *const () as usize as i64,
+            )),
             rb(OpRef::const_int(i64::from(1.5f32.to_bits()))),
             rb(OpRef::float_op(1)),
         ],
@@ -2146,7 +2148,9 @@ fn call_stack_arguments_from_frame_slots_and_constants() {
     let arg = |i: usize| rb(inputargs[i].opref());
     let big = 0x1_0000_0003i64;
     let args = [
-        rb(OpRef::const_int(mixed_stack_args as usize as i64)),
+        rb(OpRef::const_int(
+            mixed_stack_args as *const () as usize as i64,
+        )),
         arg(0),
         arg(6),
         rb(OpRef::const_float(1.25)),
@@ -2247,7 +2251,7 @@ fn compile_threadlocalref_get(
         opcode,
         &[
             rb(OpRef::const_int(
-                threadlocalref_get_helper_must_not_run as usize as i64,
+                threadlocalref_get_helper_must_not_run as *const () as usize as i64,
             )),
             rb(OpRef::const_int(8)),
         ],
@@ -2595,7 +2599,7 @@ fn compile_release_gil(flags: i64, new_value: i64) -> (DynasmBackend, JitCellTok
         OpCode::CallReleaseGilI,
         &[
             rb(OpRef::const_int(flags)),
-            rb(OpRef::const_int(swap_errno as usize as i64)),
+            rb(OpRef::const_int(swap_errno as *const () as usize as i64)),
             rb(OpRef::const_int(new_value)),
         ],
     );
@@ -2648,7 +2652,9 @@ fn call_release_gil_saves_last_error() {
         OpCode::CallReleaseGilI,
         &[
             rb(OpRef::const_int(majit_jitcode::rffi::RFFI_SAVE_LASTERROR)),
-            rb(OpRef::const_int(set_last_error_and_return as usize as i64)),
+            rb(OpRef::const_int(
+                set_last_error_and_return as *const () as usize as i64,
+            )),
             rb(OpRef::const_int(123)),
         ],
     );
@@ -2687,7 +2693,7 @@ fn call_release_gil_saves_last_error_float_result() {
         &[
             rb(OpRef::const_int(majit_jitcode::rffi::RFFI_SAVE_LASTERROR)),
             rb(OpRef::const_int(
-                set_last_error_and_return_float as usize as i64,
+                set_last_error_and_return_float as *const () as usize as i64,
             )),
             rb(OpRef::const_int(77)),
         ],
@@ -4800,21 +4806,21 @@ fn int_args(n: i64) -> (Vec<Operand>, Vec<Type>) {
 #[test]
 fn call_subtract_esp_aligned_passes_args() {
     let (args, types) = int_args(0);
-    run_aligned_call(call_align_0 as usize as i64, &args, types);
+    run_aligned_call(call_align_0 as *const () as usize as i64, &args, types);
     let (args, types) = int_args(4);
-    run_aligned_call(call_align_4 as usize as i64, &args, types);
+    run_aligned_call(call_align_4 as *const () as usize as i64, &args, types);
     let (args, types) = int_args(6);
-    run_aligned_call(call_align_6 as usize as i64, &args, types);
+    run_aligned_call(call_align_6 as *const () as usize as i64, &args, types);
     let (args, types) = int_args(7);
-    run_aligned_call(call_align_7 as usize as i64, &args, types);
+    run_aligned_call(call_align_7 as *const () as usize as i64, &args, types);
     let (args, types) = int_args(9);
-    run_aligned_call(call_align_9 as usize as i64, &args, types);
+    run_aligned_call(call_align_9 as *const () as usize as i64, &args, types);
     // 19 ints: SysV puts 13 words on the stack, Win64's `on_stack` is 19.
     // Both exceed `PASS_ON_MY_FRAME`, so the call subtracts.
     let (args, types) = int_args(19);
-    run_aligned_call(call_align_19 as usize as i64, &args, types);
+    run_aligned_call(call_align_19 as *const () as usize as i64, &args, types);
     run_aligned_call(
-        call_align_float as usize as i64,
+        call_align_float as *const () as usize as i64,
         &[rb(OpRef::const_float(1.5)), rb(OpRef::const_float(2.25))],
         vec![Type::Float, Type::Float],
     );
@@ -5815,7 +5821,10 @@ fn residual_call_register_fnloc_is_call_reg() {
     // `ARGUMENTS_GPR[0]` (ecx on Win64). The `IntAdd` result already lives
     // there, so the call is `call rcx` with no `mov rax`.
     let (backend, token) = compile_indirect_call(true, None, &[], vec![]);
-    let frame = backend.execute_token(&token, &[Value::Int(indirect_const as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(indirect_const as *const () as usize as i64)],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
@@ -5826,7 +5835,10 @@ fn residual_call_register_fnloc_is_call_reg() {
     // `ARGUMENTS_GPR[1]` and the call is that register.
     let (backend, token) =
         compile_indirect_call(true, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
-    let frame = backend.execute_token(&token, &[Value::Int(indirect_id as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(indirect_id as *const () as usize as i64)],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
@@ -5846,7 +5858,10 @@ fn residual_call_register_fnloc_is_call_reg() {
         ],
         vec![Type::Int; 4],
     );
-    let frame = backend.execute_token(&token, &[Value::Int(indirect_sum4 as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(indirect_sum4 as *const () as usize as i64)],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 10);
     let code = compiled_bytes(&token);
@@ -5865,7 +5880,10 @@ fn residual_call_frame_fnloc_moves_into_an_argument_register() {
     // the same, and `prepare_arguments` moves it into the next free
     // argument register: the call is that register, never `CALL [rbp+ofs]`.
     let (backend, token) = compile_indirect_call(false, None, &[], vec![]);
-    let frame = backend.execute_token(&token, &[Value::Int(indirect_const as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(indirect_const as *const () as usize as i64)],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 99);
     let code = compiled_bytes(&token);
@@ -5880,7 +5898,10 @@ fn residual_call_frame_fnloc_moves_into_an_argument_register() {
 
     let (backend, token) =
         compile_indirect_call(false, None, &[rb(OpRef::const_int(42))], vec![Type::Int]);
-    let frame = backend.execute_token(&token, &[Value::Int(indirect_id as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(indirect_id as *const () as usize as i64)],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 42);
     let code = compiled_bytes(&token);
@@ -5908,7 +5929,12 @@ fn residual_call_fnloc_survives_errno_and_lasterror() {
         &[rb(OpRef::const_int(stamp))],
         vec![Type::Int],
     );
-    let frame = backend.execute_token(&token, &[Value::Int(read_errno_and_stamp as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(
+            read_errno_and_stamp as *const () as usize as i64,
+        )],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 41 + stamp);
     assert_eq!(majit_rlib::rposix::get_saved_errno(), (stamp as i32) + 1);
@@ -5937,7 +5963,12 @@ fn residual_call_fnloc_survives_errno_and_lasterror() {
         &[rb(OpRef::const_int(stamp))],
         vec![Type::Int],
     );
-    let frame = backend.execute_token(&token, &[Value::Int(read_errno_and_stamp as usize as i64)]);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Int(
+            read_errno_and_stamp as *const () as usize as i64,
+        )],
+    );
     assert!(backend.get_latest_descr(&frame).is_finish());
     assert_eq!(backend.get_int_value(&frame, 0), 41 + stamp);
     assert_eq!(majit_rlib::rposix::get_saved_errno(), (stamp as i32) + 1);

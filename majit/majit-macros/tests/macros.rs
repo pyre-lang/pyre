@@ -1048,15 +1048,7 @@ mod jit_struct {
 
     #[jit_struct]
     struct FloatCell {
-        #[expect(
-            dead_code,
-            reason = "field is inspected by jit_struct descriptor generation"
-        )]
         narrow: f32,
-        #[expect(
-            dead_code,
-            reason = "field is inspected by jit_struct descriptor generation"
-        )]
         wide: f64,
     }
 
