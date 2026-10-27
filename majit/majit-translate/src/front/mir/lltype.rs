@@ -4244,9 +4244,11 @@ pub(in crate::front::mir) fn tyref_exception_class_leaf(ty: &TyRef, llbc: &Llbc)
 
 /// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
 /// every aggregate onto a GC reference, which the call-signature validator
-/// must not start enforcing for ordinary struct returns.
+/// must not start enforcing for ordinary struct returns. `"()"` is Void,
+/// the declared result of a `fn(...) -> ()` (and of `Result<(), PyError>`
+/// after the `Ok` projection).
 pub(in crate::front::mir) fn scalar_result_token(token: &str) -> bool {
-    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64")
+    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64" | "()")
 }
 
 /// FUNC.RESULT token for a non-unit tuple return: `Tuple<t0,t1,…>` of

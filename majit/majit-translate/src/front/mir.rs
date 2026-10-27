@@ -2361,7 +2361,7 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(
+        if declared_result_is_unit(
             &fd.signature.output,
             self.llbc,
             self.static_addrs.error_carrier,
@@ -2601,7 +2601,7 @@ impl<'l> CrateLowering<'l> {
             .first()
             .map(|local| &local.ty)
             .unwrap_or(&fd.signature.output);
-        if result_exc_ok_is_unit(output, self.llbc, self.static_addrs.error_carrier) {
+        if declared_result_is_unit(output, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
         }
         spec.header.graph_stamp().apply(graph)
@@ -3078,8 +3078,9 @@ impl SemanticFunctionHeader {
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
         // pointer, or a declared-Raw ADT pointer
         // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
-        // `scalar_result_token` matches that spelling. Ordinary
-        // looked-inside graphs keep FUNC.RESULT unstamped so
+        // `scalar_result_token` matches that spelling, including `"()"` so
+        // a `fn(...) -> ()` graph declares `FUNC.RESULT = Void`. Ordinary
+        // looked-inside aggregate graphs keep FUNC.RESULT unstamped so
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
@@ -3277,6 +3278,9 @@ pub(crate) struct GraphStamp {
     fun_decl_id: u64,
     module: Option<String>,
     hints: Vec<String>,
+    /// `funcptr._obj.TO.RESULT` from the LLBC signature. `GraphTransform`
+    /// stamps the same token at registration; the graph itself has to
+    /// carry it so `declared_result_type_for_*` can read Void for `()`.
     return_type: Option<String>,
     residual_return_type: Option<String>,
     return_class_root: Option<String>,
@@ -6734,6 +6738,18 @@ fn result_exc_ok_is_unit(
         && crate::front::result_exc::tyref_result_ok_is_unit(output, llbc)
 }
 
+/// Declared `FUNC.RESULT` is Void: a Rust `()` return, or a scoped
+/// `Result<(), PyError>` whose `Ok` payload is unit.
+/// `output` is the body's declared return type: the FunDecl signature
+/// for a template, local 0 after substitution for a clause spec.
+fn declared_result_is_unit(
+    output: &TyRef,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    is_unit_type(output, llbc) || result_exc_ok_is_unit(output, llbc, error_carrier)
+}
+
 fn lower_unstructured_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -7157,6 +7173,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 // whole-program annotation fixpoint, destabilises it.
                 lo.graph.return_type = Some("()".to_string());
             }
+        }
+        if declared_result_is_unit(&fd.signature.output, llbc, static_addrs.error_carrier) {
+            // A plain `fn(...) -> ()` is the same Void RESULT: the CFG
+            // still returns the unit shell as Ref. Stamp FUNC.RESULT only;
+            // do not rewrite the return value here.
+            lo.graph.return_type = Some("()".to_string());
         }
         // The `?`-diamond rewrite (`rewire_result_exc_call_sites`) detaches
         // the pre-rewrite branch / discriminant / break blocks: the call
