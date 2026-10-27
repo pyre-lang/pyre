@@ -2840,18 +2840,12 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                            pc: i32|
      -> Option<resume::ResolvedJitCode<'static>> {
         if pc < 0 {
-            if majit_gc::diag_p92_trace_io() {
-                eprintln!("P92_RESOLVE fail index={jitcode_index} pc={pc} why=pc_negative");
-            }
             return None;
         }
         let op_live = pyre_jit_trace::state::blackhole_control_opcodes().0 as u8;
         let pyjitcode = match pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index) {
             Some(j) => j,
             None => {
-                if majit_gc::diag_p92_trace_io() {
-                    eprintln!("P92_RESOLVE fail index={jitcode_index} pc={pc} why=missing_index");
-                }
                 return None;
             }
         };
@@ -2866,12 +2860,6 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         if pyjitcode.has_abort_opcode()
             && !pyre_jit_trace::state::jitcode_is_transparent_helper(jitcode_index)
         {
-            if majit_gc::diag_p92_trace_io() {
-                eprintln!(
-                    "P92_RESOLVE fail index={jitcode_index} pc={pc} why=abort name={}",
-                    pyjitcode.jitcode.name
-                );
-            }
             return None;
         }
         // A published resume frame carries a decodable JitCode `-live-`
@@ -2879,20 +2867,8 @@ pub fn blackhole_resume_via_rd_numb<'df>(
         let resolved_pc = if pyjitcode.jitcode.can_decode_live_vars(pc as usize, op_live) {
             pc as usize
         } else {
-            if majit_gc::diag_p92_trace_io() {
-                eprintln!(
-                    "P92_RESOLVE fail index={jitcode_index} pc={pc} why=no_liveness name={} op_live={op_live}",
-                    pyjitcode.jitcode.name
-                );
-            }
             return None;
         };
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_RESOLVE ok index={jitcode_index} pc={pc} name={}",
-                pyjitcode.jitcode.name
-            );
-        }
         Some(
             resume::ResolvedJitCode::new(pyjitcode.jitcode.clone(), resolved_pc)
                 .with_virtualizable_stack_base(pyjitcode.metadata.stack_base),

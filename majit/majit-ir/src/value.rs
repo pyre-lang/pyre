@@ -502,9 +502,6 @@ impl InputArg {
 
     /// Stamp the concrete runtime value on this frontend-arg identity.
     pub fn set_value(&self, v: Value) {
-        if let Value::Ref(r) = v {
-            crate::gcref_diag(r.0, "InputArg::set_value");
-        }
         self.value.set(Some(v));
     }
 
@@ -1001,31 +998,6 @@ pub fn gc_current_object_address(addr: usize) -> usize {
         let f: GcCurrentObjectAddressFn = unsafe { std::mem::transmute_copy(&p) };
         f(addr)
     }
-}
-
-/// Temporary P92 intern/ConstPtr classification hook.
-pub type GcrefDiagFn = fn(usize, &'static str);
-
-static GCREF_DIAG: AtomicPtr<()> = AtomicPtr::new(std::ptr::null_mut());
-
-pub fn set_gcref_diag(hook: Option<GcrefDiagFn>) {
-    let raw: *mut () = match hook {
-        None => std::ptr::null_mut(),
-        Some(f) => unsafe { std::mem::transmute_copy::<GcrefDiagFn, *mut ()>(&f) },
-    };
-    GCREF_DIAG.store(raw, Ordering::Release);
-}
-
-/// Write-once hook. Relaxed matches `have_debug_prints` / `OP_HAVE_DEBUG_PRINTS`
-/// (`pypy_have_debug_prints & 1`): the pointer is stored once at install.
-#[inline(always)]
-pub fn gcref_diag(addr: usize, site: &'static str) {
-    let p = GCREF_DIAG.load(Ordering::Relaxed);
-    if p.is_null() {
-        return;
-    }
-    let f: GcrefDiagFn = unsafe { std::mem::transmute_copy(&p) };
-    f(addr, site);
 }
 
 /// OPEN POLICY FORK — the one place that decides what an unregistered

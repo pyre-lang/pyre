@@ -702,7 +702,6 @@ impl Trace {
         minimum_virtualizable_size: i64,
     ) -> Result<crate::resume::NumberingState, crate::resume::TagOverflow> {
         use crate::opencoder::SnapshotIterator;
-        use smallvec::SmallVec;
 
         let offset = resume_pos as usize;
         let inputargs = self.inputargs.as_slice();
@@ -712,41 +711,6 @@ impl Trace {
             .as_ref()
             .expect("number_byte_snapshot requires TraceRecordBuffer");
         let it = SnapshotIterator::new(&trb._snapshot_data, &trb._snapshot_array_data, offset);
-        if majit_gc::diag_p92_enabled() {
-            let vable_len = it.iter_vable_array().total_length;
-            let vref_len = it.iter_vref_array().total_length;
-            let mut headers: SmallVec<[(i32, i32, usize); 16]> = SmallVec::new();
-            for i in 0..it.framestack.len() {
-                let snap = it.framestack[i];
-                let nboxes = it.iter_array(snap).len();
-                let (jc, pc) = it.unpack_jitcode_pc(snap);
-                headers.push((Self::decode_jitcode_index(jc) as i32, pc as i32, nboxes));
-            }
-            if headers.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-                let arrs: SmallVec<[(usize, i64, i64); 16]> = (0..it.framestack.len())
-                    .map(|i| {
-                        let snap = it.framestack[i];
-                        let arr =
-                            crate::opencoder::varint_only_decode(&trb._snapshot_data, snap, 2);
-                        let n = if arr == 0 {
-                            0
-                        } else {
-                            crate::opencoder::varint_only_decode(
-                                &trb._snapshot_array_data,
-                                arr as usize,
-                                0,
-                            )
-                        };
-                        (snap, arr, n)
-                    })
-                    .collect();
-                eprintln!(
-                    "P92_NUMB_HEADERS resume_pos={resume_pos} headers={headers:?} \
-                     arrs={arrs:?} vable_len={vable_len} vref_len={vref_len}"
-                );
-                crate::opencoder::p92_dump_enc_log();
-            }
-        }
         memo.number_from_snapshot_iter(
             &it,
             |tagged| snapshot_box_from_tagged(tagged, inputargs, value_slots, trb, unique_cache),
@@ -813,17 +777,6 @@ impl Trace {
     /// structured `Snapshot`. Returns the `_snapshot_data` byte offset
     /// (`create_top_snapshot`); that offset is `rd_resume_position`.
     pub fn encode_captured_snapshot(&mut self, snapshot: &Snapshot) -> i32 {
-        if majit_gc::diag_p92_enabled() {
-            let hdrs: Vec<(u32, u32, usize)> = snapshot
-                .frames
-                .iter()
-                .map(|f| (f.jitcode_index, f.pc, f.boxes.len()))
-                .collect();
-            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-                eprintln!("P92_ENCODE_SNAP frames={hdrs:?}");
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
-        }
         // `create_top_snapshot` patches the last op's descr slot when that
         // op is the guard just recorded (`opencoder.py` `_pos -= 2`).
         // A later non-guard must not be rewritten as if it were the

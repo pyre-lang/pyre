@@ -4045,14 +4045,6 @@ impl ResumeDataLoopMemo {
         }
 
         // resume.py number: patch total size
-        if majit_gc::diag_p92_enabled() && frames.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-            let cur = &numb_state.writer.current;
-            let n = cur.len();
-            let last = &cur[n.saturating_sub(8)..];
-            eprintln!(
-                "P92_NUMB_PATCH len={n} last={last:?} frames={frames:?} vable_len={vable_len} vref_len={vref_len}"
-            );
-        }
         numb_state.patch_current_size(0);
         Ok(numb_state)
     }
@@ -4192,16 +4184,6 @@ impl ResumeDataLoopMemo {
         } else {
             let (jitcode_index, pc) = frame_pcs.first().copied().unwrap_or((0, 0));
             frames.push((jitcode_index, pc, snapshot_boxes));
-        }
-        if majit_gc::diag_p92_enabled() {
-            let hdrs: Vec<(i32, i32, usize)> = frames
-                .iter()
-                .map(|(jc, pc, boxes)| (*jc, *pc, boxes.len()))
-                .collect();
-            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-                eprintln!("P92_FROM_PARTS frames={hdrs:?}");
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
         }
         self.number_slices(
             vable_array,
@@ -4445,14 +4427,6 @@ impl ResumeDataLoopMemo {
             env,
             optimizer_knowledge,
         )?;
-        if majit_gc::diag_p92_enabled() && numb_state.writer.current.first() == Some(&36) {
-            let cur = &numb_state.writer.current;
-            eprintln!(
-                "P92_NUMB_FINISH len={} slot0={}",
-                cur.len(),
-                cur.first().copied().unwrap_or(-1)
-            );
-        }
 
         // resume.py:450-451: storage.rd_numb, storage.rd_consts
         let rd_numb = numb_state.create_numbering_arc();
@@ -8156,13 +8130,6 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
         let size = self.resumecodereader.next_item_bound();
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_VREF size={size} vrefinfo={} items_read={}",
-                vrefinfo.is_some(),
-                self.resumecodereader.items_read
-            );
-        }
         // resume.py:1390-1391
         if vrefinfo.is_none() || size == 0 {
             // resume.py:1391: assert size == 0
@@ -8211,15 +8178,6 @@ impl<'a> ResumeDataDirectReader<'a> {
         vinfo.push_resume_ref_roots(self.virtualizable_ptr);
         // resume.py: assert vinfo.get_total_size(virtualizable) == vable_size - 1
         let expected = vinfo.get_total_size(self.virtualizable_ptr) as i32;
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_VABLE consume_vable_info vable_size={vable_size} expected={expected} \
-                 virtualizable={:#x} live={:#x} items_read={}",
-                virtualizable as usize,
-                self.virtualizable_ptr as usize,
-                self.resumecodereader.items_read,
-            );
-        }
         assert!(
             expected == vable_size - 1,
             "consume_vable_info: vinfo.get_total_size(0x{:x}) = {} != vable_size - 1 = {}",
@@ -8229,12 +8187,6 @@ impl<'a> ResumeDataDirectReader<'a> {
         );
         vinfo.reset_token_gcref(self.virtualizable_ptr);
         vinfo.write_from_resume_data_partial(self.virtualizable_ptr, self);
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_VABLE after write_from_resume_data_partial items_read={}",
-                self.resumecodereader.items_read
-            );
-        }
     }
 
     /// resume.py consume_vref_and_vable
@@ -8246,39 +8198,15 @@ impl<'a> ResumeDataDirectReader<'a> {
     ) {
         // resume.py:1425
         let vable_size = self.resumecodereader.next_item_bound();
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_VABLE start vable_size={vable_size} items_read={} cur_pos={} \
-                 vinfo={} vrefinfo={} ginfo={} after_gnf={}",
-                self.resumecodereader.items_read,
-                self.resumecodereader.cur_pos,
-                vinfo.is_some(),
-                vrefinfo.is_some(),
-                ginfo.is_some(),
-                self.resume_after_guard_not_forced,
-            );
-        }
 
         if self.resume_after_guard_not_forced != 2 {
             // resume.py:1427-1428
             if let Some(vi) = vinfo {
                 self.consume_vable_info(vi, vable_size);
-            } else if majit_gc::diag_p92_trace_io() && vable_size != 0 {
-                eprintln!(
-                    "P92_VABLE skipped consume_vable_info vable_size={vable_size} \
-                     items_read={}",
-                    self.resumecodereader.items_read
-                );
             }
             // resume.py:1429-1430
             if ginfo.is_some() {
                 let _ginfo_item = self.resumecodereader.next_item_bound();
-                if majit_gc::diag_p92_trace_io() {
-                    eprintln!(
-                        "P92_VABLE ginfo_item={} items_read={}",
-                        _ginfo_item, self.resumecodereader.items_read
-                    );
-                }
             }
             // resume.py:1431
             self.consume_virtualref_info(vrefinfo);
@@ -8287,21 +8215,6 @@ impl<'a> ResumeDataDirectReader<'a> {
             self.resumecodereader.jump(vable_size as usize);
             let vref_size = self.resumecodereader.next_item_bound();
             self.resumecodereader.jump(vref_size as usize * 2);
-            if majit_gc::diag_p92_trace_io() {
-                eprintln!(
-                    "P92_VABLE jump-path vable_size={vable_size} vref_size={vref_size} \
-                     items_read={}",
-                    self.resumecodereader.items_read
-                );
-            }
-        }
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_VABLE end items_read={} cur_pos={} virtualizable_ptr={:#x}",
-                self.resumecodereader.items_read,
-                self.resumecodereader.cur_pos,
-                self.virtualizable_ptr as usize,
-            );
         }
     }
 
@@ -9460,27 +9373,6 @@ where
     let _cc_guard = crate::CriticalCodeGuard::enter();
     // resume.py:1317-1321
     let resuming_after_guard_not_forced = all_virtuals.is_some();
-    if majit_gc::diag_p92_enabled()
-        && let Some(numb) = numb_root
-    {
-        let live = numb.as_slice();
-        if rd_numb.as_ptr() != live.as_ptr() || rd_numb.len() != live.len() {
-            let n_slice = rd_numb.len().min(16);
-            let n_live = live.len().min(16);
-            panic!(
-                "STALE_NUMBERING site=blackhole_from_resumedata_entry \
-                 slice_ptr={:#x} slice_len={} live_ptr={:#x} live_len={} \
-                 payload={:#x} slice_first={:02x?} live_first={:02x?}",
-                rd_numb.as_ptr() as usize,
-                rd_numb.len(),
-                live.as_ptr() as usize,
-                live.len(),
-                numb.payload_addr(),
-                &rd_numb[..n_slice],
-                &live[..n_live]
-            );
-        }
-    }
     let mut resumereader = ResumeDataDirectReader::new(
         rd_numb,
         rd_consts,
@@ -9489,31 +9381,6 @@ where
         all_virtuals,
         allocator,
     );
-    if majit_gc::diag_p92_enabled()
-        && let Some(numb) = numb_root
-    {
-        let live = numb.as_slice();
-        if rd_numb.as_ptr() != live.as_ptr() || rd_numb.len() != live.len() {
-            let n_slice = rd_numb.len().min(16);
-            let n_live = live.len().min(16);
-            panic!(
-                "STALE_NUMBERING site=after_reader_new \
-                 slice_ptr={:#x} slice_len={} live_ptr={:#x} live_len={} \
-                 payload={:#x} items_resume={} count={} cur_pos={} \
-                 slice_first={:02x?} live_first={:02x?}",
-                rd_numb.as_ptr() as usize,
-                rd_numb.len(),
-                live.as_ptr() as usize,
-                live.len(),
-                numb.payload_addr(),
-                resumereader.items_resume_section,
-                resumereader.count,
-                resumereader.resumecodereader.cur_pos,
-                &rd_numb[..n_slice],
-                &live[..n_live]
-            );
-        }
-    }
     if let Some(numb) = numb_root {
         resumereader.resumecodereader.bind_numbering(numb);
     }
@@ -9591,12 +9458,6 @@ where
 
         // resume.py:1338-1340
         let (jitcode_pos, pc) = resumereader.read_jitcode_pos_pc();
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_FRAME header jitcode_pos={jitcode_pos} pc={pc} items_read={} cur_pos={}",
-                resumereader.resumecodereader.items_read, resumereader.resumecodereader.cur_pos,
-            );
-        }
         // resume.py:1339-1340: jitcode = jitcodes[jitcode_pos]; curbh.setposition(jitcode, pc).
         let resolved = resolve_jitcode(jitcode_pos, pc).unwrap_or_else(|| {
             if let Some(numb) = numb_root {
@@ -9638,16 +9499,6 @@ where
 
         // resume.py:1341
         resumereader.consume_one_section(&mut nextbh, vinfo);
-        if majit_gc::diag_p92_trace_io() {
-            eprintln!(
-                "P92_FRAME after_section jitcode_pos={jitcode_pos} pc={pc} items_read={} \
-                 regs_i={} regs_r={} regs_f={}",
-                resumereader.resumecodereader.items_read,
-                nextbh.registers_i.len(),
-                nextbh.registers_r.len(),
-                nextbh.registers_f.len(),
-            );
-        }
 
         // `blackhole_from_resumedata` always calls `handle_rvmprof_enter`.
         // The helper already no-ops when the opcode is not `op_rvmprof_code`.

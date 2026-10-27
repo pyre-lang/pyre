@@ -35,6 +35,14 @@ pub mod regex;
 pub mod rstr;
 pub mod shortcircuit;
 
+/// The collector, its const-pointer table, the mutator registry and both
+/// portals' counters are process-wide, and libtest runs tests on parallel
+/// threads. Every test that enters either portal, builds a `Matcher` or
+/// registers a mutator holds this one lock, so the `jit_interp` and
+/// `shortcircuit` tests never overlap.
+#[cfg(test)]
+pub(crate) static PORTAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(feature = "alloc-census")]
 #[global_allocator]
 static ALLOC: majit_gc::HostNurseryClock<alloc_census::Counting> =

@@ -6612,6 +6612,59 @@ mod tests {
     }
 
     #[test]
+    fn test_default_pipeline_lazy_setfield_flushed_before_call_loopinvariant() {
+        // rewrite.py optimize_CALL_LOOPINVARIANT_I: the first occurrence is
+        // rewritten to CALL_* and `self.emit(op)` continues into OptHeap,
+        // whose `emitting_operation` flushes the lazy setfield first.
+        let fd = field_descr(13);
+        let call_descr = crate::call_descr::make_call_descr_with_effect(
+            &[Type::Int],
+            Type::Ref,
+            majit_ir::EffectInfo::MOST_GENERAL,
+        );
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    crate::history::test_support::rooted_inputarg_operand(Type::Ref, 0),
+                    crate::history::test_support::rooted_inputarg_operand(Type::Int, 100),
+                ],
+                fd,
+            ),
+            Op::with_descr(
+                OpCode::CallLoopinvariantR,
+                &[
+                    crate::history::test_support::rooted_inputarg_operand(Type::Int, 200),
+                    crate::history::test_support::rooted_inputarg_operand(Type::Int, 100),
+                ],
+                call_descr,
+            ),
+            Op::new(
+                OpCode::Finish,
+                &[crate::history::test_support::rooted_inputarg_operand(
+                    Type::Int,
+                    2,
+                )],
+            ),
+        ];
+        assign_positions(&mut ops);
+        let result = run_default_pipeline_typed(&ops, &[2, 100, 200], &[]);
+        let setfield_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("SETFIELD_GC must survive");
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CallR)
+            .expect("CALL_LOOPINVARIANT_R must become CALL_R");
+        assert!(
+            setfield_pos < call_pos,
+            "SETFIELD_GC must flush before the rewritten loop-invariant call; got {:?}",
+            result.iter().map(|op| op.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_default_pipeline_escaping_call_arg_flushes_materialization_store() {
         let sd = size_descr(3);
         let fd = field_descr(12);

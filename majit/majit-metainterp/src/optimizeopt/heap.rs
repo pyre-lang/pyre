@@ -1455,41 +1455,6 @@ impl OptHeap {
         }
     }
 
-    /// heap.py `emitting_operation`'s guard case, run at heap's OWN
-    /// `emit()` point (heap.py, which precedes `emit_postponed_op()` on
-    /// heap.py) instead of at the deferred `emitting_operation` callback
-    /// that `Optimizer::emit_operation` fires at final emission.
-    ///
-    /// The order matters for every guard that arrives with a postponed op
-    /// pending: GUARD_NOT_FORCED after its CALL_MAY_FORCE, GUARD_[NO_]OVERFLOW
-    /// after its INT_*_OVF, GUARD_TRUE / GUARD_FALSE after the comparison they
-    /// test. A lazy SETFIELD_GC forced late lands between the pair, and the
-    /// backend reads the second of the two out of the first
-    /// (`aarch64/assembler.py:1187-1193`).
-    ///
-    /// The virtual-valued sets `force_lazy_sets_for_guard` hands back are put
-    /// straight back into the caches, so the later `emitting_operation` call
-    /// re-collects them into `ctx.pending_for_guard` and the guard's
-    /// `rd_pendingfields` is unchanged.
-    fn force_lazy_sets_for_guard_early(&mut self, ctx: &mut OptContext) {
-        let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, ctx);
-        for pending_op in pending_virtual {
-            let descr = pending_op.getdescr().unwrap();
-            if pending_op.opcode == OpCode::SetarrayitemGc {
-                // A non-constant index has no `arrayitem_cache` slot to hold
-                // it, so it cannot be re-collected — emit it here.
-                match ctx.get_constant_int_box(&pending_op.arg(1).get_box_replacement(false)) {
-                    Some(index) => self.arrayitem_cache(&descr, index).lazy_set = Some(pending_op),
-                    None => {
-                        ctx.emit((*pending_op).clone());
-                    }
-                }
-            } else {
-                self.field_cache(&descr).lazy_set = Some(pending_op);
-            }
-        }
-    }
-
     /// heap.py force_lazy_sets_for_guard()
     ///
     /// Returns pendingfields: SetfieldGc/SetarrayitemGc ops where the stored
@@ -3218,8 +3183,8 @@ impl OptHeap {
     /// Consulted at TWO sites here against upstream's one.  Upstream reaches the
     /// list only from `emitting_operation`, via `OptHeap.emit` and
     /// `dispatch_opt`'s `default=OptHeap.emit` (`heap.py`).  Here
-    /// `emitting_operation` is a whole-optimizer callback that fires at final
-    /// emission, after this pass has already dispatched — `propagate_forward`
+    /// `emitting_operation` runs at heap's emit point after `dispatch_propagate`
+    /// has already dispatched — `propagate_forward`
     /// dispatches on its first line — so without the `handle_side_effects`
     /// consultation an exempt opcode would clean the caches on the way in and
     /// the later callback would then spare caches that were already gone.  The
@@ -3646,6 +3611,58 @@ impl OptHeap {
             _ => self.handle_side_effects(op, op_rc, ctx),
         }
     }
+
+    /// heap.py `OptHeap.emitting_operation(op)`, called from heap's emit point
+    /// (`propagate_forward`, heap.py `OptHeap.emit`) for every op this pass
+    /// hands downstream.
+    fn emitting_operation(&mut self, op: &Op, ctx: &mut OptContext) {
+        // heap.py: emitting_operation(op)
+
+        // RPython early returns for side-effect-free operations:
+        if op.opcode.has_no_side_effect() {
+            return;
+        }
+        if op.opcode.is_ovf() {
+            return;
+        }
+        // heap.py: guards → force lazy sets for guard
+        if op.opcode.is_guard() {
+            let pending_virtual = self.force_lazy_sets_for_guard(ctx.current_pass_idx, ctx);
+            // heap.py `self.optimizer.pendingfields = self.force_lazy_sets_for_guard()`
+            ctx.pending_for_guard = pending_virtual
+                .into_iter()
+                .map(|op| (*op).clone())
+                .collect();
+            return;
+        }
+        if Self::has_no_heap_cache_effect(op.opcode) {
+            return;
+        }
+        // heap.py: calls → handle effects
+        if op.opcode.is_call() {
+            if op.opcode.is_call_assembler() {
+                self.seen_guard_not_invalidated = false;
+            } else {
+                if Self::call_can_invalidate(op) {
+                    self.seen_guard_not_invalidated = false;
+                }
+                if !op.has_descr() {
+                    // RPython: all calls have descriptors. Conservative
+                    // fallback for pyre calls that lack an EffectInfo.
+                    self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+                    self.clean_caches(ctx);
+                    return;
+                }
+                if !Self::call_has_random_effects(op) {
+                    self.force_from_effectinfo(op, ctx);
+                    return;
+                }
+            }
+        }
+        // heap.py: everything else → force all lazy sets + clean caches
+        self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
+        self.clean_caches(ctx);
+    }
 }
 
 impl Default for OptHeap {
@@ -3684,25 +3701,16 @@ impl Optimization for OptHeap {
                 | OptimizationResult::Restart(_)
         );
         if downstreamed {
-            // heap.py `emitting_operation(op)`, whose guard case is
-            // heap.py: ONE `rop.is_guard(op.opnum)` test covering every
-            // guard opcode, running `force_lazy_sets_for_guard`.
-            //
-            // This is about ORDER, not coverage. The force already ran for every
-            // guard — `Optimizer::emit_operation` fires `emitting_operation` for
-            // all passes at final emission — but it ran too LATE, after the
-            // postponed op had been released. Running it here, at heap's own
-            // emit point, puts the forced SETFIELD_GC in FRONT of the op
-            // released on the next line instead of between that op and its
-            // guard. Both consumers want the adjacency: an `INT_*_OVF`
-            // publishes its answer in the condition flags, and there is nothing
-            // to re-test if it is lost (`aarch64/assembler.py:1191-1193`
-            // asserts it); a comparison is merely fused into its guard by
-            // `next_op_can_accept_cc` (`aarch64/assembler.py`) and
-            // falls back to materialise-and-re-test when it is not, so for that
-            // one the cost is an extra `tst`, not a wrong answer.
-            if op.opcode.is_guard() {
-                self.force_lazy_sets_for_guard_early(ctx);
+            // heap.py `emit()`: `self.emitting_operation(op)` first, so the
+            // lazy sets it forces land ahead of the postponed op released
+            // below. A Restart hands a new op back to the first pass; that op
+            // reaches this point itself.
+            match &result {
+                OptimizationResult::Emit(emitted) | OptimizationResult::Replace(emitted) => {
+                    self.emitting_operation(emitted, ctx)
+                }
+                OptimizationResult::PassOn => self.emitting_operation(op, ctx),
+                _ => {}
             }
             // heap.py `emit_postponed_op()`.
             if let Some(postponed) = self.postponed_op.take() {
@@ -3785,72 +3793,6 @@ impl Optimization for OptHeap {
         if let Some(postponed) = self.postponed_op.take() {
             ctx.emit_extra(ctx.current_pass_idx, postponed);
         }
-    }
-
-    /// RPython heap.py: emitting_operation(op)
-    /// Called for EVERY op about to be emitted, regardless of which pass emits it.
-    /// This is how the heap optimizer forces lazy sets before guards even when
-    /// the guard was emitted by an earlier pass (e.g., IntBounds).
-    fn emitting_operation(&mut self, op: &Op, ctx: &mut OptContext, self_pass_idx: usize) {
-        // heap.py: emitting_operation(op)
-        //
-        // RPython calls emitting_operation in heap pass context.
-        // Save/restore current_pass_idx so internal methods
-        // (force_from_effectinfo, etc.) use the correct heap index.
-        let saved_pass_idx = ctx.current_pass_idx;
-        ctx.current_pass_idx = self_pass_idx;
-
-        // RPython early returns for side-effect-free operations:
-        if op.opcode.has_no_side_effect() {
-            ctx.current_pass_idx = saved_pass_idx;
-            return;
-        }
-        if op.opcode.is_ovf() {
-            ctx.current_pass_idx = saved_pass_idx;
-            return;
-        }
-        // heap.py:432-434: guards → force lazy sets for guard
-        if op.opcode.is_guard() {
-            let pending_virtual = self.force_lazy_sets_for_guard(self_pass_idx, ctx);
-            // heap.py:433: self.optimizer.pendingfields = pendingfields
-            ctx.pending_for_guard = pending_virtual
-                .into_iter()
-                .map(|op| (*op).clone())
-                .collect();
-            ctx.current_pass_idx = saved_pass_idx;
-            return;
-        }
-        if Self::has_no_heap_cache_effect(op.opcode) {
-            ctx.current_pass_idx = saved_pass_idx;
-            return;
-        }
-        // heap.py:453-463: calls → handle effects
-        if op.opcode.is_call() {
-            if op.opcode.is_call_assembler() {
-                self.seen_guard_not_invalidated = false;
-            } else {
-                if Self::call_can_invalidate(op) {
-                    self.seen_guard_not_invalidated = false;
-                }
-                if !op.has_descr() {
-                    // RPython: all calls have descriptors. Conservative
-                    // fallback for pyre calls that lack an EffectInfo.
-                    self.force_all_lazy_sets(self_pass_idx, ctx);
-                    self.clean_caches(ctx);
-                    ctx.current_pass_idx = saved_pass_idx;
-                    return;
-                }
-                if !Self::call_has_random_effects(op) {
-                    self.force_from_effectinfo(op, ctx);
-                    ctx.current_pass_idx = saved_pass_idx;
-                    return;
-                }
-            }
-        }
-        // heap.py:464: everything else → force all lazy sets + clean caches
-        self.force_all_lazy_sets(self_pass_idx, ctx);
-        self.clean_caches(ctx);
-        ctx.current_pass_idx = saved_pass_idx;
     }
 
     /// heap.py OptHeap.produce_potential_short_preamble_ops(sb)

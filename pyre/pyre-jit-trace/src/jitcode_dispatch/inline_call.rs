@@ -2941,17 +2941,6 @@ pub(crate) fn collect_callee_active_boxes(
             "float",
         )?);
     }
-    if majit_gc::diag_p92_enabled() && carried_jitcode_pc == 836 && active.len() != 4 {
-        eprintln!(
-            "P92_CALLEE_BOXES jc={callee_jitcode_index} op_pc={callee_op_pc} \
-             carried={carried_jitcode_pc} n={} i={} r={} f={}",
-            active.len(),
-            banks.int.len(),
-            banks.ref_.len(),
-            banks.float.len()
-        );
-        eprintln!("{}", std::backtrace::Backtrace::force_capture());
-    }
     Ok(active)
 }
 

@@ -306,36 +306,6 @@ pub fn encode_varint_signed_array(value: i64) -> ([u8; 4], usize) {
     (out, 4)
 }
 
-/// Silent encode log for P92: I/O at `_encode_snapshot` Heisenbugs the 6-box numbering.
-static P92_ENC_LOG: std::sync::Mutex<Vec<(i64, i64, i64, i64, bool, usize, usize)>> =
-    std::sync::Mutex::new(Vec::new());
-
-fn p92_note_enc(
-    jc: i64,
-    pc: i64,
-    array: i64,
-    n: i64,
-    is_last: bool,
-    snap_len: usize,
-    arr_len: usize,
-) {
-    if let Ok(mut log) = P92_ENC_LOG.lock() {
-        log.push((jc, pc, array, n, is_last, snap_len, arr_len));
-    }
-}
-
-pub(crate) fn p92_dump_enc_log() {
-    if let Ok(log) = P92_ENC_LOG.lock() {
-        let n6: Vec<_> = log.iter().filter(|r| r.3 != 4).cloned().collect();
-        eprintln!(
-            "P92_ENC_LOG total={} n_ne_4={} last8={:?} ne4={n6:?}",
-            log.len(),
-            n6.len(),
-            log.iter().rev().take(8).collect::<Vec<_>>()
-        );
-    }
-}
-
 /// opencoder.py encode_varint_signed.
 pub fn encode_varint_signed(buf: &mut Vec<u8>, value: i64) {
     debug_assert!(
@@ -1258,7 +1228,6 @@ impl<'a> ByteTraceIter<'a> {
                 // op-graph walker forwards `OpRef::ConstPtr(GcRef)`
                 // slots across minor collection.
                 let addr = self.trace._refs[v as usize];
-                majit_gc::diag_stale_gcref(addr as usize, "byte_iter_untag");
                 Operand::from_opref(OpRef::const_ptr(majit_ir::GcRef(addr as usize)))
             }
             TAGCONSTOTHER => {
@@ -2530,22 +2499,6 @@ impl Trace {
         array: i64,
         is_last: bool,
     ) -> i64 {
-        if majit_gc::diag_p92_enabled() && pc == 836 {
-            let n = if array == 0 {
-                0
-            } else {
-                varint_only_decode(&self._snapshot_array_data, array as usize, 0)
-            };
-            p92_note_enc(
-                index,
-                pc,
-                array,
-                n,
-                is_last,
-                self._snapshot_data.len(),
-                self._snapshot_array_data.len(),
-            );
-        }
         let res = self._snapshot_data.len() as i64;
         self.append_snapshot_data_int(index);
         self.append_snapshot_data_int(pc);

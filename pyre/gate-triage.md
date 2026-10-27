@@ -101,8 +101,7 @@ Kept as-is; listed for completeness.
   `_GIN`, `_INLINE_RECOG`, `PYRE_WASM_DUMP_ALL_TRACES`, `_DUMP_BAD_TRACE`,
   `_EXEC_TRACE`, `_JIT_STATS`, `PYRE_INTERP_RETURN_LOG`, `MAJIT_NBODY_DEBUG`,
   `PYRE_DEBUG_CALL`, `PYRE_DEBUG_CLASS`, `PYRE_DESCR_DEMAND`,
-  `PYRE_CENSUS_HISTOGRAM`, `PYRE_REGEX_LENGTHS`, `PYRE_REGEX_ROWS`,
-  `PYRE_DIAG_P92`.
+  `PYRE_CENSUS_HISTOGRAM`, `PYRE_REGEX_LENGTHS`, `PYRE_REGEX_ROWS`.
   `PYRE_DESCR_DEMAND` records the distinct dense descriptor indices a run
   actually resolves, so the per-index pool loader can be measured against the
   pool size; the resolve path reads it through a `OnceLock` and pays nothing
@@ -412,7 +411,6 @@ under measurement.
 | `PYRE_GC_GATE_BASE` | VALUE | names the upstream commit `scripts/check-gc-root-brackets.py` measured its numbers over, so a backlog raised by code the baseline never saw is reported rather than charged to the branch; the workflow supplies it because a CI checkout is shallow, holds no `main` ref and has its merge commit's parent list truncated away, leaving nothing in the repository able to answer; retire when the gate's job checks out enough history for `git merge-base` to name the base itself |
 | `PYRE_EXIT_FRAME_DIAG` | OFF | prints one line per `exit_frame_with_exception` delivery to a frame's own exception table, naming the site and the verdict `exit_frame_handler_needs_unwritten_stack` reached there, passes included so a refusal is a share of something; retire when the handler search moves inside the trace and the two delivery sites become one |
 | `PYRE_GC_STRESS_CHILD` | OFF | the gc_stress harness's per-test child-process marker (`pyre/pyre-jit/tests/gc_stress.rs`): unset, the parent re-execs that test; set, this process is the child and runs the case on its worker thread. Not a product switch |
-| `PYRE_DIAG_P92` | OFF | classifies a GC word at intern / ConstPtr construction / recorder decode and panics at the first stale address; `resumecode` records NUMBERING payload bytes at creation and panics if a later read was not forwarded; retire when intern identity across a move is covered by ordinary tests |
 
 ## Summary
 

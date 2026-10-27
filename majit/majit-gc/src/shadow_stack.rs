@@ -1101,9 +1101,6 @@ pub fn get(index: usize) -> GcRef {
 
 /// Acquire a fixed translated-livevar root slot.
 pub fn acquire_owner_root(root: GcRef) -> usize {
-    if crate::diag_p92_enabled() && !root.is_null() {
-        crate::diag_stale_gcref(root.0, "acquire_owner_root");
-    }
     OWNER_ROOTS.with(|roots| {
         let mut roots = roots.borrow_mut();
         let reused = OWNER_ROOTS_FREE.with(|free| free.borrow_mut().pop());
@@ -1514,7 +1511,7 @@ pub fn depth() -> usize {
     SHADOW_STACK.with(|ss| ss.len())
 }
 
-/// P92 diagnostic: name whether `slot_addr` sits in the GcRef shadow stack
+/// Collector corruption report: name whether `slot_addr` sits in the GcRef shadow stack
 /// buffer or in `OWNER_ROOTS`. Both walks share `extra_area=shadow_stack`.
 pub fn describe_root_slot(slot_addr: usize) -> String {
     let ss = SHADOW_STACK.with(|ss| {

@@ -5635,56 +5635,6 @@ impl MiniMarkGC {
         }
     }
 
-    /// P92 intern/ConstPtr diagnostic. Panics at the first stale GC word.
-    pub(crate) fn diag_stale_gcref(&self, addr: usize, site: &'static str) {
-        let owns = self.is_managed_heap_object(addr);
-        let nursery = self.is_in_nursery(addr);
-        let retired = self.nursery.contains_retired(addr);
-        if !owns && !nursery && !retired {
-            return;
-        }
-        let mut forwarded = false;
-        let mut type_id = 0u32;
-        let mut header_valid = false;
-        let mut chased = 0usize;
-        let mut object_start = false;
-        if nursery {
-            object_start = self.is_nursery_object_start(addr);
-        } else if owns {
-            object_start = true;
-        }
-        let mut past_free = false;
-        if object_start {
-            let hdr = unsafe { *header_of(addr) };
-            forwarded = hdr.is_forwarded();
-            type_id = hdr.type_id();
-            header_valid = !forwarded && (type_id as usize) < self.types.len();
-            if forwarded {
-                chased = unsafe { GcHeader::forwarding_address(header_of(addr)) };
-            }
-            if nursery {
-                let free = self.nursery.free_ptr() as usize;
-                past_free = addr >= free && !hdr.has_flag(GcFlags::GCFLAG_PINNED);
-            }
-        }
-        let stale = forwarded
-            || retired
-            || past_free
-            || (nursery && !object_start)
-            || (nursery && !header_valid);
-        if !stale {
-            return;
-        }
-        let backtrace = std::backtrace::Backtrace::force_capture();
-        panic!(
-            "STALE_GCREF site={site} addr={addr:#x} owns={owns} nursery={nursery} \
-             object_start={object_start} forwarded={forwarded} retired={retired} \
-             type_id={type_id} header_valid={header_valid} chased={chased:#x} \
-             minors={} majors={}\n{backtrace}",
-            self.minor_collections, self.major_collections
-        );
-    }
-
     /// `get_possibly_forwarded_type_id`: follow a nursery corpse before
     /// reading its size. `set_forwarding_address` writes the live address
     /// at payload offset 0, which is `length_offset` for a varsize type

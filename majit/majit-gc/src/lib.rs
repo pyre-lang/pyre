@@ -13,59 +13,10 @@ pub use header::{
 /// Idempotent: `register_extra_root_walker` dedups by function address.
 pub fn install_const_ptr_table_walker() {
     shadow_stack::register_extra_root_walker(const_ptr_table_walker, "const_ptr_table");
-    // `gcref_diag` is a P92 intern/ConstPtr hook. Upstream has no such
-    // diagnostic: `history.py` `ConstPtr.getref_base` is a field read.
-    // `diag_stale_gcref` returns immediately unless `diag_p92_trace_io`
-    // is on, so installing it unconditionally was an acquire load plus
-    // an indirect call on every intern. Install only when the knob is on.
-    if diag_p92_enabled() {
-        majit_ir::set_gcref_diag(Some(diag_stale_gcref));
-    }
     majit_ir::set_gc_current_object_address(Some(gc_current_object_address));
 }
 
 fn const_ptr_table_walker(_visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {}
-
-/// Temporary P92 diagnostic. `PYRE_DIAG_P92` classifies a GC word at intern /
-/// ConstPtr construction / recorder decode: nursery, forwarded, header valid.
-/// Panics with a backtrace at the first stale address. Remove after the fix.
-///
-/// 0 uninit, 1 absent, 2 present. Same load as `have_debug_prints` /
-/// `OP_HAVE_DEBUG_PRINTS` (`pypy_have_debug_prints & 1`). Upstream has
-/// no such knob, so the off path is one relaxed load.
-static DIAG_P92: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-
-#[inline(always)]
-pub fn diag_p92_enabled() -> bool {
-    match DIAG_P92.load(std::sync::atomic::Ordering::Relaxed) {
-        1 => false,
-        2 => true,
-        _ => diag_p92_enabled_init(),
-    }
-}
-
-#[cold]
-#[inline(never)]
-fn diag_p92_enabled_init() -> bool {
-    let on = std::env::var_os("PYRE_DIAG_P92").is_some();
-    DIAG_P92.store(if on { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
-    on
-}
-
-/// Blackhole/intern eprints. Off: those I/O paths Heisenbug the 6-box numbering.
-pub fn diag_p92_trace_io() -> bool {
-    false
-}
-
-pub fn diag_stale_gcref(addr: usize, site: &'static str) {
-    if !diag_p92_trace_io() || addr == 0 {
-        return;
-    }
-    if !gc_sync::is_initialized() {
-        return;
-    }
-    gc_sync::gc_query_reentrant(|gc| gc.diag_stale_gcref(addr, site));
-}
 
 /// GC traits and interfaces for the JIT.
 ///

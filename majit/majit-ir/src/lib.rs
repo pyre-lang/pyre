@@ -72,8 +72,7 @@ pub use value::{
     GreenSlotRef, GreenSlotStr, GreenSlotUnicode, GreenSpec, GreenType, InputArg, InputArgRc,
     JitDriverVar, RefCurrentFn, RefReleaseFn, RefRetainFn, RetainedGreens, SharedConstPool,
     StrEqFn, StrHashFn, Type, Value, VarKind, equal_whatever, gc_current_object_address,
-    gc_id_or_identityhash, gcref_diag, green_slot_of, green_type_to_ir, green_uhash_step,
-    make_str_slot, pypyjit_greenkey, pypyjit_greenkey_uhash, set_gc_current_object_address,
-    set_gc_id_or_identityhash, set_gcref_diag, set_ref_resolver, set_str_resolver,
-    set_unicode_resolver,
+    gc_id_or_identityhash, green_slot_of, green_type_to_ir, green_uhash_step, make_str_slot,
+    pypyjit_greenkey, pypyjit_greenkey_uhash, set_gc_current_object_address,
+    set_gc_id_or_identityhash, set_ref_resolver, set_str_resolver, set_unicode_resolver,
 };

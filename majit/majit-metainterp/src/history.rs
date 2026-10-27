@@ -2791,13 +2791,6 @@ impl TraceCtx {
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
-        if majit_gc::diag_p92_enabled() && pc == 836 && active_boxes.len() != 4 {
-            eprintln!(
-                "P92_SF_CAPTURE jc={jitcode_index} pc={pc} n={}",
-                active_boxes.len()
-            );
-            eprintln!("{}", std::backtrace::Backtrace::force_capture());
-        }
         // The pc word is a raw JitCode offset.
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
@@ -2888,16 +2881,6 @@ impl TraceCtx {
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
-        if majit_gc::diag_p92_enabled() {
-            let hdrs: Vec<(u32, u32, usize)> = frames
-                .iter()
-                .map(|(jc, pc, _, boxes)| (*jc, *pc, boxes.len()))
-                .collect();
-            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-                eprintln!("P92_MF_CAPTURE frames={hdrs:?}");
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
-        }
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
             .map(|(jitcode_index, pc, _py_pc, boxes)| {
@@ -2934,16 +2917,6 @@ impl TraceCtx {
         vref_boxes: &[crate::recorder::SnapshotTagged],
         from_end: usize,
     ) {
-        if majit_gc::diag_p92_enabled() {
-            let hdrs: Vec<(u32, u32, usize)> = frames
-                .iter()
-                .map(|(jc, pc, _, boxes)| (*jc, *pc, boxes.len()))
-                .collect();
-            if hdrs.iter().any(|&(_, pc, n)| pc == 836 && n != 4) {
-                eprintln!("P92_MF_CAPTURE_OP frames={hdrs:?} from_end={from_end}");
-                eprintln!("{}", std::backtrace::Backtrace::force_capture());
-            }
-        }
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
             .map(|(jitcode_index, pc, _py_pc, boxes)| {

@@ -302,9 +302,9 @@ mod tests {
 
     /// `COMPILES` / `LAST_BODY` are process-wide and libtest runs these in
     /// parallel, so EVERY test that enters the JIT takes this — not only the
-    /// ones that read the counters. A test that enters without it does not read
-    /// the numbers, but it does move them.
-    static PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// ones that read the counters. It is the crate's one portal lock, shared
+    /// with the `shortcircuit` tests, which enter this portal too.
+    use crate::PORTAL_TEST_LOCK as PROBE_LOCK;
 
     fn matches_locked(root: *mut NodeRec, s: &[u8], threshold: u32) -> bool {
         let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -419,6 +419,7 @@ mod tests {
     /// keep that address: the callback holds it until the guard drops.
     #[test]
     fn registered_driver_address_is_stable_across_a_move() {
+        let _guard = PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         struct RegisteredMutator;
         impl Drop for RegisteredMutator {
             fn drop(&mut self) {

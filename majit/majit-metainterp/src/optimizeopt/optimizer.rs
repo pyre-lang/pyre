@@ -223,17 +223,6 @@ pub trait Optimization {
     fn is_virtual(&self, _opref: OpRef) -> bool {
         false
     }
-
-    /// RPython optimizer.py: emitting_operation(op)
-    /// Called before any operation is emitted to the output, regardless of
-    /// which pass emits it. This enables passes like OptHeap to force lazy
-    /// sets before guards, even when the guard is emitted by an earlier pass.
-    ///
-    /// `self_pass_idx` is this pass's own index in the optimizer pipeline.
-    /// RPython uses `self.next_optimization` to route lazy-set emissions
-    /// starting AFTER the current pass. In majit, pass this index to
-    /// `emit_extra` to achieve the same behavior.
-    fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
 }
 
 /// optimizer.py `have_postprocess(cls)`.
@@ -5191,31 +5180,32 @@ impl Optimizer {
             self.drain_extra_operations_from(pass_idx + 1, ctx)?;
             match result {
                 OptimizationResult::Emit(op) => {
-                    // optimizer.py:576-581: collect postprocess for this pass
-                    // if it has postprocess for this opnum.
+                    // optimizer.py `send_extra_operation`: a pass's `emit(op)`
+                    // hands `opt_result.op` to `opt.next_optimization`; only
+                    // the final `Optimizer.emit` appends it (fall-through below).
+                    debug_assert!(
+                        !(current_op.opcode.is_guard()
+                            && op.opcode.is_guard()
+                            && current_op.rd_resume_position() >= 0
+                            && op.rd_resume_position() < 0),
+                        "Emit dropped rd_resume_position: {:?} -> {:?}",
+                        current_op.opcode,
+                        op.opcode,
+                    );
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    // heap.py optimize_SETFIELD_GC ends in emit(op) of the
-                    // same ResOperation. Reuse that Rc instead of cls().
-                    let emit_rc = if op.opcode == op_rc.opcode {
+                    if op.opcode == op_rc.opcode {
+                        // heap.py optimize_SETFIELD_GC ends in emit(op) of the
+                        // same ResOperation: stamp it onto the walked-in op so
+                        // the `!replaced` fall-through appends that one Rc.
                         OptContext::stamp_emitted_op(&op, op_rc);
-                        op_rc.clone()
                     } else {
-                        let created = OpRc::new(op.clone());
-                        // Opcode change mints a second object at this position.
-                        // `replace_op_with` links the walked-in op before emit.
-                        OptContext::link_replaced_producer(op_rc, &created);
-                        created
-                    };
-                    self.emit_operation_inner(emit_rc.clone(), ctx, false)?;
-                    // optimizer.py:585-589: invoke postprocess callbacks
-                    // in reverse order after emission.
-                    for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&op, &emit_rc, ctx);
+                        // An opcode change mints a second object at this
+                        // position; the fall-through mints and links it.
+                        replaced = true;
                     }
-                    self.drain_pending_finish_guard_postprocess(ctx);
-                    return Ok(());
+                    current_op = std::borrow::Cow::Owned(op);
                 }
                 OptimizationResult::Replace(op) => {
                     debug_assert!(
@@ -5368,25 +5358,7 @@ impl Optimizer {
         let saved_in_final_emission = ctx.in_final_emission;
         ctx.in_final_emission = true;
 
-        // RPython optimizer.py: emitting_operation callback — notify all passes
-        // before any op is emitted. This is how OptHeap forces lazy sets before
-        // guards even when the guard is emitted by an earlier pass.
-        for (idx, pass) in self.passes.iter_mut().enumerate() {
-            pass.emitting_operation(&op, ctx, idx);
-        }
-        // RPython emit_extra(op, emit=False) parity: drain operations
-        // queued by emitting_operation (e.g., heap's force_lazy_set)
-        // BEFORE the current op is emitted, preserving correct ordering.
-        {
-            let end_pass = self.extra_operation_end_pass();
-            while let Some((start, queued_op)) = ctx.extra_operations_after.pop_front() {
-                self.propagate_from_pass_range(start, end_pass, &queued_op, ctx)?;
-            }
-        }
-        // A pass `emitting_operation` / queued drain may have deferred an
-        // `InvalidLoop`; abort before emitting on inconsistent state. On the
-        // abort path the context is discarded, so `in_final_emission` need not
-        // be restored.
+        // A deferred `InvalidLoop` from the pass walk aborts before emission.
         if let Some(e) = ctx.take_invalid_loop() {
             return Err(e);
         }
