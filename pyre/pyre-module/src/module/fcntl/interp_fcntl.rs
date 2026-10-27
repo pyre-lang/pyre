@@ -131,14 +131,13 @@ pub fn __majit_wrap_fcntl_flock(
             "flock() requires 2 arguments",
         ));
     }
-    // `@unwrap_spec(op=int)`.
-    if !unsafe { pyre_object::is_int(args[1]) } {
-        return Err(pyre_interpreter::PyError::type_error(
-            "flock() arguments must be integers",
-        ));
-    }
-    let op = unsafe { pyre_object::w_int_get_value(args[1]) };
-    flock(args[0], op)
+    // `@unwrap_spec(op=int)` — `gateway_int_w` / `int_w`.
+    let mut w_fd = args[0];
+    let mut w_op = args[1];
+    let op = pyre_object::with_roots!(w_fd, w_op => {
+        pyre_interpreter::baseobjspace::gateway_int_w(w_op)
+    })?;
+    flock(w_fd, op)
 }
 
 pyre_interpreter::builtin_wrapper_descriptor!(
@@ -207,33 +206,40 @@ fn lockf(
                 "lockf() takes from 2 to 5 arguments",
             ));
         }
-        for &a in args.iter().take(5).skip(1) {
-            if !unsafe { pyre_object::is_int(a) } {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "lockf() arguments must be integers",
-                ));
-            }
-        }
         // `@unwrap_spec(op=int, length=int, start=int, whence=int)` unwraps
         // the integers before the body runs; the body then unwraps its
-        // descriptor through `space.c_filedescriptor_w`.
-        let cmd = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
-        let len = if args.len() >= 3 {
-            unsafe { pyre_object::w_int_get_value(args[2]) }
+        // descriptor through `space.c_filedescriptor_w`.  `int_w` can run
+        // `__index__`, so the slice is pinned first.
+        let nargs = args.len();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(args);
+        let cmd = pyre_interpreter::baseobjspace::gateway_int_w(
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+        )? as i32;
+        let len = if nargs >= 3 {
+            pyre_interpreter::baseobjspace::gateway_int_w(pyre_object::gc_roots::shadow_stack_get(
+                base + 2,
+            ))?
         } else {
             0
         };
-        let start = if args.len() >= 4 {
-            unsafe { pyre_object::w_int_get_value(args[3]) }
+        let start = if nargs >= 4 {
+            pyre_interpreter::baseobjspace::gateway_int_w(pyre_object::gc_roots::shadow_stack_get(
+                base + 3,
+            ))?
         } else {
             0
         };
-        let whence = if args.len() >= 5 {
-            unsafe { pyre_object::w_int_get_value(args[4]) as i32 }
+        let whence = if nargs >= 5 {
+            pyre_interpreter::baseobjspace::gateway_int_w(pyre_object::gc_roots::shadow_stack_get(
+                base + 4,
+            ))? as i32
         } else {
             0
         };
-        let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
+        let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(
+            pyre_object::gc_roots::shadow_stack_get(base),
+        )?;
         // `_flock` fields: `l_type` from `op == LOCK_UN` / `op & LOCK_SH` /
         // `op & LOCK_EX`, then `F_SETLK` when `op & LOCK_NB` else `F_SETLKW`.
         let l_type = if cmd == libc::LOCK_UN {
@@ -319,27 +325,39 @@ fn fcntl(
                 "fcntl() takes 2 or 3 arguments",
             ));
         }
-        if !unsafe { pyre_object::is_int(args[1]) } {
-            return Err(pyre_interpreter::PyError::type_error(
-                "fcntl() arguments must be integers",
-            ));
-        }
         // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
         // `space.c_filedescriptor_w`, so an open file answers for the
-        // number it wraps.
+        // number it wraps.  `@unwrap_spec(op=int)` is `gateway_int_w`.
         let w_fd = args[0];
         let mut w_cmd = args[1];
         let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         let fd = pyre_object::with_roots!(w_cmd, w_arg =>
             pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
         )?;
-        let cmd = (unsafe { pyre_object::w_int_get_value(w_cmd) }) as i32;
+        let cmd = pyre_object::with_roots!(w_cmd, w_arg => {
+            pyre_interpreter::baseobjspace::gateway_int_w(w_cmd)
+        })? as i32;
         // `interp_fcntl.py fcntl` tries the string-buffer path before
-        // falling back to the integer one and returns exactly the
-        // original buffer's length; `fcntl_fcntl_impl` takes its
-        // integer arm first, on `PyIndex_Check`.
+        // falling back to `space.int_w`; a TypeError from the buffer
+        // arm is the signal to take the integer one.
         if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
-            let data = arg_readbuf(w_arg, "fcntl")?;
+            let data = match arg_readbuf(w_arg, "fcntl") {
+                Ok(data) => data,
+                Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
+                    let arg = pyre_object::with_roots!(w_cmd, w_arg => {
+                        pyre_interpreter::baseobjspace::gateway_int_w(w_arg)
+                    })? as i32;
+                    loop {
+                        let rv = unsafe { ll::fcntl_int(fd, cmd, arg) };
+                        if rv < 0 {
+                            raise_error_maybe("fcntl")?;
+                        } else {
+                            return Ok(pyre_object::w_int_new(rv as i64));
+                        }
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             // `fcntl_fcntl_impl` stages a heap copy at the argument's
             // own length when it exceeds the 1024-byte floor.
             let src = majit_rlib::rffi::scoped_str2charp::new(Some(data)).map_err(|e| {
@@ -368,7 +386,9 @@ fn fcntl(
             }
         }
         let arg = if args.len() >= 3 {
-            unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
+            pyre_object::with_roots!(w_cmd, w_arg => {
+                pyre_interpreter::baseobjspace::gateway_int_w(w_arg)
+            })? as i32
         } else {
             0
         };
@@ -422,14 +442,11 @@ fn ioctl(
                 args.len()
             )));
         }
-        if !unsafe { pyre_object::is_int(args[1]) } {
-            return Err(pyre_interpreter::PyError::type_error(
-                "ioctl() arguments must be integers",
-            ));
-        }
         // `ioctl` reads its descriptor the same way the rest of the
         // module does.  It alone raises through `_raise_error_always`,
         // so an interrupted call surfaces rather than being re-issued.
+        // `space.bigint_w(w_request).uintmask()` accepts `__index__`;
+        // `truncatedint_w` is that conversion.
         let w_fd = args[0];
         let mut w_request = args[1];
         let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
@@ -437,7 +454,9 @@ fn ioctl(
         let fd = pyre_object::with_roots!(w_request, w_arg, w_mutate =>
             pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
         )?;
-        let raw_req = (unsafe { pyre_object::w_int_get_value(w_request) }) as i64;
+        let raw_req = pyre_object::with_roots!(w_request, w_arg, w_mutate => {
+            pyre_interpreter::baseobjspace::truncatedint_w(w_request)
+        })?;
         // `normalize_ioctl_request`: the request is the low 32 bits.
         let request = raw_req as u32;
         // The integer arm comes first, before the argument is ever
@@ -464,10 +483,16 @@ fn ioctl(
                     return ioctl_mutable(fd, request, slice);
                 }
             }
-            return ioctl_readonly(fd, request, arg_readbuf(arg, "ioctl")?);
+            match arg_readbuf(arg, "ioctl") {
+                Ok(buf) => return ioctl_readonly(fd, request, buf),
+                Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {}
+                Err(e) => return Err(e),
+            }
         }
         let arg = if args.len() >= 3 {
-            unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
+            pyre_object::with_roots!(w_request, w_mutate, w_arg => {
+                pyre_interpreter::baseobjspace::gateway_int_w(w_arg)
+            })? as i32
         } else {
             0
         };

@@ -781,7 +781,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "register() missing signal",
                         ));
                     }
-                    let signum = (unsafe { pyre_object::w_int_get_value(w_signum) }) as libc::c_int;
+                    // `handler.py register` `@unwrap_spec(signum=int)`.
+                    let signum =
+                        pyre_interpreter::baseobjspace::gateway_int_w(w_signum)? as libc::c_int;
                     // `handler.py register` `@unwrap_spec(all_threads=int, chain=int)`
                     // with defaults `all_threads=1, chain=0`: the arguments are
                     // coerced as integers (`gateway_int_w`, raising on a non-int),
@@ -877,7 +879,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "unregister() missing signal",
                         ));
                     }
-                    let signum = (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::c_int;
+                    // `handler.py unregister` `@unwrap_spec(signum=int)`.
+                    let signum =
+                        pyre_interpreter::baseobjspace::gateway_int_w(args[0])? as libc::c_int;
                     check_signum(signum)?;
                     let _state = lock_faulthandler_state();
                     let changed = super::cintf::pypy_faulthandler_unregister(signum) == 1;

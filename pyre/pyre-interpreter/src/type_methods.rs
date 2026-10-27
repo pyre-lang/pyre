@@ -6800,11 +6800,9 @@ pub fn __majit_wrap_dict_descr_keys(args: &[PyObjectRef]) -> Result<PyObjectRef,
 #[majit_macros::dont_look_inside]
 fn dict_descr_keys_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "keys", 0)?;
-    require_receiver(args, "keys")?;
-    // Type-erased fallback: the receiver isn't a dict, surface
-    // an empty view rather than fabricating a foreign-shaped
-    // list (the view's source-dict slot tolerates PY_NULL via
-    // the read-side guards).
+    // `interp2app(W_DictMultiObject.descr_keys)` / `descr_self_interp_w`:
+    // a non-dict receiver is a descriptor mismatch, not an empty view.
+    require_dict_receiver(args, "keys", true)?;
     Ok(pyre_object::dictmultiobject::w_dict_keys_new(
         pyre_object::PY_NULL,
     ))
@@ -6833,7 +6831,7 @@ pub fn __majit_wrap_dict_descr_values(args: &[PyObjectRef]) -> Result<PyObjectRe
 #[majit_macros::dont_look_inside]
 fn dict_descr_values_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "values", 0)?;
-    require_receiver(args, "values")?;
+    require_dict_receiver(args, "values", true)?;
     Ok(pyre_object::dictmultiobject::w_dict_values_new(
         pyre_object::PY_NULL,
     ))
@@ -6862,7 +6860,7 @@ pub fn __majit_wrap_dict_descr_items(args: &[PyObjectRef]) -> Result<PyObjectRef
 #[majit_macros::dont_look_inside]
 fn dict_descr_items_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     arity_exact(args, "items", 0)?;
-    require_receiver(args, "items")?;
+    require_dict_receiver(args, "items", true)?;
     Ok(pyre_object::dictmultiobject::w_dict_items_new(
         pyre_object::PY_NULL,
     ))

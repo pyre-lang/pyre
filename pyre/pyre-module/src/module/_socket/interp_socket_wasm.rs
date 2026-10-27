@@ -30,11 +30,10 @@ fn socket_type() -> PyObjectRef {
 }
 
 fn socket_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let cls = args
-        .first()
-        .copied()
-        .filter(|w_cls| unsafe { pyre_object::is_type(*w_cls) })
-        .unwrap_or_else(socket_type);
+    // `interp_socket.py W_Socket.typedef` uses `generic_new_descr`, which
+    // allocates through `allocate_instance` / `check_user_subclass`.
+    let cls = args.first().copied().unwrap_or_else(socket_type);
+    pyre_interpreter::typedef::check_user_subclass(socket_type(), cls)?;
     Ok(pyre_object::w_instance_new(cls))
 }
 

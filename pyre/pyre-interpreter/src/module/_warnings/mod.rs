@@ -725,21 +725,12 @@ fn get_source_line(module_globals: PyObjectRef, lineno: i64) -> Result<PyObjectR
         &[pyre_object::gc_roots::shadow_stack_get(source_slot)],
     )?;
     let lines_slot = pin_root_slot(lines);
-    match crate::baseobjspace::getitem(
+    // `interp_warnings.py get_source_line`: `space.getitem(w_source_list,
+    // space.newint(lineno - 1))` — IndexError/TypeError propagate.
+    crate::baseobjspace::getitem(
         pyre_object::gc_roots::shadow_stack_get(lines_slot),
         pyre_object::gc_roots::shadow_stack_get(pin_root_slot(w_int_new(lineno - 1))),
-    ) {
-        Ok(line) => Ok(line),
-        Err(err)
-            if matches!(
-                err.kind,
-                crate::PyErrorKind::TypeError | crate::PyErrorKind::IndexError
-            ) =>
-        {
-            Ok(PY_NULL)
-        }
-        Err(err) => Err(err),
-    }
+    )
 }
 
 pub(crate) fn do_warn_explicit(

@@ -1339,43 +1339,44 @@ fn init_ffi_type(ns: PyObjectRef) {
             pyre_interpreter::make_builtin_function_with_doc(name, function, ffi_method_doc(name)),
         );
     }
+    // `ffi_obj.py` `W_FFIObject.descr_*` gateway names (`w_arg` → `arg`).
     for (name, function, argnames) in [
         (
             "alignof",
             ffi_alignof as pyre_interpreter::gateway::BuiltinCodeFn,
-            &["self", "cdecl"] as &[&'static str],
+            &["self", "arg"] as &[&'static str],
         ),
-        ("cast", ffi_cast, &["self", "cdecl", "source"]),
+        ("cast", ffi_cast, &["self", "arg", "ob"]),
         (
             "callback",
             ffi_callback,
             &["self", "cdecl", "python_callable", "error", "onerror"],
         ),
         ("dlclose", ffi_dlclose, &["self", "lib"]),
-        ("dlopen", ffi_dlopen, &["self", "name", "flags"]),
+        ("dlopen", ffi_dlopen, &["self", "filename", "flags"]),
         (
             "from_buffer",
             ffi_from_buffer,
             &["self", "cdecl", "python_buffer", "require_writable"],
         ),
-        ("from_handle", ffi_from_handle, &["self", "x"]),
+        ("from_handle", ffi_from_handle, &["self", "arg"]),
         ("gc", ffi_gc, &["self", "cdata", "destructor", "size"]),
         ("getctype", ffi_getctype, &["self", "cdecl", "replace_with"]),
-        ("init_once", ffi_init_once, &["self", "function", "tag"]),
+        ("init_once", ffi_init_once, &["self", "func", "tag"]),
         ("integer_const", ffi_integer_const, &["self", "name"]),
         ("list_types", ffi_list_types, &["self"]),
         ("memmove", ffi_memmove, &["self", "dest", "src", "n"]),
-        ("new", ffi_new_value, &["self", "cdecl", "init"]),
+        ("new", ffi_new_value, &["self", "arg", "init"]),
         (
             "new_allocator",
             ffi_new_allocator,
             &["self", "alloc", "free", "should_clear_after_alloc"],
         ),
-        ("new_handle", ffi_new_handle, &["self", "x"]),
+        ("new_handle", ffi_new_handle, &["self", "arg"]),
         ("release", ffi_release, &["self", "cdata"]),
-        ("sizeof", ffi_sizeof, &["self", "cdecl"]),
+        ("sizeof", ffi_sizeof, &["self", "arg"]),
         ("string", ffi_string, &["self", "cdata", "maxlen"]),
-        ("typeof", ffi_typeof, &["self", "cdecl"]),
+        ("typeof", ffi_typeof, &["self", "arg"]),
         ("unpack", ffi_unpack, &["self", "cdata", "length"]),
     ] {
         let code = pyre_interpreter::gateway::builtin_code_new_with_signature(

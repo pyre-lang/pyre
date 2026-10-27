@@ -1688,13 +1688,17 @@ pub fn register_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
     );
     // No terminal is reachable through the seam, so no descriptor is one.  The
     // answer is False rather than an error for the same reason it is on every
-    // other platform: `isatty` reports, it does not validate.
+    // other platform: `isatty` reports, it does not validate.  The fd is still
+    // unwrapped (`interp_posix.py` `isatty`, `@unwrap_spec(fd=c_int)`).
     crate::__pyre_put_new!(
         ns_slot,
         "isatty",
         crate::make_builtin_function_with_arity(
             "isatty",
-            |_args| Ok(pyre_object::w_bool_from(false)),
+            |args| {
+                crate::baseobjspace::c_int_w(args[0])?;
+                Ok(pyre_object::w_bool_from(false))
+            },
             1,
         )
     );

@@ -62,6 +62,34 @@ mod ll {
     );
 }
 
+/// `lib_pypy/syslog.py _get_argv` / `syslog_get_argv`: basename of
+/// `sys.argv[0]` when `openlog` is given no ident.  Every failure path
+/// is silent — `openlog(3)` still works with a NULL ident.
+#[cfg(feature = "host_env")]
+fn openlog_ident_from_argv() -> Option<Box<std::ffi::CStr>> {
+    let sys = pyre_interpreter::importing::get_interpreter_sys_module()?;
+    let mut argv = pyre_interpreter::baseobjspace::getattr_str(sys, "argv").ok()?;
+    let mut first = pyre_object::with_roots!(argv => {
+        pyre_interpreter::baseobjspace::getitem(argv, pyre_object::w_int_new(0))
+    })
+    .ok()?;
+    if unsafe { !pyre_object::is_str(first) } {
+        return None;
+    }
+    let script = pyre_object::with_roots!(first => {
+        pyre_interpreter::baseobjspace::str_utf8_w(first).map(str::to_owned)
+    })
+    .ok()?;
+    if script.is_empty() {
+        return None;
+    }
+    let base = script.rsplit_once('/').map(|(_, b)| b).unwrap_or(&script);
+    if base.is_empty() {
+        return None;
+    }
+    std::ffi::CString::new(base).ok().map(|c| c.into_boxed_c_str())
+}
+
 /// syslog module — PyPy: lib_pypy/syslog.py.
 ///
 /// openlog / syslog / closelog / setlogmask. `host_env` calls
@@ -70,13 +98,30 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     pyre_interpreter::__pyre_store!(ns, "openlog", pyre_interpreter::make_builtin_function("openlog", |args| {
             #[cfg(feature = "host_env")]
             {
+                // `lib_pypy/syslog.py openlog(ident=None, logoption=0, facility=LOG_USER)`
+                // / `syslog_openlog_impl`: at most three arguments; a non-str
+                // ident is TypeError; omitted/None ident uses `sys.argv[0]`.
+                if args.len() > 3 {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
+                        "openlog() takes from 0 to 3 positional arguments but {} were given",
+                        args.len()
+                    )));
+                }
                 // `args` is the gateway's native copy; a collection in
                 // `str_utf8_w` does not forward it.
                 let _roots = pyre_object::gc_roots::push_roots();
                 let args_base = _roots.pin_roots(args);
                 let ident = if !args.is_empty()
-                    && unsafe { pyre_object::is_str(_roots.get(args_base)) }
+                    && unsafe { !pyre_object::is_none(_roots.get(args_base)) }
                 {
+                    if unsafe { !pyre_object::is_str(_roots.get(args_base)) } {
+                        return Err(pyre_interpreter::PyError::type_error(format!(
+                            "openlog() argument 1 must be a str, not {}",
+                            pyre_interpreter::type_methods::arg_type_name(
+                                _roots.get(args_base)
+                            )
+                        )));
+                    }
                     // openlog(3) keeps a C string, so the ident ends at
                     // the first NUL.
                     let ident = pyre_interpreter::baseobjspace::str_utf8_w(_roots.get(args_base))?;
@@ -85,7 +130,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                         .ok()
                         .map(|c| c.into_boxed_c_str())
                 } else {
-                    None
+                    openlog_ident_from_argv()
                 };
                 for index in 1..args.len() {
                     if !unsafe { pyre_object::is_int(_roots.get(args_base + index)) } {
@@ -125,6 +170,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
     pyre_interpreter::__pyre_store!(ns, "syslog", pyre_interpreter::make_builtin_function("syslog", |args| {
             #[cfg(feature = "host_env")]
             {
+                // `lib_pypy/syslog.py syslog(arg1, arg2=None)` /
+                // `syslog_syslog_impl`: one message, or priority then message.
+                if args.len() > 2 {
+                    return Err(pyre_interpreter::PyError::type_error(format!(
+                        "syslog() takes from 1 to 2 positional arguments but {} were given",
+                        args.len()
+                    )));
+                }
                 // `args` is the gateway's native copy; a collection in
                 // `str_utf8_w` does not forward it.  Same pin as `openlog`.
                 let _roots = pyre_object::gc_roots::push_roots();

@@ -395,7 +395,7 @@ pub enum CallArg<'a> {
     Typed { code: &'a str, buffer: &'a [u8] },
     /// Untyped Python int (ConvParam default: C int).
     Int(i32),
-    /// Untyped Python float (ConvParam default: C double).
+    /// C `double` payload. Untyped Python `float` is not a ConvParam default.
     Double(f64),
     /// Address-valued argument (pointer decay, byref, bytes/str copies, NULL = 0).
     Pointer(usize),
