@@ -14741,8 +14741,15 @@ fn effect_transduce_op(
                 result,
             );
         }
-        name @ ("int_neg" | "int_invert" | "int_is_true" | "int_is_zero" | "bool_not"
-        | "ptr_nonzero" | "ptr_iszero") => {
+        name @ ("int_neg"
+        | "int_invert"
+        | "int_is_true"
+        | "int_is_zero"
+        | "bool_not"
+        | "ptr_nonzero"
+        | "ptr_iszero"
+        | "length_of_simple_gcarray_from_opaque") => {
+            // `lloperation.py`: `length_of_simple_gcarray_from_opaque` is `LLOp(sideeffects=False)`.
             let operand = effect_materialize(out, block, &op.args[0]);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(

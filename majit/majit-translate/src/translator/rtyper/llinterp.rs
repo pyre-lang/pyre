@@ -34,7 +34,7 @@ use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _address, _func, _ptr, _ptr_obj, LowLevelType, LowLevelValue, MallocFlavor, PtrTarget, Struct,
-    identityhash, isCompatibleType, malloc, typeOf,
+    identityhash, isCompatibleType, length_of_simple_gcarray_from_opaque, malloc, typeOf,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
@@ -336,7 +336,13 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
             LowLevelValue::Unsigned(n) => Ok(LLValue::Int(*n as i64)),
             LowLevelValue::Bool(b) => Ok(LLValue::Bool(*b)),
             LowLevelValue::Float(bits) => Ok(LLValue::Float(*bits)),
-            LowLevelValue::SingleFloat(bits) => Ok(LLValue::Float(*bits as u64)),
+            // `r_singlefloat.__float__` / `LLInterpreter.eval_graph`: the
+            // host value is an f64; `LLValue::Float` stores those bits.
+            // f32→f64 widening is exact, so the SingleFloat result arm
+            // (`llvalue_to_lowlevel_of_type`) narrows back to the same bits.
+            LowLevelValue::SingleFloat(bits) => {
+                Ok(LLValue::Float((f32::from_bits(*bits) as f64).to_bits()))
+            }
             LowLevelValue::LongFloat(bits) => Ok(LLValue::Float(*bits)),
             LowLevelValue::Char(c) | LowLevelValue::UniChar(c) => Ok(LLValue::Str(c.to_string())),
             LowLevelValue::Address(a) => Ok(LLValue::Address(a.clone())),
@@ -1523,6 +1529,9 @@ impl LLFrame {
             "getfield" => self.op_getfield(vals),
             "getarrayitem" => self.op_getarrayitem(vals),
             "getarraysize" => self.op_getarraysize(vals),
+            "length_of_simple_gcarray_from_opaque" => {
+                self.op_length_of_simple_gcarray_from_opaque(vals)
+            }
             "getinteriorfield" => self.op_getinteriorfield(vals),
             "direct_call" => self.op_direct_call(vals),
             "int_xor" => Ok(LLValue::Int(
@@ -1823,6 +1832,20 @@ impl LLFrame {
             message: format!("getarraysize: {e}"),
         })?;
         Ok(LLValue::Int(n as i64))
+    }
+
+    /// `LLFrame.op_length_of_simple_gcarray_from_opaque` (`llinterp.py`):
+    /// `checkptr` then `lltype.length_of_simple_gcarray_from_opaque`.
+    fn op_length_of_simple_gcarray_from_opaque(
+        &self,
+        vals: &[LLValue],
+    ) -> Result<LLValue, TaskError> {
+        checkptr_ll(&vals[0], "length_of_simple_gcarray_from_opaque")?;
+        let p = vals[0].as_ptr("length_of_simple_gcarray_from_opaque")?;
+        let n = length_of_simple_gcarray_from_opaque(p).map_err(|e| TaskError {
+            message: format!("length_of_simple_gcarray_from_opaque: {e}"),
+        })?;
+        Ok(LLValue::Int(n))
     }
 
     /// `op_getinteriorfield` (`llinterp.py`): walk field names / indices.
@@ -2127,7 +2150,7 @@ mod tests {
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{Block, BlockRefExt, HOST_ENV, Link};
     use crate::translator::rtyper::lltypesystem::lltype::{
-        _getconcretetype, Array, FuncType, LowLevelType, Ptr, functionptr,
+        _getconcretetype, Array, FuncType, GCREF, LowLevelType, Ptr, cast_opaque_ptr, functionptr,
         functionptr_for_graph_with_type, getfunctionptr, nullptr,
     };
     use crate::translator::rtyper::rclass::{Flavor, InstanceRepr, OBJECT};
@@ -2261,6 +2284,53 @@ mod tests {
         // thread-local pointer while running. After return the local
         // mirror is restored to the prior (empty) Weak.
         assert!(LLInterpreter::current_interpreter().is_none());
+    }
+
+    #[test]
+    fn eval_graph_length_of_simple_gcarray_from_opaque_returns_array_len() {
+        // `LLFrame.op_length_of_simple_gcarray_from_opaque` (`llinterp.py`):
+        // `checkptr` then `lltype.length_of_simple_gcarray_from_opaque`.
+        let opaque = Variable::named("opaque_ptr");
+        opaque.set_concretetype(Some(GCREF.clone()));
+        let n = Variable::named("n");
+        n.set_concretetype(Some(LowLevelType::Signed));
+
+        let start = Block::shared(vec![opaque.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "length_of_simple_gcarray_from_opaque",
+            vec![opaque.into()],
+            n.clone().into(),
+        ));
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "len_opaque",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![n.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(5), MallocFlavor::Gc, true).expect("malloc GcArray");
+        let LowLevelType::Ptr(gcref_t) = &*GCREF else {
+            panic!("GCREF must be a Ptr");
+        };
+        let gcref = cast_opaque_ptr(gcref_t, &arrayptr).expect("hide array behind GCREF");
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(
+                graph as Rc<dyn Any>,
+                vec![Rc::new(LowLevelValue::Ptr(Box::new(gcref))) as Rc<dyn Any>],
+                false,
+            )
+            .expect("length_of_simple_gcarray_from_opaque graph should run");
+        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 5);
     }
 
     #[test]
@@ -3375,6 +3445,52 @@ mod tests {
         let ptr = functionptr_for_graph_with_type(&graph, ft);
         let out = eval_funcptr(&ptr, &[LowLevelValue::Unsigned(7)]).expect("unsigned identity");
         assert_eq!(out, LowLevelValue::Unsigned(7));
+    }
+
+    #[test]
+    fn eval_graph_singlefloat_roundtrips_argument() {
+        // `llinterp.py` `LLInterpreter.eval_graph` keeps an `r_singlefloat`
+        // argument unchanged through an identity graph. `LLValue::Float`
+        // is the f64-bits carrier: `any_to_llvalue` widens f32→f64, and
+        // `llvalue_to_lowlevel_of_type` narrows back to the same f32 bits.
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::SingleFloat));
+        let start = Block::shared(vec![x.clone().into()]);
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::SingleFloat));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "id_singlefloat",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![x.into()], Some(returnblock), None).into_ref(),
+        ]);
+        let ft = FuncType {
+            args: vec![LowLevelType::SingleFloat],
+            result: LowLevelType::SingleFloat,
+        };
+        let ptr = functionptr_for_graph_with_type(&graph, ft);
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        for bits in [1.0f32.to_bits(), 1.5f32.to_bits()] {
+            let arg = LowLevelValue::SingleFloat(bits);
+            let out = eval_funcptr(&ptr, &[arg.clone()]).expect("SingleFloat identity");
+            assert_eq!(out, arg);
+            let any_out = interp
+                .eval_graph(
+                    graph.clone() as Rc<dyn Any>,
+                    vec![Rc::new(arg.clone()) as Rc<dyn Any>],
+                    false,
+                )
+                .expect("eval_graph SingleFloat identity");
+            let ll = any_to_llvalue(&any_out).expect("result to LLValue");
+            let typed = llvalue_to_lowlevel_of_type(&ll, &LowLevelType::SingleFloat, "id")
+                .expect("SingleFloat result");
+            assert_eq!(typed, arg);
+        }
     }
 
     fn dummy_frame() -> LLFrame {

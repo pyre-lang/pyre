@@ -38,13 +38,13 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
 use crate::translator::rtyper::lltypesystem::rstr::{
     jit_isconstant_intrinsic_funcptr, jit_isvirtual_intrinsic_funcptr, sub_helper_funcptr_constant,
 };
 use crate::translator::rtyper::rtyper::{
     LowLevelFunction, RPythonTyper, constant_with_lltype, helper_pygraph_from_graph,
-    variable_with_lltype,
+    variable_with_lltype, void_field_const,
 };
 
 /// Upstream `jit.py:889` — `self.instance.__name__` on the bound
@@ -354,6 +354,11 @@ pub enum LookInsidePred {
     IsVirtual(usize),
     /// `jit.isconstant` on argument `n`.
     IsConstant(usize),
+    /// `arg.field is None or jit.isvirtual(arg.field)`.
+    ///
+    /// `_ll_dictnext` (`rordereddict.py`): `jit.isvirtual(iter) and
+    /// (iter.dict is None or jit.isvirtual(iter.dict))`.
+    FieldNullOrIsVirtual { arg: usize, field: &'static str },
 }
 
 /// `rlib/jit.py look_inside_iff(predicate)(func)`: marks `orig` `unroll_safe` +
@@ -437,18 +442,32 @@ pub fn mint_look_inside_iff(
         )?
     };
 
-    let mut predicate_intrinsics: Vec<(usize, Constant)> = Vec::new();
+    let mut predicate_intrinsics: Vec<LookInsideIntrinsic> = Vec::new();
     for pred in predicate {
         match *pred {
             LookInsidePred::IsVirtual(i) => {
                 let arg_ty = arg_lltype(name, &args, i)?;
-                predicate_intrinsics
-                    .push((i, jit_isvirtual_intrinsic_funcptr(rtyper, arg_ty.clone())?));
+                predicate_intrinsics.push(LookInsideIntrinsic::Arg {
+                    arg: i,
+                    intrinsic: jit_isvirtual_intrinsic_funcptr(rtyper, arg_ty.clone())?,
+                });
             }
             LookInsidePred::IsConstant(i) => {
                 let arg_ty = arg_lltype(name, &args, i)?;
-                predicate_intrinsics
-                    .push((i, jit_isconstant_intrinsic_funcptr(rtyper, arg_ty.clone())?));
+                predicate_intrinsics.push(LookInsideIntrinsic::Arg {
+                    arg: i,
+                    intrinsic: jit_isconstant_intrinsic_funcptr(rtyper, arg_ty.clone())?,
+                });
+            }
+            LookInsidePred::FieldNullOrIsVirtual { arg, field } => {
+                let arg_ty = arg_lltype(name, &args, arg)?;
+                let field_lltype = ptr_struct_field_lltype(name, arg_ty, arg, field)?;
+                predicate_intrinsics.push(LookInsideIntrinsic::FieldNullOrIsVirtual {
+                    arg,
+                    field,
+                    field_lltype: field_lltype.clone(),
+                    intrinsic: jit_isvirtual_intrinsic_funcptr(rtyper, field_lltype)?,
+                });
             }
         }
     }
@@ -487,6 +506,42 @@ fn arg_lltype<'a>(
         TyperError::message(format!(
             "look_inside_iff {name}: predicate index {index} out of range ({} args)",
             args.len()
+        ))
+    })
+}
+
+/// Field lltype of `args[arg].field`. `args[arg]` must be a `Ptr` to a
+/// `Struct` that has `field` (`Struct.getattr_field_type`).
+fn ptr_struct_field_lltype(
+    name: &str,
+    arg_ty: &LowLevelType,
+    arg: usize,
+    field: &str,
+) -> Result<LowLevelType, TyperError> {
+    let LowLevelType::Ptr(ptr) = arg_ty else {
+        return Err(TyperError::message(format!(
+            "look_inside_iff {name}: FieldNullOrIsVirtual arg {arg} is not a Ptr"
+        )));
+    };
+    let st = match &ptr.TO {
+        PtrTarget::Struct(st) => st.clone(),
+        PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+            Some(LowLevelType::Struct(st)) => *st,
+            _ => {
+                return Err(TyperError::message(format!(
+                    "look_inside_iff {name}: FieldNullOrIsVirtual arg {arg} is not a Ptr to a struct"
+                )));
+            }
+        },
+        _ => {
+            return Err(TyperError::message(format!(
+                "look_inside_iff {name}: FieldNullOrIsVirtual arg {arg} is not a Ptr to a struct"
+            )));
+        }
+    };
+    st.getattr_field_type(field).ok_or_else(|| {
+        TyperError::message(format!(
+            "look_inside_iff {name}: struct has no field {field:?}"
         ))
     })
 }
@@ -612,6 +667,113 @@ fn build_look_inside_iff_trampoline_graph(
     ))
 }
 
+/// One compiled `look_inside_iff` conjunct.
+#[derive(Clone)]
+enum LookInsideIntrinsic {
+    /// `isvirtual` / `isconstant` on argument `arg`.
+    Arg { arg: usize, intrinsic: Constant },
+    /// `arg.field is None or isvirtual(arg.field)`.
+    FieldNullOrIsVirtual {
+        arg: usize,
+        field: &'static str,
+        field_lltype: LowLevelType,
+        intrinsic: Constant,
+    },
+}
+
+fn emit_arg_predicate_block(
+    argnames: &[&str],
+    args: &[LowLevelType],
+    arg_index: usize,
+    intrinsic: &Constant,
+    true_target: BlockRef,
+    false_target: BlockRef,
+) -> BlockRef {
+    let vars = look_inside_arg_vars(argnames, args);
+    let block = Block::shared(hl_vars(&vars));
+    let flag = variable_with_lltype("pred", LowLevelType::Bool);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(intrinsic.clone()),
+            Hlvalue::Variable(vars[arg_index].clone()),
+        ],
+        Hlvalue::Variable(flag.clone()),
+    ));
+    block.borrow_mut().exitswitch = Some(Hlvalue::Variable(flag));
+    block.closeblock(vec![
+        Link::new(hl_vars(&vars), Some(true_target), Some(bool_const(true))).into_ref(),
+        Link::new(hl_vars(&vars), Some(false_target), Some(bool_const(false))).into_ref(),
+    ]);
+    block
+}
+
+/// Two-block conjunct for `arg.field is None or jit.isvirtual(arg.field)`
+/// (`rordereddict.py _ll_dictnext`).
+///
+/// Block 1 (`inputs` = the args): `getfield` → `v`, `ptr_iszero(v)` → `z`;
+/// True → `true_target`, False → block 2.
+/// Block 2 (`inputs` = the args + `v`): `direct_call(isvirtual, v)` → flag;
+/// True → `true_target`, False → trampoline.
+fn emit_field_null_or_isvirtual_blocks(
+    argnames: &[&str],
+    args: &[LowLevelType],
+    arg: usize,
+    field: &'static str,
+    field_lltype: &LowLevelType,
+    intrinsic: &Constant,
+    true_target: BlockRef,
+    false_target: BlockRef,
+) -> BlockRef {
+    let vars2 = look_inside_arg_vars(argnames, args);
+    let v2 = variable_with_lltype("v", field_lltype.clone());
+    let mut block2_inputs = hl_vars(&vars2);
+    block2_inputs.push(Hlvalue::Variable(v2.clone()));
+    let block2 = Block::shared(block2_inputs);
+    let flag = variable_with_lltype("pred", LowLevelType::Bool);
+    block2.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(intrinsic.clone()), Hlvalue::Variable(v2)],
+        Hlvalue::Variable(flag.clone()),
+    ));
+    block2.borrow_mut().exitswitch = Some(Hlvalue::Variable(flag));
+    block2.closeblock(vec![
+        Link::new(
+            hl_vars(&vars2),
+            Some(true_target.clone()),
+            Some(bool_const(true)),
+        )
+        .into_ref(),
+        Link::new(hl_vars(&vars2), Some(false_target), Some(bool_const(false))).into_ref(),
+    ]);
+
+    let vars1 = look_inside_arg_vars(argnames, args);
+    let block1 = Block::shared(hl_vars(&vars1));
+    let v = variable_with_lltype("v", field_lltype.clone());
+    block1.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![
+            Hlvalue::Variable(vars1[arg].clone()),
+            void_field_const(field),
+        ],
+        Hlvalue::Variable(v.clone()),
+    ));
+    let z = variable_with_lltype("z", LowLevelType::Bool);
+    block1.borrow_mut().operations.push(SpaceOperation::new(
+        "ptr_iszero",
+        vec![Hlvalue::Variable(v.clone())],
+        Hlvalue::Variable(z.clone()),
+    ));
+    block1.borrow_mut().exitswitch = Some(Hlvalue::Variable(z));
+    let mut false_args = hl_vars(&vars1);
+    false_args.push(Hlvalue::Variable(v));
+    block1.closeblock(vec![
+        Link::new(hl_vars(&vars1), Some(true_target), Some(bool_const(true))).into_ref(),
+        Link::new(false_args, Some(block2), Some(bool_const(false))).into_ref(),
+    ]);
+    block1
+}
+
 /// `rlib/jit.py look_inside_iff` wrapper:
 ///
 /// ```python
@@ -624,7 +786,8 @@ fn build_look_inside_iff_trampoline_graph(
 ///
 /// `we_are_jitted` is the `SpecTag` exitswitch (true link first). Each
 /// predicate conjunct is its own block: true continues, false goes to
-/// the trampoline.
+/// the trampoline. `FieldNullOrIsVirtual` is two blocks (`getfield` /
+/// `ptr_iszero`, then `isvirtual` on the field).
 fn build_look_inside_iff_wrapper_graph(
     name: &str,
     argnames: &[&str],
@@ -632,7 +795,7 @@ fn build_look_inside_iff_wrapper_graph(
     result: &LowLevelType,
     orig_fn: Constant,
     trampoline_fn: Constant,
-    predicate_intrinsics: &[(usize, Constant)],
+    predicate_intrinsics: &[LookInsideIntrinsic],
 ) -> Result<PyGraph, TyperError> {
     let start_vars = look_inside_arg_vars(argnames, args);
     let startblock = Block::shared(hl_vars(&start_vars));
@@ -654,34 +817,32 @@ fn build_look_inside_iff_wrapper_graph(
     );
 
     let mut jitted_target = block_orig.clone();
-    for (arg_index, intrinsic) in predicate_intrinsics.iter().rev() {
-        let vars = look_inside_arg_vars(argnames, args);
-        let block = Block::shared(hl_vars(&vars));
-        let flag = variable_with_lltype("pred", LowLevelType::Bool);
-        block.borrow_mut().operations.push(SpaceOperation::new(
-            "direct_call",
-            vec![
-                Hlvalue::Constant(intrinsic.clone()),
-                Hlvalue::Variable(vars[*arg_index].clone()),
-            ],
-            Hlvalue::Variable(flag.clone()),
-        ));
-        block.borrow_mut().exitswitch = Some(Hlvalue::Variable(flag));
-        block.closeblock(vec![
-            Link::new(
-                hl_vars(&vars),
-                Some(jitted_target.clone()),
-                Some(bool_const(true)),
-            )
-            .into_ref(),
-            Link::new(
-                hl_vars(&vars),
-                Some(block_tramp.clone()),
-                Some(bool_const(false)),
-            )
-            .into_ref(),
-        ]);
-        jitted_target = block;
+    for pred in predicate_intrinsics.iter().rev() {
+        jitted_target = match pred {
+            LookInsideIntrinsic::Arg { arg, intrinsic } => emit_arg_predicate_block(
+                argnames,
+                args,
+                *arg,
+                intrinsic,
+                jitted_target,
+                block_tramp.clone(),
+            ),
+            LookInsideIntrinsic::FieldNullOrIsVirtual {
+                arg,
+                field,
+                field_lltype,
+                intrinsic,
+            } => emit_field_null_or_isvirtual_blocks(
+                argnames,
+                args,
+                *arg,
+                field,
+                field_lltype,
+                intrinsic,
+                jitted_target,
+                block_tramp.clone(),
+            ),
+        };
     }
 
     startblock.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
@@ -876,6 +1037,148 @@ mod tests {
             count_predicate_blocks(&startblock),
             2,
             "two conjuncts mint two predicate blocks"
+        );
+    }
+
+    /// `LookInsidePred::FieldNullOrIsVirtual` is the `_ll_dictnext`
+    /// conjunct `iter.dict is None or jit.isvirtual(iter.dict)`: wrapper
+    /// emits `getfield` / `ptr_iszero` plus `isvirtual` on the field, and
+    /// `isvirtual` on the struct arg; oopspec moves onto the trampoline.
+    #[test]
+    fn look_inside_iff_field_null_or_isvirtual_mints_getfield_and_two_isvirtuals() {
+        use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, PtrTarget, Struct};
+        use crate::translator::rtyper::lltypesystem::rstr::direct_call_funcobjs;
+
+        let ann = Rc::new(RPythonAnnotator::new(None, None, None, false));
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper.initialize_exceptiondata().expect("rtyper init");
+
+        let payload_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Opaque(OpaqueType::gc("PAYLOAD")),
+        }));
+        let iter_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc(
+                "dummy_iter",
+                vec![
+                    ("payload".into(), payload_ty.clone()),
+                    ("index".into(), LowLevelType::Signed),
+                ],
+            )),
+        }));
+        let orig_ty = iter_ty.clone();
+        let wrapper = mint_look_inside_iff(
+            &rtyper,
+            "ll_dummy_field_null",
+            &["iter"],
+            vec![iter_ty.clone()],
+            LowLevelType::Void,
+            move |name| {
+                let mut py = trivial_void_builder(name, orig_ty.clone())?;
+                py.func.oopspec = Some("test.field_null(iter)".to_string());
+                if let Some(func) = py.graph.borrow_mut().func.as_mut() {
+                    func.oopspec = Some("test.field_null(iter)".to_string());
+                }
+                Ok(py)
+            },
+            &[
+                LookInsidePred::IsVirtual(0),
+                LookInsidePred::FieldNullOrIsVirtual {
+                    arg: 0,
+                    field: "payload",
+                },
+            ],
+        )
+        .expect("mint_look_inside_iff");
+
+        assert_eq!(wrapper.name, "ll_dummy_field_null_look_inside_iff");
+        let orig = graph_named(&ann, "ll_dummy_field_null");
+        let trampoline = graph_named(&ann, "ll_dummy_field_null_trampoline");
+        let wrapper_graph = graph_named(&ann, "ll_dummy_field_null_look_inside_iff");
+
+        let orig_func = orig
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("orig GraphFunc");
+        assert_eq!(
+            orig_func.oopspec, None,
+            "look_inside_iff deletes orig oopspec (`rlib/jit.py look_inside_iff`)"
+        );
+        let tramp_func = trampoline
+            .borrow()
+            .func
+            .as_ref()
+            .cloned()
+            .expect("trampoline GraphFunc");
+        assert_eq!(
+            tramp_func.oopspec.as_deref(),
+            Some("test.field_null(iter)"),
+            "look_inside_iff moves oopspec onto the trampoline"
+        );
+
+        let inner = wrapper_graph.borrow();
+        let opnames: Vec<String> = inner
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .map(|op| op.opname.clone())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(
+            opnames.iter().any(|o| o == "getfield"),
+            "wrapper emits getfield, got {opnames:?}"
+        );
+        assert!(
+            opnames.iter().any(|o| o == "ptr_iszero"),
+            "wrapper emits ptr_iszero, got {opnames:?}"
+        );
+        let getfield_fields: Vec<_> = inner
+            .iterblocks()
+            .into_iter()
+            .flat_map(|block| {
+                block
+                    .borrow()
+                    .operations
+                    .iter()
+                    .filter(|op| op.opname == "getfield")
+                    .filter_map(|op| match op.args.get(1) {
+                        Some(Hlvalue::Constant(c)) => Some(c.value.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            getfield_fields,
+            vec![ConstValue::byte_str("payload")],
+            "getfield reads the FieldNullOrIsVirtual field"
+        );
+
+        let funcs = direct_call_funcobjs(&inner);
+        let isvirtual: Vec<_> = funcs
+            .iter()
+            .filter(|f| f._name == "majit_rlib::jit::isvirtual")
+            .collect();
+        assert_eq!(
+            isvirtual.len(),
+            2,
+            "wrapper calls isvirtual on the arg and on the field, got {:?}",
+            funcs.iter().map(|f| &f._name).collect::<Vec<_>>()
+        );
+        let arg_types: Vec<_> = isvirtual.iter().map(|f| f.TYPE.args.clone()).collect();
+        assert!(
+            arg_types.contains(&vec![iter_ty.clone()]),
+            "one isvirtual FuncType arg is the struct Ptr, got {arg_types:?}"
+        );
+        assert!(
+            arg_types.contains(&vec![payload_ty]),
+            "one isvirtual FuncType arg is the field Ptr, got {arg_types:?}"
         );
     }
 
