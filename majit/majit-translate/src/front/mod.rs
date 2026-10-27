@@ -94,7 +94,6 @@ pub(crate) mod option_unwrap;
 pub(crate) mod option_variant;
 pub(crate) mod range_iter;
 pub(crate) mod rbigint_call;
-pub(crate) mod result_as_ref;
 pub(crate) mod result_exc;
 pub(crate) mod result_map_err;
 pub(crate) mod rfloat_call;

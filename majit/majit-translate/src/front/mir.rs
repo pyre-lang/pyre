@@ -5668,10 +5668,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 )),
             );
         }
-        let result_as_ref_rewritten = crate::front::result_as_ref::rewire_result_as_ref_sites(
-            &mut lo.graph,
-            &lo.result_as_ref_sites,
-        );
         if let Some(site) = lo
             .result_map_err_sites
             .iter()
@@ -6271,7 +6267,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || unwrap_rewritten > 0
             || expect_rewritten > 0
             || result_expect_rewritten > 0
-            || result_as_ref_rewritten > 0
             || map_or_rewritten > 0
             || closure_select_rewritten > 0
             || !lo.disc_combinator_sites.is_empty()
@@ -9343,7 +9338,6 @@ struct Lowering<'a> {
     /// Ok/Err closure-select before the exception-link pass consumes the
     /// newly built result shells.
     result_map_err_sites: Vec<crate::front::result_map_err::ResultMapErrSite>,
-    result_as_ref_sites: Vec<crate::front::result_as_ref::ResultAsRefSite>,
     result_expect_sites: Vec<crate::front::option_unwrap::UnwrapSite>,
     /// `Iterator::next()` call results (`Option<T>`-typed) recorded for
     /// the `next`-diamond rewiring pass (`front::iter_next`) that runs
@@ -10378,7 +10372,6 @@ impl<'a> Lowering<'a> {
             option_ok_or_else_try_sites: Vec::new(),
             carrier_combinator_sites: Vec::new(),
             result_map_err_sites: Vec::new(),
-            result_as_ref_sites: Vec::new(),
             result_expect_sites: Vec::new(),
             next_call_results: Vec::new(),
             map_collect_sites: Vec::new(),
@@ -33077,47 +33070,36 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
         }
-        // `Result::as_ref` / `Result::expect`. The callee is that result-module
-        // item: `core::result::<Impl>::as_ref` on the `Method` spelling, and
-        // `result::Result::as_ref` when a raw `&Result` takes the static
+        // `Result::expect`. The callee is that result-module item:
+        // `core::result::<Impl>::expect` on the `Method` spelling, and
+        // `result::Result::expect` when a raw `&Result` takes the static
         // `FunctionPath` (`impl_method_owner` declines the method hint).
-        let result_ref_leaf = callee_name_path.as_deref().and_then(|path| {
+        // `as_ref` is a regular call to the extracted core body
+        // (`match *self { Ok(ref x) => Ok(x), Err(ref x) => Err(x) }`).
+        let result_expect_callee = callee_name_path.as_deref().is_some_and(|path| {
             let segs: Vec<&str> = path.split("::").collect();
-            let leaf = *segs.last()?;
-            if !matches!(leaf, "as_ref" | "expect") {
-                return None;
-            }
-            match segs.as_slice() {
-                ["core" | "std", "result", "<Impl>" | "Result", _] | ["result", "Result", _] => {
-                    Some(leaf)
-                }
-                _ => None,
-            }
+            *segs.last().unwrap_or(&"") == "expect"
+                && matches!(
+                    segs.as_slice(),
+                    ["core" | "std", "result", "<Impl>" | "Result", _] | ["result", "Result", _]
+                )
         });
-        if let (Some(name), OpKind::Call { args, .. }) = (result_ref_leaf, &op_kind) {
-            if name == "as_ref" && args.len() == 1 {
-                if let Some(site) = self.recognize_result_as_ref_site(
-                    first_arg_ty.as_ref(),
-                    &call.dest.ty,
-                    &result_var,
-                ) {
-                    self.result_as_ref_sites.push(site);
-                }
-            } else if name == "expect" && args.len() == 2 {
-                if let Some(site) = self.recognize_carrier_combinator_site(
-                    first_arg_ty.as_ref(),
-                    &result_var,
-                    crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
-                ) {
-                    self.carrier_combinator_sites.push(site);
-                } else if first_arg_ty
-                    .as_ref()
-                    .is_some_and(|ty| crate::front::result_exc::tyref_is_result(ty, self.llbc))
-                    && let Some(site) =
-                        self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
-                {
-                    self.result_expect_sites.push(site);
-                }
+        if result_expect_callee
+            && let OpKind::Call { args, .. } = &op_kind
+            && args.len() == 2
+        {
+            if let Some(site) = self.recognize_carrier_combinator_site(
+                first_arg_ty.as_ref(),
+                &result_var,
+                crate::front::result_exc::CarrierCatchKind::RaiseImplicit,
+            ) {
+                self.carrier_combinator_sites.push(site);
+            } else if first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| crate::front::result_exc::tyref_is_result(ty, self.llbc))
+                && let Some(site) = self.recognize_unwrap_site(first_arg_ty.as_ref(), &result_var)
+            {
+                self.result_expect_sites.push(site);
             }
         }
         // `Option::ok_or_else(opt, closure)?` is one combined value-or-raise
@@ -44548,93 +44530,6 @@ impl<'a> Lowering<'a> {
             args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
             fn_item_segments,
             closure_env_is_trivially_dropless,
-        })
-    }
-
-    /// core::result::Result::as_ref, restricted to payloads already modelled
-    /// as immutable RPython scalars/strings. Other payloads need a separate
-    /// address/lifetime representation; register-bank equality alone is not
-    /// sufficient evidence that their borrows can be copied as values.
-    fn recognize_result_as_ref_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        dest_ty: &TyRef,
-        result_var: &Variable,
-    ) -> Option<crate::front::result_as_ref::ResultAsRefSite> {
-        let recv_ty = self.tyref_peel_ref_to_pointee(recv_ty?)?;
-        if !crate::front::result_exc::tyref_is_result(&recv_ty, self.llbc)
-            || !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc)
-        {
-            return None;
-        }
-        let source_types = [
-            self.tyref_adt_type_arg(&recv_ty, 0)?,
-            self.tyref_adt_type_arg(&recv_ty, 1)?,
-        ];
-        let mut payload_types = [ValueType::Unknown, ValueType::Unknown];
-        for (index, source) in source_types.iter().enumerate() {
-            let destination = self.tyref_adt_type_arg(dest_ty, index)?;
-            let node = strip_ty_indirections(tyref_node(&destination, self.llbc)?, self.llbc)?;
-            let reference = node.get("Ref")?.as_array()?;
-            if reference.get(2)?.as_str()? != "Shared" {
-                return None;
-            }
-            let pointee = self.tyref_peel_ref_to_pointee(&destination)?;
-            if tyref_to_ast_string(source, self.llbc) != tyref_to_ast_string(&pointee, self.llbc) {
-                return None;
-            }
-            let ty = tyref_to_value_type_with(
-                source,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            );
-            if !matches!(
-                ty,
-                ValueType::Int
-                    | ValueType::Unsigned
-                    | ValueType::Bool
-                    | ValueType::Float
-                    | ValueType::Str
-            ) || ty
-                != tyref_enum_payload_value_type(
-                    &destination,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    self.gc_struct_ids,
-                    &self.raw_alloc_flavor_structs,
-                )
-            {
-                return None;
-            }
-            payload_types[index] = ty;
-        }
-        let source_decl = self.llbc.type_by_id(self.tyref_adt_def_id(&recv_ty)?)?;
-        let dest_decl = self.llbc.type_by_id(self.tyref_adt_def_id(dest_ty)?)?;
-        let receiver_owner = format!(
-            "{}{}",
-            source_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
-        );
-        let result_owner = format!(
-            "{}{}",
-            dest_decl.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
-        );
-        Some(crate::front::result_as_ref::ResultAsRefSite {
-            result_var: result_var.clone(),
-            receiver_variants: [
-                Self::tagged_pair_payload_owner(source_decl, &receiver_owner, 0)?,
-                Self::tagged_pair_payload_owner(source_decl, &receiver_owner, 1)?,
-            ],
-            result_variants: [
-                Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?,
-                Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?,
-            ],
-            receiver_owner,
-            result_owner,
-            payload_types,
         })
     }
 
@@ -114396,6 +114291,75 @@ mod tests {
                 None
             ),
             Some("Result<usize,u8>".into())
+        );
+    }
+
+    /// `Result::as_ref` stays a regular call to the extracted core body
+    /// `match *self { Ok(ref x) => Ok(x), Err(ref x) => Err(x) }`. The
+    /// tagged-sum Result repr is unchanged; only the caller rewrite is
+    /// gone (`guess_call_kind` regular).
+    #[test]
+    fn result_as_ref_keeps_regular_call_to_core_body() {
+        use crate::model::{CallTarget, ExitSwitch, OpKind};
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        if !std::path::Path::new(path).is_file() {
+            eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+            return;
+        }
+        let llbc = Llbc::load(path).expect("load interpreter LLBC");
+        let caller = super::lower_function(&llbc, "unicode_translate_error_str")
+            .expect("lower unicode_translate_error_str");
+        let as_ref_calls = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "as_ref",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    segments.last().map(String::as_str) == Some("as_ref")
+                        && segments.iter().any(|s| s == "result")
+                }
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            as_ref_calls, 1,
+            "caller keeps one regular call to the core as_ref body, got {as_ref_calls}"
+        );
+
+        let ctx = super::LowerContext::new(&llbc);
+        let mut lowered_core_bodies = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            if !name_path.ends_with("::result::<Impl>::as_ref") {
+                continue;
+            }
+            let graph = super::lower_fun_decl(&ctx, fd)
+                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let has_disc = graph.blocks.iter().any(|block| {
+                matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                    || block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                        )
+                    })
+            });
+            assert!(has_disc, "{name_path}: core body matches on the Result tag");
+            lowered_core_bodies += 1;
+        }
+        assert_eq!(
+            lowered_core_bodies, 1,
+            "extracted as_ref FunDecl bodies must lower, got {lowered_core_bodies}"
         );
     }
 

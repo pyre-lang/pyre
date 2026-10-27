@@ -118,6 +118,8 @@ CHARON_CORE_INCLUDE = [
     "core::option::_::is_none_or",
     "--include",
     "core::result::_::ok",
+    "--include",
+    "core::result::_::as_ref",
 ]
 CHARON_ARGS = [
     "--hide-marker-traits",
