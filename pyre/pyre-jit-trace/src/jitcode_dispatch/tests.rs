@@ -5776,8 +5776,8 @@ fn module_dict_strategy_mutated_assembles_jit_force_quasi_immutable_llop() {
 fn assembled_w_ctype_mutate_size_quasi_descr_is_the_embedded_field() {
     // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
     // with mutate_field `mutate_size` for `ctypeobj.py W_CType.size?`.
-    // Assembler `fielddescrof` must resolve that name to the embedded
-    // `QuasiImmutField` `rclass.py InstanceRepr._setup_repr` synthesizes.
+    // Assembler `fielddescrof` must resolve that name to the hidden
+    // `mutate_size` word `rclass.py InstanceRepr._setup_repr` synthesizes.
     // An offset-0 mint sends `get_current_qmut_instance` into the object
     // header (`w_class` is the lock word).
     let expected = pyre_module::module::_cffi_backend::ctypeobj::W_CTYPE_MUTATE_SIZE_OFFSET;
@@ -6743,9 +6743,11 @@ fn walker_pin_holder_attr_records_quasiimmut_from_mutate_descr() {
     let holder = Box::into_raw(Box::new(pyre_object::mapdict::CachedAttributeHolder {
         order: 0,
         attr: std::cell::Cell::new(std::ptr::null()),
-        mutate_attr: pyre_object::quasiimmut::QuasiImmutField::new(),
+        mutate_attr: pyre_object::quasiimmut::null_mutate_word(),
+        mutate_attr_lock: pyre_object::quasiimmut::null_mutate_lock(),
         typ: std::cell::Cell::new(None),
-        mutate_typ: pyre_object::quasiimmut::QuasiImmutField::new(),
+        mutate_typ: pyre_object::quasiimmut::null_mutate_word(),
+        mutate_typ_lock: pyre_object::quasiimmut::null_mutate_lock(),
     }));
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| walker_pin_holder_attr(wc, 0, holder).expect("pin"),
@@ -6764,9 +6766,11 @@ fn walker_pin_holder_typ_records_quasiimmut_from_mutate_descr() {
     let holder = Box::into_raw(Box::new(pyre_object::mapdict::CachedAttributeHolder {
         order: 0,
         attr: std::cell::Cell::new(std::ptr::null()),
-        mutate_attr: pyre_object::quasiimmut::QuasiImmutField::new(),
+        mutate_attr: pyre_object::quasiimmut::null_mutate_word(),
+        mutate_attr_lock: pyre_object::quasiimmut::null_mutate_lock(),
         typ: std::cell::Cell::new(None),
-        mutate_typ: pyre_object::quasiimmut::QuasiImmutField::new(),
+        mutate_typ: pyre_object::quasiimmut::null_mutate_word(),
+        mutate_typ_lock: pyre_object::quasiimmut::null_mutate_lock(),
     }));
     walker_pin_mapdict_records_quasiimmut_from_mutate(
         |wc| walker_pin_holder_typ(wc, 0, holder).expect("pin"),
@@ -7022,7 +7026,14 @@ fn walker_test_get_current_qmut_instance(
     field_addr: i64,
 ) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
     assert_ne!(field_addr, 0);
-    let field = unsafe { &*(field_addr as *const pyre_object::quasiimmut::QuasiImmutField) };
+    // Safety: `get_current_qmut_instance` derives the address from a live
+    // struct pointer plus the mutate field descr's offset; that field is
+    // the mutate word, with the lock word immediately after.
+    let field = unsafe {
+        pyre_object::quasiimmut::QuasiImmutField::from_mutate_word(
+            field_addr as *const std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
+        )
+    };
     std::sync::Arc::new(WalkerRecordedQuasiImmut(field.get_current_qmut_instance()))
 }
 

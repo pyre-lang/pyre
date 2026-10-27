@@ -829,13 +829,27 @@ pub struct PyCode {
     /// (`malloc_typed_stable`), which is what lets a recorded watcher keep
     /// this address. The collector runs no `Drop`, so [`pycode_destructor`]
     /// reclaims the instance.
-    pub mutate_w_globals: pyre_object::quasiimmut::QuasiImmutField,
+    pub mutate_w_globals: std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
+    pub mutate_w_globals_lock:
+        std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmutLock>,
     /// Per-code result of the runtime frame-shape gate.
     ///
     /// 0 is uncomputed; a later fill stores `1 +` the shape discriminant.
     /// `pycode.py` keeps per-code JIT state on `PyCode` (`jit_cells`); this
     /// is the same owner for the pyre-only shape latch.
     pub jit_shape: std::sync::atomic::AtomicU8,
+}
+
+pyre_object::quasi_immut_words!(PyCode, mutate_w_globals, mutate_w_globals_lock);
+
+impl PyCode {
+    #[inline]
+    pub fn mutate_w_globals(&self) -> pyre_object::quasiimmut::QuasiImmutField<'_> {
+        pyre_object::quasiimmut::QuasiImmutField::new(
+            &self.mutate_w_globals,
+            &self.mutate_w_globals_lock,
+        )
+    }
 }
 
 /// Field offset of `code_ptr` within `PyCode`.
@@ -1420,7 +1434,8 @@ fn w_code_new_owned(
             std::sync::atomic::AtomicI64::new(ADDR2LINE_MEMO_EMPTY)
         }),
         loop_header_info: std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()),
-        mutate_w_globals: pyre_object::quasiimmut::QuasiImmutField::new(),
+        mutate_w_globals: pyre_object::quasiimmut::null_mutate_word(),
+        mutate_w_globals_lock: pyre_object::quasiimmut::null_mutate_lock(),
         jit_shape: std::sync::atomic::AtomicU8::new(JIT_SHAPE_UNCOMPUTED),
     };
     // The raw-address JIT compatibility seam described above requires a
@@ -4068,7 +4083,7 @@ pub unsafe fn w_code_current_w_globals_qmut(
     }
     Some(unsafe {
         (*(obj as *const PyCode))
-            .mutate_w_globals
+            .mutate_w_globals()
             .get_current_qmut_instance()
     })
 }
@@ -4884,7 +4899,7 @@ pub unsafe fn pycode_destructor(obj_addr: usize) {
     // out-of-line lock. Releasing one strong count leaves an in-flight
     // compile's clone alive. Same release `property_destructor` performs for
     // `w_fget?`.
-    unsafe { code.mutate_w_globals.reclaim() };
+    unsafe { code.mutate_w_globals().reclaim() };
     let wrapper = obj_addr as PyObjectRef;
     {
         let mut wrappers = live_code_wrappers().lock();

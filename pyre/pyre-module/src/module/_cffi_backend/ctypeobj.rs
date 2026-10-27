@@ -120,7 +120,8 @@ pub struct W_CType {
     /// synthesizes as `mutate_<name>` for `ctypeobj.py` `"size?"`.
     ///
     /// Holds no GC pointers.
-    pub mutate_size: pyre_object::quasiimmut::QuasiImmutField,
+    pub mutate_size: std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
+    pub mutate_size_lock: std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmutLock>,
     /// `W_CType.name`.  Interpreter-level, as upstream has it: `cname`
     /// wraps it on each read.  Every ctype is memoised and rooted for the
     /// process, so its name is leaked on the same terms.
@@ -186,6 +187,8 @@ pub struct W_CType {
     pub lazy_sindex: i64,
 }
 
+pyre_object::quasi_immut_words!(W_CType, mutate_size, mutate_size_lock);
+
 /// Byte offset of `mutate_size` within [`W_CType`].
 /// `rclass.py InstanceRepr._setup_repr` / `quasiimmut.py get_mutate_field_name`.
 pub const W_CTYPE_MUTATE_SIZE_OFFSET: usize = std::mem::offset_of!(W_CType, mutate_size);
@@ -194,6 +197,11 @@ const _: () = assert!(W_CTYPE_MUTATE_SIZE_OFFSET != 0);
 const _: () = assert!(W_CTYPE_MUTATE_SIZE_OFFSET != pyre_object::pyobject::W_CLASS_OFFSET);
 
 impl W_CType {
+    #[inline]
+    pub fn mutate_size(&self) -> pyre_object::quasiimmut::QuasiImmutField<'_> {
+        pyre_object::quasiimmut::QuasiImmutField::new(&self.mutate_size, &self.mutate_size_lock)
+    }
+
     /// `W_CType.name`.
     pub fn name(&self) -> &'static str {
         self.name
@@ -390,24 +398,19 @@ pub fn new_ctype(
     let ctitem_slot = roots.base();
     let _ = roots.pin_root(ctitem);
 
-    W_CType::allocate_stable(W_CType {
-        size,
-        mutate_size: pyre_object::quasiimmut::QuasiImmutField::new(),
-        name: String::leak(name.to_string()),
-        name_position,
-        kind,
-        align,
-        ctitem: roots.get(ctitem_slot),
-        pointer_type: pyre_object::PY_NULL,
-        array_types: pyre_object::PY_NULL,
-        ctptr: pyre_object::PY_NULL,
-        length,
-        flags,
-        value_fits_long: flags & CTypeFlags::VALUE_FITS_LONG.bits() != 0,
-        value_smaller_than_long: flags & CTypeFlags::VALUE_SMALLER_THAN_LONG.bits() != 0,
-        value_fits_ulong: flags & CTypeFlags::VALUE_FITS_ULONG.bits() != 0,
-        ..Default::default()
-    })
+    let mut ct = W_CType::default();
+    ct.size = size;
+    ct.name = String::leak(name.to_string());
+    ct.name_position = name_position;
+    ct.kind = kind;
+    ct.align = align;
+    ct.ctitem = roots.get(ctitem_slot);
+    ct.length = length;
+    ct.flags = flags;
+    ct.value_fits_long = flags & CTypeFlags::VALUE_FITS_LONG.bits() != 0;
+    ct.value_smaller_than_long = flags & CTypeFlags::VALUE_SMALLER_THAN_LONG.bits() != 0;
+    ct.value_fits_ulong = flags & CTypeFlags::VALUE_FITS_ULONG.bits() != 0;
+    W_CType::allocate_stable(ct)
 }
 
 impl Default for W_CType {
@@ -418,7 +421,8 @@ impl Default for W_CType {
                 w_class: pyre_object::PY_NULL,
             },
             size: -1,
-            mutate_size: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_size: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_size_lock: pyre_object::quasiimmut::null_mutate_lock(),
             name: "",
             name_position: 0,
             kind: KIND_VOID,
@@ -455,7 +459,7 @@ static ROOTED_CTYPES: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(
 pub fn set_size(ct: &mut W_CType, size: i64) {
     let ct_ptr = ct as *mut W_CType;
     unsafe {
-        (*ct_ptr).mutate_size.invalidate_then_store(|| {
+        (*ct_ptr).mutate_size().invalidate_then_store(|| {
             (*ct_ptr).size = size;
         });
     }
@@ -469,7 +473,7 @@ pub fn set_size(ct: &mut W_CType, size: i64) {
 pub unsafe fn w_ctype_dealloc(obj: PyObjectRef) {
     unsafe {
         let ct = &mut *(obj as *mut W_CType);
-        ct.mutate_size.reclaim();
+        ct.mutate_size().reclaim();
         if ct.kind == KIND_FUNC && ct.cif_descr != 0 {
             super::ctypefunc::free_cif_descr(ct.cif_descr);
             ct.cif_descr = 0;
@@ -1051,12 +1055,13 @@ mod tests {
         );
         let ct = W_CType::default();
         assert_eq!(ct.ob.w_class, pyre_object::PY_NULL);
-        let _qmut = ct.mutate_size.get_current_qmut_instance();
+        let _qmut = ct.mutate_size().get_current_qmut_instance();
         assert_eq!(
             ct.ob.w_class,
             pyre_object::PY_NULL,
             "get_current_qmut_instance on mutate_size must not treat w_class as the field lock"
         );
-        assert!(ct.mutate_size.is_installed());
+        assert!(ct.mutate_size().is_installed());
+        unsafe { ct.mutate_size().reclaim() };
     }
 }

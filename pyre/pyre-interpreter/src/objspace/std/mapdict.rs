@@ -13,7 +13,7 @@
 use crate::PyError;
 use parking_lot::ReentrantMutex;
 use pyre_object::PyObjectRef;
-use pyre_object::quasiimmut::QuasiImmutField;
+use pyre_object::quasiimmut::{null_mutate_lock, null_mutate_word};
 
 use parking_lot::Mutex;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
@@ -262,7 +262,8 @@ pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
     let raw = pyre_object::lltype::malloc_raw(MapNode::Terminator(Terminator {
         w_cls,
         allow_unboxing: Cell::new(true),
-        mutate_allow_unboxing: QuasiImmutField::new(),
+        mutate_allow_unboxing: null_mutate_word(),
+        mutate_allow_unboxing_lock: null_mutate_lock(),
         kind,
         devolved_dict_terminator: Cell::new(std::ptr::null()),
         cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
@@ -1044,7 +1045,8 @@ pub unsafe fn new_plain_attribute(
         num_attributes: back_node.num_attributes() + 1,
         back,
         ever_mutated: Cell::new(false),
-        mutate_ever_mutated: QuasiImmutField::new(),
+        mutate_ever_mutated: null_mutate_word(),
+        mutate_ever_mutated_lock: null_mutate_lock(),
         order,
         cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: back_node.terminator(),
@@ -1097,7 +1099,8 @@ pub unsafe fn new_unboxed_plain_attribute(
         num_attributes: back_node.num_attributes() + 1,
         back,
         ever_mutated: Cell::new(false),
-        mutate_ever_mutated: QuasiImmutField::new(),
+        mutate_ever_mutated: null_mutate_word(),
+        mutate_ever_mutated_lock: null_mutate_lock(),
         order,
         cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: back_node.terminator(),
@@ -5050,9 +5053,11 @@ unsafe fn new_cached_attribute_holder(
     Box::into_raw(Box::new(CachedAttributeHolder {
         order,
         attr: Cell::new(attr),
-        mutate_attr: QuasiImmutField::new(),
+        mutate_attr: null_mutate_word(),
+        mutate_attr_lock: null_mutate_lock(),
         typ: Cell::new(unbox_type),
-        mutate_typ: QuasiImmutField::new(),
+        mutate_typ: null_mutate_word(),
+        mutate_typ_lock: null_mutate_lock(),
     }))
 }
 

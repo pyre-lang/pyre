@@ -13006,7 +13006,12 @@ mod tests {
         field_addr: i64,
     ) -> std::sync::Arc<dyn majit_ir::QuasiImmutHandle> {
         assert_ne!(field_addr, 0);
-        let field = unsafe { &*(field_addr as *const pyre_object::quasiimmut::QuasiImmutField) };
+        let field = unsafe {
+            pyre_object::quasiimmut::QuasiImmutField::from_mutate_word(
+                field_addr
+                    as *const std::sync::atomic::AtomicPtr<pyre_object::quasiimmut::QuasiImmut>,
+            )
+        };
         std::sync::Arc::new(RecordedQuasiImmut(field.get_current_qmut_instance()))
     }
 

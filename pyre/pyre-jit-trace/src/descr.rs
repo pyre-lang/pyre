@@ -2432,8 +2432,8 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // needs the census entry that gets it NULLed behind the allocation.
             field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
             field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
-            // Hidden `mutate_<name>` words. `Type::Ref` puts both words of
-            // each `QuasiImmutField` in `gc_fielddescrs`, which is what
+            // Hidden `mutate_<name>` words. `Type::Ref` puts both owner words
+            // of each pair in `gc_fielddescrs`, which is what
             // `rewrite.py clear_gc_fields` walks, so a JIT-allocated function
             // gets its NULLs from the allocation clear — the same footing
             // upstream's `mutate_<field>` sits on. The collector does NOT
@@ -2441,36 +2441,42 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // `FUNCTION_GC_PTR_OFFSETS`, which these words are deliberately
             // absent from.
             field("mutate_code", f::FUNCTION_MUTATE_CODE_OFFSET),
-            field("mutate_code_lock", f::FUNCTION_MUTATE_CODE_OFFSET + WORD),
+            field(
+                "mutate_code_lock",
+                std::mem::offset_of!(f::Function, mutate_code_lock),
+            ),
             field(
                 "mutate_w_func_globals_obj",
                 f::FUNCTION_MUTATE_W_FUNC_GLOBALS_OBJ_OFFSET,
             ),
             field(
                 "mutate_w_func_globals_obj_lock",
-                f::FUNCTION_MUTATE_W_FUNC_GLOBALS_OBJ_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_w_func_globals_obj_lock),
             ),
             field("mutate_closure", f::FUNCTION_MUTATE_CLOSURE_OFFSET),
             field(
                 "mutate_closure_lock",
-                f::FUNCTION_MUTATE_CLOSURE_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_closure_lock),
             ),
             field("mutate_defs_w", f::FUNCTION_MUTATE_DEFS_W_OFFSET),
             field(
                 "mutate_defs_w_lock",
-                f::FUNCTION_MUTATE_DEFS_W_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_defs_w_lock),
             ),
             field("mutate_name", f::FUNCTION_MUTATE_NAME_OFFSET),
-            field("mutate_name_lock", f::FUNCTION_MUTATE_NAME_OFFSET + WORD),
+            field(
+                "mutate_name_lock",
+                std::mem::offset_of!(f::Function, mutate_name_lock),
+            ),
             field("mutate_w_qualname", f::FUNCTION_MUTATE_W_QUALNAME_OFFSET),
             field(
                 "mutate_w_qualname_lock",
-                f::FUNCTION_MUTATE_W_QUALNAME_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_w_qualname_lock),
             ),
             field("mutate_w_objclass", f::FUNCTION_MUTATE_W_OBJCLASS_OFFSET),
             field(
                 "mutate_w_objclass_lock",
-                f::FUNCTION_MUTATE_W_OBJCLASS_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_w_objclass_lock),
             ),
             field(
                 "mutate_w_text_signature",
@@ -2478,12 +2484,12 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             ),
             field(
                 "mutate_w_text_signature_lock",
-                f::FUNCTION_MUTATE_W_TEXT_SIGNATURE_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_w_text_signature_lock),
             ),
             field("mutate_w_kw_defs", f::FUNCTION_MUTATE_W_KW_DEFS_OFFSET),
             field(
                 "mutate_w_kw_defs_lock",
-                f::FUNCTION_MUTATE_W_KW_DEFS_OFFSET + WORD,
+                std::mem::offset_of!(f::Function, mutate_w_kw_defs_lock),
             ),
             // `make_weakref_descr(Function)` `_lifeline_` follows the mutate
             // fields in the struct, so it follows them here. Offset order is
@@ -2508,8 +2514,6 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         "function::Function",
     )
 });
-
-const _: () = assert!(std::mem::size_of::<pyre_object::quasiimmut::QuasiImmutField>() == 2 * WORD);
 
 /// Dict storage descriptors, read after a trace has pinned the live strategy.
 ///
@@ -4635,15 +4639,11 @@ static W_TYPE_OBJECT_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> =
         use pyre_object::typeobject::W_TypeObject;
         let w_name_offset = core::mem::offset_of!(W_TypeObject, w_name);
         let version_tag_offset = core::mem::offset_of!(W_TypeObject, version_tag);
-        let mutate_version_tag_offset = core::mem::offset_of!(W_TypeObject, mutate_version_tag)
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+        let mutate_version_tag_offset = core::mem::offset_of!(W_TypeObject, mutate_version_tag);
         let mutate_version_tag_lock_offset =
-            core::mem::offset_of!(W_TypeObject, mutate_version_tag)
-                + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
-        let mutate_w_name_offset = core::mem::offset_of!(W_TypeObject, mutate_w_name)
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-        let mutate_w_name_lock_offset = core::mem::offset_of!(W_TypeObject, mutate_w_name)
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+            core::mem::offset_of!(W_TypeObject, mutate_version_tag_lock);
+        let mutate_w_name_offset = core::mem::offset_of!(W_TypeObject, mutate_w_name);
+        let mutate_w_name_lock_offset = core::mem::offset_of!(W_TypeObject, mutate_w_name_lock);
         let field = |index,
                      field_key: &str,
                      offset,
@@ -4898,10 +4898,8 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
         let caches_size = core::mem::size_of::<
             parking_lot::Mutex<Option<pyre_object::celldict::GlobalCacheRegistry>>,
         >();
-        let mutate_offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-        let mutate_lock_offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+        let mutate_offset = core::mem::offset_of!(ModuleDictStrategy, mutate_version);
+        let mutate_lock_offset = core::mem::offset_of!(ModuleDictStrategy, mutate_version_lock);
         let field = |index,
                      field_key: &str,
                      offset,
@@ -5065,9 +5063,8 @@ fn make_mapdict_quasi_descr_group(
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     let mutate_key = format!("mutate_{watched_key}");
     let mutate_lock_key = format!("mutate_{watched_key}_lock");
-    let mutate_offset = mutate_struct_offset + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_lock_offset =
-        mutate_struct_offset + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+    let mutate_offset = mutate_struct_offset;
+    let mutate_lock_offset = mutate_struct_offset + WORD;
     let field = |field_key: String,
                  offset,
                  field_size,
@@ -5237,14 +5234,10 @@ static HOLDER_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
     use pyre_object::mapdict::CachedAttributeHolder;
     let attr_offset = core::mem::offset_of!(CachedAttributeHolder, attr);
     let typ_offset = core::mem::offset_of!(CachedAttributeHolder, typ);
-    let mutate_attr_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_attr)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_attr_lock_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_attr)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
-    let mutate_typ_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_typ)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_typ_lock_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_typ)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+    let mutate_attr_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_attr);
+    let mutate_attr_lock_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_attr_lock);
+    let mutate_typ_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_typ);
+    let mutate_typ_lock_offset = core::mem::offset_of!(CachedAttributeHolder, mutate_typ_lock);
     let typ_size = core::mem::size_of::<std::cell::Cell<Option<pyre_object::mapdict::UnboxType>>>();
     let field = |field_key: &str,
                  offset,
@@ -5423,18 +5416,12 @@ static W_PROPERTY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Laz
     let fget_offset = core::mem::offset_of!(W_Property, fget);
     let fset_offset = core::mem::offset_of!(W_Property, fset);
     let fdel_offset = core::mem::offset_of!(W_Property, fdel);
-    let mutate_fget_offset = core::mem::offset_of!(W_Property, mutate_fget)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_fget_lock_offset = core::mem::offset_of!(W_Property, mutate_fget)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
-    let mutate_fset_offset = core::mem::offset_of!(W_Property, mutate_fset)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_fset_lock_offset = core::mem::offset_of!(W_Property, mutate_fset)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
-    let mutate_fdel_offset = core::mem::offset_of!(W_Property, mutate_fdel)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_fdel_lock_offset = core::mem::offset_of!(W_Property, mutate_fdel)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+    let mutate_fget_offset = core::mem::offset_of!(W_Property, mutate_fget);
+    let mutate_fget_lock_offset = core::mem::offset_of!(W_Property, mutate_fget_lock);
+    let mutate_fset_offset = core::mem::offset_of!(W_Property, mutate_fset);
+    let mutate_fset_lock_offset = core::mem::offset_of!(W_Property, mutate_fset_lock);
+    let mutate_fdel_offset = core::mem::offset_of!(W_Property, mutate_fdel);
+    let mutate_fdel_lock_offset = core::mem::offset_of!(W_Property, mutate_fdel_lock);
     let field = |index,
                  field_key: &str,
                  offset,
@@ -7781,7 +7768,6 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let int_field = |key, offset, size, signed, immutable| {
         (key, offset, size, Type::Int, signed, immutable, false)
     };
-    let mutate_w_globals = std::mem::offset_of!(PyCode, mutate_w_globals);
     build_object_descr_group_with_def_path(
         std::mem::size_of::<PyCode>(),
         pyre_interpreter::pycode::W_CODE_GC_TYPE_ID,
@@ -7919,13 +7905,13 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // `Type::Ref` + `mutate_<name>_lock` match `FUNCTION_DESCR_GROUP`.
             word_ref(
                 "mutate_w_globals",
-                mutate_w_globals + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                std::mem::offset_of!(PyCode, mutate_w_globals),
                 false,
                 false,
             ),
             word_ref(
                 "mutate_w_globals_lock",
-                mutate_w_globals + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET,
+                std::mem::offset_of!(PyCode, mutate_w_globals_lock),
                 false,
                 false,
             ),
@@ -9128,10 +9114,7 @@ pub fn ec_w_tracefunc_descr() -> DescrRef {
 /// Hidden `mutate_w_tracefunc` (`quasiimmut.py get_mutate_field_name` of pyre
 /// `w_tracefunc`).
 pub fn ec_mutate_w_tracefunc_descr() -> DescrRef {
-    ec_field_descr(
-        pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
-    )
+    ec_field_descr(pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET)
 }
 
 /// Field descr for `ExecutionContext::profilefunc`, the slot
@@ -9147,10 +9130,7 @@ pub fn ec_profilefunc_descr() -> DescrRef {
 /// Hidden `mutate_profilefunc` (`quasiimmut.py get_mutate_field_name` of pyre
 /// `profilefunc`).
 pub fn ec_mutate_profilefunc_descr() -> DescrRef {
-    ec_field_descr(
-        pyre_interpreter::EC_MUTATE_PROFILEFUNC_OFFSET
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
-    )
+    ec_field_descr(pyre_interpreter::EC_MUTATE_PROFILEFUNC_OFFSET)
 }
 
 /// Resolve one `EC_DESCR_GROUP` field by byte offset.  The group stamps
@@ -9273,14 +9253,10 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
     // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
     profilefunc.is_immutable = true;
     profilefunc.is_quasi_immutable = true;
-    let mutate_w_tracefunc_offset = pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_w_tracefunc_lock_offset = pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
-    let mutate_profilefunc_offset = pyre_interpreter::EC_MUTATE_PROFILEFUNC_OFFSET
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_profilefunc_lock_offset = pyre_interpreter::EC_MUTATE_PROFILEFUNC_OFFSET
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+    let mutate_w_tracefunc_offset = pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET;
+    let mutate_w_tracefunc_lock_offset = pyre_interpreter::EC_MUTATE_W_TRACEFUNC_OFFSET + WORD;
+    let mutate_profilefunc_offset = pyre_interpreter::EC_MUTATE_PROFILEFUNC_OFFSET;
+    let mutate_profilefunc_lock_offset = pyre_interpreter::EC_MUTATE_PROFILEFUNC_OFFSET + WORD;
     let mut specs = vec![
         field(
             u32::MAX,
@@ -9368,10 +9344,8 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
 static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     use pyre_object::gil_ready::GilReadyState;
-    let mutate_offset = std::mem::offset_of!(GilReadyState, mutate_gil_ready)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
-    let mutate_lock_offset = std::mem::offset_of!(GilReadyState, mutate_gil_ready)
-        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+    let mutate_offset = std::mem::offset_of!(GilReadyState, mutate_gil_ready);
+    let mutate_lock_offset = std::mem::offset_of!(GilReadyState, mutate_gil_ready_lock);
     let field = |field_key: &str,
                  offset,
                  field_size,
@@ -11379,7 +11353,8 @@ mod tests {
             terminator: std::ptr::null(),
             w_cls: pyre_object::PY_NULL,
             allow_unboxing: Cell::new(true),
-            mutate_allow_unboxing: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_allow_unboxing: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_allow_unboxing_lock: pyre_object::quasiimmut::null_mutate_lock(),
             kind: TerminatorKind::NoDict,
             devolved_dict_terminator: Cell::new(std::ptr::null()),
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
@@ -11398,7 +11373,8 @@ mod tests {
             num_attributes: 1,
             back: std::ptr::null(),
             ever_mutated: Cell::new(false),
-            mutate_ever_mutated: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_ever_mutated: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_ever_mutated_lock: pyre_object::quasiimmut::null_mutate_lock(),
             order: 0,
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
             unboxed: None,
@@ -11412,9 +11388,11 @@ mod tests {
         let holder = CachedAttributeHolder {
             order: 0,
             attr: Cell::new(std::ptr::null()),
-            mutate_attr: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_attr: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_attr_lock: pyre_object::quasiimmut::null_mutate_lock(),
             typ: Cell::new(None::<UnboxType>),
-            mutate_typ: pyre_object::quasiimmut::QuasiImmutField::new(),
+            mutate_typ: pyre_object::quasiimmut::null_mutate_word(),
+            mutate_typ_lock: pyre_object::quasiimmut::null_mutate_lock(),
         };
         let mutate_attr = holder_mutate_attr_descr();
         let off = mutate_attr.as_field_descr().expect("mutate descr").offset();
@@ -13407,8 +13385,7 @@ mod tests {
     fn module_dict_mutate_version_descr_is_pointer_sized_ref() {
         let descr = module_dict_mutate_version_descr();
         let field = descr.as_field_descr().expect("field descr");
-        let offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+        let offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET;
         assert_eq!(field.offset(), offset);
         assert_eq!(field.field_size(), WORD);
         assert_eq!(field.field_type(), Type::Ref);
@@ -13484,8 +13461,7 @@ mod tests {
         use majit_jitcode::jitcode::BhDescr;
 
         let canonical = module_dict_mutate_version_descr();
-        let offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET
-            + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+        let offset = pyre_object::celldict::MODULE_DICT_MUTATE_VERSION_OFFSET;
         for owner in [
             "ModuleDictStrategy",
             "celldict::ModuleDictStrategy",
@@ -13510,25 +13486,6 @@ mod tests {
                 "{owner}.mutate_version must bridge to the Type::Ref descr",
             );
         }
-
-        let nested = make_descr_from_bh(&BhDescr::Field {
-            offset,
-            field_size: 2 * WORD,
-            field_type: Type::Ref,
-            field_flag: ArrayFlag::Struct,
-            is_field_signed: false,
-            is_immutable: false,
-            is_quasi_immutable: false,
-            index_in_parent: Some(0),
-            parent: None,
-            name: "mutate_version".into(),
-            owner: "ModuleDictStrategy".into(),
-            load_is_acquire: false,
-        });
-        assert!(
-            std::sync::Arc::ptr_eq(&nested, &canonical),
-            "a two-word STRUCT spelling must still bridge onto the pointer word",
-        );
 
         let narrow = make_descr_from_bh(&BhDescr::Field {
             offset,
@@ -13834,8 +13791,7 @@ mod tests {
                     "objspace::std::mapdict::Terminator",
                 ],
                 "mutate_allow_unboxing",
-                core::mem::offset_of!(Terminator, mutate_allow_unboxing)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(Terminator, mutate_allow_unboxing),
                 WORD,
                 Type::Ref,
                 false,
@@ -13859,8 +13815,7 @@ mod tests {
                     "pyre_object::mapdict::PlainAttribute",
                 ],
                 "mutate_ever_mutated",
-                core::mem::offset_of!(PlainAttribute, mutate_ever_mutated)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(PlainAttribute, mutate_ever_mutated),
                 WORD,
                 Type::Ref,
                 false,
@@ -13884,8 +13839,7 @@ mod tests {
                     "pyre_object::mapdict::CachedAttributeHolder",
                 ],
                 "mutate_attr",
-                core::mem::offset_of!(CachedAttributeHolder, mutate_attr)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(CachedAttributeHolder, mutate_attr),
                 WORD,
                 Type::Ref,
                 false,
@@ -13909,8 +13863,7 @@ mod tests {
                     "pyre_object::mapdict::CachedAttributeHolder",
                 ],
                 "mutate_typ",
-                core::mem::offset_of!(CachedAttributeHolder, mutate_typ)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(CachedAttributeHolder, mutate_typ),
                 WORD,
                 Type::Ref,
                 false,
@@ -13946,8 +13899,7 @@ mod tests {
         }
 
         let nested = make_descr_from_bh(&BhDescr::Field {
-            offset: core::mem::offset_of!(Terminator, mutate_allow_unboxing)
-                + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+            offset: core::mem::offset_of!(Terminator, mutate_allow_unboxing),
             field_size: 2 * WORD,
             field_type: Type::Ref,
             field_flag: ArrayFlag::Struct,
@@ -13992,8 +13944,7 @@ mod tests {
                     "pyre_object::nestedscope::CellFamily",
                 ],
                 "mutate_ever_mutated",
-                core::mem::offset_of!(CellFamily, mutate_ever_mutated)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(CellFamily, mutate_ever_mutated),
                 WORD,
                 Type::Ref,
                 false,
@@ -14017,8 +13968,7 @@ mod tests {
                     "pyre_interpreter::module::sys::vm::AuditHolder",
                 ],
                 "mutate_hooks_armed",
-                core::mem::offset_of!(AuditHolder, mutate_hooks_armed)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(AuditHolder, mutate_hooks_armed),
                 WORD,
                 Type::Ref,
                 false,
@@ -14044,8 +13994,7 @@ mod tests {
                     "pyre_object::gil_ready::GilReadyState",
                 ],
                 "mutate_gil_ready",
-                std::mem::offset_of!(pyre_object::gil_ready::GilReadyState, mutate_gil_ready)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                std::mem::offset_of!(pyre_object::gil_ready::GilReadyState, mutate_gil_ready),
                 WORD,
                 Type::Ref,
                 false,
@@ -14069,8 +14018,7 @@ mod tests {
                     "pyre_object::descriptor::W_Property",
                 ],
                 "mutate_fget",
-                core::mem::offset_of!(pyre_object::descriptor::W_Property, mutate_fget)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(pyre_object::descriptor::W_Property, mutate_fget),
                 WORD,
                 Type::Ref,
                 false,
@@ -14094,8 +14042,7 @@ mod tests {
                     "pyre_object::descriptor::W_Property",
                 ],
                 "mutate_fset",
-                core::mem::offset_of!(pyre_object::descriptor::W_Property, mutate_fset)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(pyre_object::descriptor::W_Property, mutate_fset),
                 WORD,
                 Type::Ref,
                 false,
@@ -14119,8 +14066,7 @@ mod tests {
                     "pyre_object::descriptor::W_Property",
                 ],
                 "mutate_fdel",
-                core::mem::offset_of!(pyre_object::descriptor::W_Property, mutate_fdel)
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                core::mem::offset_of!(pyre_object::descriptor::W_Property, mutate_fdel),
                 WORD,
                 Type::Ref,
                 false,
@@ -14144,8 +14090,7 @@ mod tests {
                     "pyre_object::function::StaticMethod",
                 ],
                 "mutate_w_function",
-                pyre_object::function::STATICMETHOD_MUTATE_W_FUNCTION_OFFSET
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                pyre_object::function::STATICMETHOD_MUTATE_W_FUNCTION_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -14169,8 +14114,7 @@ mod tests {
                     "pyre_object::function::ClassMethod",
                 ],
                 "mutate_w_function",
-                pyre_object::function::CLASSMETHOD_MUTATE_W_FUNCTION_OFFSET
-                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                pyre_object::function::CLASSMETHOD_MUTATE_W_FUNCTION_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -16308,19 +16252,17 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             }
             // `ModuleDictStrategy.mutate_version` is the hidden OBJECTPTR
             // `rclass.py _setup_repr` adds for `version?`. The codewriter
-            // names the owner by leaf or by module path; a nested
-            // `QuasiImmutField` may arrive as a two-word STRUCT at the same
-            // offset. Bridge to the pointer-sized `Type::Ref` descr before
-            // the generic parent lookup mints a twin. Lookup is by name
-            // (`descr.py get_field_descr(STRUCT, fieldname)`), so a STRUCT
-            // or unsigned-pointer spelling of the same slot still lands here.
+            // names the owner by leaf or by module path. Bridge to the
+            // pointer-sized `Type::Ref` descr before the generic parent
+            // lookup mints a twin. Lookup is by name
+            // (`descr.py get_field_descr(STRUCT, fieldname)`).
             if (owner.as_str() == "ModuleDictStrategy"
                 || owner.as_str().ends_with("::ModuleDictStrategy"))
                 && name.as_str() == "mutate_version"
             {
                 let canonical = module_dict_mutate_version_descr();
                 if let Some(field) = canonical.as_field_descr()
-                    && (*field_size == field.field_size() || *field_size == 2 * WORD)
+                    && *field_size == field.field_size()
                 {
                     return canonical;
                 }
@@ -17349,7 +17291,7 @@ fn mint_field(
             .field_descrs
             .iter()
             .find(|descr| descr.field_key() == "mutate_version")
-            && (*field_size == canonical.field_size() || *field_size == 2 * WORD)
+            && *field_size == canonical.field_size()
         {
             return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
         }

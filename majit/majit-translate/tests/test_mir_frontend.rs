@@ -3442,7 +3442,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                             && field.owner_root.as_deref() == Some("pyobject::PyObject")
                 )
             }),
-        "FrameBox::new must copy ob_header.w_class through the inner struct descriptor"
+        "offset-0 header is the `super` chain: inner PyObject descriptors"
     );
 }
 

@@ -4892,6 +4892,29 @@ pub(in crate::front::mir) fn struct_copy_owner_keys(
     (owner_root, owner_id)
 }
 
+pub(in crate::front::mir) fn type_decl_struct_field_offset(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    field_idx: usize,
+) -> Option<u64> {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    td.layout_for_target(llbc, &target)
+        .and_then(|layout| layout.struct_field_offset(field_idx))
+}
+
+/// Leaves of by-value struct `td`, relative to `td`.
+///
+/// A leaf peels the leading offset-0 hops of its containment path: owner is
+/// the deepest struct reached through hops that are all at offset 0, and
+/// name is the rest of the path (dotted only if a nonzero hop remains).
+/// A direct scalar, pointer, or pair field `f` of `td` is owned by `td`
+/// with an empty `super_path`. A leaf of a nested by-value field `m` is
+/// composed with `nest_inline_leaf`: at offset 0 the hop joins the `super`
+/// chain and the inner descr stays (`heaptracker.all_fielddescrs` /
+/// `Transformer.zero_contents` use the inner struct's descr on the outer
+/// object); a nonzero hop, or an unknown Charon offset, spells the remaining
+/// path on `td`. Pair-field (`pair_len_field_name`) leaves of a nested
+/// struct go through the same composition.
 pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     td: &TypeDecl,
     llbc: &Llbc,
@@ -4899,7 +4922,7 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     depth: usize,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
-) -> Vec<(FieldDescriptor, ValueType)> {
+) -> Vec<InlineLeaf> {
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return Vec::new();
     };
@@ -4921,53 +4944,59 @@ pub(in crate::front::mir) fn collect_by_value_struct_leaves(
         if tyref_pair_field_kind(&f.ty, llbc).is_some() {
             let len = pair_len_field_name(&name);
             for fname in [name, len] {
-                leaves.push((
-                    FieldDescriptor::new(fname, Some(owner_root.clone()))
+                leaves.push(InlineLeaf {
+                    field: FieldDescriptor::new(fname, Some(owner_root.clone()))
                         .with_owner_id(Some(owner_id))
                         .with_base_is_deref(false),
-                    ValueType::Unsigned,
-                ));
+                    super_path: String::new(),
+                    ty: ValueType::Unsigned,
+                });
             }
             continue;
         }
         if let Some(nested) = tyref_by_value_struct_decl(&f.ty, llbc) {
-            leaves.extend(collect_by_value_struct_leaves(
+            let at_offset_zero = type_decl_struct_field_offset(td, llbc, i) == Some(0);
+            let container_field = FieldDescriptor::new(name, Some(owner_root.clone()))
+                .with_owner_id(Some(owner_id))
+                .with_base_is_deref(false);
+            for leaf in collect_by_value_struct_leaves(
                 nested,
                 llbc,
                 tombstoned,
                 gc_struct_ids,
                 depth - 1,
                 raw_alloc_flavor_structs,
-            ));
+            ) {
+                leaves.push(nest_inline_leaf(&container_field, at_offset_zero, &leaf));
+            }
             continue;
         }
-        leaves.push((
-            FieldDescriptor::new(name, Some(owner_root.clone()))
+        leaves.push(InlineLeaf {
+            field: FieldDescriptor::new(name, Some(owner_root.clone()))
                 .with_owner_id(Some(owner_id))
                 .with_base_is_deref(false)
                 .with_inline_vec(field_ty_is_inline_vec(&f.ty, llbc)),
-            tyref_to_attr_value_type_for_struct_field(
+            super_path: String::new(),
+            ty: tyref_to_attr_value_type_for_struct_field(
                 &f.ty,
                 td,
                 llbc,
                 gc_struct_ids,
                 raw_alloc_flavor_structs,
             ),
-        ));
+        });
     }
     leaves
 }
 
 /// Leaves of `owner.field` when that field is an inlined by-value struct.
 ///
-/// `None` keeps the existing one-word copy.  `Some` is the immediate
-/// inlined decl's `struct_copy_owner_keys` plus declaration-order leaves
-/// through that inner struct's own descriptors (`owner_root` = the inner
-/// struct), matching a nested `FieldRead` of `frame.ob_header.w_class`
-/// whose base is the outer object and whose descriptor belongs to
-/// `PyObject`.  `typeptr`-like header words are ordinary leaves: this is
-/// a copy of an existing value, not an allocation. A deeper by-value
-/// sub-struct's leaves keep that sub-STRUCT's owner and a bare name.
+/// `None` keeps the existing one-word copy.  `Some` is whether `field` sits
+/// at offset 0 in `owner`, plus declaration-order leaves relative to the
+/// inner owner (`collect_by_value_struct_leaves` on the nested decl).
+/// `typeptr`-like header words are ordinary leaves: this is a copy of an
+/// existing value, not an allocation. A deeper by-value sub-struct's
+/// leaves peel leading offset-0 hops (`nest_inline_leaf`).
 pub(in crate::front::mir) fn inline_struct_field_leaves(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -4980,15 +5009,14 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
     let TypeDeclKind::Struct(fields) = &td.kind else {
         return None;
     };
-    let field = fields
+    let (field_idx, field) = fields
         .iter()
-        .find(|f| f.name.as_deref() == Some(field_name))?;
+        .enumerate()
+        .find(|(_, f)| f.name.as_deref() == Some(field_name))?;
     let nested = tyref_by_value_struct_decl(&field.ty, llbc)?;
-    let (owner_root, owner_id) = struct_copy_owner_keys(nested, tombstoned);
-    Some((
-        owner_root,
-        Some(owner_id),
-        collect_by_value_struct_leaves(
+    Some(crate::model::InlineStructExpansion {
+        at_offset_zero: type_decl_struct_field_offset(td, llbc, field_idx) == Some(0),
+        leaves: collect_by_value_struct_leaves(
             nested,
             llbc,
             tombstoned,
@@ -4996,7 +5024,7 @@ pub(in crate::front::mir) fn inline_struct_field_leaves(
             16,
             raw_alloc_flavor_structs,
         ),
-    ))
+    })
 }
 
 /// Whether the pointee of exactly one raw-pointer layer is a string-family

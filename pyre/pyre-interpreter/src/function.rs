@@ -7,12 +7,15 @@
 //! the globals pointer (no clone).
 
 use pyre_object::pyobject::*;
-use pyre_object::quasiimmut::QuasiImmutField;
+use pyre_object::quasiimmut::{
+    QuasiImmut, QuasiImmutField, QuasiImmutLock, null_mutate_lock, null_mutate_word,
+};
 use pyre_object::unicodeobject::{
     UnicodeValueStorage, Utf8Str, alloc_utf8_payload, as_str_unchecked, utf8_payload_bytes,
     utf8_payload_wtf8, w_str_is_utf8, w_str_storage,
 };
 use rustpython_wtf8::Wtf8Buf;
+use std::sync::atomic::AtomicPtr;
 
 /// Type descriptor for user-defined functions.
 pub static FUNCTION_TYPE: PyType = pyre_object::pyobject::new_pytype_with_weakref(
@@ -207,24 +210,51 @@ pub struct Function {
     /// Hidden `mutate_<name>` fields `quasiimmut.py get_mutate_field_name`
     /// names and `rclass.py _setup_repr` adds as `('mutate_' + name, OBJECTPTR)`
     /// per `function.py Function._immutable_fields_` `?` entry. Null means
-    /// nothing folded the field (`quasiimmut.py`). Both words of each
-    /// [`QuasiImmutField`] are declared `Type::Ref` in `FUNCTION_DESCR_GROUP`
+    /// nothing folded the field (`quasiimmut.py`). Both words of each pair
+    /// are declared `Type::Ref` in `FUNCTION_DESCR_GROUP`
     /// so `rewrite.py clear_gc_fields` NULLs them on a JIT allocation
     /// (incminimark does not zero-fill), while [`FUNCTION_GC_PTR_OFFSETS`]
     /// omits them so the collector never traces them.
-    pub mutate_code: QuasiImmutField,
-    pub mutate_w_func_globals_obj: QuasiImmutField,
-    pub mutate_closure: QuasiImmutField,
-    pub mutate_defs_w: QuasiImmutField,
-    pub mutate_name: QuasiImmutField,
-    pub mutate_w_qualname: QuasiImmutField,
-    pub mutate_w_objclass: QuasiImmutField,
-    pub mutate_w_text_signature: QuasiImmutField,
-    pub mutate_w_kw_defs: QuasiImmutField,
+    pub mutate_code: AtomicPtr<QuasiImmut>,
+    pub mutate_code_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_w_func_globals_obj: AtomicPtr<QuasiImmut>,
+    pub mutate_w_func_globals_obj_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_closure: AtomicPtr<QuasiImmut>,
+    pub mutate_closure_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_defs_w: AtomicPtr<QuasiImmut>,
+    pub mutate_defs_w_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_name: AtomicPtr<QuasiImmut>,
+    pub mutate_name_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_w_qualname: AtomicPtr<QuasiImmut>,
+    pub mutate_w_qualname_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_w_objclass: AtomicPtr<QuasiImmut>,
+    pub mutate_w_objclass_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_w_text_signature: AtomicPtr<QuasiImmut>,
+    pub mutate_w_text_signature_lock: AtomicPtr<QuasiImmutLock>,
+    pub mutate_w_kw_defs: AtomicPtr<QuasiImmut>,
+    pub mutate_w_kw_defs_lock: AtomicPtr<QuasiImmutLock>,
     /// `function.py` `make_weakref_descr(Function)` `_lifeline_`.
     /// `builtin_function_or_method` shares this payload.
     pub lifeline: PyObjectRef,
 }
+
+pyre_object::quasi_immut_words!(Function, mutate_code, mutate_code_lock);
+pyre_object::quasi_immut_words!(
+    Function,
+    mutate_w_func_globals_obj,
+    mutate_w_func_globals_obj_lock
+);
+pyre_object::quasi_immut_words!(Function, mutate_closure, mutate_closure_lock);
+pyre_object::quasi_immut_words!(Function, mutate_defs_w, mutate_defs_w_lock);
+pyre_object::quasi_immut_words!(Function, mutate_name, mutate_name_lock);
+pyre_object::quasi_immut_words!(Function, mutate_w_qualname, mutate_w_qualname_lock);
+pyre_object::quasi_immut_words!(Function, mutate_w_objclass, mutate_w_objclass_lock);
+pyre_object::quasi_immut_words!(
+    Function,
+    mutate_w_text_signature,
+    mutate_w_text_signature_lock
+);
+pyre_object::quasi_immut_words!(Function, mutate_w_kw_defs, mutate_w_kw_defs_lock);
 
 /// Number of `?` entries in `function.py:34-42 _immutable_fields_`.
 ///
@@ -290,35 +320,71 @@ impl QuasiImmutSlot {
 }
 
 impl Function {
-    /// The inline `mutate_<name>` field `quasiimmut.py get_mutate_field_name`
-    /// names for `slot`.
     #[inline]
-    pub fn mutate_field(&self, slot: QuasiImmutSlot) -> &QuasiImmutField {
-        match slot {
-            QuasiImmutSlot::Code => &self.mutate_code,
-            QuasiImmutSlot::WFuncGlobalsObj => &self.mutate_w_func_globals_obj,
-            QuasiImmutSlot::Closure => &self.mutate_closure,
-            QuasiImmutSlot::DefsW => &self.mutate_defs_w,
-            QuasiImmutSlot::Name => &self.mutate_name,
-            QuasiImmutSlot::WQualname => &self.mutate_w_qualname,
-            QuasiImmutSlot::WObjclass => &self.mutate_w_objclass,
-            QuasiImmutSlot::WTextSignature => &self.mutate_w_text_signature,
-            QuasiImmutSlot::WKwDefs => &self.mutate_w_kw_defs,
-        }
+    pub fn mutate_code(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_code, &self.mutate_code_lock)
     }
 
     #[inline]
-    pub fn mutate_field_mut(&mut self, slot: QuasiImmutSlot) -> &mut QuasiImmutField {
+    pub fn mutate_w_func_globals_obj(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(
+            &self.mutate_w_func_globals_obj,
+            &self.mutate_w_func_globals_obj_lock,
+        )
+    }
+
+    #[inline]
+    pub fn mutate_closure(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_closure, &self.mutate_closure_lock)
+    }
+
+    #[inline]
+    pub fn mutate_defs_w(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_defs_w, &self.mutate_defs_w_lock)
+    }
+
+    #[inline]
+    pub fn mutate_name(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_name, &self.mutate_name_lock)
+    }
+
+    #[inline]
+    pub fn mutate_w_qualname(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_w_qualname, &self.mutate_w_qualname_lock)
+    }
+
+    #[inline]
+    pub fn mutate_w_objclass(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_w_objclass, &self.mutate_w_objclass_lock)
+    }
+
+    #[inline]
+    pub fn mutate_w_text_signature(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(
+            &self.mutate_w_text_signature,
+            &self.mutate_w_text_signature_lock,
+        )
+    }
+
+    #[inline]
+    pub fn mutate_w_kw_defs(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_w_kw_defs, &self.mutate_w_kw_defs_lock)
+    }
+
+    /// The inline `mutate_<name>` field `quasiimmut.py get_mutate_field_name`
+    /// names for `slot`.
+    #[inline]
+    pub fn mutate_field(&self, slot: QuasiImmutSlot) -> QuasiImmutField<'_> {
         match slot {
-            QuasiImmutSlot::Code => &mut self.mutate_code,
-            QuasiImmutSlot::WFuncGlobalsObj => &mut self.mutate_w_func_globals_obj,
-            QuasiImmutSlot::Closure => &mut self.mutate_closure,
-            QuasiImmutSlot::DefsW => &mut self.mutate_defs_w,
-            QuasiImmutSlot::Name => &mut self.mutate_name,
-            QuasiImmutSlot::WQualname => &mut self.mutate_w_qualname,
-            QuasiImmutSlot::WObjclass => &mut self.mutate_w_objclass,
-            QuasiImmutSlot::WTextSignature => &mut self.mutate_w_text_signature,
-            QuasiImmutSlot::WKwDefs => &mut self.mutate_w_kw_defs,
+            QuasiImmutSlot::Code => self.mutate_code(),
+            QuasiImmutSlot::WFuncGlobalsObj => self.mutate_w_func_globals_obj(),
+            QuasiImmutSlot::Closure => self.mutate_closure(),
+            QuasiImmutSlot::DefsW => self.mutate_defs_w(),
+            QuasiImmutSlot::Name => self.mutate_name(),
+            QuasiImmutSlot::WQualname => self.mutate_w_qualname(),
+            QuasiImmutSlot::WObjclass => self.mutate_w_objclass(),
+            QuasiImmutSlot::WTextSignature => self.mutate_w_text_signature(),
+            QuasiImmutSlot::WKwDefs => self.mutate_w_kw_defs(),
         }
     }
 
@@ -356,7 +422,7 @@ impl Function {
 pub unsafe fn function_quasi_immut_field<'a>(
     obj: PyObjectRef,
     slot: QuasiImmutSlot,
-) -> Option<&'a QuasiImmutField> {
+) -> Option<QuasiImmutField<'a>> {
     if obj.is_null() || !unsafe { is_function_carrier(obj) } {
         return None;
     }
@@ -733,7 +799,7 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
 /// Field block `function_new_impl` publishes for a new `Function`.
 ///
 /// `Function.__init__` leaves the attribute slots null. Each `mutate_<name>`
-/// is a fresh [`QuasiImmutField::new`] — `quasiimmut` `mutate_<name>` stays
+/// is a fresh null mutate-word pair — `quasiimmut` `mutate_<name>` stays
 /// null until the first read is recorded — so a caller that wraps an existing
 /// function must assign copied slots afterwards. Copying that function by
 /// value would share its watchers.
@@ -771,15 +837,24 @@ fn function_object_value(
         w_text_signature: PY_NULL,
         w_new_self: PY_NULL,
         w_moduleobj: PY_NULL,
-        mutate_code: QuasiImmutField::new(),
-        mutate_w_func_globals_obj: QuasiImmutField::new(),
-        mutate_closure: QuasiImmutField::new(),
-        mutate_defs_w: QuasiImmutField::new(),
-        mutate_name: QuasiImmutField::new(),
-        mutate_w_qualname: QuasiImmutField::new(),
-        mutate_w_objclass: QuasiImmutField::new(),
-        mutate_w_text_signature: QuasiImmutField::new(),
-        mutate_w_kw_defs: QuasiImmutField::new(),
+        mutate_code: null_mutate_word(),
+        mutate_code_lock: null_mutate_lock(),
+        mutate_w_func_globals_obj: null_mutate_word(),
+        mutate_w_func_globals_obj_lock: null_mutate_lock(),
+        mutate_closure: null_mutate_word(),
+        mutate_closure_lock: null_mutate_lock(),
+        mutate_defs_w: null_mutate_word(),
+        mutate_defs_w_lock: null_mutate_lock(),
+        mutate_name: null_mutate_word(),
+        mutate_name_lock: null_mutate_lock(),
+        mutate_w_qualname: null_mutate_word(),
+        mutate_w_qualname_lock: null_mutate_lock(),
+        mutate_w_objclass: null_mutate_word(),
+        mutate_w_objclass_lock: null_mutate_lock(),
+        mutate_w_text_signature: null_mutate_word(),
+        mutate_w_text_signature_lock: null_mutate_lock(),
+        mutate_w_kw_defs: null_mutate_word(),
+        mutate_w_kw_defs_lock: null_mutate_lock(),
         lifeline: PY_NULL,
     }
 }
@@ -1294,7 +1369,7 @@ pub unsafe fn demote_module_function_to_builtin(obj: PyObjectRef) {
 ///
 /// The value is a fresh `Function`: `can_change_code` is false
 /// (`BuiltinFunction`) and each `mutate_<name>` is a new
-/// [`QuasiImmutField::new`]. A bytewise copy of `func` would share its
+/// null mutate-word pair. A bytewise copy of `func` would share its
 /// quasi-immutable watchers. `ob_type`
 /// and `w_class` are tagged `BUILTIN_FUNCTION_TYPE` the same way
 /// `demote_module_function_to_builtin` tags them. Allocation is the
@@ -4804,10 +4879,24 @@ mod tests {
             let f = &*(obj as *const Function);
             for (slot, name) in names {
                 assert_eq!(QuasiImmutSlot::from_mutate_field_name(name), slot);
-                let field = f.mutate_field(slot);
-                let offset =
-                    (field as *const QuasiImmutField as usize) - (f as *const Function as usize);
+                let word = match slot {
+                    QuasiImmutSlot::Code => std::ptr::addr_of!(f.mutate_code),
+                    QuasiImmutSlot::WFuncGlobalsObj => {
+                        std::ptr::addr_of!(f.mutate_w_func_globals_obj)
+                    }
+                    QuasiImmutSlot::Closure => std::ptr::addr_of!(f.mutate_closure),
+                    QuasiImmutSlot::DefsW => std::ptr::addr_of!(f.mutate_defs_w),
+                    QuasiImmutSlot::Name => std::ptr::addr_of!(f.mutate_name),
+                    QuasiImmutSlot::WQualname => std::ptr::addr_of!(f.mutate_w_qualname),
+                    QuasiImmutSlot::WObjclass => std::ptr::addr_of!(f.mutate_w_objclass),
+                    QuasiImmutSlot::WTextSignature => {
+                        std::ptr::addr_of!(f.mutate_w_text_signature)
+                    }
+                    QuasiImmutSlot::WKwDefs => std::ptr::addr_of!(f.mutate_w_kw_defs),
+                };
+                let offset = word as usize - (f as *const Function as usize);
                 assert_eq!(offset, function_mutate_field_offset(slot), "{name}");
+                let _ = f.mutate_field(slot);
             }
         }
     }

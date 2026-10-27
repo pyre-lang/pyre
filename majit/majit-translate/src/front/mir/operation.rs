@@ -1034,7 +1034,37 @@ impl<'a> Lowering<'a> {
                                 "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
                             ))
                         })?;
-                        self.emit_inlined_struct_leaf_copy(mir_bb, &base, &src, nested);
+                        let at_offset_zero = self
+                            .struct_field_offset_from_payload(&field_base_ty, field_payload)
+                            == Some(0);
+                        let container_field = match self
+                            .resolve_adt_field(&field_base_ty, field_payload)
+                        {
+                            Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
+                                FieldDescriptor::new(field_name, Some(owner_root))
+                                    .with_owner_id(owner_id)
+                                    .with_owner_declared_gc(container_declared_gc(
+                                        &field_base_ty,
+                                        self.llbc,
+                                        self.gc_struct_ids,
+                                        self.immutable_fields,
+                                    ))
+                                    .with_base_is_deref(base_is_deref)
+                                    .with_host_index(host_index)
+                            }
+                            None => {
+                                FieldDescriptor::new(field_label_from_payload(field_payload), None)
+                                    .with_base_is_deref(base_is_deref)
+                            }
+                        };
+                        self.emit_inlined_struct_leaf_copy(
+                            mir_bb,
+                            &base,
+                            &src,
+                            nested,
+                            &container_field,
+                            at_offset_zero,
+                        );
                         return Ok(());
                     }
                     // Resolve the field through its TypeDecl exactly
