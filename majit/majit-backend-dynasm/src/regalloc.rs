@@ -840,7 +840,7 @@ impl RegisterManager {
         Loc::Reg(reg)
     }
 
-    /// regalloc.py:696
+    /// llsupport/regalloc.py `_sync_var_to_stack`.
     pub fn _sync_var_to_stack(
         &mut self,
         v: &Operand,
