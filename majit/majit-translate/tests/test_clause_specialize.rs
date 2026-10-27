@@ -343,23 +343,45 @@ fn dict_entries_value_set_at_binds_spec_entries_item_ptr() {
     }
 }
 
-/// `index_words_ptr` returns `typed_items_block_items_base as *mut i64`.
-/// That is `rffi.cast` onto `CArrayPtr` (`cast_ptr_to_int` then
-/// `cast_int_to_ptr`) so look-inside answers `SomePtr` for the caller's
-/// `direct_ptradd` (`rffi.py` `ptradd`). Aliasing the CAST_ADDRESS
-/// Instance would fail `ann_direct_ptradd`.
+/// `ll_dict_lookup` / `_ll_write_indexes` access the mutable GcArray behind
+/// `d.indexes`. They must keep GC array operations rather than escaping to
+/// raw pointer arithmetic or treating the shared integer storage as immutable.
 #[test]
-fn index_words_ptr_rffi_casts_items_base_to_carray_ptr() {
+fn dict_indexes_keep_mutable_gc_array_reads_and_writes() {
     let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
-    let graph = lower_function(&llbc, "index_words_ptr").expect("lower index_words_ptr");
+    let graph = lower_function(&llbc, "index_at").expect("lower index_at");
     assert!(
-        graph_calls_leaf(&graph, "cast_ptr_to_int"),
-        "index_words_ptr must rffi.cast via cast_ptr_to_int, ops {:?}",
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(
+                op.kind,
+                OpKind::ArrayRead {
+                    item_ty: ValueType::Int,
+                    nolength: false,
+                    pure: false,
+                    ..
+                }
+            )),
+        "dict index reads must use mutable GC array items, ops {:?}",
         op_kinds(&graph)
     );
+    let graph = lower_function(&llbc, "set_index_at").expect("lower set_index_at");
     assert!(
-        graph_calls_leaf(&graph, "cast_int_to_ptr"),
-        "index_words_ptr must rffi.cast via cast_int_to_ptr, ops {:?}",
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(
+                op.kind,
+                OpKind::ArrayWrite {
+                    item_ty: ValueType::Int,
+                    nolength: false,
+                    ..
+                }
+            )),
+        "dict index writes must use GC array items, ops {:?}",
         op_kinds(&graph)
     );
 }
