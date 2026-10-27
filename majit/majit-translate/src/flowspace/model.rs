@@ -2344,8 +2344,24 @@ impl HostEnv {
             HostObject::new_builtin_callable("majit_rlib.jit.conditional_call4"),
         );
         majit_rlib_jit.module_set(
+            "conditional_call_elidable0",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable0"),
+        );
+        majit_rlib_jit.module_set(
             "conditional_call_elidable1",
             HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable1"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call_elidable2",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable2"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call_elidable3",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable3"),
+        );
+        majit_rlib_jit.module_set(
+            "conditional_call_elidable4",
+            HostObject::new_builtin_callable("majit_rlib.jit.conditional_call_elidable4"),
         );
         // `rlib/nonconst.py NonConstant` is an `ExtRegistryEntry`, never a
         // graph: looking inside it would hand the caller back the very
@@ -2795,7 +2811,7 @@ fn host_env_template_leaf(leaf: &str) -> &str {
 }
 
 /// Residual `majit_rlib::jit::conditional_call0..4` /
-/// `conditional_call_elidable1` leaf. `rlib/jit.py` `ConditionalCallEntry`
+/// `conditional_call_elidable0..4` leaf. `rlib/jit.py` `ConditionalCallEntry`
 /// (`_about_ = _jit_conditional_call, _jit_conditional_call_value`) is one
 /// ExtRegistry object; a harvested body of that leaf is not a
 /// `FunctionDesc`. `__spec_` / `__inst_` / `<…>` spellings of the same
@@ -2810,7 +2826,11 @@ pub(crate) fn is_host_env_conditional_call_leaf(leaf: &str) -> bool {
             | "conditional_call2"
             | "conditional_call3"
             | "conditional_call4"
+            | "conditional_call_elidable0"
             | "conditional_call_elidable1"
+            | "conditional_call_elidable2"
+            | "conditional_call_elidable3"
+            | "conditional_call_elidable4"
     )
 }
 

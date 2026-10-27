@@ -957,8 +957,7 @@ fn transduce_op(
             // transducer has no CallControl; `rewrite_op_direct_call`
             // mints the `dont_look_inside` residual before `guess_call_kind`
             // (`codewriter::get_raw_address`).
-            let args: Vec<FVar> = op.args[1..]
-                .iter()
+            let args: Vec<FVar> = non_void_args(&op.args[1..])
                 .map(|a| materialize(out, block, a))
                 .collect();
             let result = expect_var(&op.result);
@@ -986,8 +985,7 @@ fn transduce_op(
             );
             let cond = materialize(out, block, &op.args[0]);
             let callee = callee_name_from_funcptr(&op.args[1]);
-            let extra_args: Vec<FVar> = op.args[2..]
-                .iter()
+            let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
                 .map(|a| materialize(out, block, a))
                 .collect();
             let result = expect_var(&op.result);
@@ -1014,8 +1012,7 @@ fn transduce_op(
             );
             let value = materialize(out, block, &op.args[0]);
             let callee = callee_name_from_funcptr(&op.args[1]);
-            let extra_args: Vec<FVar> = op.args[2..]
-                .iter()
+            let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
                 .map(|a| materialize(out, block, a))
                 .collect();
             let result = expect_var(&op.result);
@@ -1060,6 +1057,31 @@ pub(crate) fn emit_conditional_call_oopspec(
     )
 }
 
+/// Interpreter-facing `oopspec("jit.conditional_call_value")` Call.
+///
+/// `_rewrite_op_cond_call` reads args[0] as the value, args[1] as
+/// the function (`fn_const_target_of` of a 0-arg `__fn_const` Call),
+/// and args[2:] as the callee arguments. The helper leaf is
+/// `conditional_call_elidableN`.
+pub(crate) fn emit_conditional_call_value_oopspec(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    value: FVar,
+    callee_name: &str,
+    extra_args: Vec<FVar>,
+    result: FVar,
+) {
+    emit_conditional_call_oopspec_named(
+        out,
+        block,
+        value,
+        callee_name,
+        extra_args,
+        result,
+        "conditional_call_elidable",
+    )
+}
+
 /// Interpreter-facing `oopspec("jit.conditional_call")` /
 /// `oopspec("jit.conditional_call_value")` Call.
 ///
@@ -1067,8 +1089,8 @@ pub(crate) fn emit_conditional_call_oopspec(
 /// the function (`fn_const_target_of` of a 0-arg `__fn_const` Call),
 /// and args[2:] as the callee arguments. The helper leaf is
 /// `{helper_prefix}{n}`: `conditional_callN` (`is_jit_conditional_call_path`)
-/// or `conditional_call_elidableN`. Only `conditional_call_elidable1` exists
-/// in majit-rlib.
+/// or `conditional_call_elidableN`. `Transformer._rewrite_op_cond_call`
+/// rejects floats and more than 4 function arguments.
 fn emit_conditional_call_oopspec_named(
     out: &mut crate::model::FunctionGraph,
     block: BlockId,
@@ -1079,10 +1101,12 @@ fn emit_conditional_call_oopspec_named(
     helper_prefix: &str,
 ) {
     let n = extra_args.len();
-    if helper_prefix == "conditional_call_elidable" && n != 1 {
-        panic!(
-            "jtransform_opname::lower_graph: missing majit_rlib::jit::conditional_call_elidable{n} helper"
-        );
+    let has_float = std::iter::once(&cond).chain(extra_args.iter()).any(|v| {
+        v.concretetype()
+            .is_some_and(|ty| crate::model::getkind(&ty) == crate::model::ConcreteType::Float)
+    });
+    if n > 4 || has_float {
+        panic!("Conditional call does not support floats or more than 4 arguments");
     }
     let fn_target = CallTarget::function_path(
         std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
@@ -1373,6 +1397,19 @@ fn record_exact_value_linkarg(hlv: &Hlvalue) -> LinkArg {
         Hlvalue::Variable(v) => LinkArg::Value(v.clone()),
         Hlvalue::Constant(c) => LinkArg::Const(c.clone()),
     }
+}
+
+/// Runtime call operands, dropping Void. Void is compile-time only.
+///
+/// `jtransform.py Transformer.make_three_lists` skips `kind == 'void'`
+/// (`add_in_correct_list`); `call.py CallControl.getcalldescr` builds
+/// `NON_VOID_ARGS` the same way. `_rewrite_op_cond_call` routes extra
+/// args through `rewrite_call` → `make_three_lists`.
+fn non_void_args(args: &[Hlvalue]) -> impl Iterator<Item = &Hlvalue> {
+    args.iter().filter(|hlv| match hlv {
+        Hlvalue::Variable(v) => !matches!(v.concretetype(), Some(LowLevelType::Void)),
+        Hlvalue::Constant(c) => !matches!(c.concretetype, Some(LowLevelType::Void)),
+    })
 }
 
 /// Map a flowspace operand to a model operand `Variable`, materialising
@@ -3000,6 +3037,155 @@ mod tests {
         assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
     }
 
+    /// Void-typed `direct_call` operands are compile-time only
+    /// (`jtransform.py Transformer.make_three_lists`,
+    /// `call.py CallControl.getcalldescr`) and must not be materialised.
+    /// `lowlevel_type_const` is the `T` argument `ll_dict_lookup` receives.
+    #[test]
+    fn lower_graph_skips_void_typed_direct_call_constant_args() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, PtrTarget};
+
+        let size = variable_with_lltype("size", LowLevelType::Unsigned);
+        let startblock = Block::shared(vec![Hlvalue::Variable(size.clone())]);
+        let return_var = variable_with_lltype("out", LowLevelType::Unsigned);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_direct_call_void_t",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+
+        let func_type = FuncType {
+            args: vec![
+                LowLevelType::Unsigned,
+                LowLevelType::Unsigned,
+                LowLevelType::Void,
+            ],
+            result: LowLevelType::Unsigned,
+        };
+        let funcptr = Ptr {
+            TO: PtrTarget::Func(func_type),
+        }
+        ._example();
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+
+        let out = variable_with_lltype("out", LowLevelType::Unsigned);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![
+                callee,
+                Hlvalue::Variable(size),
+                constant_with_lltype(ConstValue::UInt(1280), LowLevelType::Unsigned),
+                lowlevel_type_const(LowLevelType::Unsigned),
+            ],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+
+        let mut calls = Vec::new();
+        let mut const_uints = 0;
+        let mut residual = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::Call { target, args, .. } => calls.push((target.clone(), args.len())),
+                    OpKind::ConstUInt(1280) => const_uints += 1,
+                    other => residual.push(format!("{other:?}")),
+                }
+            }
+        }
+        assert_eq!(
+            const_uints, 1,
+            "the 1280 constant arg materialises as ConstUInt(1280)"
+        );
+        assert_eq!(calls.len(), 1);
+        let (target, argc) = &calls[0];
+        assert_eq!(
+            *target,
+            crate::model::CallTarget::function_path(["<example>"])
+        );
+        assert_eq!(*argc, 2, "size + the materialised 1280; Void T is dropped");
+        assert!(residual.is_empty(), "unexpected residual ops: {residual:?}");
+    }
+
+    /// `build_ll_call_lookup_function_helper_graph` calls `ll_dict_lookup`
+    /// with a Void `T` (`lowlevel_type_const(TYPE_LONG)`). Lowering drops
+    /// that operand rather than materialising it.
+    #[test]
+    fn lower_graph_lowers_ll_call_lookup_function_dropping_void_t() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+        use crate::translator::rtyper::lltypesystem::rordereddict::build_ll_call_lookup_function_helper_graph;
+
+        let dict_ptr = STRPTR.clone();
+        let key_lltype = LowLevelType::Signed;
+        let ensure_ft = FuncType {
+            args: vec![dict_ptr.clone()],
+            result: LowLevelType::Void,
+        };
+        let ensure_fn = functionptr(
+            ensure_ft,
+            "ll_ensure_indexes",
+            None,
+            Some("ll_ensure_indexes".to_string()),
+        );
+        let lookup_ft = FuncType {
+            args: vec![
+                dict_ptr.clone(),
+                key_lltype.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+                LowLevelType::Void,
+            ],
+            result: LowLevelType::Signed,
+        };
+        let lookup_fn = functionptr(
+            lookup_ft,
+            "ll_dict_lookup",
+            None,
+            Some("ll_dict_lookup".to_string()),
+        );
+        let helper = build_ll_call_lookup_function_helper_graph(
+            "ll_call_lookup_function",
+            dict_ptr,
+            key_lltype,
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(ensure_fn)), LowLevelType::Void),
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(lookup_fn)), LowLevelType::Void),
+        )
+        .expect("build_ll_call_lookup_function_helper_graph");
+
+        let model = lower_graph(&helper.graph.borrow());
+        let mut calls = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                if let OpKind::Call { target, args, .. } = &op.kind {
+                    calls.push((target.clone(), args.len()));
+                }
+            }
+        }
+        assert_eq!(
+            calls,
+            vec![
+                (
+                    crate::model::CallTarget::function_path(["ll_ensure_indexes"]),
+                    1
+                ),
+                (
+                    crate::model::CallTarget::function_path(["ll_dict_lookup"]),
+                    4
+                ),
+            ],
+            "lookup keeps d, key, hash, flag and drops Void T"
+        );
+    }
+
     /// A funcptr `_name` is the `::`-joined CallPath. Splitting restores
     /// the marked `["majit_rlib", "jit", "isconstant"]` oopspec path.
     #[test]
@@ -3586,5 +3772,97 @@ mod tests {
             })
         });
         assert!(has_fn_const, "function arg is a 0-arg __fn_const Call");
+    }
+
+    fn lower_jit_conditional_call_value_with_extra(n: usize) -> crate::model::FunctionGraph {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+
+        let value = variable_with_lltype("h", LowLevelType::Signed);
+        let extra: Vec<_> = (0..n)
+            .map(|i| variable_with_lltype(&format!("a{i}"), LowLevelType::Signed))
+            .collect();
+        let mut inputargs = vec![Hlvalue::Variable(value.clone())];
+        inputargs.extend(extra.iter().cloned().map(Hlvalue::Variable));
+        let startblock = Block::shared(inputargs);
+        let return_var = variable_with_lltype("out", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_conditional_call_value",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let ft = FuncType {
+            args: vec![LowLevelType::Signed; n],
+            result: LowLevelType::Signed,
+        };
+        let funcptr = functionptr(ft, "compute", None, Some("compute".to_string()));
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Signed);
+        let mut args = vec![Hlvalue::Variable(value), callee];
+        args.extend(extra.into_iter().map(Hlvalue::Variable));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_conditional_call_value",
+            args,
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        lower_graph(&graph)
+    }
+
+    fn cond_elidable_call_argc(model: &crate::model::FunctionGraph, leaf: &str) -> Vec<usize> {
+        model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    let segs = target.path_segments()?;
+                    if segs == ["majit_rlib", "jit", leaf] {
+                        Some(args.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `Transformer._rewrite_op_cond_call` accepts 0 extra arguments
+    /// (`conditional_call_elidable0`).
+    #[test]
+    fn lower_graph_lowers_jit_conditional_call_value_arity0() {
+        let model = lower_jit_conditional_call_value_with_extra(0);
+        assert_eq!(
+            cond_elidable_call_argc(&model, "conditional_call_elidable0"),
+            vec![2],
+            "one conditional_call_elidable0 Call (value, fn)"
+        );
+    }
+
+    /// `Transformer._rewrite_op_cond_call` accepts 2 extra arguments
+    /// (`conditional_call_elidable2`).
+    #[test]
+    fn lower_graph_lowers_jit_conditional_call_value_arity2() {
+        let model = lower_jit_conditional_call_value_with_extra(2);
+        assert_eq!(
+            cond_elidable_call_argc(&model, "conditional_call_elidable2"),
+            vec![4],
+            "one conditional_call_elidable2 Call (value, fn, a0, a1)"
+        );
+    }
+
+    /// `Transformer._rewrite_op_cond_call` rejects more than 4 function
+    /// arguments.
+    #[test]
+    #[should_panic(expected = "Conditional call does not support floats or more than 4 arguments")]
+    fn lower_graph_jit_conditional_call_value_arity5_is_rejected() {
+        let _ = lower_jit_conditional_call_value_with_extra(5);
     }
 }

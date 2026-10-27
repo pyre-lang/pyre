@@ -9404,9 +9404,11 @@ pub(crate) fn funcobj_from_funcptr_constant(hlv: &Hlvalue) -> Option<_func> {
     }
 }
 
-/// Every `direct_call` / `jit_conditional_call` callee funcobj in `graph`.
+/// Every `direct_call` / `jit_conditional_call` /
+/// `jit_conditional_call_value` callee funcobj in `graph`.
 /// `direct_call` stores the funcptr in args[0]; `jit_conditional_call`
-/// stores it in args[1] (`rlist.py _ll_list_resize_ge`).
+/// and `jit_conditional_call_value` store it in args[1]
+/// (`rlist.py _ll_list_resize_ge` / `rstr.py LLHelpers.ll_strhash`).
 pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
     graph
         .iterblocks()
@@ -9419,7 +9421,7 @@ pub(crate) fn direct_call_funcobjs(graph: &FunctionGraph) -> Vec<_func> {
                 .filter_map(|op| {
                     let funcptr = match op.opname.as_str() {
                         "direct_call" => op.args.first(),
-                        "jit_conditional_call" => op.args.get(1),
+                        "jit_conditional_call" | "jit_conditional_call_value" => op.args.get(1),
                         _ => None,
                     };
                     funcptr.and_then(funcobj_from_funcptr_constant)
@@ -15856,6 +15858,39 @@ mod tests {
             panic!("jit_conditional_call_value arg[1] must be funcptr Constant");
         };
         assert!(format!("{:?}", c_func.value).contains("LLPtr"));
+    }
+
+    /// `ll_strhash` / `ll_unicode_hash` call the internal hash helper
+    /// both as `jit_conditional_call_value` and as `direct_call`.
+    /// `direct_call_funcobjs` collects both funcptrs.
+    #[test]
+    fn direct_call_funcobjs_includes_strhash_conditional_call_value_callee() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+
+        for (name, ptr, internal, inner) in [
+            ("ll_strhash", STRPTR.clone(), "_ll_strhash", "_hash_string"),
+            (
+                "ll_unicode_hash",
+                UNICODEPTR.clone(),
+                "_ll_unicode_strhash",
+                "_hash_unicode_string",
+            ),
+        ] {
+            let ann = RPythonAnnotator::new(None, None, None, false);
+            let rtyper = RPythonTyper::new(&ann);
+            let helper =
+                build_ll_strhash_helper_graph(&rtyper, name, ptr, internal, inner).expect(name);
+            let names: Vec<String> = direct_call_funcobjs(&helper.graph.borrow())
+                .into_iter()
+                .map(|func| func._name)
+                .collect();
+            assert_eq!(
+                names.iter().filter(|n| *n == internal).count(),
+                2,
+                "{name} collects jit_conditional_call_value and direct_call of {internal}: {names:?}"
+            );
+        }
     }
 
     /// `ll_find_char` synthesised against `Ptr(STR)` produces the
