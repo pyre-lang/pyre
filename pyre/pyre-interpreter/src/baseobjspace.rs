@@ -12157,20 +12157,22 @@ pub unsafe fn _pure_version_tag(w_type: *mut PyObject) -> u64 {
 /// change, it reads the live `_version_tag` field; under the JIT for any
 /// other type it goes through the `@elidable_promote` `_pure_version_tag`
 /// so the value folds away on the trace.  Upstream asks
-/// `self.is_heaptype()`.  pyre also asks CPython's HEAPTYPE owner bit: a
-/// `TypeDef` declared `cpython_mutable` keeps `flag_heaptype == false`
-/// but is a CPython heap type and accepts setattr.  Both bits are
-/// immutable fields, so the branch folds on a promoted type.
+/// `self.is_heaptype()` (an immutable field).  pyre also has CPython heap
+/// types that are PyPy builtins (`flag_heaptype == false`): one declared
+/// `cpython_mutable` accepts setattr, so for those it asks the
+/// quasi-immutable `flag_cpython_immutabletype?`, which `PyType_Freeze`
+/// invalidates.
 #[inline]
 pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
     if majit_metainterp::jit::we_are_jitted() {
         if pyre_object::w_type_is_heaptype(w_type)
-            || pyre_object::w_type_is_cpython_heaptype(w_type)
+            || (pyre_object::w_type_is_cpython_heaptype(w_type)
+                && !pyre_object::typeobject::w_type_read_cpython_immutabletype_field(w_type))
         {
-            // Heap types can still be mutated; read the live field (the
-            // caller promotes the result). typeobject.py `version_tag`
-            // returns `self._version_tag` here, a getfield, not the
-            // interpreter Acquire residual.
+            // The tag can still change; read the live field (the caller
+            // promotes the result). typeobject.py `version_tag` returns
+            // `self._version_tag` here, a getfield, not the interpreter
+            // Acquire residual.
             return pyre_object::typeobject::w_type_read_version_tag_field(w_type);
         }
         // Prebuilt objects cannot get their version_tag changed.

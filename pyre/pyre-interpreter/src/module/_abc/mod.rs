@@ -775,7 +775,11 @@ fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
         // `(tp_flags & mask) == flags`: a class already carrying the marker
         // passed it to its descendants at creation
         // (`inherit_flag_map_or_seq`), so that subtree is done.
+        //
+        // `set_flags_recursive` also stops on IMMUTABLETYPE, which
+        // `PyType_Freeze` sets on a heap type without clearing its heap-type bit.
         if !typeobject::w_type_is_heaptype(w_type)
+            || typeobject::w_type_is_cpython_immutabletype(w_type)
             || typeobject::w_type_get_flag_map_or_seq(w_type) == flag
         {
             return;

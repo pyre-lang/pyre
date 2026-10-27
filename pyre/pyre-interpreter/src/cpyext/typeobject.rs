@@ -7059,8 +7059,9 @@ pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
         }
     }
     unsafe {
-        pyre_object::typeobject::w_type_set_heaptype(w_type, false);
-        // Freezing changes CPython's immutable axis but not its HEAPTYPE owner.
+        // `typeobject.c PyType_Freeze` adds IMMUTABLETYPE and keeps HEAPTYPE.
+        // `flag_heaptype` is fixed at construction (`typeobject.py`
+        // `_immutable_fields_`), so only the CPython immutable axis moves.
         pyre_object::w_type_set_cpython_immutabletype(w_type, true);
         if !tp.is_null() {
             (*tp).tp_flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE;

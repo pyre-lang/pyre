@@ -1925,8 +1925,8 @@ fn ll_arraymove_intrinsic(
 }
 
 /// True when `instantiated_name` is a generic instantiation of the enum
-/// variant declaration `root` names (`result::Result<i32,PyError>::Ok` of
-/// `Result::Ok`).
+/// variant template `root` names (`result::Result<i32,PyError>::Ok` of
+/// `Result::Ok`).  `root` itself must be a template, not an instantiation.
 ///
 /// `bookkeeper.py` `getdesc` keys the class object, never a spelling.  The
 /// declaration identity here is the name -> `StructId` table
@@ -1939,6 +1939,13 @@ fn instantiates_variant_declaration(
     root: &str,
 ) -> bool {
     if !instantiated_name.contains('<') {
+        return false;
+    }
+    // A destination spelled with generic arguments is a concrete
+    // instantiation, whose own ClassDef is the cast result (`rclass.py`
+    // `InstanceRepr.convert_from_to` compares the actual classes).  Only a
+    // template destination keeps the operand's instantiation.
+    if root.contains('<') {
         return false;
     }
     let template = majit_ir::descr::strip_generic_args(instantiated_name);
@@ -3871,6 +3878,14 @@ mod tests {
             !instantiates_variant_declaration(&bk, "result::Result<i32,PyError>", "Result::Ok"),
             "enum instantiation is not the Ok variant"
         );
+        assert!(
+            !instantiates_variant_declaration(
+                &bk,
+                &ok_cd.borrow().name,
+                "result::Result<f64,PyError>::Ok"
+            ),
+            "a concrete instantiation destination is not a template"
+        );
     }
 
     /// `a::Result<i32,E>::Ok` and `b::Result::Ok` share `(Result, Ok)`
@@ -4033,6 +4048,84 @@ mod tests {
                 .as_ref()
                 .is_some_and(|cd| std::rc::Rc::ptr_eq(cd, &ok_cd)),
             "cast must keep a::Result<i32,E>::Ok"
+        );
+    }
+
+    /// Casting `a::Result<i32,E>::Ok` to `a::Result<f64,E>::Ok` yields the f64 destination ClassDef.
+    #[test]
+    fn cast_instance_uses_destination_for_a_concrete_instantiation_destination() {
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        let bk = bk();
+        let a_ok = majit_ir::descr::StructId::from_canonical("a::Result::Ok");
+        let a_result = majit_ir::descr::StructId::from_canonical("a::Result");
+        let _registry = crate::test_support::register_struct_ids_serialized(HashMap::from([
+            ("a::Result::Ok".to_string(), Some(a_ok)),
+            ("a::Result".to_string(), Some(a_result)),
+        ]));
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Result".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result::Ok".to_string(),
+            vec![("__pos_0".to_string(), "??TypeVar".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result<i32,E>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result<i32,E>::Ok".to_string(),
+            vec![("__pos_0".to_string(), "i32".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result<f64,E>".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "a::Result<f64,E>::Ok".to_string(),
+            vec![("__pos_0".to_string(), "f64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        for root in bk.struct_root_names() {
+            let _ = bk.getuniqueclassdef_for_struct_root(&root);
+        }
+
+        let ok_cd = bk
+            .getuniqueclassdef_for_enum_variant("a::Result<i32,E>", "Ok")
+            .expect("a::Result<i32,E>::Ok");
+        let dest_cd = bk
+            .getuniqueclassdef_for_struct_root("a::Result<f64,E>::Ok")
+            .expect("dest");
+        let s_ok = SomeValue::Instance(SomeInstance::new(
+            Some(ok_cd.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let mut s_root = crate::annotator::model::s_str0();
+        s_root.set_const_box(crate::flowspace::model::Constant::new(
+            crate::flowspace::model::ConstValue::byte_str("a::Result<f64,E>::Ok"),
+        ));
+        let out = cast_instance_intrinsic(&bk, &[Some(s_ok), Some(s_root)], &HashMap::new())
+            .expect("cast of a::Result Ok to a::Result<f64,E>::Ok");
+        let SomeValue::Instance(inst_out) = out else {
+            panic!("expected SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst_out
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| Rc::ptr_eq(cd, &dest_cd)),
+            "cast must yield the f64 destination"
+        );
+        assert!(
+            inst_out
+                .classdef
+                .as_ref()
+                .is_some_and(|cd| !Rc::ptr_eq(cd, &ok_cd)),
         );
     }
 

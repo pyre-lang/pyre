@@ -6,6 +6,7 @@
 # `tp_base` and `PyErr_NewExceptionWithDoc`.
 
 import cpyext_types as m
+import sys
 
 # ── the type itself ────────────────────────────────────────────────────
 assert m.Point.__name__ == 'Point'
@@ -505,6 +506,20 @@ except TypeError:
     pass
 else:
     raise AssertionError('a frozen class accepted an attribute')
+
+# Freezing adds IMMUTABLETYPE and keeps HEAPTYPE.  The instance layout does not
+# change, so an instance reports the same size (`sys.getsizeof` counts the
+# pre-header of a heap type with a dict or weakrefs).
+assert Mutable.__flags__ & (1 << 9), 'PyType_Freeze keeps Py_TPFLAGS_HEAPTYPE'
+assert Mutable.__flags__ & (1 << 8), 'PyType_Freeze sets Py_TPFLAGS_IMMUTABLETYPE'
+
+class Sized:
+    pass
+
+size_before = sys.getsizeof(Sized())
+m.freeze(Sized)
+size_after = sys.getsizeof(Sized())
+assert size_after == size_before, (size_after, size_before)
 
 # A class whose base is still mutable cannot be frozen.
 class Derived(Mutable):
