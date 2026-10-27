@@ -11,7 +11,7 @@
 //!   the Skip-fallback in
 //!   [`crate::codewriter::codewriter::transform_graph_to_jitcode`]
 //!   still drive this `annotate()` for its side-effect: populating each
-//!   `Variable.annotation` cell via [`setbinding`].  A
+//!   `Variable.annotation` cell via `setbinding_with`.  A
 //!   follow-up retirement slice drops both consumers and this file
 //!   together once the dual-gate Skip categories close.
 //!
@@ -126,7 +126,7 @@ pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bo
 
 /// Read the legacy `ValueType` discriminator out of
 /// `var.annotation`.  Returns `Unknown` when the slot is empty —
-/// consistent with [`setbinding`]'s invariant (every non-`Unknown`
+/// consistent with [`setbinding_with`]'s invariant (every non-`Unknown`
 /// setbinding writes a paired shell; `Unknown` clears it).
 fn read_binding(var: &Variable) -> ValueType {
     var.annotation
@@ -162,6 +162,7 @@ fn read_binding_some(var: &Variable) -> Option<Rc<SomeValue>> {
 /// Unknown` has no upstream annotation-stage counterpart; setting it
 /// clears any stale shell so the downstream rtyper fails fast at
 /// `bindingrepr` instead of silently bridging to `GcRef`.
+#[cfg(test)]
 pub(crate) fn setbinding(var: &Variable, ty: ValueType) {
     setbinding_with(var, ty, None);
 }

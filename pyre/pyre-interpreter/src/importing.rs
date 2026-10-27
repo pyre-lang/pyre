@@ -1338,6 +1338,7 @@ fn soabi_middle(so_ext: &str) -> String {
 ///
 /// wheel 0.34.2 depends on the shorter form, so do not widen it without
 /// checking wheel — `pep425tags.get_abi_tag` special-cases CPython.
+#[cfg(not(windows))]
 fn soabi_tag(so_ext: &str) -> String {
     so_ext
         .split('.')
@@ -1367,6 +1368,7 @@ pub(crate) fn multiarch() -> &'static str {
 /// is gated on (`imp/interp_imp.py`), and therefore the one that decides
 /// whether `_imp.extension_suffixes()` answers anything.  A build that cannot
 /// load an extension must not name the files one would be compiled against.
+#[cfg(not(windows))]
 pub(crate) const fn extension_loader_present() -> bool {
     cfg!(all(
         feature = "cpyext",
@@ -1417,6 +1419,7 @@ fn extension_abi_suffix() -> String {
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
 ))]
+#[cfg(not(windows))]
 fn on_path(program: &str) -> bool {
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path).any(|directory| {
@@ -1432,11 +1435,13 @@ fn on_path(program: &str) -> bool {
     not(feature = "sandbox"),
     not(target_arch = "wasm32")
 )))]
+#[cfg(not(windows))]
 fn on_path(_program: &str) -> bool {
     false
 }
 
 /// `sys.base_prefix` as a path, empty where the interpreter publishes `''`.
+#[cfg(not(windows))]
 fn sysconfigdata_base_prefix() -> PathBuf {
     #[cfg(feature = "host_env")]
     {
@@ -1456,6 +1461,7 @@ fn sysconfigdata_base_prefix() -> PathBuf {
 /// the shell.  A prefix with a space in it would reach either of them as two
 /// arguments.  Double quotes are the form they agree on; a path that needs none
 /// is left alone so the variable reads the way it always has.
+#[cfg(not(windows))]
 fn quote_for_cflags(path: &str) -> String {
     let bare = |b: u8| b.is_ascii_alphanumeric() || b"-_./+=:,@~".contains(&b);
     if path.bytes().all(bare) {
@@ -1487,6 +1493,7 @@ fn quote_for_cflags(path: &str) -> String {
 /// `sysconfig._get_sysconfigdata` reaches this module by name only after
 /// `_PYTHON_SYSCONFIGDATA_NAME` and `_PYTHON_SYSCONFIGDATA_PATH` have had their
 /// turn, so a cross-compilation snapshot still overrides it.
+#[cfg(not(windows))]
 fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
     // These take the root slot rather than the dict itself: a word passed by
     // value goes stale the moment the key or the value allocates.
@@ -9382,6 +9389,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn cflags_include_path_survives_word_splitting() {
         // An ordinary prefix keeps reading the way it always has.
         assert_eq!(

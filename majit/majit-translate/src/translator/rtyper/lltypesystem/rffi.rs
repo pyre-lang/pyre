@@ -1285,15 +1285,9 @@ fn build_str2charp_helper_graph(rtyper: &RPythonTyper, name: &str) -> Result<PyG
 /// (`rgc.py FinalizerQueue.register_finalizer`); the tag is the
 /// `CDefinedIntSymbolic` `FqTagEntry.specialize_call` yields
 /// (`framework.py get_finalizer_queue_index` reads `.default`).
-pub(crate) fn build_get_raw_address_buf_from_string_helper_graph(
-    name: &str,
-) -> Result<PyGraph, TyperError> {
-    Ok(build_get_raw_address_buf_from_string_family(name)?.0)
-}
-
-/// Outer `_get_raw_address_buf_from_string` graph plus every callee graph
-/// hanging off its `direct_call` funcptrs (`call.py` follows
-/// `funcobj.graph`).
+///
+/// Returns the outer graph plus every callee graph hanging off its
+/// `direct_call` funcptrs (`call.py` follows `funcobj.graph`).
 pub(crate) fn build_get_raw_address_buf_from_string_family(
     name: &str,
 ) -> Result<(PyGraph, Vec<(String, GraphRef)>), TyperError> {
@@ -1861,102 +1855,6 @@ mod tests {
         assert_eq!(func_t.result, LowLevelType::Void);
     }
 
-    #[test]
-    fn build_get_raw_address_buf_from_string_emits_cache_and_finalizer_ops() {
-        let helper =
-            build_get_raw_address_buf_from_string_helper_graph("_get_raw_address_buf_from_string")
-                .expect("build_get_raw_address_buf_from_string_helper_graph");
-        assert_eq!(helper.func.name, "_get_raw_address_buf_from_string");
-        assert_eq!(helper.func._jit_look_inside_, None);
-        let inner = helper.graph.borrow();
-        let mut opnames = Vec::new();
-        let mut saw_getitem_keyerror = false;
-        for block in inner.iterblocks() {
-            let block = block.borrow();
-            for op in &block.operations {
-                opnames.push(op.opname.clone());
-                if op.opname == "direct_call" {
-                    let callee = match &op.args[0] {
-                        Hlvalue::Constant(c) => format!("{:?}", c.value),
-                        other => format!("{other:?}"),
-                    };
-                    if callee.contains("ll_dict_getitem") && block.canraise() {
-                        saw_getitem_keyerror = block.exits.iter().any(|link| {
-                            matches!(
-                                &link.borrow().exitcase,
-                                Some(Hlvalue::Constant(c))
-                                    if format!("{:?}", c.value).contains("KeyError")
-                            )
-                        });
-                    }
-                }
-            }
-        }
-        assert!(
-            opnames.iter().any(|n| n == "gc_id"),
-            "gc_id (compute_unique_id): {opnames:?}"
-        );
-        assert!(
-            opnames.iter().any(|n| n == "gc_fq_register"),
-            "gc_fq_register: {opnames:?}"
-        );
-        assert!(
-            saw_getitem_keyerror,
-            "ll_dict_getitem direct_call with KeyError exit: {opnames:?}"
-        );
-        assert!(
-            opnames.iter().any(|n| n == "direct_call"),
-            "str2charp / dict helpers are direct_call: {opnames:?}"
-        );
-        let saw_str2charp = inner.iterblocks().iter().any(|block| {
-            block.borrow().operations.iter().any(|op| {
-                op.opname == "direct_call"
-                    && matches!(
-                        &op.args[0],
-                        Hlvalue::Constant(c) if format!("{:?}", c.value).contains("str2charp")
-                    )
-            })
-        });
-        assert!(saw_str2charp, "direct_call str2charp: {opnames:?}");
-        let saw_setitem = inner.iterblocks().iter().any(|block| {
-            block.borrow().operations.iter().any(|op| {
-                op.opname == "direct_call"
-                    && matches!(
-                        &op.args[0],
-                        Hlvalue::Constant(c) if format!("{:?}", c.value).contains("ll_dict_setitem")
-                    )
-            })
-        });
-        assert!(saw_setitem, "direct_call ll_dict_setitem: {opnames:?}");
-        assert!(
-            opnames.iter().any(|n| n == "cast_opaque_ptr"),
-            "cast_opaque_ptr(GCREF, llstr): {opnames:?}"
-        );
-
-        let mut saw_spec_tag = false;
-        for block in inner.iterblocks() {
-            for op in &block.borrow().operations {
-                if op.opname == "gc_fq_register" {
-                    match &op.args[0] {
-                        Hlvalue::Constant(c) => {
-                            assert_eq!(
-                                c.value,
-                                ConstValue::SpecTag(fq_addr_from_string_tag_id()),
-                                "fq index is the _fq_addr_from_string CDefinedIntSymbolic"
-                            );
-                            assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Signed));
-                            saw_spec_tag = true;
-                        }
-                        other => {
-                            panic!("gc_fq_register fq index must be a constant, got {other:?}")
-                        }
-                    }
-                }
-            }
-        }
-        assert!(saw_spec_tag, "gc_fq_register fq index missing");
-    }
-
     fn funcptr_name_and_graph(hlv: &Hlvalue) -> Option<(String, Option<usize>)> {
         use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
         let Hlvalue::Constant(c) = hlv else {
@@ -1969,42 +1867,6 @@ mod tests {
             Ok(Some(_ptr_obj::Func(func))) => Some((func._name.clone(), func.graph)),
             _ => None,
         }
-    }
-
-    #[test]
-    fn buf_helper_direct_call_funcptrs_carry_callee_graphs() {
-        let helper =
-            build_get_raw_address_buf_from_string_helper_graph("_get_raw_address_buf_from_string")
-                .expect("build_get_raw_address_buf_from_string_helper_graph");
-        let inner = helper.graph.borrow();
-        let mut names = Vec::new();
-        for block in inner.iterblocks() {
-            for op in &block.borrow().operations {
-                if op.opname != "direct_call" {
-                    continue;
-                }
-                let Some((name, graph)) = funcptr_name_and_graph(&op.args[0]) else {
-                    continue;
-                };
-                assert!(
-                    graph.is_some(),
-                    "{name} direct_call funcptr must carry funcobj.graph"
-                );
-                names.push(name);
-            }
-        }
-        assert!(
-            names.iter().any(|n| n == "ll_dict_getitem"),
-            "ll_dict_getitem: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n == "ll_dict_setitem"),
-            "ll_dict_setitem: {names:?}"
-        );
-        assert!(
-            names.iter().any(|n| n == "str2charp"),
-            "str2charp: {names:?}"
-        );
     }
 
     #[test]

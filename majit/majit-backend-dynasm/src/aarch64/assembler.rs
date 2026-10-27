@@ -7538,8 +7538,7 @@ impl<'a> AssemblerARM64<'a> {
         base_size: i64,
         item_size: i64,
     ) {
-        // The length comes from its regalloc location, for the reason
-        // `genop_alloc_varsize` states below: `consider_raw_call_like` plans
+        // The length comes from its regalloc location: `consider_raw_call_like` plans
         // these opcodes, and `before_call` leaves a value bound to a
         // callee-saved member of the allocation pool in its register, where
         // `resolve_opref` cannot see it.
@@ -7560,58 +7559,6 @@ impl<'a> AssemblerARM64<'a> {
             ; blr x8
             ; ldp x29, x30, [sp], #16
         );
-    }
-
-    /// Shared implementation for NEW_ARRAY.
-    /// Allocates base_size + length * item_size bytes, zero-fills,
-    /// and writes length to the header.
-    #[allow(dead_code)] // assembler.py genop_new_array / genop_alloc_varsize
-    fn genop_alloc_varsize(&mut self, op: &Op, arglocs: &[Loc], base_size: i64, item_size: i64) {
-        // The length comes from its regalloc location.  `prepare_raw_call_like`
-        // plans these opcodes, and `before_call` leaves a value bound to a
-        // callee-saved member of the allocation pool in its register, where
-        // `resolve_opref` cannot see it.  The load is consumed by the very next
-        // instruction, so rax/x0 doubling as ABI arg0 is safe here.
-        let [len_loc, ..] = arglocs else {
-            panic!("varsize allocation expects a length location, got {arglocs:?}");
-        };
-        self.emit_load_to_rax(*len_loc);
-        let malloc_ptr = libc::malloc as *const () as i64;
-        let memset_ptr = libc::memset as *const () as i64;
-
-        dynasm!(self.mc ; .arch aarch64
-            ; str x0, [sp, #-16]!               // save length
-        );
-        if item_size != 1 {
-            self.emit_mov_imm64(1, item_size);
-            dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, base_size as u32
-            ; str x0, [sp, #-16]!               // save total_size
-        );
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
-        self.emit_mov_imm64(8, malloc_ptr);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x8
-            ; ldp x29, x30, [sp], #16
-            ; ldr x2, [sp], #16                 // total_size
-            ; str x0, [sp, #-16]!               // save ptr on stack
-            ; mov x1, 0                          // val = 0
-            ; stp x29, x30, [sp, #-16]!
-        );
-        self.emit_mov_imm64(8, memset_ptr);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x8
-            ; ldp x29, x30, [sp], #16
-            ; ldr x0, [sp], #16                  // restore ptr from stack
-            ; ldr x1, [sp], #16                  // length
-            ; str x1, [x0, 8]                    // store length at offset 8
-        );
-
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     /// ZERO_ARRAY: zero a range in an array.

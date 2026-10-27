@@ -5117,37 +5117,6 @@ pub(in crate::front::mir) fn tyref_is_primitive_scalar(ty: &TyRef, llbc: &Llbc) 
         .is_some_and(|node| json_ty_is_copy_scalar(node, llbc))
 }
 
-/// Peel `Deduplicated` / `Value` wrappers off a Charon value.
-pub(in crate::front::mir) fn peel_hashcons_value<'a>(
-    llbc: &'a Llbc,
-    mut value: &'a serde_json::Value,
-) -> &'a serde_json::Value {
-    loop {
-        let Some(obj) = value.as_object() else {
-            break;
-        };
-        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
-            match llbc.dedup_body(id) {
-                Some(body) => {
-                    value = body;
-                    continue;
-                }
-                None => break,
-            }
-        }
-        if let Some(body) = obj
-            .get("Value")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.get(1))
-        {
-            value = body;
-            continue;
-        }
-        break;
-    }
-    value
-}
-
 pub(in crate::front::mir) fn borrowed_place_referent(rvalue: &Rvalue) -> Option<Place> {
     let place = match rvalue {
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,

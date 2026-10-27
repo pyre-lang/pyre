@@ -51,21 +51,19 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
     build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
     build_ll_find_char_helper_graph, build_ll_find_helper_graph_on, build_ll_int_helper_graph,
-    build_ll_join_chars_helper_graph, build_ll_join_chars_isvirtual_helper_graph,
-    build_ll_join_chars_look_inside_iff_helper_graph, build_ll_join_chars_trampoline_helper_graph,
-    build_ll_join_strs_helper_graph, build_ll_join_strs_look_inside_iff_helper_graph,
-    build_ll_join_strs_trampoline_helper_graph, build_ll_replace_chr_chr_helper_graph,
-    build_ll_rfind_char_helper_graph, build_ll_startswith_char_helper_graph,
-    build_ll_startswith_helper_graph, build_ll_str_is_true_helper_graph,
-    build_ll_str_string_helper_graph, build_ll_str2unicode_helper_graph,
-    build_ll_strcmp_helper_graph, build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
+    build_ll_join_chars_isvirtual_helper_graph, build_ll_join_strs_helper_graph,
+    build_ll_join_strs_look_inside_iff_helper_graph, build_ll_join_strs_trampoline_helper_graph,
+    build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
+    build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
+    build_ll_str_is_true_helper_graph, build_ll_str_string_helper_graph,
+    build_ll_str2unicode_helper_graph, build_ll_strcmp_helper_graph,
+    build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
     build_ll_strfasthash_helper_graph, build_ll_strhash_helper_graph,
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
-    build_ll_string2list_helper_graph, build_ll_stringslice_helper_graph,
-    build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
-    build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
-    build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph, const_str_cache_llstr,
-    null_str_ptr, temp_ptr_lltype,
+    build_ll_stringslice_helper_graph, build_ll_stritem_checked_helper_graph,
+    build_ll_stritem_helper_graph, build_ll_stritem_nonneg_checked_helper_graph,
+    build_ll_stritem_nonneg_helper_graph, build_ll_strlen_helper_graph,
+    build_ll_unichr2str_helper_graph, const_str_cache_llstr, null_str_ptr, temp_ptr_lltype,
 };
 use crate::translator::rtyper::rlist::build_ll_alloc_and_set_isconstant_helper_graph;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -879,86 +877,6 @@ fn lowlevel_str2unicode_function(rtyper: &RPythonTyper) -> Result<LowLevelFuncti
     )
 }
 
-/// Mint `LLHelpers.ll_join_chars` (`lltypesystem/rstr.py`) through
-/// `look_inside_iff` (`rlib/jit.py`): original loop, `dont_look_inside`
-/// trampoline, `isconstant` / `isvirtual` predicates, and the wrapper
-/// named `ll_join_chars`. Returns the wrapper.
-pub(crate) fn ll_join_chars_helper(
-    rtyper: &RPythonTyper,
-    items_ptr_lltype: LowLevelType,
-) -> Result<LowLevelFunction, TyperError> {
-    let orig_args = vec![
-        LowLevelType::Signed,
-        items_ptr_lltype.clone(),
-        LowLevelType::Void,
-    ];
-    let orig = {
-        let items = items_ptr_lltype.clone();
-        rtyper.lowlevel_helper_function_with_builder(
-            "ll_join_chars__orig".to_string(),
-            orig_args.clone(),
-            STRPTR.clone(),
-            move |_r, _a, _res| build_ll_join_chars_helper_graph("ll_join_chars__orig", items),
-        )?
-    };
-    let trampoline = {
-        let items = items_ptr_lltype.clone();
-        let orig_fn = functionptr_const(rtyper, &orig)?;
-        rtyper.lowlevel_helper_function_with_builder(
-            "ll_join_chars_trampoline".to_string(),
-            orig_args.clone(),
-            STRPTR.clone(),
-            move |_r, _a, _res| {
-                build_ll_join_chars_trampoline_helper_graph(
-                    "ll_join_chars_trampoline",
-                    items,
-                    orig_fn,
-                )
-            },
-        )?
-    };
-    // `rlib/jit.py isconstant`. Shared with alloc_and_set: the
-    // `(name, args, result)` cache hits on the second mint.
-    let isconstant = rtyper.lowlevel_helper_function_with_builder(
-        "_ll_alloc_and_set_isconstant".to_string(),
-        vec![LowLevelType::Signed],
-        LowLevelType::Bool,
-        |rtyper, _a, _res| {
-            build_ll_alloc_and_set_isconstant_helper_graph(rtyper, "_ll_alloc_and_set_isconstant")
-        },
-    )?;
-    let isvirtual = {
-        let items = items_ptr_lltype.clone();
-        rtyper.lowlevel_helper_function_with_builder(
-            "ll_join_chars_isvirtual".to_string(),
-            vec![items_ptr_lltype.clone()],
-            LowLevelType::Bool,
-            move |rtyper, _a, _res| {
-                build_ll_join_chars_isvirtual_helper_graph(rtyper, "ll_join_chars_isvirtual", items)
-            },
-        )?
-    };
-    let orig_fn = functionptr_const(rtyper, &orig)?;
-    let trampoline_fn = functionptr_const(rtyper, &trampoline)?;
-    let isconstant_fn = functionptr_const(rtyper, &isconstant)?;
-    let isvirtual_fn = functionptr_const(rtyper, &isvirtual)?;
-    rtyper.lowlevel_helper_function_with_builder(
-        "ll_join_chars".to_string(),
-        orig_args,
-        STRPTR.clone(),
-        move |_r, _a, _res| {
-            build_ll_join_chars_look_inside_iff_helper_graph(
-                "ll_join_chars",
-                items_ptr_lltype,
-                orig_fn,
-                trampoline_fn,
-                isconstant_fn,
-                isvirtual_fn,
-            )
-        },
-    )
-}
-
 /// Mint `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) through
 /// `look_inside_iff` (`rlib/jit.py`) with `loop_unrolling_heuristic`
 /// (`cutoff=2`): original loop, `dont_look_inside` trampoline,
@@ -1019,30 +937,6 @@ pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunct
                 trampoline_fn,
                 isconstant_fn,
                 isvirtual_fn,
-            )
-        },
-    )
-}
-
-/// Mint `LLHelpers.ll_string2list` (`lltypesystem/rstr.py`).
-/// `@jit.dont_look_inside`; `newlist` is `RESLIST.ll_newlist`.
-pub(crate) fn ll_string2list_helper(
-    rtyper: &RPythonTyper,
-    list_ptr_lltype: LowLevelType,
-    item_lltype: LowLevelType,
-    newlist: &LowLevelFunction,
-) -> Result<LowLevelFunction, TyperError> {
-    let newlist_fn = functionptr_const(rtyper, newlist)?;
-    rtyper.lowlevel_helper_function_with_builder(
-        "ll_string2list".to_string(),
-        vec![LowLevelType::Void, STRPTR.clone()],
-        list_ptr_lltype.clone(),
-        move |_r, _a, _res| {
-            build_ll_string2list_helper_graph(
-                "ll_string2list",
-                list_ptr_lltype,
-                item_lltype,
-                newlist_fn,
             )
         },
     )
@@ -7091,58 +6985,5 @@ mod tests {
             "expected second direct_call to ll_stritem_nonneg in {item_dbg}"
         );
         assert!(ops._called_exception_is_here_or_cannot_occur);
-    }
-
-    /// `ll_join_chars_helper` / `ll_string2list_helper` mint through a
-    /// fresh rtyper the same way the alloc_and_set family does.
-    #[test]
-    fn ll_join_chars_helper_and_ll_string2list_helper_mint_on_fresh_rtyper() {
-        use crate::translator::rtyper::lltypesystem::lltype::{Array, Ptr, PtrTarget};
-        use crate::translator::rtyper::rint::unsigned_repr;
-        use crate::translator::rtyper::rlist::{
-            ListLayout, ListRepr, build_ll_newlist_helper_graph,
-        };
-        use std::rc::Rc;
-        use std::sync::Arc;
-
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        rtyper
-            .initialize_exceptiondata()
-            .expect("initialize_exceptiondata in test setup");
-        let r_uint: Arc<dyn Repr> = unsigned_repr();
-        let r_list = ListRepr::new(&rtyper, r_uint).expect("ListRepr::new");
-        let list_ptr = r_list.lowleveltype().clone();
-        let item = LowLevelType::Unsigned;
-        let items_ptr = LowLevelType::Ptr(Box::new(Ptr {
-            TO: PtrTarget::Array(Array::gc(item.clone())),
-        }));
-        assert!(
-            ll_join_chars_helper(rtyper.as_ref(), items_ptr).is_ok(),
-            "ll_join_chars_helper must mint"
-        );
-        assert!(
-            ll_join_strs_helper(rtyper.as_ref()).is_ok(),
-            "ll_join_strs_helper must mint"
-        );
-        let newlist = rtyper
-            .lowlevel_helper_function_with_builder(
-                "ll_newlist".to_string(),
-                vec![LowLevelType::Signed],
-                list_ptr.clone(),
-                {
-                    let ptr = list_ptr.clone();
-                    let item = item.clone();
-                    move |_r, _a, _res| {
-                        build_ll_newlist_helper_graph("ll_newlist", ListLayout::Resized, ptr, item)
-                    }
-                },
-            )
-            .expect("ll_newlist");
-        assert!(
-            ll_string2list_helper(rtyper.as_ref(), list_ptr, item, &newlist).is_ok(),
-            "ll_string2list_helper must mint"
-        );
-        let _keep = ann;
     }
 }

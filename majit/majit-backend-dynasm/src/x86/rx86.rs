@@ -32,7 +32,9 @@ pub(crate) const EDI: u8 = 7;
 pub(crate) const R8: u8 = 8;
 #[cfg(test)]
 pub(crate) const R9: u8 = 9;
+#[cfg(test)]
 pub(crate) const R10: u8 = 10;
+#[cfg(test)]
 pub(crate) const R11: u8 = 11;
 pub(crate) const R12: u8 = 12;
 #[cfg(test)]
@@ -793,24 +795,6 @@ pub(crate) fn imul_rri(mc: &mut Assembler, dst: u8, src: u8, immed: i32) {
 /// `IMUL_ri` — `imul r64, imm`.
 pub(crate) fn imul_ri(mc: &mut Assembler, reg: u8, immed: i32) {
     imul_rri(mc, reg, reg, immed);
-}
-
-/// `IMUL_rri8`/`IMUL_rri32` — `imul r64, [base + ofs], imm8` / `imul r64, [base + ofs], imm32`.
-pub(crate) fn imul_rmi(mc: &mut Assembler, dst: u8, mem: (u8, i32), immed: i32) {
-    encode_rex(
-        mc,
-        rex_register(dst, 8) | rex_mem_reg_plus_const(mem),
-        REX_W,
-    );
-    if single_byte(i64::from(immed)) {
-        DynasmApi::push(mc, 0x6B);
-        encode_m(mc, mem.0, mem.1, reg_number_3bits(dst) << 3);
-        writeimm8(mc, immed);
-    } else {
-        DynasmApi::push(mc, 0x69);
-        encode_m(mc, mem.0, mem.1, reg_number_3bits(dst) << 3);
-        writeimm32(mc, immed);
-    }
 }
 
 // ALU reg, mem
@@ -1765,7 +1749,6 @@ mod tests {
             movss_xm(mc, 3, (EAX, 4));
             movss_mx(mc, (R9, 0), 3);
             movq_mx(mc, (ESP, 8), 2);
-            imul_rmi(mc, EAX, (EDI, 8), 3);
             mul_b(mc, 16);
             or8_mi(mc, (EDX, 1), 0x20);
             push_b(mc, 8);
@@ -1803,7 +1786,6 @@ mod tests {
             ; movss xmm3, [rax + 4]
             ; movss [r9], xmm3
             ; movq [rsp + 8], xmm2
-            ; imul rax, [rdi + 8], 3
             ; mul QWORD [rbp + 16]
             ; or BYTE [rdx + 1], 0x20
             ; push QWORD [rbp + 8]

@@ -638,9 +638,11 @@ pub(crate) fn python_frexp(f: f64) -> (f64, i32) {
     }
 }
 
+#[cfg(test)]
 const TAKE_NEXT: f64 = 2147483648.0; // 2**31
 
 /// `objectmodel._hash_float`.
+#[cfg(test)]
 pub(crate) fn hash_float_value(f: f64) -> i64 {
     if !f.is_finite() {
         if f.is_infinite() {
@@ -661,6 +663,7 @@ pub(crate) fn hash_float_value(f: f64) -> i64 {
 
 /// `_hash_string` over UniChar ords, then `_ll_strhash`'s `0 → 29872897`
 /// fixup (`LLHelpers.ll_strhash` / `objectmodel._hash_string`).
+#[cfg(test)]
 pub(crate) fn hash_unichar_ords(chars: &[char]) -> i64 {
     let Some(&first) = chars.first() else {
         return -1;

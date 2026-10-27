@@ -5,7 +5,7 @@
 //! (`rpython/annotator/annrpython.py`,
 //! `rpython/flowspace/model.py: Variable.annotation`).  Pyre writes the
 //! same lattice node into `Variable.annotation` via
-//! [`crate::translator::rtyper::legacy_annotator::setbinding`], which
+//! `legacy_annotator::setbinding_with`, which
 //! routes through [`valuetype_to_someshell`] to build the shell.
 //!
 //! `ValueType::Unknown` returns `None` from [`valuetype_to_someshell`]

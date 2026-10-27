@@ -711,23 +711,6 @@ fn funcptr_search_normal(
     )
 }
 
-fn funcptr_search_elidable(
-    rtyper: &RPythonTyper,
-    kind: &StringKind,
-    value_can_be_none: bool,
-) -> Result<Hlvalue, TyperError> {
-    let ptr = kind.ptr_lltype.clone();
-    cached_helper_funcptr(
-        rtyper,
-        "_search_elidable",
-        search_args(kind),
-        LowLevelType::Signed,
-        move |rtyper| {
-            build_search_elidable_helper_graph(rtyper, "_search_elidable", ptr, value_can_be_none)
-        },
-    )
-}
-
 fn unpack_tuple5(
     block: &BlockRef,
     tup: &Variable,
@@ -4909,59 +4892,6 @@ fn emit_adaptive_switch_to_twoway(
     Ok(())
 }
 
-/// `rstring.py` `_search` — translation-time `isinstance` dispatch.
-///
-/// `value_can_be_none` is the caller's `SomeString.can_be_None`, forwarded
-/// to `_search_elidable` / `_search_normal`.
-pub(crate) fn build_search_helper_graph(
-    rtyper: &RPythonTyper,
-    name: &str,
-    ptr_lltype: LowLevelType,
-    value_can_be_none: bool,
-) -> Result<PyGraph, TyperError> {
-    let kind = StringKind::from_ptr(ptr_lltype)?;
-    let value = v("value", kind.ptr_lltype.clone());
-    let other = v("other", kind.ptr_lltype.clone());
-    let start = v("start", LowLevelType::Signed);
-    let end = v("end", LowLevelType::Signed);
-    let mode = v("mode", LowLevelType::Signed);
-    let startblock = blk(vec![
-        value.clone(),
-        other.clone(),
-        start.clone(),
-        end.clone(),
-        mode.clone(),
-    ]);
-    let return_var = v("result", LowLevelType::Signed);
-    let graph =
-        FunctionGraph::with_return_var(name.to_string(), startblock.clone(), hl(&return_var));
-    let callee = if kind.is_unicode() {
-        funcptr_search_normal(rtyper, &kind, value_can_be_none)?
-    } else {
-        funcptr_search_elidable(rtyper, &kind, value_can_be_none)?
-    };
-    let res = emit_direct_call(
-        &startblock,
-        callee,
-        vec![hl(&value), hl(&other), hl(&start), hl(&end), hl(&mode)],
-        "res",
-        LowLevelType::Signed,
-    );
-    ret(&startblock, hl(&res), graph.returnblock.clone());
-    Ok(finish_graph(
-        graph,
-        name,
-        vec![
-            "value".into(),
-            "other".into(),
-            "start".into(),
-            "end".into(),
-            "mode".into(),
-        ],
-        false,
-    ))
-}
-
 /// `rstring.py` `_search_elidable`. `@jit.elidable` stamps
 /// `_elidable_function_`; the body is `direct_call _search_normal`.
 ///
@@ -6757,19 +6687,6 @@ mod tests {
                 vec!["_search_normal".to_string()]
             );
 
-            let search =
-                build_search_helper_graph(&rtyper, "_search", ptr.clone(), false).expect("_search");
-            let expected = if ptr == *STRPTR {
-                "_search_elidable"
-            } else {
-                "_search_normal"
-            };
-            assert_eq!(
-                direct_call_names(&search.graph.borrow()),
-                vec![expected.to_string()]
-            );
-            assert!(!search.func._elidable_function_);
-
             build_bloom_add_helper_graph(&rtyper, "bloom_add", ptr.clone()).expect("bloom_add");
             build_bloom_helper_graph(&rtyper, "bloom", ptr.clone()).expect("bloom");
             build_lex_search_helper_graph(&rtyper, "_lex_search", ptr.clone())
@@ -6977,11 +6894,6 @@ mod tests {
                     "_adaptive_find",
                     build_adaptive_find_helper_graph(&rtyper, "_adaptive_find", ptr.clone())
                         .expect("_adaptive_find"),
-                ),
-                (
-                    "_search",
-                    build_search_helper_graph(&rtyper, "_search", ptr.clone(), false)
-                        .expect("_search"),
                 ),
                 (
                     "_search_elidable",

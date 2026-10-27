@@ -160,6 +160,7 @@ pub(crate) fn get_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitC
 
 /// Already-published body at `index`, or `None` if that cell was never
 /// decoded. Does not run [`load_jitcode`].
+#[cfg(test)]
 pub(crate) fn peek_jitcode_ref_by_index(index: usize) -> Option<&'static Arc<JitCode>> {
     JITCODE_CELLS.get(index)?.get().map(|frozen| &frozen.0)
 }
