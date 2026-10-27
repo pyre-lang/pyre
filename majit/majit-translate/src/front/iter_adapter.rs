@@ -81,7 +81,6 @@ pub(crate) fn is_enumerate_ctor_target(target: &CallTarget) -> bool {
         CallTarget::FunctionPath { segments, .. } => {
             segments.last().map(String::as_str) == Some("enumerate")
         }
-        CallTarget::Indirect { method_name, .. } => method_name == "enumerate",
         CallTarget::SyntheticTransparentCtor {
             name, owner_path, ..
         } => name_is_enumerate(name) || owner_path.last().is_some_and(|s| name_is_enumerate(s)),

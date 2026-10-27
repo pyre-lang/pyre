@@ -11240,7 +11240,7 @@ fn walker_probe_exact_dict_hit(
             pyre_object::is_exact_type(key, &pyre_object::pyobject::STR_TYPE)
                 && pyre_object::w_str_get_value_opt(key).is_some()
                 && pyre_object::dict_eq_hook::try_hash_str(
-                    pyre_object::w_str_get_value_opt(key).unwrap().as_bytes(),
+                    pyre_object::unicodeobject::w_str_storage(key),
                 )
                 .is_some()
         };

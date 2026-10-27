@@ -675,14 +675,10 @@ pub const BC_ABORT_RESULT_R: u8 = 195;
 // address refused by `rewrite_op_getsubstruct`).
 pub const BC_ABORT_RESULT_I: u8 = 249;
 
-// pyre-only `vtable_method_ptr/rd>i` — emitted by `OpKind::
-// VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython has no counterpart
-// because Python dispatch goes through `cpu.bh_call_*` resolved at
-// runtime; pyre's Rust port hits this only when a `dyn Trait` method
-// pointer must be reified into the bytecode stream (backend-epic
-// adaptation, see `blackhole.rs`'s `handler_vtable_method_ptr_bail`, which
-// aborts the frame rather than manufacturing a pointer).
-pub const BC_VTABLE_METHOD_PTR: u8 = 196;
+// slot 196 (formerly BC_VTABLE_METHOD_PTR) freed — dyn Trait dispatch
+// is `ClassRepr.getclsfield` (`getfield_raw_i` of `{vtable}.method_*`)
+// plus `indirect_call`. Do not reuse this byte until a new opcode is
+// assigned here on purpose.
 
 // `record_quasiimmut_field/rdd` — RPython `blackhole.py bhimpl_record_quasiimmut_field`
 // `bhimpl_record_quasiimmut_field`.  Records that a quasi-immutable
@@ -1481,13 +1477,6 @@ pub fn extension_insns() -> IndexMap<&'static str, u8> {
     // pyre-only `abort/>i` — Int-result variant, handled by
     // `handler_abort_result_marker_i` exactly like `abort/`.
     m.insert("abort/>i", BC_ABORT_RESULT_I);
-    // pyre-only `vtable_method_ptr/rd>i` — emitted by
-    // `OpKind::VtableMethodPtr` (`assembler.rs`'s `encode_op`).  RPython's dispatch
-    // resolves dyn-method addresses through `cpu.bh_call_*` at runtime
-    // and never needs to reify a method pointer into the bytecode stream;
-    // pyre's Rust port hits this only on `dyn Trait` calls, where the
-    // backend epic must look up the vtable slot itself.
-    m.insert("vtable_method_ptr/rd>i", BC_VTABLE_METHOD_PTR);
     // pyre-only `arraybase_vable/rdd>i` — address of item 0 of a
     // virtualizable array field.  Registered here rather than in
     // `wellknown_bh_insns` beside `arraylen_vable` because RPython has no

@@ -2488,9 +2488,9 @@ pub fn descr_spelling_gate_recheck_now() {
 /// - `JitCode` → `make_jitcode_descr` (the existing adapter the
 ///   walker's `inline_call_*` recursion exercises).
 ///
-/// `Switch` / `VableField` / `VableArray` / `VtableMethod` also get
-/// concrete trace-side descriptor adapters so the pool shape stays
-/// equivalent to `Assembler.descrs`.
+/// `Switch` / `VableField` / `VableArray` also get concrete trace-side
+/// descriptor adapters so the pool shape stays equivalent to
+/// `Assembler.descrs`.
 ///
 /// Identity (`Arc::ptr_eq`) currently matches only for the `JitCode`
 /// slot — content-derived adapters
@@ -3923,8 +3923,7 @@ mod tests {
                 | BhDescr::Size { .. } => 0,
                 BhDescr::Switch { .. }
                 | BhDescr::VableField { .. }
-                | BhDescr::VableArray { .. }
-                | BhDescr::VtableMethod { .. } => 2,
+                | BhDescr::VableArray { .. } => 2,
             };
             assert_eq!(kind, expected, "descriptor index {i}");
         }
@@ -5204,11 +5203,6 @@ mod tests {
     /// pinned so that an opname MOVING out of this list (because the codewriter
     /// started emitting it) shows up as a test failure to be classified,
     /// instead of silently becoming a live `dispatch_step` panic.
-    ///
-    /// `vtable_method_ptr/rd>i` left the list exactly that way: routing
-    /// `dyn Trait` calls through `CallTarget::Indirect` became the default, so
-    /// the codewriter emits it and it is now registered in
-    /// `build_inline_call_only_bh_builder` instead.
     ///
     /// `new/d>r` left it the same way: lowering a rebuilt `Result` shell as an
     /// allocation, and a `#[jit_interp]` frontend's declared `struct_allocs`

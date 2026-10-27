@@ -4994,6 +4994,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::hash_str_hooked",
         pyre_object::dict_eq_hook::hash_str_hooked,
     );
+    cpa1!(
+        &mut entries,
+        "pyre_object::dict_eq_hook::hash_str_hooked_str",
+        "pyre_object::hash_str_hooked_str",
+        pyre_object::dict_eq_hook::hash_str_hooked_str,
+    );
     // Residual calls read one pointer word (`llmodel.py bh_call_r`).
     // The bridge maps None to NULL; the Option body stays for a traced call.
     pa2!(
@@ -5001,6 +5007,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dictmultiobject::dict_entries_probe_object",
         "pyre_object::dict_entries_probe_object",
         dict_entries_probe_object_word,
+    );
+    upa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_probe_str",
+        "pyre_object::dict_entries_probe_str",
+        pyre_object::dictmultiobject::dict_entries_probe_str,
     );
     upa2!(
         &mut entries,
@@ -7523,6 +7535,14 @@ mod tests {
                 dict_entries_probe_object_word as *const () as usize as i64,
             ),
             (
+                "pyre_object::dictmultiobject::dict_entries_probe_str",
+                pyre_object::dictmultiobject::dict_entries_probe_str as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dict_entries_probe_str",
+                pyre_object::dictmultiobject::dict_entries_probe_str as *const () as usize as i64,
+            ),
+            (
                 "pyre_object::dictmultiobject::dict_entries_probe_hashed",
                 dict_entries_probe_hashed_word as *const () as usize as i64,
             ),
@@ -7554,6 +7574,27 @@ mod tests {
         assert_ne!(
             bindings["pyre_object::dictmultiobject::w_dict_lookup_int_strategy"], raw_lookup,
             "must not publish the Option-returning Rust item"
+        );
+    }
+
+    #[test]
+    fn hash_str_hooked_str_is_registered() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = pyre_object::dict_eq_hook::hash_str_hooked_str as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::dict_eq_hook::hash_str_hooked_str"],
+            expected
+        );
+        assert_eq!(bindings["pyre_object::hash_str_hooked_str"], expected);
+
+        crate::test_hooks::install_hash_hook();
+        let addr = bindings["pyre_object::dict_eq_hook::hash_str_hooked_str"] as usize;
+        let hooked_str: extern "C" fn(*mut pyre_object::unicodeobject::Utf8Str) -> i64 =
+            unsafe { std::mem::transmute(addr) };
+        let key = pyre_object::unicodeobject::prebuilt_str_storage("abc");
+        assert_eq!(
+            hooked_str(key),
+            pyre_object::dict_eq_hook::hash_str_hooked(b"abc".as_ptr(), 3)
         );
     }
 

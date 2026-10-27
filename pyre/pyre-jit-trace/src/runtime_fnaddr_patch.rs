@@ -198,10 +198,9 @@ static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
     //     surface the tracing-policy helpers inline their callees, and several
     //     distinct registered residuals then compile to the same code:
     //     `label_arg_to_usize` / `load_fast_var_num_to_index` are both
-    //     `arg.get(op_arg).as_usize()`, `convert_value_arg` /
-    //     `special_method_arg` are both `arg.get(op_arg)`, and
-    //     `hash_str_hooked_bytes` decomposes its slice to the `(ptr, len)`
-    //     `hash_str_hooked` already takes.  The build binary folds each pair;
+    //     `arg.get(op_arg).as_usize()`, and `convert_value_arg` /
+    //     `special_method_arg` are both `arg.get(op_arg)`.  The build binary
+    //     folds each pair;
     //     the runtime binary, built at a different optimization level, need
     //     not, so the two runtime addresses differ.  Folding merges only
     //     identical machine code, so a residual call patched to either twin

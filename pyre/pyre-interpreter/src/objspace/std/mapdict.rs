@@ -5995,11 +5995,19 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py `getitem_str` — `w_obj.getdictvalue(space, key)`.
-    /// The trait key is a UTF-8 `&str`; a UTF-8 string is valid WTF-8, so the
-    /// node lookup uses its `Wtf8` view directly.
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
-        instance_node_getdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key))
-            .unwrap_or(pyre_object::PY_NULL)
+    /// The trait key is the rstr `STR` of the text; a UTF-8 string is valid
+    /// WTF-8, so the node lookup uses its `Wtf8` view directly.
+    /// Returns `PY_NULL` on a miss.
+    unsafe fn getitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut pyre_object::unicodeobject::Utf8Str,
+    ) -> PyObjectRef {
+        instance_node_getdictvalue(
+            mapdict_strategy_unerase(w_dict),
+            pyre_object::unicodeobject::utf8_payload_wtf8(key),
+        )
+        .unwrap_or(pyre_object::PY_NULL)
     }
 
     /// mapdict.py `setitem`.
@@ -6032,9 +6040,17 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     /// mapdict.py `setitem_str` — `flag = w_obj.setdictvalue(...);
     /// assert flag`. The receiver is the instance behind a materialised
     /// `__dict__` view, so its terminator has a dict and the write cannot fail.
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        let flag =
-            instance_node_setdictvalue(mapdict_strategy_unerase(w_dict), Wtf8::new(key), w_value);
+    unsafe fn setitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut pyre_object::unicodeobject::Utf8Str,
+        w_value: PyObjectRef,
+    ) {
+        let flag = instance_node_setdictvalue(
+            mapdict_strategy_unerase(w_dict),
+            pyre_object::unicodeobject::utf8_payload_wtf8(key),
+            w_value,
+        );
         debug_assert!(flag, "mapdict.py:1174 assert flag");
     }
 
@@ -6141,7 +6157,7 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let curr = node_search(map, DICT)?;
         let key = &(*curr).as_plain().name;
         // mapdict.py reads the value with `getitem_str(w_dict, key)`, but
-        // the trait's `getitem_str` takes a `&str` and a node name is WTF-8:
+        // the trait's `getitem_str` takes a one-word rstr `STR` and a node name is WTF-8:
         // `setitem` stores the full name (mapdict.py), so a lone surrogate
         // is a node here and has no `&str` form. The `node_search` hit makes
         // the value-present arm explicit: `node_read` would return
@@ -6672,6 +6688,9 @@ mod tests {
     fn wn(s: &str) -> &Wtf8 {
         Wtf8::new(s)
     }
+    fn sk(s: &str) -> *mut pyre_object::unicodeobject::Utf8Str {
+        pyre_object::unicodeobject::prebuilt_str_storage(s)
+    }
     fn wb(s: &str) -> Wtf8Buf {
         Wtf8::new(s).to_owned()
     }
@@ -7190,7 +7209,10 @@ mod tests {
 
             // getitem_str + getitem(text key) both reach the map; a missing key
             // and the never-equal short-circuit return PY_NULL.
-            assert_eq!(MAP_DICT_STRATEGY.getitem_str(w_dict, "x"), sentinel(0x11));
+            assert_eq!(
+                MAP_DICT_STRATEGY.getitem_str(w_dict, sk("x")),
+                sentinel(0x11)
+            );
             let w_key_y = pyre_object::w_str_new("y");
             assert_eq!(MAP_DICT_STRATEGY.getitem(w_dict, w_key_y), sentinel(0x22));
             let w_key_z = pyre_object::w_str_new("z");
@@ -7213,17 +7235,17 @@ mod tests {
             );
 
             // setitem_str grows; delitem(text) shrinks the backing instance.
-            MAP_DICT_STRATEGY.setitem_str(w_dict, "z", sentinel(0x33));
+            MAP_DICT_STRATEGY.setitem_str(w_dict, sk("z"), sentinel(0x33));
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 3);
             let w_key_x = pyre_object::w_str_new("x");
             assert!(MAP_DICT_STRATEGY.delitem(w_dict, w_key_x));
-            assert!(MAP_DICT_STRATEGY.getitem_str(w_dict, "x").is_null());
+            assert!(MAP_DICT_STRATEGY.getitem_str(w_dict, sk("x")).is_null());
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
 
             // clear drops every DICT entry.
             MAP_DICT_STRATEGY.clear(w_dict);
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
-            assert!(MAP_DICT_STRATEGY.getitem_str(w_dict, "y").is_null());
+            assert!(MAP_DICT_STRATEGY.getitem_str(w_dict, sk("y")).is_null());
         }
     }
 
@@ -7267,7 +7289,7 @@ mod tests {
             assert_eq!(pyre_object::w_str_get_wtf8(w_ascii_key), "ascii");
             assert_eq!(w_ascii_value, sentinel(0x44));
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 0);
-            assert!(MAP_DICT_STRATEGY.getitem_str(w_dict, "ascii").is_null());
+            assert!(MAP_DICT_STRATEGY.getitem_str(w_dict, sk("ascii")).is_null());
             assert_eq!(instance_node_getdictvalue(obj_ref, wn("ascii")), None);
         }
     }
@@ -7636,8 +7658,8 @@ mod tests {
             // (storing the wrapper) is excluded from the view.
             assert!(instance_node_setdictvalue(obj_ref, wn("x"), sentinel(0x1)));
             assert_eq!(MAP_DICT_STRATEGY.length(w1), 1);
-            assert_eq!(MAP_DICT_STRATEGY.getitem_str(w1, "x"), sentinel(0x1));
-            assert!(MAP_DICT_STRATEGY.getitem_str(w1, "dict").is_null());
+            assert_eq!(MAP_DICT_STRATEGY.getitem_str(w1, sk("x")), sentinel(0x1));
+            assert!(MAP_DICT_STRATEGY.getitem_str(w1, sk("dict")).is_null());
         }
     }
 

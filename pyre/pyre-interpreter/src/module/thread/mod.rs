@@ -2929,8 +2929,13 @@ fn thread_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     let sys = crate::importing::get_interpreter_sys_module()
         .ok_or_else(|| crate::PyError::runtime_error("sys module is unavailable"))?;
     let sys_dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
-    let mut file =
-        unsafe { pyre_object::w_module_dict_getitem_str(sys_dict, "stderr") }.unwrap_or(PY_NULL);
+    let mut file = unsafe {
+        pyre_object::w_module_dict_getitem_str(
+            sys_dict,
+            pyre_object::unicodeobject::prebuilt_str_storage("stderr"),
+        )
+    }
+    .unwrap_or(PY_NULL);
     if file.is_null() || unsafe { is_none(file) } {
         let thread = pyre_object::gc_roots::shadow_stack_get(thread_slot);
         if unsafe { is_none(thread) } {

@@ -1328,6 +1328,11 @@ pub(crate) struct CrateLowering<'l> {
     jitdriver_receiver_roots: &'l [String],
     state: &'l CrateLoweringState,
     root_stack: RootStackAnalyzer<'l>,
+    /// Lower a fat-`&dyn` return whose callee body lives in an earlier crate.
+    /// Whole-program graph visibility the per-crate extraction splits apart.
+    /// Filled by `ProvidedCrate::lowering`; `None` on every other
+    /// [`CrateLowering::new`] path.
+    prior_fat_dyn_callee: Option<&'l dyn Fn(&str) -> Option<FunctionGraph>>,
 }
 
 impl CrateLoweringState {
@@ -1584,6 +1589,7 @@ impl<'l> CrateLowering<'l> {
         static_addrs: crate::HostStaticAddrs<'l>,
         jitdriver_receiver_roots: &'l [String],
         state: &'l CrateLoweringState,
+        prior_fat_dyn_callee: Option<&'l dyn Fn(&str) -> Option<FunctionGraph>>,
     ) -> Self {
         Self {
             llbc,
@@ -1591,7 +1597,35 @@ impl<'l> CrateLowering<'l> {
             jitdriver_receiver_roots,
             state,
             root_stack: RootStackAnalyzer::new(llbc, &state.root_stack),
+            prior_fat_dyn_callee,
         }
+    }
+
+    /// Lower a local fat-`&dyn` callee of this crate for a later splice.
+    pub(crate) fn lower_fat_dyn_callee_local(&self, def_id: u64) -> Option<FunctionGraph> {
+        let CrateLoweringState {
+            struct_field_attrs,
+            struct_fields,
+            tombstoned_leaves,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+            dont_look_inside,
+            ..
+        } = self.state;
+        lower_fat_dyn_callee(
+            self.llbc,
+            def_id,
+            self.static_addrs,
+            self.jitdriver_receiver_roots,
+            struct_field_attrs,
+            struct_fields,
+            dont_look_inside,
+            tombstoned_leaves,
+            gc_struct_ids,
+            immutable_fields,
+            raw_alloc_flavor_structs,
+        )
     }
 
     /// Lower every declaration the filters admit, then every clause
@@ -1869,6 +1903,7 @@ impl<'l> CrateLowering<'l> {
             llbc,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             ref root_stack,
             ..
         } = *self;
@@ -1897,6 +1932,7 @@ impl<'l> CrateLowering<'l> {
             &body,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             struct_field_attrs,
             struct_fields,
             dont_look_inside,
@@ -2076,6 +2112,7 @@ impl<'l> CrateLowering<'l> {
             llbc,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             ref root_stack,
             ..
         } = *self;
@@ -2091,6 +2128,7 @@ impl<'l> CrateLowering<'l> {
             body,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             struct_field_attrs,
             struct_fields,
             dont_look_inside,
@@ -2240,7 +2278,7 @@ fn build_semantic_program_from_llbc_with_static_addrs_filtered(
         module_filter,
         function_filter,
     );
-    let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state)
+    let functions = CrateLowering::new(llbc, static_addrs, jitdriver_receiver_roots, &state, None)
         .lower_all(module_filter, function_filter);
     let program = state.finish(functions);
     report_lowering_skips(&skips);
@@ -5162,6 +5200,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &u,
         static_addrs,
         jitdriver_receiver_roots,
+        None,
         struct_field_attrs,
         struct_fields,
         dont_look_inside,
@@ -5198,7 +5237,7 @@ fn lower_fat_dyn_callee(
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> Option<FunctionGraph> {
-    if crate::front::dyn_fat::splice_in_progress(def_id) {
+    if crate::front::dyn_fat::splice_in_progress(llbc, def_id) {
         return None;
     }
     let decl = llbc.fn_by_id(def_id)?;
@@ -5236,6 +5275,7 @@ fn splice_recorded_fat_dyn_returns(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
+    prior_fat_dyn_callee: Option<&dyn Fn(&str) -> Option<FunctionGraph>>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
@@ -5251,10 +5291,10 @@ fn splice_recorded_fat_dyn_returns(
         if let Some(cached) = cache.borrow().get(&def_id).cloned() {
             return cached;
         }
-        if crate::front::dyn_fat::splice_in_progress(def_id) {
+        if crate::front::dyn_fat::splice_in_progress(llbc, def_id) {
             return None;
         }
-        let lowered = lower_fat_dyn_callee(
+        let mut lowered = lower_fat_dyn_callee(
             llbc,
             def_id,
             static_addrs,
@@ -5267,6 +5307,14 @@ fn splice_recorded_fat_dyn_returns(
             immutable_fields,
             raw_alloc_flavor_structs,
         );
+        if lowered.is_none()
+            && let Some(decl) = llbc.fn_by_id(def_id)
+            && !decl.has_unstructured_body()
+        {
+            if let Some(lookup) = prior_fat_dyn_callee {
+                lowered = lookup(&decl.item_meta.name_path());
+            }
+        }
         cache.borrow_mut().insert(def_id, lowered.clone());
         lowered
     };
@@ -5514,6 +5562,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     u: &Unstructured,
     static_addrs: crate::HostStaticAddrs<'_>,
     jitdriver_receiver_roots: &[String],
+    prior_fat_dyn_callee: Option<&dyn Fn(&str) -> Option<FunctionGraph>>,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
@@ -6314,6 +6363,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             fd,
             static_addrs,
             jitdriver_receiver_roots,
+            prior_fat_dyn_callee,
             struct_field_attrs,
             struct_fields,
             dont_look_inside,

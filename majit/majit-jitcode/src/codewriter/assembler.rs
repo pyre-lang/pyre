@@ -1155,10 +1155,6 @@ pub enum AssemblerDescrKey {
     VableArray {
         index: usize,
     },
-    VtableMethod {
-        trait_root: String,
-        method_name: String,
-    },
     /// `descr.py InteriorFieldDescr(arraydescr, fielddescr)` identity
     /// is the composition of the array and field descriptor keys.
     InteriorField {
@@ -1287,13 +1283,6 @@ impl AssemblerDescrKey {
             }
             crate::jitcode::BhDescr::VableField { index } => Self::VableField { index: *index },
             crate::jitcode::BhDescr::VableArray { index } => Self::VableArray { index: *index },
-            crate::jitcode::BhDescr::VtableMethod {
-                trait_root,
-                method_name,
-            } => Self::VtableMethod {
-                trait_root: trait_root.clone(),
-                method_name: method_name.clone(),
-            },
             crate::jitcode::BhDescr::InteriorField { array, field } => Self::InteriorField {
                 array: Box::new(Self::from_ready(array)),
                 field: Box::new(Self::from_ready(field)),

@@ -334,27 +334,27 @@ pub extern "C" fn hash_str_hooked(ptr: *const u8, len: usize) -> i64 {
     HASH_STR_HOOK.with(|cell| cell.get().map(|f| unsafe { f(ptr, len) }).unwrap_or(0))
 }
 
-/// [`hash_str_hooked`] over a byte slice.
-///
-/// Marked so the `as_ptr` decomposition runs *inside* the boundary that is
-/// already opaque (`rlib/jit.py:139`): `core::slice::<Impl>::as_ptr` is an
-/// unregistered foreign leaf, and spelling it in [`try_hash_str`]'s traced body
-/// stopped that graph and every caller above it.  A `&[u8]` argument crosses a
-/// residual call unchanged — the same shape `host_seam::emit_stdout` uses — and
-/// the `i64` result is a single word, so nothing here widens the residual ABI.
+/// [`hash_str_hooked`] over the rstr `STR` of a text — one word, as
+/// `rstr.py ll_strhash` takes the STR.  The digest is the installed hook's
+/// (Python-level `hash()`), not `STR.hash`.
 #[majit_macros::dont_look_inside]
-pub fn hash_str_hooked_bytes(bytes: &[u8]) -> i64 {
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "`key` is a live rstr `STR` the caller holds (one GC word, as `rstr.py ll_strhash` takes it)"
+)]
+pub extern "C" fn hash_str_hooked_str(key: *mut crate::unicodeobject::Utf8Str) -> i64 {
+    let bytes = unsafe { crate::unicodeobject::utf8_payload_bytes(key) };
     hash_str_hooked(bytes.as_ptr(), bytes.len())
 }
 
-/// Invoke the installed `hash_str` hook over `bytes`.  Returns `None` when no
+/// Invoke the installed `hash_str` hook over the STR key.  Returns `None` when no
 /// hook is installed (pyre-object lib tests without the str hook, pre-init
 /// snapshot tools); the str-keyed GET helpers then fall back to the
-/// allocating `object_key_for(w_str_new(key))` path so behavior is preserved.
+/// wrapping `object_key_for(w_str_from_storage(key))` path so behavior is preserved.
 #[inline]
-pub fn try_hash_str(bytes: &[u8]) -> Option<i64> {
+pub fn try_hash_str(key: *mut crate::unicodeobject::Utf8Str) -> Option<i64> {
     if has_hash_str_hook() {
-        Some(hash_str_hooked_bytes(bytes))
+        Some(hash_str_hooked_str(key))
     } else {
         None
     }

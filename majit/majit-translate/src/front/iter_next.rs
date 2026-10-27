@@ -91,7 +91,6 @@ pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
     match target {
         CallTarget::Method { name, .. } => name == "next",
         CallTarget::FunctionPath { segments, .. } => segments.last().is_some_and(|s| s == "next"),
-        CallTarget::Indirect { method_name, .. } => method_name == "next",
         _ => false,
     }
 }

@@ -8232,7 +8232,11 @@ fn journal_walker_dict_store_subscr<Sym: WalkSym>(
                 return None;
             }
             let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
-            pyre_object::w_module_dict_getitem_str(dict, key_text).unwrap_or(std::ptr::null_mut())
+            pyre_object::w_module_dict_getitem_str(
+                dict,
+                pyre_object::unicodeobject::prebuilt_str_storage(key_text),
+            )
+            .unwrap_or(std::ptr::null_mut())
         } else if pyre_object::w_dict_is_empty_strategy(dict) {
             std::ptr::null_mut()
         } else {

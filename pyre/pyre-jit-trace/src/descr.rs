@@ -16275,31 +16275,6 @@ mod switch_descr_tests {
     }
 }
 
-/// Trace-side adapter for pyre's Rust-vtable method descriptor.
-#[derive(Debug)]
-pub struct PyreVtableMethodDescr {
-    trait_root: String,
-    method_name: String,
-}
-
-impl PyreVtableMethodDescr {
-    pub fn new(trait_root: String, method_name: String) -> Self {
-        Self {
-            trait_root,
-            method_name,
-        }
-    }
-}
-
-impl Descr for PyreVtableMethodDescr {
-    fn repr(&self) -> String {
-        format!(
-            "VtableMethodDescr({}::{})",
-            self.trait_root, self.method_name
-        )
-    }
-}
-
 /// `assembler.py Assembler.descrs` parity adapter — translate one
 /// codewriter-side `BhDescr` slot (`majit-jitcode/src/codewriter/jitcode.rs`)
 /// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
@@ -16329,9 +16304,9 @@ impl Descr for PyreVtableMethodDescr {
 ///   `make_call_descr_with_effect`, preserving RPython `call.py:320`
 ///   effectinfo_from_writeanalyze parity for descr cache keys and
 ///   residual-call classification.
-/// * `Switch` / `VableField` / `VableArray` / `VtableMethod` — trace-side
-///   adapters preserve the descriptor slot instead of substituting a
-///   fail-descr placeholder.
+/// * `Switch` / `VableField` / `VableArray` — trace-side adapters
+///   preserve the descriptor slot instead of substituting a fail-descr
+///   placeholder.
 pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
     use majit_jitcode::jitcode::BhDescr;
     match bh {
@@ -17314,13 +17289,6 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
         BhDescr::VableArray { index } => {
             crate::frame_layout::pyframe_array_field_descr(*index as u16)
         }
-        BhDescr::VtableMethod {
-            trait_root,
-            method_name,
-        } => Arc::new(PyreVtableMethodDescr::new(
-            trait_root.clone(),
-            method_name.clone(),
-        )),
     }
 }
 

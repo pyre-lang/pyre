@@ -859,15 +859,6 @@ pub(crate) fn remap_op_kind(
             value: remap_var(value),
             kind_char: *kind_char,
         },
-        OpKind::VtableMethodPtr {
-            receiver,
-            trait_root,
-            method_name,
-        } => OpKind::VtableMethodPtr {
-            receiver: remap_var(receiver),
-            trait_root: trait_root.clone(),
-            method_name: method_name.clone(),
-        },
         OpKind::IndirectCall {
             funcptr,
             args,
@@ -1334,7 +1325,6 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         } => {
             vec![clone_var(obj), clone_var(class_carrier)]
         }
-        OpKind::VtableMethodPtr { receiver, .. } => vec![clone_var(receiver)],
         OpKind::IndirectCall { funcptr, args, .. } => {
             let mut v = vec![clone_var(funcptr)];
             v.extend(args.iter().map(&clone_var));
@@ -1557,9 +1547,6 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::VableFieldRead { .. }
         | OpKind::VableArrayRead { .. }
         | OpKind::VableArrayLen { .. }
-        // Pure vtable slot read — `cast_pointer + getfield` chain
-        // collapsed into one op (see `OpKind::VtableMethodPtr` doc).
-        | OpKind::VtableMethodPtr { .. }
         // `newtuple` is `PureOperation` (`operation.py`).
         | OpKind::NewTuple { .. }
         // `getslice` is registered `pure=True` for flowspace folding/CSE

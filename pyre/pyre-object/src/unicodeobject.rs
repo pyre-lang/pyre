@@ -1421,9 +1421,9 @@ pub unsafe fn w_str_set_hash(obj: PyObjectRef, hash: i64) {
 /// from `_ll_strhash`'s.
 ///
 /// The digest is the one [`crate::dict_eq_hook::try_hash_str`] produces, so a
-/// key hashed here lands in the bucket a borrowed-`&str` probe would have
+/// key hashed here lands in the bucket an rstr `STR` probe would have
 /// found.  Answers zero when no str-hash hook is installed — callers read that
-/// as "no memo", not as a digest, and hash the borrowed bytes themselves.
+/// as "no memo", not as a digest, and hash the STR themselves.
 ///
 /// # Safety
 /// `obj` must be a `W_UnicodeObject`.
@@ -1432,8 +1432,7 @@ pub unsafe fn w_str_hash_memoized(obj: PyObjectRef) -> i64 {
     if cached != 0 {
         return cached;
     }
-    let bytes = unsafe { w_str_get_wtf8(obj) }.as_bytes();
-    let Some(hash) = crate::dict_eq_hook::try_hash_str(bytes) else {
+    let Some(hash) = crate::dict_eq_hook::try_hash_str(unsafe { w_str_storage(obj) }) else {
         return 0;
     };
     unsafe { w_str_set_hash(obj, hash) };

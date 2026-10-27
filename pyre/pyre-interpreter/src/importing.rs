@@ -3746,9 +3746,10 @@ pub(crate) fn sys_modules_finditem_str_exact(
     }
     let hash = unsafe { pyre_object::w_str_hash_memoized(w_name) };
     if majit_metainterp::jit::we_are_jitted() {
+        let key_str = unsafe { pyre_object::unicodeobject::w_str_storage(w_name) };
         return unsafe {
             pyre_object::dictmultiobject::w_dict_get_strategy(dict)
-                .getitem_str_hashed(dict, key, hash)
+                .getitem_str_hashed(dict, key_str, hash)
         };
     }
     match unsafe {
@@ -6836,7 +6837,8 @@ unsafe fn sys_modules_exact_str(name: &str) -> PyObjectRef {
             .getitem_str(dict, name)
             .unwrap_or(pyre_object::PY_NULL);
     }
-    pyre_object::dictmultiobject::w_dict_get_strategy(dict).getitem_str(dict, name)
+    let name_str = pyre_object::unicodeobject::prebuilt_str_storage(name);
+    pyre_object::dictmultiobject::w_dict_get_strategy(dict).getitem_str(dict, name_str)
 }
 
 /// `space.call_method` of a three-argument callable, as five words.

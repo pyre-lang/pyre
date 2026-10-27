@@ -639,8 +639,6 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
         // type matches `rclass.py InstanceRepr.rtype_isinstance`'s
         // `LowLevelType::Bool` result.
         OpKind::IsInstance { .. } => ValueType::Bool,
-        // RPython: vtable entry is a `Ptr(FuncType)` address.
-        OpKind::VtableMethodPtr { .. } => ValueType::Int,
         // The class pointer, as the hint ops carry it.
         OpKind::GuardClass { .. } => ValueType::Int,
         OpKind::IndirectCall { result_ty, .. } => result_ty.clone(),

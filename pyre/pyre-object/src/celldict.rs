@@ -1364,8 +1364,14 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
 
     /// `celldict.py getitem_str` — str fast path matches
     /// `w_module_dict_getitem_str` and its cell-cache behavior.
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
-        crate::dictmultiobject::w_module_dict_getitem_str(w_dict, key).unwrap_or(PY_NULL)
+    unsafe fn getitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut crate::unicodeobject::Utf8Str,
+    ) -> PyObjectRef {
+        let key_bytes = unsafe { crate::unicodeobject::utf8_payload_bytes(key) };
+        let key = unsafe { std::str::from_utf8_unchecked(key_bytes) };
+        ModuleDictStrategy::getitem_str(self, w_dict, key).unwrap_or(PY_NULL)
     }
 
     /// `celldict.py setitem` + `_setitem_str_cell_known` — str
@@ -1378,7 +1384,14 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     }
 
     /// `celldict.py setitem_str`.
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
+    unsafe fn setitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut crate::unicodeobject::Utf8Str,
+        w_value: PyObjectRef,
+    ) {
+        let key_bytes = unsafe { crate::unicodeobject::utf8_payload_bytes(key) };
+        let key = unsafe { std::str::from_utf8_unchecked(key_bytes) };
         crate::dictmultiobject::w_module_dict_setitem_str(w_dict, key, w_value);
     }
 

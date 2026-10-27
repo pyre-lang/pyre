@@ -1886,17 +1886,12 @@ mod tests {
         );
     }
 
-    /// The `extension_insns()` quarantine holds 8 keys arising from
-    /// the borrow-checker abort signals (2) and the proc-macro JIT-machine
-    /// state addressing (6), plus 3 more pyre-only
-    /// keys — `inline_call_nested_ext/P` (nested-bytecode `inline_call`
-    /// adapter, `BC_INLINE_CALL = 17`), `abort/>r` (Ref-result variant of
-    /// `abort/`), `vtable_method_ptr/rd>i` (dyn-trait method-pointer
-    /// reification) — so the `extension_insns()` table now holds 11
-    /// entries total.  `wellknown_bh_insns()` is a strict
-    /// subset of RPython's canonical opname universe; `insn_byte` merges both
-    /// tables so build-time `write_insn(...)` callers continue to resolve
-    /// unchanged.
+    /// The `extension_insns()` quarantine holds the borrow-checker abort
+    /// signals, the proc-macro JIT-machine state addressing keys, and
+    /// pyre-only adapters (`inline_call_nested_ext/P`, `abort/>r`).
+    /// `wellknown_bh_insns()` is a strict subset of RPython's canonical
+    /// opname universe; `insn_byte` merges both tables so build-time
+    /// `write_insn(...)` callers continue to resolve unchanged.
     #[test]
     fn extension_insns_quarantines_runtime_keys_out_of_wellknown() {
         let wellknown = wellknown_bh_insns();
@@ -1915,11 +1910,6 @@ mod tests {
             ("inline_call_nested_ext/P", insns::BC_INLINE_CALL),
             // Ref-result variant of the borrow-checker abort signal.
             ("abort/>r", majit_jitcode::insns::BC_ABORT_RESULT_R),
-            // dyn-trait method pointer reification (backend epic).
-            (
-                "vtable_method_ptr/rd>i",
-                majit_jitcode::insns::BC_VTABLE_METHOD_PTR,
-            ),
         ];
 
         for (key, expected_byte) in pairs {

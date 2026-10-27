@@ -1879,8 +1879,7 @@ fn real_main() {
                 | majit_translate::jitcode::BhDescr::Size { .. } => 0_u8,
                 majit_translate::jitcode::BhDescr::Switch { .. }
                 | majit_translate::jitcode::BhDescr::VableField { .. }
-                | majit_translate::jitcode::BhDescr::VableArray { .. }
-                | majit_translate::jitcode::BhDescr::VtableMethod { .. } => 2_u8,
+                | majit_translate::jitcode::BhDescr::VableArray { .. } => 2_u8,
             });
             // `GcCache.get_field_descr` attaches every FieldDescr to the
             // one SizeDescr in `GcCache._cache_size[STRUCT]`; the parent and

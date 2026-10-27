@@ -2027,12 +2027,10 @@ fn translate_op_or_frontier(
 /// the trait is a registered dispatch family.
 ///
 /// `args[0]` is the receiver; the rationale for this shape is on the
-/// `CallTarget::Indirect` arm of [`translate_op`], which is one of the two
-/// callers. The other is that arm's pyre-internal twin, `OpKind::IndirectCall`
-/// carrying a `family_key`: an `indirect_call` op has no pre-rtyper spelling
-/// upstream — `rpbc.py` mints it inside `rtype_simple_call`, so
-/// everything the annotator sees is still a `simple_call` — and the adapter is
-/// the entry into annotation, so both spellings must arrive here as one.
+/// `OpKind::IndirectCall { family_key: Some }` arm of [`translate_op`].
+/// An `indirect_call` op has no pre-rtyper spelling upstream — `rpbc.py`
+/// mints it inside `rtype_simple_call`, so everything the annotator sees is
+/// still a `simple_call` — and the adapter is the entry into annotation.
 fn dyn_trait_dispatch_ops(
     arg_hls: Vec<Hlvalue>,
     trait_root: &str,
@@ -3766,12 +3764,6 @@ pub fn translate_op(
         //                                    mirroring `flowspace/
         //                                    flowcontext.py:LOAD_ATTR +
         //                                    CALL_FUNCTION` shape.
-        //   Indirect { trait_root, name } — `dyn Trait` dispatch. Pyre's
-        //                                    `rclass.rs` rewrites this into
-        //                                    a `VtableMethodPtr` followed
-        //                                    by an `IndirectCall`; reaching
-        //                                    the adapter means rclass.rs
-        //                                    didn't run, so fail-loud.
         //   UnsupportedExpr               — frontend coverage gap; fail-loud
         //                                    surfaces the missing
         //                                    `front::mir` arm.
@@ -4381,56 +4373,9 @@ pub fn translate_op(
                         FlowspaceOp::new("simple_call", call_args, result),
                     ])
                 }
-                // A `dyn Trait` virtual call. `front::mir` routes the
-                // inline-Field vtable-slot dispatch here with the receiver already in
-                // `args[0]`.  The production codewriter lowers it through
-                // `rpbc::lower_indirect_calls` (`VtableMethodPtr` +
-                // `IndirectCall`), but pyre has no IR vtable struct, so the
-                // funcptr projection cannot carry a `Ptr(Func)` lltype that
-                // `PtrRepr::rtype_simple_call` (rmodel.rs) needs —
-                // synthesising a `SomePtr(Func)` symbolically is not
-                // available in the two-phase annotate/rtype prepass.
-                //
-                // Instead lower to the same `getattr(receiver,
-                // method_name)` + `simple_call(bound_method, args[1..])`
-                // shape as `CallTarget::Method`.  The receiver `args[0]` is
-                // a `dyn Trait` call-result / deref TEMP annotated
-                // `SomeInstance(classdef=None)` — `dyn Trait` has no
-                // `class_root`, and `derive_subject_inputcells` (this file,
-                // the #346 receiver seeder) only touches startblock
-                // inputargs, not temps — so the method getattr would block
-                // on the classdef-less shell.  Narrow the receiver first to
-                // the trait-family base `ClassDef` via the
-                // `__cast_instance_intrinsic` mechanism (same as the `mir.rs`
-                // path, lowered by `translate_op`'s `__cast_instance_intrinsic`
-                // arm): emit
-                // `simple_call(__cast_instance_intrinsic, receiver,
-                // Constant(byte_str(base_root)))` producing a narrowed
-                // receiver, then `getattr(narrowed, method_name)`.  The
-                // family base's impl subclasses carry the methods through
-                // attrfamily merge, so the getattr resolves the impl
-                // `MethodDesc` family and the trailing `simple_call` rtypes
-                // through the ordinary bound-method path
-                // (`rpbc.py FunctionRepr.call`); dispatch stays virtual.
-                //
-                // The cast root must resolve through `struct_root_classes`
-                // to the base classdef `register_trait_family` minted under
-                // `canonical_struct_name(base_root)`.  `trait_root` here is
-                // the bare trait leaf (`dyn_indirect_target`), but the family
-                // base is keyed by the trait's full `name_path()`, so map the
-                // leaf back through `registered_trait_family_base_root`.  When
-                // no base is registered (unregistered / foreign trait, or an
-                // ambiguous same-leaf collision) the lookup returns `None`
-                // and the plain getattr is emitted — the receiver stays
-                // classdef-less and fails loud exactly as before, no cast to
-                // a non-existent root.
-                CallTarget::Indirect {
-                    method_name,
-                    trait_root,
-                    ..
-                } => {
-                    dyn_trait_dispatch_ops(arg_hls, trait_root, method_name, result, call_registry)
-                }
+                // `dyn Trait` virtual calls arrive as `OpKind::IndirectCall`
+                // with `family_key` (the `{vtable}.method_*` FieldRead plus
+                // `FunctionReprBase.call`). That arm is below.
                 CallTarget::UnsupportedExpr => Err(TyperError::message(format!(
                     "translate_op: Call with CallTarget::UnsupportedExpr at \
                      result={} — frontend coverage gap; the `front::mir` \
@@ -4458,7 +4403,7 @@ pub fn translate_op(
         //
         // `family_key` carries the pre-rtyper identity of the vtable slot, so a
         // dyn-trait dispatch lowers to the same `getattr` + `simple_call` shape
-        // as its `CallTarget::Indirect` twin. `funcptr` is dropped: it is the
+        // as `CallTarget::Method`. `funcptr` is dropped: it is the
         // `Field[Adt(vtable), slot]` projection, which the `getattr` re-derives
         // from the receiver at the level the annotator works in.
         OpKind::IndirectCall {
@@ -4494,24 +4439,6 @@ pub fn translate_op(
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
         }
-
-        // ─── Pyre-internal: VtableMethodPtr ───
-        // TODO(rclass-vtable-rework): pyre-only adaptation of
-        // `rclass.py getclsfield()`.  Emitted by
-        // `translator/rtyper/rclass.rs` to project the function
-        // pointer out of a `dyn Trait` receiver's vtable. It exists
-        // only *inside* the rtyper pipeline (rclass produces it;
-        // jtransform consumes it), so reaching the flowspace adapter
-        // input means an rtyper-stage layer missed its own emit/
-        // consume invariant.
-        OpKind::VtableMethodPtr { .. } => Err(TyperError::message(format!(
-            "translate_op: VtableMethodPtr at result={} is rtyper-internal \
-             (TODO(rclass-vtable-rework) of rclass.py:371-377); rclass.rs \
-             emits it and the jtransform layer consumes it before flowspace \
-             adapter input — reaching here means the rclass→jtransform \
-             pipeline broke",
-            fmt_op_result(op),
-        ))),
 
         // `int_between(n, m, p)` is the llop `n <= m < p`
         // (`rarithmetic.int_between`).  It is not a flowspace operator, so
@@ -4611,8 +4538,8 @@ pub fn translate_op(
         // post-rtyper jtransform-emitted variant is enumerated in
         // `post_rtyper_jtransform_variant_name` and short-circuits with
         // a stage-mismatch message before this fall-through, and every
-        // pyre-internal rtyper-cutover variant (`IndirectCall`,
-        // `VtableMethodPtr`) has its own targeted fail-loud arm.  Hitting
+        // pyre-internal rtyper-cutover variant (`IndirectCall`) has its
+        // own targeted fail-loud arm.  Hitting
         // this catch-all means a brand-new `OpKind` was added without
         // updating either the explicit translate arm OR the variant-name
         // table — fail-loud with a clear pointer at where the missing
@@ -4683,7 +4610,6 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::GuardTrue { .. } => "GuardTrue",
         OpKind::GuardFalse { .. } => "GuardFalse",
         OpKind::GuardValue { .. } => "GuardValue",
-        OpKind::VtableMethodPtr { .. } => "VtableMethodPtr",
         OpKind::IndirectCall { .. } => "IndirectCall",
         OpKind::BinOp { .. } => "BinOp",
         OpKind::UnaryOp { .. } => "UnaryOp",
@@ -11528,59 +11454,6 @@ mod tests {
     }
 
     #[test]
-    fn translate_op_call_indirect_chains_getattr_simple_call() {
-        // Call::Indirect (`dyn Trait` virtual call) lowers to the same
-        // `[getattr(receiver, method_name) -> meth, simple_call(meth,
-        // args[1..])]` chain as `CallTarget::Method`.  The receiver
-        // `args[0]` is seeded (by `derive_subject_inputcells`) as the
-        // trait-family base ClassDef, so the method getattr resolves the
-        // impl `MethodDesc` family in the two-phase prepass instead of
-        // failing loud.
-        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
-        let mut graph = LegacyGraph::new("translate_op_fixture");
-        let vars = mint_vars(&mut graph, 11); // vars[0..11]
-        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new())); // receiver
-        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new())); // arg
-        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new())); // result
-        let op = SpaceOperation {
-            result: Some(vars[3].clone()),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::indirect("MyTrait", "do_it"),
-                args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
-                result_ty: ValueType::Int,
-            },
-        };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
-            .expect("Call::Indirect must lower to getattr + simple_call");
-        assert_eq!(translated.len(), 2);
-        assert_eq!(translated[0].opname, "getattr");
-        assert_eq!(translated[1].opname, "simple_call");
-        // getattr's name arg is the method name as a byte string.
-        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
-            panic!("getattr method-name arg must be a Constant");
-        };
-        assert!(matches!(
-            name_const.value,
-            ConstValue::ByteStr(ref bytes) if bytes == b"do_it"
-        ));
-        // Bound-method Variable identity threads from getattr.result into
-        // simple_call.args[0].
-        let Hlvalue::Variable(ref m1) = translated[0].result else {
-            panic!("getattr result must be Variable");
-        };
-        let Hlvalue::Variable(ref m2) = translated[1].args[0] else {
-            panic!("simple_call's first arg must be Variable (bound method)");
-        };
-        assert_eq!(
-            m1.id(),
-            m2.id(),
-            "bound method Variable identity must thread"
-        );
-        // simple_call args = [bound_method, args[1..]]
-        assert_eq!(translated[1].args.len(), 2);
-    }
-
-    #[test]
     fn translate_op_indirect_call_without_family_key_lowers_to_simple_call() {
         // An IndirectCall carrying no `family_key` is a stored function
         // pointer. The annotator sees `simple_call(funcptr, *args)`
@@ -11616,9 +11489,8 @@ mod tests {
     }
 
     /// An IndirectCall that does carry a `family_key` names a dyn-trait vtable
-    /// slot, and lowers to the same pre-rtyper shape as its `CallTarget::
-    /// Indirect` twin: `getattr(receiver, method)` then `simple_call`. The
-    /// annotator never sees an `indirect_call` — `rpbc.py` mints that
+    /// slot, and lowers to `getattr(receiver, method)` then `simple_call`.
+    /// The annotator never sees an `indirect_call` — `rpbc.py` mints that
     /// inside `rtype_simple_call`, downstream of here.
     #[test]
     fn translate_op_indirect_call_with_family_key_lowers_to_getattr_simple_call() {

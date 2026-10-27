@@ -3711,7 +3711,6 @@ fn call_target_variant_name(target: &CallTarget) -> &'static str {
         CallTarget::Method { .. } => "Method",
         CallTarget::FunctionPath { .. } => "FunctionPath",
         CallTarget::SyntheticTransparentCtor { .. } => "SyntheticTransparentCtor",
-        CallTarget::Indirect { .. } => "Indirect",
         CallTarget::UnsupportedExpr => "UnsupportedExpr",
     }
 }
@@ -7924,10 +7923,10 @@ impl CallControl {
         // Resolve the FunctionPath spelling before the mutable graph borrow.
         // `from` is the graph identity `call_op_callees` already resolved;
         // the op may still spell `crate::m::f` / a local-crate root.
-        // Trait `CallTarget::Indirect` and empty `IndirectCall` families
-        // expand here too (`all_impls_for_indirect` / builtin wrappers),
-        // the same rows `call_op_callees` would yield, so the selected
-        // graph can be written onto the op (`row_of_graphs.values()`).
+        // Trait `IndirectCall { family_key }` and empty `IndirectCall`
+        // families expand here too (`all_impls_for_indirect` / builtin
+        // wrappers), the same rows `call_op_callees` would yield, so the
+        // selected graph can be written onto the op (`row_of_graphs.values()`).
         let from_aliases = self.function_graphs.alias_paths(from);
         enum ExpandFamily {
             Trait(String, String),
@@ -7949,13 +7948,9 @@ impl CallControl {
                     target: target @ CallTarget::FunctionPath { .. },
                     ..
                 } => (target.function_call_path(), None),
-                OpKind::Call {
-                    target:
-                        CallTarget::Indirect {
-                            graphs: None,
-                            trait_root,
-                            method_name,
-                        },
+                OpKind::IndirectCall {
+                    graphs: None,
+                    family_key: Some((trait_root, method_name)),
                     ..
                 } => (
                     None,
@@ -8007,20 +8002,15 @@ impl CallControl {
                         *resolved_path = Some(to.clone());
                     }
                 }
-                CallTarget::Indirect { graphs, .. } => {
-                    let family = graphs.get_or_insert_with(|| expanded.take().unwrap_or_default());
-                    replace_family_member(family, from, to);
-                }
                 _ => {}
             },
-            OpKind::IndirectCall {
-                graphs: Some(graphs),
-                ..
-            } => {
-                if graphs.is_empty() {
-                    *graphs = expanded.take().unwrap_or_default();
+            OpKind::IndirectCall { graphs, .. } => {
+                if graphs.as_deref().is_none_or(<[_]>::is_empty) {
+                    *graphs = Some(expanded.take().unwrap_or_default());
                 }
-                replace_family_member(graphs, from, to);
+                if let Some(family) = graphs {
+                    replace_family_member(family, from, to);
+                }
             }
             _ => {}
         }
@@ -8147,55 +8137,26 @@ impl CallControl {
             // `call.py CallControl.graphs_from` indirect_call — the attached
             // `c_graphs` family, `None` meaning "unknown
             // family" and classifying the site as residual.
-            OpKind::IndirectCall { graphs, .. } => match graphs {
+            OpKind::IndirectCall {
+                graphs, family_key, ..
+            } => match graphs {
                 Some(graphs) if graphs.is_empty() => builtin_wrappers.to_vec(),
                 Some(graphs) => graphs.clone(),
-                None => {
-                    if bfs_phase {
-                        crate::decline::record(
-                            BFS_GATE,
-                            "indirect-family-unknown",
-                            format_args!("in {caller}"),
-                        );
+                None => match family_key {
+                    Some((trait_root, method_name)) => {
+                        self.all_impls_for_indirect(trait_root, method_name)
                     }
-                    Vec::new()
-                }
-            },
-            // Same indirect_call site, spelled the way it
-            // exists *before* `rpbc::lower_indirect_calls`
-            // rewrites it into `VtableMethodPtr` +
-            // `IndirectCall`.  That lowering runs inside
-            // `transform_graph_to_jitcode`, i.e. strictly
-            // after `find_all_graphs`, so this is the shape
-            // the BFS actually sees.
-            //
-            // This is not a second family resolver: the arm
-            // below and `lower_indirect_calls` both call
-            // `all_impls_for_indirect`, and the lowering only
-            // folds an empty answer into `graphs = None`,
-            // which the arm above skips exactly as an empty
-            // `callees` does here.  The two arms therefore
-            // enumerate the same callees
-            // (`rpbc.py c_graphs = row_of_graphs.values()`).
-            //
-            // Running the lowering before graph discovery so
-            // only the post-rtyper shape reaches the BFS would
-            // match RPython's phase order, but it forces every
-            // registered graph to be lowered up front, which is
-            // the eager pass on-demand body lowering replaced
-            // when the prepass peak RSS came down from 7.71 GB
-            // to 4.25 GB.
-            OpKind::Call {
-                target:
-                    CallTarget::Indirect {
-                        trait_root,
-                        method_name,
-                        graphs,
-                    },
-                ..
-            } => match graphs {
-                Some(graphs) => graphs.clone(),
-                None => self.all_impls_for_indirect(trait_root, method_name),
+                    None => {
+                        if bfs_phase {
+                            crate::decline::record(
+                                BFS_GATE,
+                                "indirect-family-unknown",
+                                format_args!("in {caller}"),
+                            );
+                        }
+                        Vec::new()
+                    }
+                },
             },
             // `call.py CallControl.guess_call_kind` direct_call.  These three
             // classifications are attached to the single
@@ -10136,7 +10097,7 @@ impl CallControl {
             CallTarget::SyntheticTransparentCtor {
                 is_struct: true, ..
             } => None,
-            CallTarget::SyntheticTransparentCtor { .. } | CallTarget::Indirect { .. } => None,
+            CallTarget::SyntheticTransparentCtor { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
     }
@@ -12143,29 +12104,6 @@ impl CallControl {
     ///         return True
     /// ```
     pub fn _canraise(&self, target: &CallTarget, cache: &mut AnalysisCache) -> CanRaise {
-        if let CallTarget::Indirect {
-            trait_root,
-            method_name,
-            graphs,
-        } = target
-        {
-            // Same fold as `rpbc.rs`'s `lower_indirect_calls` and as `getcalldescr`'s
-            // `CallShape::Indirect` above: `all_impls_for_indirect` returns
-            // an empty vector both when the family is genuinely empty and
-            // when its impls live outside the analyzed sources, and this
-            // side cannot tell those apart.  `Some(&[])` would reach
-            // `cached_can_raise_family`'s `No` initialiser without the loop
-            // body ever running, i.e. "an unregistered family cannot
-            // raise".  `None` is the honest answer and gives `Yes`.
-            // A specialized row stamped on the op is the family the
-            // annotator selected (`row_of_graphs.values()`).
-            let graphs = match graphs {
-                Some(graphs) if !graphs.is_empty() => graphs.clone(),
-                _ => self.all_impls_for_indirect(trait_root, method_name),
-            };
-            let graphs = (!graphs.is_empty()).then_some(graphs);
-            return self.cached_can_raise_family(graphs.as_deref(), cache);
-        }
         self.cached_can_raise(target, cache)
     }
 
@@ -14992,13 +14930,8 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         // be conservative.
         OpKind::Call { .. } => RaiseClass::Yes,
 
-        // ── vtable entry extraction: pure memory load, no raise ──
-        // RPython: op.args[0] in indirect_call is a plain Variable,
-        // the address extraction itself has no raising analogue.
-        OpKind::VtableMethodPtr { .. } => RaiseClass::No,
         // ── indirect_call canraise comes from the family's calldescr ──
-        // (analyze() dispatch, not here). Not yet emitted; arm reserved
-        // for Phase B.
+        // (analyze() dispatch, not here).
         OpKind::IndirectCall { .. } => RaiseClass::Yes,
 
         // ── Abort placeholders: canraise.py:18 → True (conservative) ─
@@ -16871,6 +16804,43 @@ mod tests {
             },
         });
         hinted
+    }
+
+    fn push_vtable_slot_indirect_call(
+        graph: &mut FunctionGraph,
+        block: BlockId,
+        receiver: crate::flowspace::model::Variable,
+        extra_args: Vec<crate::flowspace::model::Variable>,
+        trait_root: &str,
+        method_name: &str,
+        result_ty: ValueType,
+        result: Option<crate::flowspace::model::Variable>,
+    ) {
+        let funcptr = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(funcptr.clone()),
+            kind: OpKind::FieldRead {
+                base: receiver.clone(),
+                field: FieldDescriptor::new(
+                    format!("method_{method_name}"),
+                    Some(format!("{trait_root}::{{vtable}}")),
+                ),
+                ty: ValueType::Int,
+                pure: true,
+            },
+        });
+        let mut args = vec![receiver];
+        args.extend(extra_args);
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs: None,
+                family_key: Some((trait_root.to_string(), method_name.to_string())),
+                result_ty,
+            },
+        });
     }
 
     fn push_hint_fresh_virtualizable(
@@ -20722,14 +20692,16 @@ mod tests {
         let frame = caller.alloc_value_var();
         let hinted = push_hint_access_directly(&mut caller, entry, frame);
         let result = caller.alloc_value_var();
-        caller.block_mut(entry).operations.push(SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args([hinted]),
-                result_ty: ValueType::Ref(None),
-            },
-        });
+        push_vtable_slot_indirect_call(
+            &mut caller,
+            entry,
+            hinted,
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Ref(None),
+            Some(result.clone()),
+        );
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::Call {
@@ -20745,19 +20717,20 @@ mod tests {
 
         let ad = access_directly_path(&impl_path);
         let caller = cc.function_graphs().get(&caller_path).expect("caller");
-        match &caller.block(caller.startblock).operations[1].kind {
-            OpKind::Call {
-                target: CallTarget::Indirect { graphs, .. },
-                ..
-            } => {
-                assert_eq!(
-                    graphs.as_ref(),
-                    Some(&vec![ad.clone()]),
-                    "trait call must name the AccessDirect implementation"
-                );
-            }
-            other => panic!("expected CallTarget::Indirect, got {other:?}"),
-        }
+        let graphs = caller
+            .block(caller.startblock)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::IndirectCall { graphs, .. } => Some(graphs),
+                _ => None,
+            })
+            .expect("trait IndirectCall");
+        assert_eq!(
+            graphs.as_ref(),
+            Some(&vec![ad.clone()]),
+            "trait call must name the AccessDirect implementation"
+        );
         assert!(
             cc.is_candidate(&ad),
             "discovery must reach the AccessDirect implementation"
@@ -20835,14 +20808,16 @@ mod tests {
         let mut caller = FunctionGraph::new("caller");
         let entry = caller.startblock;
         let plain = caller.alloc_value_var();
-        caller.block_mut(entry).operations.push(SpaceOperation {
-            result: None,
-            kind: OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args([plain.clone()]),
-                result_ty: ValueType::Void,
-            },
-        });
+        push_vtable_slot_indirect_call(
+            &mut caller,
+            entry,
+            plain.clone(),
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Void,
+            None,
+        );
         let funcptr = caller.alloc_value_var();
         caller.block_mut(entry).operations.push(SpaceOperation {
             result: None,
@@ -20859,35 +20834,50 @@ mod tests {
         cc.annotate_access_directly(&[caller_path.clone()]);
 
         let caller = cc.function_graphs().get(&caller_path).expect("caller");
-        match &caller.block(caller.startblock).operations[0].kind {
-            OpKind::Call {
-                target: CallTarget::Indirect { graphs, .. },
-                ..
-            } => {
-                assert!(
-                    graphs.is_none()
-                        || graphs.as_ref().is_some_and(|family| {
-                            family.contains(&impl_path)
-                                && !family.iter().any(is_access_directly_path)
-                        }),
-                    "unflagged trait family must stay regular: {graphs:?}"
-                );
+        let mut trait_graphs = None;
+        let mut wrapper_graphs = None;
+        for op in &caller.block(caller.startblock).operations {
+            match &op.kind {
+                OpKind::IndirectCall {
+                    graphs,
+                    family_key: Some((root, method)),
+                    ..
+                } if root == "Handler" && method == "run" => {
+                    trait_graphs = Some(graphs);
+                }
+                OpKind::IndirectCall {
+                    graphs,
+                    family_key: None,
+                    ..
+                } => {
+                    wrapper_graphs = Some(graphs);
+                }
+                OpKind::IndirectCall { graphs, .. }
+                    if graphs
+                        .as_ref()
+                        .is_some_and(|family| family.contains(&impl_path)) =>
+                {
+                    trait_graphs = Some(graphs);
+                }
+                _ => {}
             }
-            other => panic!("expected CallTarget::Indirect, got {other:?}"),
         }
-        match &caller.block(caller.startblock).operations[1].kind {
-            OpKind::IndirectCall { graphs, .. } => {
-                assert!(
-                    graphs.as_ref().is_some_and(|family| {
-                        family.is_empty()
-                            || (family.contains(&wrapper)
-                                && !family.iter().any(is_access_directly_path))
-                    }),
-                    "unflagged wrapper family must stay regular: {graphs:?}"
-                );
-            }
-            other => panic!("expected IndirectCall, got {other:?}"),
-        }
+        let graphs = trait_graphs.expect("trait IndirectCall");
+        assert!(
+            graphs.is_none()
+                || graphs.as_ref().is_some_and(|family| {
+                    family.contains(&impl_path) && !family.iter().any(is_access_directly_path)
+                }),
+            "unflagged trait family must stay regular: {graphs:?}"
+        );
+        let graphs = wrapper_graphs.expect("wrapper IndirectCall");
+        assert!(
+            graphs.as_ref().is_some_and(|family| {
+                family.is_empty()
+                    || (family.contains(&wrapper) && !family.iter().any(is_access_directly_path))
+            }),
+            "unflagged wrapper family must stay regular: {graphs:?}"
+        );
         assert_regular_not_access_directly(&cc, &impl_path);
         assert_no_access_directly_copy(&cc, &impl_path);
         assert_regular_not_access_directly(&cc, &wrapper);
@@ -26139,14 +26129,12 @@ mod tests {
         assert!(no_members.extra_info._write_descrs_fields.is_none());
     }
 
-    /// `_canraise`'s `CallTarget::Indirect` arm resolves the family itself
-    /// through `all_impls_for_indirect`, so it meets the same question one
-    /// step earlier than `getcalldescr` does — and must answer it the same
-    /// way: a family it cannot enumerate can raise.
+    /// `getcalldescr` of an `IndirectCall { graphs: None }` is the unknown
+    /// family: a family it cannot enumerate can raise.
     ///
     /// The two registered families are the non-vacuity control: they show
-    /// `cached_can_raise_family` reaching both `No` and `Yes` off the
-    /// members it was handed, so the unregistered family's `Yes` is the
+    /// family analysis reaching both `CannotRaise` and `CanRaise` off the
+    /// members it was handed, so the unregistered family's top is the
     /// unknown-family rule and not a constant.
     #[test]
     fn unenumerable_indirect_family_canraise_is_top() {
@@ -26155,15 +26143,31 @@ mod tests {
         cc.register_trait_method("run", Some("Loud"), "B", raising_graph("B::run"));
         cc.find_all_graphs_for_tests();
 
-        let mut cache = AnalysisCache::default();
+        let descr_of = |graphs: Option<Vec<CallPath>>| {
+            let mut cache = AnalysisCache::default();
+            cc.getcalldescr(
+                &indirect_call_op(graphs),
+                Vec::new(),
+                Type::Void,
+                OopSpecIndex::None,
+                None,
+                &mut cache,
+                None,
+            )
+        };
+
         assert_eq!(
-            cc._canraise(&CallTarget::indirect("Quiet", "run"), &mut cache),
-            CanRaise::No,
+            descr_of(Some(cc.all_impls_for_indirect("Quiet", "run")))
+                .extra_info
+                .extraeffect,
+            ExtraEffect::CannotRaise,
             "control: an enumerated non-raising family reaches bottom"
         );
         assert_eq!(
-            cc._canraise(&CallTarget::indirect("Loud", "run"), &mut cache),
-            CanRaise::Yes,
+            descr_of(Some(cc.all_impls_for_indirect("Loud", "run")))
+                .extra_info
+                .extraeffect,
+            ExtraEffect::CanRaise,
             "control: an enumerated raising member is seen"
         );
 
@@ -26172,8 +26176,8 @@ mod tests {
             "the invariant below needs a family with no registered impls"
         );
         assert_eq!(
-            cc._canraise(&CallTarget::indirect("Unheard", "run"), &mut cache),
-            CanRaise::Yes,
+            descr_of(None).extra_info.extraeffect,
+            ExtraEffect::RandomEffects,
             "a family with no enumerable members is unknown, not proven empty"
         );
     }

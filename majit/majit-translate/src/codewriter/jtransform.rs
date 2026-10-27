@@ -476,18 +476,13 @@ pub struct GraphTransformResult {
 ///
 /// This wrapper does NOT run `lower_indirect_calls` (the
 /// rtyper-equivalent pass lives in
-/// `translator/rtyper/rpbc.rs`).  Callers that can produce
-/// `CallTarget::Indirect` must go through
-/// `codewriter::transform_graph_to_jitcode` instead, which threads
-/// `&CallControl` and runs the lowering pass before jtransform.
-/// This debug-assertion catches missed lowering sites at the
-/// remaining entries (test fixtures).
+/// `translator/rtyper/rpbc.rs`). Dyn-trait sites arrive as
+/// `OpKind::IndirectCall` with a `{vtable}.method_*` FieldRead
+/// funcptr (`ClassRepr.getclsfield` / `FunctionReprBase.call`).
 pub fn transform_graph(
     graph: &FunctionGraph,
     config: &GraphTransformConfig,
 ) -> GraphTransformResult {
-    #[cfg(debug_assertions)]
-    crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
     let mut transformer = Transformer::new(config);
     transformer.transform(graph)
 }
@@ -4767,13 +4762,13 @@ impl<'a> Transformer<'a> {
                 self.rewrite_op_direct_call(op, target, &args, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
-            // RPython jtransform.py. Pyre's rtyper-equivalent
-            // (`translator/rtyper/rpbc.rs`) lowers
-            // `OpKind::Call { target: CallTarget::Indirect, .. }` into
-            // `OpKind::IndirectCall { funcptr, args, graphs, .. }`
-            // before jtransform runs, so by this point the funcptr is
-            // already a regular Variable and `args` still carry the full
-            // call argument list, including the receiver.
+            // RPython jtransform.py. The MIR frontend emits
+            // `{vtable}.method_*` FieldRead plus `OpKind::IndirectCall`
+            // (`ClassRepr.getclsfield` / `FunctionReprBase.call`);
+            // `rpbc::lower_indirect_calls` fills `graphs` before
+            // jtransform runs. The funcptr is a regular Variable and
+            // `args` still carry the full call argument list, including
+            // the receiver.
             OpKind::IndirectCall {
                 funcptr,
                 args,
@@ -9128,17 +9123,11 @@ impl<'a> Transformer<'a> {
         //   def rewrite_op_direct_call(op): ... handle_%s_call
         //
         // The indirect path (`jtransform.py rewrite_op_indirect_call`)
-        // is reached via `OpKind::IndirectCall` which the rtyper-equivalent
-        // layer (`translator/rtyper/rpbc.rs::lower_indirect_calls`) emits
-        // before jtransform runs, dispatched from `rewrite_operation` to
-        // `lower_indirect_call_op`. By this point, no `CallTarget::Indirect`
-        // can survive — that invariant is asserted in debug builds by
-        // `assert_no_indirect_call_targets`.
-        debug_assert!(
-            !matches!(target, CallTarget::Indirect { .. }),
-            "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
-             before reaching rewrite_op_direct_call",
-        );
+        // is reached via `OpKind::IndirectCall` which the MIR frontend
+        // emits (`ClassRepr.getclsfield` + `FunctionReprBase.call`) and
+        // `rpbc::lower_indirect_calls` fills with `c_graphs` before
+        // jtransform runs, dispatched from `rewrite_operation` to
+        // `lower_indirect_call_op`.
         // A function item used as a *value* (`DecodedConst::FnPath`) is a
         // synthetic 0-arg Call with a `__fn_const` head. Its value is the
         // function's address (`rtyper.getcallable` / `getfunctionptr`), not
@@ -15172,17 +15161,6 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             segs.push(name.as_str());
             crate::parse::CallPath::from_segments(segs)
         }
-        // RPython: an indirect_call has no single jitcode-lookup path —
-        // the family is handled via the op-based `graphs_from(op)` +
-        // `IndirectCallTargets` sidecar.  This fallback returns a stub
-        // path only reached by callers that don't distinguish; the real
-        // consumer (`handle_regular_indirect_call`) uses the family path
-        // directly.
-        CallTarget::Indirect {
-            trait_root,
-            method_name,
-            ..
-        } => crate::parse::CallPath::from_segments([trait_root.as_str(), method_name.as_str()]),
         CallTarget::UnsupportedExpr => crate::parse::CallPath::from_segments(["<unsupported>"]),
     }
 }
@@ -15639,15 +15617,6 @@ fn remap_op(
         OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
             value: remap_value(value, aliases),
             kind_char: *kind_char,
-        },
-        OpKind::VtableMethodPtr {
-            receiver,
-            trait_root,
-            method_name,
-        } => OpKind::VtableMethodPtr {
-            receiver: remap_value(receiver, aliases),
-            trait_root: trait_root.clone(),
-            method_name: method_name.clone(),
         },
         OpKind::VableForce { base } => OpKind::VableForce {
             base: remap_value(base, aliases),
@@ -20482,8 +20451,8 @@ mod tests {
     }
 
     #[test]
-    fn transform_graph_remaps_vtable_method_receiver_after_same_as_identity() {
-        let mut graph = FunctionGraph::new("same_as_then_vtable_method");
+    fn transform_graph_remaps_vtable_method_slot_base_after_same_as_identity() {
+        let mut graph = FunctionGraph::new("same_as_then_vtable_slot");
         let receiver_var = graph
             .push_op_var(
                 graph.startblock,
@@ -20508,30 +20477,31 @@ mod tests {
             .unwrap();
         graph.push_op_var(
             graph.startblock,
-            OpKind::VtableMethodPtr {
-                receiver: alias_var,
-                trait_root: "Handler".into(),
-                method_name: "run".into(),
+            OpKind::FieldRead {
+                base: alias_var,
+                field: FieldDescriptor::new("method_run", Some("Handler::{vtable}".to_string())),
+                ty: ValueType::Int,
+                pure: true,
             },
             true,
         );
         graph.set_return(graph.startblock, None);
 
         let transformed = transform_graph(&graph, &GraphTransformConfig::default());
-        let vtable_receiver = transformed
+        let field_base = transformed
             .graph
             .block(transformed.graph.startblock)
             .operations
             .iter()
             .find_map(|op| match &op.kind {
-                OpKind::VtableMethodPtr { receiver, .. } => Some(receiver),
+                OpKind::FieldRead { base, field, .. } if field.name == "method_run" => Some(base),
                 _ => None,
             })
-            .expect("VtableMethodPtr must survive the transform");
+            .expect("method_run FieldRead must survive the transform");
 
         assert_eq!(
-            vtable_receiver, &receiver_var,
-            "VtableMethodPtr.receiver must follow _do_renaming through same_as"
+            field_base, &receiver_var,
+            "FieldRead.base must follow _do_renaming through same_as"
         );
     }
 
@@ -35447,11 +35417,50 @@ mod tests {
         );
     }
 
+    fn push_vtable_slot_indirect_call(
+        graph: &mut FunctionGraph,
+        receiver: crate::flowspace::model::Variable,
+        extra_args: Vec<crate::flowspace::model::Variable>,
+        trait_root: &str,
+        method_name: &str,
+        result_ty: ValueType,
+        has_result: bool,
+    ) {
+        let funcptr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: receiver.clone(),
+                    field: FieldDescriptor::new(
+                        format!("method_{method_name}"),
+                        Some(format!("{trait_root}::{{vtable}}")),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        let mut args = vec![receiver];
+        args.extend(extra_args);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::IndirectCall {
+                funcptr,
+                args,
+                graphs: None,
+                family_key: Some((trait_root.to_string(), method_name.to_string())),
+                result_ty,
+            },
+            has_result,
+        );
+    }
+
     /// Build a graph that calls `receiver.run()` on a `dyn Handler`
     /// receiver with two registered impls, run the rtyper-equivalent
     /// `lower_indirect_calls` pass and then `Transformer::transform`,
     /// and assert the post-jtransform sequence is exactly
-    /// `[VtableMethodPtr, Live, GuardValue{kind='i'},
+    /// `[FieldRead method_*, Live, GuardValue{kind='i'},
     ///   CallResidual{funcptr=Value(_), indirect_targets=Some}, Live]`.
     /// RPython `jtransform.py + 538-553` orthodox port parity.
     #[test]
@@ -35488,13 +35497,13 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args(vec![receiver_var]),
-                result_ty: ValueType::Void,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Void,
             true,
         );
         graph.set_return(graph.startblock, None);
@@ -35510,8 +35519,11 @@ mod tests {
         let ops = &result.graph.block(graph.startblock).operations;
         let post_input = &ops[1..];
         assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
+            matches!(
+                &post_input[0].kind,
+                OpKind::FieldRead { field, .. } if field.name == "method_run"
+            ),
+            "expected FieldRead method_run first, got {:?}",
             post_input[0].kind
         );
         assert!(
@@ -35582,13 +35594,13 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("Handler", "run"),
-                args: crate::model::call_args(vec![receiver_var]),
-                result_ty: ValueType::Void,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            Vec::new(),
+            "Handler",
+            "run",
+            ValueType::Void,
             true,
         );
         graph.set_return(graph.startblock, None);
@@ -35640,7 +35652,7 @@ mod tests {
     /// Runs the full rtyper-equivalent + jtransform pipeline for a
     /// `receiver.m(extras...)` dyn-Trait call and asserts the emitted
     /// op sequence is exactly
-    /// `[VtableMethodPtr, Live, GuardValue{'i'}, CallResidual, Live]`,
+    /// `[FieldRead method_*, Live, GuardValue{'i'}, CallResidual, Live]`,
     /// with the CallResidual's arg-kind distribution matching `expect`
     /// and `result_kind` matching `expect_res_kind`.  Two impls are
     /// registered so `CallKind::Regular` is selected.
@@ -35727,9 +35739,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut args_vars: Vec<crate::flowspace::model::Variable> = vec![receiver_var];
+        let mut extras_vars: Vec<crate::flowspace::model::Variable> = Vec::new();
         for (i, ty) in extras.iter().enumerate() {
-            args_vars.push(
+            extras_vars.push(
                 graph
                     .push_op_var(
                         graph.startblock,
@@ -35744,13 +35756,13 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("T", "m"),
-                args: crate::model::call_args(args_vars),
-                result_ty,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            extras_vars,
+            "T",
+            "m",
+            result_ty,
             has_result,
         );
         graph.set_return(graph.startblock, None);
@@ -35770,8 +35782,11 @@ mod tests {
             .collect();
 
         assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
+            matches!(
+                &post_input[0].kind,
+                OpKind::FieldRead { field, .. } if field.name == "method_m"
+            ),
+            "expected FieldRead method_m first, got {:?}",
             post_input[0].kind,
         );
         assert!(
@@ -35862,16 +35877,14 @@ mod tests {
     // `handle_residual_indirect_call` is an alias for the regular
     // residual-call path (`jtransform.py`): no `int_guard_value` guard
     // and no `IndirectCallTargets` sidecar; only `[residual_call_*, -live-]`.
-    // On the pyre side we additionally retain the `VtableMethodPtr` op
-    // emitted by `lower_indirect_calls` — the rtyper-equivalent layer runs
-    // unconditionally and provides the runtime funcptr `Variable` consumed
-    // by the `CallResidual.funcptr` `CallFuncPtr::Value` operand.
+    // The `{vtable}.method_*` FieldRead is the `ClassRepr.getclsfield`
+    // funcptr consumed by `CallResidual.funcptr` `CallFuncPtr::Value`.
 
     /// Same skeleton as `check_indirect_regular_call_kind` but drops
     /// `find_all_graphs_for_tests`, so `candidate_graphs` stays empty
     /// and `guess_call_kind(op)` falls through to `CallKind::Residual`
     /// via the `graphs_from(op)` call.py fall-through.
-    /// Emit is `[VtableMethodPtr, CallResidual{indirect_targets: None},
+    /// Emit is `[FieldRead method_*, CallResidual{indirect_targets: None},
     /// Live?]` — the trailing `-live-` appears only when the descriptor's
     /// `can_raise` is true, which is the default for non-elidable
     /// family calls.
@@ -35956,9 +35969,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        let mut args_vars: Vec<crate::flowspace::model::Variable> = vec![receiver_var];
+        let mut extras_vars: Vec<crate::flowspace::model::Variable> = Vec::new();
         for (i, ty) in extras.iter().enumerate() {
-            args_vars.push(
+            extras_vars.push(
                 graph
                     .push_op_var(
                         graph.startblock,
@@ -35973,13 +35986,13 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
-        graph.push_op_var(
-            graph.startblock,
-            OpKind::Call {
-                target: CallTarget::indirect("T", "m"),
-                args: crate::model::call_args(args_vars),
-                result_ty,
-            },
+        push_vtable_slot_indirect_call(
+            &mut graph,
+            receiver_var,
+            extras_vars,
+            "T",
+            "m",
+            result_ty,
             has_result,
         );
         graph.set_return(graph.startblock, None);
@@ -35999,8 +36012,11 @@ mod tests {
             .collect();
 
         assert!(
-            matches!(post_input[0].kind, OpKind::VtableMethodPtr { .. }),
-            "expected VtableMethodPtr first, got {:?}",
+            matches!(
+                &post_input[0].kind,
+                OpKind::FieldRead { field, .. } if field.name == "method_m"
+            ),
+            "expected FieldRead method_m first, got {:?}",
             post_input[0].kind,
         );
         // Residual path must NOT emit the [Live, GuardValue] prefix —

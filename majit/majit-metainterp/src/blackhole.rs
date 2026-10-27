@@ -4854,17 +4854,11 @@ mod tests {
         }
 
         #[test]
-        fn unresolved_call_and_vtable_bail_set_abort_permanent_bail() {
+        fn unresolved_call_sets_abort_permanent_bail() {
             let mut builder = build_test_bh_builder();
             let mut bh = builder.acquire_interp();
             let err = super::super::reject_unresolved_call(&mut bh, 0);
             assert!(matches!(err, DispatchError::LeaveFrame));
-            assert!(bh.aborted && bh.abort_permanent_bail);
-
-            bh.aborted = false;
-            bh.abort_permanent_bail = false;
-            let err = super::super::handler_vtable_method_ptr_bail(&mut bh, &[], 0);
-            assert!(matches!(err, Err(DispatchError::LeaveFrame)));
             assert!(bh.aborted && bh.abort_permanent_bail);
         }
 
@@ -5443,19 +5437,6 @@ mod tests {
             let mut bh = builder.acquire_interp();
             bh.exception_last_value = 0;
             let _ = super::handler_reraise(&mut bh, &[], 0);
-        }
-
-        #[test]
-        fn obsolete_vtable_method_opcode_bails_instead_of_panicking() {
-            let mut builder = super::build_inline_call_only_bh_builder(&[(
-                "recursive_call_v/iIRFIRF",
-                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
-            )]);
-            let mut bh = builder.acquire_interp();
-            let err = super::handler_vtable_method_ptr_bail(&mut bh, &[], 0)
-                .expect_err("unsupported named vtable lookup must leave blackhole");
-            assert!(matches!(err, super::DispatchError::LeaveFrame));
-            assert!(bh.aborted);
         }
 
         /// A pooled interp must not carry the previous run's frame identity.
@@ -11307,14 +11288,6 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         "abort_permanent/".to_string(),
         majit_jitcode::insns::BC_ABORT_PERMANENT,
     );
-    // The canonical MIR dyn-call path is now a concrete vtable FieldRead plus
-    // IndirectCall (`ClassRepr.getclsfield` / `FunctionReprBase.call`).  Keep
-    // the old pyre-only byte registered for frozen/abstract-trait fallback
-    // jitcodes; its handler safely bails to the source interpreter.
-    insns.insert(
-        "vtable_method_ptr/rd>i".to_string(),
-        majit_jitcode::insns::BC_VTABLE_METHOD_PTR,
-    );
     // blackhole.py bhimpl_switch. `handler_switch` is wired in
     // `wire_bhimpl_handlers` but the byte was absent from this builder's
     // insns map, so a deopt through a `switch/id` op landed on the
@@ -12383,8 +12356,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "record_quasiimmut_field/idd",
         handler_record_quasiimmut_field,
     );
-    // Compatibility fallback for the obsolete name-based vtable opcode.
-    builder.wire_handler("vtable_method_ptr/rd>i", handler_vtable_method_ptr_bail);
     builder.wire_handler(
         "jit_force_quasi_immutable/rd",
         handler_jit_force_quasi_immutable,
@@ -12701,24 +12672,6 @@ fn handler_guard_class_r(
     bh.registers_r[code[p + 1] as usize] = typeptr;
     Ok(p + 2)
 }
-/// Fallback for the obsolete pyre-only named vtable lookup.
-///
-/// PyPy's `ClassRepr.getclsfield` emits an ordinary field read; it never tries
-/// to resolve `(trait, method)` strings in the blackhole.  If an old frozen
-/// graph or the still-conservative abstract-trait path reaches this opcode, no
-/// faithful pointer can be manufactured from its descriptor.
-/// `convert_and_run_from_pyjitpl` resumes from one abort, and the resume
-/// consumers require `abort_permanent_bail` (`bhimpl_abort_permanent`).
-fn handler_vtable_method_ptr_bail(
-    bh: &mut BlackholeInterpreter,
-    _code: &[u8],
-    _p: usize,
-) -> Result<usize, DispatchError> {
-    bh.aborted = true;
-    bh.abort_permanent_bail = true;
-    Err(DispatchError::LeaveFrame)
-}
-
 fn handler_record_quasiimmut_field(
     bh: &mut BlackholeInterpreter,
     code: &[u8],

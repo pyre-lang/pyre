@@ -2001,6 +2001,24 @@ pub(in crate::front::mir) fn trait_default_method_id(
         .as_u64()
 }
 
+/// The impl's own body for `method_idx`, or the trait default when the
+/// impl does not override it (`ClassDesc.lookup` /
+/// [`trait_method_on_known_receiver`]).
+pub(in crate::front::mir) fn impl_or_default_method_fn_id(
+    llbc: &Llbc,
+    impl_id: u64,
+    method_idx: u64,
+) -> Option<u64> {
+    let trait_id = llbc
+        .trait_impls_raw()
+        .get(impl_id as usize)?
+        .get("impl_trait")?
+        .get("id")?
+        .as_u64()?;
+    crate::front::clause_spec::impl_method_fn_id(llbc, impl_id, method_idx)
+        .or_else(|| trait_default_method_id(llbc, trait_id, method_idx))
+}
+
 /// The function item a `FnDef` node names, spelled as the `RegularCall`
 /// a direct call to it would carry — Fun id and the instantiation
 /// `generics`. A `RegionBinder` unwraps to `skip_binder`.

@@ -609,7 +609,6 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::GuardFalse { .. }
         | OpKind::GuardValue { .. }
         | OpKind::GuardClass { .. }
-        | OpKind::VtableMethodPtr { .. }
         | OpKind::VableForce { .. }
         | OpKind::Hint { .. }
         | OpKind::CallElidable { .. }

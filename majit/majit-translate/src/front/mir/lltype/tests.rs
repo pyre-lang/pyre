@@ -3153,6 +3153,296 @@ fn a_mono_trait_object_call_names_its_method_from_assoc_item_names() {
     );
 }
 
+/// Dest-only Unsize `VTable(TraitImpl, Global)` + `CallKind::Trait` Dyn,
+/// shaped like real LLBC. The impl overrides `head`.
+#[test]
+fn unsize_constant_vtable_dyn_call_is_a_direct_impl_call() {
+    let llbc = unsize_vtable_dyn_call_fixture(true);
+    let graph = super::lower_function(&llbc, "call_head").expect("lower call_head");
+    assert_unsize_dyn_call_is_direct(&graph, 1, "head");
+}
+
+/// Same Unsize + Dyn call when the impl does not override `head`:
+/// the trait default body is the direct callee.
+#[test]
+fn unsize_constant_vtable_dyn_call_uses_trait_default_when_impl_does_not_override() {
+    let llbc = unsize_vtable_dyn_call_fixture(false);
+    let graph = super::lower_function(&llbc, "call_head").expect("lower call_head");
+    assert_unsize_dyn_call_is_direct(&graph, 1, "head");
+}
+
+fn unsize_vtable_dyn_call_fixture(impl_overrides: bool) -> Llbc {
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "name": path,
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let ident = |s: &str| serde_json::json!({"Ident": [s, 0]});
+    let empty_generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let concrete_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+    });
+    let src_ty = serde_json::json!({"RawPtr": [concrete_adt.clone(), "Mut"]});
+    let dyn_ty = serde_json::json!({
+        "Ref": [null, {"DynTrait": {
+            "binder": {
+                "params": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_clauses": [{
+                        "origin": "Dyn",
+                        "trait_": {"skip_binder": {"id": 0, "generics": empty_generics}}
+                    }]
+                },
+                "kind": "Dyn"
+            }
+        }}, "Shared"]
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+    let local = |i: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": i,
+            "name": name,
+            "span": span,
+            "ty": ty
+        })
+    };
+    let impl_seg = serde_json::json!({
+        "Impl": {
+            "Ty": {"skip_binder": concrete_adt.clone()},
+            "Trait": 0
+        }
+    });
+    let method_name = if impl_overrides {
+        vec![ident("fixture"), ident("Concrete"), impl_seg, ident("head")]
+    } else {
+        vec![ident("fixture"), ident("Storage"), impl_seg, ident("head")]
+    };
+    let method_fd = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(method_name),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [src_ty.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": []},
+            "body": []
+        }}
+    });
+    let trait_ref = serde_json::json!({
+        "skip_binder": {
+            "kind": {"TraitImpl": {"id": 0, "generics": empty_generics}},
+            "trait_decl_ref": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [concrete_adt.clone()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }
+    });
+    let vtable_const = serde_json::json!({
+        "kind": {"Global": {"Global": {"id": 0, "generics": empty_generics}}}
+    });
+    let unsize = serde_json::json!({
+        "UnaryOp": [
+            {"Cast": {"Unsize": [
+                dyn_ty.clone(),
+                {"VTable": [trait_ref, vtable_const]}
+            ]}},
+            {"Move": place(serde_json::json!({"Local": 1}), &src_ty)}
+        ]
+    });
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(vec![ident("fixture"), ident("call_head")]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [src_ty.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                local(0, None, &unit),
+                local(1, Some("arg0"), &src_ty),
+                local(2, Some("dyn_recv"), &dyn_ty),
+                local(3, Some("alias"), &dyn_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 2}), &dyn_ty),
+                            unsize
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            place(serde_json::json!({"Local": 3}), &dyn_ty),
+                            {"Use": [
+                                {"Copy": place(serde_json::json!({"Local": 2}), &dyn_ty)},
+                                "No"
+                            ]}
+                        ]}}
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Trait": [
+                                    {"kind": "Dyn", "trait_decl_ref": {"skip_binder": {"id": 0}}},
+                                    0
+                                ]},
+                                "generics": empty_generics
+                            }},
+                            "args": [{"Move": place(serde_json::json!({"Local": 3}), &dyn_ty)}],
+                            "dest": place(serde_json::json!({"Local": 0}), &unit)
+                        },
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}
+                },
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }}
+    });
+    let mut trait_method = serde_json::json!({
+        "skip_binder": {
+            "name": "head",
+            "signature": {"inputs": [dyn_ty.clone()]}
+        }
+    });
+    if !impl_overrides {
+        trait_method["skip_binder"]["default"] = serde_json::json!({"id": 1});
+    }
+    let impl_methods = if impl_overrides {
+        serde_json::json!([{
+            "kind": {"TraitMethod": [0, 0]},
+            "skip_binder": {"id": 1}
+        }])
+    } else {
+        serde_json::json!([])
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [{
+                "def_id": 0,
+                "item_meta": meta(vec![ident("fixture"), ident("Concrete")]),
+                "kind": {"Struct": []}
+            }],
+            "fun_decls": [caller, method_fd],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(vec![ident("fixture"), ident("Storage")]),
+                "methods": [trait_method]
+            }],
+            "trait_impls": [{
+                "def_id": 0,
+                "impl_trait": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": [concrete_adt],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                },
+                "methods": impl_methods
+            }]
+        }
+    });
+    Llbc::from_slice(file.to_string().as_bytes()).expect("unsize vtable fixture parses")
+}
+
+fn assert_unsize_dyn_call_is_direct(
+    graph: &crate::model::FunctionGraph,
+    fun_decl_id: u64,
+    method_leaf: &str,
+) {
+    use crate::model::{CallTarget, OpKind};
+
+    let mut direct = 0usize;
+    let mut method_slot_reads = 0usize;
+    let mut indirect = 0usize;
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::Call {
+                    target:
+                        CallTarget::FunctionPath {
+                            segments,
+                            fun_decl_id: Some(id),
+                            ..
+                        },
+                    ..
+                } if *id == fun_decl_id
+                    && segments.last().map(String::as_str) == Some(method_leaf) =>
+                {
+                    direct += 1;
+                }
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            fun_decl_id: Some(id),
+                            ..
+                        },
+                    ..
+                } if *id == fun_decl_id && name == method_leaf => {
+                    direct += 1;
+                }
+                OpKind::FieldRead { field, .. } if field.name.starts_with("method_") => {
+                    method_slot_reads += 1;
+                }
+                OpKind::IndirectCall { .. } => {
+                    indirect += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(
+        method_slot_reads,
+        0,
+        "Unsize constant vtable must not FieldRead {{vtable}}.method_*\n{}",
+        graph.dump()
+    );
+    assert_eq!(
+        indirect,
+        0,
+        "Unsize constant vtable must not IndirectCall\n{}",
+        graph.dump()
+    );
+    assert_eq!(
+        direct,
+        1,
+        "expected one direct Call of the impl method {method_leaf} (fun_decl {fun_decl_id})\n{}",
+        graph.dump()
+    );
+}
+
 #[test]
 fn bodyless_trait_method_behind_a_clause_is_not_indirect() {
     // `fn body<H: Storage>(h: &mut H) { h.head() }`: the declaration of

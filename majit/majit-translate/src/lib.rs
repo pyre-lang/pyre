@@ -2490,7 +2490,7 @@ fn analyze_pipeline_from_module_paths(
         )
         .collect();
     // Auto-population (receiver-dispatch configuration): register EVERY `>=2`-impl trait so its
-    // inline `dyn Trait` receiver (lowered to `CallTarget::Indirect`) narrows
+    // inline `dyn Trait` receiver (lowered to `IndirectCall { family_key }`) narrows
     // to the family base ClassDef.  Union with the config list (dedup by
     // base_root), never replacing it, so an existing configuration stays
     // valid. Minting base/impl subclass classdefs and lowering the indirect
@@ -4139,11 +4139,28 @@ mod portal_driver_tests {
             )
             .unwrap();
         for (trait_root, method) in [("Handler", "run"), ("Unregistered", "go")] {
+            let funcptr = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: receiver.clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            format!("method_{method}"),
+                            Some(format!("{trait_root}::{{vtable}}")),
+                        ),
+                        ty: ValueType::Int,
+                        pure: true,
+                    },
+                    true,
+                )
+                .unwrap();
             graph.push_op_var(
                 graph.startblock,
-                OpKind::Call {
-                    target: CallTarget::indirect(trait_root, method),
-                    args: crate::model::call_args(vec![receiver.clone()]),
+                OpKind::IndirectCall {
+                    funcptr,
+                    args: vec![receiver.clone()],
+                    graphs: None,
+                    family_key: Some((trait_root.to_string(), method.to_string())),
                     result_ty: ValueType::Void,
                 },
                 true,
@@ -4171,7 +4188,8 @@ mod portal_driver_tests {
         assert!(all.by_path.contains_key(&portal));
 
         // The in-place pass fills `Handler::run` with its one registered
-        // impl and leaves `Unregistered::go` as a `CallTarget::Indirect`.
+        // impl and leaves `Unregistered::go` as `IndirectCall { graphs: None,
+        // family_key: Some }` (collapse_unresolved is false).
         let stored = call_control
             .function_graphs()
             .get(&portal)
@@ -4192,18 +4210,11 @@ mod portal_driver_tests {
             .collect();
         assert_eq!(
             filled,
-            vec![(Some(vec![CallPath::from_segments(["A", "run"])]), None)],
-            "Handler::run must keep A::run as its only candidate"
-        );
-        assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Indirect { trait_root, method_name, .. },
-                    ..
-                } if trait_root == "Unregistered" && method_name == "go"
-            )),
-            "Unregistered::go must stay an unresolved indirect call"
+            vec![
+                (Some(vec![CallPath::from_segments(["A", "run"])]), None),
+                (None, Some(("Unregistered".to_string(), "go".to_string()))),
+            ],
+            "Handler::run must keep A::run as its only candidate; Unregistered::go stays unresolved"
         );
     }
 

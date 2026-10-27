@@ -1248,8 +1248,11 @@ fn store_subscr_current_if_callback_free(
             }
             let key_text = pyre_object::unicodeobject::w_str_get_value_opt(key)?;
             return Some(
-                pyre_object::w_module_dict_getitem_str(namespace, key_text)
-                    .unwrap_or(std::ptr::null_mut()),
+                pyre_object::w_module_dict_getitem_str(
+                    namespace,
+                    pyre_object::unicodeobject::prebuilt_str_storage(key_text),
+                )
+                .unwrap_or(std::ptr::null_mut()),
             );
         }
         if pyre_object::w_dict_is_empty_strategy(namespace) {
