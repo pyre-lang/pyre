@@ -1730,7 +1730,7 @@ fn fn_null_constant(
 /// payload has no named pointee. A `null_fn` empty `FuncType` does
 /// not union with `Ptr(Struct)` (`llannotation.py`
 /// `pairtype(SomePtr, SomePtr)`).
-fn raw_ptr_null_constant(
+pub(crate) fn raw_ptr_null_constant(
     bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
     kwds: &HashMap<String, Option<SomeValue>>,

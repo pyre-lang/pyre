@@ -3356,13 +3356,45 @@ pub(crate) fn raw_owner_return_root(token: &str) -> Option<&str> {
     if rest.is_empty() { None } else { Some(rest) }
 }
 
-/// `SomePtr` for a `raw:<owner>` token when that owner's layout is registered.
-/// `None` when the token is not a raw-pointer result or the layout is absent;
-/// callers then keep [`residual_return_shell`]'s integer shell.
+/// Pointer/instance annotation for a `raw:<owner>` FUNC.RESULT token,
+/// and for a `Tuple<...>` whose items include at least one such token.
+///
+/// A storage-raw owner is `SomePtr`; a flavor-raw class is a nullable
+/// `SomeInstance(classdef)` (`annotator/model.py SomeInstance`). A
+/// `Tuple<raw:Owner,i64>` carries those item annotations
+/// (`model.py SomeTuple`). `None` when the token is not a raw-pointer
+/// result, the layout is absent, or no tuple item resolved through this
+/// path; callers then keep [`residual_return_shell`]'s integer shell.
 fn raw_ptr_token_annotation(
     registry: &CallRegistry,
     token: Option<&str>,
 ) -> Option<crate::annotator::model::SomeValue> {
+    if let Some(inner) = token
+        .and_then(|t| t.strip_prefix("Tuple<"))
+        .and_then(|s| s.strip_suffix(">"))
+    {
+        let args = crate::front::mir::split_top_level_type_args(inner);
+        if args.is_empty() {
+            return None;
+        }
+        let mut any_raw = false;
+        let mut items = Vec::with_capacity(args.len());
+        for item in args {
+            let resolved = if let Some(raw) = raw_ptr_token_annotation(registry, Some(item)) {
+                any_raw = true;
+                raw
+            } else {
+                residual_return_shell(Some(item))?
+            };
+            items.push(resolved);
+        }
+        if any_raw {
+            return Some(crate::annotator::model::SomeValue::Tuple(
+                crate::annotator::model::SomeTuple::new(items),
+            ));
+        }
+        return None;
+    }
     let root = raw_owner_return_root(token?)?;
     let bk = registry.bookkeeper();
     if let Some(cell) = bk.raw_struct_ptr_annotation(root) {
@@ -10794,6 +10826,26 @@ mod tests {
         assert!(
             matches!(t_shell, SomeValue::Ptr(_)),
             "raw: token shell is {t_shell:?}"
+        );
+        let tuple_shell = raw_ptr_token_annotation(&registry, Some("Tuple<raw:rawptr::T,i64>"))
+            .expect("Tuple<raw:T,i64> carries the owner's pointer annotation");
+        let SomeValue::Tuple(tuple) = tuple_shell else {
+            panic!("expected SomeTuple, got {tuple_shell:?}");
+        };
+        assert_eq!(tuple.items.len(), 2);
+        assert!(
+            matches!(tuple.items[0], SomeValue::Ptr(_)),
+            "item 0 is the owner's pointer, got {:?}",
+            tuple.items[0]
+        );
+        assert!(
+            matches!(tuple.items[1], SomeValue::Integer(_)),
+            "item 1 is an integer annotation, got {:?}",
+            tuple.items[1]
+        );
+        assert!(
+            raw_ptr_token_annotation(&registry, Some("Tuple<i64,i64>")).is_none(),
+            "a tuple with no raw item falls through to residual_return_shell"
         );
         assert!(
             residual_return_shell(Some("raw:rawptr::T")).is_some(),

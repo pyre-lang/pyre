@@ -7146,13 +7146,14 @@ impl<'a> Transformer<'a> {
         };
         let base = resolve_alias(arg, &self.aliases);
         // `rewrite_op_hint` / `handle_hint`: `'%s_guard_value' % getkind(v.concretetype)`.
-        // A flavor-raw `Ref(Some)` is int at `history.getkind`; stamp that
-        // bank onto the operand before reading the kind char so the
-        // register class and the opname share one cell.
-        let operand_ty = declared_value_type_of(graph, &base).or_else(|| match &op.kind {
+        // A flavor-raw `Ref(Some)` is int at `history.getkind`. Production
+        // `legacy_resolve::resolve_types` already commits that
+        // concretetype (`valuetype_to_concrete_for_legacy`); the hint
+        // Call's own `result_ty` is the O(1) source when the op carries one.
+        let operand_ty = match &op.kind {
             OpKind::Call { result_ty, .. } => Some(result_ty.clone()),
             _ => None,
-        });
+        };
         if let Some(ty) = operand_ty.as_ref()
             && self.flavor_raw_ref_is_int_banked(ty)
         {
@@ -15526,44 +15527,6 @@ fn classify_hint_target(target: &CallTarget) -> Option<crate::hints::HintKind> {
     target
         .path_segments()
         .and_then(crate::hints::classify_hint_segments)
-}
-
-/// Declared `ValueType` of the op that defines `var` (`Input.ty`,
-/// `FieldRead.ty`, `Call.result_ty`, …). `get_value_type` only sees the
-/// already-stamped `concretetype` cell and collapses every Ref to
-/// `Ref(None)`, so a flavor-raw `Ref(Some(CodeObject))` has to come
-/// from the producer op.
-fn declared_value_type_of(
-    graph: &FunctionGraph,
-    var: &crate::flowspace::model::Variable,
-) -> Option<ValueType> {
-    for block in &graph.blocks {
-        for op in &block.operations {
-            if op.result.as_ref() != Some(var) {
-                continue;
-            }
-            return declared_result_value_type(&op.kind);
-        }
-    }
-    None
-}
-
-fn declared_result_value_type(kind: &OpKind) -> Option<ValueType> {
-    match kind {
-        OpKind::Input { ty, .. }
-        | OpKind::FieldRead { ty, .. }
-        | OpKind::VableFieldRead { ty, .. } => Some(ty.clone()),
-        OpKind::ArrayRead { item_ty, .. }
-        | OpKind::InteriorFieldRead { item_ty, .. }
-        | OpKind::VableArrayRead { item_ty, .. }
-        | OpKind::RawLoad { item_ty, .. }
-        | OpKind::GcLoadIndexed { item_ty, .. } => Some(item_ty.clone()),
-        OpKind::Call { result_ty, .. }
-        | OpKind::IndirectCall { result_ty, .. }
-        | OpKind::BinOp { result_ty, .. }
-        | OpKind::UnaryOp { result_ty, .. } => Some(result_ty.clone()),
-        _ => None,
-    }
 }
 
 /// The rtyper op `jit_force_virtualizable`, not `hint_force_virtualizable`.
@@ -31070,6 +31033,12 @@ mod tests {
             false,
         );
         graph.set_return(graph.startblock, Some(code.clone()));
+
+        crate::translator::rtyper::legacy_annotator::annotate(&graph);
+        crate::translator::rtyper::legacy_resolve::resolve_types(
+            &graph,
+            &cc.raw_alloc_flavor_structs,
+        );
 
         let mut graph = Transformer::new(&config)
             .with_callcontrol(&mut cc)
