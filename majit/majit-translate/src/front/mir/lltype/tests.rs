@@ -7605,6 +7605,89 @@ fn dont_look_inside_option_objectptr_residual_is_nullable_gcref() {
     );
 }
 
+/// A `GcType` struct whose field 0 is a fieldless enum does not mark
+/// that enum Gc. A `GcType` struct whose field 0 is a plain struct
+/// does (`lltype.py` `Struct._first_struct`).
+#[test]
+fn declared_gc_field0_closure_follows_struct_not_enum() {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |segs: &[&str]| {
+        serde_json::json!({
+            "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Value": [id, {"Adt": {"id": id, "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}}]
+        })
+    };
+    let e_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "E"]),
+        "kind": {"Enum": [
+            {"name": "A", "fields": [], "discriminant": 0, "attr_info": null},
+            {"name": "B", "fields": [], "discriminant": 1, "attr_info": null}
+        ]}
+    });
+    let s_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "S"]),
+        "kind": {"Struct": [{"name": "head", "ty": adt(0)}]}
+    });
+    let p_decl = serde_json::json!({
+        "def_id": 2,
+        "item_meta": meta(&["fixture", "P"]),
+        "kind": {"Struct": []}
+    });
+    let t_decl = serde_json::json!({
+        "def_id": 3,
+        "item_meta": meta(&["fixture", "T"]),
+        "kind": {"Struct": [{"name": "head", "ty": adt(2)}]}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [e_decl, s_decl, p_decl, t_decl],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["majit_gc", "header", "GcType"])
+            }],
+            "trait_impls": [
+                {"impl_trait": {"id": 0, "generics": {"types": [adt(1)]}}},
+                {"impl_trait": {"id": 0, "generics": {"types": [adt(3)]}}}
+            ]
+        }
+    });
+    let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+        .expect("fixture Llbc parses");
+    let kinds = super::declared_gckind_by_name(std::slice::from_ref(&llbc));
+    let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let e_sid = super::struct_id_for_type_decl(llbc.type_by_id(0).expect("E decl"));
+    let p_sid = super::struct_id_for_type_decl(llbc.type_by_id(2).expect("P decl"));
+    assert_eq!(kinds.get("E"), Some(&GcKind::Raw));
+    assert!(
+        !gc.contains(&e_sid),
+        "fieldless enum E is not a Struct._first_struct parent"
+    );
+    assert_eq!(kinds.get("P"), Some(&GcKind::Gc));
+    assert!(gc.contains(&p_sid), "plain struct P is field 0 of GcType T");
+    assert_eq!(kinds.get("S"), Some(&GcKind::Gc));
+    assert_eq!(kinds.get("T"), Some(&GcKind::Gc));
+}
+
 /// A transparent handle wrapping an alias of `*mut Header` is a GC
 /// pointer when `Header` is field 0 of a `GcType` struct.
 /// `history.getkind` of that pointer is ref.
