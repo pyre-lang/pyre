@@ -5,26 +5,52 @@
 //! word 0, `length` at one word, `chars` immediately after the header.
 //! UNICODE uses the same header; `chars` are UCS-4 `UniChar` (`u32`).
 
-/// `rstr.STR` header in front of the character bytes.
+/// `rstr.STR`: `GcStruct('rpy_string', ('hash', Signed), ('chars', Array(Char)))`.
+/// `length` is the varsize length word of `chars` (`len(s.chars)`).
 #[repr(C)]
-pub(crate) struct StrHeader {
-    pub(crate) hash: isize,
-    pub(crate) length: usize,
+#[allow(clippy::upper_case_acronyms)]
+pub struct STR {
+    pub hash: isize,
+    pub length: usize,
+    pub chars: [u8; 0],
+}
+
+/// `rstr.UNICODE`: `GcStruct('rpy_unicode', ('hash', Signed), ('chars', Array(UniChar)))`.
+#[repr(C)]
+#[allow(clippy::upper_case_acronyms)]
+pub struct UNICODE {
+    pub hash: isize,
+    pub length: usize,
+    pub chars: [u32; 0],
+}
+
+impl majit_gc::GcType for STR {
+    fn type_id() -> u32 {
+        majit_gc::lowlevel_str_type_id()
+    }
+    const SIZE: usize = std::mem::size_of::<STR>();
+}
+
+impl majit_gc::GcType for UNICODE {
+    fn type_id() -> u32 {
+        majit_gc::lowlevel_unicode_type_id()
+    }
+    const SIZE: usize = std::mem::size_of::<UNICODE>();
 }
 
 /// `LowlevelStringHeader.hash` / `BUILTIN_STRING_HASH_OFFSET`.
-pub(crate) const STR_HASH_OFFSET: usize = std::mem::offset_of!(StrHeader, hash);
+pub(crate) const STR_HASH_OFFSET: usize = std::mem::offset_of!(STR, hash);
 /// `LowlevelStringHeader.length` / `BUILTIN_STRING_LEN_OFFSET`.
-pub(crate) const STR_LEN_OFFSET: usize = std::mem::offset_of!(StrHeader, length);
+pub(crate) const STR_LEN_OFFSET: usize = std::mem::offset_of!(STR, length);
 /// `LOWLEVEL_STRING_CHARS_OFFSET` / `BUILTIN_STRING_CHARS_OFFSET`.
-pub(crate) const STR_CHARS_OFFSET: usize = std::mem::size_of::<StrHeader>();
+pub(crate) const STR_CHARS_OFFSET: usize = std::mem::offset_of!(STR, chars);
 
 /// `rstr.UNICODE` header; same `hash` / `length` words as [`STR_HASH_OFFSET`].
-pub(crate) const UNICODE_HASH_OFFSET: usize = STR_HASH_OFFSET;
+pub(crate) const UNICODE_HASH_OFFSET: usize = std::mem::offset_of!(UNICODE, hash);
 /// `rstr.UNICODE` length word; same slot as [`STR_LEN_OFFSET`].
-pub(crate) const UNICODE_LEN_OFFSET: usize = STR_LEN_OFFSET;
+pub(crate) const UNICODE_LEN_OFFSET: usize = std::mem::offset_of!(UNICODE, length);
 /// Offset of the UCS-4 `chars` payload (`Array(UniChar)` item width 4).
-pub(crate) const UNICODE_CHARS_OFFSET: usize = STR_CHARS_OFFSET;
+pub(crate) const UNICODE_CHARS_OFFSET: usize = std::mem::offset_of!(UNICODE, chars);
 
 const _: () = {
     assert!(STR_HASH_OFFSET == 0);
@@ -39,18 +65,18 @@ const _: () = {
 ///
 /// SAFETY: `s` is a residual `Ptr(STR)` whose header and `length` bytes
 /// are valid for this layout.
-pub(crate) unsafe fn str_as_bytes<'a>(s: *const u8) -> &'a [u8] {
-    let len = unsafe { s.add(STR_LEN_OFFSET).cast::<usize>().read_unaligned() };
-    unsafe { std::slice::from_raw_parts(s.add(STR_CHARS_OFFSET), len) }
+pub(crate) unsafe fn str_as_bytes<'a>(s: *const STR) -> &'a [u8] {
+    let len = unsafe { (*s).length };
+    unsafe { std::slice::from_raw_parts((&raw const (*s).chars).cast::<u8>(), len) }
 }
 
 /// The `chars` payload of a live `Ptr(UNICODE)`.
 ///
 /// SAFETY: `s` is a residual `Ptr(UNICODE)` whose header and `length`
 /// UCS-4 codepoints are valid for this layout.
-pub(crate) unsafe fn unicode_as_unichars<'a>(s: *const u8) -> &'a [u32] {
-    let len = unsafe { s.add(UNICODE_LEN_OFFSET).cast::<usize>().read_unaligned() };
-    unsafe { std::slice::from_raw_parts(s.add(UNICODE_CHARS_OFFSET).cast::<u32>(), len) }
+pub(crate) unsafe fn unicode_as_unichars<'a>(s: *const UNICODE) -> &'a [u32] {
+    let len = unsafe { (*s).length };
+    unsafe { std::slice::from_raw_parts((&raw const (*s).chars).cast::<u32>(), len) }
 }
 
 /// Shared `LLHelpers.ll_find_char` loop (`rstr.py`). `C` is `STR` `Char`
@@ -77,7 +103,7 @@ where
 /// `LLHelpers.ll_find_char` (`rstr.py`) for `Ptr(STR)`. `#[elidable]`
 /// publishes the residual trampoline on `HELPER_FNADDRS`.
 #[majit_macros::elidable]
-pub fn ll_find_char(s: *const u8, ch: i64, start: i64, end: i64) -> i64 {
+pub fn ll_find_char(s: *const STR, ch: i64, start: i64, end: i64) -> i64 {
     // SAFETY: residual `Ptr(STR)` callee; the caller supplies a live STR.
     let chars = unsafe { str_as_bytes(s) };
     ll_find_char_loop(chars, ch, start, end)
@@ -88,7 +114,7 @@ pub fn ll_find_char(s: *const u8, ch: i64, start: i64, end: i64) -> i64 {
 /// `ll_find_char_unicode` so the UNICODE specialization cannot alias
 /// the STR row.
 #[majit_macros::elidable]
-pub fn ll_find_char_unicode(s: *const u8, ch: i64, start: i64, end: i64) -> i64 {
+pub fn ll_find_char_unicode(s: *const UNICODE, ch: i64, start: i64, end: i64) -> i64 {
     // SAFETY: residual `Ptr(UNICODE)` callee; the caller supplies a live UNICODE.
     let chars = unsafe { unicode_as_unichars(s) };
     ll_find_char_loop(chars, ch, start, end)
@@ -98,22 +124,15 @@ pub fn ll_find_char_unicode(s: *const u8, ch: i64, start: i64, end: i64) -> i64 
 mod tests {
     use super::*;
 
-    fn str_buf(bytes: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; STR_CHARS_OFFSET + bytes.len() + 1];
+    fn str_buf(bytes: &[u8]) -> Vec<usize> {
+        let nbytes = STR_CHARS_OFFSET + bytes.len() + 1;
+        let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut buf = vec![0usize; nwords];
+        let p = buf.as_mut_ptr().cast::<u8>();
         unsafe {
-            buf.as_mut_ptr()
-                .add(STR_HASH_OFFSET)
-                .cast::<isize>()
-                .write_unaligned(0);
-            buf.as_mut_ptr()
-                .add(STR_LEN_OFFSET)
-                .cast::<usize>()
-                .write_unaligned(bytes.len());
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                buf.as_mut_ptr().add(STR_CHARS_OFFSET),
-                bytes.len(),
-            );
+            (*p.cast::<STR>()).hash = 0;
+            (*p.cast::<STR>()).length = bytes.len();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(STR_CHARS_OFFSET), bytes.len());
         }
         buf
     }
@@ -121,7 +140,7 @@ mod tests {
     #[test]
     fn ll_find_char_finds_clamps_and_misses() {
         let buf = str_buf(b"hello");
-        let s = buf.as_ptr();
+        let s = buf.as_ptr().cast::<STR>();
         assert_eq!(ll_find_char(s, i64::from(b'e'), 0, 5), 1);
         assert_eq!(ll_find_char(s, i64::from(b'z'), 0, 5), -1);
         assert_eq!(ll_find_char(s, i64::from(b'o'), 0, 100), 4);
@@ -141,20 +160,17 @@ mod tests {
         assert!(found, "HELPER_FNADDRS must publish ll_find_char");
     }
 
-    fn unicode_buf(chars: &[u32]) -> Vec<u8> {
-        let mut buf = vec![0u8; UNICODE_CHARS_OFFSET + chars.len() * 4];
+    fn unicode_buf(chars: &[u32]) -> Vec<usize> {
+        let nbytes = UNICODE_CHARS_OFFSET + chars.len() * 4;
+        let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut buf = vec![0usize; nwords];
+        let p = buf.as_mut_ptr().cast::<u8>();
         unsafe {
-            buf.as_mut_ptr()
-                .add(UNICODE_HASH_OFFSET)
-                .cast::<isize>()
-                .write_unaligned(0);
-            buf.as_mut_ptr()
-                .add(UNICODE_LEN_OFFSET)
-                .cast::<usize>()
-                .write_unaligned(chars.len());
+            (*p.cast::<UNICODE>()).hash = 0;
+            (*p.cast::<UNICODE>()).length = chars.len();
             std::ptr::copy_nonoverlapping(
                 chars.as_ptr(),
-                buf.as_mut_ptr().add(UNICODE_CHARS_OFFSET).cast::<u32>(),
+                p.add(UNICODE_CHARS_OFFSET).cast::<u32>(),
                 chars.len(),
             );
         }
@@ -166,7 +182,7 @@ mod tests {
         let latin_small_a = u32::from(b'a');
         let latin_extended_a = 0x0100u32;
         let buf = unicode_buf(&[latin_small_a, latin_extended_a, latin_small_a]);
-        let s = buf.as_ptr();
+        let s = buf.as_ptr().cast::<UNICODE>();
         assert_eq!(
             ll_find_char_unicode(s, i64::from(latin_extended_a), 0, 3),
             1

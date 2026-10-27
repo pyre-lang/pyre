@@ -334,7 +334,7 @@ pub unsafe fn install_type_terminator(w_type: PyObjectRef) {
     let existing = unsafe { pyre_object::w_type_get_terminator(w_type) };
     let hasdict = unsafe { pyre_object::w_type_get_hasdict(w_type) };
     let typedef_hasdict = unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) };
-    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict) as *const u8;
+    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict);
     if existing.is_null() {
         unsafe { pyre_object::w_type_set_terminator(w_type, term) };
         return;
@@ -395,7 +395,7 @@ pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// # Safety
 /// `w_type` must be a live `W_TypeObject`.
-pub unsafe fn ensure_type_terminator(w_type: PyObjectRef) -> *const u8 {
+pub unsafe fn ensure_type_terminator(w_type: PyObjectRef) -> MapRef {
     let term = unsafe { pyre_object::w_type_get_terminator(w_type) };
     debug_assert!(
         !term.is_null(),
@@ -540,7 +540,7 @@ pub unsafe fn typedef_owns_dict(obj: PyObjectRef) -> bool {
 unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
     let term = unsafe { pyre_object::w_type_get_terminator(w_type) };
     if !term.is_null() {
-        return term as MapRef;
+        return term;
     }
     debug_assert!(
         unsafe { pyre_object::w_type_get_layout_ptr(w_type) }.is_null(),
@@ -548,9 +548,9 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
     );
     let hasdict = unsafe { pyre_object::w_type_get_hasdict(w_type) };
     let typedef_hasdict = unsafe { pyre_object::w_type_get_typedef_hasdict(w_type) };
-    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict) as *const u8;
+    let term = new_instance_terminator(w_type, hasdict, typedef_hasdict);
     unsafe { pyre_object::w_type_set_terminator(w_type, term) };
-    term as MapRef
+    term
 }
 
 /// Forward `Terminator.w_cls` stored in the immortal map node.
@@ -577,7 +577,7 @@ pub unsafe fn walk_type_terminator_w_cls(w_type: PyObjectRef, f: &mut dyn FnMut(
     if w_type.is_null() {
         return;
     }
-    let term = unsafe { pyre_object::w_type_get_terminator(w_type) } as MapRef;
+    let term = unsafe { pyre_object::w_type_get_terminator(w_type) };
     if term.is_null() {
         return;
     }

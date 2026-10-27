@@ -490,7 +490,7 @@ impl Drop for PendingPartsCacheDigitRoot {
 /// Visit the `_digits` GC slots held by the process-global formatter cache.
 /// PyPy's module-global `_parts_cache` is part of the translated prebuilt root
 /// graph; pyre's embedder adapts these raw slots to its `GcRef` root visitor.
-pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
+pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut TypedItemsBlock)) {
     // rbigint.py's NULLRBIGINT / ONERBIGINT / ONENEGATIVERBIGINT /
     // FIVERBIGINT are translated prebuilt roots.  Do not initialize a
     // previously-unused constant from inside the collector; visit only slots
@@ -498,9 +498,7 @@ pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
     for slot in prebuilt_slots() {
         if let Some(&raw) = slot.get() {
             let value = unsafe { &mut *(raw as *mut RBigInt) };
-            visitor(unsafe {
-                &mut *(&mut value._digits as *mut *mut TypedItemsBlock as *mut *mut u8)
-            });
+            visitor(&mut value._digits);
         }
     }
 
@@ -514,9 +512,7 @@ pub fn walk_rbigint_cache_digit_slots(mut visitor: impl FnMut(&mut *mut u8)) {
             // shared object's `_digits` slot updates every reader without an
             // aliasing data race.
             let value = unsafe { &mut *(std::sync::Arc::as_ptr(value) as *mut RBigInt) };
-            visitor(unsafe {
-                &mut *(&mut value._digits as *mut *mut TypedItemsBlock as *mut *mut u8)
-            });
+            visitor(&mut value._digits);
         }
     }
 }

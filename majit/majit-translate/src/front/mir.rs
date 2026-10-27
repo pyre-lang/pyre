@@ -18919,7 +18919,21 @@ impl<'a> Lowering<'a> {
             ));
             self.bind_slice_iter(dest_local, iter, args[0].clone());
         } else if self.len_shadow[dest_local].is_some() && tyref_is_u8_window(&dest_ty, self.llbc) {
-            if call_dest_is_w1_str_source(&call, self.llbc) {
+            // A builder byte view whose dest keeps a length shadow is still
+            // the built STR (`AbstractStringBuilderRepr.rtype_method_build` /
+            // `ll_build`).
+            let arg_locals: Vec<Option<usize>> =
+                call.args.iter().map(|op| operand_local(Some(op))).collect();
+            let built = if call.args.len() == 1 {
+                self.builder_identity_string(mir_bb, &arg_locals)?
+            } else {
+                None
+            };
+            if let Some(built) = built {
+                self.bind_str_source_to_dest(mir_bb, dest_local, built);
+            } else if call_dest_is_w1_str_source(&call, self.llbc)
+                || call_dest_is_format_str_view(&call, self.llbc, &self.accum)
+            {
                 let header = if self.is_w_bytes_data(reg) || self.is_w_bytes_block(reg) {
                     let bb_id = self.emit_bb(mir_bb);
                     self.emit_w_bytes_data_str_read(bb_id, args[0].clone())
@@ -49192,6 +49206,11 @@ struct AccumulatorFacts {
     /// (`AbstractStringBuilderRepr.rtype_method_build`).
     identity_accumulator: Vec<Option<usize>>,
     has_builder: bool,
+    /// `alloc::fmt::format` dests, their `must_use` / move aliases, and the
+    /// shared-ref temps of those: one `Ptr(STR)` (`rstr.py` `do_stringformat`;
+    /// the #277 fmt collapsers rewrite the call to `ll_strconcat`, and an
+    /// unrecognized call stays unregistered, so its subject never rtypes).
+    format_str: Vec<bool>,
 }
 
 impl AccumulatorFacts {
@@ -49263,14 +49282,155 @@ impl AccumulatorFacts {
             }
         }
         let has_builder = graph_has_builder_accumulator(llbc, body, &builder_mode);
+        let format_str = format_str_locals(body, llbc);
         Self {
             builder_mode,
             append_accumulator,
             append_piece_accumulator,
             identity_accumulator,
             has_builder,
+            format_str,
         }
     }
+}
+
+enum FormatStrDef {
+    /// `alloc::fmt::format` call dest.
+    Format,
+    /// `must_use(move/copy M)` call dest, `Use(move/copy M)`, or shared `&M`:
+    /// marked iff `M` is.
+    Alias(usize),
+}
+
+/// `alloc::fmt::format` dests, their `must_use` / move aliases, and the
+/// shared-ref temps of those. Body locals only (never the return place or a
+/// parameter). Least fixpoint: a local is marked when it has at least one
+/// def and every whole-local def is format / `must_use` of a marked local /
+/// `Use` of a marked local / a shared `&` of a marked local. Any other
+/// rvalue, call, or projected write declines the local. A non-Shared borrow
+/// of a local (or a projection of it) also declines it: a mutable borrow can
+/// change the value without a def of the local (`String::push_str(&mut s)`).
+fn format_str_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    let mut defs: Vec<Vec<FormatStrDef>> = (0..n).map(|_| Vec::new()).collect();
+    let mut declined = vec![false; n];
+    let mut saw_format = false;
+    let decline_place = |declined: &mut [bool], place: &Place| {
+        if let Some(local) = place_root_local(place)
+            && local < n
+        {
+            declined[local] = true;
+        }
+    };
+    for bb in &body.body {
+        for st in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
+                continue;
+            };
+            if let Rvalue::Ref {
+                place: src, kind, ..
+            } = rvalue
+                && kind.as_str() != Some("Shared")
+            {
+                decline_place(&mut declined, src);
+            }
+            match &place.kind {
+                PlaceKind::Local(dest) => {
+                    let dest = *dest as usize;
+                    if dest >= n {
+                        continue;
+                    }
+                    match format_str_rvalue_def(rvalue) {
+                        Some(FormatStrDef::Format) => {
+                            saw_format = true;
+                            defs[dest].push(FormatStrDef::Format);
+                        }
+                        Some(alias) => defs[dest].push(alias),
+                        None => declined[dest] = true,
+                    }
+                }
+                PlaceKind::Projection(..) => decline_place(&mut declined, place),
+                _ => {}
+            }
+        }
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) {
+            match &call.dest.kind {
+                PlaceKind::Local(dest) => {
+                    let dest = *dest as usize;
+                    if dest >= n {
+                        continue;
+                    }
+                    match format_str_call_def(call, llbc) {
+                        Some(FormatStrDef::Format) => {
+                            saw_format = true;
+                            defs[dest].push(FormatStrDef::Format);
+                        }
+                        Some(alias) => defs[dest].push(alias),
+                        None => declined[dest] = true,
+                    }
+                }
+                PlaceKind::Projection(..) => decline_place(&mut declined, &call.dest),
+                _ => {}
+            }
+        }
+    }
+    if !saw_format {
+        return vec![false; n];
+    }
+    let mut marked = vec![false; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for local in arg_count + 1..n {
+            if marked[local] || declined[local] || defs[local].is_empty() {
+                continue;
+            }
+            if defs[local].iter().all(|d| match d {
+                FormatStrDef::Format => true,
+                FormatStrDef::Alias(m) => marked.get(*m).copied() == Some(true),
+            }) {
+                marked[local] = true;
+                changed = true;
+            }
+        }
+    }
+    marked
+}
+
+fn format_str_rvalue_def(rvalue: &Rvalue) -> Option<FormatStrDef> {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_local(Some(op)).map(FormatStrDef::Alias),
+        Rvalue::Ref { place, kind, .. } => {
+            if kind.as_str() != Some("Shared") {
+                return None;
+            }
+            match place.kind {
+                PlaceKind::Local(m) => Some(FormatStrDef::Alias(m as usize)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn format_str_call_def(call: &CallPayload, llbc: &Llbc) -> Option<FormatStrDef> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let np = fd.item_meta.name_path();
+    let segs: Vec<String> = np.split("::").map(str::to_string).collect();
+    if fmt_path_ends_with(&segs, &["fmt", "format"]) {
+        return Some(FormatStrDef::Format);
+    }
+    if np == "core::hint::must_use" && call.args.len() == 1 {
+        return operand_local(call.args.first()).map(FormatStrDef::Alias);
+    }
+    None
 }
 
 /// Whether a builder borrow temp is used exactly once in the selected role of
@@ -82952,6 +83112,14 @@ fn call_dest_is_built_str_view(call: &CallPayload, accum: &AccumulatorFacts) -> 
     accum.builder_mode.get(c).copied() == Some(true)
 }
 
+/// A string identity call ([`is_string_identity_call`]) whose argument is a
+/// [`AccumulatorFacts::format_str`] local: the dest is a W1 STR view of the
+/// formatted string.
+fn call_dest_is_format_str_view(call: &CallPayload, llbc: &Llbc, accum: &AccumulatorFacts) -> bool {
+    is_string_identity_call(llbc, call)
+        && operand_local(call.args.first()).is_some_and(|l| accum.format_str.get(l) == Some(&true))
+}
+
 /// Body locals whose every window-typed def is a W1 STR source or a W2
 /// list view (or a Use/Ref/Cast/reborrow of one). Parameters keep the
 /// two-word window ABI, except `RDict` / `HashMap` key formals
@@ -82980,6 +83148,7 @@ fn body_owner_view_locals(
             if is_body_local(dest) && tyref_is_u8_window(&call.dest.ty, llbc) {
                 if call_dest_is_w1_str_source(&call, llbc)
                     || call_dest_is_built_str_view(&call, accum)
+                    || call_dest_is_format_str_view(&call, llbc, accum)
                 {
                     str_view[dest] = true;
                     w1_call_def[dest] = true;
@@ -126485,6 +126654,10 @@ mod tests {
         json!({"Use": [{"Move": place}, "No"]})
     }
 
+    fn use_copy(place: Value) -> Value {
+        json!({"Use": [{"Copy": place}, "No"]})
+    }
+
     fn move_op(place: Value) -> Value {
         json!({"Move": place})
     }
@@ -126758,6 +126931,148 @@ mod tests {
             },
             "body": "Opaque"
         })
+    }
+
+    fn fmt_arguments_adt() -> Value {
+        json!({"Adt": {"id": 1, "builtin": null, "generics": str_builder_generics()}})
+    }
+
+    fn fmt_arguments_decl() -> Value {
+        json!({
+            "def_id": 1,
+            "item_meta": type_decl_meta(&["core", "fmt", "Arguments"]),
+            "kind": "Opaque"
+        })
+    }
+
+    fn fmt_format_decl(def_id: u64) -> Value {
+        json!({
+            "def_id": def_id,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("alloc"),
+                ident_seg("fmt"),
+                ident_seg("format"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [fmt_arguments_adt()],
+                "output": string_adt()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn hint_must_use_decl(def_id: u64) -> Value {
+        json!({
+            "def_id": def_id,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("core"),
+                ident_seg("hint"),
+                ident_seg("must_use"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [string_adt()],
+                "output": string_adt()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn deref_place(local: u64, base_ty: &Value, pointee_ty: &Value) -> Value {
+        json!({
+            "kind": {"Projection": [place_of(local, base_ty), "Deref"]},
+            "ty": pointee_ty
+        })
+    }
+
+    fn format_as_bytes_window_name() -> &'static str {
+        "format_string_as_bytes_window_param"
+    }
+
+    fn format_as_bytes_window_llbc() -> majit_charon_reader::Llbc {
+        let string = string_adt();
+        let args_ty = fmt_arguments_adt();
+        let unit = unit_ty();
+        let shared = ref_string("Shared");
+        let window = window_shared_slice();
+        let slice = window_slice();
+        let name = format_as_bytes_window_name();
+        llbc_with_types(
+            "fixture",
+            vec![string_decl(), fmt_arguments_decl()],
+            vec![
+                subject_decl(
+                    name,
+                    1,
+                    vec![args_ty.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &args_ty),
+                        local_of(2, &string),
+                        local_of(3, &string),
+                        local_of(4, &shared),
+                        local_of(5, &window),
+                        local_of(6, &window),
+                    ],
+                    vec![
+                        bb(
+                            vec![],
+                            call_term(
+                                1,
+                                vec![move_op(place_of(1, &args_ty))],
+                                place_of(2, &string),
+                                1,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(2, &string))],
+                                place_of(3, &string),
+                                2,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(4, &shared),
+                                ref_rvalue(place_of(3, &string), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(4, &shared))],
+                                place_of(5, &window),
+                                3,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(6, &window),
+                                ref_rvalue(deref_place(5, &window, &slice), "Shared"),
+                            )],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(6, &window))],
+                                place_of(0, &unit),
+                                4,
+                                5,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                fmt_format_decl(1),
+                hint_must_use_decl(2),
+                string_as_bytes_decl(),
+                opaque_decl(4, &["fixture", "g"], vec![window], unit),
+            ],
+        )
     }
 
     fn string_as_ref_bytes_decl() -> Value {
@@ -127244,6 +127559,617 @@ mod tests {
         assert!(
             !fed_by_new,
             "g (or the window conversion feeding it) must not take the StringBuilder: {graph:#?}"
+        );
+    }
+
+    fn format_call_result_ids(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if super::fmt_path_ends_with(segments, &["fmt", "format"]) => {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn g_or_str_window_fed_by(graph: &FunctionGraph, ids: &std::collections::HashSet<u64>) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    let watches_g = leaf == Some("g");
+                    let watches_window = leaf
+                        == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                        || leaf == Some("__strlen");
+                    (watches_g || watches_window) && args.iter().any(|arg| ids.contains(&arg.id()))
+                }
+                _ => false,
+            })
+    }
+
+    /// Format dests plus `__cast_instance_intrinsic` aliases and SSA
+    /// renames across block links (`emit_str_to_window` reads the header
+    /// in a successor of the format block).
+    fn ids_flowing_from(
+        graph: &FunctionGraph,
+        seeds: &std::collections::HashSet<u64>,
+    ) -> std::collections::HashSet<u64> {
+        let mut ids = seeds.clone();
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for block in &graph.blocks {
+                for op in &block.operations {
+                    let OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } = &op.kind
+                    else {
+                        continue;
+                    };
+                    if segments.last().map(String::as_str) != Some("__cast_instance_intrinsic") {
+                        continue;
+                    }
+                    let Some(src) = args.first().and_then(|a| a.as_variable()) else {
+                        continue;
+                    };
+                    if ids.contains(&src.id())
+                        && let Some(result) = &op.result
+                        && ids.insert(result.id())
+                    {
+                        changed = true;
+                    }
+                }
+                for link in &block.exits {
+                    let target = graph.block(link.target);
+                    for (i, arg) in link.args.iter().enumerate() {
+                        let Some(src) = arg.as_variable() else {
+                            continue;
+                        };
+                        if ids.contains(&src.id())
+                            && let Some(inp) = target.inputargs.get(i)
+                            && ids.insert(inp.id())
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        }
+        ids
+    }
+
+    /// `format(args)` → `must_use` → `&` → `as_bytes` → `g(&[u8])`.
+    /// The format dest is a W1 STR (`rstr.py` `do_stringformat`).
+    #[test]
+    fn format_string_as_bytes_into_window_param_binds_the_str() {
+        let name = format_as_bytes_window_name();
+        let llbc = format_as_bytes_window_llbc();
+        let graph = super::lower_function(&llbc, name)
+            .unwrap_or_else(|err| panic!("{name} failed to lower: {err}"));
+        assert!(
+            !has_path_leaf(&graph, "as_bytes"),
+            "as_bytes of a format String must not stay residual: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(&graph, "ll_slice_len_slot_new")
+                && !has_path_leaf(&graph, "ll_slice_len_slot_take"),
+            "format as_bytes must not use SLICE_LEN_SLOT_NEW/TAKE: {graph:#?}"
+        );
+        let format_ids = format_call_result_ids(&graph);
+        assert!(
+            !format_ids.is_empty(),
+            "fmt::format must remain in the graph: {graph:#?}"
+        );
+        let format_ids = ids_flowing_from(&graph, &format_ids);
+        assert!(
+            g_or_str_window_fed_by(&graph, &format_ids),
+            "g (or the STR→window conversion feeding it) must take the format result: {graph:#?}"
+        );
+    }
+
+    /// The `String` local is also defined by `String::new` on another
+    /// `If` arm, so it is not a format_str local and `as_bytes` stays.
+    #[test]
+    fn mixed_format_and_heap_string_as_bytes_keeps_call() {
+        let string = string_adt();
+        let args_ty = fmt_arguments_adt();
+        let unit = unit_ty();
+        let flag = bool_ty();
+        let shared = ref_string("Shared");
+        let window = window_shared_slice();
+        let slice = window_slice();
+        let name = "mixed_format_heap_string_as_bytes_window_param";
+        let graph = lower_owned_concat(
+            name,
+            vec![string_decl(), fmt_arguments_decl()],
+            vec![
+                subject_decl(
+                    name,
+                    2,
+                    vec![args_ty.clone(), flag.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &args_ty),
+                        local_of(2, &flag),
+                        local_of(3, &string),
+                        local_of(4, &string),
+                        local_of(5, &shared),
+                        local_of(6, &window),
+                        local_of(7, &window),
+                    ],
+                    vec![
+                        bb(
+                            vec![],
+                            json!({"Switch": {
+                                "discr": {"Copy": place_of(2, &flag)},
+                                "targets": {"If": [1, 2]}
+                            }}),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                5,
+                                vec![move_op(place_of(1, &args_ty))],
+                                place_of(3, &string),
+                                3,
+                                7,
+                            ),
+                        ),
+                        bb(vec![], call_term(1, vec![], place_of(3, &string), 3, 7)),
+                        bb(
+                            vec![],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &string))],
+                                place_of(4, &string),
+                                4,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, &shared),
+                                ref_rvalue(place_of(4, &string), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(5, &shared))],
+                                place_of(6, &window),
+                                5,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(7, &window),
+                                ref_rvalue(deref_place(6, &window, &slice), "Shared"),
+                            )],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(7, &window))],
+                                place_of(0, &unit),
+                                6,
+                                7,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                string_new_decl(),
+                hint_must_use_decl(2),
+                string_as_bytes_decl(),
+                opaque_decl(4, &["fixture", "g"], vec![window], unit),
+                fmt_format_decl(5),
+            ],
+        );
+        assert!(
+            has_path_leaf(&graph, "as_bytes"),
+            "mixed format/new String::as_bytes keeps the residual call: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(
+                &graph,
+                crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING
+            ),
+            "mixed format/new as_bytes is not get_raw_address_of_string: {graph:#?}"
+        );
+    }
+
+    #[test]
+    fn format_str_locals_follows_must_use_and_ref() {
+        let llbc = format_as_bytes_window_llbc();
+        let body = llbc
+            .fn_by_id(0)
+            .and_then(|fd| fd.unstructured())
+            .expect("subject unstructured");
+        let marks = super::format_str_locals(&body, &llbc);
+        assert_eq!(
+            marks.get(2).copied(),
+            Some(true),
+            "format dest is format_str: {marks:?}"
+        );
+        assert_eq!(
+            marks.get(3).copied(),
+            Some(true),
+            "must_use dest is format_str: {marks:?}"
+        );
+        assert_eq!(
+            marks.get(4).copied(),
+            Some(true),
+            "shared-ref temp is format_str: {marks:?}"
+        );
+        assert_eq!(
+            marks.get(1).copied(),
+            Some(false),
+            "Arguments parameter is not format_str: {marks:?}"
+        );
+        assert_eq!(
+            marks.get(5).copied(),
+            Some(false),
+            "as_bytes dest is not format_str: {marks:?}"
+        );
+    }
+
+    fn format_mut_borrowed_format_string_llbc() -> majit_charon_reader::Llbc {
+        let string = string_adt();
+        let args_ty = fmt_arguments_adt();
+        let unit = unit_ty();
+        let shared = ref_string("Shared");
+        let mut_ref = ref_string("Mut");
+        let window = window_shared_slice();
+        let slice = window_slice();
+        let name = "format_mut_borrowed_format_string";
+        llbc_with_types(
+            "fixture",
+            vec![string_decl(), fmt_arguments_decl()],
+            vec![
+                subject_decl(
+                    name,
+                    1,
+                    vec![args_ty.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &args_ty),
+                        local_of(2, &string),
+                        local_of(3, &string),
+                        local_of(4, &shared),
+                        local_of(5, &window),
+                        local_of(6, &window),
+                        local_of(7, &mut_ref),
+                    ],
+                    vec![
+                        bb(
+                            vec![],
+                            call_term(
+                                1,
+                                vec![move_op(place_of(1, &args_ty))],
+                                place_of(2, &string),
+                                1,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(2, &string))],
+                                place_of(3, &string),
+                                2,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![
+                                assign_stmt(
+                                    place_of(7, &mut_ref),
+                                    ref_rvalue(place_of(3, &string), "Mut"),
+                                ),
+                                assign_stmt(
+                                    place_of(4, &shared),
+                                    ref_rvalue(place_of(3, &string), "Shared"),
+                                ),
+                            ],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(4, &shared))],
+                                place_of(5, &window),
+                                3,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(6, &window),
+                                ref_rvalue(deref_place(5, &window, &slice), "Shared"),
+                            )],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(6, &window))],
+                                place_of(0, &unit),
+                                4,
+                                5,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                fmt_format_decl(1),
+                hint_must_use_decl(2),
+                string_as_bytes_decl(),
+                opaque_decl(4, &["fixture", "g"], vec![window], unit),
+            ],
+        )
+    }
+
+    #[test]
+    fn format_str_locals_declines_a_mut_borrowed_format_string() {
+        let llbc = format_mut_borrowed_format_string_llbc();
+        let body = llbc
+            .fn_by_id(0)
+            .and_then(|fd| fd.unstructured())
+            .expect("subject unstructured");
+        let marks = super::format_str_locals(&body, &llbc);
+        assert_eq!(
+            marks.get(2).copied(),
+            Some(true),
+            "format dest is format_str: {marks:?}"
+        );
+        assert_eq!(
+            marks.get(3).copied(),
+            Some(false),
+            "must_use dest is declined by &mut: {marks:?}"
+        );
+        assert_eq!(
+            marks.get(4).copied(),
+            Some(false),
+            "shared-ref of a declined local is not format_str: {marks:?}"
+        );
+    }
+
+    fn shadowed_builder_as_bytes_graph(
+        name: &str,
+        types: Vec<Value>,
+        builder: &Value,
+        mut_borrow: &Value,
+        shared_borrow: &Value,
+        new_decl: Value,
+        push_decl: Value,
+        as_bytes_decl: Value,
+    ) -> FunctionGraph {
+        let word = word_ty();
+        let unit = unit_ty();
+        let flag = bool_ty();
+        let window = window_shared_slice();
+        lower_owned_concat(
+            name,
+            types,
+            vec![
+                subject_decl(
+                    name,
+                    3,
+                    vec![word.clone(), flag.clone(), window.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &word),
+                        local_of(2, &flag),
+                        local_of(3, &window),
+                        local_of(4, builder),
+                        local_of(5, mut_borrow),
+                        local_of(6, &unit),
+                        local_of(7, shared_borrow),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(4, builder), 1, 7)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, mut_borrow),
+                                ref_rvalue(place_of(4, builder), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![
+                                    move_op(place_of(5, mut_borrow)),
+                                    copy_op(place_of(1, &word)),
+                                ],
+                                place_of(6, &unit),
+                                2,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            json!({"Switch": {
+                                "discr": {"Copy": place_of(2, &flag)},
+                                "targets": {"If": [3, 4]}
+                            }}),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(7, shared_borrow),
+                                ref_rvalue(place_of(4, builder), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(7, shared_borrow))],
+                                place_of(3, &window),
+                                5,
+                                7,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &window),
+                                use_copy(place_of(3, &window)),
+                            )],
+                            json!({"Goto": {"target": 5}}),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(3, &window))],
+                                place_of(0, &unit),
+                                6,
+                                7,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                new_decl,
+                push_decl,
+                as_bytes_decl,
+                opaque_decl(4, &["fixture", "g"], vec![window], unit),
+            ],
+        )
+    }
+
+    fn stringbuilder_new_ids(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::STRINGBUILDER_NEW) =>
+                {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_shadowed_builder_as_bytes_builds_the_str(graph: &FunctionGraph, name: &str) {
+        assert!(
+            has_path_leaf(graph, crate::runtime_names::shims::STRINGBUILDER_NEW),
+            "{name}: accumulator must be in builder mode: {graph:#?}"
+        );
+        assert!(
+            has_path_leaf(graph, crate::runtime_names::shims::STRINGBUILDER_BUILD),
+            "{name}: as_bytes of a shadowed builder dest must ll_build: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(graph, "as_bytes"),
+            "{name}: as_bytes must not stay residual: {graph:#?}"
+        );
+        let new_ids = stringbuilder_new_ids(graph);
+        let g_fed = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if segments.last().map(String::as_str) == Some("g") => {
+                    args.iter().any(|arg| new_ids.contains(&arg.id()))
+                }
+                _ => false,
+            });
+        assert!(
+            !g_fed,
+            "{name}: g must not take the StringBuilder: {graph:#?}"
+        );
+        let join_ids: Vec<_> = graph
+            .blocks
+            .iter()
+            .filter(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.last().map(String::as_str) == Some("g")
+                    )
+                })
+            })
+            .map(|block| block.id)
+            .collect();
+        let join_ptr_is_new = graph.blocks.iter().any(|block| {
+            block.exits.iter().any(|link| {
+                join_ids.contains(&link.target)
+                    && link
+                        .args
+                        .iter()
+                        .any(|arg| arg.as_variable().is_some_and(|v| new_ids.contains(&v.id())))
+            })
+        });
+        assert!(
+            !join_ptr_is_new,
+            "{name}: bb_a→bb_join pointer must not be STRINGBUILDER_NEW: {graph:#?}"
+        );
+    }
+
+    /// Mixed defs of a builder `String::as_bytes` window with a `&[u8]`
+    /// parameter: dest keeps a length shadow, so `ll_build`
+    /// (`AbstractStringBuilderRepr.rtype_method_build`) must still fire.
+    #[test]
+    fn shadowed_builder_string_as_bytes_builds_the_str() {
+        let string = string_adt();
+        let borrow = ref_string("Mut");
+        let shared = ref_string("Shared");
+        let graph = shadowed_builder_as_bytes_graph(
+            "shadowed_builder_string_as_bytes",
+            vec![string_decl()],
+            &string,
+            &borrow,
+            &shared,
+            string_new_decl(),
+            string_push_str_decl(),
+            string_as_bytes_decl(),
+        );
+        assert_shadowed_builder_as_bytes_builds_the_str(&graph, "shadowed_builder_string_as_bytes");
+    }
+
+    /// Mixed defs of a builder `Wtf8Buf::as_bytes` window with a `&[u8]`
+    /// parameter: dest keeps a length shadow, so `ll_build`
+    /// (`AbstractStringBuilderRepr.rtype_method_build`) must still fire.
+    #[test]
+    fn shadowed_builder_wtf8buf_as_bytes_builds_the_str() {
+        let wtf8 = wtf8_adt();
+        let borrow = ref_wtf8("Mut");
+        let shared = ref_wtf8("Shared");
+        let graph = shadowed_builder_as_bytes_graph(
+            "shadowed_builder_wtf8buf_as_bytes",
+            vec![wtf8buf_decl()],
+            &wtf8,
+            &borrow,
+            &shared,
+            wtf8buf_new_decl(),
+            push_str_decl(),
+            as_bytes_decl(),
+        );
+        assert_shadowed_builder_as_bytes_builds_the_str(
+            &graph,
+            "shadowed_builder_wtf8buf_as_bytes",
         );
     }
 

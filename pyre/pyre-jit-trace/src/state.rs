@@ -5645,7 +5645,7 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
         {
             // `W_CType.size?` is the only quasi-immutable `size`. The watcher
             // lives on the ctype; the module hook reads it.
-            pyre_interpreter::importing::ctype_size_qmut(struct_ptr as *const u8)
+            pyre_interpreter::importing::ctype_size_qmut(struct_ptr as pyre_object::gc_hook::GCREF)
         } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {
             pyre_interpreter::function::function_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,

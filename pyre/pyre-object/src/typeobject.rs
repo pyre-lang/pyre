@@ -7,6 +7,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::mapdict::MapRef;
 use crate::pyobject::*;
 
 bitflags::bitflags! {
@@ -330,11 +331,9 @@ pub struct W_TypeObject {
     /// typeobject.py:179 `terminator` — the root of this type's mapdict
     /// attribute map (a `DictTerminator` when `hasdict`, else
     /// `NoDictTerminator`), created once per type (typeobject.py:251-260).
-    /// Erased `*const MapNode` (the map node layer lives in the
-    /// `pyre-interpreter` crate, which `pyre-object` must not depend on; the
-    /// interpreter side casts it back). Null until installed by the mapdict
-    /// layer. Mirrors `W_ObjectObject.map`.
-    pub terminator: *const u8,
+    /// Typed `MapRef` (`mapdict.py` `Terminator` / `AbstractAttribute`).
+    /// Null until installed by the mapdict layer. Mirrors `W_ObjectObject.map`.
+    pub terminator: crate::mapdict::MapRef,
     /// typeobject.py:162 `_version_tag` — bumped to a fresh identity whenever
     /// the content of `dict_w` of any type in the MRO changes (`mutated()`,
     /// typeobject.py:285-286), so caches keyed on it (method cache, LOAD_ATTR
@@ -1374,18 +1373,18 @@ pub unsafe fn w_type_set_uses_object_setattr(obj: PyObjectRef, v: bool) {
         .store(v, std::sync::atomic::Ordering::Release);
 }
 
-/// typeobject.py `terminator` getter/setter. The stored value is an
-/// erased `*const MapNode`; the `pyre-interpreter` mapdict layer casts it.
+/// typeobject.py `terminator` getter/setter. The stored value is a typed
+/// `MapRef` (`mapdict.py` `Terminator` / `AbstractAttribute`).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_type_get_terminator(obj: PyObjectRef) -> *const u8 {
+pub unsafe fn w_type_get_terminator(obj: PyObjectRef) -> MapRef {
     (*(obj as *const W_TypeObject)).terminator
 }
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-pub unsafe fn w_type_set_terminator(obj: PyObjectRef, terminator: *const u8) {
+pub unsafe fn w_type_set_terminator(obj: PyObjectRef, terminator: MapRef) {
     (*(obj as *mut W_TypeObject)).terminator = terminator;
 }
 

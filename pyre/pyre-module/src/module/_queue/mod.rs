@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 #[pyre_interpreter::pyre_class("_queue.SimpleQueue", cpython_heaptype, weakrefable)]
 #[derive(Default)]
 pub struct W_SimpleQueue {
-    pub map: *const u8,
+    pub map: pyre_object::mapdict::MapRef,
     pub storage: *mut pyre_object::object_array::ItemsBlock,
     queue: Mutex<VecDeque<PyObjectRef>>,
     not_empty: Condvar,

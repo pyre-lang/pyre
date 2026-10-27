@@ -8729,7 +8729,7 @@ fn walker_emit_user_mapdict_empty<Sym: WalkSym>(
     new_op: OpRef,
     map_descr: majit_ir::DescrRef,
     storage_descr: majit_ir::DescrRef,
-    terminator: *const u8,
+    terminator: pyre_object::mapdict::MapRef,
     concrete: pyre_object::PyObjectRef,
 ) {
     let terminator_const = ctx.trace_ctx.const_int(terminator as i64);

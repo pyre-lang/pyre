@@ -1240,7 +1240,7 @@ const _: () = assert!(
 /// (`items_block_set_ref`, [`FixedObjectArray::set_ref`]) takes the plain
 /// store for these blocks with no ownership query. Returns the payload
 /// address, or `None` when the allocator refuses.
-unsafe fn std_alloc_gc_array(payload: Layout, zeroed: bool) -> Option<*mut u8> {
+unsafe fn std_alloc_gc_array(payload: Layout, zeroed: bool) -> Option<crate::gc_hook::GCREF> {
     let layout = std_gc_array_layout(std_gc_array_size(payload)?);
     unsafe {
         let raw = if zeroed {
@@ -1254,12 +1254,12 @@ unsafe fn std_alloc_gc_array(payload: Layout, zeroed: bool) -> Option<*mut u8> {
         std::ptr::write_bytes(raw, 0, GC_ARRAY_HEADER_SIZE);
         // `cast_adr_to_ptr(result + size_gc_header)`: the payload address is
         // header address arithmetic, as `header_of` spells the inverse.
-        Some((raw as usize + GC_ARRAY_HEADER_SIZE) as *mut u8)
+        Some((raw as usize + GC_ARRAY_HEADER_SIZE) as crate::gc_hook::GCREF)
     }
 }
 
 /// Free a block [`std_alloc_gc_array`] returned for the same `payload` layout.
-unsafe fn std_dealloc_gc_array(block: *mut u8, payload: Layout) {
+unsafe fn std_dealloc_gc_array(block: crate::gc_hook::GCREF, payload: Layout) {
     let size = std_gc_array_size(payload).expect("std GcArray layout");
     let header = (block as usize - GC_ARRAY_HEADER_SIZE) as *mut u8;
     unsafe { dealloc(header, std_gc_array_layout(size)) };
@@ -1314,7 +1314,7 @@ unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
     }
     unsafe {
         let cap = (*block).capacity;
-        std_dealloc_gc_array(block as *mut u8, items_block_layout(cap));
+        std_dealloc_gc_array(block as crate::gc_hook::GCREF, items_block_layout(cap));
     }
 }
 
@@ -1692,7 +1692,10 @@ pub unsafe fn dealloc_typed_items_block(block: *mut TypedItemsBlock) {
     }
     unsafe {
         let cap = (*block).capacity;
-        std_dealloc_gc_array(block as *mut u8, typed_items_block_layout(cap));
+        std_dealloc_gc_array(
+            block as crate::gc_hook::GCREF,
+            typed_items_block_layout(cap),
+        );
     }
 }
 
@@ -1901,7 +1904,7 @@ pub unsafe fn dealloc_mro_block(block: *mut FixedObjectArray) {
     }
     unsafe {
         let len = (*block).len;
-        std_dealloc_gc_array(block as *mut u8, mro_block_layout(len));
+        std_dealloc_gc_array(block as crate::gc_hook::GCREF, mro_block_layout(len));
     }
 }
 

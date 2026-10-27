@@ -6,7 +6,7 @@
 //! an RPython list to the `ll_*` helpers of `lltypesystem/rlist.py`.
 //!
 //! Items are one word each. A helper exists per item register kind — `_i`
-//! (`usize`), `_r` (`*mut u8`, a managed reference) and `_f` (`f64`) — because
+//! (`usize`), `_r` (`GCREF`, a managed reference) and `_f` (`f64`) — because
 //! the translator reads bodies before monomorphisation. The hints are those of
 //! the upstream helper each one mirrors:
 //!
@@ -141,6 +141,7 @@ use super::rffi::{
     raw_free, raw_malloc_varsize_char, raw_ptradd, raw_read_f64, raw_read_ptr, raw_write_f64,
     raw_write_ptr,
 };
+use majit_gc::GCREF;
 
 const WORD: usize = std::mem::size_of::<usize>();
 
@@ -183,8 +184,8 @@ pub fn ll_vec_as_ptr(header: usize) -> usize {
     vec_header_word(header, VEC_PTR_WORD)
 }
 
-fn vec_header_r(l: &mut Vec<*mut u8>) -> usize {
-    l as *mut Vec<*mut u8> as usize
+fn vec_header_r(l: &mut Vec<GCREF>) -> usize {
+    l as *mut Vec<GCREF> as usize
 }
 
 fn vec_header_f(l: &mut Vec<f64>) -> usize {
@@ -758,7 +759,7 @@ pub fn ll_slice_rotate_left_i(items: usize, length: usize, k: usize) {
 
 /// `ll_newemptylist`.
 #[majit_macros::oopspec("newlist(0)")]
-pub fn ll_vec_newemptylist_r() -> Vec<*mut u8> {
+pub fn ll_vec_newemptylist_r() -> Vec<GCREF> {
     Vec::new()
 }
 
@@ -766,7 +767,7 @@ pub fn ll_vec_newemptylist_r() -> Vec<*mut u8> {
 /// until the caller writes it, and `length` is already the list length.
 /// No `newlist(length)` oopspec: the result is a raw `Vec` header (kind
 /// int), and that rewrite emits GC `new_array_clear` into a ref bank.
-pub fn ll_vec_newlist_r(length: usize) -> Vec<*mut u8> {
+pub fn ll_vec_newlist_r(length: usize) -> Vec<GCREF> {
     let mut l = Vec::with_capacity(length);
     unsafe {
         l.set_len(length);
@@ -776,13 +777,13 @@ pub fn ll_vec_newlist_r(length: usize) -> Vec<*mut u8> {
 }
 
 /// `rlist.py _ll_zero_or_null` for a pointer item.
-fn ll_vec_zero_or_null_r(item: *mut u8) -> bool {
+fn ll_vec_zero_or_null_r(item: GCREF) -> bool {
     item.is_null()
 }
 
 /// `rgc.ll_arrayclear`. Writes null into each of the `count` slots.
 #[majit_macros::dont_look_inside_cannot_raise]
-fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
+fn ll_vec_arrayclear_r(l: &mut Vec<GCREF>, count: usize) {
     let mut i = 0;
     while i < count {
         ll_vec_setitem_fast_r(l, i, std::ptr::null_mut());
@@ -792,20 +793,20 @@ fn ll_vec_arrayclear_r(l: &mut Vec<*mut u8>, count: usize) {
 
 /// `rlist.py _ll_alloc_and_clear`. See [`ll_vec_alloc_and_clear_i`].
 #[majit_macros::oopspec("newlist_clear(count)")]
-pub fn ll_vec_alloc_and_clear_r(count: usize) -> Vec<*mut u8> {
+pub fn ll_vec_alloc_and_clear_r(count: usize) -> Vec<GCREF> {
     let mut l = ll_vec_newlist_r(count);
     ll_vec_arrayclear_r(&mut l, count);
     l
 }
 
 /// `@jit.look_inside_iff(lambda LIST, count, item: jit.isconstant(count) and count < 137)`.
-fn ll_vec_alloc_and_set_nonnull_iff_r(count: usize, _item: *mut u8) -> bool {
+fn ll_vec_alloc_and_set_nonnull_iff_r(count: usize, _item: GCREF) -> bool {
     crate::jit::isconstant(&count) && count < 137
 }
 
 /// `rlist.py _ll_alloc_and_set_nonnull`.
 #[majit_macros::look_inside_iff(ll_vec_alloc_and_set_nonnull_iff_r)]
-pub fn ll_vec_alloc_and_set_nonnull_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
+pub fn ll_vec_alloc_and_set_nonnull_r(count: usize, item: GCREF) -> Vec<GCREF> {
     let mut l = ll_vec_newlist_r(count);
     let mut i = 0;
     while i < count {
@@ -816,7 +817,7 @@ pub fn ll_vec_alloc_and_set_nonnull_r(count: usize, item: *mut u8) -> Vec<*mut u
 }
 
 /// `rlist.py _ll_alloc_and_set_nojit`.
-fn ll_vec_alloc_and_set_nojit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
+fn ll_vec_alloc_and_set_nojit_r(count: usize, item: GCREF) -> Vec<GCREF> {
     let mut l = ll_vec_newlist_r(count);
     if ll_vec_zero_or_null_r(item) {
         ll_vec_arrayclear_r(&mut l, count);
@@ -827,7 +828,7 @@ fn ll_vec_alloc_and_set_nojit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 }
 
 /// `rlist.py _ll_alloc_and_set_jit`.
-fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
+fn ll_vec_alloc_and_set_jit_r(count: usize, item: GCREF) -> Vec<GCREF> {
     if ll_vec_zero_or_null_r(item) {
         ll_vec_alloc_and_clear_r(count)
     } else {
@@ -837,7 +838,7 @@ fn ll_vec_alloc_and_set_jit_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 
 /// `rlist.py ll_alloc_and_set`. `rarithmetic.int_force_ge_zero` is a no-op:
 /// `count` is `usize`, already `>= 0`.
-pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
+pub fn ll_vec_alloc_and_set_r(count: usize, item: GCREF) -> Vec<GCREF> {
     if crate::jit::we_are_jitted() {
         ll_vec_alloc_and_set_jit_r(count, item)
     } else {
@@ -847,25 +848,25 @@ pub fn ll_vec_alloc_and_set_r(count: usize, item: *mut u8) -> Vec<*mut u8> {
 
 /// `ll_newlist_hint`.
 #[majit_macros::oopspec("newlist_hint(lengthhint)")]
-pub fn ll_vec_newlist_hint_r(lengthhint: usize) -> Vec<*mut u8> {
+pub fn ll_vec_newlist_hint_r(lengthhint: usize) -> Vec<GCREF> {
     Vec::with_capacity(lengthhint)
 }
 
 /// `ll_length`.
 #[majit_macros::oopspec("list.len(l)")]
-pub fn ll_vec_length_r(l: &mut Vec<*mut u8>) -> usize {
+pub fn ll_vec_length_r(l: &mut Vec<GCREF>) -> usize {
     vec_header_word(vec_header_r(l), VEC_LEN_WORD)
 }
 
 /// `ll_getitem_fast`: `index` is in bounds.
 #[majit_macros::oopspec("list.getitem(l, index)")]
-pub fn ll_vec_getitem_fast_r(l: &mut Vec<*mut u8>, index: usize) -> *mut u8 {
-    raw_read_ptr(vec_item_addr(vec_header_r(l), index, ITEM_SIZE_R)) as *mut u8
+pub fn ll_vec_getitem_fast_r(l: &mut Vec<GCREF>, index: usize) -> GCREF {
+    raw_read_ptr(vec_item_addr(vec_header_r(l), index, ITEM_SIZE_R)) as GCREF
 }
 
 /// `ll_setitem_fast`: `index` is in bounds.
 #[majit_macros::oopspec("list.setitem(l, index, item)")]
-pub fn ll_vec_setitem_fast_r(l: &mut Vec<*mut u8>, index: usize, item: *mut u8) {
+pub fn ll_vec_setitem_fast_r(l: &mut Vec<GCREF>, index: usize, item: GCREF) {
     raw_write_ptr(
         vec_item_addr(vec_header_r(l), index, ITEM_SIZE_R),
         item as usize,
@@ -873,14 +874,14 @@ pub fn ll_vec_setitem_fast_r(l: &mut Vec<*mut u8>, index: usize, item: *mut u8) 
 }
 
 /// `ll_append`.
-pub fn ll_vec_append_r(l: &mut Vec<*mut u8>, newitem: *mut u8) {
+pub fn ll_vec_append_r(l: &mut Vec<GCREF>, newitem: GCREF) {
     let length = ll_vec_length_r(l);
     ll_vec_resize_ge_r(l, length + 1);
     ll_vec_setitem_fast_r(l, length, newitem);
 }
 
 /// `_ll_list_resize_ge`. See [`ll_vec_resize_ge_i`].
-pub fn ll_vec_resize_ge_r(l: &mut Vec<*mut u8>, newsize: usize) {
+pub fn ll_vec_resize_ge_r(l: &mut Vec<GCREF>, newsize: usize) {
     let allocated = vec_header_word(vec_header_r(l), VEC_CAP_WORD);
     let cond = allocated < newsize;
     if crate::jit::isconstant(&allocated) && crate::jit::isconstant(&newsize) {
@@ -896,7 +897,7 @@ pub fn ll_vec_resize_ge_r(l: &mut Vec<*mut u8>, newsize: usize) {
 /// `@jit.look_inside_iff(lambda l, newsize, overallocate:
 /// jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
 fn ll_vec_resize_hint_really_iff_r(
-    l: &mut Vec<*mut u8>,
+    l: &mut Vec<GCREF>,
     newsize: usize,
     _overallocate: bool,
 ) -> bool {
@@ -906,7 +907,7 @@ fn ll_vec_resize_hint_really_iff_r(
 
 /// `_ll_list_resize_hint_really`.
 #[majit_macros::look_inside_iff(ll_vec_resize_hint_really_iff_r)]
-pub fn ll_vec_resize_hint_really_r(l: &mut Vec<*mut u8>, newsize: usize, overallocate: bool) {
+pub fn ll_vec_resize_hint_really_r(l: &mut Vec<GCREF>, newsize: usize, overallocate: bool) {
     let header = vec_header_r(l);
     let new_allocated = if newsize == 0 {
         vec_set_header_word(header, VEC_LEN_WORD, 0);
@@ -923,14 +924,14 @@ pub fn ll_vec_resize_hint_really_r(l: &mut Vec<*mut u8>, newsize: usize, overall
 
 /// `@jit.look_inside_iff(lambda l: jit.isvirtual(l) and
 /// jit.isconstant(l.ll_length()))`.
-fn ll_vec_reverse_iff_r(l: &mut Vec<*mut u8>) -> bool {
+fn ll_vec_reverse_iff_r(l: &mut Vec<GCREF>) -> bool {
     let length = ll_vec_length_r(l);
     crate::jit::isvirtual(&*l) && crate::jit::isconstant(&length)
 }
 
 /// `ll_reverse`.
 #[majit_macros::look_inside_iff(ll_vec_reverse_iff_r)]
-pub fn ll_vec_reverse_r(l: &mut Vec<*mut u8>) {
+pub fn ll_vec_reverse_r(l: &mut Vec<GCREF>) {
     let length = ll_vec_length_r(l) as isize;
     let mut i: isize = 0;
     let mut length_1_i = length - 1 - i;
@@ -945,18 +946,18 @@ pub fn ll_vec_reverse_r(l: &mut Vec<*mut u8>) {
 }
 
 /// `lltype.free(l, flavor='raw')` of a lowered `Vec` header and its buffer.
-pub fn ll_vec_free_r(l: &mut Vec<*mut u8>) {
+pub fn ll_vec_free_r(l: &mut Vec<GCREF>) {
     ll_vec_free_buffer(vec_header_r(l), ITEM_SIZE_R, ITEM_ALIGN_R);
 }
 
 /// `ll_items`: the header's item pointer.
-pub fn ll_vec_items_r(l: &mut Vec<*mut u8>) -> usize {
+pub fn ll_vec_items_r(l: &mut Vec<GCREF>) -> usize {
     vec_header_word(vec_header_r(l), VEC_PTR_WORD)
 }
 
 /// `ll_extend` from the `(items, length)` slice. `ovfcheck` on `len1 + len2`
 /// rejects a wrapping sum, then `_ll_resize_ge` and `ll_arraycopy`.
-pub fn ll_vec_extend_from_slice_r(l: &mut Vec<*mut u8>, items: usize, length: usize) {
+pub fn ll_vec_extend_from_slice_r(l: &mut Vec<GCREF>, items: usize, length: usize) {
     let len1 = ll_vec_length_r(l);
     let newlen = len1.checked_add(length).expect("Vec capacity overflow");
     ll_vec_resize_ge_r(l, newlen);
@@ -966,17 +967,17 @@ pub fn ll_vec_extend_from_slice_r(l: &mut Vec<*mut u8>, items: usize, length: us
 /// Length of a length-prefixed object GcArray. The array is a movable GC
 /// object; callers re-read this from `l2` rather than caching it across a
 /// collection.
-fn gcarray_length_r(l2: *mut u8) -> usize {
+fn gcarray_length_r(l2: GCREF) -> usize {
     raw_read_ptr(raw_ptradd(l2 as usize, GCARRAY_LEN_OFFSET))
 }
 
 /// Item `index` of a length-prefixed object GcArray, read from the array
 /// word so a collection that moves `l2` is visible on the next index.
-fn gcarray_getitem_r(l2: *mut u8, index: usize) -> *mut u8 {
+fn gcarray_getitem_r(l2: GCREF, index: usize) -> GCREF {
     raw_read_ptr(raw_ptradd(
         l2 as usize,
         GCARRAY_ITEMS_OFFSET + index * ITEM_SIZE_R,
-    )) as *mut u8
+    )) as GCREF
 }
 
 /// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
@@ -987,7 +988,7 @@ fn gcarray_getitem_r(l2: *mut u8, index: usize) -> *mut u8 {
 /// `ovfcheck(len1 + len2)`: a wrapping sum would undersize the resize.
 /// Overflow is MemoryError, the same `Vec capacity overflow` panic as
 /// [`vec_buf_layout`].
-pub fn ll_vec_extend_r(l: &mut Vec<*mut u8>, l2: *mut u8) {
+pub fn ll_vec_extend_r(l: &mut Vec<GCREF>, l2: GCREF) {
     let len1 = ll_vec_length_r(l);
     let len2 = gcarray_length_r(l2);
     let newlength = len1
@@ -1023,12 +1024,12 @@ pub fn ll_slice_arraycopy_r(
 }
 
 /// `ll_getitem_fast` on the items at `items`: `index` is in bounds.
-pub fn ll_slice_getitem_fast_r(items: usize, index: usize) -> *mut u8 {
-    raw_read_ptr(slice_item_addr(items, index, ITEM_SIZE_R)) as *mut u8
+pub fn ll_slice_getitem_fast_r(items: usize, index: usize) -> GCREF {
+    raw_read_ptr(slice_item_addr(items, index, ITEM_SIZE_R)) as GCREF
 }
 
 /// `ll_setitem_fast` on the items at `items`: `index` is in bounds.
-pub fn ll_slice_setitem_fast_r(items: usize, index: usize, item: *mut u8) {
+pub fn ll_slice_setitem_fast_r(items: usize, index: usize, item: GCREF) {
     raw_write_ptr(slice_item_addr(items, index, ITEM_SIZE_R), item as usize)
 }
 
@@ -1037,7 +1038,7 @@ pub fn ll_slice_setitem_fast_r(items: usize, index: usize, item: *mut u8) {
 ///
 /// `ll_listcontains` is "not inlined by the JIT -- contains a loop".
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn ll_slice_contains_r(items: usize, length: usize, item: *mut u8) -> bool {
+pub fn ll_slice_contains_r(items: usize, length: usize, item: GCREF) -> bool {
     let word = item as usize;
     let mut i = 0;
     while i < length {
@@ -1051,18 +1052,18 @@ pub fn ll_slice_contains_r(items: usize, length: usize, item: *mut u8) -> bool {
 
 /// The item at `addr`, an [`ll_slice_get_addr_r`] result, or `default` when
 /// `addr` is 0: `opt.copied().unwrap_or(default)`.
-pub fn ll_slice_load_or_r(addr: usize, default: *mut u8) -> *mut u8 {
+pub fn ll_slice_load_or_r(addr: usize, default: GCREF) -> GCREF {
     let word = if addr != 0 {
         raw_read_ptr(addr)
     } else {
         default as usize
     };
-    word as *mut u8
+    word as GCREF
 }
 
 /// `s.to_vec()`: `ll_copy` — a new `Vec` of `length` items, then
 /// `ll_arraycopy` of the items at `items`.
-pub fn ll_slice_to_vec_r(items: usize, length: usize) -> Vec<*mut u8> {
+pub fn ll_slice_to_vec_r(items: usize, length: usize) -> Vec<GCREF> {
     let mut l = ll_vec_newlist_hint_r(length);
     ll_vec_resize_ge_r(&mut l, length);
     ll_slice_arraycopy_r(items, ll_vec_items_r(&mut l), 0, 0, length);
@@ -1098,7 +1099,7 @@ pub fn ll_slice_buffer_new_r(length: usize) -> usize {
 /// `[item; length]` into the buffer at `items`.
 /// `rgc.ll_arrayfill`, which is `@jit.dont_look_inside`.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn ll_slice_buffer_fill_r(items: usize, length: usize, item: *mut u8) {
+pub fn ll_slice_buffer_fill_r(items: usize, length: usize, item: GCREF) {
     let mut i = 0;
     while i < length {
         ll_slice_setitem_fast_r(items, i, item);
@@ -1489,9 +1490,9 @@ mod tests {
         let header = __majit_call_target_ll_vec_newlist_hint_r(4);
         assert_ne!(header, 0);
         assert_eq!(__majit_call_target_ll_vec_length_r(header), 0);
-        let l = unsafe { &mut *(header as usize as *mut Vec<*mut u8>) };
+        let l = unsafe { &mut *(header as usize as *mut Vec<GCREF>) };
         assert!(l.capacity() >= 4);
-        l.push(8 as *mut u8);
+        l.push(8 as GCREF);
         assert_eq!(__majit_call_target_ll_vec_length_r(header), 1);
         ll_vec_free_r(l);
     }
@@ -1561,7 +1562,7 @@ mod tests {
         assert_eq!(ll_vec_alloc_and_clear_i(0), Vec::<usize>::new());
         assert_eq!(ll_vec_alloc_and_clear_i(3), vec![0usize; 3]);
 
-        let p = 0x20 as *mut u8;
+        let p = 0x20 as GCREF;
         assert_eq!(ll_vec_alloc_and_set_r(0, std::ptr::null_mut()), Vec::new());
         assert_eq!(ll_vec_alloc_and_set_r(0, p), Vec::new());
         assert_eq!(
@@ -1569,7 +1570,7 @@ mod tests {
             vec![std::ptr::null_mut(); 3]
         );
         assert_eq!(ll_vec_alloc_and_set_r(3, p), vec![p; 3]);
-        assert_eq!(ll_vec_alloc_and_clear_r(0), Vec::<*mut u8>::new());
+        assert_eq!(ll_vec_alloc_and_clear_r(0), Vec::<GCREF>::new());
         assert_eq!(ll_vec_alloc_and_clear_r(3), vec![std::ptr::null_mut(); 3]);
 
         assert_eq!(ll_vec_alloc_and_set_f(0, 0.0), Vec::<f64>::new());
@@ -1620,8 +1621,8 @@ mod tests {
         assert_eq!(f, vec![4.5, 3.5, 2.5, 1.5, 0.5]);
 
         let mut r = ll_vec_newemptylist_r();
-        let a = 0x10 as *mut u8;
-        let b = 0x20 as *mut u8;
+        let a = 0x10 as GCREF;
+        let b = 0x20 as GCREF;
         ll_vec_append_r(&mut r, a);
         ll_vec_append_r(&mut r, b);
         ll_vec_reverse_r(&mut r);
@@ -1646,9 +1647,9 @@ mod tests {
 
         ll_slice_rotate_right_i(0, 0, 3);
 
-        let a = 0x10 as *mut u8;
-        let b = 0x20 as *mut u8;
-        let c = 0x30 as *mut u8;
+        let a = 0x10 as GCREF;
+        let b = 0x20 as GCREF;
+        let c = 0x30 as GCREF;
         let mut r = vec![a, b, c];
         let items = ll_vec_items_r(&mut r);
         ll_slice_rotate_right_r(items, 3, 1);
@@ -1689,10 +1690,10 @@ mod tests {
         let floats = [1.5f64, 2.5, 3.5];
         assert_eq!(ll_slice_getitem_fast_f(floats.as_ptr() as usize, 2), 3.5);
 
-        let mut r = vec![0x10 as *mut u8, 0x20 as *mut u8];
+        let mut r = vec![0x10 as GCREF, 0x20 as GCREF];
         let items = ll_vec_items_r(&mut r);
         ll_slice_reverse_r(items, 2);
-        assert_eq!(ll_slice_getitem_fast_r(items, 0), 0x20 as *mut u8);
+        assert_eq!(ll_slice_getitem_fast_r(items, 0), 0x20 as GCREF);
 
         ll_slice_reverse_i(0, 0);
 
@@ -1859,26 +1860,26 @@ mod tests {
         #[repr(C)]
         struct GcArrayWord {
             length: usize,
-            items: [*mut u8; 2],
+            items: [GCREF; 2],
         }
         let mut src = GcArrayWord {
             length: 2,
-            items: [0x10 as *mut u8, 0x20 as *mut u8],
+            items: [0x10 as GCREF, 0x20 as GCREF],
         };
         let mut l = ll_vec_newemptylist_r();
-        ll_vec_append_r(&mut l, 0x01 as *mut u8);
-        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
+        ll_vec_append_r(&mut l, 0x01 as GCREF);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as GCREF);
         assert_eq!(ll_vec_length_r(&mut l), 3);
-        assert_eq!(ll_vec_getitem_fast_r(&mut l, 0), 0x01 as *mut u8);
-        assert_eq!(ll_vec_getitem_fast_r(&mut l, 1), 0x10 as *mut u8);
-        assert_eq!(ll_vec_getitem_fast_r(&mut l, 2), 0x20 as *mut u8);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 0), 0x01 as GCREF);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 1), 0x10 as GCREF);
+        assert_eq!(ll_vec_getitem_fast_r(&mut l, 2), 0x20 as GCREF);
 
         let mut empty = GcArrayWord {
             length: 0,
             items: [std::ptr::null_mut(), std::ptr::null_mut()],
         };
         let before = ll_vec_length_r(&mut l);
-        ll_vec_extend_r(&mut l, &mut empty as *mut GcArrayWord as *mut u8);
+        ll_vec_extend_r(&mut l, &mut empty as *mut GcArrayWord as GCREF);
         assert_eq!(ll_vec_length_r(&mut l), before);
     }
 
@@ -1890,15 +1891,15 @@ mod tests {
         #[repr(C)]
         struct GcArrayWord {
             length: usize,
-            items: [*mut u8; 1],
+            items: [GCREF; 1],
         }
         let mut src = GcArrayWord {
             length: usize::MAX,
             items: [std::ptr::null_mut()],
         };
         let mut l = ll_vec_newemptylist_r();
-        ll_vec_append_r(&mut l, 0x01 as *mut u8);
-        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as *mut u8);
+        ll_vec_append_r(&mut l, 0x01 as GCREF);
+        ll_vec_extend_r(&mut l, &mut src as *mut GcArrayWord as GCREF);
     }
 
     #[test]

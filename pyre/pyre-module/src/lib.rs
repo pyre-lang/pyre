@@ -213,7 +213,7 @@ fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, us
 }
 
 fn hook_ctype_size_qmut(
-    ptr: *const u8,
+    ptr: pyre_object::gc_hook::GCREF,
 ) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
     #[cfg(all(
         feature = "host_env",

@@ -12256,7 +12256,7 @@ fn emit_walker_instance<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     w_type: pyre_object::PyObjectRef,
     type_const: OpRef,
-    terminator: *const u8,
+    terminator: pyre_object::mapdict::MapRef,
 ) -> (OpRef, pyre_object::PyObjectRef) {
     let concrete_instance = pyre_object::w_instance_new(w_type);
     // `emit_instance_inline` appends to `opencoder.py Trace._ops`. Pin the

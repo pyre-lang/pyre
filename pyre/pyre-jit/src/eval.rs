@@ -5570,7 +5570,7 @@ fn walk_rbigint_parts_cache(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     majit_rlib::rbigint::walk_rbigint_cache_digit_slots(|slot| {
         let mut root = majit_ir::GcRef(*slot as usize);
         visitor(&mut root);
-        *slot = root.0 as *mut u8;
+        *slot = root.0 as _;
     });
 }
 
@@ -15302,15 +15302,17 @@ fn value_to_vable_identity_bits(value: &Value) -> i64 {
 
 fn sync_virtualizable_after_guard_failure(
     resolved_vable: &[Value],
-    frame_u8: *mut u8,
+    frame: *mut PyFrame,
     vinfo: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) {
     unsafe {
         // pyjitpl.py: reset token before synchronize_virtualizable().
-        vinfo.reset_vable_token(frame_u8);
+        vinfo.reset_vable_token(frame.cast::<u8>());
     }
     let array_lengths: Vec<usize> = (0..vinfo.array_fields.len())
-        .map(|array_index| unsafe { vinfo.get_array_length(frame_u8.cast_const(), array_index) })
+        .map(|array_index| unsafe {
+            vinfo.get_array_length(frame.cast::<u8>().cast_const(), array_index)
+        })
         .collect();
     let expected_total_without_identity =
         vinfo.num_static_extra_boxes + array_lengths.iter().sum::<usize>();
@@ -15324,8 +15326,9 @@ fn sync_virtualizable_after_guard_failure(
             .iter()
             .zip(&array_lengths)
             .map(|(field, len)| {
-                let container =
-                    unsafe { *(frame_u8.cast_const().add(field.field_offset) as *const *const u8) };
+                let container = unsafe {
+                    *(frame.cast::<u8>().cast_const().add(field.field_offset) as *const *const u8)
+                };
                 format!(
                     "{}@{}: container={container:?} len_off={} len={len}",
                     field.name, field.field_offset, field.length_offset,
@@ -15334,7 +15337,7 @@ fn sync_virtualizable_after_guard_failure(
             .collect();
         panic!(
             "rebuild_guard_fail_state: virtualizable box count mismatch \
-             (expected {}, got {}); frame={frame_u8:?} statics={} arrays=[{}] vable={:?}",
+             (expected {}, got {}); frame={frame:?} statics={} arrays=[{}] vable={:?}",
             expected_total_without_identity + 1,
             resolved_vable.len(),
             vinfo.num_static_extra_boxes,
@@ -15390,11 +15393,11 @@ fn sync_virtualizable_after_guard_failure(
     debug_assert_eq!(cursor, resolved_vable.len());
     // Identity and the write target: re-read after boxing allocates.
     boxes[out] = value_to_vable_identity_bits(&resolved_vable[0]);
-    let frame_u8 = boxes[out] as *mut u8;
+    let frame = boxes[out] as *mut PyFrame;
 
     unsafe {
-        vinfo.write_boxes(frame_u8, &boxes);
-        let frame = &mut *(frame_u8 as *mut PyFrame);
+        vinfo.write_boxes(frame.cast::<u8>(), &boxes);
+        let frame = &mut *frame;
         frame.clear_stack_above(frame.valuestackdepth);
     }
 }
@@ -15646,7 +15649,6 @@ fn build_resumed_frames(
     // `blackhole_resume_via_rd_numb` (resume.py).)
     let vable_frame_before = vable_frame_from_resolved(&resolved_vable);
     if !vable_frame_before.is_null() {
-        let frame_u8 = vable_frame_before as *mut u8;
         // resume.py blackhole_from_resumedata parity:
         //     vinfo = self.jitdriver_sd.virtualizable_info
         // Use the JIT driver's cached `Arc<VirtualizableInfo>` set once by
@@ -15656,7 +15658,7 @@ fn build_resumed_frames(
         let vinfo = crate::eval::driver_pair().1.clone();
         match vable_mode {
             ResumeVableMode::GuardFailureSync => {
-                sync_virtualizable_after_guard_failure(&resolved_vable, frame_u8, &vinfo);
+                sync_virtualizable_after_guard_failure(&resolved_vable, vable_frame_before, &vinfo);
             }
         }
     }

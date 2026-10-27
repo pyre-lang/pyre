@@ -15,7 +15,7 @@ use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use super::rstr::{STR_CHARS_OFFSET, StrHeader, str_as_bytes};
+use super::rstr::{STR, str_as_bytes};
 use crate::rffi::{MemoryError, free_charp, str2charp};
 
 /// `lltype.Array(Char)` length word (`llmemory.ArrayLengthOffset` is 0,
@@ -442,7 +442,7 @@ static STR_FQ_FREE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 ///
 /// Upstream has no JIT hint; the only caller is `get_raw_address_of_string`.
 #[allow(non_snake_case)]
-pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
+pub fn _get_raw_address_buf_from_string(string: *mut STR) -> *mut u8 {
     let key = majit_gc::gc_id_or_identityhash(string as usize);
     {
         let fq = _fq_addr_from_string.lock();
@@ -450,7 +450,7 @@ pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
             return ptr as *mut u8;
         }
     }
-    let ptr = match unsafe { str2charp(str_as_bytes(string as *const u8), false) } {
+    let ptr = match unsafe { str2charp(str_as_bytes(string), false) } {
         Ok(ptr) => ptr,
         Err(MemoryError) => {
             // `str2charp` raises `MemoryError`: pending exception + NULL is the
@@ -507,18 +507,18 @@ fn __majit_register_helper_fnaddr__get_raw_address_buf_from_string() {
 /// nursery copy returns `_get_raw_address_buf_from_string`.
 /// Returns `CCHARP` (`*mut u8`).
 #[majit_macros::dont_look_inside]
-pub fn get_raw_address_of_string(string: *mut u8) -> *mut u8 {
+pub fn get_raw_address_of_string(string: *mut STR) -> *mut u8 {
     let mut string = string;
     let gcref = majit_ir::GcRef(string as usize);
     if majit_gc::can_move(gcref) {
         let moved = majit_gc::gc_move_out_of_nursery(gcref);
-        string = moved.0 as *mut u8;
+        string = moved.0 as *mut STR;
         if majit_gc::can_move(moved) {
             return _get_raw_address_buf_from_string(string);
         }
     }
-    let data_start = unsafe { string.add(STR_CHARS_OFFSET) };
-    let len = unsafe { (*string.cast::<StrHeader>()).length };
+    let data_start = unsafe { (&raw mut (*string).chars).cast::<u8>() };
+    let len = unsafe { (*string).length };
     unsafe {
         *data_start.add(len) = 0;
     }
@@ -528,6 +528,7 @@ pub fn get_raw_address_of_string(string: *mut u8) -> *mut u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lltypesystem::rstr::STR_CHARS_OFFSET;
 
     #[test]
     fn raw_block_round_trips_words() {
@@ -760,9 +761,9 @@ mod tests {
         let nbytes = STR_CHARS_OFFSET + text.len() + 1;
         let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
         let mut words = vec![0usize; nwords];
-        let ptr = words.as_mut_ptr() as *mut u8;
+        let ptr = words.as_mut_ptr().cast::<u8>();
         unsafe {
-            let strp = ptr.cast::<StrHeader>();
+            let strp = ptr.cast::<STR>();
             (*strp).hash = 0;
             (*strp).length = text.len();
             std::ptr::copy_nonoverlapping(text.as_ptr(), ptr.add(STR_CHARS_OFFSET), text.len());
@@ -777,10 +778,10 @@ mod tests {
     fn get_raw_address_of_string_non_nursery_writes_nul() {
         let text = b"hello";
         let mut storage = alloc_fake_str(text, 0xFF);
-        let ptr = storage.as_mut_ptr() as *mut u8;
+        let ptr = storage.as_mut_ptr().cast::<STR>();
         let result = get_raw_address_of_string(ptr);
         unsafe {
-            assert_eq!(result, ptr.add(STR_CHARS_OFFSET));
+            assert_eq!(result, (ptr as *mut u8).add(STR_CHARS_OFFSET));
             assert_eq!(std::slice::from_raw_parts(result, text.len()), text);
             assert_eq!(*result.add(text.len()), 0);
         }
@@ -791,12 +792,12 @@ mod tests {
         with_host_gc_mutator(|| {
             let text = b"cache-me";
             let mut storage = alloc_fake_str(text, 0xFF);
-            let ptr = storage.as_mut_ptr() as *mut u8;
+            let ptr = storage.as_mut_ptr().cast::<STR>();
             let first = _get_raw_address_buf_from_string(ptr);
             let second = _get_raw_address_buf_from_string(ptr);
             assert_eq!(first, second);
             unsafe {
-                assert_ne!(first, ptr.add(STR_CHARS_OFFSET));
+                assert_ne!(first, (ptr as *mut u8).add(STR_CHARS_OFFSET));
                 assert_eq!(std::slice::from_raw_parts(first, text.len()), text);
                 assert_eq!(*first.add(text.len()), 0);
             }
@@ -818,13 +819,13 @@ mod tests {
         }
     }
 
-    fn write_str_payload(payload: *mut u8, text: &[u8]) {
+    fn write_str_payload(payload: *mut STR, text: &[u8]) {
         unsafe {
-            let strp = payload.cast::<StrHeader>();
-            (*strp).hash = 0;
-            (*strp).length = text.len();
-            std::ptr::copy_nonoverlapping(text.as_ptr(), payload.add(STR_CHARS_OFFSET), text.len());
-            *payload.add(STR_CHARS_OFFSET + text.len()) = 0;
+            (*payload).hash = 0;
+            (*payload).length = text.len();
+            let chars = (&raw mut (*payload).chars).cast::<u8>();
+            std::ptr::copy_nonoverlapping(text.as_ptr(), chars, text.len());
+            *chars.add(text.len()) = 0;
         }
     }
 
@@ -841,9 +842,9 @@ mod tests {
             });
             majit_gc::gc_sync::gc_op(|gc| unsafe { gc.roots.add(&mut root) });
             majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
-            write_str_payload(root.0 as *mut u8, text);
+            write_str_payload(root.0 as *mut STR, text);
 
-            let copy = _get_raw_address_buf_from_string(root.0 as *mut u8);
+            let copy = _get_raw_address_buf_from_string(root.0 as *mut STR);
             let key = majit_gc::gc_id_or_identityhash(root.0);
             unsafe {
                 assert_ne!(copy, (root.0 as *mut u8).add(STR_CHARS_OFFSET));

@@ -7,7 +7,7 @@
 //! `_search_normal` reads `Ptr(UNICODE)` through the same header with
 //! UCS-4 `UniChar` cells.
 
-use crate::lltypesystem::rstr::{str_as_bytes, unicode_as_unichars};
+use crate::lltypesystem::rstr::{STR, UNICODE, str_as_bytes, unicode_as_unichars};
 
 /// `rstring.py` `SEARCH_COUNT`.
 pub const SEARCH_COUNT: i64 = 0;
@@ -59,7 +59,7 @@ fn bloom<C: SearchChar>(mask: u64, c: C) -> bool {
 /// `_search_normal` for the STR arm of `_search` (`isinstance(value, str)`
 /// is a translation-time constant).
 #[majit_macros::elidable]
-pub fn _search_elidable(s1: *const u8, s2: *const u8, start: i64, end: i64, mode: i64) -> i64 {
+pub fn _search_elidable(s1: *const STR, s2: *const STR, start: i64, end: i64, mode: i64) -> i64 {
     // SAFETY: residual `Ptr(STR)` callee; the caller supplies live STRs.
     let value = unsafe { str_as_bytes(s1) };
     let other = unsafe { str_as_bytes(s2) };
@@ -73,8 +73,8 @@ pub fn _search_elidable(s1: *const u8, s2: *const u8, start: i64, end: i64, mode
 /// residual is published as `_search_elidable`. A residual specialization
 /// aliases this row only when its argument layout is `Ptr(UNICODE)`.
 pub extern "C" fn _search_normal_unicode(
-    s1: *const u8,
-    s2: *const u8,
+    s1: *const UNICODE,
+    s2: *const UNICODE,
     start: i64,
     end: i64,
     mode: i64,
@@ -661,10 +661,7 @@ fn adaptive_find<C: SearchChar>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lltypesystem::rstr::{
-        STR_CHARS_OFFSET, STR_HASH_OFFSET, STR_LEN_OFFSET, UNICODE_CHARS_OFFSET,
-        UNICODE_HASH_OFFSET, UNICODE_LEN_OFFSET,
-    };
+    use crate::lltypesystem::rstr::{STR_CHARS_OFFSET, UNICODE_CHARS_OFFSET};
 
     fn naive<C: SearchChar>(hay: &[C], needle: &[C], lo: i64, hi: i64, mode: i64) -> i64 {
         let mut start = lo;
@@ -784,22 +781,15 @@ mod tests {
         assert_eq!(_search_normal(hay, b"", 2, 2, SEARCH_COUNT), 1);
     }
 
-    fn str_buf(bytes: &[u8]) -> Vec<u8> {
-        let mut buf = vec![0u8; STR_CHARS_OFFSET + bytes.len() + 1];
+    fn str_buf(bytes: &[u8]) -> Vec<usize> {
+        let nbytes = STR_CHARS_OFFSET + bytes.len() + 1;
+        let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut buf = vec![0usize; nwords];
+        let p = buf.as_mut_ptr().cast::<u8>();
         unsafe {
-            buf.as_mut_ptr()
-                .add(STR_HASH_OFFSET)
-                .cast::<isize>()
-                .write_unaligned(0);
-            buf.as_mut_ptr()
-                .add(STR_LEN_OFFSET)
-                .cast::<usize>()
-                .write_unaligned(bytes.len());
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                buf.as_mut_ptr().add(STR_CHARS_OFFSET),
-                bytes.len(),
-            );
+            (*p.cast::<STR>()).hash = 0;
+            (*p.cast::<STR>()).length = bytes.len();
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), p.add(STR_CHARS_OFFSET), bytes.len());
         }
         buf
     }
@@ -809,25 +799,28 @@ mod tests {
         let hay = str_buf(b"abracadabra");
         let needle = str_buf(b"cad");
         assert_eq!(
-            _search_elidable(hay.as_ptr(), needle.as_ptr(), 0, 11, SEARCH_FIND),
+            _search_elidable(
+                hay.as_ptr().cast::<STR>(),
+                needle.as_ptr().cast::<STR>(),
+                0,
+                11,
+                SEARCH_FIND,
+            ),
             4
         );
     }
 
-    fn unicode_buf(chars: &[u32]) -> Vec<u8> {
-        let mut buf = vec![0u8; UNICODE_CHARS_OFFSET + chars.len() * 4];
+    fn unicode_buf(chars: &[u32]) -> Vec<usize> {
+        let nbytes = UNICODE_CHARS_OFFSET + chars.len() * 4;
+        let nwords = (nbytes + std::mem::size_of::<usize>() - 1) / std::mem::size_of::<usize>();
+        let mut buf = vec![0usize; nwords];
+        let p = buf.as_mut_ptr().cast::<u8>();
         unsafe {
-            buf.as_mut_ptr()
-                .add(UNICODE_HASH_OFFSET)
-                .cast::<isize>()
-                .write_unaligned(0);
-            buf.as_mut_ptr()
-                .add(UNICODE_LEN_OFFSET)
-                .cast::<usize>()
-                .write_unaligned(chars.len());
+            (*p.cast::<UNICODE>()).hash = 0;
+            (*p.cast::<UNICODE>()).length = chars.len();
             std::ptr::copy_nonoverlapping(
                 chars.as_ptr(),
-                buf.as_mut_ptr().add(UNICODE_CHARS_OFFSET).cast::<u32>(),
+                p.add(UNICODE_CHARS_OFFSET).cast::<u32>(),
                 chars.len(),
             );
         }
@@ -902,15 +895,33 @@ mod tests {
         let hay = unicode_buf(&[b'a' as u32, 0x1F600, b'b' as u32, 0x1F600]);
         let needle = unicode_buf(&[0x1F600]);
         assert_eq!(
-            _search_normal_unicode(hay.as_ptr(), needle.as_ptr(), 0, 4, SEARCH_FIND),
+            _search_normal_unicode(
+                hay.as_ptr().cast::<UNICODE>(),
+                needle.as_ptr().cast::<UNICODE>(),
+                0,
+                4,
+                SEARCH_FIND,
+            ),
             1
         );
         assert_eq!(
-            _search_normal_unicode(hay.as_ptr(), needle.as_ptr(), 0, 4, SEARCH_RFIND),
+            _search_normal_unicode(
+                hay.as_ptr().cast::<UNICODE>(),
+                needle.as_ptr().cast::<UNICODE>(),
+                0,
+                4,
+                SEARCH_RFIND,
+            ),
             3
         );
         assert_eq!(
-            _search_normal_unicode(hay.as_ptr(), needle.as_ptr(), 0, 4, SEARCH_COUNT),
+            _search_normal_unicode(
+                hay.as_ptr().cast::<UNICODE>(),
+                needle.as_ptr().cast::<UNICODE>(),
+                0,
+                4,
+                SEARCH_COUNT,
+            ),
             2
         );
     }

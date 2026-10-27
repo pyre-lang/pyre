@@ -1028,7 +1028,7 @@ unsafe fn raw_chain_next_frame(f_backref: *mut PyFrame) -> *mut PyFrame {
 /// `virtualref.py is_virtual_ref(gcref)` supplies the predicate.
 #[inline]
 unsafe fn forward_virtual_ref_forced(
-    value: *mut u8,
+    value: pyre_object::gc_hook::GCREF,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) -> bool {
     unsafe {
@@ -1060,7 +1060,7 @@ unsafe fn walk_frame_value_slot(
     // AFTER the visitor so a relocated value is the live one.
     unsafe {
         let value = (*slot_ptr).0 as PyObjectRef;
-        if forward_virtual_ref_forced(value as *mut u8, visitor) {
+        if forward_virtual_ref_forced(value as pyre_object::gc_hook::GCREF, visitor) {
             return;
         }
         walk_raw_exception_roots(value, visitor);

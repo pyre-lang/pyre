@@ -68,7 +68,7 @@ pub fn alloc_bytes_block(bytes: &[u8]) -> *mut BytesBlock {
 /// Where a bytes block comes from.
 enum BlockRoute {
     /// The managed heap served it.
-    Managed(*mut u8),
+    Managed(*mut BytesBlock),
     /// No heap owns the request — before the GC is up, or in a unit test — so
     /// the caller allocates it and the block is immortal.
     Raw,
@@ -91,7 +91,9 @@ fn route_bytes_block(size: usize) -> BlockRoute {
     }
     match crate::gc_hook::GcAllocOutcome::from_hook(crate::gc_hook::try_gc_alloc_stable(tid, size))
     {
-        crate::gc_hook::GcAllocOutcome::Allocated(raw) => BlockRoute::Managed(raw as *mut u8),
+        crate::gc_hook::GcAllocOutcome::Allocated(raw) => {
+            BlockRoute::Managed(raw.cast::<BytesBlock>())
+        }
         crate::gc_hook::GcAllocOutcome::Failed => BlockRoute::Refused,
         crate::gc_hook::GcAllocOutcome::NoRoute => BlockRoute::Raw,
     }
@@ -111,6 +113,7 @@ pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
         // `init_gc_object_immortal` in front of the payload.
         BlockRoute::Raw => {
             majit_gc::header::alloc_varsize_with_gc_header_immortal(size, lowlevel_str_gc_type_id())
+                .cast::<BytesBlock>()
         }
     };
     if block.is_null() {
@@ -119,7 +122,6 @@ pub fn try_alloc_bytes_block(bytes: &[u8]) -> Option<*mut BytesBlock> {
     // SAFETY: `block` names `size` writable bytes: hash, length, `bytes.len()`
     // chars, and the trailing NUL `mallocstr` writes.
     unsafe {
-        let block = block as *mut BytesBlock;
         (*block).hash = 0;
         (*block).length = bytes.len();
         let chars = (block as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
@@ -143,14 +145,15 @@ pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
         BlockRoute::Managed(raw) => {
             // SAFETY: `raw` names `size` writable bytes, and the managed heap
             // makes no promise about what they hold.
-            unsafe { std::ptr::write_bytes(raw, 0, size) };
+            unsafe { std::ptr::write_bytes(raw.cast::<u8>(), 0, size) };
             raw
         }
         BlockRoute::Refused => return None,
         BlockRoute::Raw => majit_gc::header::alloc_varsize_with_gc_header_immortal_zeroed(
             size,
             lowlevel_str_gc_type_id(),
-        ),
+        )
+        .cast::<BytesBlock>(),
     };
     if block.is_null() {
         return None;
@@ -158,7 +161,6 @@ pub fn try_alloc_bytes_block_zeroed(len: usize) -> Option<*mut BytesBlock> {
     // SAFETY: `block` names the STR header followed by `len` zeroed char
     // slots and the trailing NUL. Zero-fill already wrote `hash = 0`.
     unsafe {
-        let block = block as *mut BytesBlock;
         (*block).length = len;
         Some(block)
     }
