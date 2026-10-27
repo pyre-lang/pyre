@@ -134,15 +134,14 @@ impl IntegerRepr {
 
     /// Convert `lowleveltype._defl()` to the `ConstValue` carrier that
     /// `contains_value` admits. `UnsignedLongLongLong._defl` is
-    /// `LowLevelValue::Unsigned(0)` (no 128-bit `LowLevelValue` arm),
-    /// which must become `UInt128(0)` (`r_ulonglonglong(0)`), not
-    /// `UInt(0)`.
+    /// `LowLevelValue::UnsignedLongLongLong(0)` (`r_ulonglonglong(0)`),
+    /// which must become `UInt128(0)`, not `UInt(0)`.
     fn defl_as_const(lltype: &LowLevelType) -> Result<ConstValue, TyperError> {
         match (lltype, lltype._defl()) {
-            (LowLevelType::UnsignedLongLongLong, LowLevelValue::Unsigned(_)) => {
+            (LowLevelType::UnsignedLongLongLong, LowLevelValue::UnsignedLongLongLong(_)) => {
                 Ok(ConstValue::UInt128(0))
             }
-            (LowLevelType::SignedLongLongLong, LowLevelValue::Signed(_)) => {
+            (LowLevelType::SignedLongLongLong, LowLevelValue::SignedLongLongLong(_)) => {
                 Ok(ConstValue::Int128(0))
             }
             (_, LowLevelValue::Unsigned(n)) => Ok(ConstValue::UInt(n)),
@@ -265,6 +264,11 @@ impl Repr for IntegerRepr {
                 LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
                     ConstValue::UInt(*n as u64)
                 }
+                // `IntegerRepr.convert_const` → `cast_primitive` →
+                // `Number._cast`: `r_longlonglong(value)` /
+                // `r_ulonglonglong(value)`.
+                LowLevelType::SignedLongLongLong => ConstValue::Int128(*n as i128),
+                LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(*n as i128 as u128),
                 _ => value.clone(),
             },
             ConstValue::UInt(n) => match self.lltype {
@@ -276,16 +280,56 @@ impl Repr for IntegerRepr {
                 LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(*n as u128),
                 _ => value.clone(),
             },
-            // RPython's `typeOf(value)` sees `r_longlonglong` /
-            // `r_ulonglonglong` as `lltype.Number` too.  Keep their
-            // dedicated carriers intact so `i128::MIN` / `u128::MAX`
-            // survive `convert_const` without first narrowing through
-            // pyre's legacy i64 integer carrier.
-            ConstValue::Int128(_) | ConstValue::UInt128(_) => value.clone(),
+            // `IntegerRepr.convert_const` → `cast_primitive` →
+            // `Number._cast` (`intmask` / `r_uint` / `longlonglongmask` /
+            // `r_ulonglonglong`).
+            ConstValue::Int128(_) | ConstValue::UInt128(_) => {
+                let (low128, fits_i128) = match value {
+                    ConstValue::Int128(n) => (*n as u128, true),
+                    ConstValue::UInt128(u) => (*u, *u <= i128::MAX as u128),
+                    _ => unreachable!(),
+                };
+                match self.lltype {
+                    LowLevelType::Signed
+                    | LowLevelType::Unsigned
+                    | LowLevelType::SignedLongLong
+                    | LowLevelType::UnsignedLongLong => {
+                        // `intmask` / `r_uint` mask to the target word,
+                        // `longlongmask` / `r_ulonglong` to 64 bits.
+                        let bits = match self.lltype {
+                            LowLevelType::Signed | LowLevelType::Unsigned => {
+                                crate::layout::target_word_size() as u32 * 8
+                            }
+                            _ => 64,
+                        };
+                        let shift = 128 - bits;
+                        if matches!(
+                            self.lltype,
+                            LowLevelType::Signed | LowLevelType::SignedLongLong
+                        ) {
+                            ConstValue::Int((((low128 << shift) as i128) >> shift) as i64)
+                        } else {
+                            ConstValue::UInt(((low128 << shift) >> shift) as u64)
+                        }
+                    }
+                    LowLevelType::SignedLongLongLong if fits_i128 => {
+                        ConstValue::Int128(low128 as i128)
+                    }
+                    LowLevelType::SignedLongLongLong => {
+                        return Err(TyperError::message(format!(
+                            "OverflowError: {low128} does not fit in signed 128-bit integer"
+                        )));
+                    }
+                    LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(low128),
+                    _ => value.clone(),
+                }
+            }
             ConstValue::Bool(flag) => match self.lltype {
                 LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => {
                     ConstValue::UInt(u64::from(*flag))
                 }
+                LowLevelType::SignedLongLongLong => ConstValue::Int128(i128::from(*flag)),
+                LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(u128::from(*flag)),
                 _ => ConstValue::Int(i64::from(*flag)),
             },
             _ => return Err(TyperError::message(format!("not an integer: {value:?}"))),
@@ -504,12 +548,14 @@ impl Repr for IntegerRepr {
 
 /// RPython `ll_hash_int(n) = intmask(n)` (`rint.py`).
 ///
-/// Synthesizes a single-block helper graph that maps the per-width
-/// integer input to a `Signed` result. For `Signed`/`Bool` the body is
-/// identity (the value already fits in `Signed` and the lltype-level
-/// representation lines up); for wider widths a single `cast_*_to_int`
-/// op is emitted. The resulting graph is suitable as a `direct_call`
-/// target from [`super::rtuple::gen_hash_function`].
+/// `rbuiltin.py` `rtype_intmask` does `hop.inputargs(lltype.Signed)`,
+/// which converts the argument with `IntegerRepr.convert_from_to`
+/// (`pairtype(IntegerRepr, IntegerRepr)` in `rint.py`): Bool →
+/// `cast_bool_to_int` (`rbool.py`); Unsigned → `cast_uint_to_int`;
+/// SignedLongLong → `truncate_longlong_to_int`; every other pair →
+/// `cast_primitive` with a Signed result Variable. Synthesizes a
+/// single-block helper graph that emits that same op. Suitable as a
+/// `direct_call` target from [`super::rtuple::gen_hash_function`].
 ///
 /// Reused from [`super::rbool::BoolRepr::get_ll_hash_function`] —
 /// upstream `BoolRepr(IntegerRepr)` inherits `get_ll_hash_function`
@@ -532,23 +578,21 @@ pub(crate) fn build_ll_hash_int_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // upstream `intmask(n)`: identity for `Signed` (already 64-bit on
-    // host). For other primitive widths emit the matching cast-to-int
-    // op so the helper's `Signed` return type matches the link arg.
-    // Bool MUST cast (`cast_bool_to_int`) — without it the return link
-    // would carry a `Bool`-typed Variable into a `Signed`-typed return
-    // slot, a type mismatch that breaks downstream callers
-    // (`gen_hash_function` mixes the result with `int_mul`/`int_xor`).
+    // `rtype_intmask` / `IntegerRepr.convert_from_to`: identity for
+    // `Signed` (already the target). Bool MUST emit `cast_bool_to_int`
+    // — without it the return link would carry a `Bool`-typed Variable
+    // into a `Signed`-typed return slot (`gen_hash_function` mixes the
+    // result with `int_mul`/`int_xor`).
     let return_value = if lltype == &LowLevelType::Signed {
         Hlvalue::Variable(arg)
     } else {
         let cast_op = match lltype {
             LowLevelType::Bool => "cast_bool_to_int",
             LowLevelType::Unsigned => "cast_uint_to_int",
-            LowLevelType::SignedLongLong => "cast_longlong_to_int",
-            LowLevelType::SignedLongLongLong => "cast_lllong_to_int",
-            LowLevelType::UnsignedLongLong => "cast_ulonglong_to_int",
-            LowLevelType::UnsignedLongLongLong => "cast_ulllong_to_int",
+            LowLevelType::SignedLongLong => "truncate_longlong_to_int",
+            LowLevelType::UnsignedLongLong
+            | LowLevelType::SignedLongLongLong
+            | LowLevelType::UnsignedLongLongLong => "cast_primitive",
             other => {
                 return Err(TyperError::message(format!(
                     "ll_hash_int: no cast-to-Signed op for {other:?}"
@@ -1474,6 +1518,14 @@ mod tests {
         // `cast_primitive` of `r_uint` onto SignedLongLongLong is a
         // positive `r_longlonglong` (`IntegerRepr.convert_const`).
         let converted = signedlonglonglong_repr()
+            .convert_const(&ConstValue::Int(5))
+            .expect("Int converts to SignedLongLongLong");
+        assert_eq!(converted.value, ConstValue::Int128(5));
+        let converted = unsignedlonglonglong_repr()
+            .convert_const(&ConstValue::Int(5))
+            .expect("Int converts to UnsignedLongLongLong");
+        assert_eq!(converted.value, ConstValue::UInt128(5));
+        let converted = signedlonglonglong_repr()
             .convert_const(&ConstValue::UInt(7))
             .expect("UInt converts to SignedLongLongLong");
         assert_eq!(converted.value, ConstValue::Int128(7));
@@ -1481,6 +1533,38 @@ mod tests {
             .convert_const(&ConstValue::UInt(1u64 << 63))
             .expect("UInt(1<<63) converts to positive Int128");
         assert_eq!(converted.value, ConstValue::Int128(1i128 << 63));
+    }
+
+    #[test]
+    fn integer_repr_convert_const_casts_128bit_via_number_cast() {
+        // `IntegerRepr.convert_const` → `cast_primitive` → `Number._cast`.
+        let converted = signed_repr()
+            .convert_const(&ConstValue::Int128((1i128 << 64) + 5))
+            .expect("intmask of Int128((1<<64)+5)");
+        assert_eq!(converted.value, ConstValue::Int(5));
+        let converted = signed_repr()
+            .convert_const(&ConstValue::Int128(-1))
+            .expect("intmask of Int128(-1)");
+        assert_eq!(converted.value, ConstValue::Int(-1));
+
+        let converted = unsigned_repr()
+            .convert_const(&ConstValue::UInt128(u128::MAX))
+            .expect("r_uint of UInt128(u128::MAX)");
+        assert_eq!(converted.value, ConstValue::UInt(u64::MAX));
+
+        let converted = unsignedlonglonglong_repr()
+            .convert_const(&ConstValue::Int128(-1))
+            .expect("r_ulonglonglong of Int128(-1)");
+        assert_eq!(converted.value, ConstValue::UInt128(u128::MAX));
+
+        let err = signedlonglonglong_repr()
+            .convert_const(&ConstValue::UInt128(u128::MAX))
+            .expect_err("longlonglongmask of UInt128(u128::MAX)");
+        assert!(err.to_string().contains("OverflowError"));
+        let converted = signedlonglonglong_repr()
+            .convert_const(&ConstValue::UInt128(5))
+            .expect("longlonglongmask of UInt128(5)");
+        assert_eq!(converted.value, ConstValue::Int128(5));
     }
 
     #[test]
@@ -1670,6 +1754,30 @@ mod tests {
         let startblock = inner.startblock.borrow();
         assert_eq!(startblock.operations.len(), 1);
         assert_eq!(startblock.operations[0].opname, "cast_uint_to_int");
+    }
+
+    /// `rtype_intmask` / `IntegerRepr.convert_from_to`: widths without a
+    /// dedicated cast-to-Signed op emit `cast_primitive`.
+    #[test]
+    fn integer_repr_get_ll_hash_function_wide_emits_convert_from_to_ops() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        for (r, expected) in [
+            (signedlonglong_repr(), "truncate_longlong_to_int"),
+            (unsignedlonglong_repr(), "cast_primitive"),
+            (signedlonglonglong_repr(), "cast_primitive"),
+            (unsignedlonglonglong_repr(), "cast_primitive"),
+        ] {
+            let llfn = r
+                .get_ll_hash_function(&rtyper)
+                .expect("get_ll_hash_function")
+                .expect("returns Some helper");
+            let graph = llfn.graph.as_ref().expect("helper carries a graph");
+            let inner = graph.graph.borrow();
+            let startblock = inner.startblock.borrow();
+            assert_eq!(startblock.operations.len(), 1, "{}", llfn.name);
+            assert_eq!(startblock.operations[0].opname, expected, "{}", llfn.name);
+        }
     }
 
     /// `lowlevel_helper_function_with_builder` caches by

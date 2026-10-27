@@ -470,13 +470,12 @@ impl LowLevelType {
                 matches!(value, ConstValue::UInt(_))
             }
             LowLevelType::SignedLongLong => matches!(value, ConstValue::Int(_)),
-            LowLevelType::SignedLongLongLong => {
-                matches!(value, ConstValue::Int(_) | ConstValue::Int128(_))
-            }
-            LowLevelType::UnsignedLongLongLong => {
-                // `r_uint` is not `r_ulonglonglong` (`typeOf`).
-                matches!(value, ConstValue::Int(_) | ConstValue::UInt128(_))
-            }
+            // `lltype.py` `_contains_value` → `isCompatibleType(typeOf(value),
+            // self)`. `typeOf(r_longlonglong)` is `SignedLongLongLong`;
+            // `typeOf` of a Python `int` is `Signed`.
+            LowLevelType::SignedLongLongLong => matches!(value, ConstValue::Int128(_)),
+            // `typeOf(r_ulonglonglong)` is `UnsignedLongLongLong`.
+            LowLevelType::UnsignedLongLongLong => matches!(value, ConstValue::UInt128(_)),
             // upstream `Float` / `SingleFloat` / `LongFloat` accept
             // Python `float`.
             LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
@@ -560,6 +559,10 @@ pub enum LowLevelValue {
     Void,
     Signed(i64),
     Unsigned(u64),
+    /// RPython `r_longlonglong`.
+    SignedLongLongLong(i128),
+    /// RPython `r_ulonglonglong`.
+    UnsignedLongLongLong(u128),
     Bool(bool),
     Float(u64),
     SingleFloat(u32),
@@ -4091,9 +4094,9 @@ impl LowLevelType {
             LowLevelType::Signed => LowLevelValue::Signed(0),
             LowLevelType::Unsigned => LowLevelValue::Unsigned(0),
             LowLevelType::SignedLongLong => LowLevelValue::Signed(0),
-            LowLevelType::SignedLongLongLong => LowLevelValue::Signed(0),
+            LowLevelType::SignedLongLongLong => LowLevelValue::SignedLongLongLong(0),
             LowLevelType::UnsignedLongLong => LowLevelValue::Unsigned(0),
-            LowLevelType::UnsignedLongLongLong => LowLevelValue::Unsigned(0),
+            LowLevelType::UnsignedLongLongLong => LowLevelValue::UnsignedLongLongLong(0),
             LowLevelType::Bool => LowLevelValue::Bool(false),
             LowLevelType::Float => LowLevelValue::Float(0.0f64.to_bits()),
             LowLevelType::SingleFloat => LowLevelValue::SingleFloat(0.0f32.to_bits()),
@@ -4166,6 +4169,8 @@ pub fn typeOf_value(value: &LowLevelValue) -> ConcretetypePlaceholder {
         LowLevelValue::Void => LowLevelType::Void,
         LowLevelValue::Signed(_) => LowLevelType::Signed,
         LowLevelValue::Unsigned(_) => LowLevelType::Unsigned,
+        LowLevelValue::SignedLongLongLong(_) => LowLevelType::SignedLongLongLong,
+        LowLevelValue::UnsignedLongLongLong(_) => LowLevelType::UnsignedLongLongLong,
         LowLevelValue::Bool(_) => LowLevelType::Bool,
         LowLevelValue::Float(_) => LowLevelType::Float,
         LowLevelValue::SingleFloat(_) => LowLevelType::SingleFloat,
@@ -7106,6 +7111,9 @@ mod tests {
         assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::UInt(1)));
         assert!(!LowLevelType::SignedLongLongLong.contains_value(&ConstValue::UInt128(u128::MAX)));
         assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::Int128(i128::MIN)));
+        assert!(!LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int(1)));
+        assert!(LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int128(1)));
+        assert!(!LowLevelType::UnsignedLongLongLong.contains_value(&ConstValue::Int(1)));
         assert!(!LowLevelType::Signed.contains_value(&ConstValue::Bool(true)));
 
         // RPython `Float` / `SingleFloat` / `LongFloat` accept Python float.
@@ -7114,6 +7122,15 @@ mod tests {
         assert!(LowLevelType::SingleFloat.contains_value(&ConstValue::Float(0)));
         assert!(LowLevelType::LongFloat.contains_value(&ConstValue::Float(0)));
         assert!(!LowLevelType::Float.contains_value(&ConstValue::Int(0)));
+    }
+
+    #[test]
+    fn signedlonglonglong_contains_value_admits_int128_only() {
+        use crate::flowspace::model::ConstValue;
+
+        // `lltype.py` `_contains_value` / `typeOf`: Python `int` is `Signed`.
+        assert!(!LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int(1)));
+        assert!(LowLevelType::SignedLongLongLong.contains_value(&ConstValue::Int128(1)));
     }
 
     #[test]

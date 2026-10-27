@@ -181,10 +181,11 @@ enum HostObjectKind {
         reusable_prebuilt_instance: OnceLock<HostObject>,
     },
     /// Python module object. `members` is the module dict — the target of
-    /// `getattr` lookup. `Mutex` satisfies the `Sync` requirement of the
-    /// `LazyLock` singleton.
+    /// `getattr` lookup. Insertion order matches a Python `__dict__`
+    /// (`enumerate_exceptions_top_down` walks `exceptions.__dict__.values()`).
+    /// `Mutex` satisfies the `Sync` requirement of the `LazyLock` singleton.
     Module {
-        members: Mutex<HashMap<String, HostObject>>,
+        members: Mutex<IndexMap<String, HostObject>>,
     },
     /// Python builtin callable (function, method). No structure beyond the name.
     BuiltinCallable,
@@ -575,6 +576,15 @@ impl HostObject {
         }
     }
 
+    /// Members of a `HostObjectKind::Module` (`exceptions.__dict__.values()`).
+    /// Empty for every other kind.
+    pub fn module_values(&self) -> Vec<HostObject> {
+        match &self.inner.kind {
+            HostObjectKind::Module { members } => members.lock().values().cloned().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Host-level `obj.__class__` / `type(obj)` view used by
     /// `description.new_or_old_class()`. Only returns `None` for
     /// `Opaque`, whose real runtime type the Rust carrier does not
@@ -652,7 +662,7 @@ impl HostObject {
                 module_name: None,
                 qualname,
                 kind: HostObjectKind::Module {
-                    members: Mutex::new(HashMap::new()),
+                    members: Mutex::new(IndexMap::new()),
                 },
             }),
         }
@@ -1622,46 +1632,87 @@ impl HostEnv {
         // annotator.exception.standard_exceptions entry). The Rust port
         // registers the same class object under both lookup keys to reproduce
         // that shared upstream identity.
-        let base = HostObject::new_class("BaseException", vec![]);
-        let exc = HostObject::new_class("Exception", vec![base.clone()]);
-        let runtime = HostObject::new_class("RuntimeError", vec![exc.clone()]);
-        let stackovf = HostObject::new_class("StackOverflow", vec![runtime.clone()]);
-        let not_impl = HostObject::new_class("NotImplementedError", vec![runtime.clone()]);
-
-        let children = [
-            ("AssertionError", &exc),
-            ("ImportError", &exc),
-            ("StopIteration", &exc),
-            ("TypeError", &exc),
-            ("ValueError", &exc),
-            ("ZeroDivisionError", &exc),
-            ("AttributeError", &exc),
-            ("KeyError", &exc),
-            ("IndexError", &exc),
-            ("NameError", &exc),
-            ("LookupError", &exc),
-            ("OverflowError", &exc),
+        //
+        // `enumerate_exceptions_top_down` walks the host `exceptions`
+        // module only (`llinterp.py enumerate_exceptions_top_down`).
+        // StackOverflow is rstackovf's class, so it stays off that module.
+        let exceptions = HostObject::new_module("exceptions");
+        // Parents before children. `parent_name = None` is BaseException.
+        const EXCEPTION_TREE: &[(&str, Option<&str>)] = &[
+            ("BaseException", None),
+            ("SystemExit", Some("BaseException")),
+            ("KeyboardInterrupt", Some("BaseException")),
+            ("GeneratorExit", Some("BaseException")),
+            ("Exception", Some("BaseException")),
+            ("StopIteration", Some("Exception")),
+            ("AssertionError", Some("Exception")),
+            ("AttributeError", Some("Exception")),
+            ("BufferError", Some("Exception")),
+            ("EOFError", Some("Exception")),
+            ("ImportError", Some("Exception")),
+            ("MemoryError", Some("Exception")),
+            ("ReferenceError", Some("Exception")),
+            ("SystemError", Some("Exception")),
+            ("TypeError", Some("Exception")),
+            ("ArithmeticError", Some("Exception")),
+            ("FloatingPointError", Some("ArithmeticError")),
+            ("OverflowError", Some("ArithmeticError")),
+            ("ZeroDivisionError", Some("ArithmeticError")),
+            ("LookupError", Some("Exception")),
+            ("IndexError", Some("LookupError")),
+            ("KeyError", Some("LookupError")),
+            ("NameError", Some("Exception")),
+            ("UnboundLocalError", Some("NameError")),
+            ("OSError", Some("Exception")),
+            ("RuntimeError", Some("Exception")),
+            ("NotImplementedError", Some("RuntimeError")),
+            ("SyntaxError", Some("Exception")),
+            ("IndentationError", Some("SyntaxError")),
+            ("TabError", Some("IndentationError")),
+            ("ValueError", Some("Exception")),
+            ("UnicodeError", Some("ValueError")),
+            ("UnicodeDecodeError", Some("UnicodeError")),
+            ("UnicodeEncodeError", Some("UnicodeError")),
+            ("UnicodeTranslateError", Some("UnicodeError")),
+            ("Warning", Some("Exception")),
+            ("DeprecationWarning", Some("Warning")),
+            ("PendingDeprecationWarning", Some("Warning")),
+            ("RuntimeWarning", Some("Warning")),
+            ("SyntaxWarning", Some("Warning")),
+            ("UserWarning", Some("Warning")),
+            ("FutureWarning", Some("Warning")),
+            ("ImportWarning", Some("Warning")),
+            ("UnicodeWarning", Some("Warning")),
+            ("BytesWarning", Some("Warning")),
         ];
-        for (name, parent) in children {
-            let cls = HostObject::new_class(name, vec![parent.clone()]);
-            self.insert_builtin(name, cls);
+        for &(name, parent_name) in EXCEPTION_TREE {
+            let bases = match parent_name {
+                Some(parent_name) => vec![self.lookup_builtin(parent_name).unwrap_or_else(|| {
+                    panic!("exception parent {parent_name} must be registered first")
+                })],
+                None => Vec::new(),
+            };
+            let cls = HostObject::new_class(name, bases);
+            self.insert_builtin(name, cls.clone());
+            exceptions.module_set(name, cls);
         }
         // Python 3 binds `EnvironmentError = OSError`. Upstream
         // `EnvironmentError.__init__` (`builtin.py` / `rbuiltin.py`)
         // is that class's initializer.
-        let os_error = HostObject::new_class("OSError", vec![exc.clone()]);
-        self.insert_builtin("OSError", os_error.clone());
-        self.insert_builtin("EnvironmentError", os_error);
-        self.insert_builtin("BaseException", base);
-        self.insert_builtin("Exception", exc);
-        self.insert_builtin("RuntimeError", runtime);
+        let os_error = self.lookup_builtin("OSError").expect("OSError");
+        self.insert_builtin("EnvironmentError", os_error.clone());
+        self.insert_builtin("IOError", os_error.clone());
+        exceptions.module_set("EnvironmentError", os_error.clone());
+        exceptions.module_set("IOError", os_error);
+        let runtime = self.lookup_builtin("RuntimeError").expect("RuntimeError");
+        let stackovf = HostObject::new_class("StackOverflow", vec![runtime]);
         // upstream `_StackOverflow = StackOverflow` (rstackovf.py) —
         // Register the same class object under both keys. "StackOverflow" is
         // the original module-level class name, and "_StackOverflow" is the
         // alias used at flow level.
         self.insert_builtin("StackOverflow", stackovf.clone());
         self.insert_builtin("_StackOverflow", stackovf);
-        self.insert_builtin("NotImplementedError", not_impl);
+        self.modules.lock().insert("exceptions".into(), exceptions);
     }
 
     fn bootstrap_builtin_types(&mut self) {
@@ -2758,11 +2809,6 @@ impl HostEnv {
     /// upstream `getattr(__builtin__, name)` — `flowcontext.py:851`.
     pub fn lookup_builtin(&self, name: &str) -> Option<HostObject> {
         self.builtins.get(name).cloned()
-    }
-
-    /// exceptions.__dict__.values() analogue
-    pub fn builtin_values(&self) -> Vec<HostObject> {
-        self.builtins.values().cloned().collect()
     }
 
     pub fn builtin_module(&self) -> HostObject {
@@ -6518,6 +6564,29 @@ mod tests {
         assert!(env.is_class());
         assert!(os_error.is_class());
         assert_eq!(env, os_error);
+    }
+
+    #[test]
+    fn exceptions_module_holds_the_standard_hierarchy() {
+        let exceptions = HOST_ENV
+            .import_module("exceptions")
+            .expect("exceptions module");
+        let lookup = |name: &str| {
+            HOST_ENV
+                .lookup_builtin(name)
+                .unwrap_or_else(|| panic!("missing builtin {name}"))
+        };
+        let lookup_error = lookup("LookupError");
+        assert!(lookup("KeyError").is_subclass_of(&lookup_error));
+        assert!(lookup("IndexError").is_subclass_of(&lookup_error));
+        let arithmetic = lookup("ArithmeticError");
+        assert!(lookup("ZeroDivisionError").is_subclass_of(&arithmetic));
+        assert!(lookup("OverflowError").is_subclass_of(&arithmetic));
+        assert!(lookup("UnicodeDecodeError").is_subclass_of(&lookup("ValueError")));
+        assert!(exceptions.module_get("StackOverflow").is_none());
+        let os_error = lookup("OSError");
+        assert_eq!(lookup("EnvironmentError"), os_error);
+        assert_eq!(lookup("IOError"), os_error);
     }
 
     #[test]

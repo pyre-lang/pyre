@@ -211,20 +211,16 @@ fn lltype_when_pointer(value: &ConstValue) -> Option<LowLevelType> {
 /// distinguishes them (Bool, Float family, Char, UniChar, Address,
 /// Ptr). Signed integers are `ConstValue::Int`; `r_uint` /
 /// `r_ulonglong` are `ConstValue::UInt` (`rarithmetic.build_int`).
+/// A 128-bit type takes only its own carrier (`typeOf`).
 fn const_value_compatible_with_concretetype(value: &ConstValue, t: &LowLevelType) -> bool {
     match (value, t) {
         // Upstream integer families: `int → Signed`, `r_uint →
         // Unsigned`, `r_longlong → SignedLongLong`, `r_ulonglong →
         // UnsignedLongLong`. `SignedLongLong is Signed` on 64-bit
         // (`_numbertypes[r_int] = _numbertypes[int]`); `UnsignedLongLong
-        // is Unsigned` (`r_ulonglong is r_uint`).
-        (
-            ConstValue::Int(_),
-            LowLevelType::Signed
-            | LowLevelType::SignedLongLong
-            | LowLevelType::SignedLongLongLong
-            | LowLevelType::UnsignedLongLongLong,
-        ) => true,
+        // is Unsigned` (`r_ulonglong is r_uint`). A 128-bit type takes
+        // only its own carrier (`typeOf`).
+        (ConstValue::Int(_), LowLevelType::Signed | LowLevelType::SignedLongLong) => true,
         (ConstValue::UInt(_), LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => true,
         // `r_longlonglong → SignedLongLongLong`, `r_ulonglonglong →
         // UnsignedLongLongLong`.
@@ -684,11 +680,6 @@ mod tests {
         assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
         let c = Constant::with_concretetype(ConstValue::UInt(42), LowLevelType::UnsignedLongLong);
         assert_eq!(llvalue_from_constant(&c), Some(ConstValue::UInt(42)));
-        let c = Constant::with_concretetype(ConstValue::Int(42), LowLevelType::SignedLongLongLong);
-        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
-        let c =
-            Constant::with_concretetype(ConstValue::Int(42), LowLevelType::UnsignedLongLongLong);
-        assert_eq!(llvalue_from_constant(&c), Some(ConstValue::Int(42)));
         let c = Constant::with_concretetype(
             ConstValue::Int128(i128::MIN),
             LowLevelType::SignedLongLongLong,
@@ -716,5 +707,22 @@ mod tests {
     fn llvalue_from_constant_panics_on_bool_concretetype_with_int_value() {
         let c = Constant::with_concretetype(ConstValue::Int(7), LowLevelType::Bool);
         let _ = llvalue_from_constant(&c);
+    }
+
+    /// A 128-bit type takes only its own carrier (`typeOf`).
+    #[test]
+    fn const_value_compatible_with_concretetype_128bit_takes_own_carrier() {
+        assert!(!const_value_compatible_with_concretetype(
+            &ConstValue::Int(1),
+            &LowLevelType::SignedLongLongLong,
+        ));
+        assert!(const_value_compatible_with_concretetype(
+            &ConstValue::Int128(1),
+            &LowLevelType::SignedLongLongLong,
+        ));
+        assert!(!const_value_compatible_with_concretetype(
+            &ConstValue::Int(1),
+            &LowLevelType::UnsignedLongLongLong,
+        ));
     }
 }

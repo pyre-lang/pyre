@@ -5679,6 +5679,9 @@ pub fn build_ll_arrayclear_helper_graph(
         LowLevelType::UnsignedLongLongLong => {
             constant_with_lltype(ConstValue::UInt128(0), item_lltype.clone())
         }
+        LowLevelType::SignedLongLongLong => {
+            constant_with_lltype(ConstValue::Int128(0), item_lltype.clone())
+        }
         _ => constant_with_lltype(ConstValue::Int(0), item_lltype.clone()),
     };
 
@@ -7998,6 +8001,227 @@ mod tests {
             panic!("returnblock inputarg must be a Variable");
         };
         assert_eq!(ret.concretetype.borrow().clone(), Some(LowLevelType::Void));
+    }
+
+    #[test]
+    fn helper_builder_converts_ll_grow_by_overflow_llexitcase_to_vtable() {
+        // `RPythonTyper.specialize_block` → `_convert_link` (`rtyper.py`):
+        // `close_ovfcheck_block` OverflowError links go through
+        // `rclass.get_type_repr.convert_const`, so `llexitcase` is the
+        // low-level vtable (`ConstValue::LLPtr`), not the host class.
+        use super::{ConstValue, Hlvalue, STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, STRPTR};
+        let (_ann, rtyper) = setup_rtyper();
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![STRINGBUILDERPTR.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    super::build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        dummy_funcptr_const(),
+                    )
+                },
+            )
+            .expect("ll_grow_by helper");
+        let pygraph = helper.graph.expect("helper graph");
+        let inner = pygraph.graph.borrow();
+        let mut converted = 0usize;
+        for block in inner.iterblocks() {
+            if !block.borrow().canraise() {
+                continue;
+            }
+            let exits = block.borrow().exits.clone();
+            assert_eq!(exits.len(), 2, "ovfcheck has normal + OverflowError exits");
+            match &exits[1].borrow().llexitcase {
+                Some(Hlvalue::Constant(c)) => {
+                    assert!(
+                        matches!(c.value, ConstValue::LLPtr(_)),
+                        "OverflowError llexitcase must be LLPtr vtable, got {:?}",
+                        c.value
+                    );
+                    converted += 1;
+                }
+                other => panic!("expected Constant llexitcase, got {other:?}"),
+            }
+            match &exits[1].borrow().exitcase {
+                Some(Hlvalue::Constant(c)) => {
+                    assert!(
+                        matches!(c.value, ConstValue::HostObject(_)),
+                        "exitcase stays the host OverflowError class, got {:?}",
+                        c.value
+                    );
+                }
+                other => panic!("expected host-class exitcase, got {other:?}"),
+            }
+        }
+        assert!(
+            converted >= 1,
+            "ll_grow_by must convert at least one OverflowError llexitcase"
+        );
+    }
+
+    #[test]
+    fn ll_grow_by_overflow_raises_memoryerror_as_llexception() {
+        // Overflowing `ll_grow_by` takes the OverflowError handler
+        // (`except OverflowError: raise MemoryError`) instead of
+        // reporting mixed vtable/host-class representations.
+        use std::any::Any;
+        use std::rc::Rc;
+
+        use super::{STRINGBUILDER, STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, STRPTR};
+        use crate::translator::rtyper::llinterp::{FrameError, LLInterpreter, LLValue};
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+        use crate::translator::rtyper::rtyper::functionptr_const;
+
+        let (ann, rtyper) = setup_rtyper();
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![STRINGBUILDERPTR.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    super::build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        dummy_funcptr_const(),
+                    )
+                },
+            )
+            .expect("ll_grow_by helper");
+        let _c_func = functionptr_const(&rtyper, &helper).expect("functionptr const");
+        let pygraph = helper.graph.expect("helper graph");
+        let mut builder = malloc(STRINGBUILDER.clone(), None, MallocFlavor::Gc, true)
+            .expect("malloc STRINGBUILDER");
+        builder
+            .setattr("total_size", LowLevelValue::Signed(1))
+            .expect("total_size");
+        let interp = Rc::new(LLInterpreter::new(rtyper.clone(), false, None));
+        let err = interp
+            .eval_graph(
+                pygraph.graph.clone() as Rc<dyn Any>,
+                vec![
+                    Rc::new(LowLevelValue::Ptr(Box::new(builder))) as Rc<dyn Any>,
+                    Rc::new(i64::MAX) as Rc<dyn Any>,
+                ],
+                false,
+            )
+            .expect_err("overflowing ll_grow_by raises");
+        match err {
+            FrameError::LLException { etype, evalue } => {
+                let LLValue::Ptr(etype_ptr) = etype else {
+                    panic!("etype must be the low-level vtable Ptr, got {etype:?}");
+                };
+                assert!(
+                    matches!(evalue, LLValue::Ptr(_)),
+                    "evalue must be the low-level instance Ptr, got {evalue:?}"
+                );
+                let ed = rtyper.exceptiondata().expect("exceptiondata");
+                let memerr = crate::annotator::exception::standard_exception_classes()
+                    .into_iter()
+                    .find(|cls| cls.qualname() == "MemoryError")
+                    .expect("MemoryError");
+                let expected = crate::translator::rtyper::rmodel::inputconst(
+                    ed.r_exception_type.as_ref(),
+                    &super::ConstValue::HostObject(memerr),
+                )
+                .expect("MemoryError vtable");
+                let super::ConstValue::LLPtr(expected_ptr) = expected.value else {
+                    panic!(
+                        "expected MemoryError vtable LLPtr, got {:?}",
+                        expected.value
+                    );
+                };
+                assert_eq!(
+                    *etype_ptr, *expected_ptr,
+                    "raised etype must be the MemoryError vtable"
+                );
+            }
+            FrameError::Task(e) => panic!(
+                "OverflowError handler must be taken, not a task error: {}",
+                e.message
+            ),
+        }
+        let _keep = ann;
+    }
+
+    #[test]
+    fn ll_grow_by_exceptblock_link_carries_llptr_memoryerror_constants() {
+        // `insert_link_conversions` → `inputconst(r_a2, a1.value)` for
+        // exceptblock inputargs (`exceptiondata.r_exception_type` /
+        // `r_exception_value`). After helper registration the MemoryError
+        // raise link carries `ConstValue::LLPtr` in args[0] and args[1].
+        use super::{ConstValue, Hlvalue, STRINGBUILDERPTR, STRINGPIECE, STRINGPIECEPTR, STRPTR};
+        let (_ann, rtyper) = setup_rtyper();
+        let helper = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_grow_by".to_string(),
+                vec![STRINGBUILDERPTR.clone(), LowLevelType::Signed],
+                LowLevelType::Void,
+                move |_r, _a, _res| {
+                    super::build_ll_grow_by_helper_graph(
+                        "ll_grow_by",
+                        STRINGBUILDERPTR.clone(),
+                        STRINGPIECEPTR.clone(),
+                        STRINGPIECE.clone(),
+                        STRPTR.clone(),
+                        dummy_funcptr_const(),
+                    )
+                },
+            )
+            .expect("ll_grow_by helper");
+        let pygraph = helper.graph.expect("helper graph");
+        let inner = pygraph.graph.borrow();
+        let exceptblock = inner.exceptblock.clone();
+        let mut converted = 0usize;
+        for block in inner.iterblocks() {
+            let exits = block.borrow().exits.clone();
+            for link in exits {
+                let targets_except = match link.borrow().target.as_ref() {
+                    Some(t) => std::rc::Rc::ptr_eq(t, &exceptblock),
+                    None => false,
+                };
+                if !targets_except {
+                    continue;
+                }
+                let args = &link.borrow().args;
+                assert!(args.len() >= 2, "exceptblock link carries etype and evalue");
+                match args[0].as_ref() {
+                    Some(Hlvalue::Constant(c)) => {
+                        assert!(
+                            matches!(c.value, ConstValue::LLPtr(_)),
+                            "exceptblock args[0] must be LLPtr vtable, got {:?}",
+                            c.value
+                        );
+                    }
+                    other => panic!("expected Constant args[0], got {other:?}"),
+                }
+                match args[1].as_ref() {
+                    Some(Hlvalue::Constant(c)) => {
+                        assert!(
+                            matches!(c.value, ConstValue::LLPtr(_)),
+                            "exceptblock args[1] must be LLPtr instance, got {:?}",
+                            c.value
+                        );
+                    }
+                    other => panic!("expected Constant args[1], got {other:?}"),
+                }
+                converted += 1;
+            }
+        }
+        assert!(
+            converted >= 1,
+            "ll_grow_by must convert at least one exceptblock MemoryError link"
+        );
     }
 
     #[test]

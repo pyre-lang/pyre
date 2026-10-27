@@ -1,21 +1,20 @@
 //! Port of `rpython/rtyper/lltypesystem/opimpl.py`.
 //!
 //! Upstream defines per-`LLOp` fold callables that
-//! `translator/backendopt/constfold.py:34-46` invokes via
+//! `translator/backendopt/constfold.py` invokes via
 //! `op = getattr(llop, spaceop.opname); op(RESTYPE, *args)`. Each
 //! callable raises on type mismatch; the constfold catch-all converts
-//! that into "do not fold". The Rust port mirrors the same shape: each
-//! `op_<name>` takes `&[ConstValue]` and returns `Option<ConstValue>`,
-//! where `None` is the convergent analogue of upstream's exception
-//! path (TypeError / OverflowError / AssertionError → no fold).
+//! that into "do not fold". Most `op_<name>` functions take
+//! `&[ConstValue]` and return `Option<ConstValue>`, where `None` is
+//! the convergent analogue of that exception path. The `lllong_*` /
+//! `ulllong_*` family returns [`Result<ConstValue, OpimplError>`] so
+//! `LLFrame.getoperationhandler` (`llinterp.py`) can surface the same
+//! exception text; [`get_op_impl`] maps `Err` to `None`.
 //!
 //! Coverage: every op with a primitive carrier in [`ConstValue`] is
-//! ported (Int / Bool / Float / ByteStr / UniStr / LLPtr).
-//! Ops requiring lltype-runtime carriers (`r_longlonglong`,
-//! `r_ulonglonglong`, `lltype._parentable`) intentionally have no fold
-//! here — once the backing carrier lands in `lltype.rs`, the
-//! corresponding `op_<name>` function lifts in line-by-line from
-//! upstream.
+//! ported (Int / UInt / Int128 / UInt128 / Bool / Float / ByteStr /
+//! UniStr / LLPtr). Ops requiring remaining lltype-runtime carriers
+//! (`lltype._parentable`) have no fold here until that carrier lands.
 //!
 //! Symbolic-carrier branches (PARITY by structural unreachability):
 //! upstream `op_int_add` `opimpl.py`, `op_int_sub` `:215-220`,
@@ -50,8 +49,18 @@ use crate::translator::rtyper::lltypesystem::llmemory::{cast_adr_to_ptr, cast_in
 use crate::translator::rtyper::lltypesystem::lltype::{_address, LowLevelType};
 
 /// Fold callable signature. `None` mirrors upstream's "exception →
-/// no fold" path (`constfold.py:34-46`).
+/// no fold" path (`constfold.py`).
 pub type FoldFn = fn(&[ConstValue]) -> Option<ConstValue>;
+
+/// Exception text from an `op_*` body. Upstream `opimpl.py` raises
+/// TypeError / AssertionError / OverflowError / ZeroDivisionError /
+/// ValueError; `constfold.py` treats that as "do not fold", and
+/// `LLFrame.getoperationhandler` (`llinterp.py`) reports the same
+/// message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpimplError {
+    pub message: String,
+}
 
 /// RPython `ops_returning_a_bool`.
 pub const ops_returning_a_bool: &[&str] = &["gt", "ge", "lt", "le", "eq", "ne", "bool", "is_true"];
@@ -825,6 +834,690 @@ pub fn op_ullong_ge(args: &[ConstValue]) -> Option<ConstValue> {
     op_uint_ge(args)
 }
 
+// lllong_* / ulllong_* — r_longlonglong / r_ulonglonglong
+//
+// Upstream `get_primitive_op_src` generates most of these as
+// `op_function` with `argtype = r_longlonglong` / `r_ulonglonglong`;
+// the six explicit bodies are `op_lllong_floordiv`, `op_lllong_mod`,
+// `op_lllong_lshift`, `op_lllong_rshift`, `op_ulllong_lshift`,
+// `op_ulllong_rshift`. `LL_OPERATIONS[name].fold` points at the same
+// function `LLFrame.getoperationhandler` (`llinterp.py`) and
+// `constfold.py` both call.
+
+/// Host Python `type(x).__name__` of the value this carrier stands for.
+/// `opimpl.py` `get_primitive_op_src` `op_function` formats it with `%r`.
+fn constvalue_python_type_name(v: &ConstValue) -> &'static str {
+    match v {
+        ConstValue::Int(_) | ConstValue::UInt(_) => "int",
+        ConstValue::Bool(_) => "bool",
+        ConstValue::Int128(_) => "r_longlonglong",
+        ConstValue::UInt128(_) => "r_ulonglonglong",
+        ConstValue::Float(_) => "float",
+        ConstValue::ByteStr(_) => "str",
+        ConstValue::UniStr(_) => "unicode",
+        ConstValue::None => "NoneType",
+        ConstValue::LLPtr(_) => "_ptr",
+        ConstValue::LLAddress(_) => "fakeaddress",
+        _ => "object",
+    }
+}
+
+/// `opimpl.py` `get_primitive_op_src` `op_function` TypeError.
+fn primitive_arg_type_error(
+    opname: &str,
+    argn: Option<usize>,
+    typname: &str,
+    got: &ConstValue,
+) -> OpimplError {
+    let pytype = constvalue_python_type_name(got);
+    OpimplError {
+        message: match argn {
+            None => {
+                format!("TypeError: '{opname}' arg must be {typname}, got '{pytype}' instead")
+            }
+            Some(n) => {
+                format!("TypeError: '{opname}' arg {n} must be {typname}, got '{pytype}' instead")
+            }
+        },
+    }
+}
+
+fn expect_lllong(opname: &str, argn: Option<usize>, v: &ConstValue) -> Result<i128, OpimplError> {
+    match v {
+        ConstValue::Int128(n) => Ok(*n),
+        other => Err(primitive_arg_type_error(opname, argn, "lllong", other)),
+    }
+}
+
+fn expect_ulllong(opname: &str, argn: Option<usize>, v: &ConstValue) -> Result<u128, OpimplError> {
+    match v {
+        ConstValue::UInt128(u) => Ok(*u),
+        other => Err(primitive_arg_type_error(opname, argn, "ulllong", other)),
+    }
+}
+
+/// `opimpl.py` explicit `op_*` functions fail with `assert`.
+fn opimpl_assert_failed(opname: &str, assertion: &str) -> OpimplError {
+    OpimplError {
+        message: format!("AssertionError: op_{opname}: assert {assertion}"),
+    }
+}
+
+fn assert_lllong(opname: &str, varname: &str, v: &ConstValue) -> Result<i128, OpimplError> {
+    match v {
+        ConstValue::Int128(n) => Ok(*n),
+        _ => Err(opimpl_assert_failed(
+            opname,
+            &format!("isinstance({varname}, r_longlonglong_arg)"),
+        )),
+    }
+}
+
+fn assert_ulllong(opname: &str, varname: &str, v: &ConstValue) -> Result<u128, OpimplError> {
+    match v {
+        ConstValue::UInt128(u) => Ok(*u),
+        _ => Err(opimpl_assert_failed(
+            opname,
+            &format!("isinstance({varname}, r_ulonglonglong)"),
+        )),
+    }
+}
+
+/// `rarithmetic.is_valid_int`: a word-sized int, a bool, or a 128-bit
+/// value that fits in `i64`. Used by `op_lllong_lshift`,
+/// `op_lllong_rshift`, `op_ulllong_rshift`.
+fn assert_valid_int(opname: &str, varname: &str, v: &ConstValue) -> Result<i64, OpimplError> {
+    let assertion = format!("is_valid_int({varname})");
+    match v {
+        ConstValue::Int(n) => Ok(*n),
+        ConstValue::Bool(b) => Ok(i64::from(*b)),
+        ConstValue::Int128(n) => {
+            i64::try_from(*n).map_err(|_| opimpl_assert_failed(opname, &assertion))
+        }
+        ConstValue::UInt128(n) => {
+            i64::try_from(*n).map_err(|_| opimpl_assert_failed(opname, &assertion))
+        }
+        _ => Err(opimpl_assert_failed(opname, &assertion)),
+    }
+}
+
+/// `op_ulllong_lshift`: `isinstance(y, int)` (a bool is an int; an
+/// `r_longlonglong` / `r_ulonglonglong` is a `long`).
+fn assert_int(opname: &str, varname: &str, v: &ConstValue) -> Result<i64, OpimplError> {
+    match v {
+        ConstValue::Int(n) => Ok(*n),
+        ConstValue::Bool(b) => Ok(i64::from(*b)),
+        _ => Err(opimpl_assert_failed(
+            opname,
+            &format!("isinstance({varname}, int)"),
+        )),
+    }
+}
+
+/// `rarithmetic.py` `signed_int.__new__` OverflowError.
+fn lllong_overflow(desc: impl std::fmt::Display) -> OpimplError {
+    OpimplError {
+        message: format!("OverflowError: {desc} does not fit in signed 128-bit integer"),
+    }
+}
+
+/// Decimal string of a sign-magnitude integer. `magnitude` is
+/// little-endian `u64` limbs of `|value|`; a leading `-` is emitted
+/// only when `negative` and the value is non-zero.
+pub(crate) fn exact_int_decimal(negative: bool, magnitude: &[u64]) -> String {
+    const TEN19: u128 = 10_000_000_000_000_000_000;
+    let mut limbs: Vec<u64> = magnitude.to_vec();
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    if limbs.is_empty() {
+        return "0".to_string();
+    }
+    let mut chunks = Vec::new();
+    while !limbs.is_empty() {
+        let mut rem: u128 = 0;
+        for limb in limbs.iter_mut().rev() {
+            let cur = (rem << 64) | u128::from(*limb);
+            *limb = (cur / TEN19) as u64;
+            rem = cur % TEN19;
+        }
+        while limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        chunks.push(rem as u64);
+    }
+    let mut s = String::new();
+    if negative {
+        s.push('-');
+    }
+    let last = chunks.len() - 1;
+    s.push_str(&chunks[last].to_string());
+    for c in chunks[..last].iter().rev() {
+        s.push_str(&format!("{c:019}"));
+    }
+    s
+}
+
+fn trim_limbs(mut mag: Vec<u64>) -> Vec<u64> {
+    while mag.last() == Some(&0) {
+        mag.pop();
+    }
+    if mag.is_empty() {
+        mag.push(0);
+    }
+    mag
+}
+
+fn add_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let n = a.len().max(b.len());
+    let mut out = Vec::with_capacity(n + 1);
+    let mut carry = 0u128;
+    for i in 0..n {
+        carry += u128::from(*a.get(i).unwrap_or(&0)) + u128::from(*b.get(i).unwrap_or(&0));
+        out.push(carry as u64);
+        carry >>= 64;
+    }
+    if carry != 0 {
+        out.push(carry as u64);
+    }
+    trim_limbs(out)
+}
+
+fn cmp_mag(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    let n = a.len().max(b.len());
+    for i in (0..n).rev() {
+        let av = *a.get(i).unwrap_or(&0);
+        let bv = *b.get(i).unwrap_or(&0);
+        if av != bv {
+            return av.cmp(&bv);
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn sub_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let n = a.len().max(b.len());
+    let mut out = vec![0u64; n];
+    let mut borrow = 0u64;
+    for i in 0..n {
+        let av = *a.get(i).unwrap_or(&0);
+        let bv = *b.get(i).unwrap_or(&0);
+        let (d1, b1) = av.overflowing_sub(bv);
+        let (d2, b2) = d1.overflowing_sub(borrow);
+        out[i] = d2;
+        borrow = u64::from(b1 || b2);
+    }
+    trim_limbs(out)
+}
+
+fn add_signed_mag(neg_a: bool, a: &[u64], neg_b: bool, b: &[u64]) -> (bool, Vec<u64>) {
+    if neg_a == neg_b {
+        (neg_a, add_mag(a, b))
+    } else {
+        match cmp_mag(a, b) {
+            std::cmp::Ordering::Greater => (neg_a, sub_mag(a, b)),
+            std::cmp::Ordering::Less => (neg_b, sub_mag(b, a)),
+            std::cmp::Ordering::Equal => (false, vec![0]),
+        }
+    }
+}
+
+fn mul_mag(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.iter().all(|&l| l == 0) || b.iter().all(|&l| l == 0) {
+        return vec![0];
+    }
+    let mut out = vec![0u64; a.len() + b.len() + 1];
+    for (i, &ai) in a.iter().enumerate() {
+        let mut carry = 0u128;
+        for (j, &bj) in b.iter().enumerate() {
+            let t = u128::from(ai) * u128::from(bj) + u128::from(out[i + j]) + carry;
+            out[i + j] = t as u64;
+            carry = t >> 64;
+        }
+        let mut k = i + b.len();
+        while carry != 0 {
+            let t = u128::from(out[k]) + carry;
+            out[k] = t as u64;
+            carry = t >> 64;
+            k += 1;
+        }
+    }
+    trim_limbs(out)
+}
+
+fn lshift_mag(mag: &[u64], y: i64) -> Vec<u64> {
+    if mag.iter().all(|&l| l == 0) {
+        return vec![0];
+    }
+    let y = y as u64;
+    let limb_shift = (y / 64) as usize;
+    let bit_shift = (y % 64) as u32;
+    let mut out = vec![0u64; mag.len() + limb_shift + 1];
+    if bit_shift == 0 {
+        for (i, &m) in mag.iter().enumerate() {
+            out[i + limb_shift] = m;
+        }
+    } else {
+        let mut carry = 0u64;
+        for (i, &m) in mag.iter().enumerate() {
+            out[i + limb_shift] = (m << bit_shift) | carry;
+            carry = m >> (64 - bit_shift);
+        }
+        out[mag.len() + limb_shift] = carry;
+    }
+    trim_limbs(out)
+}
+
+fn i128_sign_mag(n: i128) -> (bool, [u64; 2]) {
+    let mag = n.unsigned_abs();
+    (n < 0, [mag as u64, (mag >> 64) as u64])
+}
+
+fn exact_i128_add(x: i128, y: i128) -> String {
+    let (nx, ax) = i128_sign_mag(x);
+    let (ny, ay) = i128_sign_mag(y);
+    let (neg, mag) = add_signed_mag(nx, &ax, ny, &ay);
+    exact_int_decimal(neg, &mag)
+}
+
+fn exact_i128_sub(x: i128, y: i128) -> String {
+    let (nx, ax) = i128_sign_mag(x);
+    let (ny, ay) = i128_sign_mag(y);
+    let (neg, mag) = add_signed_mag(nx, &ax, !ny, &ay);
+    exact_int_decimal(neg, &mag)
+}
+
+fn exact_i128_mul(x: i128, y: i128) -> String {
+    let (nx, ax) = i128_sign_mag(x);
+    let (ny, ay) = i128_sign_mag(y);
+    let mag = mul_mag(&ax, &ay);
+    exact_int_decimal(nx != ny, &mag)
+}
+
+fn exact_i128_lshift(x: i128, y: i64) -> String {
+    let (neg, mag) = i128_sign_mag(x);
+    let shifted = lshift_mag(&mag, y);
+    exact_int_decimal(neg, &shifted)
+}
+
+fn lllong_zero_div() -> OpimplError {
+    OpimplError {
+        message: "ZeroDivisionError: integer division or modulo by zero".to_string(),
+    }
+}
+
+/// `opimpl.py` `get_primitive_op_src` binary `op_function` for `lllong_*`.
+fn lllong_binop(
+    opname: &str,
+    args: &[ConstValue],
+    f: impl FnOnce(i128, i128) -> Result<ConstValue, OpimplError>,
+) -> Result<ConstValue, OpimplError> {
+    let x = expect_lllong(opname, Some(1), &args[0])?;
+    let y = expect_lllong(opname, Some(2), &args[1])?;
+    f(x, y)
+}
+
+/// `opimpl.py` `get_primitive_op_src` binary `op_function` for `ulllong_*`.
+fn ulllong_binop(
+    opname: &str,
+    args: &[ConstValue],
+    f: impl FnOnce(u128, u128) -> Result<ConstValue, OpimplError>,
+) -> Result<ConstValue, OpimplError> {
+    let x = expect_ulllong(opname, Some(1), &args[0])?;
+    let y = expect_ulllong(opname, Some(2), &args[1])?;
+    f(x, y)
+}
+
+/// `op_lllong_lshift`: `r_longlonglong_result(x << y)`.
+fn lllong_lshift(x: i128, y: i64) -> Result<i128, OpimplError> {
+    if y < 0 {
+        return Err(OpimplError {
+            message: "ValueError: negative shift count".to_string(),
+        });
+    }
+    if x == 0 {
+        return Ok(0);
+    }
+    if y >= 128 {
+        return Err(lllong_overflow(exact_i128_lshift(x, y)));
+    }
+    let y_u = y as u32;
+    if x > 0 {
+        if x > (i128::MAX >> y_u) {
+            return Err(lllong_overflow(exact_i128_lshift(x, y)));
+        }
+        Ok(x.wrapping_shl(y_u))
+    } else if x < (i128::MIN >> y_u) {
+        Err(lllong_overflow(exact_i128_lshift(x, y)))
+    } else {
+        Ok(x.wrapping_shl(y_u))
+    }
+}
+
+/// `op_lllong_rshift`: `r_longlonglong_result(x >> y)`.
+fn lllong_rshift(x: i128, y: i64) -> Result<i128, OpimplError> {
+    if y < 0 {
+        Err(OpimplError {
+            message: "ValueError: negative shift count".to_string(),
+        })
+    } else if y >= 128 {
+        Ok(if x < 0 { -1 } else { 0 })
+    } else {
+        Ok(x >> y)
+    }
+}
+
+/// `op_ulllong_lshift`: `r_ulonglonglong(x << y)` (mask 128).
+fn ulllong_lshift(x: u128, y: i64) -> Result<u128, OpimplError> {
+    if y < 0 {
+        Err(OpimplError {
+            message: "ValueError: negative shift count".to_string(),
+        })
+    } else if y >= 128 {
+        Ok(0)
+    } else {
+        Ok(x.wrapping_shl(y as u32))
+    }
+}
+
+/// `op_ulllong_rshift`: `r_ulonglonglong(x >> y)`.
+fn ulllong_rshift(x: u128, y: i64) -> Result<u128, OpimplError> {
+    if y < 0 {
+        Err(OpimplError {
+            message: "ValueError: negative shift count".to_string(),
+        })
+    } else if y >= 128 {
+        Ok(0)
+    } else {
+        Ok(x >> y)
+    }
+}
+
+pub fn op_lllong_is_true(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = expect_lllong("lllong_is_true", None, &args[0])?;
+    Ok(ConstValue::Bool(x != 0))
+}
+
+pub fn op_lllong_neg(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = expect_lllong("lllong_neg", None, &args[0])?;
+    x.checked_neg()
+        .map(ConstValue::Int128)
+        .ok_or_else(|| lllong_overflow(1u128 << 127))
+}
+
+pub fn op_lllong_abs(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = expect_lllong("lllong_abs", None, &args[0])?;
+    x.checked_abs()
+        .map(ConstValue::Int128)
+        .ok_or_else(|| lllong_overflow(1u128 << 127))
+}
+
+pub fn op_lllong_invert(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = expect_lllong("lllong_invert", None, &args[0])?;
+    Ok(ConstValue::Int128(!x))
+}
+
+pub fn op_lllong_add(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_add", args, |x, y| {
+        x.checked_add(y)
+            .map(ConstValue::Int128)
+            .ok_or_else(|| lllong_overflow(exact_i128_add(x, y)))
+    })
+}
+
+pub fn op_lllong_sub(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_sub", args, |x, y| {
+        x.checked_sub(y)
+            .map(ConstValue::Int128)
+            .ok_or_else(|| lllong_overflow(exact_i128_sub(x, y)))
+    })
+}
+
+pub fn op_lllong_mul(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_mul", args, |x, y| {
+        x.checked_mul(y)
+            .map(ConstValue::Int128)
+            .ok_or_else(|| lllong_overflow(exact_i128_mul(x, y)))
+    })
+}
+
+/// `op_lllong_floordiv`: Python floor then C truncation.
+pub fn op_lllong_floordiv(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = assert_lllong("lllong_floordiv", "x", &args[0])?;
+    let y = assert_lllong("lllong_floordiv", "y", &args[1])?;
+    if y == 0 {
+        return Err(lllong_zero_div());
+    }
+    x.checked_div(y)
+        .map(ConstValue::Int128)
+        .ok_or_else(|| lllong_overflow(1u128 << 127))
+}
+
+/// `op_lllong_mod`: Python remainder then C truncation.
+pub fn op_lllong_mod(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = assert_lllong("lllong_mod", "x", &args[0])?;
+    let y = assert_lllong("lllong_mod", "y", &args[1])?;
+    if y == 0 {
+        return Err(lllong_zero_div());
+    }
+    if x == i128::MIN && y == -1 {
+        Ok(ConstValue::Int128(0))
+    } else {
+        Ok(ConstValue::Int128(x % y))
+    }
+}
+
+pub fn op_lllong_lt(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_lt", args, |x, y| Ok(ConstValue::Bool(x < y)))
+}
+
+pub fn op_lllong_le(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_le", args, |x, y| Ok(ConstValue::Bool(x <= y)))
+}
+
+pub fn op_lllong_eq(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_eq", args, |x, y| Ok(ConstValue::Bool(x == y)))
+}
+
+pub fn op_lllong_ne(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_ne", args, |x, y| Ok(ConstValue::Bool(x != y)))
+}
+
+pub fn op_lllong_gt(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_gt", args, |x, y| Ok(ConstValue::Bool(x > y)))
+}
+
+pub fn op_lllong_ge(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_ge", args, |x, y| Ok(ConstValue::Bool(x >= y)))
+}
+
+pub fn op_lllong_and(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_and", args, |x, y| Ok(ConstValue::Int128(x & y)))
+}
+
+pub fn op_lllong_or(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_or", args, |x, y| Ok(ConstValue::Int128(x | y)))
+}
+
+pub fn op_lllong_xor(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    lllong_binop("lllong_xor", args, |x, y| Ok(ConstValue::Int128(x ^ y)))
+}
+
+pub fn op_lllong_lshift(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = assert_lllong("lllong_lshift", "x", &args[0])?;
+    let y = assert_valid_int("lllong_lshift", "y", &args[1])?;
+    Ok(ConstValue::Int128(lllong_lshift(x, y)?))
+}
+
+pub fn op_lllong_rshift(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = assert_lllong("lllong_rshift", "x", &args[0])?;
+    let y = assert_valid_int("lllong_rshift", "y", &args[1])?;
+    Ok(ConstValue::Int128(lllong_rshift(x, y)?))
+}
+
+pub fn op_ulllong_is_true(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = expect_ulllong("ulllong_is_true", None, &args[0])?;
+    Ok(ConstValue::Bool(x != 0))
+}
+
+pub fn op_ulllong_invert(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = expect_ulllong("ulllong_invert", None, &args[0])?;
+    Ok(ConstValue::UInt128(!x))
+}
+
+pub fn op_ulllong_add(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_add", args, |x, y| {
+        Ok(ConstValue::UInt128(x.wrapping_add(y)))
+    })
+}
+
+pub fn op_ulllong_sub(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_sub", args, |x, y| {
+        Ok(ConstValue::UInt128(x.wrapping_sub(y)))
+    })
+}
+
+pub fn op_ulllong_mul(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_mul", args, |x, y| {
+        Ok(ConstValue::UInt128(x.wrapping_mul(y)))
+    })
+}
+
+pub fn op_ulllong_floordiv(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_floordiv", args, |x, y| {
+        if y == 0 {
+            return Err(lllong_zero_div());
+        }
+        Ok(ConstValue::UInt128(x / y))
+    })
+}
+
+pub fn op_ulllong_mod(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_mod", args, |x, y| {
+        if y == 0 {
+            return Err(lllong_zero_div());
+        }
+        Ok(ConstValue::UInt128(x % y))
+    })
+}
+
+pub fn op_ulllong_lt(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_lt", args, |x, y| Ok(ConstValue::Bool(x < y)))
+}
+
+pub fn op_ulllong_le(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_le", args, |x, y| Ok(ConstValue::Bool(x <= y)))
+}
+
+pub fn op_ulllong_eq(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_eq", args, |x, y| Ok(ConstValue::Bool(x == y)))
+}
+
+pub fn op_ulllong_ne(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_ne", args, |x, y| Ok(ConstValue::Bool(x != y)))
+}
+
+pub fn op_ulllong_gt(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_gt", args, |x, y| Ok(ConstValue::Bool(x > y)))
+}
+
+pub fn op_ulllong_ge(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_ge", args, |x, y| Ok(ConstValue::Bool(x >= y)))
+}
+
+pub fn op_ulllong_and(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_and", args, |x, y| Ok(ConstValue::UInt128(x & y)))
+}
+
+pub fn op_ulllong_or(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_or", args, |x, y| Ok(ConstValue::UInt128(x | y)))
+}
+
+pub fn op_ulllong_xor(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    ulllong_binop("ulllong_xor", args, |x, y| Ok(ConstValue::UInt128(x ^ y)))
+}
+
+pub fn op_ulllong_lshift(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = assert_ulllong("ulllong_lshift", "x", &args[0])?;
+    let y = assert_int("ulllong_lshift", "y", &args[1])?;
+    Ok(ConstValue::UInt128(ulllong_lshift(x, y)?))
+}
+
+pub fn op_ulllong_rshift(args: &[ConstValue]) -> Result<ConstValue, OpimplError> {
+    let x = assert_ulllong("ulllong_rshift", "x", &args[0])?;
+    let y = assert_valid_int("ulllong_rshift", "y", &args[1])?;
+    Ok(ConstValue::UInt128(ulllong_rshift(x, y)?))
+}
+
+macro_rules! wide_int_op_table {
+    ($($name:literal => $fn:ident),+ $(,)?) => {
+        /// Shared `op_*` lookup for `lllong_*` / `ulllong_*`.
+        /// `LLFrame.getoperationhandler` (`llinterp.py`) and [`get_op_impl`]
+        /// both go through this table, matching upstream
+        /// `LL_OPERATIONS[name].fold` / `getattr(opimpl, 'op_' + opname)`.
+        pub fn lllong_op_impl(
+            opname: &str,
+        ) -> Option<fn(&[ConstValue]) -> Result<ConstValue, OpimplError>> {
+            match opname {
+                $($name => Some($fn),)+
+                _ => None,
+            }
+        }
+
+        fn register_wide_int_folds(m: &mut HashMap<&'static str, FoldFn>) {
+            $(
+                {
+                    fn fold(args: &[ConstValue]) -> Option<ConstValue> {
+                        $fn(args).ok()
+                    }
+                    m.insert($name, fold as FoldFn);
+                }
+            )+
+        }
+    };
+}
+
+wide_int_op_table! {
+    "lllong_is_true" => op_lllong_is_true,
+    "lllong_neg" => op_lllong_neg,
+    "lllong_abs" => op_lllong_abs,
+    "lllong_invert" => op_lllong_invert,
+    "lllong_add" => op_lllong_add,
+    "lllong_sub" => op_lllong_sub,
+    "lllong_mul" => op_lllong_mul,
+    "lllong_floordiv" => op_lllong_floordiv,
+    "lllong_mod" => op_lllong_mod,
+    "lllong_lt" => op_lllong_lt,
+    "lllong_le" => op_lllong_le,
+    "lllong_eq" => op_lllong_eq,
+    "lllong_ne" => op_lllong_ne,
+    "lllong_gt" => op_lllong_gt,
+    "lllong_ge" => op_lllong_ge,
+    "lllong_and" => op_lllong_and,
+    "lllong_or" => op_lllong_or,
+    "lllong_lshift" => op_lllong_lshift,
+    "lllong_rshift" => op_lllong_rshift,
+    "lllong_xor" => op_lllong_xor,
+    "ulllong_is_true" => op_ulllong_is_true,
+    "ulllong_invert" => op_ulllong_invert,
+    "ulllong_add" => op_ulllong_add,
+    "ulllong_sub" => op_ulllong_sub,
+    "ulllong_mul" => op_ulllong_mul,
+    "ulllong_floordiv" => op_ulllong_floordiv,
+    "ulllong_mod" => op_ulllong_mod,
+    "ulllong_lt" => op_ulllong_lt,
+    "ulllong_le" => op_ulllong_le,
+    "ulllong_eq" => op_ulllong_eq,
+    "ulllong_ne" => op_ulllong_ne,
+    "ulllong_gt" => op_ulllong_gt,
+    "ulllong_ge" => op_ulllong_ge,
+    "ulllong_and" => op_ulllong_and,
+    "ulllong_or" => op_ulllong_or,
+    "ulllong_lshift" => op_ulllong_lshift,
+    "ulllong_rshift" => op_ulllong_rshift,
+    "ulllong_xor" => op_ulllong_xor,
+}
+
 // ptr_*
 
 /// RPython `op_ptr_eq` (`opimpl.py`).
@@ -1527,20 +2220,6 @@ pub fn op_unlikely(args: &[ConstValue]) -> Option<ConstValue> {
 //    arms (cast_pointer needs the `LLPtr` carrier walk, cast_primitive
 //    the primitive-reinterpret over RESTYPE).
 //
-// 6. r_longlonglong / r_ulonglonglong 128-bit integer carrier
-//    (6 ops):
-//      op_lllong_floordiv       :314-320
-//      op_lllong_mod            :322-328
-//      op_lllong_lshift         :350-353
-//      op_lllong_rshift         :355-358
-//      op_ulllong_lshift        :370-373
-//      op_ulllong_rshift        :375-378
-//    Convergence: `ConstValue::Int128(i128)` / `UInt128(u128)`
-//    variants. Aliasing the existing llong/ullong handlers is
-//    rejected — `ConstValue::Int(i64)` cannot represent the full
-//    128-bit range, so an alias would silently fold values that
-//    upstream's `r_longlonglong_arg` assertion catches.
-//
 // 7. llgroup combined-symbolic / vtable carrier (7 ops):
 //      op_get_group_member          :662-667
 //      op_get_next_group_member     :669-674
@@ -1676,6 +2355,8 @@ pub fn get_op_impl(opname: &str) -> Option<FoldFn> {
         m.insert("ullong_ne", op_ullong_ne);
         m.insert("ullong_gt", op_ullong_gt);
         m.insert("ullong_ge", op_ullong_ge);
+
+        register_wide_int_folds(&mut m);
 
         m.insert("cast_int_to_uint", op_cast_int_to_uint);
         m.insert("cast_uint_to_int", op_cast_uint_to_int);
@@ -2410,5 +3091,59 @@ mod tests {
             panic!("an odd integer must build a tagged-int fakeaddress");
         };
         assert_eq!(op_cast_adr_to_ptr(&restype, &[intadr]), None);
+    }
+
+    fn i128c(n: i128) -> ConstValue {
+        ConstValue::Int128(n)
+    }
+    fn u128c(n: u128) -> ConstValue {
+        ConstValue::UInt128(n)
+    }
+
+    #[test]
+    fn lllong_ulllong_ops_share_opimpl_bodies() {
+        assert_eq!(op_lllong_add(&[i128c(1), i128c(2)]).unwrap(), i128c(3));
+        assert_eq!(
+            op_lllong_floordiv(&[i128c(-7), i128c(2)]).unwrap(),
+            i128c(-3)
+        );
+        assert_eq!(op_lllong_mod(&[i128c(-7), i128c(2)]).unwrap(), i128c(-1));
+        assert!(
+            op_lllong_add(&[i128c(i128::MAX), i128c(1)])
+                .unwrap_err()
+                .message
+                .contains("OverflowError")
+        );
+        assert_eq!(
+            op_lllong_add(&[i(1), i128c(1)]).unwrap_err().message,
+            "TypeError: 'lllong_add' arg 1 must be lllong, got 'int' instead"
+        );
+        assert_eq!(
+            op_ulllong_invert(&[i128c(1)]).unwrap_err().message,
+            "TypeError: 'ulllong_invert' arg must be ulllong, got 'r_longlonglong' instead"
+        );
+        let err = op_lllong_floordiv(&[i(1), i128c(1)]).unwrap_err();
+        assert!(
+            err.message.starts_with("AssertionError:"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            op_ulllong_add(&[u128c(u128::MAX), u128c(1)]).unwrap(),
+            u128c(0)
+        );
+        assert_eq!(exact_int_decimal(false, &[0]), "0");
+    }
+
+    #[test]
+    fn lllong_ulllong_constfold_via_get_op_impl() {
+        let f_add = get_op_impl("lllong_add").expect("lllong_add must be registered");
+        assert_eq!(f_add(&[i128c(1), i128c(2)]), Some(i128c(3)));
+        let f_div = get_op_impl("lllong_floordiv").expect("lllong_floordiv must be registered");
+        assert_eq!(f_div(&[i(1), i128c(1)]), None);
+        let f_uadd = get_op_impl("ulllong_add").expect("ulllong_add must be registered");
+        assert_eq!(f_uadd(&[u128c(u128::MAX), u128c(1)]), Some(u128c(0)));
+        assert!(lllong_op_impl("lllong_add").is_some());
+        assert!(lllong_op_impl("int_add").is_none());
     }
 }
