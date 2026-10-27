@@ -15332,19 +15332,19 @@ fn raw_list_produced_const(
 /// that spelling stays `usize`. The identity is what lets `arraydescrof`
 /// read the flag and `sizeof(ARRAY.OF)`; without one, an int element is
 /// eight bytes wide.
+/// Same key `array_type_id_of_lltype` gives the raw ARRAY.
 fn rust_vec_item_array_type_id(
     item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> String {
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    let spelling = match item {
-        LowLevelType::Signed => "isize",
-        LowLevelType::Unsigned => "usize",
-        LowLevelType::Float => "f64",
-        // `cast_ptr_to_int` stores the reference as a word. The buffer stays
-        // untraced, so the element is that word and not a GC pointer.
-        _ => "usize",
-    };
-    format!("Vec<{spelling}>")
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+    if matches!(item, LowLevelType::Ptr(p) if p._needsgc()) {
+        return "Vec<usize>".to_string();
+    }
+    crate::codewriter::call::array_type_id_of_lltype(&Array::with_hints(
+        item.clone(),
+        vec![("nolength".into(), ConstValue::Bool(true))],
+    ))
 }
 
 /// Item buffer of a raw `Vec` header.
@@ -33999,6 +33999,27 @@ mod tests {
                 assert_eq!(value, &item);
             }
         }
+    }
+
+    /// `rust_vec_item_array_type_id` is the same key `array_type_id_of_lltype`
+    /// gives the raw `CArray` of that item.
+    #[test]
+    fn rust_vec_item_id_matches_raw_carray() {
+        use crate::codewriter::call::array_type_id_of_lltype;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        assert_eq!(
+            rust_vec_item_array_type_id(&LowLevelType::Signed),
+            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Signed)),
+        );
+        assert_eq!(
+            rust_vec_item_array_type_id(&LowLevelType::Unsigned),
+            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Unsigned)),
+        );
+        assert_eq!(
+            rust_vec_item_array_type_id(&LowLevelType::Float),
+            array_type_id_of_lltype(&rffi::CArray(LowLevelType::Float)),
+        );
     }
 
     /// The item descr of `list.getitem` / `list.setitem` is `arraydescrof`

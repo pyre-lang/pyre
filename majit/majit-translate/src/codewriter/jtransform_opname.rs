@@ -78,9 +78,6 @@ use crate::model::{
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
 use crate::translator::rtyper::lltypesystem::rstr::{STR, UNICODE};
-use majit_jitcode::codewriter::jtransform::{
-    LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
-};
 
 /// Block identity key — flowspace blocks are `Rc<RefCell<Block>>` with no
 /// inherent id, so identity is the allocation address (RPython compares
@@ -1457,18 +1454,9 @@ fn emit_setarrayitem(
     }
 }
 
-/// `cpu.arraydescrof(ARRAY)` identity.  `GcArray(Signed)` / `GcArray(Float)`
-/// share the list-items ARRAY the main Transformer already names
-/// (`LIST_INT_ITEMS_ARRAY` / `LIST_FLOAT_ITEMS_ARRAY`); a GC-pointer OF
-/// is `LIST_OBJ_ITEMS_ARRAY`.
+/// `descr.py get_array_descr` cache key: one spelling per ARRAY lltype.
 fn array_type_id_of(arr: &Array) -> Option<String> {
-    match &arr.OF {
-        LowLevelType::Signed | LowLevelType::Unsigned => Some(LIST_INT_ITEMS_ARRAY.to_string()),
-        LowLevelType::Float => Some(LIST_FLOAT_ITEMS_ARRAY.to_string()),
-        LowLevelType::Ptr(p) if p._needsgc() => Some(LIST_OBJ_ITEMS_ARRAY.to_string()),
-        LowLevelType::Struct(s) => Some(format!("GcArray({})", s._name)),
-        other => Some(format!("GcArray({})", other.short_name())),
-    }
+    Some(crate::codewriter::call::array_type_id_of_lltype(arr))
 }
 
 fn array_nolength(arr: &Array) -> bool {
@@ -3555,7 +3543,7 @@ mod tests {
                     } => {
                         assert_eq!(length, &n);
                         assert_eq!(*item_ty, ValueType::Void);
-                        assert_eq!(array_type_id.as_deref(), Some("GcArray(Void)"));
+                        assert_eq!(array_type_id.as_deref(), Some("GcArray<()>"));
                         assert_eq!(op.result.as_ref(), Some(&a));
                         news.push("new_array");
                     }
@@ -3747,8 +3735,6 @@ mod tests {
     /// `setarrayitem_raw_*`, never the STR/UNICODE `chars` fusion.
     #[test]
     fn lower_graph_lowers_raw_array_getarrayitem_and_setarrayitem() {
-        let raw_array = CArray(LowLevelType::Signed);
-        let expected_id = super::array_type_id_of(&raw_array);
         let array_ptr = CArrayPtr(LowLevelType::Signed);
         let p = variable_with_lltype("p", array_ptr);
         let i = variable_with_lltype("i", LowLevelType::Signed);
@@ -3801,7 +3787,7 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(*item_ty, ValueType::Int);
-                        assert_eq!(array_type_id, &expected_id);
+                        assert_eq!(array_type_id.as_deref(), Some("Vec<isize>"));
                         assert!(*nolength);
                         assert!(!*pure);
                         reads += 1;
@@ -3813,7 +3799,7 @@ mod tests {
                         ..
                     } => {
                         assert_eq!(*item_ty, ValueType::Int);
-                        assert_eq!(array_type_id, &expected_id);
+                        assert_eq!(array_type_id.as_deref(), Some("Vec<isize>"));
                         assert!(*nolength);
                         writes += 1;
                     }

@@ -14283,33 +14283,95 @@ fn effect_value_type_of(var: &crate::flowspace::model::Variable) -> crate::model
         .unwrap_or(crate::model::ValueType::Int)
 }
 
+/// `lltype.build_number` identity: it caches by the Python integer class,
+/// and on a 64-bit host `rarithmetic.r_longlong is r_int` /
+/// `r_ulonglong is r_uint`, so `lltype.SignedLongLong is lltype.Signed`
+/// and `lltype.UnsignedLongLong is lltype.Unsigned`.
+fn array_of_lltype_identity(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if crate::layout::target_word_size() == 8 {
+        match of {
+            LowLevelType::SignedLongLong => LowLevelType::Signed,
+            LowLevelType::UnsignedLongLong => LowLevelType::Unsigned,
+            other => other.clone(),
+        }
+    } else {
+        of.clone()
+    }
+}
+
+/// `descr.py get_array_descr` cache key: one spelling per ARRAY lltype.
+/// The key follows `_gckind` and `ARRAY.OF` with `lltype.build_number`
+/// identity; the element spelling is the Rust name `get_type_flag` reads
+/// after `extract_element_type_from_str`.
+pub(crate) fn array_type_id_of_lltype(
+    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+    use majit_jitcode::codewriter::jtransform::{
+        LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
+    };
+    let of = array_of_lltype_identity(&arr.OF);
+    if arr._gckind == GcKind::Gc {
+        match &of {
+            LowLevelType::Signed => LIST_INT_ITEMS_ARRAY.to_string(),
+            LowLevelType::Float => LIST_FLOAT_ITEMS_ARRAY.to_string(),
+            LowLevelType::Ptr(p) if p._needsgc() => LIST_OBJ_ITEMS_ARRAY.to_string(),
+            of => format!("GcArray<{}>", array_item_spelling(of)),
+        }
+    } else {
+        format!("Vec<{}>", array_item_spelling(&of))
+    }
+}
+
+/// Element spelling of `ARRAY.OF` after `lltype.build_number` identity.
+/// `descr.py get_type_flag` reads this spelling: a Ptr whose
+/// `TO._gckind == 'gc'` is FLAG_POINTER, independent of the containing
+/// ARRAY's `_gckind`.
+fn array_item_spelling(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> String {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match of {
+        LowLevelType::Signed => "isize".to_string(),
+        LowLevelType::Unsigned => "usize".to_string(),
+        LowLevelType::Float => "f64".to_string(),
+        LowLevelType::SingleFloat => "f32".to_string(),
+        LowLevelType::Char => "u8".to_string(),
+        LowLevelType::UniChar => "char".to_string(),
+        LowLevelType::Bool => "bool".to_string(),
+        LowLevelType::Struct(s) => s._name.clone(),
+        LowLevelType::Void => "()".to_string(),
+        LowLevelType::Ptr(p) if !p._needsgc() => "*const u8".to_string(),
+        // descr.py get_type_flag: a Ptr whose TO._gckind == 'gc' is
+        // FLAG_POINTER, independent of the containing ARRAY's _gckind.
+        LowLevelType::Ptr(_) => "GCREF".to_string(),
+        LowLevelType::SignedLongLong => "i64".to_string(),
+        LowLevelType::UnsignedLongLong => "u64".to_string(),
+        LowLevelType::Address => "usize".to_string(),
+        of => panic!("array_type_id_of_lltype: unsupported ARRAY.OF {of:?}"),
+    }
+}
+
 /// ARRAY identity for `arraydescrof_concrete`. A named `array_type_id`
 /// publishes `DescrSetMember::Array`; `None` mints a descr with no key
 /// and S4c degrades to `EF_RANDOM_EFFECTS`. STR.chars is
 /// `CHAR_ARRAY = GcArray(Char)` (`ll_str.py`).
 fn effect_array_type_id(base: &crate::flowspace::model::Variable) -> Option<String> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
-    let of = match base.concretetype() {
+    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, PtrTarget};
+    let arr = match base.concretetype() {
         Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
-            PtrTarget::Array(arr) => arr.OF,
-            _ => return Some("GcArray(Char)".to_string()),
+            PtrTarget::Array(arr) => Some(arr),
+            _ => None,
         },
-        Some(LowLevelType::Array(arr)) => arr.OF,
-        _ => return Some("GcArray(Char)".to_string()),
+        Some(LowLevelType::Array(arr)) => Some(*arr),
+        _ => None,
     };
-    match of {
-        LowLevelType::Char => Some("GcArray(Char)".to_string()),
-        LowLevelType::UniChar => Some("GcArray(UniChar)".to_string()),
-        LowLevelType::Signed => Some("GcArray(Signed)".to_string()),
-        LowLevelType::Unsigned => Some("GcArray(Unsigned)".to_string()),
-        LowLevelType::Bool => Some("GcArray(Bool)".to_string()),
-        LowLevelType::Float => Some("GcArray(Float)".to_string()),
-        // `rewrite_op_getinteriorfield`: ARRAY.OF is the element struct
-        // (`odictentry`). `extract_element_type_from_str` recovers that
-        // name from `GcArray({s._name})`.
-        LowLevelType::Struct(s) => Some(format!("GcArray({})", s._name)),
-        _ => Some("GcArray(Char)".to_string()),
-    }
+    Some(array_type_id_of_lltype(
+        &arr.unwrap_or_else(|| Array::gc(LowLevelType::Char)),
+    ))
 }
 
 fn effect_linkarg(hlv: &crate::flowspace::model::Hlvalue) -> LinkArg {
@@ -14519,18 +14581,7 @@ fn effect_malloc_array_type_id(hlv: &crate::flowspace::model::Hlvalue) -> Option
     match hlv {
         Hlvalue::Constant(c) => match &c.value {
             ConstValue::LowLevelType(lltype) => match &**lltype {
-                LowLevelType::Array(a) => {
-                    let elem = match a.OF {
-                        LowLevelType::Char => "Char",
-                        LowLevelType::UniChar => "UniChar",
-                        LowLevelType::Signed => "Signed",
-                        LowLevelType::Unsigned => "Unsigned",
-                        LowLevelType::Bool => "Bool",
-                        LowLevelType::Float => "Float",
-                        _ => return Some(lltype.short_name()),
-                    };
-                    Some(format!("Array({elem})"))
-                }
+                LowLevelType::Array(a) => Some(array_type_id_of_lltype(a)),
                 _ => Some(lltype.short_name()),
             },
             _ => None,
@@ -15088,6 +15139,105 @@ mod tests {
         assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
         assert_eq!(ty, majit_ir::value::Type::Int);
         assert_eq!(size, 4);
+    }
+
+    /// `descr.py get_array_descr` keys `cache[ARRAY]`; a GC ARRAY and a
+    /// raw `CArray` of the same OF are different lltypes.
+    #[test]
+    fn array_type_id_keeps_gckind() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi;
+        use majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
+        let gc = array_type_id_of_lltype(&Array::gc(LowLevelType::Signed));
+        let raw = array_type_id_of_lltype(&rffi::CArray(LowLevelType::Signed));
+        assert_eq!(gc, LIST_INT_ITEMS_ARRAY);
+        assert_eq!(raw, "Vec<isize>");
+        assert_ne!(gc, raw);
+    }
+
+    /// Angle-bracket spellings recover the Rust name `get_type_flag` reads.
+    #[test]
+    fn array_type_id_decodes_to_rust_element() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let cases = [
+            (rffi::CArray(LowLevelType::Char), "u8", 1usize),
+            (rffi::CArray(LowLevelType::Bool), "bool", 1),
+            (rffi::CArray(LowLevelType::SingleFloat), "f32", 4),
+            (rffi::CArray(LowLevelType::UniChar), "char", 4),
+            (Array::gc(LowLevelType::Char), "u8", 1),
+        ];
+        for (arr, elem, size) in cases {
+            let id = array_type_id_of_lltype(&arr);
+            let recovered = extract_element_type_from_str(&id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!(recovered, elem, "{id}");
+            let (_, _, item_size) = get_type_flag(&recovered, &HashSet::new());
+            assert_eq!(item_size, size, "{id}");
+        }
+    }
+
+    /// `descr.py get_type_flag`: Unsigned is FLAG_UNSIGNED; a GC ARRAY of
+    /// Unsigned is not `LIST_INT_ITEMS_ARRAY`.
+    #[test]
+    fn array_type_id_gc_unsigned_is_usize() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        let id = array_type_id_of_lltype(&Array::gc(LowLevelType::Unsigned));
+        assert_eq!(id, "GcArray<usize>");
+        assert_eq!(
+            get_type_flag("usize", &HashSet::new()).0,
+            majit_ir::descr::ArrayFlag::Unsigned
+        );
+    }
+
+    /// On a 64-bit host `lltype.SignedLongLong is lltype.Signed`, so both
+    /// ARRAY lltypes share `LIST_INT_ITEMS_ARRAY`.
+    #[test]
+    fn array_type_id_gc_signed_longlong_is_signed() {
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        use majit_jitcode::codewriter::jtransform::LIST_INT_ITEMS_ARRAY;
+        assert_eq!(crate::layout::target_word_size(), 8);
+        assert_eq!(
+            array_type_id_of_lltype(&Array::gc(LowLevelType::Signed)),
+            LIST_INT_ITEMS_ARRAY
+        );
+        assert_eq!(
+            array_type_id_of_lltype(&Array::gc(LowLevelType::SignedLongLong)),
+            LIST_INT_ITEMS_ARRAY
+        );
+    }
+
+    /// Raw ARRAY of longlong identity-collapses to the word integer
+    /// spelling on a 64-bit host.
+    #[test]
+    fn array_type_id_raw_longlong_is_word() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        assert_eq!(
+            array_type_id_of_lltype(&rffi::CArray(LowLevelType::SignedLongLong)),
+            "Vec<isize>"
+        );
+        assert_eq!(
+            array_type_id_of_lltype(&rffi::CArray(LowLevelType::UnsignedLongLong)),
+            "Vec<usize>"
+        );
+    }
+
+    /// `descr.py get_type_flag`: a Ptr whose `TO._gckind == 'gc'` is
+    /// FLAG_POINTER, independent of the containing ARRAY's `_gckind`.
+    #[test]
+    fn array_type_id_raw_gc_ptr_is_gcref() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::lltypesystem::rffi;
+        let id = array_type_id_of_lltype(&rffi::CArray(GCREF.clone()));
+        assert_eq!(id, "Vec<GCREF>");
+        assert_eq!(
+            extract_element_type_from_str("Vec<GCREF>").as_deref(),
+            Some("GCREF")
+        );
+        assert_eq!(
+            get_type_flag("GCREF", &HashSet::new()).0,
+            majit_ir::descr::ArrayFlag::Pointer
+        );
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
@@ -26055,7 +26205,7 @@ mod tests {
             Some((
                 "key".to_string(),
                 Some("odictentry".to_string()),
-                Some("GcArray(odictentry)".to_string()),
+                Some("GcArray<odictentry>".to_string()),
                 index,
             )),
             "getinteriorfield: {:?}",
@@ -26123,7 +26273,7 @@ mod tests {
             Some((
                 "f_valid".to_string(),
                 Some("odictentry".to_string()),
-                Some("GcArray(odictentry)".to_string()),
+                Some("GcArray<odictentry>".to_string()),
                 ValueType::Int,
             )),
             "setinteriorfield: {:?}",

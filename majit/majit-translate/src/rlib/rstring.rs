@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::codewriter::call::array_type_id_of_lltype;
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
     SpaceOperation, Variable,
@@ -32,7 +33,9 @@ use crate::model::{
     FunctionGraph as ModelGraph, Link as ModelLink, LinkArg, OpKind, ValueType,
 };
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget, Struct};
+use crate::translator::rtyper::lltypesystem::lltype::{
+    Array, LowLevelType, Ptr, PtrTarget, Struct,
+};
 use crate::translator::rtyper::lltypesystem::rstr::{
     chars_array_ptr_lltype_from_strptr, close_assert_ptr_not_none, sub_helper_funcptr_constant,
 };
@@ -6236,24 +6239,17 @@ fn search_value_type_of(var: &Variable) -> ValueType {
 }
 
 fn search_array_type_id(base: &Variable) -> Option<String> {
-    let of = match base.concretetype() {
+    let arr = match base.concretetype() {
         Some(LowLevelType::Ptr(ptr)) => match ptr.TO {
-            PtrTarget::Array(arr) => arr.OF,
-            _ => return Some("GcArray(Char)".to_string()),
+            PtrTarget::Array(arr) => Some(arr),
+            _ => None,
         },
-        Some(LowLevelType::Array(arr)) => arr.OF,
-        _ => return Some("GcArray(Char)".to_string()),
+        Some(LowLevelType::Array(arr)) => Some(*arr),
+        _ => None,
     };
-    let elem = match of {
-        LowLevelType::Char => "Char",
-        LowLevelType::UniChar => "UniChar",
-        LowLevelType::Signed => "Signed",
-        LowLevelType::Unsigned => "Unsigned",
-        LowLevelType::Bool => "Bool",
-        LowLevelType::Float => "Float",
-        _ => return Some("GcArray(Char)".to_string()),
-    };
-    Some(format!("GcArray({elem})"))
+    Some(array_type_id_of_lltype(
+        &arr.unwrap_or_else(|| Array::gc(LowLevelType::Char)),
+    ))
 }
 
 fn search_linkarg(hlv: &Hlvalue) -> LinkArg {
