@@ -6281,28 +6281,41 @@ fn search_non_void_args(args: &[Hlvalue]) -> impl Iterator<Item = &Hlvalue> {
     })
 }
 
+/// Choose the UnaryOp carrier for an llop in the search-helper effect graph.
+///
+/// `GraphAnalyzer.analyze_simple_operation` reads only `op.opname`. The
+/// operand is the last non-Void operand, else the last Variable operand.
+/// Void Constants are never materialised.
+fn search_unaryop_operand(args: &[Hlvalue]) -> Option<(&Hlvalue, Vec<&Hlvalue>)> {
+    let non_void: Vec<&Hlvalue> = search_non_void_args(args).collect();
+    if let Some((last, rest)) = non_void.split_last() {
+        return Some((*last, rest.to_vec()));
+    }
+    args.iter()
+        .rfind(|hlv| matches!(hlv, Hlvalue::Variable(_)))
+        .map(|last| (last, Vec::new()))
+}
+
 fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Variable {
     match hlv {
         Hlvalue::Variable(v) => v.clone(),
         Hlvalue::Constant(c) => {
-            let (kind, lltype) = match &c.value {
-                ConstValue::Int(n) => (OpKind::ConstInt(*n), LowLevelType::Signed),
-                ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
-                ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
-                ConstValue::AddressOffset(_) => (OpKind::ConstInt(0), LowLevelType::Signed),
-                ConstValue::ByteStr(bytes) => {
-                    let n = i64::from(bytes.first().copied().unwrap_or(0));
-                    (OpKind::ConstInt(n), LowLevelType::Signed)
-                }
-                other => {
-                    panic!("effect_graph_from_search_helper: cannot materialise constant {other:?}")
-                }
-            };
-            let result = out
-                .push_op_var(block, kind, true)
-                .expect("constant op produces a result var");
-            result.set_concretetype(Some(lltype));
-            result
+            // The search effect graph is only read by the effect analyzers
+            // (`effectinfo`), never executed, so a symbolic offset contributes
+            // no value.
+            if matches!(&c.value, ConstValue::AddressOffset(_)) {
+                let result = out
+                    .push_op_var(block, OpKind::ConstInt(0), true)
+                    .expect("constant op produces a result var");
+                result.set_concretetype(Some(LowLevelType::Signed));
+                return result;
+            }
+            crate::codewriter::jtransform_opname::materialize_constant(
+                out,
+                block,
+                c,
+                "effect_graph_from_search_helper",
+            )
         }
     }
 }
@@ -6470,6 +6483,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 op.args.len() >= 2,
                 "effect_graph_from_search_helper: jit_conditional_call needs cond and fnptr"
             );
+            crate::codewriter::jtransform_opname::check_cond_call_operands(&op.args);
             let cond = search_materialize(out, block, &op.args[0]);
             let (callee, _) = search_callee_funcptr(&op.args[1]);
             let extra_args: Vec<_> = search_non_void_args(&op.args[2..])
@@ -6489,6 +6503,7 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 op.args.len() >= 2,
                 "effect_graph_from_search_helper: jit_conditional_call_value needs value and fnptr"
             );
+            crate::codewriter::jtransform_opname::check_cond_call_operands(&op.args);
             let value = search_materialize(out, block, &op.args[0]);
             let (callee, _) = search_callee_funcptr(&op.args[1]);
             let extra_args: Vec<_> = search_non_void_args(&op.args[2..])
@@ -6608,11 +6623,14 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
         }
         name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
-            // `effect_graph_from_rtyped_helper`: UnaryOp keeps the llop
-            // name so analyzers consult `ll_operations()`. Extra Variable
-            // operands stay materialised; Constant extras are already values.
-            let Some((last, rest)) = op.args.split_last() else {
-                panic!("effect_graph_from_search_helper: {name} has no operand");
+            // `GraphAnalyzer.analyze_simple_operation` reads only the
+            // opname; the UnaryOp operand is the carrier the effect graph
+            // needs, taken from the last non-Void operand, else the last
+            // Variable operand. Void Constants are never materialised.
+            let Some((last, rest)) = search_unaryop_operand(&op.args) else {
+                panic!(
+                    "effect_graph_from_search_helper: {name} has no operand the effect graph can carry"
+                );
             };
             for arg in rest {
                 if matches!(arg, Hlvalue::Variable(_)) {
@@ -6637,13 +6655,19 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             // `analyze_simple_operation` with the `lloperation.py` flags.
             // UnaryOp keeps the llop name so analyzers consult
             // `ll_operations()`, matching `effect_graph_from_rtyped_helper`.
+            // `GraphAnalyzer.analyze_simple_operation` reads only the
+            // opname; the UnaryOp operand is the carrier the effect graph
+            // needs, taken from the last non-Void operand, else the last
+            // Variable operand. Void Constants are never materialised.
             if other != "direct_call"
                 && other != "indirect_call"
                 && crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
                     .contains_key(other)
             {
-                let Some((last, rest)) = op.args.split_last() else {
-                    panic!("effect_graph_from_search_helper: {other} has no operand");
+                let Some((last, rest)) = search_unaryop_operand(&op.args) else {
+                    panic!(
+                        "effect_graph_from_search_helper: {other} has no operand the effect graph can carry"
+                    );
                 };
                 for arg in rest {
                     if matches!(arg, Hlvalue::Variable(_)) {
@@ -6872,6 +6896,32 @@ mod tests {
             leaves,
             vec![3],
             "effect graph emits conditional_call_elidable1 (value, fn, s), got {leaves:?}"
+        );
+    }
+
+    /// `keepalive(v)` with Void-typed Variable `v` still becomes UnaryOp.
+    /// `GraphAnalyzer.analyze_simple_operation` reads only the opname;
+    /// the last Variable is the carrier when every operand is Void.
+    #[test]
+    fn search_helper_effect_graph_accepts_void_variable_keepalive() {
+        let kept = v("kept", LowLevelType::Void);
+        let startblock = blk(vec![kept.clone()]);
+        let result = v("v", LowLevelType::Void);
+        let graph =
+            FunctionGraph::with_return_var("ka_void".to_string(), startblock.clone(), hl(&result));
+        emit(&startblock, "keepalive", vec![hl(&kept)], result.clone());
+        ret(&startblock, hl(&result), graph.returnblock.clone());
+        let effect = effect_graph_from_search_helper(&graph);
+        assert!(
+            effect.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "keepalive"
+            )),
+            "keepalive Void Variable: {:?}",
+            effect
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
         );
     }
 

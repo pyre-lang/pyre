@@ -70,7 +70,7 @@ use std::rc::Rc;
 
 use crate::flowspace::model::Variable as FVar;
 use crate::flowspace::model::{
-    Block as FlowBlock, ConstValue, FunctionGraph as FlowGraph, Hlvalue,
+    Block as FlowBlock, ConstValue, Constant, FunctionGraph as FlowGraph, Hlvalue,
 };
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FN_CONST_HEAD, Link, LinkArg, OpKind, ValueType,
@@ -1027,6 +1027,7 @@ fn transduce_op(
                 op.args.len() >= 2,
                 "jtransform_opname::lower_graph: jit_conditional_call needs cond and fnptr"
             );
+            check_cond_call_operands(&op.args);
             let cond = materialize(out, block, &op.args[0]);
             let callee = callee_name_from_funcptr(&op.args[1]);
             let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
@@ -1054,6 +1055,7 @@ fn transduce_op(
                 op.args.len() >= 2,
                 "jtransform_opname::lower_graph: jit_conditional_call_value needs value and fnptr"
             );
+            check_cond_call_operands(&op.args);
             let value = materialize(out, block, &op.args[0]);
             let callee = callee_name_from_funcptr(&op.args[1]);
             let extra_args: Vec<FVar> = non_void_args(&op.args[2..])
@@ -1073,6 +1075,22 @@ fn transduce_op(
         // `jtransform.py Transformer.rewrite_op_debug_assert` returns [].
         "debug_assert" => {}
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
+    }
+}
+
+/// `Transformer._rewrite_op_cond_call`: on the operation's own operands
+/// (`[cond_or_value, funcptr, *args]`, Void included), reject any float
+/// operand or more than 4 function arguments.
+pub(crate) fn check_cond_call_operands(args: &[Hlvalue]) {
+    let have_floats = args.iter().any(|arg| {
+        let ty = match arg {
+            Hlvalue::Variable(v) => v.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
+        ty.is_some_and(|ty| crate::model::getkind(&ty) == crate::model::ConcreteType::Float)
+    });
+    if args.len() > 4 + 2 || have_floats {
+        panic!("Conditional call does not support floats or more than 4 arguments");
     }
 }
 
@@ -1133,8 +1151,8 @@ pub(crate) fn emit_conditional_call_value_oopspec(
 /// the function (`fn_const_target_of` of a 0-arg `__fn_const` Call),
 /// and args[2:] as the callee arguments. The helper leaf is
 /// `{helper_prefix}{n}`: `conditional_callN` (`is_jit_conditional_call_path`)
-/// or `conditional_call_elidableN`. `Transformer._rewrite_op_cond_call`
-/// rejects floats and more than 4 function arguments.
+/// or `conditional_call_elidableN`. The arity/float check is
+/// `check_cond_call_operands`, run by the callers on the original operands.
 fn emit_conditional_call_oopspec_named(
     out: &mut crate::model::FunctionGraph,
     block: BlockId,
@@ -1145,13 +1163,10 @@ fn emit_conditional_call_oopspec_named(
     helper_prefix: &str,
 ) {
     let n = extra_args.len();
-    let has_float = std::iter::once(&cond).chain(extra_args.iter()).any(|v| {
-        v.concretetype()
-            .is_some_and(|ty| crate::model::getkind(&ty) == crate::model::ConcreteType::Float)
-    });
-    if n > 4 || has_float {
-        panic!("Conditional call does not support floats or more than 4 arguments");
-    }
+    debug_assert!(
+        n <= 4,
+        "the helper leaf `{helper_prefix}{{n}}` only exists for 0..=4"
+    );
     let fn_target = CallTarget::function_path(
         std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
     );
@@ -1521,27 +1536,97 @@ fn non_void_args(args: &[Hlvalue]) -> impl Iterator<Item = &Hlvalue> {
     })
 }
 
+/// `Transformer.make_three_lists` takes a Constant operand of any kind
+/// (`getkind(v.concretetype)`); `assembler.py emit_const` pools it by kind.
+pub(crate) fn materialize_constant(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    c: &Constant,
+    who: &str,
+) -> FVar {
+    let fail = || -> ! {
+        panic!(
+            "{who}: cannot materialise constant operand {:?} of type {:?}",
+            c.value, c.concretetype
+        )
+    };
+    let kind = match c.concretetype.as_ref() {
+        Some(LowLevelType::Signed | LowLevelType::SignedLongLong) => match &c.value {
+            ConstValue::Int(n) => OpKind::ConstInt(*n),
+            _ => fail(),
+        },
+        Some(LowLevelType::Unsigned | LowLevelType::UnsignedLongLong) => match &c.value {
+            ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+            ConstValue::Int(n) if *n >= 0 => OpKind::ConstUInt(*n as u64),
+            _ => fail(),
+        },
+        Some(LowLevelType::Bool) => match &c.value {
+            ConstValue::Bool(b) => OpKind::ConstBool(*b),
+            _ => fail(),
+        },
+        Some(LowLevelType::Char) => match &c.value {
+            ConstValue::ByteStr(bytes) if bytes.len() == 1 => OpKind::ConstInt(i64::from(bytes[0])),
+            _ => fail(),
+        },
+        Some(LowLevelType::UniChar) => match &c.value {
+            ConstValue::UniStr(s) if s.chars().count() == 1 => {
+                OpKind::ConstInt(s.chars().next().expect("one UniChar") as i64)
+            }
+            _ => fail(),
+        },
+        Some(LowLevelType::Float) => match &c.value {
+            ConstValue::Float(bits) => OpKind::ConstFloat(*bits),
+            _ => fail(),
+        },
+        Some(LowLevelType::SingleFloat) => match &c.value {
+            ConstValue::Float(bits) => {
+                OpKind::ConstSingleFloat((f64::from_bits(*bits) as f32).to_bits())
+            }
+            _ => fail(),
+        },
+        Some(LowLevelType::Ptr(p)) => match &c.value {
+            ConstValue::LLPtr(ptr) if matches!(ptr._obj0_value(), Ok(None)) => {
+                if p._needsgc() {
+                    OpKind::ConstRefNull
+                } else {
+                    OpKind::ConstInt(0)
+                }
+            }
+            _ => fail(),
+        },
+        None => match &c.value {
+            ConstValue::Int(n) => OpKind::ConstInt(*n),
+            ConstValue::UInt(n) => OpKind::ConstUInt(*n),
+            ConstValue::Bool(b) => OpKind::ConstBool(*b),
+            _ => fail(),
+        },
+        Some(_) => fail(),
+    };
+    let lltype = match c.concretetype.clone() {
+        Some(ty) => ty,
+        None => match &c.value {
+            ConstValue::Int(_) => LowLevelType::Signed,
+            ConstValue::UInt(_) => LowLevelType::Unsigned,
+            ConstValue::Bool(_) => LowLevelType::Bool,
+            _ => fail(),
+        },
+    };
+    let result = out
+        .push_op_var(block, kind, true)
+        .expect("constant op produces a result var");
+    // `push_op_var` mints the result with `ConcreteType::Unknown`;
+    // stamp the Constant's concretetype so regalloc colours it.
+    result.set_concretetype(Some(lltype));
+    result
+}
+
 /// Map a flowspace operand to a model operand `Variable`, materialising
-/// constants into `ConstInt`/`ConstBool` ops pushed ahead of the consumer.
+/// constants into typed `Const*` ops pushed ahead of the consumer.
 fn materialize(out: &mut crate::model::FunctionGraph, block: BlockId, hlv: &Hlvalue) -> FVar {
     match hlv {
         Hlvalue::Variable(v) => v.clone(),
         Hlvalue::Constant(c) => {
-            let (kind, lltype) = match &c.value {
-                ConstValue::Int(n) => (OpKind::ConstInt(*n), LowLevelType::Signed),
-                ConstValue::UInt(n) => (OpKind::ConstUInt(*n), LowLevelType::Unsigned),
-                ConstValue::Bool(b) => (OpKind::ConstBool(*b), LowLevelType::Bool),
-                other => panic!(
-                    "jtransform_opname::lower_graph: cannot materialise constant operand {other:?}"
-                ),
-            };
-            let result = out
-                .push_op_var(block, kind, true)
-                .expect("ConstInt/ConstBool op produces a result var");
-            // `push_op_var` mints the result with `ConcreteType::Unknown`;
-            // stamp the int-bank kind so regalloc colours it.
-            result.set_concretetype(Some(lltype));
-            result
+            materialize_constant(out, block, c, "jtransform_opname::lower_graph")
         }
     }
 }
@@ -1773,7 +1858,7 @@ fn is_unichar_array_ptr(var: &FVar) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::lower_graph;
+    use super::{lower_graph, materialize_constant};
     use crate::annotator::annrpython::RPythonAnnotator;
     use crate::flowspace::model::{
         Block, BlockRefExt, ConstValue, Constant, FunctionGraph as FlowGraph, GraphFunc, Hlvalue,
@@ -4242,5 +4327,238 @@ mod tests {
     #[should_panic(expected = "Conditional call does not support floats or more than 4 arguments")]
     fn lower_graph_jit_conditional_call_value_arity5_is_rejected() {
         let _ = lower_jit_conditional_call_value_with_extra(5);
+    }
+
+    /// `Transformer._rewrite_op_cond_call` on
+    /// `jit_conditional_call(cond, f, *args)`.
+    fn lower_jit_conditional_call(
+        extra: Vec<crate::flowspace::model::Variable>,
+    ) -> crate::model::FunctionGraph {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+
+        let cond = variable_with_lltype("cond", LowLevelType::Bool);
+        let mut inputargs = vec![Hlvalue::Variable(cond.clone())];
+        inputargs.extend(extra.iter().cloned().map(Hlvalue::Variable));
+        let startblock = Block::shared(inputargs);
+        let return_var = variable_with_lltype("out", LowLevelType::Void);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_conditional_call",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let ft = FuncType {
+            args: extra
+                .iter()
+                .map(|v| v.concretetype().unwrap_or(LowLevelType::Void))
+                .collect(),
+            result: LowLevelType::Void,
+        };
+        let funcptr = functionptr(ft, "compute", None, Some("compute".to_string()));
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Void);
+        let mut args = vec![Hlvalue::Variable(cond), callee];
+        args.extend(extra.into_iter().map(Hlvalue::Variable));
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_conditional_call",
+            args,
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        lower_graph(&graph)
+    }
+
+    /// `_rewrite_op_cond_call` counts Void operands: five function
+    /// arguments of which one is Void are still `len(op.args) > 4 + 2`.
+    #[test]
+    #[should_panic(expected = "Conditional call does not support floats or more than 4 arguments")]
+    fn cond_call_rejects_five_args_even_if_one_is_void() {
+        let extra: Vec<_> = (0..4)
+            .map(|i| variable_with_lltype(&format!("a{i}"), LowLevelType::Signed))
+            .chain(std::iter::once(variable_with_lltype(
+                "v",
+                LowLevelType::Void,
+            )))
+            .collect();
+        let _ = lower_jit_conditional_call(extra);
+    }
+
+    /// Four function arguments and no Void operand lower to
+    /// `conditional_call4`.
+    #[test]
+    fn cond_call_accepts_four_args_plus_none_void() {
+        let extra: Vec<_> = (0..4)
+            .map(|i| variable_with_lltype(&format!("a{i}"), LowLevelType::Signed))
+            .collect();
+        let model = lower_jit_conditional_call(extra);
+        assert_eq!(
+            cond_elidable_call_argc(&model, "conditional_call4"),
+            vec![6],
+            "one conditional_call4 Call (cond, fn, a0, a1, a2, a3)"
+        );
+    }
+
+    /// `_rewrite_op_cond_call` rejects a float operand on the original
+    /// `jit_conditional_call_value` value, before Void removal.
+    #[test]
+    #[should_panic(expected = "Conditional call does not support floats or more than 4 arguments")]
+    fn cond_call_value_rejects_a_float_value() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+
+        let value = variable_with_lltype("h", LowLevelType::Float);
+        let startblock = Block::shared(vec![Hlvalue::Variable(value.clone())]);
+        let return_var = variable_with_lltype("out", LowLevelType::Float);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_conditional_call_value_float",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let ft = FuncType {
+            args: vec![],
+            result: LowLevelType::Float,
+        };
+        let funcptr = functionptr(ft, "compute", None, Some("compute".to_string()));
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", LowLevelType::Float);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_conditional_call_value",
+            vec![Hlvalue::Variable(value), callee],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let _ = lower_graph(&graph);
+    }
+
+    fn nullptr_gc_struct() -> (Constant, LowLevelType) {
+        use crate::translator::rtyper::lltypesystem::lltype::nullptr;
+        let container = LowLevelType::Struct(Box::new(Struct::gc("S", vec![])));
+        let ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(container.clone()).expect("Ptr(GcStruct)"),
+        ));
+        let null = nullptr(container).expect("nullptr(GcStruct)");
+        (
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(null)), ptr_ty.clone()),
+            ptr_ty,
+        )
+    }
+
+    #[test]
+    fn materialize_constant_null_gc_ptr_is_const_ref_null() {
+        let (c, ptr_ty) = nullptr_gc_struct();
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_null_gc_ptr");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstRefNull),
+            "null GC Ptr Constant becomes ConstRefNull: {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(ptr_ty));
+    }
+
+    #[test]
+    fn materialize_constant_char_is_const_int() {
+        let c = Constant::with_concretetype(ConstValue::byte_str([b'a']), LowLevelType::Char);
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_char");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstInt(97)),
+            "Char b'a' becomes ConstInt(97): {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Char));
+    }
+
+    #[test]
+    fn materialize_constant_float_is_const_float() {
+        let c = Constant::with_concretetype(ConstValue::float(1.5), LowLevelType::Float);
+        let mut out = crate::model::FunctionGraph::new("materialize_constant_float");
+        let start = out.startblock;
+        let result = materialize_constant(&mut out, start, &c, "test");
+        let ops = &out.block(out.startblock).operations;
+        assert_eq!(ops.len(), 1);
+        assert!(
+            matches!(ops[0].kind, OpKind::ConstFloat(bits) if bits == 1.5f64.to_bits()),
+            "Float 1.5 becomes ConstFloat: {:?}",
+            ops[0].kind
+        );
+        assert_eq!(result.concretetype(), Some(LowLevelType::Float));
+    }
+
+    /// `jit_conditional_call_value` value operand may be a null GC-pointer
+    /// Constant (`Transformer.make_three_lists` accepts a ref-kind Constant).
+    #[test]
+    fn cond_call_value_accepts_a_null_pointer_cached_value() {
+        use crate::translator::rtyper::lltypesystem::lltype::{FuncType, functionptr};
+
+        let (value_c, ptr_ty) = nullptr_gc_struct();
+        let value = Hlvalue::Constant(value_c);
+        let startblock = Block::shared(vec![]);
+        let return_var = variable_with_lltype("out", ptr_ty.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_conditional_call_value_null",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let ft = FuncType {
+            args: vec![],
+            result: ptr_ty.clone(),
+        };
+        let funcptr = functionptr(ft, "compute", None, Some("compute".to_string()));
+        let callee = constant_with_lltype(ConstValue::LLPtr(Box::new(funcptr)), LowLevelType::Void);
+        let out = variable_with_lltype("out", ptr_ty);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "jit_conditional_call_value",
+            vec![value, callee],
+            Hlvalue::Variable(out.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(out)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let model = lower_graph(&graph);
+        let ops = &model.block(model.startblock).operations;
+        let null_var = ops
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::ConstRefNull))
+            .and_then(|op| op.result.clone())
+            .expect("cached value materialises as ConstRefNull");
+        let call_args = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    let segs = target.path_segments()?;
+                    (segs == ["majit_rlib", "jit", "conditional_call_elidable0"]).then_some(args)
+                }
+                _ => None,
+            })
+            .expect("conditional_call_elidable0 Call");
+        assert_eq!(
+            call_args.first(),
+            Some(&LinkArg::Value(null_var)),
+            "first argument is the ConstRefNull result: {call_args:?}"
+        );
     }
 }
