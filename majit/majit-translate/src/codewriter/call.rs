@@ -4397,6 +4397,14 @@ impl CallControl {
                 if rank.is_array()
                     && rank.is_immutable()
                     && let Some(field_ty) = self.struct_fields.field_type(struct_name, field_name)
+                    // `[i64]` / `[f64]` name the shared `TypedItemsBlock` /
+                    // `FloatItemsBlock` storage, which mutable arrays use too
+                    // (int and float lists, `d.indexes`, the range-strategy
+                    // state). `rbigint.py`'s `_digits[*]` makes its own
+                    // immutable ARRAY upstream, so the field cannot make the
+                    // shared identity `_pure`; jtransform still recognises
+                    // its reads from the `_digits` FieldRead.
+                    && !matches!(field_ty, "[i64]" | "[f64]")
                 {
                     self.immutable_array_types.insert(field_ty.to_string());
                 }
@@ -15015,6 +15023,34 @@ fn effect_transduce_op(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `RBigInt._digits[*]` is published as `[i64]`, the identity every
+    /// `TypedItemsBlock` int array shares (`d.indexes` included). Only the
+    /// tuple's own `[*mut PyObject]` row becomes an immutable ARRAY type.
+    #[test]
+    fn shared_typed_items_identity_is_not_an_immutable_array_type() {
+        use crate::model::ImmutableRank;
+        let mut cc = CallControl::new();
+        cc.struct_fields.fields.insert(
+            "RBigInt".to_string(),
+            vec![("_digits".to_string(), "[i64]".to_string())],
+        );
+        cc.struct_fields.fields.insert(
+            "W_TupleObject".to_string(),
+            vec![("wrappeditems".to_string(), "[*mut PyObject]".to_string())],
+        );
+        cc.immutable_fields_by_struct.insert(
+            "RBigInt".to_string(),
+            vec![("_digits".to_string(), ImmutableRank::ImmutableArray)],
+        );
+        cc.immutable_fields_by_struct.insert(
+            "W_TupleObject".to_string(),
+            vec![("wrappeditems".to_string(), ImmutableRank::ImmutableArray)],
+        );
+        cc.recompute_immutable_array_types();
+        assert!(!cc.immutable_array_types.contains("[i64]"));
+        assert!(cc.immutable_array_types.contains("[*mut PyObject]"));
+    }
     use crate::model::{
         BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
     };
