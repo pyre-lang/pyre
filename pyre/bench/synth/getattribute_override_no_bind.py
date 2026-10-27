@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=374
+# pyre-check: max-pypy-ratio=710
 # Two regressions in one hot loop:
 #
 # 1. Binding: a non-default `__getattribute__` must suppress LOAD_METHOD
@@ -32,4 +32,4 @@ def run(c, n):
     return total
 
 
-print(run(C(), 600000))
+print(run(C(), 1200000))

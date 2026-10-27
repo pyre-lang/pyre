@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=24
+# pyre-check: max-pypy-ratio=58
 # list error-message parity where 3.14 and PyPy AGREE (check.py oracle is
 # PyPy).  list.index's missing-value message DIVERGES — 3.14 says
 # "list.index(x): x not in list" (gh-100242 dropped the repr) while PyPy keeps
@@ -24,7 +24,7 @@ def drive():
     # ValueError count is compared (the message diverges 3.14 vs PyPy).
     hits = 0
     n = 0
-    while n < 100000:
+    while n < 400000:
         try:
             [1, 2, 3].index(9)
         except ValueError:

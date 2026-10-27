@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=50
+# pyre-check: max-pypy-ratio=17
 # pyre-check: spec-folds=builtin_getattr
 # pyre-check: trace-shape=main:absent=CallMayForceR
 # PyPy traces through builtin getattr for lone-surrogate names just as it does
@@ -6,7 +6,7 @@
 # the bound Method into its CALL, and inlines the property's Python getter.
 # Losing either path leaves a per-iteration CALL_MAY_FORCE and crosses this
 # ceiling; the folded dynasm path is about 6x faster than that residual path.
-N = 1200000
+N = 14400000
 
 METH = '\udc81'   # lone surrogate naming a method on the class
 PROP = '\udc82'   # lone surrogate naming a property (data descriptor)

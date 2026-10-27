@@ -1,5 +1,4 @@
-# pyre-check: max-pypy-ratio=28
-# The ceiling is twice the slowest ratio observed, 13.9x on the macos runner.
+# pyre-check: max-pypy-ratio=8.3
 # Deep operand-stack Variables across a nested-call deopt guard.
 # Several computed Variables (x, y, z) sit deep on the stack as arguments being
 # marshalled for `acc(...)` while `mul(i, i)` (a residual call that can guard /
@@ -23,4 +22,4 @@ def f(n):
     return s
 
 
-print(f(1440000))
+print(f(11520000))

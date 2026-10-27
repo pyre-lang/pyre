@@ -14,7 +14,7 @@
 # exact aggregate over the loop makes that silent miscompile observable.
 import gc
 
-N = 800000
+N = 1600000
 
 
 class A:

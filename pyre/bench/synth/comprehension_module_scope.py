@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=83
+# pyre-check: max-pypy-ratio=9.9
 # PEP 709 inlines comprehensions into their enclosing scope. At module
 # scope the iteration variable becomes a CO_FAST_HIDDEN local, yet a later
 # top-level binding of the same name is a normal global (STORE_NAME). The
@@ -16,7 +16,7 @@ def _hot(n, total):
     # STORE_NAME every iteration and revokes any trace that folded a
     # LOAD_GLOBAL from this module (`celldict.py notify_version_watchers`).
     i = 0
-    while i < 9600000:
+    while i < 28800000:
         total = total + n
         i = i + 1
     return total

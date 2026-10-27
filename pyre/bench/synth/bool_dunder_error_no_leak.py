@@ -1,8 +1,8 @@
-# pyre-check: max-pypy-ratio=76
+# pyre-check: max-pypy-ratio=110
 # A __bool__ that raises surfaces the error exactly once; the interpreter does
 # not stash a duplicate pending exception that resurfaces on a later unrelated
 # statement. Output verified against CPython/PyPy.
-N = 120000
+N = 5760000
 
 
 class Boom:

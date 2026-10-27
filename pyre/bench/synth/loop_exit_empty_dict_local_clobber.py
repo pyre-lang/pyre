@@ -1,5 +1,4 @@
-# pyre-check: max-pypy-ratio=19
-# The ceiling is twice the slowest ratio observed, 9.3x on the macos runner.
+# pyre-check: max-pypy-ratio=6.6
 # A local must not read back as the `for` loop's iterator after the loop.
 #
 # An empty dict literal must not decline in the codewriter: the decline
@@ -28,7 +27,7 @@
 #     slot just as `range_iterator` did).
 #
 # Expected output: ('set', 'dict')
-N = 1680000
+N = 55440000
 
 
 def driver(n):

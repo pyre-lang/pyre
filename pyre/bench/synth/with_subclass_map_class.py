@@ -12,7 +12,7 @@ except ImportError:
     pass
 
 WARM = 64
-N = 8000
+N = 72000
 
 
 class A:

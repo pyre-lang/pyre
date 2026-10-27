@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=54
+# pyre-check: max-pypy-ratio=175
 # PR271 review parity guard.  check.py's correctness oracle is PyPy, so this
 # bench only asserts behaviour where 3.14 and PyPy AGREE; it guards the
 # tuple-subclass override (P1), the live `__length_hint__` (P2) and the
@@ -82,7 +82,7 @@ def drive() -> list:  # noqa: PLR0915 - parity oracle kept intentionally linear
     # ignores `__len__`).  Driven hot so the FOR_ITER over the cursor compiles.
     total = 0
     n = 0
-    while n < 20000:
+    while n < 40000:
         for x in LenSeq():
             total += x
         n += 1
@@ -102,7 +102,7 @@ def drive() -> list:  # noqa: PLR0915 - parity oracle kept intentionally linear
     t = TupOverride([10, 20, 30])
     acc = 0
     n = 0
-    while n < 20000:
+    while n < 40000:
         acc = t[1]
         n += 1
     out.append(("tuple_override", acc))

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=18
 # A fresh empty list promoted by append takes RPython's first 0 -> 4 backing
 # grow. The following subscript revisits that block through
 # W_ListObject.int_items.block after the grow helper updates the owner field.
@@ -13,4 +13,4 @@ def f(n):
     return acc
 
 
-print(f(1500000))
+print(f(18000000))

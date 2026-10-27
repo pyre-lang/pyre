@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=37
+# pyre-check: max-pypy-ratio=11
 # An exception escaping a compiled frame must keep a traceback node for every
 # INLINED intermediate frame it passed through.
 #
@@ -31,7 +31,7 @@
 # every frame it propagates over, so a level that already had a node from
 # somewhere else would show up twice.  Each line is a full chain, so a doubled
 # node is as visible as a missing one.
-N = 1200000
+N = 7200000
 
 
 def leaf(i, n):

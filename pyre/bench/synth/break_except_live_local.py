@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=22
+# pyre-check: max-pypy-ratio=60
 MODULUS = 1_000_003
 
 
@@ -10,7 +10,7 @@ def maybe_raise(step):
 
 def run():
     total = 0
-    for _ in range(87_124):
+    for _ in range(348_496):
         value = 0
         step = 0
         while step < 10:

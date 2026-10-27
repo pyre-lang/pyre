@@ -1,9 +1,9 @@
-# pyre-check: max-pypy-ratio=65
+# pyre-check: max-pypy-ratio=130
 # A metaclass __getattr__ is consulted when an attribute is missing on a
 # type and its MRO, mirroring _handle_getattribute looking the hook up on
 # type(cls). A present attribute resolves normally without the hook.
 
-N = 200000
+N = 400000
 
 
 class Meta(type):

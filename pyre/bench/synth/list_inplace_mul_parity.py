@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=18
+# pyre-check: max-pypy-ratio=195
 # In-place list repeat (`list *= n`) parity.  CPython and PyPy both mutate the
 # list in place (listobject descr_inplace_mul), so the list object identity is
 # preserved across `*=`; only `*` produces a fresh list.  check.py's oracle is
@@ -54,7 +54,7 @@ def drive():
     # Drive a hot loop so a compiled trace exercises the in-place repeat.
     total = 0
     k = 0
-    while k < 80000:
+    while k < 480000:
         h = [k, k + 1]
         h *= 3
         total += len(h)

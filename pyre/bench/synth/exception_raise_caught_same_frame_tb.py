@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=20
 # A frame that raises and catches in one body contributes EXACTLY ONE
 # traceback node, and it keeps that count once the loop is compiled.
 #

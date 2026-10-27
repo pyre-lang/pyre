@@ -1,6 +1,4 @@
-# pyre-check: max-pypy-ratio=36
-# The ceiling is twice the slowest ratio observed (17.8x on the linux runner),
-# rounded up.
+# pyre-check: max-pypy-ratio=19
 # `__defaults__` replaced part-way through a compiled loop, in the two shapes
 # that break differently from a same-length replacement.
 #
@@ -16,7 +14,7 @@
 # Its `value0` is field 0, exactly where `W_TupleObject.wrappeditems` sits, so a
 # trace that reads `wrappeditems` off the live `defs_w` without proving the
 # class reads the raw integer instead of the items array.
-N = 3000000
+N = 15000000
 
 
 def long_tail(n):

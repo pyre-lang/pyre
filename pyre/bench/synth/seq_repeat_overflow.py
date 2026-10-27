@@ -1,10 +1,10 @@
-# pyre-check: max-pypy-ratio=64
+# pyre-check: max-pypy-ratio=110
 # Sequence repeat semantics: a count exceeding the signed machine word overflows
 # (OverflowError) rather than wrapping to a huge unsigned count that fails as
 # MemoryError, and a count of 1 on an immutable exact sequence returns the
 # receiver unchanged while a mutable one copies. Output verified against
 # CPython/PyPy.
-N = 240000
+N = 480000
 BIG = 2**63
 
 

@@ -1,8 +1,4 @@
-# pyre-check: max-pypy-ratio=22
-# pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is twice the slowest the macos
-# runner observes (11.0x). It read 10, a blanket value from the sweep that
-# first gave every fixture a ceiling.
+# pyre-check: max-pypy-ratio=8.2
 # Binary-operator and comparison TypeError messages name the operand's real
 # class (not the placeholder 'object'), and the `**`/pow() message reads
 # 'for ** or pow():'. A custom class with no numeric dunders drives every
@@ -30,7 +26,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(2250000))
+    print("warm", warm(22500000))
     f = Foo()
     m("add", lambda: 1 + f)
     m("sub", lambda: 1 - f)

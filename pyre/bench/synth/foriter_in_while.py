@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=13
 # FOR_ITER inside a while-loop: the common real-world pattern.
 # The while-loop is the JIT entry; the for-loop body must handle the FOR_ITER
 # liveness scoping correctly.  `outer_var` additionally reads the outer
@@ -8,7 +8,7 @@
 def main():
     total = 0
     n = 0
-    while n < 50000:
+    while n < 200000:
         for x in range(100):
             total += x
         n += 1
@@ -18,7 +18,7 @@ def main():
 def outer_var():
     total = 0
     n = 0
-    while n < 5000:
+    while n < 20000:
         for i in range(200):
             total += i * n
         n += 1
@@ -26,7 +26,7 @@ def outer_var():
 
 
 print(main())
-# Expected: 50000 * sum(range(100)) = 50000 * 4950 = 247500000
+# Expected: 200000 * sum(range(100)) = 200000 * 4950 = 990000000
 print(outer_var())
-# Expected: sum(n for n in range(5000)) * sum(i for i in range(200))
-#         = 12497500 * 19900 = 248700250000
+# Expected: sum(n for n in range(20000)) * sum(i for i in range(200))
+#         = 199990000 * 19900 = 3979801000000

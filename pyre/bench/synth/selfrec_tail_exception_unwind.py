@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=12
+# pyre-check: max-pypy-ratio=22
 """Self-recursive CALL_ASSEMBLER exception unwind regression.
 
 The raise happens while evaluating a tail call's accumulator argument.  It
@@ -22,7 +22,7 @@ def recur(depth, accumulator):
 
 
 checksum = 0
-for iteration in range(34_000):
+for iteration in range(68_000):
     try:
         checksum = (checksum + recur(iteration % 8, 0)) % MODULUS
     except ZeroDivisionError:

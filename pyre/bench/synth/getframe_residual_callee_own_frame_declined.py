@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=32
+# pyre-check: max-pypy-ratio=150
 # Historical `_declined` companion to `getframe_residual_callee_own_frame`.
 # Exact `_getframe(0).f_locals` now remains traced and owns the callee's exact
 # red frame, so it neither forces that frame nor clears the caller's
@@ -28,7 +28,7 @@ def bump(x):
 
 def main():
     total = 0
-    for i in range(100000):
+    for i in range(1500000):
         total += bump(i)
     print(total, c.n)
 

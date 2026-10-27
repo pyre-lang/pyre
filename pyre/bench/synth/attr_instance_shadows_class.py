@@ -7,7 +7,7 @@
 # still wins over a competing instance-dict entry (injected directly, since the
 # data descriptor's no-op __set__ never writes __dict__). Output verified
 # against CPython/PyPy.
-N = 60000
+N = 120000
 
 
 class T(tuple):

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=167
+# pyre-check: max-pypy-ratio=11
 # Regression guard for the per-call-created nested closure JIT hang.
 #
 # `add` is defined fresh on every `make` call, and `make` is driven from a
@@ -8,7 +8,7 @@
 # code object is re-materialized per call instead, every closure instance gets
 # a fresh green key, the give-up never sticks, and tracing thrashes
 # super-linearly until this bench times out.
-N = 120000
+N = 720000
 
 
 def make(n):

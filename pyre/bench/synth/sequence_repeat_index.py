@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=17
+# pyre-check: max-pypy-ratio=22
 # str/tuple `*` route the repeat count through getindex_w: a custom __index__
 # repeats the sequence just like list/bytes, and an out-of-index-range __index__
 # raises OverflowError naming the original operand. A hot loop first warms
@@ -32,7 +32,7 @@ def repeat(w_seq, w_count):
 
 
 def main():
-    print("warm", warm(900000))
+    print("warm", warm(1800000))
     print("tuple three", repeat((7,), Three()))
     print("str three", repeat("ab", Three()))
     print("tuple big", repeat((7,), BigIndex()))

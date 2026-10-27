@@ -31,7 +31,7 @@ def side_c(v):
 def main():
     total = 0
     i = 0
-    N = 80000
+    N = 480000
     while i < N:
         # Late flip: the and-chain's first operand is truthy until i=12000,
         # then always falsy so the chain short-circuits early.

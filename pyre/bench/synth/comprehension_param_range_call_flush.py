@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=11
 # A module-scope hot loop calling a helper that returns an inlined list
 # comprehension over `range(n)` with `n` a parameter.  Once the loop reaches the
 # trace threshold it records the `len(f(<const>))` body; recording the CALL to
@@ -23,7 +23,7 @@ def f(n):
 
 t = 0
 k = 0
-while k < 19800:
+while k < 79200:
     t += len(f(300))
     k += 1
 print(t)

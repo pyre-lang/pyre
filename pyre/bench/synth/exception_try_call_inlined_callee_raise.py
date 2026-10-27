@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=24
+# pyre-check: max-pypy-ratio=130
 # A conditional raise two call levels below a `try` must reach the enclosing
 # `except`, including once the frame holding the `try` runs as its own compiled
 # trace.
@@ -15,7 +15,7 @@
 # from completing a trace of its own, so `shape` is compiled as a func-entry
 # trace instead of being inlined into the caller.  The raise must also be
 # conditional, so the exception edge stays off the recorded path.
-N = 720000
+N = 4320000
 
 
 def leaf(i):

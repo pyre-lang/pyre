@@ -9,7 +9,7 @@
 # FOR_ITER advance mutates shared counter (exempt). Then a declining nested-residual CALL.
 # If the inline sub-walk aborts AFTER the exempt advance and the trait leg re-runs step,
 # the SHARED generator is advanced AGAIN -> double advance / dropped item / counter skew.
-N = 200000
+N = 1200000
 
 
 class Shared:

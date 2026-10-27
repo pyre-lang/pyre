@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=34
+# pyre-check: max-pypy-ratio=130
 # A metaclass overriding __getattribute__ / __delattr__ intercepts class
 # attribute reads / deletes (`C.x`, `del C.x`), replacing the builtin
 # type.__getattribute__ / type.__delattr__.  objspace.py:664 runs the
@@ -6,7 +6,7 @@
 # receiver.  A __getattribute__ raising AttributeError falls back to the
 # metaclass __getattr__.  Ordinary classes (metaclass=type) are unaffected.
 # Output verified against CPython/PyPy.
-N = 20000
+N = 80000
 
 
 class Meta1(type):

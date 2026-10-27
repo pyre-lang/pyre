@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=21
 # Two nested hot loops with a guard-set switch keyed on the outer phase; the
 # inner late arm (touching a None-or-int local) only executes once the global
 # count crosses 5000, forcing bridge deopts mid-run. This once panicked on
@@ -30,7 +30,7 @@ def main():
     hold = None
     count = 0
     outer = 0
-    while outer < 1200:
+    while outer < 10800:
         gate = count > 5000
         s, hold = inner(outer, label, hold, gate)
         total += s

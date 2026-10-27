@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=41
+# pyre-check: max-pypy-ratio=57
 # PEP 479: a StopIteration that escapes a generator body is replaced by
 # RuntimeError("generator raised StopIteration") chained from it, across every
 # drive path (list / for / tuple / next / send) and whether the StopIteration
@@ -45,7 +45,7 @@ def drive():
     # Drive the conversion hot so a compiled trace exercises the leak path.
     hot = 0
     n = 0
-    while n < 60000:
+    while n < 120000:
         try:
             list(g_raise())
         except RuntimeError:

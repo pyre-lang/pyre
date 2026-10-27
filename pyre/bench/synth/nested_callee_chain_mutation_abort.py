@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=26
 # gh#495 guard: nested inlined callees mutate through a branch-bearing abort path.
 # 3-level nested branch-bearing mutating callees. outer while -> A -> B -> C, each mutates.
-N = 320000
+N = 1920000
 
 
 class Counter:

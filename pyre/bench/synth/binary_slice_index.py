@@ -1,7 +1,5 @@
-# pyre-check: max-pypy-ratio=368.5
+# pyre-check: max-pypy-ratio=370
 # pyre-check: trace-shape=main:max=CallMayForceR:6
-# dynasm 79.5-184.2x, cranelift 91.3-178.7x; the ceiling is twice the slower,
-# rounded up to one decimal place.
 # Slice bounds are evaluated through __index__ in both lowering paths:
 #   * a dynamic slice `seq[a:b]` compiles to BINARY_SLICE, handled by
 #     `binary_slice_values`;

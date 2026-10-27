@@ -1,7 +1,4 @@
-# pyre-check: max-pypy-ratio=105
-# pypy's exec time is pinned to the startup-subtraction floor here, so the
-# ratio is not a measurement: the ceiling is twice the slowest ratio the CI
-# runners observe (51.5x), rounded up.
+# pyre-check: max-pypy-ratio=91
 # A guard failing inside an inlined `__init__` must hand the caller the
 # instance, not `__init__`'s return value.  `typeobject.py descr_call` discards
 # `__init__`'s result and returns the instance; the flattened constructor
@@ -37,7 +34,7 @@ class Loop:
 
 loop = Loop()
 none_handles = 0
-for i in range(100000):
+for i in range(3000000):
     h = loop._call_soon(int, (), None)
     if h is None:
         none_handles += 1

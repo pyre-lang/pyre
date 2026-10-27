@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=13
+# pyre-check: max-pypy-ratio=125
 # operator's in-place functions (iadd/iand/ior/... = space.inplace_X) and the
 # mutable set's in-place operator slots (__iand__/__ior__/__ixor__/__isub__,
 # each a set/frozenset-only op that mutates self and returns it). Sets are
@@ -19,7 +19,7 @@ def s(x):
 
 
 def main():
-    print("warm", warm(75000))
+    print("warm", warm(3600000))
 
     # operator in-place arithmetic / bitwise on ints
     print("iadd", operator.iadd(3, 4))

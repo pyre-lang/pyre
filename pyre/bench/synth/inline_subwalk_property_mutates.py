@@ -1,7 +1,7 @@
-# pyre-check: max-pypy-ratio=50
+# pyre-check: max-pypy-ratio=94
 # gh#495 guard: inlined property residual mutates before branch and caught miss.
 # @property value-returning mutating + try/except-inside-callee raising branch
-N = 120000
+N = 240000
 class C:
     def __init__(self): self.pos = 0
     @property

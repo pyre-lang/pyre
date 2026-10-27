@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=108
+# pyre-check: max-pypy-ratio=150
 # #171/PR248 §3a: generic sequence-protocol iteration must be LAZY.
 # An object with `__getitem__` but no `__iter__` iterates through a sequence
 # cursor (iterobject.py W_SeqIterObject.descr_next: `space.getitem` per step,
@@ -27,7 +27,7 @@ def main():
     total = 0
     order = 0
     n = 0
-    while n < 40000:
+    while n < 80000:
         step = 0
         for x in Seq():
             # Fold the visit order in so a batch-then-iterate path (which would

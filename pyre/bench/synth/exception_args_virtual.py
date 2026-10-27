@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=21
-N = 2000000
+N = 12000000
 
 
 def may_fail(i):

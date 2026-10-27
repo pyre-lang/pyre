@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=19
+# pyre-check: max-pypy-ratio=12
 # An `except (A, B):` clause builds its match target with `BUILD_TUPLE` on
 # every visit, so the tuple is a fresh object each time the handler runs. The
 # `CHECK_EXC_MATCH` fold pins the match target it saw while tracing; pinning
@@ -10,7 +10,7 @@
 # The single-class `except A:` loop below is the control: same raise rate, a
 # match target that is loaded rather than built. Both loops must agree with the
 # interpreter and neither may accumulate side exits.
-N = 600000
+N = 7200000
 
 
 def tuple_clause(n):

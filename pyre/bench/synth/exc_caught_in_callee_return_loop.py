@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=55
+# pyre-check: max-pypy-ratio=59
 # A callee catches a residual-call exception in-frame and RETURNS a sentinel
 # into a JIT-hot outer loop.  When the callee gets hot enough that a bridge is
 # compiled for the exception-guard (GUARD_NO_EXCEPTION) failure on the
@@ -7,7 +7,7 @@
 # raised-call result and hand a NULL back to the caller — "call failed").  The
 # bridge tracer declines the caught-in-frame exception-guard case so the
 # blackhole resume routes the exception to the handler and returns the sentinel.
-N = 360000
+N = 1440000
 
 
 def lookup(d, k):

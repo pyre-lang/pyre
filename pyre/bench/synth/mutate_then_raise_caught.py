@@ -1,7 +1,7 @@
-# pyre-check: max-pypy-ratio=35
+# pyre-check: max-pypy-ratio=18
 # gh#495 guard: mutating residual raises and is caught inside the inlined callee.
 # V2: mutate-then-RAISE, caught inside callee. Tests fixed path under exc churn.
-N = 240000
+N = 1920000
 class C:
     def __init__(self):
         self.pos = 0

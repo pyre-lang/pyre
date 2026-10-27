@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=9.2
 # CHECK_EXC_MATCH against a non-exception target. The loop warms up with a
 # valid except class so the trace JIT-compiles, then on the final iteration the
 # except target becomes a non-exception (int 5). cmp_exc_match raises TypeError
@@ -22,7 +22,7 @@ def f(n):
 
 
 def main():
-    cv, ct = f(3000000)
+    cv, ct = f(15000000)
     print("final", cv, ct)
 
 

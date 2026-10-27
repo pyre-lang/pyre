@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=23
 # An extended slice `seq[a:b:c]` (a step operand) compiles the bounds to
 # BUILD_SLICE — the `newslice(start, stop, step)` HLOp — then BINARY_SUBSCR,
 # a distinct lowering from the two-bound BINARY_SLICE path. A `newslice`
@@ -12,7 +12,7 @@
 # follows re-enters through a bridge whose guard can then fail once more,
 # which moves guard_failures for reasons outside this fixture. Crossing
 # resumes around 0.3x of the old count; the gated counters are unchanged.
-N = 150000
+N = 300000
 
 
 class Idx:

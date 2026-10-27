@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=364
+# pyre-check: max-pypy-ratio=365
 """Hot property get/set plus Python 3.14 metadata surface."""
 
 
@@ -36,7 +36,7 @@ def main():
     counter = Counter()
     total = 0
     i = 0
-    while i < 800000:
+    while i < 8000000:
         counter.value = i
         total += counter.value
         i += 1
@@ -50,7 +50,7 @@ def main():
     # The property fold is exact-type only.  A subclass keeps the same layout
     # but must still dispatch through its overridden descriptor methods.
     owner = PropertySubclassOwner()
-    for _ in range(20000):
+    for _ in range(200000):
         assert owner.value == "override-get"
     owner.value = 1
     assert owner.recorded == "override-set"

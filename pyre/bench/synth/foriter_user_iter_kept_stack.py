@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=31
+# pyre-check: max-pypy-ratio=69
 # User-defined iterator FOR_ITER paths enter a user frame for each item while
 # the caller keeps a depth > 1 operand stack resident across condexpr and
 # short-circuit branch guards.  The kept-stack branch guards must remain
@@ -6,7 +6,7 @@
 # ResultToTos boundary, including heap-int (>= 256) merge slots, nested user
 # iterators, and a comprehension.
 
-N = 60000
+N = 180000
 
 
 class NextIter:

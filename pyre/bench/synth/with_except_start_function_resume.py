@@ -1,5 +1,4 @@
-# pyre-check: max-pypy-ratio=12
-# The ceiling is twice the slowest ratio observed, 14.2x on the macos runner.
+# pyre-check: max-pypy-ratio=21
 # A function-entry trace records only the early-return arm.  The first true
 # call then fails that guard and blackhole-replays the previously unvisited
 # `with` arm.  WITH_EXCEPT_START must read the live handler stack and call
@@ -31,7 +30,7 @@ def run(raise_inside):
         abs()
 
 
-for _ in range(6300):
+for _ in range(126000):
     run(False)
 run(True)
 print("ok", len(seen))

@@ -1,6 +1,4 @@
-# pyre-check: max-pypy-ratio=139.1
-# dynasm 35.0-69.5x, cranelift 41.7-50.2x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=90
 # Sequence-iterator pickle protocol parity.  check.py's correctness oracle is
 # PyPy, so this bench asserts only behaviour where 3.14 and PyPy AGREE.
 #

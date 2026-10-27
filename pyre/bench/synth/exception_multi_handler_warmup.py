@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=17
+# pyre-check: max-pypy-ratio=25
 # Multi-except dispatch + counter-only handler bodies on the blackhole
 # guard-failure resume path. The loop warms up exception-free (so the trace
 # compiles the no-exception path), then raises ZeroDivisionError and
@@ -12,7 +12,7 @@
 #     so the handler was skipped.
 # A trace that raises from iteration 1 records the handler and never needs
 # the resume path; only warm-up-then-raise reaches it.
-N = 864000
+N = 1728000
 
 
 def work(n):

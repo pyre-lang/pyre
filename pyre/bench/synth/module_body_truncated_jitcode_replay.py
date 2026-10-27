@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=21
+# pyre-check: max-pypy-ratio=8.2
 # A module body whose JitCode lowering stops early must not let a later loop
 # header borrow the truncation's resume marker. `class` compiles to
 # LOAD_BUILD_CLASS, which has no JitCode lowering, so the body ends there with
@@ -25,7 +25,7 @@ seen.append("once")
 
 i = 0
 steps = 0
-while i < 2400000:
+while i < 21600000:
     steps = steps + i
     i = i + 1
 

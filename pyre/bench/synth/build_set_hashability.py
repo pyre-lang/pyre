@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=105
+# pyre-check: max-pypy-ratio=120
 # BUILD_SET (the {...} set literal) hashes every element through
 # space.hash_w, so an unhashable element — a list, or an instance whose
 # __hash__ is None / raises / returns a non-int — raises instead of silently
@@ -13,7 +13,7 @@
 # 71000; 70000 is the last zero-poll value. 60000 keeps a ~10k margin,
 # `back_edge_polls=0` on all three backends, and the same guard_failures;
 # loops_compiled stays 3.
-N = 60000
+N = 120000
 
 
 class HashRaises:

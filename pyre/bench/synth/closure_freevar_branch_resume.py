@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=28
+# pyre-check: max-pypy-ratio=11
 # gh#498 guard: a branch resume must keep the current closure-call result
 # local, across the three freevar flavours.
 #
@@ -8,7 +8,7 @@
 #
 # Each flavour keeps its own driver loop so the closure stays a direct call
 # from the hot loop, as it was when these lived in separate files.
-N = 240000
+N = 1440000
 
 
 def run_readonly():

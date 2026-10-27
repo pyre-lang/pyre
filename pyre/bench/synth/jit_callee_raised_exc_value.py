@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=35
+# pyre-check: max-pypy-ratio=88
 # An exception raised by a CALLEE (a helper function or an exhausted generator)
 # with a per-iteration computed argument, caught in a hot JIT-traced caller's
 # `except ... as e`. walker_record_guard_exception discarded the GuardException
@@ -27,14 +27,14 @@ def echo(n):
 def run():
     h = 0
     # Callee helper raise: e.args[0] must track w each iteration.
-    for k in range(12000):
+    for k in range(24000):
         w = (k * 7 + 3) % M
         try:
             boom(w)
         except ValueError as e:
             h = (h * 31 + e.args[0]) & 0xFFFFFFFFFF
     # Exhausted-generator StopIteration: e.value must track the returned total.
-    for k in range(12000):
+    for k in range(24000):
         gg = echo(9)
         gg.send(None)
         i = 0

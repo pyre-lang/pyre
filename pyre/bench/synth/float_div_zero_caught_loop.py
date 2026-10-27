@@ -5,7 +5,7 @@
 # A `float_eq(rhs, 0.0) -> guard_false` precondition (the JIT form of
 # floatobject.py:519 `_floatdiv`'s zero check) deopts a zero divisor to the
 # checked descr_truediv path, which raises and is caught in-frame.
-N = 480000
+N = 3840000
 
 
 def helper(i):

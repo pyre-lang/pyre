@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=60
+# pyre-check: max-pypy-ratio=9.7
 # The forced-vable escape on a BRIDGE walk -- the case its two older siblings
 # `getframe_bridge_force_plain` and `getframe_bridge_force_after_store` were
 # written for and can no longer produce.
@@ -21,13 +21,6 @@
 # lever; this file keeps the inlined rare-arm shape and pins that the
 # printed totals stay the same once the fold compiles.
 #
-# The ceiling is a level record, not a fitted number. Locally this reads ~9.4x
-# on dynasm and ~11.2x on cranelift, both `~`-clamped so no gate is applied --
-# but `~` is not a property of the fixture, it is a property of the run, and the
-# same family has been seen to read 5.6x locally and 25-30x on the ubuntu
-# cranelift leg. 60 is that local cranelift number carried across that observed
-# spread with room; tighten it once a CI reading exists, and set it from the leg
-# that ENFORCES it rather than from a dynasm measurement.
 import sys
 
 _gf = sys._getframe
@@ -45,7 +38,7 @@ def peek():
 def main():
     total = 0
     names = 0
-    for i in range(2000000):
+    for i in range(12000000):
         if i % 97 == 0:
             names += len(peek())
         total += i

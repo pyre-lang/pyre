@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=7.4
 # A CALL_KW directly in the hot loop body (not nested inside an inlined
 # callee, unlike call_star_forms_inlined_callee.py), on a callee the seeded
 # inline takes.  The keyword overrides a default (`step=1`) and the result
@@ -13,7 +13,7 @@
 # because the names tuple sits above the arguments (caller_operand_slots).
 # call_kw_residual_kwargs_callee.py is the other half, covering the same
 # opcode on a callee the inline declines.
-N = 2400000
+N = 33600000
 
 
 def g(x, step=1):

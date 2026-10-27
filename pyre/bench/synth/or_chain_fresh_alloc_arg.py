@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=141
-N = 300000
+# pyre-check: max-pypy-ratio=16
+N = 6000000
 
 
 class Box:

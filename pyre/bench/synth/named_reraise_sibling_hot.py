@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=14
 # A named `except E as m:` handler whose body bare-re-raises compiles its
 # implicit cleanup to `DELETE_FAST m; RERAISE`, immediately followed by a
 # sibling `except` clause's type check. On the re-raise path the exception must
@@ -6,7 +6,7 @@
 # binding `m` is cleared. A `del` of a bound local inside the try body plus a
 # sibling clause exercises the same walker-native DELETE_FAST bound
 # continuation. Output is verified against CPython/PyPy.
-N = 810000
+N = 4860000
 
 
 def reraise_sibling(i):

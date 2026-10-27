@@ -50,10 +50,10 @@ def triple_nest(a_n, b_n, c_n):
     return s
 
 
-print("rect_40_50", rectangular(40, 50))
-print("rect_50_40", rectangular(50, 40))
-print("rect_1000_200", rectangular(1000, 200))
-print("tri_200", triangular(200))
-print("tri_523", triangular(523))
-print("fif_300_211", for_in_for(300, 211))
-print("triple_40_30_20", triple_nest(40, 30, 20))
+print("rect_160_50", rectangular(160, 50))
+print("rect_200_40", rectangular(200, 40))
+print("rect_4000_200", rectangular(4000, 200))
+print("tri_800", triangular(800))
+print("tri_2092", triangular(2092))
+print("fif_1200_211", for_in_for(1200, 211))
+print("triple_160_30_20", triple_nest(160, 30, 20))

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=43
+# pyre-check: max-pypy-ratio=8.4
 # Nested FOR_ITER with a branch-local Int condition and a kept stack at the
 # bridge resume point. The resolved-offset bridge decodes a non-empty Int bank,
 # so the Int register bank is reconstructed concretely at bridge resume and the
@@ -20,4 +20,4 @@ def run(n):
     return total
 
 
-print(run(100000))
+print(run(3000000))

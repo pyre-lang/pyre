@@ -1,5 +1,5 @@
 # pyre-check: requires-modules=gc
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=15
 # One LOAD_ATTR site alternates between maps whose insertion order assigns
 # different storage slots to `q`; promoting the map must guard the selected
 # storage coordinate, while a class-layout guard alone cannot (mapdict.py _get_mapdict_map).
@@ -35,4 +35,4 @@ def run(n):
     return total
 
 
-print(run(1000000))
+print(run(9000000))

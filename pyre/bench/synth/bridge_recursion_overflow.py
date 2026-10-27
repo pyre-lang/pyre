@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=8.9
 # Parity fixture for the depth-1 bridge self-recursive inline lift
 # (#704). `f` is a tail-recursive
 # exact-integer callee whose `acc * 2 + 1` crosses the machine-int boundary
@@ -16,6 +16,6 @@ def f(n, acc):
 
 
 out = []
-for i in range(18000):
+for i in range(36000):
     out.append(f(64, i) % 1000000007)
 print(out[0], out[-1], sum(out) % 1000000007)

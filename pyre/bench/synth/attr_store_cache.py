@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=128
-N = 480000
+# pyre-check: max-pypy-ratio=130
+N = 960000
 
 
 class C:

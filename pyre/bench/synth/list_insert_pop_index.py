@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=19
+# pyre-check: max-pypy-ratio=48
 # list.insert(index, x) and list.pop(index) coerce the index through
 # `__index__` (`getindex_w(index, OverflowError)`): a small custom index
 # inserts/pops at the resolved position, an out-of-range pop reports "pop index
@@ -43,7 +43,7 @@ def pop(i):
 
 
 def main():
-    print("warm", warm(75000))
+    print("warm", warm(1875000))
     m("ins_idx", lambda: ins(Idx(1)))
     m("ins_neg", lambda: ins(Idx(-1)))
     m("ins_float", lambda: ins(1.5))

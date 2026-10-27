@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=35
+# pyre-check: max-pypy-ratio=56
 # BINARY_SUBSCR whose receiver resolves `__getitem__` to a Python function.
 # Covers the two receiver shapes whose subscript the type's own MRO owns — a
 # user instance and a builtin sequence subclass that overrides `__getitem__` —
@@ -78,11 +78,11 @@ def hot_rebind(o, n):
 
 
 def main():
-    print("plain", hot_plain(Seq(), 60000))
-    print("caught", hot_caught(Seq(), 60000))
-    print("override", hot_override(TupOverride([10, 20, 30]), 60000))
-    print("polymorphic", hot_polymorphic(Seq(), Neg(), 60000))
-    print("rebind", hot_rebind(Rebind(), 60000))
+    print("plain", hot_plain(Seq(), 2160000))
+    print("caught", hot_caught(Seq(), 2160000))
+    print("override", hot_override(TupOverride([10, 20, 30]), 2160000))
+    print("polymorphic", hot_polymorphic(Seq(), Neg(), 2160000))
+    print("rebind", hot_rebind(Rebind(), 2160000))
 
     # A special method resolves on the type, so an instance-dict entry is not
     # consulted and the subscript still raises.

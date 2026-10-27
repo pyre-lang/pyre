@@ -1,7 +1,4 @@
-# pyre-check: max-pypy-ratio=17
-# pypy's exec time is pinned to the startup-subtraction floor on most runs here,
-# so the ratio is not a measurement. Nine local readings across the three
-# backends span 1.8x-5.5x, and the ceiling is three times the slowest of them.
+# pyre-check: max-pypy-ratio=32
 #
 # A guard-failure resume inside an inlined callee must close that callee's
 # execution-context scope before its blackhole advances to the caller
@@ -24,7 +21,7 @@ import sys
 
 
 def inner(k):
-    if k > 17997:                       # two triggering calls, not one
+    if k > 863997:                       # two triggering calls, not one
         return sys._getframe(1).f_locals['base']
     return k
 
@@ -37,4 +34,4 @@ def outer(n):
     return acc, sorted(locals().keys())
 
 
-print(outer(18000))
+print(outer(864000))
