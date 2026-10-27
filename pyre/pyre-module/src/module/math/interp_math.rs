@@ -1071,18 +1071,20 @@ pub fn dist(args: &[PyObjectRef]) -> PyResult {
     }
     // `interp_math.py dist`: unpack both sequences, then compare lengths,
     // then `_get_double` per coordinate. Conversion can call `__float__`.
+    // `collect_iterable` returns unrooted pointers. Publish the first
+    // sequence before unpacking the second.
     let w_p = args[0];
     let mut w_q = args[1];
     let p_items =
         pyre_object::with_roots!(w_q => pyre_interpreter::builtins::collect_iterable(w_p))?;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let p_base = pyre_object::gc_roots::pin_roots(&p_items);
     let q_items = pyre_interpreter::builtins::collect_iterable(w_q)?;
     if p_items.len() != q_items.len() {
         return Err(pyre_interpreter::PyError::value_error(
             "both points must have the same number of dimensions",
         ));
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let p_base = pyre_object::gc_roots::pin_roots(&p_items);
     let q_base = pyre_object::gc_roots::pin_roots(&q_items);
     let mut p = Vec::with_capacity(p_items.len());
     let mut q = Vec::with_capacity(q_items.len());
