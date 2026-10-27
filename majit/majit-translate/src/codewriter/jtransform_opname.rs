@@ -56,10 +56,13 @@
 //! `Transformer.rewrite_op_malloc_varsize` / `rewrite_op_getarrayitem` /
 //! `rewrite_op_setarrayitem` / `rewrite_op_getarraysize` (`jtransform.py`)
 //! rewrite a standalone `GcArray` (a list `items` block) to `new_array` /
-//! `getarrayitem_gc_*` / `setarrayitem_gc_*` / `arraylen_gc`.  The
-//! transducer distinguishes that ARRAY from a STR/UNICODE `chars` interior
-//! array by the lltype on the op (`malloc_varsize`'s first-arg Constant
-//! ARRAY, or the array operand's `concretetype`), not by the helper name.
+//! `getarrayitem_gc_*` / `setarrayitem_gc_*` / `arraylen_gc`, and a raw
+//! `ARRAY` (`rffi.CArray`, `_gckind == 'raw'`) to `raw_malloc_varsize` /
+//! `getarrayitem_raw_*` / `setarrayitem_raw_*` (`_rewrite_raw_malloc`).
+//! The transducer distinguishes those ARRAYs from a STR/UNICODE `chars`
+//! interior array by the lltype on the op (`malloc_varsize`'s first-arg
+//! Constant ARRAY, or the array operand's `concretetype`), not by the
+//! helper name.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -345,10 +348,14 @@ fn transduce_op(
                 );
             }
         }
-        // `s.chars[i]` → `strgetitem(s, i)` / `unicodegetitem(s, i)`.  A
-        // standalone `GcArray` is `getarrayitem_gc_<kind>`
-        // (`rewrite_op_getarrayitem`).  Prefix: `_array_of_voids` then
-        // `FixedSizeArray` (`rewrite_op_getarrayitem`).
+        // `Transformer.rewrite_op_getarrayitem`: `_array_of_voids` then
+        // `FixedSizeArray`, then a standalone ARRAY.  `ARRAY._gckind ==
+        // 'gc'` is `getarrayitem_gc_<kind>` (`pure` from
+        // `_immutable_field`); `ARRAY._gckind == 'raw'` is
+        // `getarrayitem_raw_<kind>` with `pure` always false (never
+        // `_pure`) and `getarrayitem_raw_r` refused.  A STR/UNICODE
+        // `chars` interior pointer fuses to `strgetitem` /
+        // `unicodegetitem`.
         "getarrayitem" => {
             if let Some(array_ty) = array_type_of_operand(&op.args[0]) {
                 if array_of_voids(&array_ty) {
@@ -372,10 +379,11 @@ fn transduce_op(
                 emit_getarrayitem(out, block, op, chars_alias, family);
             }
         }
-        // `s.chars[i] = c` → `strsetitem(s, i, c)` / `unicodesetitem(...)`.
-        // Void result.  A standalone `GcArray` is `setarrayitem_gc_<kind>`
-        // (`rewrite_op_setarrayitem`).  Prefix: `_array_of_voids` then
-        // `FixedSizeArray` (`rewrite_op_setarrayitem`).
+        // `Transformer.rewrite_op_setarrayitem`: `_array_of_voids` then
+        // `FixedSizeArray`, then a standalone ARRAY.
+        // `setarrayitem_<gckind>_<kind>`; `setarrayitem_raw_r` is
+        // refused.  A STR/UNICODE `chars` interior pointer fuses to
+        // `strsetitem` / `unicodesetitem`.
         "setarrayitem" => {
             if let Some(array_ty) = array_type_of_operand(&op.args[0]) {
                 if array_of_voids(&array_ty) {
@@ -397,13 +405,32 @@ fn transduce_op(
                 emit_setarrayitem(out, block, op, chars_alias, family);
             }
         }
-        // `rewrite_op_malloc_varsize`: flavor `raw` first (these helpers are
-        // gc), then `op.args[0].value == rstr.STR` → `newstr`,
-        // `== rstr.UNICODE` → `newunicode`, else ARRAY → `new_array` /
-        // `new_array_clear`.
+        // `Transformer.rewrite_op_malloc_varsize`: flavor `raw` first
+        // (`_rewrite_raw_malloc` / `raw_malloc_varsize`), then
+        // `op.args[0].value == rstr.STR` → `newstr`, `== rstr.UNICODE`
+        // → `newunicode`, else ARRAY → `new_array` / `new_array_clear`.
         "malloc_varsize" => {
             let malloc_ty = malloc_type_lltype(&op.args[0]);
-            if let Some(alloc_family) = str_family_from_lltype(malloc_ty) {
+            if crate::codewriter::call::effect_malloc_flavor_is_raw(&op.args[1]) {
+                let (zero, track_allocation, add_memory_pressure, extra_flags) =
+                    crate::codewriter::call::effect_malloc_raw_flags(&op.args[1]);
+                let owner = crate::codewriter::call::effect_malloc_owner(&op.args[0]);
+                let size = materialize(out, block, &op.args[2]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::raw_malloc_with_flags(
+                        owner,
+                        Some(malloc_ty.clone()),
+                        zero,
+                        track_allocation,
+                        add_memory_pressure,
+                        extra_flags,
+                        Some(size),
+                    ),
+                    result,
+                );
+            } else if let Some(alloc_family) = str_family_from_lltype(malloc_ty) {
                 let size = materialize(out, block, &op.args[2]);
                 let result = expect_var(&op.result);
                 out.push_op_with_result_var(
@@ -772,24 +799,44 @@ fn transduce_op(
                 false,
             );
         }
-        // `malloc(STRUCT, {'flavor':'gc'})` for a fixed-size GcStruct → `New`.
-        // The struct leaf (`"stringbuilder"`) is read off the first operand's
-        // `LowLevelType` constant and keys the assembler's size descriptor
-        // (`bh_size_spec_from_callcontrol`, `path_hash(owner)`).  A plain
-        // GcStruct with no boxed `ob_type`, so `New` (not `NewWithVtable`).
-        // The flavor operand must be `{'flavor': 'gc'}`: `jtransform.py
-        // rewrite_op_malloc` lowers only the gc flavor to `new(descr)`, so a
-        // `raw`/`nonmovable` allocation is rejected rather than silently
-        // lowered to a GC `New`.
+        // `Transformer.rewrite_op_malloc`: flavor `raw` is
+        // `_rewrite_raw_malloc` / `raw_malloc_fixedsize`; flavor `gc`
+        // is `new(descr)` (`New`).  The struct leaf (`"stringbuilder"`)
+        // is read off the first operand's `LowLevelType` constant and
+        // keys the assembler's size descriptor
+        // (`bh_size_spec_from_callcontrol`, `path_hash(owner)`).  A
+        // plain GcStruct with no boxed `ob_type`, so `New` (not
+        // `NewWithVtable`).  Any other flavor is refused.
         "malloc" => {
-            assert!(
-                is_gc_flavor_const(&op.args[1]),
-                "jtransform_opname::lower_graph: malloc flavor operand is not {{'flavor': 'gc'}}: {:?}",
-                op.args[1]
-            );
-            let owner = malloc_struct_owner(&op.args[0]);
-            let result = expect_var(&op.result);
-            out.push_op_with_result_var(block, OpKind::New { owner }, result);
+            if crate::codewriter::call::effect_malloc_flavor_is_raw(&op.args[1]) {
+                let (zero, track_allocation, add_memory_pressure, extra_flags) =
+                    crate::codewriter::call::effect_malloc_raw_flags(&op.args[1]);
+                let owner = crate::codewriter::call::effect_malloc_owner(&op.args[0]);
+                let malloc_ty = crate::codewriter::call::effect_malloc_type(&op.args[0]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::raw_malloc_with_flags(
+                        owner,
+                        Some(malloc_ty),
+                        zero,
+                        track_allocation,
+                        add_memory_pressure,
+                        extra_flags,
+                        None,
+                    ),
+                    result,
+                );
+            } else {
+                assert!(
+                    is_gc_flavor_const(&op.args[1]),
+                    "jtransform_opname::lower_graph: malloc flavor operand is not {{'flavor': 'gc'}}: {:?}",
+                    op.args[1]
+                );
+                let owner = malloc_struct_owner(&op.args[0]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(block, OpKind::New { owner }, result);
+            }
         }
         // `Transformer` rename table: Bool and Signed share the `i` input
         // bank, so the one backend conversion is `cast_int_to_float`.
@@ -1194,6 +1241,27 @@ fn gc_array_from_lltype(ty: &LowLevelType) -> Option<Array> {
     }
 }
 
+/// Raw `Array` carried by `v.concretetype` / `concretetype.TO`
+/// (`Transformer.rewrite_op_getarrayitem` `ARRAY._gckind == 'raw'`).
+fn raw_array_of_operand(hlv: &Hlvalue) -> Option<Array> {
+    let var = hlvalue_as_var(hlv)?;
+    raw_array_from_lltype(&var.concretetype()?)
+}
+
+fn raw_array_from_lltype(ty: &LowLevelType) -> Option<Array> {
+    match ty {
+        LowLevelType::ForwardReference(fwd) => raw_array_from_lltype(&fwd.resolved()?),
+        LowLevelType::Array(arr) if arr._gckind == GcKind::Raw => Some(arr.as_ref().clone()),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) if arr._gckind == GcKind::Raw => Some(arr.clone()),
+            PtrTarget::ForwardReference(fwd) => raw_array_from_lltype(&fwd.resolved()?),
+            _ => None,
+        },
+        LowLevelType::InteriorPtr(ip) => raw_array_from_lltype(ip.TO.as_ref()),
+        _ => None,
+    }
+}
+
 /// `ARRAY = op.args[0].concretetype.TO` (`rewrite_op_getarrayitem` /
 /// `rewrite_op_setarrayitem`).  `malloc_type_lltype` produces the TYPE
 /// constant itself, not a Ptr; this helper is the operand-side Ptr.TO.
@@ -1279,6 +1347,33 @@ fn emit_getarrayitem(
             },
             result,
         );
+    } else if let Some(array) = raw_array_of_operand(&op.args[0])
+        .filter(|_| !chars_alias.contains_key(&expect_var(&op.args[0])))
+    {
+        // `Transformer.rewrite_op_getarrayitem`: a standalone raw ARRAY
+        // never uses `_pure`; a reference result is
+        // `getarrayitem_raw_r not supported`.  STR/UNICODE `chars` is
+        // also `GcKind::Raw`; a same-block `getsubstruct` alias stays
+        // on the fusion arm below.
+        let base = expect_var(&op.args[0]);
+        let index = materialize(out, block, &op.args[1]);
+        let result = expect_var(&op.result);
+        let item_ty = value_type_of(&result);
+        if matches!(item_ty, ValueType::Ref(_)) {
+            panic!("getarrayitem_raw_r not supported");
+        }
+        out.push_op_with_result_var(
+            block,
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty,
+                array_type_id: array_type_id_of(&array),
+                nolength: array_nolength(&array),
+                pure: false,
+            },
+            result,
+        );
     } else {
         let string_var = resolve_string(chars_alias, &op.args[0]);
         let index = materialize(out, block, &op.args[1]);
@@ -1316,6 +1411,32 @@ fn emit_setarrayitem(
                 index,
                 value,
                 item_ty: hlvalue_value_type(&op.args[2]),
+                nolength: array_nolength(&array),
+                array_type_id: array_type_id_of(&array),
+            },
+            false,
+        );
+    } else if let Some(array) = raw_array_of_operand(&op.args[0])
+        .filter(|_| !chars_alias.contains_key(&expect_var(&op.args[0])))
+    {
+        // `Transformer.rewrite_op_setarrayitem`: a standalone raw ARRAY
+        // of references is `setarrayitem_raw_r not supported`.
+        // STR/UNICODE `chars` is also `GcKind::Raw`; a same-block
+        // `getsubstruct` alias stays on the fusion arm below.
+        let item_ty = hlvalue_value_type(&op.args[2]);
+        if matches!(item_ty, ValueType::Ref(_)) {
+            panic!("setarrayitem_raw_r not supported");
+        }
+        let base = expect_var(&op.args[0]);
+        let index = materialize(out, block, &op.args[1]);
+        let value = linkarg_from_hlvalue(&op.args[2]);
+        out.push_op_var(
+            block,
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value,
+                item_ty,
                 array_type_id: array_type_id_of(&array),
                 nolength: array_nolength(&array),
             },
@@ -1620,9 +1741,8 @@ fn malloc_struct_owner(hlv: &Hlvalue) -> String {
 }
 
 /// Whether a `malloc` flavor operand is the `{'flavor': 'gc'}` dict constant
-/// (`gc_flavor_const`).  `jtransform.py rewrite_op_malloc` lowers only the gc
-/// flavor to `new(descr)`; a `raw`/`nonmovable` allocation has no such form,
-/// so the transducer rejects it rather than silently emitting a GC `New`.
+/// (`gc_flavor_const`).  `Transformer.rewrite_op_malloc` lowers the gc
+/// flavor to `new(descr)`.
 fn is_gc_flavor_const(hlv: &Hlvalue) -> bool {
     let Hlvalue::Constant(c) = hlv else {
         return false;
@@ -1678,6 +1798,7 @@ mod tests {
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
     };
+    use crate::translator::rtyper::lltypesystem::rffi::{CArray, CArrayPtr};
     use crate::translator::rtyper::lltypesystem::rstr::{
         STRPTR, build_ll_search_helper_graph, chars_array_ptr_lltype_from_strptr,
         direct_call_funcobjs, graph_ref_for_funcptr_id, struct_lltype_from_strptr,
@@ -3601,6 +3722,277 @@ mod tests {
             kinds,
             vec!["arraylen_gc", "getarrayitem_gc", "setarrayitem_gc"]
         );
+    }
+
+    /// Flags dict `{flavor: raw, ...}` in the same shape as `gc_flavor_const`.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+    )]
+    fn raw_flavor_const(extra: &[(&str, ConstValue)]) -> Hlvalue {
+        use indexmap::IndexMap;
+        let mut flags =
+            IndexMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("raw"))]);
+        for (key, value) in extra {
+            flags.insert(ConstValue::byte_str(*key), value.clone());
+        }
+        constant_with_lltype(
+            ConstValue::Dict(std::sync::Arc::new(flags)),
+            LowLevelType::Void,
+        )
+    }
+
+    /// `Transformer.rewrite_op_getarrayitem` / `rewrite_op_setarrayitem`:
+    /// a standalone raw `CArray(Signed)` is `getarrayitem_raw_*` /
+    /// `setarrayitem_raw_*`, never the STR/UNICODE `chars` fusion.
+    #[test]
+    fn lower_graph_lowers_raw_array_getarrayitem_and_setarrayitem() {
+        let raw_array = CArray(LowLevelType::Signed);
+        let expected_id = super::array_type_id_of(&raw_array);
+        let array_ptr = CArrayPtr(LowLevelType::Signed);
+        let p = variable_with_lltype("p", array_ptr);
+        let i = variable_with_lltype("i", LowLevelType::Signed);
+        let startblock = Block::shared(vec![
+            Hlvalue::Variable(p.clone()),
+            Hlvalue::Variable(i.clone()),
+        ]);
+        let return_var = variable_with_lltype("x", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_raw_array_item_ops",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let x = variable_with_lltype("x", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getarrayitem",
+            vec![Hlvalue::Variable(p.clone()), Hlvalue::Variable(i.clone())],
+            Hlvalue::Variable(x.clone()),
+        ));
+        let set = variable_with_lltype("set", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "setarrayitem",
+            vec![
+                Hlvalue::Variable(p),
+                Hlvalue::Variable(i),
+                Hlvalue::Variable(x.clone()),
+            ],
+            Hlvalue::Variable(set),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(x)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let mut reads = 0;
+        let mut writes = 0;
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::ArrayRead {
+                        item_ty,
+                        array_type_id,
+                        nolength,
+                        pure,
+                        ..
+                    } => {
+                        assert_eq!(*item_ty, ValueType::Int);
+                        assert_eq!(array_type_id, &expected_id);
+                        assert!(*nolength);
+                        assert!(!*pure);
+                        reads += 1;
+                    }
+                    OpKind::ArrayWrite {
+                        item_ty,
+                        array_type_id,
+                        nolength,
+                        ..
+                    } => {
+                        assert_eq!(*item_ty, ValueType::Int);
+                        assert_eq!(array_type_id, &expected_id);
+                        assert!(*nolength);
+                        writes += 1;
+                    }
+                    OpKind::LoweredBlackholeOp { opname, .. } => {
+                        panic!("raw array must not fuse to {opname}")
+                    }
+                    other => panic!("unexpected op: {other:?}"),
+                }
+            }
+        }
+        assert_eq!(reads, 1);
+        assert_eq!(writes, 1);
+    }
+
+    /// `Transformer.rewrite_op_malloc_varsize` flavor `raw` first:
+    /// `_rewrite_raw_malloc` / `raw_malloc_varsize`.
+    #[test]
+    fn lower_graph_lowers_raw_malloc_varsize_to_raw_malloc() {
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let array_ty = LowLevelType::Array(Box::new(CArray(LowLevelType::Char)));
+        let array_ptr = CArrayPtr(LowLevelType::Char);
+
+        let lower = |flags: Hlvalue| {
+            let startblock = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+            let return_var = variable_with_lltype("p", array_ptr.clone());
+            let graph = FlowGraph::with_return_var(
+                "ll_test_raw_malloc_varsize",
+                startblock.clone(),
+                Hlvalue::Variable(return_var),
+            );
+            let p = variable_with_lltype("p", array_ptr.clone());
+            startblock.borrow_mut().operations.push(SpaceOperation::new(
+                "malloc_varsize",
+                vec![
+                    lowlevel_type_const(array_ty.clone()),
+                    flags,
+                    Hlvalue::Variable(n.clone()),
+                ],
+                Hlvalue::Variable(p.clone()),
+            ));
+            startblock.closeblock(vec![
+                Link::new(
+                    vec![Hlvalue::Variable(p)],
+                    Some(graph.returnblock.clone()),
+                    None,
+                )
+                .into_ref(),
+            ]);
+            lower_graph(&graph)
+        };
+
+        let assert_raw = |model: crate::model::FunctionGraph, expect_zero: bool| {
+            let mut found = false;
+            for block in &model.blocks {
+                for op in &block.operations {
+                    match &op.kind {
+                        OpKind::RawMalloc {
+                            TYPE,
+                            length,
+                            zero,
+                            track_allocation,
+                            ..
+                        } => {
+                            assert!(TYPE.is_some(), "TYPE: Some(..), got {TYPE:?}");
+                            assert!(length.is_some(), "length: Some(_), got {length:?}");
+                            assert_eq!(*zero, expect_zero);
+                            assert!(*track_allocation);
+                            found = true;
+                        }
+                        other => {
+                            panic!("raw malloc_varsize must lower to RawMalloc, got {other:?}")
+                        }
+                    }
+                }
+            }
+            assert!(found, "missing RawMalloc");
+        };
+
+        assert_raw(lower(raw_flavor_const(&[])), false);
+        assert_raw(
+            lower(raw_flavor_const(&[("zero", ConstValue::Bool(true))])),
+            true,
+        );
+    }
+
+    /// `Transformer.rewrite_op_malloc` flavor `raw`:
+    /// `_rewrite_raw_malloc` / `raw_malloc_fixedsize`.
+    #[test]
+    fn lower_graph_lowers_raw_malloc_fixedsize_to_raw_malloc() {
+        let raw_struct = LowLevelType::Struct(Box::new(Struct::new(
+            "raw_tuple",
+            vec![("f".into(), LowLevelType::Signed)],
+        )));
+        let struct_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(match &raw_struct {
+                LowLevelType::Struct(s) => s.as_ref().clone(),
+                _ => unreachable!(),
+            }),
+        }));
+        let startblock = Block::shared(vec![]);
+        let return_var = variable_with_lltype("p", struct_ptr.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_raw_malloc_fixedsize",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let p = variable_with_lltype("p", struct_ptr);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc",
+            vec![lowlevel_type_const(raw_struct), raw_flavor_const(&[])],
+            Hlvalue::Variable(p.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(p)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let mut found = false;
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::RawMalloc {
+                        TYPE,
+                        length,
+                        zero,
+                        track_allocation,
+                        ..
+                    } => {
+                        assert!(TYPE.is_some());
+                        assert!(length.is_none(), "fixed-size raw malloc has length: None");
+                        assert!(!*zero);
+                        assert!(*track_allocation);
+                        found = true;
+                    }
+                    other => panic!("raw malloc must lower to RawMalloc, got {other:?}"),
+                }
+            }
+        }
+        assert!(found, "missing RawMalloc");
+    }
+
+    /// `Transformer.rewrite_op_getarrayitem`: a raw ARRAY of GC pointers
+    /// is `getarrayitem_raw_r not supported`.
+    #[test]
+    #[should_panic(expected = "getarrayitem_raw_r not supported")]
+    fn lower_graph_getarrayitem_raw_r_is_not_supported() {
+        let array_ptr = CArrayPtr(STRPTR.clone());
+        let p = variable_with_lltype("p", array_ptr);
+        let i = variable_with_lltype("i", LowLevelType::Signed);
+        let startblock = Block::shared(vec![
+            Hlvalue::Variable(p.clone()),
+            Hlvalue::Variable(i.clone()),
+        ]);
+        let return_var = variable_with_lltype("x", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_raw_array_ref_getitem",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let x = variable_with_lltype("x", STRPTR.clone());
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getarrayitem",
+            vec![Hlvalue::Variable(p), Hlvalue::Variable(i)],
+            Hlvalue::Variable(x.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(x)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let _model = lower_graph(&graph);
     }
 
     /// `ll_newlist` / `ll_append` graphs `_twoway_preprocess` uses (the
