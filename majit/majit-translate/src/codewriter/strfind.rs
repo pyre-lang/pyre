@@ -39,7 +39,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     _func, _ptr_obj, LowLevelType, PtrObj, PtrTarget,
 };
 use crate::translator::rtyper::lltypesystem::rstr::{
-    STRPTR, UNICODEPTR, build_ll_find_char_helper_graph, build_ll_find_helper_graph_on,
+    STRPTR, build_ll_find_char_helper_graph, build_ll_find_helper_graph_on,
     build_ll_search_helper_graph_on, chars_array_ptr_lltype_from_strptr, direct_call_funcobjs,
     graph_ref_for_funcptr_id,
 };
@@ -932,6 +932,7 @@ mod tests {
     use crate::model::{CallTarget, ConcreteType, OpKind, ValueType};
     use crate::policy::JitPolicy;
     use crate::translator::rtyper::lltypesystem::lltype::{FuncType, Ptr, Struct, functionptr};
+    use crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR;
     use crate::translator::rtyper::lltypesystem::rstr::{
         build_ll_find_helper_graph, build_ll_strhash_helper_graph, funcobj_from_funcptr_constant,
     };

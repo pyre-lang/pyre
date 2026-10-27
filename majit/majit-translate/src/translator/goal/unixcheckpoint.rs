@@ -92,12 +92,12 @@ type Pid = i32;
 enum ForkResult {
     #[cfg_attr(
         not(unix),
-        expect(dead_code, reason = "fork parent result is only constructed on Unix")
+        allow(dead_code, reason = "fork parent result is only constructed on Unix")
     )]
     Parent(Pid),
     #[cfg_attr(
         not(unix),
-        expect(dead_code, reason = "fork child result is only constructed on Unix")
+        allow(dead_code, reason = "fork child result is only constructed on Unix")
     )]
     Child,
     NotSupported,
@@ -107,12 +107,12 @@ enum ForkResult {
 enum WaitStatus {
     #[cfg_attr(
         not(unix),
-        expect(dead_code, reason = "wait exit status is only constructed on Unix")
+        allow(dead_code, reason = "wait exit status is only constructed on Unix")
     )]
     Exited(i32),
     #[cfg_attr(
         not(unix),
-        expect(dead_code, reason = "wait signal status is only constructed on Unix")
+        allow(dead_code, reason = "wait signal status is only constructed on Unix")
     )]
     Signaled(i32),
     Other(i32),
@@ -128,12 +128,12 @@ trait CheckpointRuntime {
 enum WaitError {
     #[cfg_attr(
         not(unix),
-        expect(dead_code, reason = "EINTR wait retry is only constructed on Unix")
+        allow(dead_code, reason = "EINTR wait retry is only constructed on Unix")
     )]
     Interrupted,
     #[cfg_attr(
         not(unix),
-        expect(dead_code, reason = "wait errno is only constructed on Unix")
+        allow(dead_code, reason = "wait errno is only constructed on Unix")
     )]
     Other(i32),
 }

@@ -5015,7 +5015,7 @@ mod tests {
         Value,
     };
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     #[test]
     fn varsize_slowpaths_return_null_on_size_overflow() {
@@ -5102,47 +5102,6 @@ mod tests {
 
     extern "C" fn return_ref_passthrough(arg: i64) -> i64 {
         arg
-    }
-
-    static TEST_HELPER_ALLOC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
-
-    const TEST_HELPER_MARKER: i64 = 0x5a5a5a5a_i64;
-
-    extern "C" fn alloc_marked_ref() -> i64 {
-        crate::runner::gc_box::DYNASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let gc = guard
-                .as_mut()
-                .expect("alloc_marked_ref requires an active dynasm GC");
-            let type_id = TEST_HELPER_ALLOC_TYPE_ID.load(Ordering::Relaxed);
-            assert_ne!(type_id, u32::MAX, "test helper type id not initialized");
-            let obj = gc.alloc_nursery_typed(type_id, 16);
-            unsafe {
-                *(obj.0 as *mut i64) = TEST_HELPER_MARKER;
-            }
-            obj.0 as i64
-        })
-    }
-
-    extern "C" fn alloc_marked_ref_collecting() -> i64 {
-        crate::runner::gc_box::DYNASM_ACTIVE_GC.with(|cell| {
-            let mut guard = cell.borrow_mut();
-            let gc = guard
-                .as_mut()
-                .expect("alloc_marked_ref_collecting requires an active dynasm GC");
-            let type_id = TEST_HELPER_ALLOC_TYPE_ID.load(Ordering::Relaxed);
-            assert_ne!(type_id, u32::MAX, "test helper type id not initialized");
-            let obj = gc.alloc_nursery_typed(type_id, 16);
-            unsafe {
-                *(obj.0 as *mut i64) = TEST_HELPER_MARKER;
-            }
-            let root_depth = majit_gc::shadow_stack::depth();
-            let ss_idx = majit_gc::shadow_stack::push(obj);
-            let _bump = gc.alloc_nursery_typed(type_id, 80);
-            let updated = majit_gc::shadow_stack::get(ss_idx);
-            majit_gc::shadow_stack::pop_to(root_depth);
-            updated.0 as i64
-        })
     }
 
     extern "C" fn collect_nursery_via_dynasm_gc() {

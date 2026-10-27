@@ -64,8 +64,7 @@ use majit_backend::{
     AsmMemoryBlock, AsmMemoryManager, BackendError, JitCellToken, MachineDataBlockWrapper,
 };
 use majit_ir::{
-    FailDescr, FailDescrStore, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex,
-    TargetArgLoc, Type,
+    FailDescr, FailDescrStore, InputArgRc, Op, OpCode, OpRc, OpRef, OpTypeIndex, TargetArgLoc, Type,
 };
 
 use crate::arch::*;
@@ -140,7 +139,6 @@ impl CallAssemblerTargetAddr {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7039,7 +7037,7 @@ impl<'a> Assembler386<'a> {
 
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
     #[allow(dead_code)]
-    fn genop_finish(&mut self, op: &Op, fail_index: u32) {
+    fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
         let finish_refs: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();

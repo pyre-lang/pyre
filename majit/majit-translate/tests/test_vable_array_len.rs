@@ -10,7 +10,6 @@
 mod common;
 
 use common::{interpreter_llbc, lower_context_for};
-use majit_charon_reader::Llbc;
 use majit_translate::flowspace::model::Variable;
 use majit_translate::front::mir::{LowerContext, lower_fun_decl};
 use majit_translate::model::{CallTarget, FunctionGraph, LinkArg, OpKind};
