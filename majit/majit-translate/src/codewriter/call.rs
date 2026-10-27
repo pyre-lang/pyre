@@ -13932,6 +13932,39 @@ pub(crate) fn type_str_leaf_is_void_zst(type_str: &str) -> bool {
     leaf == "PhantomData" || leaf == "BuildHasherDefault"
 }
 
+/// descr.py get_type_flag: a Ptr whose immediate target `TO._gckind == 'raw'`
+/// is FLAG_UNSIGNED (int-banked, word size), regardless of what the target
+/// contains. A Rust pointer's gckind comes from the pointee type's
+/// declaration; a pointee that is a scalar or itself a pointer (a word
+/// slot) is raw memory.
+///
+/// After one `*const ` prefix, the remainder is raw when it is a nested
+/// `*const ` / `*mut ` pointer, `GCREF`, or a scalar name (`isize` `usize`
+/// `i64` `u64` `i32` `u32` `i16` `u16` `i8` `u8` `f64` `f32` `bool`
+/// `char`). After one `*mut ` prefix the same remainder is raw, except
+/// `*mut u8` stays on the Ref fallback because it is ambiguous between
+/// CCHARP / Ptr(STR) / GCREF; resolving that is a separate `*u8` spelling
+/// PR. Slices (`*const [u8]`) and `[T; N]` do not match.
+fn raw_thin_pointer_spelling(s: &str) -> bool {
+    const SCALARS: &[&str] = &[
+        "isize", "usize", "i64", "u64", "i32", "u32", "i16", "u16", "i8", "u8", "f64", "f32",
+        "bool", "char",
+    ];
+    if let Some(rest) = s.strip_prefix("*const ") {
+        rest.starts_with("*const ")
+            || rest.starts_with("*mut ")
+            || rest == "GCREF"
+            || SCALARS.contains(&rest)
+    } else if let Some(rest) = s.strip_prefix("*mut ") {
+        rest.starts_with("*const ")
+            || rest.starts_with("*mut ")
+            || rest == "GCREF"
+            || (rest != "u8" && SCALARS.contains(&rest))
+    } else {
+        false
+    }
+}
+
 pub(crate) fn get_type_flag(
     type_str: &str,
     raw_alloc_flavor_structs: &HashSet<String>,
@@ -13965,6 +13998,15 @@ pub(crate) fn get_type_flag(
                 crate::layout::target_word_size(),
             )
         }
+        // descr.py get_type_flag: a Ptr whose TO._gckind == 'raw' is
+        // FLAG_UNSIGNED. A thin `*const`/`*mut` spelling whose pointee is
+        // a scalar, a pointer word, or GCREF is raw. `*mut u8` stays on
+        // the Ref fallback.
+        s if raw_thin_pointer_spelling(s) => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
+            crate::layout::target_word_size(),
+        ),
         // descr.py get_type_flag: a Ptr whose pointee has `_gckind == 'raw'`
         // is FLAG_UNSIGNED. A one-word-item Vec is
         // `Ptr(Struct(raw) "RustVec")` (`rrustvec.rs rust_vec_lltype`);
@@ -14929,11 +14971,11 @@ pub(crate) fn array_type_id_of_lltype(
 /// `descr.py get_type_flag` reads this spelling: a Ptr whose
 /// `TO._gckind == 'gc'` is FLAG_POINTER, independent of the containing
 /// ARRAY's `_gckind`.
-fn array_item_spelling(
+fn try_array_item_spelling(
     of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-) -> String {
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-    match of {
+) -> Option<String> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    Some(match of {
         LowLevelType::Signed => "isize".to_string(),
         LowLevelType::Unsigned => "usize".to_string(),
         LowLevelType::Float => "f64".to_string(),
@@ -14943,15 +14985,36 @@ fn array_item_spelling(
         LowLevelType::Bool => "bool".to_string(),
         LowLevelType::Struct(s) => s._name.clone(),
         LowLevelType::Void => "()".to_string(),
-        LowLevelType::Ptr(p) if !p._needsgc() => "*const u8".to_string(),
+        // descr.py get_type_flag: the key keeps the item spelling only
+        // where get_type_flag reads it as a raw thin pointer; anything
+        // else is the generic raw pointer `*const u8` (FLAG_UNSIGNED).
+        LowLevelType::Ptr(p) if !p._needsgc() => match &p.TO {
+            PtrTarget::Array(arr) => {
+                match try_array_item_spelling(&array_of_lltype_identity(&arr.OF)) {
+                    Some(item) if raw_thin_pointer_spelling(&format!("*const {item}")) => {
+                        format!("*const {item}")
+                    }
+                    _ => "*const u8".to_string(),
+                }
+            }
+            PtrTarget::Struct(_) => "*const u8".to_string(),
+            _ => "*const u8".to_string(),
+        },
         // descr.py get_type_flag: a Ptr whose TO._gckind == 'gc' is
         // FLAG_POINTER, independent of the containing ARRAY's _gckind.
         LowLevelType::Ptr(_) => "GCREF".to_string(),
         LowLevelType::SignedLongLong => "i64".to_string(),
         LowLevelType::UnsignedLongLong => "u64".to_string(),
         LowLevelType::Address => "usize".to_string(),
-        of => panic!("array_type_id_of_lltype: unsupported ARRAY.OF {of:?}"),
-    }
+        _ => return None,
+    })
+}
+
+fn array_item_spelling(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> String {
+    try_array_item_spelling(of)
+        .unwrap_or_else(|| panic!("array_type_id_of_lltype: unsupported ARRAY.OF {of:?}"))
 }
 
 /// ARRAY identity for `arraydescrof_concrete`. A named `array_type_id`
@@ -15865,6 +15928,78 @@ mod tests {
             get_type_flag("GCREF", &HashSet::new()).0,
             majit_ir::descr::ArrayFlag::Pointer
         );
+    }
+
+    /// `descr.py get_type_flag`: a raw Ptr item is FLAG_UNSIGNED. A raw
+    /// Struct pointee cannot tell get_type_flag that it is raw, so it
+    /// spells `*const u8`. A `CCHARP` item is `*const u8`; a pointer to a
+    /// raw `CArray(Signed)` is `*const isize`. A pointer to a raw array of
+    /// GC pointers is `*const GCREF`; a pointer to a raw array of
+    /// LongFloat is the generic `*const u8`.
+    #[test]
+    fn array_type_id_raw_ptr_items_keep_pointee() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::lltypesystem::rffi;
+        use majit_ir::descr::ArrayFlag;
+        fn raw_struct_ptr(name: &str) -> LowLevelType {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(Struct::new(name, vec![("x".into(), LowLevelType::Signed)])),
+            }))
+        }
+        fn gc_struct_ptr(name: &str) -> LowLevelType {
+            LowLevelType::Ptr(Box::new(Ptr {
+                TO: PtrTarget::Struct(Struct::gc(name, vec![("x".into(), LowLevelType::Signed)])),
+            }))
+        }
+        fn assert_unsigned_item(id: &str) {
+            let item = extract_element_type_from_str(id).unwrap_or_else(|| panic!("{id}"));
+            assert_eq!(
+                get_type_flag(&item, &HashSet::new()).0,
+                ArrayFlag::Unsigned,
+                "{id}"
+            );
+        }
+        let a = array_type_id_of_lltype(&rffi::CArray(raw_struct_ptr("A")));
+        let b = array_type_id_of_lltype(&rffi::CArray(raw_struct_ptr("B")));
+        assert_eq!(a, "Vec<*const u8>");
+        assert_eq!(b, "Vec<*const u8>");
+        let ccharp = array_type_id_of_lltype(&rffi::CArray(rffi::CCHARP.clone()));
+        assert_eq!(ccharp, "Vec<*const u8>");
+        let signed_arr =
+            array_type_id_of_lltype(&rffi::CArray(rffi::CArrayPtr(LowLevelType::Signed)));
+        assert_eq!(signed_arr, "Vec<*const isize>");
+        let gc_arr = array_type_id_of_lltype(&rffi::CArray(rffi::CArrayPtr(gc_struct_ptr("G"))));
+        assert_eq!(gc_arr, "Vec<*const GCREF>");
+        let longfloat_arr =
+            array_type_id_of_lltype(&rffi::CArray(rffi::CArrayPtr(LowLevelType::LongFloat)));
+        assert_eq!(longfloat_arr, "Vec<*const u8>");
+        for id in [&a, &b, &ccharp, &signed_arr, &gc_arr, &longfloat_arr] {
+            assert_unsigned_item(id);
+        }
+    }
+
+    /// `descr.py get_type_flag`: a Ptr whose TO._gckind == 'raw' is
+    /// FLAG_UNSIGNED, int-banked, one word. `*mut u8` and a named struct
+    /// pointee stay on the Ref fallback.
+    #[test]
+    fn raw_thin_pointer_is_int_banked() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+        let word = crate::layout::target_word_size();
+        let expected = (ArrayFlag::Unsigned, Type::Int, word);
+        let fallback = (ArrayFlag::Pointer, Type::Ref, word);
+        let empty = HashSet::new();
+        assert_eq!(get_type_flag("*const f64", &empty), expected);
+        assert_eq!(get_type_flag("*const GCREF", &empty), expected);
+        assert_eq!(get_type_flag("*const *const PyObject", &empty), expected);
+        assert_eq!(get_type_flag("*mut f64", &empty), expected);
+        assert_eq!(get_type_flag("*mut isize", &empty), expected);
+        assert_eq!(get_type_flag("*mut *mut PyObject", &empty), expected);
+        assert_eq!(get_type_flag("*mut u8", &empty), fallback);
+        assert_eq!(get_type_flag("*const PyObject", &empty), fallback);
+        assert_eq!(get_type_flag("*mut PyObject", &empty), fallback);
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
