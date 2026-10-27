@@ -19,22 +19,24 @@
 
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::LazyLock;
 
 use crate::annotator::annrpython::RPythonAnnotator;
 use crate::flowspace::model::{
-    BlockRef, ConstValue, Constant, FunctionGraph, GraphRef, Hlvalue, HostObject, LinkRef,
-    SpaceOperation, Variable,
+    BlockKey, BlockRef, ConstValue, Constant, FunctionGraph, GraphRef, HOST_ENV, Hlvalue,
+    HostObject, LinkRef, SpaceOperation, Variable,
 };
 use crate::tool::ansi_print::AnsiLogger;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::llmemory;
+use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _address, _func, _ptr, _ptr_obj, LowLevelType, LowLevelValue, MallocFlavor, PtrTarget, Struct,
-    identityhash, isCompatibleType, length_of_simple_gcarray_from_opaque, malloc, typeOf,
+    _address, _func, _ptr, _ptr_obj, LowLevelType, LowLevelValue, MallocFlavor, Ptr, PtrTarget,
+    Struct, cast_opaque_ptr, cast_pointer, identityhash, isCompatibleType,
+    length_of_simple_gcarray_from_opaque, malloc, typeOf,
 };
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
@@ -73,9 +75,10 @@ impl std::fmt::Display for LLException {
 impl std::error::Error for LLException {}
 
 /// What escapes `LLFrame.eval`: upstream raises `LLException(etype, evalue)`,
-/// which the caller's `eval_block` catches, or the frame fails internally.
+/// which the caller's `eval_block` catches, or `LLInterpreter.eval_graph`
+/// re-raises the typed pair to the public caller.
 #[derive(Debug)]
-enum FrameError {
+pub enum FrameError {
     /// `LLException.args == (etype, evalue)`.
     LLException {
         etype: LLValue,
@@ -87,6 +90,12 @@ enum FrameError {
 impl From<TaskError> for FrameError {
     fn from(err: TaskError) -> Self {
         FrameError::Task(err)
+    }
+}
+
+impl From<FrameError> for TaskError {
+    fn from(err: FrameError) -> Self {
+        err.into_task_error()
     }
 }
 
@@ -162,10 +171,10 @@ pub fn checkadr(addr: &LowLevelValue) -> Result<(), TyperError> {
 /// Concrete low-level value used by the local `LLFrame` port.
 ///
 /// Upstream `LLFrame.bindings` stores arbitrary concrete Python objects.
-/// Rust does not have that object model, so this private enum carries
+/// Rust does not have that object model, so this enum carries
 /// the primitive shapes currently produced by local lltyped graphs.
 #[derive(Clone, Debug, PartialEq)]
-enum LLValue {
+pub enum LLValue {
     Void,
     Int(i64),
     Bool(bool),
@@ -286,6 +295,84 @@ fn host_class_object(value: &ConstValue) -> Option<&HostObject> {
         ConstValue::HostObject(obj) if obj.is_class() => Some(obj),
         _ => None,
     }
+}
+
+/// `LLInterpreter.find_exception`: resolve an `LLException` etype to a
+/// host exception class. Flow-level exceptions carry the host class as
+/// `LLValue::Const`; rtyped exceptions carry an `OBJECT_VTABLE` pointer
+/// whose `name.chars` equal `cls.__name__`. A subclass vtable inlines the
+/// parent as `super` (`cast_vtable_to_typeptr`).
+fn find_exception(etype: &LLValue) -> Result<HostObject, TaskError> {
+    match etype {
+        LLValue::Const(c) => host_class_object(c).cloned().ok_or_else(|| TaskError {
+            message: "LLInterpreter.find_exception: etype is not a class".to_string(),
+        }),
+        LLValue::Ptr(p) => {
+            let name = vtable_exception_name(p).ok_or_else(unmatched_ll_exception)?;
+            enumerate_exceptions_top_down()
+                .into_iter()
+                .find(|cls| cls.simple_name() == name)
+                .ok_or_else(unmatched_ll_exception)
+        }
+        _ => Err(TaskError {
+            message: "LLInterpreter.find_exception: etype is not a class".to_string(),
+        }),
+    }
+}
+
+fn unmatched_ll_exception() -> TaskError {
+    TaskError {
+        message: "LLInterpreter.find_exception: couldn't match exception, maybe it has RPython attributes like OSError?".to_string(),
+    }
+}
+
+/// `"".join(klass.name.chars)` over an `OBJECT_VTABLE` pointer. Follow
+/// `super` until a struct with a `name` field is found
+/// (`cast_vtable_to_typeptr`).
+fn vtable_exception_name(p: &_ptr) -> Option<String> {
+    let mut current = LowLevelValue::Ptr(Box::new(p.clone()));
+    loop {
+        if let Ok(name_lv) = ll_getattr(&current, "name") {
+            return join_str_chars(&name_lv);
+        }
+        current = ll_getattr(&current, "super").ok()?;
+    }
+}
+
+/// Field read used by `LLFrame.op_getfield` / `op_getinteriorfield`.
+fn ll_getattr(value: &LowLevelValue, field: &str) -> Result<LowLevelValue, String> {
+    match value {
+        LowLevelValue::Ptr(p) => p.getattr(field),
+        LowLevelValue::InteriorPtr(ip) => ip.getattr(field),
+        other => Err(format!("getattr {field}: not a struct: {other:?}")),
+    }
+}
+
+/// `"".join(name.chars)` — `name` is `Ptr(rstr.STR)`; `chars` is the
+/// inlined `Array(Char)` read the same way as `op_getarrayitem`.
+fn join_str_chars(name_lv: &LowLevelValue) -> Option<String> {
+    let str_ptr = match name_lv {
+        LowLevelValue::Ptr(p) if p.nonzero() => p.as_ref(),
+        _ => return None,
+    };
+    let chars_lv = str_ptr.getattr("chars").ok()?;
+    let mut s = String::new();
+    let mut i = 0usize;
+    loop {
+        let item = match &chars_lv {
+            LowLevelValue::Ptr(p) => p.getitem(i).ok(),
+            LowLevelValue::InteriorPtr(ip) => ip.getitem(i).ok(),
+            _ => return None,
+        };
+        match item {
+            Some(LowLevelValue::Char(c)) => {
+                s.push(c);
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    Some(s)
 }
 
 /// Inverse of the `LowLevelValue` arm of [`any_to_llvalue`]: convert an
@@ -621,6 +708,16 @@ fn hlvalue_concretetype(v: &Hlvalue) -> Option<LowLevelType> {
     }
 }
 
+/// The ophandlers with `need_result_type = True`
+/// (`opimpl.py` `op_cast_pointer` / `op_cast_opaque_ptr` /
+/// `op_cast_primitive`).
+fn need_result_type(opname: &str) -> bool {
+    matches!(
+        opname,
+        "cast_pointer" | "cast_opaque_ptr" | "cast_primitive"
+    )
+}
+
 /// `LLFrame.perform_call` (`llinterp.py`): `ARGS = typeOf(f).TO.ARGS`
 /// must match `graph.getargs()` arity and `isCompatibleType` per slot.
 fn validate_graph_funcptr_type(graph: &GraphRef, ARGS: &[LowLevelType]) -> Result<(), TaskError> {
@@ -735,7 +832,7 @@ fn eval_graph_on_funcptr(
     graph: GraphRef,
     args: &[LowLevelValue],
     RESULT: &LowLevelType,
-) -> Result<LowLevelValue, TaskError> {
+) -> Result<LowLevelValue, FrameError> {
     let ll_args: Vec<LLValue> = args
         .iter()
         .cloned()
@@ -743,11 +840,12 @@ fn eval_graph_on_funcptr(
         .collect::<Result<_, _>>()?;
     if let Some(interp) = LLInterpreter::current_interpreter() {
         let frame = Rc::new(RefCell::new(LLFrame::new(graph, ll_args)));
-        let result = frame
-            .borrow_mut()
-            .eval(&interp, frame.clone())
-            .map_err(FrameError::into_task_error)?;
-        llvalue_to_lowlevel_of_type(&result, RESULT, "eval_funcptr")
+        let result = frame.borrow_mut().eval(&interp, frame.clone())?;
+        Ok(llvalue_to_lowlevel_of_type(
+            &result,
+            RESULT,
+            "eval_funcptr",
+        )?)
     } else {
         let interp = dummy_interpreter();
         let any_args: Vec<Rc<dyn Any>> = args
@@ -757,15 +855,16 @@ fn eval_graph_on_funcptr(
             .collect();
         let result = interp.eval_graph(graph as Rc<dyn Any>, any_args, false)?;
         let ll = any_to_llvalue(&result)?;
-        llvalue_to_lowlevel_of_type(&ll, RESULT, "eval_funcptr")
+        Ok(llvalue_to_lowlevel_of_type(&ll, RESULT, "eval_funcptr")?)
     }
 }
 
 /// Run a stored adtmeth funcptr (`llinterp.py` `op_direct_call` /
 /// `perform_call`): a graph goes through `LLInterpreter.eval_graph` (or
 /// a subframe when already interpreting); a graphless funcptr goes
-/// through its `_callable` name.
-pub fn eval_funcptr(funcptr: &_ptr, args: &[LowLevelValue]) -> Result<LowLevelValue, TaskError> {
+/// through its `_callable` name. An `LLException` from the callee
+/// graph propagates unchanged (`LLFrame.perform_call`).
+pub fn eval_funcptr(funcptr: &_ptr, args: &[LowLevelValue]) -> Result<LowLevelValue, FrameError> {
     let func = func_from_ptr(funcptr, "eval_funcptr")?;
     let RESULT = funcptr_RESULT(funcptr)?;
     if let Some(graph) = func.graph_ref() {
@@ -779,14 +878,14 @@ pub fn eval_funcptr(funcptr: &_ptr, args: &[LowLevelValue]) -> Result<LowLevelVa
             .map(|v| lowlevel_to_llvalue(v, name))
             .collect::<Result<_, _>>()?;
         let result = invoke_callable(name, &ll_args)?;
-        llvalue_to_lowlevel_of_type(&result, &RESULT, name)
+        Ok(llvalue_to_lowlevel_of_type(&result, &RESULT, name)?)
     } else {
-        Err(TaskError {
+        Err(FrameError::from(TaskError {
             message: format!(
                 "llinterp.py LLFrame.perform_call — don't know how to execute {}",
                 func._name
             ),
-        })
+        }))
     }
 }
 
@@ -828,9 +927,9 @@ pub struct LLInterpreter {
     /// the class so subclasses can override; the Rust port has only
     /// the one [`LLFrame`] type, so the slot is documented but unused.
     pub frame_class: std::marker::PhantomData<LLFrame>,
-    /// Upstream `self.traceback_frames = []` initialized at the top of
-    /// `eval_graph` (`:91`). The local port carries the slot to keep
-    /// the upstream shape; it is reset on each `eval_graph` entry.
+    /// `LLInterpreter.eval_graph` resets this to `[]` on entry;
+    /// `LLFrame.eval` appends the frame when any error leaves it
+    /// (innermost first, matching upstream unwind order).
     pub traceback_frames: RefCell<Vec<Rc<RefCell<LLFrame>>>>,
 }
 
@@ -875,13 +974,11 @@ impl LLInterpreter {
         }
     }
 
-    /// Upstream `eval_graph(self, graph, args=(), recursive=False)` at
-    /// `llinterp.py`.
+    /// `LLInterpreter.eval_graph`. An `LLException` that escapes the
+    /// entry frame is returned as `FrameError::LLException { etype, evalue }`
+    /// with both values kept. Restores `CURRENT_INTERPRETER` and pops
+    /// `frame_stack` (depth `debug_assert_eq!`) on every exit.
     ///
-    /// Mirrors upstream `:99` `LLInterpreter.current_interpreter = self`
-    /// unconditionally — every public entry installs the thread-local
-    /// pointer that `LLFrame` opcode handlers consult, then restores
-    /// the previous value on exit (handling re-entrant evaluation).
     /// Takes `self: &Rc<Self>` because installing a `Weak<Self>` into
     /// the thread-local requires upgrading from a `Rc`, matching
     /// upstream's Python-object identity.
@@ -890,11 +987,11 @@ impl LLInterpreter {
         graph: Rc<dyn Any>,
         args: Vec<Rc<dyn Any>>,
         _recursive: bool,
-    ) -> Result<Rc<dyn Any>, TaskError> {
-        // Upstream `llframe = self.frame_class(graph, args, self)` at
-        // `llinterp.py:85`. The local public API still accepts
-        // `Rc<dyn Any>` because driver plumbing is not typed yet; the
-        // executable leaf accepts the orthodox `GraphRef`.
+    ) -> Result<Rc<dyn Any>, FrameError> {
+        // `LLInterpreter.eval_graph`: `llframe = self.frame_class(graph, args, self)`.
+        // The local public API still accepts `Rc<dyn Any>` because driver
+        // plumbing is not typed yet; the executable leaf accepts the
+        // orthodox `GraphRef`.
         let graph = graph
             .downcast::<RefCell<FunctionGraph>>()
             .map_err(|_| TaskError {
@@ -904,12 +1001,10 @@ impl LLInterpreter {
             })?;
         let args: Vec<LLValue> = args.iter().map(any_to_llvalue).collect::<Result<_, _>>()?;
         let llframe = Rc::new(RefCell::new(LLFrame::new(graph, args)));
-        // Upstream `:91`: `self.traceback_frames = []`. Reset the slot
-        // at every `eval_graph` entry (top-level call resets the stack).
+        // `LLInterpreter.eval_graph`: `self.traceback_frames = []`.
         self.traceback_frames.borrow_mut().clear();
-        // Upstream `:99`: `LLInterpreter.current_interpreter = self`.
-        // Save the prior value so re-entrant `eval_graph` (recursive
-        // calls into another graph) restores correctly on return.
+        // `LLInterpreter.eval_graph`: `LLInterpreter.current_interpreter = self`.
+        // Save the prior value so re-entrant `eval_graph` restores it on return.
         let prior = CURRENT_INTERPRETER.with(|cell| {
             let old = cell.borrow().clone();
             *cell.borrow_mut() = Rc::downgrade(self);
@@ -918,13 +1013,72 @@ impl LLInterpreter {
         let old_depth = self.frame_stack.borrow().len();
         let result = llframe.borrow_mut().eval(self, llframe.clone());
         debug_assert_eq!(self.frame_stack.borrow().len(), old_depth);
+        if let Err(ref err) = result {
+            match err {
+                FrameError::LLException { etype, evalue } => {
+                    log.method("error", &format!("LLEXCEPTION: {etype:?} {evalue:?}"));
+                }
+                FrameError::Task(task_err) => {
+                    log.method("error", &format!("AN ERROR OCCURED: {task_err}"));
+                }
+            }
+            self.print_traceback();
+        }
         CURRENT_INTERPRETER.with(|cell| {
             *cell.borrow_mut() = prior;
         });
-        match result {
-            Ok(v) => Ok(v.into_any()),
-            Err(e) => Err(e.into_task_error()),
+        result.map(LLValue::into_any)
+    }
+
+    /// `LLInterpreter.print_traceback`: take `traceback_frames`, reverse
+    /// (innermost-first → outer first), clear the list, format one header
+    /// per frame plus each op of `curr_block`, mark `curr_operation_index`
+    /// with `"E  "`, write each line to stderr, return the lines.
+    pub fn print_traceback(&self) -> Vec<String> {
+        let mut frames = self.traceback_frames.replace(Vec::new());
+        frames.reverse();
+        let mut lines = Vec::new();
+        for frame_rc in frames {
+            let frame = frame_rc.borrow();
+            let mut logline = format!("{}()", frame.graph.borrow().name);
+            let Some(block) = frame.curr_block.clone() else {
+                logline.push_str(" <not running yet>");
+                lines.push(logline);
+                continue;
+            };
+            // `self.typer.annotator.annotated[block].func.__module__`;
+            // KeyError / AttributeError / TypeError → " <unknown module>".
+            let module = self.typer.annotator.upgrade().and_then(|ann| {
+                let graph = ann
+                    .annotated
+                    .borrow()
+                    .get(&BlockKey::of(&block))
+                    .cloned()
+                    .flatten()?;
+                graph.borrow().func.as_ref()?.module.clone()
+            });
+            match module {
+                Some(module) => {
+                    logline.push(' ');
+                    logline.push_str(&module);
+                }
+                None => logline.push_str(" <unknown module>"),
+            }
+            lines.push(logline);
+            let operations = block.borrow().operations.clone();
+            for (i, operation) in operations.iter().enumerate() {
+                let prefix = if i == frame.curr_operation_index {
+                    "E  "
+                } else {
+                    "   "
+                };
+                lines.push(format!("{prefix}{operation}"));
+            }
         }
+        for line in &lines {
+            log.method("traceback", line);
+        }
+        lines
     }
 }
 
@@ -1063,6 +1217,8 @@ impl LLFrame {
 
     /// `LLFrame.eval`: walk blocks until a returnblock; an `LLException`
     /// that is not handled in this graph escapes as `FrameError::LLException`.
+    /// Any `Err` leaving the frame is pushed onto
+    /// `LLInterpreter.traceback_frames` before returning (innermost first).
     fn eval(
         &mut self,
         llinterpreter: &LLInterpreter,
@@ -1099,6 +1255,12 @@ impl LLFrame {
                 }
             }
         };
+        if result.is_err() {
+            llinterpreter
+                .traceback_frames
+                .borrow_mut()
+                .push(self_ref.clone());
+        }
         let leavingframe = llinterpreter.frame_stack.borrow_mut().pop();
         debug_assert!(
             leavingframe
@@ -1264,13 +1426,54 @@ impl LLFrame {
         cls.is_subclass_of(exitcase)
     }
 
+    /// `LLFrame.eval_operation` canraise check using
+    /// `LLInterpreter.find_exception`.
+    ///
+    /// If `opname` is absent from `LL_OPERATIONS`, or its `canraise`
+    /// list contains `Exception`, the raise is allowed. Otherwise the
+    /// raised class must be a subclass of one of the listed classes.
+    fn check_operation_canraise(&self, opname: &str, etype: &LLValue) -> Result<(), TaskError> {
+        let Some(opdesc) = ll_operations().get(opname) else {
+            return Ok(());
+        };
+        if opdesc.canraise.iter().any(|&name| name == "Exception") {
+            return Ok(());
+        }
+        let exc = find_exception(etype)?;
+        for canraise_name in &opdesc.canraise {
+            let args =
+                crate::translator::rtyper::rtyper::exception_args(canraise_name).map_err(|e| {
+                    TaskError {
+                        message: format!("LLInterpreter.find_exception: {e}"),
+                    }
+                })?;
+            let canraise_cls = match args.first() {
+                Some(Hlvalue::Constant(c)) => host_class_object(&c.value),
+                _ => None,
+            };
+            if let Some(canraise_cls) = canraise_cls {
+                if self.fn_exception_match(&exc, canraise_cls) {
+                    return Ok(());
+                }
+            }
+        }
+        Err(TaskError {
+            message: format!(
+                "the operation {opname} is not expected to raise {}",
+                exc.simple_name()
+            ),
+        })
+    }
+
     /// `LLFrame.make_llexception`: store the standard exception
     /// class/instance as `pending_exception` so `eval_block` routes it
     /// through `dispatch_exception`. The pair is the same
     /// `exception_args` HostObject class/instance
     /// `close_ovfcheck_block` puts on an OverflowError exit, so
     /// `fn_exception_match` walks the HostObject class hierarchy.
-    fn make_llexception(&mut self, name: &str) -> Result<(), TaskError> {
+    /// `opname` is the raising op, used for the `LLFrame.eval_operation`
+    /// canraise check.
+    fn make_llexception(&mut self, opname: &str, name: &str) -> Result<(), TaskError> {
         let args =
             crate::translator::rtyper::rtyper::exception_args(name).map_err(|e| TaskError {
                 message: format!("LLFrame.make_llexception: {e}"),
@@ -1287,6 +1490,7 @@ impl LLFrame {
                 });
             }
         };
+        self.check_operation_canraise(opname, &etype)?;
         self.pending_exception = Some((etype, evalue));
         Ok(())
     }
@@ -1303,7 +1507,7 @@ impl LLFrame {
         match op(vals[0].as_i64(opname)?, vals[1].as_i64(opname)?) {
             Some(n) => Ok(LLValue::Int(n)),
             None => {
-                self.make_llexception("OverflowError")?;
+                self.make_llexception(opname, "OverflowError")?;
                 Ok(LLValue::Int(0))
             }
         }
@@ -1347,17 +1551,32 @@ impl LLFrame {
         })
     }
 
-    /// `LLFrame.eval_operation`. An `LLException` from the handler stores
-    /// on `pending_exception` and does not bind `operation.result`.
+    /// `LLFrame.eval_operation`. An `LLException` from the handler is
+    /// canraise-checked then stored on `pending_exception` and does not
+    /// bind `operation.result`.
     fn eval_operation(&mut self, operation: &SpaceOperation) -> Result<(), TaskError> {
-        let vals = operation
+        let mut vals = operation
             .args
             .iter()
             .map(|arg| self.getval(arg))
             .collect::<Result<Vec<_>, _>>()?;
+        if need_result_type(&operation.opname) {
+            let concretetype =
+                hlvalue_concretetype(&operation.result).ok_or_else(|| TaskError {
+                    message: format!(
+                        "LLFrame.eval_operation: {} missing result concretetype",
+                        operation.opname
+                    ),
+                })?;
+            vals.insert(
+                0,
+                LLValue::Const(ConstValue::LowLevelType(Box::new(concretetype))),
+            );
+        }
         let retval = match self.getoperationhandler(&operation.opname, &vals) {
             Ok(v) => v,
             Err(FrameError::LLException { etype, evalue }) => {
+                self.check_operation_canraise(&operation.opname, &etype)?;
                 self.pending_exception = Some((etype, evalue));
                 return Ok(());
             }
@@ -1462,10 +1681,9 @@ impl LLFrame {
             // reinterpret the unsigned word's bits as Signed. The carrier
             // already stores the word as `i64`, so this is the identity.
             "cast_uint_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
-            // `op_cast_primitive` between integer types reinterprets the
-            // machine word; the Signed carrier already holds it, so the
-            // Signed<->Unsigned cast is the identity on the i64 word.
-            "cast_primitive" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
+            // `opimpl.py op_cast_primitive(TYPE, value)`:
+            // `need_result_type` inserts TYPE as `vals[0]`.
+            "cast_primitive" => self.op_cast_primitive(vals),
             // `op_cast_int_to_char(b) = chr(b)` (opimpl.py): the char
             // carrier is the one-char `Str`.
             "cast_int_to_char" => {
@@ -1587,6 +1805,8 @@ impl LLFrame {
             "length_of_simple_gcarray_from_opaque" => {
                 self.op_length_of_simple_gcarray_from_opaque(vals)
             }
+            "cast_pointer" => return self.op_cast_pointer(vals),
+            "cast_opaque_ptr" => return self.op_cast_opaque_ptr(vals),
             "getinteriorfield" => self.op_getinteriorfield(vals),
             "direct_call" => return self.op_direct_call(vals),
             "int_xor" => Ok(LLValue::Int(
@@ -1910,6 +2130,45 @@ impl LLFrame {
         Ok(LLValue::Int(n))
     }
 
+    /// `opimpl.py op_cast_primitive(TYPE, value)`:
+    /// `return lltype.cast_primitive(TYPE, value)`.
+    fn op_cast_primitive(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+        let TYPE = match vals.first() {
+            Some(LLValue::Const(ConstValue::LowLevelType(t))) => t.as_ref(),
+            _ => {
+                return Err(TaskError {
+                    message: "LLFrame.op_cast_primitive: TYPE must be a LowLevelType".to_string(),
+                });
+            }
+        };
+        let value = vals.get(1).ok_or_else(|| TaskError {
+            message: "LLFrame.op_cast_primitive: missing value".to_string(),
+        })?;
+        cast_primitive(TYPE, value, "cast_primitive")
+    }
+
+    /// `opimpl.py op_cast_pointer`: `checkptr(obj); return lltype.cast_pointer(RESTYPE, obj)`.
+    fn op_cast_pointer(&mut self, vals: &[LLValue]) -> Result<LLValue, FrameError> {
+        let RESTYPE = restype_ptr(vals, "cast_pointer")?;
+        checkptr_ll(&vals[1], "cast_pointer")?;
+        let p = vals[1].as_ptr("cast_pointer")?;
+        let result = cast_pointer(&RESTYPE, p).map_err(|e| TaskError {
+            message: format!("LLFrame.op_cast_pointer: {e}"),
+        })?;
+        Ok(LLValue::Ptr(Box::new(result)))
+    }
+
+    /// `LLFrame.op_cast_opaque_ptr`: `checkptr(obj); return lltype.cast_opaque_ptr(RESTYPE, obj)`.
+    fn op_cast_opaque_ptr(&mut self, vals: &[LLValue]) -> Result<LLValue, FrameError> {
+        let RESTYPE = restype_ptr(vals, "cast_opaque_ptr")?;
+        checkptr_ll(&vals[1], "cast_opaque_ptr")?;
+        let p = vals[1].as_ptr("cast_opaque_ptr")?;
+        let result = cast_opaque_ptr(&RESTYPE, p).map_err(|e| TaskError {
+            message: format!("LLFrame.op_cast_opaque_ptr: {e}"),
+        })?;
+        Ok(LLValue::Ptr(Box::new(result)))
+    }
+
     /// `op_getinteriorfield` (`llinterp.py`): walk field names / indices.
     fn op_getinteriorfield(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
         checkptr_ll(&vals[0], "getinteriorfield")?;
@@ -2001,6 +2260,194 @@ fn checkptr_ll(val: &LLValue, opname: &str) -> Result<(), TaskError> {
     }
 }
 
+/// `lltype.py Number` — the integer Primitive subclasses.
+fn is_number_type(t: &LowLevelType) -> bool {
+    matches!(
+        t,
+        LowLevelType::Signed
+            | LowLevelType::Unsigned
+            | LowLevelType::SignedLongLong
+            | LowLevelType::SignedLongLongLong
+            | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong
+    )
+}
+
+/// `lltype.typeOf(value)` for an `LLValue` primitive carrier.
+///
+/// The `Int` carrier does not record which `Number` it is; report
+/// `Signed` (`typeOf` of a Python `int`). A one-char `Str` is `Char`,
+/// or `UniChar` when `TGT` is `UniChar`, so `ORIG == TGT` identity
+/// holds for both character primitives that share the carrier.
+fn primitive_type_of_llvalue(
+    value: &LLValue,
+    TGT: &LowLevelType,
+) -> Result<LowLevelType, TaskError> {
+    match value {
+        LLValue::Int(_) => Ok(LowLevelType::Signed),
+        LLValue::Bool(_) => Ok(LowLevelType::Bool),
+        LLValue::Float(_) => Ok(LowLevelType::Float),
+        LLValue::Str(s) if s.chars().count() == 1 => {
+            if matches!(TGT, LowLevelType::UniChar) {
+                Ok(LowLevelType::UniChar)
+            } else {
+                Ok(LowLevelType::Char)
+            }
+        }
+        LLValue::Address(_) => Ok(LowLevelType::Address),
+        LLValue::Void => Ok(LowLevelType::Void),
+        _ => Err(TaskError {
+            message: "lltype.cast_primitive: can only primitive to primitive".to_string(),
+        }),
+    }
+}
+
+/// `lltype.py Number._cast`: wrap to the Number's width and signedness.
+/// The `LLValue::Int` carrier is the 64-bit word, so Signed / Unsigned /
+/// longlong wrap is the identity on that word.
+fn number_cast(TGT: &LowLevelType, value: i64) -> LLValue {
+    match TGT {
+        LowLevelType::Unsigned
+        | LowLevelType::UnsignedLongLong
+        | LowLevelType::UnsignedLongLongLong => LLValue::Int(value as u64 as i64),
+        _ => LLValue::Int(value),
+    }
+}
+
+/// Python `long(float)` then the 64-bit word of `Number._cast`. Truncates
+/// toward zero; inf / nan raise like host `long()`.
+fn float_to_long(f: f64) -> Result<i64, TaskError> {
+    if f.is_nan() {
+        return Err(TaskError {
+            message: "ValueError: cannot convert float NaN to integer".to_string(),
+        });
+    }
+    if f.is_infinite() {
+        return Err(TaskError {
+            message: "OverflowError: cannot convert float infinity to integer".to_string(),
+        });
+    }
+    let t = f.trunc();
+    if t.abs() < 2f64.powi(127) {
+        Ok((t as i128) as i64)
+    } else {
+        Ok(0)
+    }
+}
+
+/// `lltype.cast_primitive(TGT, value)`.
+fn cast_primitive(TGT: &LowLevelType, value: &LLValue, opname: &str) -> Result<LLValue, TaskError> {
+    let ORIG = primitive_type_of_llvalue(value, TGT)?;
+    if !TGT.is_primitive() {
+        return Err(TaskError {
+            message: "lltype.cast_primitive: can only primitive to primitive".to_string(),
+        });
+    }
+    // `if ORIG == TGT: return value`. The Int carrier does not record
+    // which Number it is, so integer→integer always applies `TGT._cast`
+    // (identity on the 64-bit Signed/Unsigned/longlong word).
+    if ORIG == *TGT && !matches!(value, LLValue::Int(_)) {
+        return Ok(value.clone());
+    }
+    let mut working: Option<i64> = None;
+    if ORIG == LowLevelType::Char || ORIG == LowLevelType::UniChar {
+        let LLValue::Str(s) = value else {
+            return Err(TaskError {
+                message: format!("{opname}: expected Char, got {value:?}"),
+            });
+        };
+        let ch = s.chars().next().ok_or_else(|| TaskError {
+            message: format!("{opname}: empty char"),
+        })?;
+        working = Some(ch as i64);
+    } else if ORIG == LowLevelType::Float {
+        let f = value.as_f64(opname)?;
+        if *TGT == LowLevelType::SingleFloat {
+            // No SingleFloat carrier: round through f32 and store the
+            // widened f64 bits, matching `llvalue_to_lowlevel_of_type`
+            // / `any_to_llvalue` SingleFloat round trip (`r_singlefloat`).
+            return Ok(LLValue::Float(((f as f32) as f64).to_bits()));
+        } else if *TGT == LowLevelType::LongFloat {
+            return Ok(LLValue::Float(f.to_bits()));
+        }
+        working = Some(float_to_long(f)?);
+    } else if let LLValue::Int(n) = value {
+        working = Some(*n);
+    } else if let LLValue::Bool(b) = value {
+        working = Some(i64::from(*b));
+    }
+    let Some(value_n) = working else {
+        if ORIG == LowLevelType::SingleFloat && *TGT == LowLevelType::Float {
+            return Ok(LLValue::Float(value.as_f64(opname)?.to_bits()));
+        }
+        if ORIG == LowLevelType::LongFloat && *TGT == LowLevelType::Float {
+            return Ok(LLValue::Float(value.as_f64(opname)?.to_bits()));
+        }
+        return Err(TaskError {
+            message: format!(
+                "lltype.cast_primitive: unsupported cast {} -> {}",
+                ORIG.short_name(),
+                TGT.short_name()
+            ),
+        });
+    };
+    // `_to_primitive = {Char: chr, UniChar: unichr, Float: float, Bool: bool}`
+    match TGT {
+        LowLevelType::Char => {
+            let ch = u8::try_from(value_n).map_err(|_| TaskError {
+                message: format!("opimpl.py op_cast_int_to_char: {value_n} out of char range"),
+            })? as char;
+            return Ok(LLValue::Str(ch.to_string()));
+        }
+        LowLevelType::UniChar => {
+            let ch = u32::try_from(value_n)
+                .ok()
+                .and_then(char::from_u32)
+                .ok_or_else(|| TaskError {
+                    message: format!("{opname}: {value_n} is not a valid UniChar"),
+                })?;
+            return Ok(LLValue::Str(ch.to_string()));
+        }
+        LowLevelType::Float => {
+            return Ok(LLValue::Float((value_n as f64).to_bits()));
+        }
+        LowLevelType::Bool => {
+            return Ok(LLValue::Bool(value_n != 0));
+        }
+        _ => {}
+    }
+    if is_number_type(TGT) {
+        return Ok(number_cast(TGT, value_n));
+    }
+    if ORIG == LowLevelType::SingleFloat && *TGT == LowLevelType::Float {
+        return Ok(LLValue::Float((value_n as f64).to_bits()));
+    }
+    if ORIG == LowLevelType::LongFloat && *TGT == LowLevelType::Float {
+        return Ok(LLValue::Float((value_n as f64).to_bits()));
+    }
+    Err(TaskError {
+        message: format!(
+            "lltype.cast_primitive: unsupported cast {} -> {}",
+            ORIG.short_name(),
+            TGT.short_name()
+        ),
+    })
+}
+
+fn restype_ptr(vals: &[LLValue], opname: &str) -> Result<Ptr, TaskError> {
+    let LLValue::Const(ConstValue::LowLevelType(t)) = &vals[0] else {
+        return Err(TaskError {
+            message: format!("LLFrame.op_{opname}: RESTYPE must be a LowLevelType"),
+        });
+    };
+    match t.as_ref() {
+        LowLevelType::Ptr(p) => Ok((**p).clone()),
+        other => Err(TaskError {
+            message: format!("LLFrame.op_{opname}: RESTYPE must be a Ptr, got {other:?}"),
+        }),
+    }
+}
+
 fn exitcase_value(value: &Hlvalue) -> Option<ConstValue> {
     match value {
         Hlvalue::Constant(c) => Some(c.value.clone()),
@@ -2059,7 +2506,10 @@ pub struct WrappedGraph {
 }
 
 impl WrappedGraph {
-    pub fn call(&self, args: Vec<Rc<dyn Any>>) -> Result<Rc<dyn Any>, TaskError> {
+    /// `wrap_graph`'s `interp_func` (`llinterp.py`): call
+    /// `llinterpreter.eval_graph`. An `LLException` from the graph
+    /// propagates unchanged (`LLFrame.perform_call`).
+    pub fn call(&self, args: Vec<Rc<dyn Any>>) -> Result<Rc<dyn Any>, FrameError> {
         let mut graph_args = self.self_arg.clone();
         graph_args.extend(args);
         self.llinterpreter
@@ -2105,11 +2555,43 @@ pub fn wrap_graph(
     )
 }
 
-/// RPython `enumerate_exceptions_top_down()`.
-pub fn enumerate_exceptions_top_down() -> Result<Vec<String>, TyperError> {
-    Err(TyperError::missing_rtype_operation(
-        "llinterp.enumerate_exceptions_top_down requires host Python exception module reflection",
-    ))
+/// RPython `enumerate_exceptions_top_down()`: walk
+/// `exceptions.__dict__.values()`, adding each class that is a
+/// subclass of `BaseException`, bases first.
+pub fn enumerate_exceptions_top_down() -> Vec<HostObject> {
+    let base_exc = HOST_ENV
+        .lookup_builtin("BaseException")
+        .expect("HOST_ENV BaseException");
+    let mut result = Vec::new();
+    let mut seen: HashSet<HostObject> = HashSet::new();
+    fn addcls(
+        cls: &HostObject,
+        base_exc: &HostObject,
+        result: &mut Vec<HostObject>,
+        seen: &mut HashSet<HostObject>,
+    ) {
+        if !cls.is_class() || !cls.is_subclass_of(base_exc) {
+            return;
+        }
+        if seen.contains(cls) {
+            return;
+        }
+        if let Some(bases) = cls.class_bases() {
+            for base in bases {
+                addcls(base, base_exc, result, seen);
+            }
+        }
+        result.push(cls.clone());
+        seen.insert(cls.clone());
+    }
+    // HOST_ENV.builtins is a HashMap and has no order; sort by builtin
+    // name so the walk is deterministic.
+    let mut builtins = HOST_ENV.builtin_values();
+    builtins.sort_by(|a, b| a.simple_name().cmp(b.simple_name()));
+    for cls in &builtins {
+        addcls(cls, &base_exc, &mut result, &mut seen);
+    }
+    result
 }
 
 /// RPython `_address_of_local_var`.
@@ -2282,8 +2764,27 @@ mod tests {
 
         assert_eq!(_address_of_local_var::_TYPE, LowLevelType::Address);
         assert_eq!(_address_of_thread_local::_TYPE, LowLevelType::Address);
-        let missing = enumerate_exceptions_top_down().expect_err("host reflection deferred");
-        assert!(missing.is_missing_rtype_operation());
+        let classes = enumerate_exceptions_top_down();
+        assert_eq!(
+            classes.first().map(|c| c.simple_name()),
+            Some("BaseException")
+        );
+        let exception_pos = classes
+            .iter()
+            .position(|c| c.simple_name() == "Exception")
+            .expect("Exception");
+        let valueerror_pos = classes
+            .iter()
+            .position(|c| c.simple_name() == "ValueError")
+            .expect("ValueError");
+        assert!(exception_pos < valueerror_pos);
+        for (i, cls) in classes.iter().enumerate() {
+            assert!(
+                classes[..i].iter().all(|prev| prev != cls),
+                "duplicate identity {}",
+                cls.simple_name()
+            );
+        }
     }
 
     #[test]
@@ -2291,7 +2792,8 @@ mod tests {
         let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
         let err = interp
             .eval_graph(Rc::new(()) as Rc<dyn Any>, Vec::new(), false)
-            .expect_err("non-graph inputs still fail at the typed leaf");
+            .expect_err("non-graph inputs still fail at the typed leaf")
+            .into_task_error();
         assert!(err.message.contains("llinterp.py:84"), "{}", err.message);
     }
 
@@ -2393,6 +2895,180 @@ mod tests {
             )
             .expect("length_of_simple_gcarray_from_opaque graph should run");
         assert_eq!(*out.downcast::<i64>().expect("Signed return"), 5);
+    }
+
+    #[test]
+    fn eval_graph_cast_opaque_ptr_round_trips_a_gc_array() {
+        // malloc_varsize a GcArray(Signed) of length 3, hide it behind
+        // GCREF, recover the array pointer, and read the length both as
+        // `length_of_simple_gcarray_from_opaque` and `getarraysize`.
+        use crate::flowspace::model::Constant as FlowConstant;
+        use crate::translator::rtyper::lltypesystem::lltype::Array;
+
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let array_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(array_ty.clone()).expect("array ptr type"),
+        ));
+        let type_c = || {
+            Hlvalue::Constant(FlowConstant::new(ConstValue::LowLevelType(Box::new(
+                array_ty.clone(),
+            ))))
+        };
+        let flavor_c = || {
+            let mut flags = indexmap::IndexMap::new();
+            flags.insert(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"));
+            Hlvalue::Constant(FlowConstant::new(ConstValue::Dict(std::sync::Arc::new(
+                flags,
+            ))))
+        };
+        let int_c = |n: i64| Hlvalue::Constant(FlowConstant::new(ConstValue::Int(n)));
+
+        let p = Variable::named("p");
+        p.set_concretetype(Some(array_ptr_ty.clone()));
+        let g = Variable::named("g");
+        g.set_concretetype(Some(GCREF.clone()));
+        let q = Variable::named("q");
+        q.set_concretetype(Some(array_ptr_ty));
+        let n = Variable::named("n");
+        n.set_concretetype(Some(LowLevelType::Signed));
+        let s = Variable::named("s");
+        s.set_concretetype(Some(LowLevelType::Signed));
+
+        let start = Block::shared(vec![]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![type_c(), flavor_c(), int_c(3)],
+            p.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_opaque_ptr",
+            vec![p.into()],
+            g.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_opaque_ptr",
+            vec![g.clone().into()],
+            q.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "length_of_simple_gcarray_from_opaque",
+            vec![g.into()],
+            n.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getarraysize",
+            vec![q.into()],
+            s.into(),
+        ));
+
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "cast_opaque_roundtrip",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![n.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(graph as Rc<dyn Any>, Vec::new(), false)
+            .expect("cast_opaque_ptr round-trip graph should run");
+        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 3);
+    }
+
+    #[test]
+    fn eval_graph_cast_pointer_between_struct_and_parent() {
+        // rclass inheritance: child's first inlined field is the parent
+        // GcStruct. `cast_pointer` up-casts the child ptr to the parent
+        // ptr type; `getfield` then reads a parent field.
+        use crate::flowspace::model::Constant as FlowConstant;
+
+        let object_t = Struct::gc("object", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let sub_t = Struct::gc(
+            "subclass",
+            vec![
+                (
+                    "super".into(),
+                    LowLevelType::Struct(Box::new(object_t.clone())),
+                ),
+                ("x".into(), LowLevelType::Signed),
+            ],
+        );
+        let object_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(object_t)))
+                .expect("parent ptr type"),
+        ));
+        let sub_ptr_ty = LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(sub_t.clone())))
+                .expect("child ptr type"),
+        ));
+
+        let child = Variable::named("child");
+        child.set_concretetype(Some(sub_ptr_ty));
+        let parent = Variable::named("parent");
+        parent.set_concretetype(Some(object_ptr_ty));
+        let set = Variable::named("set");
+        set.set_concretetype(Some(LowLevelType::Void));
+        let n = Variable::named("n");
+        n.set_concretetype(Some(LowLevelType::Signed));
+
+        let field = || Hlvalue::Constant(FlowConstant::new(ConstValue::byte_str("typeptr")));
+        let forty_two = || Hlvalue::Constant(FlowConstant::new(ConstValue::Int(42)));
+
+        let start = Block::shared(vec![child.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_pointer",
+            vec![child.into()],
+            parent.clone().into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![parent.clone().into(), field(), forty_two()],
+            set.into(),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![parent.into(), field()],
+            n.clone().into(),
+        ));
+
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::Signed));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "cast_parent",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![n.into()], Some(returnblock), None).into_ref(),
+        ]);
+
+        let subptr = malloc(
+            LowLevelType::Struct(Box::new(sub_t)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("malloc subclass");
+
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let out = interp
+            .eval_graph(
+                graph as Rc<dyn Any>,
+                vec![Rc::new(LowLevelValue::Ptr(Box::new(subptr))) as Rc<dyn Any>],
+                false,
+            )
+            .expect("cast_pointer parent-field graph should run");
+        assert_eq!(*out.downcast::<i64>().expect("Signed return"), 42);
     }
 
     #[test]
@@ -2593,8 +3269,9 @@ mod tests {
         let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
         let err = interp
             .eval_graph(graph as Rc<dyn Any>, Vec::new(), false)
-            .expect_err("negative varsize length must abort evaluation before allocating");
-        let msg = format!("{err}");
+            .expect_err("negative varsize length must abort evaluation before allocating")
+            .into_task_error();
+        let msg = err.message;
         assert!(
             msg.contains("negative varsize length"),
             "expected a negative-length rejection, got {msg:?}"
@@ -3035,8 +3712,7 @@ mod tests {
         assert!(interp.frame_stack.borrow().is_empty());
     }
 
-    #[test]
-    fn eval_graph_reports_exception_escaping_the_entry_graph() {
+    fn graph_unhandled_direct_call_to_overflow() -> GraphRef {
         let callee = graph_raising_overflow();
         let fptr_c = Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(
             signed_nullary_funcptr(&callee),
@@ -3062,17 +3738,153 @@ mod tests {
         start.closeblock(vec![
             Link::new(vec![call_result.into()], Some(returnblock), None).into_ref(),
         ]);
+        graph
+    }
 
+    fn exception_etype_evalue(name: &str) -> (LLValue, LLValue) {
+        match crate::translator::rtyper::rtyper::exception_args(name)
+            .expect(name)
+            .as_slice()
+        {
+            [Hlvalue::Constant(cls), Hlvalue::Constant(inst)] => {
+                (const_to_llvalue(cls), const_to_llvalue(inst))
+            }
+            other => panic!("{name} did not yield class/instance: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn eval_graph_reports_exception_escaping_the_entry_graph() {
+        let graph = graph_unhandled_direct_call_to_overflow();
+        let (expected_etype, expected_evalue) = exception_etype_evalue("OverflowError");
         let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
-        let err = interp
+        match interp
+            .eval_graph(graph as Rc<dyn Any>, Vec::new(), false)
+            .expect_err("exception escaping the entry graph")
+        {
+            FrameError::LLException { etype, evalue } => {
+                assert_eq!(etype, expected_etype);
+                assert_eq!(evalue, expected_evalue);
+            }
+            other => panic!("expected FrameError::LLException, got {other:?}"),
+        }
+        assert!(interp.frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn eval_graph_records_traceback_frames_when_exception_escapes() {
+        // Entry → callee raising OverflowError with no handler: two frames
+        // unwind, innermost first (`LLFrame.eval`). `eval_graph` then
+        // reports via `print_traceback`, which clears the list.
+        let graph = graph_unhandled_direct_call_to_overflow();
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        interp
             .eval_graph(graph as Rc<dyn Any>, Vec::new(), false)
             .expect_err("exception escaping the entry graph");
+        assert!(interp.traceback_frames.borrow().is_empty());
+        assert!(interp.frame_stack.borrow().is_empty());
+    }
+
+    #[test]
+    fn print_traceback_reverses_frames_and_marks_the_raising_op() {
+        // Bypass `eval_graph` so `traceback_frames` is not cleared;
+        // `LLFrame.eval` still appends (innermost first). Reverse order
+        // puts the outer graph first.
+        let graph = graph_unhandled_direct_call_to_overflow();
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let prior = CURRENT_INTERPRETER.with(|cell| {
+            let old = cell.borrow().clone();
+            *cell.borrow_mut() = Rc::downgrade(&interp);
+            old
+        });
+        let frame = Rc::new(RefCell::new(LLFrame::new(graph, Vec::new())));
+        frame
+            .borrow_mut()
+            .eval(&interp, frame.clone())
+            .expect_err("exception escaping nested eval");
+        CURRENT_INTERPRETER.with(|cell| {
+            *cell.borrow_mut() = prior;
+        });
+        assert_eq!(interp.traceback_frames.borrow().len(), 2);
+        let lines = interp.print_traceback();
         assert!(
-            err.message.contains("unhandled LLException"),
+            lines
+                .first()
+                .is_some_and(|line| line.starts_with("unhandled_raise()")),
+            "{lines:?}"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.starts_with("E  ")).count(),
+            1,
+            "{lines:?}"
+        );
+        assert!(interp.traceback_frames.borrow().is_empty());
+    }
+
+    #[test]
+    fn eval_operation_rejects_an_exception_the_op_cannot_raise() {
+        let frame = dummy_frame();
+        let (zdiv_etype, _) = exception_etype_evalue("ZeroDivisionError");
+        let (ovf_etype, _) = exception_etype_evalue("OverflowError");
+        let err = frame
+            .check_operation_canraise("int_add_ovf", &zdiv_etype)
+            .expect_err("int_add_ovf cannot raise ZeroDivisionError");
+        assert!(
+            err.message.contains("is not expected to raise"),
             "{}",
             err.message
         );
-        assert!(interp.frame_stack.borrow().is_empty());
+        frame
+            .check_operation_canraise("int_add_ovf", &ovf_etype)
+            .expect("int_add_ovf may raise OverflowError");
+        frame
+            .check_operation_canraise("direct_call", &zdiv_etype)
+            .expect("direct_call canraise includes Exception");
+    }
+
+    fn vtable_with_exception_name(name: &str) -> LLValue {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            MallocFlavor, Struct, malloc, typeOf,
+        };
+        use crate::translator::rtyper::lltypesystem::rstr::llstr;
+
+        let name_str = llstr(name.as_bytes()).expect("llstr");
+        let name_ty = LowLevelType::Ptr(Box::new(typeOf(&name_str)));
+        let vtable_t = Struct::new("object_vtable", vec![("name".into(), name_ty)]);
+        let mut vtable = malloc(
+            LowLevelType::Struct(Box::new(vtable_t)),
+            None,
+            MallocFlavor::Raw,
+            true,
+        )
+        .expect("malloc vtable");
+        vtable
+            .setattr("name", LowLevelValue::Ptr(Box::new(name_str)))
+            .expect("setattr name");
+        LLValue::Ptr(Box::new(vtable))
+    }
+
+    #[test]
+    fn find_exception_resolves_vtable_name_chars_to_host_class() {
+        let etype = vtable_with_exception_name("ValueError");
+        let cls = find_exception(&etype).expect("ValueError");
+        let expected = HOST_ENV
+            .lookup_builtin("ValueError")
+            .expect("HOST_ENV ValueError");
+        assert_eq!(cls, expected);
+    }
+
+    #[test]
+    fn find_exception_rejects_unknown_vtable_name() {
+        let etype = vtable_with_exception_name("NoSuchError");
+        let err = find_exception(&etype).expect_err("unknown vtable name");
+        assert!(
+            err.message.contains(
+                "couldn't match exception, maybe it has RPython attributes like OSError?"
+            ),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -3586,7 +4398,8 @@ mod tests {
                 vec![Rc::new(0_i64) as Rc<dyn Any>, Rc::new(0_i64) as Rc<dyn Any>],
                 false,
             )
-            .expect_err("jit_conditional_call_value is refused while not jitted");
+            .expect_err("jit_conditional_call_value is refused while not jitted")
+            .into_task_error();
         assert!(
             err.message.contains("NotImplementedError"),
             "{}",
@@ -3609,6 +4422,9 @@ mod tests {
         };
         let arity_ptr = functionptr_for_graph_with_type(&graph, arity_ft);
         let arity_err = eval_funcptr(&arity_ptr, &[]).expect_err("arity mismatch");
+        let FrameError::Task(arity_err) = arity_err else {
+            panic!("expected FrameError::Task, got {arity_err:?}");
+        };
         assert!(
             arity_err
                 .message
@@ -3630,6 +4446,9 @@ mod tests {
             ],
         )
         .expect_err("type mismatch");
+        let FrameError::Task(type_err) = type_err else {
+            panic!("expected FrameError::Task, got {type_err:?}");
+        };
         assert!(
             type_err.message.contains("called with wrong func ptr type"),
             "{}",
@@ -3670,6 +4489,21 @@ mod tests {
         let ptr = functionptr_for_graph_with_type(&graph, ft);
         let out = eval_funcptr(&ptr, &[LowLevelValue::Unsigned(7)]).expect("unsigned identity");
         assert_eq!(out, LowLevelValue::Unsigned(7));
+    }
+
+    #[test]
+    fn eval_funcptr_propagates_llexception_from_raising_graph() {
+        // `LLFrame.perform_call` returns the subframe's `LLException`
+        // unchanged; `eval_funcptr` does the same for a graph call.
+        let graph = graph_unhandled_direct_call_to_overflow();
+        let (expected_etype, _) = exception_etype_evalue("OverflowError");
+        let fptr = signed_nullary_funcptr(&graph);
+        match eval_funcptr(&fptr, &[]).expect_err("raising graph") {
+            FrameError::LLException { etype, .. } => {
+                assert_eq!(etype, expected_etype);
+            }
+            other => panic!("expected FrameError::LLException, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3789,6 +4623,97 @@ mod tests {
                 )
                 .unwrap(),
             LLValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn eval_operation_cast_primitive_ports_lltype_cast_primitive() {
+        // Drive `op_cast_primitive` through `LLFrame.eval_operation` so
+        // `need_result_type` inserts the result Variable's concretetype
+        // as TYPE (`opimpl.py` `op_cast_primitive.need_result_type`).
+        fn run(
+            src_ty: LowLevelType,
+            tgt: LowLevelType,
+            value: LLValue,
+        ) -> Result<LLValue, TaskError> {
+            let mut frame = dummy_frame();
+            let src = Variable::named("src");
+            src.set_concretetype(Some(src_ty));
+            frame.setvar(&Hlvalue::Variable(src.clone()), value)?;
+            let result = Variable::named("dst");
+            result.set_concretetype(Some(tgt));
+            let op = SpaceOperation::new("cast_primitive", vec![src.into()], result.clone().into());
+            frame.eval_operation(&op)?;
+            frame.getval(&Hlvalue::Variable(result))
+        }
+
+        assert_eq!(
+            run(LowLevelType::Signed, LowLevelType::Char, LLValue::Int(65)).unwrap(),
+            LLValue::Str("A".into())
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Char,
+                LowLevelType::Signed,
+                LLValue::Str("A".into())
+            )
+            .unwrap(),
+            LLValue::Int(65)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::Signed,
+                LLValue::Float((-2.7f64).to_bits())
+            )
+            .unwrap(),
+            LLValue::Int(-2)
+        );
+        assert_eq!(
+            run(LowLevelType::Signed, LowLevelType::Float, LLValue::Int(3)).unwrap(),
+            LLValue::Float(3.0f64.to_bits())
+        );
+        assert_eq!(
+            run(LowLevelType::Signed, LowLevelType::Bool, LLValue::Int(0)).unwrap(),
+            LLValue::Bool(false)
+        );
+        assert_eq!(
+            run(LowLevelType::Signed, LowLevelType::Bool, LLValue::Int(5)).unwrap(),
+            LLValue::Bool(true)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Unsigned,
+                LowLevelType::Signed,
+                LLValue::Int(-1)
+            )
+            .unwrap(),
+            LLValue::Int(-1)
+        );
+        // No dedicated SingleFloat carrier: f32 round trip on `LLValue::Float`.
+        let f = 2.1f64;
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::SingleFloat,
+                LLValue::Float(f.to_bits()),
+            )
+            .unwrap(),
+            LLValue::Float(((f as f32) as f64).to_bits())
+        );
+        let err = run(LowLevelType::Signed, LowLevelType::Char, LLValue::Int(300))
+            .expect_err("Signed→Char 300");
+        assert!(err.message.contains("out of char range"), "{}", err.message);
+        let tgt = LowLevelType::Func(Box::new(FuncType {
+            args: vec![],
+            result: LowLevelType::Void,
+        }));
+        let err = super::cast_primitive(&tgt, &LLValue::Int(1), "cast_primitive")
+            .expect_err("non-Primitive TGT");
+        assert!(
+            err.message.contains("can only primitive to primitive"),
+            "{}",
+            err.message
         );
     }
 

@@ -39,6 +39,7 @@ use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
     exception_args, helper_pygraph_from_graph, variable_with_lltype, void_field_const,
 };
+use crate::translator::tool::taskengine::TaskError;
 
 fn ptr_to_gc_array(of: LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
@@ -11294,7 +11295,9 @@ fn host_hlinvoke(
             }
         },
     };
-    eval_funcptr(&p, args).map_err(|e| TyperError::message(e.message))
+    eval_funcptr(&p, args)
+        .map_err(TaskError::from)
+        .map_err(|e| TyperError::message(e.message))
 }
 
 /// RPython `d.keyhash(key)` (`rordereddict.py` `convert_const`): call the
@@ -11313,6 +11316,7 @@ fn ll_keyhash(d: &_ptr, key: &LowLevelValue) -> Result<i64, TyperError> {
                 ))
             })?;
             eval_funcptr(&fp, std::slice::from_ref(key))
+                .map_err(TaskError::from)
                 .map_err(|e| TyperError::message(e.message))?
         }
         None => {
@@ -11360,6 +11364,7 @@ fn ll_keyeq(d: &_ptr, a: &LowLevelValue, b: &LowLevelValue) -> Result<Option<boo
                 TyperError::message(format!("d.keyeq: stored adtmeth is not a funcptr: {adt:?}"))
             })?;
             eval_funcptr(&fp, &[a.clone(), b.clone()])
+                .map_err(TaskError::from)
                 .map_err(|e| TyperError::message(e.message))?
         }
     };

@@ -118,6 +118,62 @@ pub fn conditional_call4<A, B, C, D>(
     }
 }
 
+/// The `value` of [`conditional_call_elidable0`]: `rlib/jit.py
+/// conditional_call_elidable` recomputes when an integer cache is `0` or a
+/// pointer cache is NULL.
+pub trait ConditionalCallValue: Copy {
+    /// `value == 0` for an integer, `not value` for a pointer.
+    fn is_miss(self) -> bool;
+}
+
+impl<T> ConditionalCallValue for *mut T {
+    fn is_miss(self) -> bool {
+        self.is_null()
+    }
+}
+
+impl<T> ConditionalCallValue for *const T {
+    fn is_miss(self) -> bool {
+        self.is_null()
+    }
+}
+
+impl ConditionalCallValue for isize {
+    fn is_miss(self) -> bool {
+        self == 0
+    }
+}
+
+impl ConditionalCallValue for usize {
+    fn is_miss(self) -> bool {
+        self == 0
+    }
+}
+
+impl ConditionalCallValue for i64 {
+    fn is_miss(self) -> bool {
+        self == 0
+    }
+}
+
+impl ConditionalCallValue for u64 {
+    fn is_miss(self) -> bool {
+        self == 0
+    }
+}
+
+impl ConditionalCallValue for i32 {
+    fn is_miss(self) -> bool {
+        self == 0
+    }
+}
+
+impl ConditionalCallValue for u32 {
+    fn is_miss(self) -> bool {
+        self == 0
+    }
+}
+
 /// `rlib/jit.py conditional_call_elidable` residual body
 /// (`if value is NULL: value = function(*args); return value`).
 ///
@@ -127,13 +183,17 @@ pub fn conditional_call4<A, B, C, D>(
 /// `_jit_conditional_call_value`). Argument order is
 /// `(value, function, *args)`, the same as the void [`conditional_call0`]
 /// family that reaches `Transformer.rewrite_op_jit_conditional_call`.
-/// Null is a miss. Upstream is one `*args` function with
+/// An integer `0` or a NULL pointer is a miss (`rlib/jit.py
+/// conditional_call_elidable`). Upstream is one `*args` function with
 /// `_always_inline_ = 'try'`; Rust spells one arity per residual
 /// word-count (`Transformer._rewrite_op_cond_call` rejects more than 4
 /// function arguments).
 #[majit_macros::oopspec("jit.conditional_call_value")]
-pub fn conditional_call_elidable0<T>(value: *mut T, function: unsafe fn() -> *mut T) -> *mut T {
-    if value.is_null() {
+pub fn conditional_call_elidable0<V: ConditionalCallValue>(
+    value: V,
+    function: unsafe fn() -> V,
+) -> V {
+    if value.is_miss() {
         unsafe { function() }
     } else {
         value
@@ -142,12 +202,12 @@ pub fn conditional_call_elidable0<T>(value: *mut T, function: unsafe fn() -> *mu
 
 /// [`conditional_call_elidable0`] with one function argument.
 #[majit_macros::oopspec("jit.conditional_call_value")]
-pub fn conditional_call_elidable1<T, A>(
-    value: *mut T,
-    function: unsafe fn(A) -> *mut T,
+pub fn conditional_call_elidable1<V: ConditionalCallValue, A>(
+    value: V,
+    function: unsafe fn(A) -> V,
     a: A,
-) -> *mut T {
-    if value.is_null() {
+) -> V {
+    if value.is_miss() {
         unsafe { function(a) }
     } else {
         value
@@ -156,13 +216,13 @@ pub fn conditional_call_elidable1<T, A>(
 
 /// [`conditional_call_elidable0`] with two function arguments.
 #[majit_macros::oopspec("jit.conditional_call_value")]
-pub fn conditional_call_elidable2<T, A, B>(
-    value: *mut T,
-    function: unsafe fn(A, B) -> *mut T,
+pub fn conditional_call_elidable2<V: ConditionalCallValue, A, B>(
+    value: V,
+    function: unsafe fn(A, B) -> V,
     a: A,
     b: B,
-) -> *mut T {
-    if value.is_null() {
+) -> V {
+    if value.is_miss() {
         unsafe { function(a, b) }
     } else {
         value
@@ -171,14 +231,14 @@ pub fn conditional_call_elidable2<T, A, B>(
 
 /// [`conditional_call_elidable0`] with three function arguments.
 #[majit_macros::oopspec("jit.conditional_call_value")]
-pub fn conditional_call_elidable3<T, A, B, C>(
-    value: *mut T,
-    function: unsafe fn(A, B, C) -> *mut T,
+pub fn conditional_call_elidable3<V: ConditionalCallValue, A, B, C>(
+    value: V,
+    function: unsafe fn(A, B, C) -> V,
     a: A,
     b: B,
     c: C,
-) -> *mut T {
-    if value.is_null() {
+) -> V {
+    if value.is_miss() {
         unsafe { function(a, b, c) }
     } else {
         value
@@ -187,15 +247,15 @@ pub fn conditional_call_elidable3<T, A, B, C>(
 
 /// [`conditional_call_elidable0`] with four function arguments.
 #[majit_macros::oopspec("jit.conditional_call_value")]
-pub fn conditional_call_elidable4<T, A, B, C, D>(
-    value: *mut T,
-    function: unsafe fn(A, B, C, D) -> *mut T,
+pub fn conditional_call_elidable4<V: ConditionalCallValue, A, B, C, D>(
+    value: V,
+    function: unsafe fn(A, B, C, D) -> V,
     a: A,
     b: B,
     c: C,
     d: D,
-) -> *mut T {
-    if value.is_null() {
+) -> V {
+    if value.is_miss() {
         unsafe { function(a, b, c, d) }
     } else {
         value
@@ -292,5 +352,47 @@ mod tests {
         let again = conditional_call_elidable2(hit, compute, &mut slot, 2);
         assert!(std::ptr::eq(again, hit));
         assert_eq!(slot, 2);
+    }
+
+    #[test]
+    fn conditional_call_elidable_int_cache_computes_on_zero() {
+        // Residual `rlib/jit.py conditional_call_elidable`: integer 0 is a miss.
+        unsafe fn compute(x: isize) -> isize {
+            x * 2
+        }
+        assert_eq!(conditional_call_elidable1(0isize, compute, 21), 42);
+        assert_eq!(conditional_call_elidable1(7isize, compute, 21), 7);
+    }
+
+    #[test]
+    fn conditional_call_elidable_ptr_cache_computes_on_null() {
+        // Residual `rlib/jit.py conditional_call_elidable`: NULL is a miss.
+        unsafe fn compute(target: *mut i32) -> *mut i32 {
+            target
+        }
+        let target = Box::leak(Box::new(1i32)) as *mut i32;
+        let hit = conditional_call_elidable1(std::ptr::null_mut(), compute, target);
+        assert!(std::ptr::eq(hit, target));
+        let cached = Box::leak(Box::new(2i32)) as *mut i32;
+        let again = conditional_call_elidable1(cached, compute, target);
+        assert!(std::ptr::eq(again, cached));
+    }
+
+    #[test]
+    fn conditional_call_elidable0_usize_cache() {
+        unsafe fn compute() -> usize {
+            42
+        }
+        assert_eq!(conditional_call_elidable0(0usize, compute), 42);
+        assert_eq!(conditional_call_elidable0(7usize, compute), 7);
+    }
+
+    #[test]
+    fn conditional_call_elidable4_usize_cache() {
+        unsafe fn compute(a: usize, b: usize, c: usize, d: usize) -> usize {
+            a + b + c + d
+        }
+        assert_eq!(conditional_call_elidable4(0usize, compute, 1, 2, 3, 4), 10);
+        assert_eq!(conditional_call_elidable4(7usize, compute, 1, 2, 3, 4), 7);
     }
 }
