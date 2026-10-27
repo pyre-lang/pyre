@@ -469,11 +469,6 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
                 )
             }
         }
-        CallTarget::Indirect {
-            trait_root,
-            method_name,
-            ..
-        } => format!("$<* indirect 'dyn {trait_root}::{method_name}'>"),
         CallTarget::UnsupportedExpr => "$<unsupported call target>".to_string(),
     }
 }

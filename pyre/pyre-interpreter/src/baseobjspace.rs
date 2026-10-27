@@ -6322,9 +6322,10 @@ pub fn finditem_str_named(
                 pyre_object::gc_roots::shadow_stack_get(base),
                 nameindex,
             );
+            let key_str = pyre_object::unicodeobject::prebuilt_str_storage(key);
             let hit = unsafe {
                 pyre_object::dictmultiobject::w_dict_get_strategy(obj)
-                    .getitem_str_hashed(obj, key, hash)
+                    .getitem_str_hashed(obj, key_str, hash)
             };
             return finditem_str_drain(
                 key,

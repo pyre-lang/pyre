@@ -2615,7 +2615,7 @@ fn analyze_pipeline_from_module_paths(
         )
         .collect();
     // Auto-population (receiver-dispatch configuration): register EVERY `>=2`-impl trait so its
-    // inline `dyn Trait` receiver (lowered to `CallTarget::Indirect`) narrows
+    // inline `dyn Trait` receiver (lowered to `IndirectCall { family_key }`) narrows
     // to the family base ClassDef.  Union with the config list (dedup by
     // base_root), never replacing it, so an existing configuration stays
     // valid. Minting base/impl subclass classdefs and lowering the indirect
@@ -4382,6 +4382,51 @@ mod portal_driver_tests {
             graph
         };
         let mut call_control = call::CallControl::new();
+        // The vtable STRUCT a Charon `{vtable}` TypeDecl declares in production
+        // (`derive_program_metadata` → `set_struct_fields` / `set_struct_layout`);
+        // `rclass.py ClassRepr._setup_repr` builds the vtable STRUCT before any
+        // `getclsfield`.
+        let handler_owner = "Handler::{vtable}";
+        let unregistered_owner = "Unregistered::{vtable}";
+        let handler_id = majit_ir::descr::StructId::from_canonical(handler_owner);
+        let unregistered_id = majit_ir::descr::StructId::from_canonical(unregistered_owner);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (handler_owner.to_string(), Some(handler_id)),
+                (unregistered_owner.to_string(), Some(unregistered_id)),
+            ]));
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        for (owner, field_name) in [
+            (handler_owner, "method_run"),
+            (unregistered_owner, "method_go"),
+        ] {
+            struct_fields.fields.insert(
+                owner.to_string(),
+                vec![(field_name.to_string(), "usize".to_string())],
+            );
+        }
+        call_control.set_struct_fields(struct_fields);
+        for (id, field_name) in [(handler_id, "method_run"), (unregistered_id, "method_go")] {
+            call_control.set_struct_layout(
+                id,
+                crate::call::StructLayout {
+                    size: 8,
+                    align: 8,
+                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    fields: vec![crate::call::StructFieldLayout {
+                        name: field_name.to_string(),
+                        offset: 0,
+                        size: 8,
+                        flag: majit_ir::descr::ArrayFlag::Unsigned,
+                        field_type: majit_ir::value::Type::Int,
+                        rank: None,
+                    }],
+                    host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+                },
+            );
+        }
         call_control.register_trait_method("run", Some("Handler"), "A", handler_impl("A::run"));
         let portal = CallPath::from_segments(["fixture", "portal"]);
         let mut graph = FunctionGraph::new("portal");
@@ -4397,11 +4442,28 @@ mod portal_driver_tests {
             )
             .unwrap();
         for (trait_root, method) in [("Handler", "run"), ("Unregistered", "go")] {
+            let funcptr = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: receiver.clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            format!("method_{method}"),
+                            Some(format!("{trait_root}::{{vtable}}")),
+                        ),
+                        ty: ValueType::Int,
+                        pure: true,
+                    },
+                    true,
+                )
+                .unwrap();
             graph.push_op_var(
                 graph.startblock,
-                OpKind::Call {
-                    target: CallTarget::indirect(trait_root, method),
-                    args: crate::model::call_args(vec![receiver.clone()]),
+                OpKind::IndirectCall {
+                    funcptr,
+                    args: vec![receiver.clone()],
+                    graphs: None,
+                    family_key: Some((trait_root.to_string(), method.to_string())),
                     result_ty: ValueType::Void,
                 },
                 true,
@@ -4429,7 +4491,8 @@ mod portal_driver_tests {
         assert!(all.by_path.contains_key(&portal));
 
         // The in-place pass fills `Handler::run` with its one registered
-        // impl and leaves `Unregistered::go` as a `CallTarget::Indirect`.
+        // impl and leaves `Unregistered::go` as `IndirectCall { graphs: None,
+        // family_key: Some }` (collapse_unresolved is false).
         let stored = call_control
             .function_graphs()
             .get(&portal)
@@ -4450,18 +4513,11 @@ mod portal_driver_tests {
             .collect();
         assert_eq!(
             filled,
-            vec![(Some(vec![CallPath::from_segments(["A", "run"])]), None)],
-            "Handler::run must keep A::run as its only candidate"
-        );
-        assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Indirect { trait_root, method_name, .. },
-                    ..
-                } if trait_root == "Unregistered" && method_name == "go"
-            )),
-            "Unregistered::go must stay an unresolved indirect call"
+            vec![
+                (Some(vec![CallPath::from_segments(["A", "run"])]), None),
+                (None, Some(("Unregistered".to_string(), "go".to_string()))),
+            ],
+            "Handler::run must keep A::run as its only candidate; Unregistered::go stays unresolved"
         );
     }
 

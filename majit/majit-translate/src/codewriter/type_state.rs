@@ -211,7 +211,6 @@ pub(crate) fn authoritative_result_type_from_op(
         | OpKind::RecursiveCall { result_kind, .. } => {
             concrete_if_known(kind_char_to_concrete(*result_kind))
         }
-        OpKind::VtableMethodPtr { .. } => Some(ConcreteType::Signed),
         // `arraylen_gc/rd>i` and `arraylen_vable/rdd>i` answer a length
         // (`jtransform.py rewrite_op_getarraysize`, `blackhole.py`
         // `bhimpl_arraylen_gc` `@arguments("cpu", "r", "d", returns="i")`).

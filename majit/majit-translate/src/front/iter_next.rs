@@ -98,7 +98,6 @@ pub(crate) fn is_iterator_next_target(target: &CallTarget) -> bool {
         CallTarget::FunctionPath { segments, .. } => {
             is_slice_iter_next_segments(segments) || segments.last().is_some_and(|s| s == "next")
         }
-        CallTarget::Indirect { method_name, .. } => method_name == "next",
         _ => false,
     }
 }

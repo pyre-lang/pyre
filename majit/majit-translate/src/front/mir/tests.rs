@@ -7672,6 +7672,231 @@ fn unsize_of_unregistered_ptr_metadata_is_unsupported() {
     );
 }
 
+/// `SetStrategy::{add,remove,has_key}` Dynamic rewrite targets the word
+/// trampoline, except when that trampoline's own body is being lowered.
+#[test]
+fn set_strategy_add_dynamic_does_not_rewrite_the_trampoline_to_itself() {
+    use crate::model::{CallTarget, OpKind};
+
+    let span = serde_json::json!({"data": {
+        "file_id": 0,
+        "beg": {"line": 1, "col": 0},
+        "end": {"line": 1, "col": 10}
+    }});
+    let meta = |path: &[&str]| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let empty_generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+    });
+    let vtable_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": empty_generics}
+    });
+    let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+    let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+    let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+    let fn_ptr = serde_json::json!({
+        "FnPtr": {"inputs": [fat_ty.clone(), holder_ref.clone()], "output": {"Tuple": []}}
+    });
+    let unit = serde_json::json!({"Tuple": []});
+    let field_attr = serde_json::json!({
+        "attributes": [], "inline": null, "rename": null, "public": true
+    });
+    let holder = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "Holder"]),
+        "kind": {"Struct": [{
+            "name": "slot",
+            "ty": fat_ty,
+            "attr_info": field_attr
+        }]}
+    });
+    let vtable = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "SetStrategy", "{vtable}"]),
+        "kind": {"Struct": [{
+            "name": "method_add",
+            "ty": fn_ptr,
+            "attr_info": field_attr
+        }]}
+    });
+    let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+    let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+    let slot_place = place(
+        serde_json::json!({"Projection": [
+            place(serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 1}), &holder_ref),
+                "Deref"
+            ]}), &holder_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &fat_ty,
+    );
+    let metadata_place = place(
+        serde_json::json!({"Projection": [
+            place(serde_json::json!({"Local": 2}), &fat_ty),
+            "PtrMetadata"
+        ]}),
+        &vtable_ptr,
+    );
+    let slot_field = place(
+        serde_json::json!({"Projection": [
+            place(serde_json::json!({"Projection": [
+                metadata_place,
+                "Deref"
+            ]}), &vtable_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &fn_ptr,
+    );
+    let fun_decl = |def_id: u64, path: &[&str]| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": meta(path),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": unit},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &holder_ref),
+                    local(2, &fat_ty),
+                    local(3, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fat_ty),
+                                {"Use": [{"Read": slot_place}, "No"]}
+                            ]}},
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 3}), &fn_ptr),
+                                {"UnaryOp": [
+                                    {"Cast": {"RawPtr": fn_ptr.clone()}},
+                                    {"Read": slot_field}
+                                ]}
+                            ]}}
+                        ],
+                        "kind": "Regular",
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": [{"Read": place(
+                                    serde_json::json!({"Local": 3}),
+                                    &fn_ptr
+                                )}, {"regions": []}]},
+                                "args": [
+                                    {"Move": place(
+                                        serde_json::json!({"Local": 2}),
+                                        &fat_ty
+                                    )},
+                                    {"Read": place(
+                                        serde_json::json!({"Local": 1}),
+                                        &holder_ref
+                                    )}
+                                ]
+                            },
+                            "dest": place(serde_json::json!({"Local": 0}), &unit),
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "kind": "Regular", "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        })
+    };
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "pyre_object",
+            "type_decls": [holder, vtable],
+            "fun_decls": [
+                fun_decl(0, &["pyre_object", "setobject", "set_strategy_add_key_ptr"]),
+                fun_decl(1, &["pyre_object", "setobject", "call_add"])
+            ],
+            "global_decls": [],
+            "trait_decls": [{
+                "def_id": 0,
+                "item_meta": meta(&["fixture", "SetStrategy"]),
+                "methods": [{"skip_binder": {"name": "add"}}]
+            }],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+
+    let trampoline = super::lower_function(&llbc, "set_strategy_add_key_ptr")
+        .expect("lower set_strategy_add_key_ptr");
+    let trampoline_indirect: Vec<_> = trampoline
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::IndirectCall {
+                graphs: None,
+                family_key: Some(family),
+                ..
+            } => Some(family.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        trampoline_indirect,
+        vec![("SetStrategy".to_string(), "add".to_string())],
+        "trampoline body keeps unknown-graph IndirectCall: {trampoline_indirect:?}"
+    );
+    let trampoline_self_calls: Vec<_> = trampoline
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.as_slice() == ["pyre_object", "setobject", "set_strategy_add_key_ptr"],
+            _ => false,
+        })
+        .collect();
+    assert!(
+        trampoline_self_calls.is_empty(),
+        "trampoline must not Call itself: {trampoline_self_calls:?}"
+    );
+
+    let caller = super::lower_function(&llbc, "call_add").expect("lower call_add");
+    let caller_rewrites: Vec<_> = caller
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice()
+                == ["pyre_object", "setobject", "set_strategy_add_key_ptr"] =>
+            {
+                Some(segments.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        caller_rewrites.len(),
+        1,
+        "other caller still rewrites to the trampoline: {caller_rewrites:?}"
+    );
+}
+
 /// `w_dict_getitem_str_hashed` reads `imp` on two strategy arms, merges,
 /// then reads `method_*` after a passthrough. The FatMeta metadata word
 /// must be an inputarg of the method_* block: a dominating use of the
@@ -22880,6 +23105,394 @@ fn niche_option_non_niche_payloads_remain_aggregate() {
         assert_eq!(null_muts, 0, "case {name}: {none_msg}");
         assert!(transparent_ctors >= 2, "case {name}: {agg_msg}");
     }
+}
+
+/// rustc coerces `&mut keyhash` to `*mut i64` before the call:
+/// `_t = &mut h; _a = &raw mut (*_t)`, or `_a = copy _t as *mut i64`
+/// (`PtrToPtr`). The passed type is already a raw pointer; the spill
+/// still materializes an address so the residual does not store through
+/// the i64 word.
+///
+/// `h` is a function-local primitive, so that address is
+/// `rffi.scoped_alloc` / `lltype.malloc(flavor='raw')`: one Char-varsize
+/// cell for the storage scope (`jtransform.py` `_rewrite_raw_malloc` /
+/// `OS_RAW_MALLOC_VARSIZE_CHAR`). A per-call `Tuple<i64>` spill was the
+/// pre-#2491 shape.
+#[test]
+fn raw_scalar_coerced_mut_borrow_spills_the_word() {
+    for coerce in [RawScalarCoerce::RawMutDeref, RawScalarCoerce::PtrToPtr] {
+        let graph = lower_coerced_raw_scalar_spill(coerce);
+        assert_coerced_raw_scalar_spill(&graph, coerce);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RawScalarCoerce {
+    /// `_t = &mut h; _a = &raw mut (*_t)` — the measured product MIR.
+    RawMutDeref,
+    /// `_t = &mut h; _a = copy _t as *mut i64`.
+    PtrToPtr,
+}
+
+fn lower_coerced_raw_scalar_spill(coerce: RawScalarCoerce) -> FunctionGraph {
+    let span = fixture_span();
+    let word = i64_ty();
+    let borrowed = serde_json::json!({"Ref": ["Erased", word, "Mut"]});
+    let raw = serde_json::json!({"RawPtr": [word, "Mut"]});
+    let generics = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let place = |index: u64, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": index}, "ty": ty});
+    let local = |index: u64, name: Option<&str>, ty: &serde_json::Value| {
+        serde_json::json!({
+            "index": index, "name": name, "span": span, "ty": ty
+        })
+    };
+    let h = place(2, &word);
+    let borrow = place(3, &borrowed);
+    let raw_place = place(4, &raw);
+    let word_arg = place(5, &word);
+    let dest = place(6, &word);
+    let coerce_assign = match coerce {
+        RawScalarCoerce::RawMutDeref => serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [raw_place.clone(), {"RawPtr": {
+                "place": {
+                    "kind": {"Projection": [borrow.clone(), "Deref"]},
+                    "ty": word
+                },
+                "kind": "Mut",
+                "ptr_metadata": null
+            }}]}
+        }),
+        RawScalarCoerce::PtrToPtr => serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [raw_place.clone(), {"Cast": [
+                "PtrToPtr",
+                {"Move": borrow.clone()},
+                raw.clone()
+            ]}]}
+        }),
+    };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["probe", "write_hash"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word.clone()],
+            "output": word.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                local(0, None, &word),
+                local(1, Some("x"), &word),
+                local(2, Some("h"), &word),
+                local(3, None, &borrowed),
+                local(4, None, &raw),
+                local(5, None, &word),
+                local(6, None, &word)
+            ]},
+            "body": [
+                {
+                    "statements": [
+                        {"span": span, "kind": {"Assign": [
+                            h.clone(),
+                            {"Use": [{"Read": place(1, &word)}, "Yes"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [
+                            word_arg.clone(),
+                            {"Use": [{"Read": h.clone()}, "Yes"]}
+                        ]}},
+                        {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                            "place": h.clone(),
+                            "kind": "Mut",
+                            "ptr_metadata": null
+                        }}]}},
+                        coerce_assign
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": generics
+                            }},
+                            "args": [
+                                {"Move": word_arg},
+                                {"Move": raw_place}
+                            ]
+                        },
+                        "dest": dest,
+                        "target": 1,
+                        "on_unwind": 2
+                    }}}
+                },
+                {
+                    "statements": [{"span": span, "kind": {"Assign": [
+                        place(0, &word),
+                        {"Use": [{"Read": h}, "Yes"]}
+                    ]}}],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "Return"}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": span, "kind": "UnwindResume"}
+                }
+            ]
+        }}
+    });
+    let sink_locals = vec![
+        local(0, None, &word),
+        local(1, None, &word),
+        local(2, None, &raw),
+    ];
+    let sink = serde_json::json!({
+        "def_id": 1,
+        "item_meta": fixture_item_meta(ident_path(&["probe", "sink"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [word.clone(), raw.clone()],
+            "output": word.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 2, "locals": sink_locals},
+            "body": [{
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    super::lower_function(&llbc, "write_hash")
+        .unwrap_or_else(|err| panic!("lower write_hash ({coerce:?}): {err}"))
+}
+
+fn assert_coerced_raw_scalar_spill(graph: &FunctionGraph, coerce: RawScalarCoerce) {
+    let ops: Vec<&SpaceOperation> = graph_ops(graph);
+    let dump = ops
+        .iter()
+        .map(|op| format!("{:?}", op.kind))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mallocs: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::RawMalloc { .. }))
+        .copied()
+        .collect();
+    assert_eq!(mallocs.len(), 1, "{coerce:?}: one RawMalloc\n{dump}");
+    let ptr = mallocs[0].result.as_ref().expect("RawMalloc result");
+    let length = match &mallocs[0].kind {
+        OpKind::RawMalloc {
+            owner,
+            zero: false,
+            length: Some(length),
+            ..
+        } if owner == super::address::RAW_SCALAR_CELL_OWNER => length,
+        other => {
+            panic!("{coerce:?}: spill owner is Array(Char) scoped_alloc, got {other:?}\n{dump}")
+        }
+    };
+    let length_n = ops.iter().find_map(|op| {
+        if op.result.as_ref() != Some(length) {
+            return None;
+        }
+        match &op.kind {
+            OpKind::ConstUInt(n) => Some(*n),
+            OpKind::ConstInt(n) => u64::try_from(*n).ok(),
+            _ => None,
+        }
+    });
+    assert_eq!(
+        length_n,
+        Some(8),
+        "{coerce:?}: i64 cell is eight bytes\n{dump}"
+    );
+    assert!(
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::RawMalloc { owner, .. } if owner == super::address::RAW_SCALAR_SPILL_OWNER
+        )),
+        "{coerce:?}: the local is not a per-call Tuple<i64> spill\n{dump}"
+    );
+    let malloc_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(ptr))
+        })
+        .expect("cell malloc block");
+    assert_eq!(
+        malloc_block.id, graph.startblock,
+        "{coerce:?}: the cell is allocated on function entry\n{dump}"
+    );
+    assert!(
+        ops.iter().any(|op| match &op.kind {
+            OpKind::RawStore {
+                base,
+                item_ty: ValueType::Int,
+                itemsize: 8,
+                is_item_signed: true,
+                ..
+            } if base == ptr => true,
+            _ => false,
+        }),
+        "{coerce:?}: store must write the i64 through the cell\n{dump}"
+    );
+    let call = ops
+        .iter()
+        .map(|op| &op.kind)
+        .find(|kind| match kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("sink"),
+            _ => false,
+        })
+        .unwrap_or_else(|| panic!("{coerce:?}: missing sink call\n{dump}"));
+    let OpKind::Call { args, .. } = call else {
+        unreachable!("sink is a Call");
+    };
+    let call_arg = |index: usize| {
+        args.get(index)
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("{coerce:?}: call arg {index} is not a variable: {call:?}"))
+    };
+    assert_ne!(
+        call_arg(0),
+        ptr,
+        "{coerce:?}: the i64 word must stay the word, not the spill address\n{dump}"
+    );
+    assert_eq!(
+        call_arg(1),
+        ptr,
+        "{coerce:?}: hash_out receives the malloc address, not the word\n{dump}"
+    );
+    let call_block = graph
+        .blocks
+        .iter()
+        .find(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| std::ptr::eq(&op.kind, call))
+        })
+        .expect("call block");
+    let call_at = call_block
+        .operations
+        .iter()
+        .position(|op| std::ptr::eq(&op.kind, call))
+        .expect("call");
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "{coerce:?}: the cell is not freed right after the call\n{dump}"
+    );
+    assert!(
+        !call_block.operations[call_at..]
+            .iter()
+            .any(|op| matches!(op.kind, OpKind::RawLoad { .. })),
+        "{coerce:?}: the cell has no copy-out RawLoad after the call\n{dump}"
+    );
+    let frees: Vec<_> = ops
+        .iter()
+        .filter(|op| matches!(&op.kind, OpKind::RawFree { .. }))
+        .copied()
+        .collect();
+    assert!(
+        !frees.is_empty(),
+        "{coerce:?}: the cell is freed at function exit\n{dump}"
+    );
+    for free in &frees {
+        match &free.kind {
+            OpKind::RawFree { ptr: freed } if aliases_scoped_raw_cell(graph, freed, ptr) => {}
+            other => panic!("{coerce:?}: RawFree must release the cell, got {other:?}\n{dump}"),
+        }
+    }
+}
+
+/// `scoped_alloc` frees the cell at `StorageDead` / function exit, after
+/// the pointer has crossed a block as an inputarg (`compute_lifetimes`
+/// unions `IDENTITY_OPS` and `Block.inputargs`).
+fn aliases_scoped_raw_cell(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    cell: &crate::flowspace::model::Variable,
+) -> bool {
+    fn visit(
+        graph: &FunctionGraph,
+        var: &crate::flowspace::model::Variable,
+        cell: &crate::flowspace::model::Variable,
+        seen: &mut std::collections::HashSet<u64>,
+    ) -> bool {
+        if var == cell {
+            return true;
+        }
+        if !seen.insert(var.id()) {
+            return false;
+        }
+        if let Some(op) = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(var))
+        {
+            return match &op.kind {
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "same_as" || op == "cast_int_to_ptr" || op == "cast_ptr_to_int" =>
+                {
+                    visit(graph, operand, cell, seen)
+                }
+                _ => false,
+            };
+        }
+        let Some((target_id, slot)) = graph.blocks.iter().find_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|arg| arg == var)
+                .map(|slot| (block.id, slot))
+        }) else {
+            return false;
+        };
+        let mut any = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                if link.target != target_id {
+                    continue;
+                }
+                let Some(src) = link.args.get(slot).and_then(LinkArg::as_variable) else {
+                    return false;
+                };
+                any = true;
+                if !visit(graph, src, cell, seen) {
+                    return false;
+                }
+            }
+        }
+        any
+    }
+    visit(graph, var, cell, &mut std::collections::HashSet::new())
 }
 
 /// `option_question_mark` with a String payload: Option `?` is a regular

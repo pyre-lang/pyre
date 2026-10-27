@@ -47,74 +47,6 @@ impl DictStrategy for ClassDictStrategySlot {
     }
 
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
-        CLASS_DICT_METHODS.getitem(w_dict, w_key)
-    }
-
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
-        CLASS_DICT_METHODS.getitem_str(w_dict, key)
-    }
-
-    unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
-        CLASS_DICT_METHODS.setitem(w_dict, w_key, w_value)
-    }
-
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        CLASS_DICT_METHODS.setitem_str(w_dict, key, w_value)
-    }
-
-    unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
-        CLASS_DICT_METHODS.delitem(w_dict, w_key)
-    }
-
-    unsafe fn length(&self, w_dict: PyObjectRef) -> usize {
-        CLASS_DICT_METHODS.length(w_dict)
-    }
-
-    unsafe fn w_keys(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        CLASS_DICT_METHODS.w_keys(w_dict)
-    }
-
-    unsafe fn values(&self, w_dict: PyObjectRef) -> Vec<PyObjectRef> {
-        CLASS_DICT_METHODS.values(w_dict)
-    }
-
-    unsafe fn items(&self, w_dict: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
-        CLASS_DICT_METHODS.items(w_dict)
-    }
-
-    unsafe fn clear(&self, w_dict: PyObjectRef) {
-        CLASS_DICT_METHODS.clear(w_dict)
-    }
-
-    unsafe fn switch_to_object_strategy(&self, _w_dict: PyObjectRef) -> bool {
-        true
-    }
-
-    unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
-        CLASS_DICT_METHODS.walk_gc_refs(w_dict, visitor)
-    }
-}
-
-static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
-
-pyre_object::define_prebuilt_dict_strategy_ref!(
-    CLASS_DICT_STRATEGY_REF,
-    class_dict_strategy_ref,
-    pyre_object::dictmultiobject::StrategyKind::Class,
-    &CLASS_DICT_SLOT
-);
-
-struct ClassDictMethods;
-
-static CLASS_DICT_METHODS: ClassDictMethods = ClassDictMethods;
-
-/// rerased unerase (`classdict.py`): `dstorage` is the type.
-unsafe fn unerase(w_dict: PyObjectRef) -> PyObjectRef {
-    (*(w_dict as *const pyre_object::W_DictObject)).dstorage as PyObjectRef
-}
-
-impl ClassDictMethods {
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if pyre_object::is_str(w_key) {
             return self.getitem_wtf8(w_dict, pyre_object::w_str_get_wtf8(w_key));
         }
@@ -131,16 +63,12 @@ impl ClassDictMethods {
         pyre_object::celldict::unwrap_cell(w_value)
     }
 
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
-        self.getitem_wtf8(w_dict, Wtf8::new(key))
-    }
-
-    unsafe fn getitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8) -> PyObjectRef {
-        let w_type = unerase(w_dict);
-        let Some(w_value) = crate::type_dict_lookup_wtf8(w_type, key) else {
-            return PY_NULL;
-        };
-        pyre_object::celldict::unwrap_cell(w_value)
+    unsafe fn getitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut pyre_object::unicodeobject::Utf8Str,
+    ) -> PyObjectRef {
+        self.getitem_wtf8(w_dict, pyre_object::unicodeobject::utf8_payload_wtf8(key))
     }
 
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
@@ -153,17 +81,17 @@ impl ClassDictMethods {
         ));
     }
 
-    unsafe fn setitem_str(&self, w_dict: PyObjectRef, key: &str, w_value: PyObjectRef) {
-        self.setitem_wtf8(w_dict, Wtf8::new(key), w_value)
-    }
-
-    unsafe fn setitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8, w_value: PyObjectRef) {
-        // `setitem_str` additionally catches the TypeError and stores raw
-        // into `dict_w` when `w_type.is_cpytype()`; pyre has no cpytype
-        // concept, so the refusal propagates unconditionally.
-        if let Err(err) = type_setdictvalue_wtf8(unerase(w_dict), key, w_value) {
-            crate::call::set_call_error(err);
-        }
+    unsafe fn setitem_str(
+        &self,
+        w_dict: PyObjectRef,
+        key: *mut pyre_object::unicodeobject::Utf8Str,
+        w_value: PyObjectRef,
+    ) {
+        self.setitem_wtf8(
+            w_dict,
+            pyre_object::unicodeobject::utf8_payload_wtf8(key),
+            w_value,
+        )
     }
 
     unsafe fn delitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> bool {
@@ -237,6 +165,10 @@ impl ClassDictMethods {
         crate::baseobjspace::mutated_absent(w_type);
     }
 
+    unsafe fn switch_to_object_strategy(&self, _w_dict: PyObjectRef) -> bool {
+        true
+    }
+
     unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let dstorage_field =
             std::ptr::addr_of_mut!((*(w_dict as *mut pyre_object::W_DictObject)).dstorage)
@@ -246,6 +178,40 @@ impl ClassDictMethods {
         }
         visitor(dstorage_field);
     }
+}
+
+impl ClassDictStrategySlot {
+    unsafe fn getitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8) -> PyObjectRef {
+        let w_type = unerase(w_dict);
+        let Some(w_value) = crate::type_dict_lookup_wtf8(w_type, key) else {
+            return PY_NULL;
+        };
+        pyre_object::celldict::unwrap_cell(w_value)
+    }
+
+    unsafe fn setitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8, w_value: PyObjectRef) {
+        // `setitem_str` additionally catches the TypeError and stores raw
+        // into `dict_w` when `w_type.is_cpytype()`; pyre has no cpytype
+        // concept, so the refusal propagates unconditionally.
+        if let Err(err) = type_setdictvalue_wtf8(unerase(w_dict), key, w_value) {
+            crate::call::set_call_error(err);
+        }
+    }
+}
+
+static CLASS_DICT_SLOT: ClassDictStrategySlot = ClassDictStrategySlot;
+
+/// The [`DictStrategyRef`] holder a class-dict's `dstrategy` slot points at.
+pyre_object::define_prebuilt_dict_strategy_ref!(
+    CLASS_DICT_STRATEGY_REF,
+    class_dict_strategy_ref,
+    pyre_object::dictmultiobject::StrategyKind::Class,
+    &CLASS_DICT_SLOT
+);
+
+/// rerased unerase (`classdict.py`): `dstorage` is the type.
+unsafe fn unerase(w_dict: PyObjectRef) -> PyObjectRef {
+    (*(w_dict as *const pyre_object::W_DictObject)).dstorage as PyObjectRef
 }
 
 fn type_namespace(w_type: PyObjectRef) -> PyObjectRef {
@@ -476,6 +442,10 @@ mod tests {
     use indexmap::IndexMap;
     use pyre_object::typedef::{TypeDef, TypeDefValue};
 
+    fn sk(s: &str) -> *mut pyre_object::unicodeobject::Utf8Str {
+        pyre_object::unicodeobject::prebuilt_str_storage(s)
+    }
+
     #[test]
     fn fromcache_returns_one_class_dict_strategy_per_space() {
         crate::typedef::init_typeobjects();
@@ -515,9 +485,9 @@ mod tests {
                 pyre_object::w_dict_get_strategy(w_dict).strategy_kind(),
                 StrategyKind::Class
             );
-            assert!(!CLASS_DICT_SLOT.getitem_str(w_dict, "append").is_null());
+            assert!(!CLASS_DICT_SLOT.getitem_str(w_dict, sk("append")).is_null());
             let before = pyre_object::w_type_get_version_tag(list_type);
-            CLASS_DICT_SLOT.setitem_str(w_dict, "append", pyre_object::w_int_new(1));
+            CLASS_DICT_SLOT.setitem_str(w_dict, sk("append"), pyre_object::w_int_new(1));
             assert!(crate::call::take_call_error().is_some());
             assert_eq!(pyre_object::w_type_get_version_tag(list_type), before);
         }
@@ -537,10 +507,10 @@ mod tests {
             pyre_object::w_type_set_heaptype(w_type, true);
             let w_dict = class_dict_for_type(w_type);
             let before = pyre_object::w_type_get_version_tag(w_type);
-            CLASS_DICT_SLOT.setitem_str(w_dict, "attr", pyre_object::w_int_new(7));
+            CLASS_DICT_SLOT.setitem_str(w_dict, sk("attr"), pyre_object::w_int_new(7));
             assert!(crate::call::take_call_error().is_none());
             assert_eq!(
-                CLASS_DICT_SLOT.getitem_str(w_dict, "attr"),
+                CLASS_DICT_SLOT.getitem_str(w_dict, sk("attr")),
                 crate::type_dict_lookup(w_type, "attr").unwrap()
             );
             assert_ne!(pyre_object::w_type_get_version_tag(w_type), before);

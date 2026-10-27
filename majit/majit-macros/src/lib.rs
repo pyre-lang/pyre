@@ -4581,6 +4581,8 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
             #orig_call
         }
 
+        #trampoline_call_target_fn
+
         #[doc(hidden)]
         #[allow(non_upper_case_globals)]
         const #trampoline_opaque_marker: bool = false;
@@ -4603,7 +4605,6 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
         }
 
         #call_target_fn
-        #trampoline_call_target_fn
     }
 }
 
@@ -6464,6 +6465,42 @@ mod tests {
                 .all(|attr| !attr_ends_with(attr, "oopspec")),
             "dispatch must not keep a pending #[oopspec] attr"
         );
+    }
+
+    /// Residual jitcode targets `<name>_trampoline`. That fn gets the same
+    /// word-ABI `HELPER_FNADDRS` adapter `#[dont_look_inside]` publishes:
+    /// `Option<*mut T>` / `Option<PyObjectRef>` is one nullable pointer word.
+    #[test]
+    fn look_inside_iff_trampoline_gets_the_word_abi_call_target() {
+        let func = parse_fn(
+            r#"
+            fn lookup(d: i64, key: i64) -> Option<*mut u8> {
+                None
+            }
+            "#,
+        );
+        let predicate: Path = syn::parse_str("lookup_iff").unwrap();
+        let items = parse_expansion_items(expand_look_inside_iff_item(predicate, func));
+        let _ = expansion_fn(&items, "lookup_trampoline");
+        let trampoline_target = expansion_fn(&items, "__majit_call_target_lookup_trampoline");
+        let text = quote! { #trampoline_target }.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target_lookup_trampoline (__majit_arg_0 : i64 , __majit_arg_1 : i64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("lookup_trampoline ("), "{text}");
+        assert!(
+            text.contains(":: core :: option :: Option :: Some (__majit_ptr)"),
+            "{text}"
+        );
+        assert!(
+            text.contains(":: core :: option :: Option :: None => 0"),
+            "{text}"
+        );
+        assert!(text.contains("stringify ! (lookup_trampoline)"), "{text}");
+        assert!(text.contains("as * const () , 2"), "{text}");
     }
 
     /// Same move when `#[oopspec]` already expanded and left markers in the

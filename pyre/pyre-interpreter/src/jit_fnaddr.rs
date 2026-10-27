@@ -250,6 +250,58 @@ extern "C" fn w_dict_lookup_int_strategy_word(obj: i64, key: i64) -> i64 {
     .unwrap_or(pyre_object::PY_NULL) as usize as i64
 }
 
+/// One-word residual ABI for [`pyre_object::rordereddict::ll_dict_hash_of`].
+/// The graph passes a one-word key by value (`rordereddict.py` `d.keyhash(key)`);
+/// the Rust item borrows it, so the host takes the word and borrows locally.
+/// Published as a plain Rust `fn`, matching `ll_dict_hash_of`, so `p2_inst!`
+/// can take the item (`publish_p2` proofs a `fn(...)`, not `extern "C" fn`).
+fn ll_dict_hash_of_word<K, V, S>(d: &pyre_object::rordereddict::RDict<K, V, S>, key: K) -> u64
+where
+    K: std::hash::Hash
+        + Eq
+        + Copy
+        + pyre_object::rordereddict::EntryDummy
+        + pyre_object::rordereddict::GcRefOffsets,
+    V: Copy + pyre_object::rordereddict::EntryDummy + pyre_object::rordereddict::GcRefOffsets,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
+    pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K>(d, &key)
+}
+
+/// One-word residual ABI for [`pyre_object::rordereddict::ll_dict_lookup_trampoline`]
+/// (`ll_dict_lookup`).
+fn ll_dict_lookup_trampoline_word<K, V, S>(
+    d: &pyre_object::rordereddict::RDict<K, V, S>,
+    hash: u64,
+    key: K,
+) -> isize
+where
+    K: std::hash::Hash + Eq + Copy + pyre_object::rordereddict::EntryDummy,
+    V: Copy + pyre_object::rordereddict::EntryDummy,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+    K: pyre_object::rordereddict::Equivalent<K>,
+{
+    pyre_object::rordereddict::ll_dict_lookup_trampoline::<K, V, S, K>(d, hash, &key)
+}
+
+/// One-word residual ABI for [`pyre_object::rordereddict::ll_dict_contains_trampoline`].
+fn ll_dict_contains_trampoline_word<K, V, S>(
+    d: &pyre_object::rordereddict::RDict<K, V, S>,
+    hash: u64,
+    key: K,
+) -> bool
+where
+    K: std::hash::Hash + Eq + Copy + pyre_object::rordereddict::EntryDummy,
+    V: Copy + pyre_object::rordereddict::EntryDummy,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+    K: pyre_object::rordereddict::Equivalent<K>,
+{
+    pyre_object::rordereddict::ll_dict_contains_trampoline::<K, V, S, K>(d, hash, &key)
+}
+
 /// One-word residual ABI for `w_dict_lookup_identity_strategy`.
 extern "C" fn w_dict_lookup_identity_strategy_word(obj: i64, key: i64) -> i64 {
     unsafe {
@@ -5510,6 +5562,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "dictmultiobject::ObjectDictStrategy::<impl pyre_object::dictmultiobject::DictStrategy<pyre_object::dictmultiobject::ObjectDictStrategy>>::getitem_str_hashed",
         object_dict_getitem_str_hashed_word,
     );
+    cpa1!(
+        &mut entries,
+        "pyre_object::dict_eq_hook::hash_str_hooked_str",
+        "pyre_object::hash_str_hooked_str",
+        pyre_object::dict_eq_hook::hash_str_hooked_str,
+    );
     // Residual calls read one pointer word (`llmodel.py bh_call_r`).
     // The bridge maps None to NULL; the Option body stays for a traced call.
     pa2!(
@@ -5517,6 +5575,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::dictmultiobject::dict_entries_probe_object",
         "pyre_object::dict_entries_probe_object",
         dict_entries_probe_object_word,
+    );
+    upa3!(
+        &mut entries,
+        "pyre_object::dictmultiobject::dict_entries_probe_str",
+        "pyre_object::dict_entries_probe_str",
+        pyre_object::dictmultiobject::dict_entries_probe_str,
     );
     upa2!(
         &mut entries,
@@ -6531,6 +6595,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::IntKeyHash,
     >(&mut entries);
+    // The graph passes a one-word key by value; the shim borrows it (see ll_dict_hash_of_word).
+    register_rdict_key_word_inst::<
+        i64,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::IntKeyHash,
+    >(&mut entries);
     register_rdict_setitem_inst::<
         i64,
         pyre_object::PyObjectRef,
@@ -6541,7 +6611,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
+    register_rdict_key_by_address_inst::<
+        pyre_object::dictmultiobject::ObjectKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
     register_rdict_dont_look_inside_inst::<
+        pyre_object::dictmultiobject::BytesKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::BytesKeyHash,
+    >(&mut entries);
+    register_rdict_key_by_address_inst::<
         pyre_object::dictmultiobject::BytesKey,
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::BytesKeyHash,
@@ -6556,12 +6636,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::PyObjectRef,
         std::collections::hash_map::RandomState,
     >(&mut entries);
+    register_rdict_key_by_address_inst::<
+        pyre_object::identitydict::IdentityKey,
+        pyre_object::PyObjectRef,
+        std::collections::hash_map::RandomState,
+    >(&mut entries);
     register_rdict_setitem_inst::<
         pyre_object::identitydict::IdentityKey,
         pyre_object::PyObjectRef,
         std::collections::hash_map::RandomState,
     >(&mut entries);
     register_rdict_dont_look_inside_inst::<
+        pyre_object::celldict::StrKey,
+        pyre_object::PyObjectRef,
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    >(&mut entries);
+    register_rdict_key_by_address_inst::<
         pyre_object::celldict::StrKey,
         pyre_object::PyObjectRef,
         pyre_object::dictmultiobject::StrKeyBuildHasher,
@@ -6576,10 +6666,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         (),
         pyre_object::dictmultiobject::ObjectKeyBuildHasher,
     >(&mut entries);
+    register_rdict_key_by_address_inst::<
+        pyre_object::dictmultiobject::ObjectKey,
+        (),
+        pyre_object::dictmultiobject::ObjectKeyBuildHasher,
+    >(&mut entries);
     register_rdict_dont_look_inside_inst::<i64, (), pyre_object::dictmultiobject::IntKeyHash>(
         &mut entries,
     );
+    register_rdict_key_word_inst::<i64, (), pyre_object::dictmultiobject::IntKeyHash>(&mut entries);
     register_rdict_dont_look_inside_inst::<
+        pyre_object::dictmultiobject::BytesKey,
+        (),
+        pyre_object::dictmultiobject::BytesKeyHash,
+    >(&mut entries);
+    register_rdict_key_by_address_inst::<
         pyre_object::dictmultiobject::BytesKey,
         (),
         pyre_object::dictmultiobject::BytesKeyHash,
@@ -6589,7 +6690,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         (),
         pyre_object::dictmultiobject::StrKeyBuildHasher,
     >(&mut entries);
+    register_rdict_key_by_address_inst::<
+        pyre_object::celldict::StrKey,
+        (),
+        pyre_object::dictmultiobject::StrKeyBuildHasher,
+    >(&mut entries);
     register_rdict_dont_look_inside_inst::<
+        pyre_object::setobject::IdentitySetKey,
+        (),
+        std::collections::hash_map::RandomState,
+    >(&mut entries);
+    register_rdict_key_by_address_inst::<
         pyre_object::setobject::IdentitySetKey,
         (),
         std::collections::hash_map::RandomState,
@@ -6653,12 +6764,6 @@ where
         std::any::type_name::<V>(),
         std::any::type_name::<S>(),
     ];
-    let kvsk = [
-        std::any::type_name::<K>(),
-        std::any::type_name::<V>(),
-        std::any::type_name::<S>(),
-        std::any::type_name::<K>(),
-    ];
     p1_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_grow_trampoline",
@@ -6683,6 +6788,25 @@ where
         pyre_object::rordereddict::ll_dict_del_trampoline::<K, V, S>,
         &kvs,
     );
+}
+
+fn register_rdict_key_by_address_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
+where
+    K: std::hash::Hash
+        + Eq
+        + Copy
+        + pyre_object::rordereddict::EntryDummy
+        + pyre_object::rordereddict::GcRefOffsets,
+    V: Copy + pyre_object::rordereddict::EntryDummy + pyre_object::rordereddict::GcRefOffsets,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
+    let kvsk = [
+        std::any::type_name::<K>(),
+        std::any::type_name::<V>(),
+        std::any::type_name::<S>(),
+        std::any::type_name::<K>(),
+    ];
     p3_inst!(
         entries,
         "pyre_object::rordereddict::ll_dict_lookup_trampoline",
@@ -6699,6 +6823,46 @@ where
         entries,
         "pyre_object::rordereddict::ll_dict_hash_of",
         pyre_object::rordereddict::ll_dict_hash_of::<K, V, S, K>,
+        &kvsk,
+    );
+}
+
+fn register_rdict_key_word_inst<K, V, S>(entries: &mut Vec<(&'static str, i64)>)
+where
+    K: ResidualSlot
+        + WasmWord
+        + std::hash::Hash
+        + Eq
+        + Copy
+        + pyre_object::rordereddict::EntryDummy
+        + pyre_object::rordereddict::GcRefOffsets
+        + pyre_object::rordereddict::Equivalent<K>,
+    V: Copy + pyre_object::rordereddict::EntryDummy + pyre_object::rordereddict::GcRefOffsets,
+    S: std::hash::BuildHasher,
+    (K, V): pyre_object::rordereddict::GcEntriesType,
+{
+    let kvsk = [
+        std::any::type_name::<K>(),
+        std::any::type_name::<V>(),
+        std::any::type_name::<S>(),
+        std::any::type_name::<K>(),
+    ];
+    p3_inst!(
+        entries,
+        "pyre_object::rordereddict::ll_dict_lookup_trampoline",
+        ll_dict_lookup_trampoline_word::<K, V, S>,
+        &kvsk,
+    );
+    p3_inst!(
+        entries,
+        "pyre_object::rordereddict::ll_dict_contains_trampoline",
+        ll_dict_contains_trampoline_word::<K, V, S>,
+        &kvsk,
+    );
+    p2_inst!(
+        entries,
+        "pyre_object::rordereddict::ll_dict_hash_of",
+        ll_dict_hash_of_word::<K, V, S>,
         &kvsk,
     );
 }
@@ -8676,6 +8840,14 @@ mod tests {
                 dict_entries_probe_object_word as *const () as usize as i64,
             ),
             (
+                "pyre_object::dictmultiobject::dict_entries_probe_str",
+                pyre_object::dictmultiobject::dict_entries_probe_str as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::dict_entries_probe_str",
+                pyre_object::dictmultiobject::dict_entries_probe_str as *const () as usize as i64,
+            ),
+            (
                 "pyre_object::dictmultiobject::dict_entries_probe_hashed",
                 dict_entries_probe_hashed_word as *const () as usize as i64,
             ),
@@ -8712,6 +8884,73 @@ mod tests {
             bindings["pyre_object::dictmultiobject::w_dict_lookup_int_strategy"], raw_lookup,
             "must not publish the Option-returning Rust item"
         );
+    }
+
+    #[test]
+    fn hash_str_hooked_str_is_registered() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let expected = pyre_object::dict_eq_hook::hash_str_hooked_str as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::dict_eq_hook::hash_str_hooked_str"],
+            expected
+        );
+        assert_eq!(bindings["pyre_object::hash_str_hooked_str"], expected);
+
+        crate::test_hooks::install_hash_hook();
+        let addr = bindings["pyre_object::dict_eq_hook::hash_str_hooked_str"] as usize;
+        let hooked_str: extern "C" fn(*mut pyre_object::unicodeobject::Utf8Str) -> i64 =
+            unsafe { std::mem::transmute(addr) };
+        let key = pyre_object::unicodeobject::prebuilt_str_storage("abc");
+        assert_eq!(
+            hooked_str(key),
+            pyre_object::dict_eq_hook::hash_str_hooked(b"abc".as_ptr(), 3)
+        );
+    }
+
+    #[test]
+    fn rdict_int_key_residuals_take_the_key_word() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        type K = i64;
+        type V = pyre_object::PyObjectRef;
+        type S = pyre_object::dictmultiobject::IntKeyHash;
+        let kvsk = [
+            std::any::type_name::<K>(),
+            std::any::type_name::<V>(),
+            std::any::type_name::<S>(),
+            std::any::type_name::<K>(),
+        ];
+        for (template, expected) in [
+            (
+                "pyre_object::rordereddict::ll_dict_hash_of",
+                super::ll_dict_hash_of_word::<K, V, S> as *const (),
+            ),
+            (
+                "pyre_object::rordereddict::ll_dict_lookup_trampoline",
+                super::ll_dict_lookup_trampoline_word::<K, V, S> as *const (),
+            ),
+            (
+                "pyre_object::rordereddict::ll_dict_contains_trampoline",
+                super::ll_dict_contains_trampoline_word::<K, V, S> as *const (),
+            ),
+        ] {
+            let path = super::interned_residual_inst_path(template, &kvsk);
+            assert_eq!(
+                bindings.get(path).copied(),
+                Some(expected as usize as i64),
+                "{path}"
+            );
+        }
+
+        let mut d = pyre_object::dictmultiobject::IntDictStorage::new();
+        d.insert(7, 1 as usize as pyre_object::PyObjectRef);
+        assert!(
+            super::ll_dict_lookup_trampoline_word(&d, super::ll_dict_hash_of_word(&d, 7), 7) >= 0
+        );
+        assert!(!super::ll_dict_contains_trampoline_word(
+            &d,
+            super::ll_dict_hash_of_word(&d, 8),
+            8
+        ));
     }
 
     #[test]
