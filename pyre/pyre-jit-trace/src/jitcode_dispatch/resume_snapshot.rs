@@ -659,7 +659,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // A helper sub-walk with paused Python parents takes
     // `walker_capture_transparent_helper_snapshot`, which encodes those
     // parents at CALL `next_pc` dest-cleared and appends one section per
-    // live helper (`collect_live_helper_guard_sections`). A helper
+    // live helper (`collect_live_helper_guard_sections`); parents that
+    // are images of those live helpers are dropped. A helper
     // entered without a paused caller (Root GET_ITER) still collapses to
     // the containing Python opcode.
     //
@@ -3111,8 +3112,16 @@ fn clear_in_a_call_result(
 ) -> Option<(usize, usize, OpRef)> {
     let (bank, color) = result_register?;
     let (index, cleared) = match bank {
-        'i' => (0, trace_ctx.const_int(0)),
-        'r' => (1, trace_ctx.const_ref(pyre_object::PY_NULL as i64)),
+        'i' => {
+            let cleared = trace_ctx.const_int(0);
+            super::assert_int_bank_box(cleared, "in_a_call");
+            (0, cleared)
+        }
+        'r' => {
+            let cleared = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+            super::assert_ref_bank_box(cleared, "in_a_call");
+            (1, cleared)
+        }
         'f' => (2, trace_ctx.const_float(0)),
         _ => return None,
     };
@@ -3125,6 +3134,11 @@ fn clear_in_a_call_result(
 /// the paused `MIFrame`, keeps reading the caller's registers.
 fn restore_in_a_call_result(banks: [&RegisterBank; 3], saved: Option<(usize, usize, OpRef)>) {
     if let Some((index, color, saved)) = saved {
+        match index {
+            0 => super::assert_int_bank_box(saved, "in_a_call"),
+            1 => super::assert_ref_bank_box(saved, "in_a_call"),
+            _ => {}
+        }
         banks[index].set(color, saved);
     }
 }
@@ -4411,6 +4425,42 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
     Some(parent_frames)
 }
 
+/// `opencoder.py` `_ensure_parent_resumedata` numbers each `framestack`
+/// `MIFrame` once. `sections` are the live helper `MIFrame`s (outermost
+/// ancestor first, innermost last). Paused-caller images stop at the last
+/// numbered caller, so the trailing helper images match a prefix of
+/// `sections`; drop that suffix of images (and a numbered innermost image).
+/// Outer images stay.
+pub(crate) fn drop_parent_images_of_live_helper_sections(
+    parents: &mut Vec<InlineParentFrame>,
+    sections: &[(u32, u32, u32, Vec<OpRef>)],
+    is_transparent_helper: impl Fn(u32) -> bool,
+) {
+    let Some(inner) = sections.last() else {
+        return;
+    };
+    if parents.last().is_some_and(|last| {
+        is_transparent_helper(last.jitcode_index) && last.jitcode_index == inner.0
+    }) {
+        parents.pop();
+    }
+    let start = parents
+        .iter()
+        .rposition(|p| !is_transparent_helper(p.jitcode_index))
+        .map_or(0, |i| i + 1);
+    let images = &parents[start..];
+    let drop_n = (1..=images.len().min(sections.len()))
+        .rev()
+        .find(|&n| {
+            images[images.len() - n..]
+                .iter()
+                .zip(&sections[..n])
+                .all(|(p, s)| p.jitcode_index == s.0)
+        })
+        .unwrap_or(0);
+    parents.truncate(parents.len() - drop_n);
+}
+
 /// A guard inside a canonical helper body, or a paused-parent-only capture
 /// (operator tail / finished callee) that reuses the same encoder.
 ///
@@ -4418,12 +4468,12 @@ pub(crate) fn finished_callee_parent_frames<Sym: WalkSym>(
 /// order. When this walk is a live helper (`transparent_helper_subwalk`),
 /// `collect_live_helper_guard_sections` appends one section per helper
 /// `MIFrame` after those parents, innermost last
-/// (`MetaInterp.capture_resumedata`).
+/// (`MetaInterp.capture_resumedata`). Images of live helper frames are dropped.
 fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    parent_frames: Vec<InlineParentFrame>,
+    mut parent_frames: Vec<InlineParentFrame>,
     guard_stamp: GuardStampTarget,
 ) -> Result<(), DispatchError> {
     if parent_frames.is_empty() || !ctx.trace_ctx.vable_snapshot_buildable() {
@@ -4449,6 +4499,9 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     }
     let helper_sections = collect_live_helper_guard_sections(ctx, op_pc, after_residual_call)?;
+    drop_parent_images_of_live_helper_sections(&mut parent_frames, &helper_sections, |index| {
+        crate::state::jitcode_is_transparent_helper(index as i32)
+    });
     let saved_vable = publish_outermost_parent_vable_scalars(ctx, &parent_frames, op_pc)?;
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
     crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);

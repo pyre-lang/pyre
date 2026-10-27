@@ -3411,7 +3411,10 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
     };
     let _ = op_pc;
     let boxed = match ty {
-        Type::Int => crate::state::wrapint(ctx.trace_ctx, value),
+        Type::Int => {
+            assert_int_bank_box(value, "walker_box_int");
+            crate::state::wrapint(ctx.trace_ctx, value)
+        }
         Type::Float => crate::state::wrapfloat(ctx.trace_ctx, value),
         Type::Ref | Type::Void => value,
     };

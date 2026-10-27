@@ -445,6 +445,122 @@ fn dummy_operator_tail_caller() -> InlineParentFrame {
     }
 }
 
+fn dummy_parent_frame(jitcode_index: u32) -> InlineParentFrame {
+    let mut parent = dummy_operator_tail_caller();
+    parent.jitcode_index = jitcode_index;
+    parent
+}
+
+fn dummy_helper_section(jitcode_index: u32) -> (u32, u32, u32, Vec<OpRef>) {
+    (jitcode_index, 0, 0, Vec::new())
+}
+
+fn parent_jitcodes(parents: &[InlineParentFrame]) -> Vec<u32> {
+    parents.iter().map(|parent| parent.jitcode_index).collect()
+}
+
+#[test]
+fn drop_parent_images_dedupes_live_helper_chain() {
+    let mut parents: Vec<_> = [100u32, 1, 2, 3]
+        .into_iter()
+        .map(dummy_parent_frame)
+        .collect();
+    let sections: Vec<_> = [1u32, 2, 3, 4]
+        .into_iter()
+        .map(dummy_helper_section)
+        .collect();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 100,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![100]);
+}
+
+#[test]
+fn drop_parent_images_drops_numbered_innermost_image() {
+    let mut parents: Vec<_> = [100u32, 1, 2, 4]
+        .into_iter()
+        .map(dummy_parent_frame)
+        .collect();
+    let sections: Vec<_> = [1u32, 2, 4].into_iter().map(dummy_helper_section).collect();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 100,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![100]);
+}
+
+#[test]
+fn drop_parent_images_keeps_outer_helper_without_section() {
+    let mut parents: Vec<_> = [100u32, 7, 1].into_iter().map(dummy_parent_frame).collect();
+    let sections: Vec<_> = [1u32, 2].into_iter().map(dummy_helper_section).collect();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 100,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![100, 7]);
+}
+
+#[test]
+fn drop_parent_images_noop_without_sections() {
+    let mut parents: Vec<_> = [100u32, 1].into_iter().map(dummy_parent_frame).collect();
+    let sections: Vec<(u32, u32, u32, Vec<OpRef>)> = Vec::new();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 100,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![100, 1]);
+}
+
+#[test]
+fn drop_parent_images_keeps_images_that_are_not_a_section_prefix() {
+    let mut parents: Vec<_> = [100u32, 5].into_iter().map(dummy_parent_frame).collect();
+    let sections: Vec<_> = [1u32, 2].into_iter().map(dummy_helper_section).collect();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 100,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![100, 5]);
+}
+
+#[test]
+fn drop_parent_images_skips_extra_inner_sections() {
+    let mut parents: Vec<_> = [100u32, 1, 2].into_iter().map(dummy_parent_frame).collect();
+    let sections: Vec<_> = [1u32, 2, 3, 4]
+        .into_iter()
+        .map(dummy_helper_section)
+        .collect();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 100,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![100]);
+}
+
+#[test]
+fn drop_parent_images_exec_load_global_chain() {
+    let mut parents: Vec<_> = [4805u32, 4804, 1617, 1618]
+        .into_iter()
+        .map(dummy_parent_frame)
+        .collect();
+    let sections: Vec<_> = [1617u32, 1618, 689, 693, 320, 321, 298]
+        .into_iter()
+        .map(dummy_helper_section)
+        .collect();
+    super::resume_snapshot::drop_parent_images_of_live_helper_sections(
+        &mut parents,
+        &sections,
+        |i| i < 4804,
+    );
+    assert_eq!(parent_jitcodes(&parents), vec![4805, 4804]);
+}
+
 /// `capture_vstack_mirror_image` returns `None` when the walk mirror is
 /// invalid. The pre-inline admission must then decline so the walk takes
 /// the ordinary residual instead of entering the dunder.
@@ -1716,6 +1832,11 @@ fn dummy_int_add_box(tc: &mut TraceCtx) -> OpRef {
 fn dummy_ptr_eq_box(tc: &mut TraceCtx) -> OpRef {
     let null = tc.const_null();
     tc.record_op(majit_ir::OpCode::PtrEq, &[null, null])
+}
+
+/// Recorded non-const Ref box. `New` is arity 0 (`opencoder.py _op_start`).
+fn dummy_new_box(tc: &mut TraceCtx) -> OpRef {
+    tc.record_op(majit_ir::OpCode::New, &[])
 }
 
 #[test]
@@ -4712,7 +4833,7 @@ fn goto_if_not_ptr_nonzero_guards_nonnull_and_falls_through() {
     // `rL`: 1B ref reg + 3B label (target 9).
     let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = dummy_ptr_eq_box(&mut tc);
+    let operand = dummy_new_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(
         0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
@@ -4743,7 +4864,7 @@ fn goto_if_not_ptr_iszero_takes_the_branch_when_nonnull() {
         .expect("`goto_if_not_ptr_iszero/rL` must be in insns table");
     let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = dummy_ptr_eq_box(&mut tc);
+    let operand = dummy_new_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(
         0xdead_beef_usize as *mut pyre_object::pyobject::PyObject,
@@ -4767,7 +4888,7 @@ fn goto_if_not_ptr_iszero_uses_aligned_cast_int_to_ptr_box_when_register_is_null
     // `rL`: 1B ref reg + 3B label (target 9).
     let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = dummy_ptr_eq_box(&mut tc);
+    let operand = dummy_new_box(&mut tc);
     let aligned = 0x1000_usize;
     tc.set_opref_concrete(operand, majit_ir::Value::Ref(majit_ir::GcRef(aligned)));
     let mut regs_r = [operand];
@@ -4784,7 +4905,7 @@ fn goto_if_not_ptr_nonzero_guards_isnull_and_takes_the_branch() {
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
     let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = dummy_ptr_eq_box(&mut tc);
+    let operand = dummy_new_box(&mut tc);
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Ref(std::ptr::null_mut())];
     let (_, next_pc) = run_hint_step(&code, &mut tc, &mut regs_r, &mut concrete_r, &mut [])
@@ -4801,7 +4922,7 @@ fn goto_if_not_ptr_nonzero_declines_without_a_concrete() {
         .expect("`goto_if_not_ptr_nonzero/rL` must be in insns table");
     let code = [byte, 0x00, 0x09, 0x00, 0x00];
     let mut tc = fresh_trace_ctx();
-    let operand = dummy_ptr_eq_box(&mut tc);
+    let operand = dummy_new_box(&mut tc);
     let ops_before = tc.num_ops();
     let mut regs_r = [operand];
     let mut concrete_r = [ConcreteValue::Null];
@@ -8683,6 +8804,184 @@ fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
     );
 }
 
+/// A declined / wrong-kind helper SubReturn must not land a Ref box in
+/// an Int dest (`pyjitpl.py make_result_of_lastop`: the bank follows
+/// `resultbox.type`).  Building a full `residualize_inline_call_via_fnaddr`
+/// fixture needs a callable `jitcode.fnaddr` in the descr pool, which
+/// these unit tests do not mint; the dest-write abort is the defensive
+/// check that path uses.
+#[test]
+fn write_int_reg_refuses_ref_resultbox() {
+    let mut tc = fresh_trace_ctx();
+    let ref_box = tc.const_null();
+    assert_eq!(tc.get_opref_type(ref_box), Some(Type::Ref));
+    let sentinel = tc.const_int(0x11);
+    let mut regs_i = [sentinel];
+    let mut concrete_i = [ConcreteValue::Int(0x11)];
+    let err = with_hint_walk_context(
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+        |wc| write_int_reg(wc, 0, 0, ref_box, ConcreteValue::Null),
+    );
+    assert_eq!(
+        err,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 })
+    );
+    assert_eq!(
+        regs_i[0], sentinel,
+        "a Ref OpRef must not enter registers_i"
+    );
+}
+
+/// `write_int_reg` aborts via `ensure_resultbox_type_for_bank` before the
+/// store; the underlying Int-bank writer panics so a bypass names the site.
+#[test]
+#[should_panic(expected = "registers_i holds")]
+fn registers_i_store_panics_on_ref_box() {
+    let mut tc = fresh_trace_ctx();
+    let ref_box = tc.const_null();
+    assert_eq!(tc.get_opref_type(ref_box), Some(Type::Ref));
+    let sentinel = tc.const_int(0x11);
+    let mut regs_i = [sentinel];
+    let mut concrete_i = [ConcreteValue::Int(0x11)];
+    with_hint_walk_context(
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+        |wc| store_int_bank(wc.registers_i, 0, ref_box, "write_int_reg"),
+    );
+}
+
+#[test]
+fn write_residual_call_result_to_dst_refuses_ref_into_int_bank() {
+    let mut tc = fresh_trace_ctx();
+    let ref_box = tc.const_null();
+    let sentinel = tc.const_int(0x22);
+    let mut regs_i = [sentinel];
+    let mut concrete_i = [ConcreteValue::Int(0x22)];
+    let err = with_hint_walk_context(
+        &mut tc,
+        &mut [],
+        &mut [],
+        &mut regs_i,
+        &mut concrete_i,
+        &mut [],
+        &[],
+        |wc| super::residual_call::write_residual_call_result_to_dst(wc, 0, 0, 'i', ref_box),
+    );
+    assert_eq!(
+        err,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 })
+    );
+    assert_eq!(
+        regs_i[0], sentinel,
+        "residual dest write must not bind a Ref to 'i'"
+    );
+}
+
+#[test]
+fn inline_call_r_i_refuses_ref_subreturn() {
+    // Callee `ref_return r0` surfaces a Ref SubReturn. The caller's
+    // `inline_call_r_i` dest is Int; dest-write must abort rather than
+    // bind the Ref box into `registers_i`.
+    let ref_ret = *insns_opname_to_byte()
+        .get("ref_return/r")
+        .expect("`ref_return/r` must be in insns table");
+    let inline_ri_byte = *insns_opname_to_byte()
+        .get("inline_call_r_i/dR>i")
+        .expect("`inline_call_r_i/dR>i` must be in insns table");
+    let callee_code: &'static [u8] = Box::leak(Box::new([ref_ret, 0]));
+    let sub_body = SubJitCodeBody {
+        code: callee_code,
+        num_regs_r: 1,
+        num_regs_i: 1,
+        num_regs_f: 0,
+        constants_i: &[],
+        constants_r: &[],
+        constants_f: &[],
+        jitcode_index: None,
+    };
+    let lookup = {
+        let sub_body = sub_body.clone();
+        move |idx: usize| {
+            if idx == 7 {
+                Some(sub_body.clone())
+            } else {
+                None
+            }
+        }
+    };
+    let caller_code = [inline_ri_byte, 0x07, 0x00, 0x01, 0x02, 0x03];
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 4);
+    let sentinel_pre = tc.const_int(0xDEAD_BEEF);
+    let regs_i: Vec<OpRef> = vec![sentinel_pre; 4];
+    let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    descr_pool[7] = make_jitcode_descr(7);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let raw_pool: [majit_metainterp::jitcode::RuntimeBhDescr; 0] = [];
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let err = step(&caller_code, 0, &mut wc)
+        .expect_err("inline_call_r_i must not dest-write a Ref SubReturn");
+    assert_eq!(
+        err,
+        DispatchError::OrthodoxSubWalkTraceUnsupported { pc: 0, symbolic: 0 }
+    );
+    assert_eq!(
+        wc.registers_i.get(3),
+        Some(sentinel_pre),
+        "Ref SubReturn must not replace the Int dest"
+    );
+}
+
 #[test]
 fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
     // Acceptance: caller's `inline_call_ir_r/dIR>r` carries
@@ -11181,7 +11480,7 @@ fn step_through_int_copy_advances_past_operand_bytes() {
     // distinguish src from dst slots.
     let code = [int_copy_byte, 0x02, 0x05];
     let mut tc = fresh_trace_ctx();
-    let regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
     let descr = done_descr_ref_for_tests();
     let ops_before = tc.num_ops();
     let session = std::cell::RefCell::new(WalkSession::default());
@@ -11249,7 +11548,7 @@ fn int_copy_writes_src_value_into_dst_register() {
         .expect("`int_copy/i>i` must be in insns table");
     let code = [int_copy_byte, 0x02, 0x05]; // src=2, dst=5
     let mut tc = fresh_trace_ctx();
-    let regs_i = distinct_const_refs(&mut tc, 8);
+    let regs_i = distinct_const_ints(&mut tc, 8);
     let src_val_pre = regs_i[2];
     let dst_val_pre = regs_i[5];
     assert_ne!(
@@ -11321,7 +11620,7 @@ fn int_copy_with_out_of_range_dst_register_surfaces_typed_error() {
         .expect("`int_copy/i>i` must be in insns table");
     let code = [int_copy_byte, 0x00, 0x09]; // src=0 (in range), dst=9 (OOR)
     let mut tc = fresh_trace_ctx();
-    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_ints(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
@@ -18959,6 +19258,93 @@ fn helper_jitcode_fills_a_trace_too_long_miframe() {
     assert_eq!(miframe.jitcode.name(), "helper_too_long_fill");
 }
 
+/// `pyjitpl.py generate_guard(resumepc=orgpc)` numbers the current helper
+/// `MIFrame` at its own `record_quasiimmut_field` orgpc. The portal
+/// merge-green remap (`merge_entry_for` / `portal_merge_op3_live_for_py_pc`)
+/// is the header-GNI rule for the Python frame only.
+#[test]
+fn walker_gni_resume_pc_keeps_helper_orgpc_inside_transparent_helper_subwalk() {
+    let live = crate::state::op_live();
+    const PORTAL_MERGE_LIVE: usize = 54;
+    const HELPER_ORGPC: usize = 3;
+    let mut code = vec![0u8; PORTAL_MERGE_LIVE + 3];
+    code[0] = live;
+    code[PORTAL_MERGE_LIVE] = live;
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("gni_helper_orgpc");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code,
+        startpoints: Some([0_usize, PORTAL_MERGE_LIVE].into_iter().collect()),
+        ..Default::default()
+    });
+    let py_code = pyre_interpreter::compile_exec("None").expect("test code should compile");
+    let key =
+        pyre_interpreter::w_code_new(Box::into_raw(Box::new(py_code)) as *const ()) as *const ();
+    let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null());
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.merge_entry_by_green = vec![(HELPER_ORGPC as u32, PORTAL_MERGE_LIVE as u32)];
+    pyjit.metadata.py_floor_by_jit_pc = vec![(PORTAL_MERGE_LIVE as u32, HELPER_ORGPC as u32)];
+    let installed = crate::state::install_jitcode_for(key, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    let index = unsafe { (*installed).index };
+    let mut tc = fresh_trace_ctx();
+    dummy_ptr_eq_box(&mut tc);
+    let descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session.borrow_mut().recording_jitcode_index = index;
+    session.borrow_mut().root_debug_merge_point_py_pc = Some(HELPER_ORGPC as u32);
+    let lookup = { move |_idx: usize| None };
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            transparent_helper_subwalk: true,
+            ..test_fbw_mode()
+        },
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &descr_pool,
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &lookup,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    assert_eq!(
+        super::walker_gni_resume_pc(&wc, HELPER_ORGPC),
+        HELPER_ORGPC,
+        "a helper subwalk GNI resumes at the helper orgpc even when the portal has a merge -live- for the current DEBUG_MERGE_POINT"
+    );
+    wc.fbw_mode.transparent_helper_subwalk = false;
+    assert_eq!(
+        super::walker_gni_resume_pc(&wc, HELPER_ORGPC),
+        PORTAL_MERGE_LIVE,
+        "the portal header-GNI remap still binds the merge -live- for the same py_pc"
+    );
+}
+
 /// CHANGE 3 (d): a failed ancestor splice is not a latch.
 /// `convert_and_run_from_pyjitpl` (`blackhole.py`) copies every
 /// framestack level; an image missing ancestor helpers resumes the
@@ -19372,7 +19758,7 @@ fn inline_call_ir_v_accepts_void_returning_callee() {
     ];
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_ints(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -19462,7 +19848,7 @@ fn inline_call_ir_v_rejects_non_void_returning_callee() {
     ];
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let regs_i = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_ints(&mut tc, 4);
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -19556,8 +19942,10 @@ fn inline_call_irf_v_accepts_void_returning_callee() {
     ];
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let regs_i = distinct_const_refs(&mut tc, 4);
-    let regs_f = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_ints(&mut tc, 4);
+    let regs_f: Vec<OpRef> = (0..4)
+        .map(|i| tc.const_float((i as f64).to_bits() as i64))
+        .collect();
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);
@@ -19649,8 +20037,10 @@ fn inline_call_irf_v_rejects_non_void_returning_callee() {
     ];
     let mut tc = fresh_trace_ctx();
     let regs_r = distinct_const_refs(&mut tc, 4);
-    let regs_i = distinct_const_refs(&mut tc, 4);
-    let regs_f = distinct_const_refs(&mut tc, 4);
+    let regs_i = distinct_const_ints(&mut tc, 4);
+    let regs_f: Vec<OpRef> = (0..4)
+        .map(|i| tc.const_float((i as f64).to_bits() as i64))
+        .collect();
     let descr = done_descr_ref_for_tests();
     let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
     descr_pool[7] = make_jitcode_descr(7);

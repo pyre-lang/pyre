@@ -99,8 +99,14 @@ fn replace_box_in_paused_frames(session: &mut WalkSession, oldbox: OpRef, newbox
                 state.replace_active_box(oldbox, newbox);
             }
             let bank = match oldbox.ty() {
-                Some(Type::Int) => parent.registers_i.as_ref(),
-                Some(Type::Ref) => parent.registers_r.as_ref(),
+                Some(Type::Int) => {
+                    assert_int_bank_box(newbox, "replace_active_box");
+                    parent.registers_i.as_ref()
+                }
+                Some(Type::Ref) => {
+                    assert_ref_bank_box(newbox, "replace_active_box");
+                    parent.registers_r.as_ref()
+                }
                 Some(Type::Float) => parent.registers_f.as_ref(),
                 _ => None,
             };
@@ -134,8 +140,14 @@ pub(super) fn with_replace_frames<Sym: WalkSym, R>(
         let mut session = unsafe { (*data.session).borrow_mut() };
         replace_box_in_paused_frames(&mut session, oldbox, newbox);
         match oldbox.ty() {
-            Some(Type::Int) => unsafe { (*data.registers_i).replace_active_box(oldbox, newbox) },
-            Some(Type::Ref) => unsafe { (*data.registers_r).replace_active_box(oldbox, newbox) },
+            Some(Type::Int) => {
+                assert_int_bank_box(newbox, "replace_active_box");
+                unsafe { (*data.registers_i).replace_active_box(oldbox, newbox) }
+            }
+            Some(Type::Ref) => {
+                assert_ref_bank_box(newbox, "replace_active_box");
+                unsafe { (*data.registers_r).replace_active_box(oldbox, newbox) }
+            }
             Some(Type::Float) => unsafe { (*data.registers_f).replace_active_box(oldbox, newbox) },
             _ => {}
         }
@@ -180,8 +192,14 @@ fn replace_box_in_all_walk_frames<Sym: WalkSym>(
 ) {
     replace_box_in_paused_frames(&mut ctx.session.borrow_mut(), oldbox, newbox);
     let bank = match oldbox.ty() {
-        Some(Type::Int) => ctx.registers_i,
-        Some(Type::Ref) => ctx.registers_r,
+        Some(Type::Int) => {
+            assert_int_bank_box(newbox, "replace_active_box");
+            ctx.registers_i
+        }
+        Some(Type::Ref) => {
+            assert_ref_bank_box(newbox, "replace_active_box");
+            ctx.registers_r
+        }
         Some(Type::Float) => ctx.registers_f,
         _ => panic!("replace_active_box_in_frame requires a typed value: {oldbox:?}"),
     };

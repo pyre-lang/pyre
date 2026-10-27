@@ -17560,9 +17560,14 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// catching middle that cannot be reconstructed declines before any
 /// `carrier_ec_leave` shortens `topframeref`.
 fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
+    // A decoded `frame` red is already in the trace (`consume_boxes` /
+    // `decode_ref_color_bank`) before `prepare_resume_from_failure`.
+    // Emitting another PyFrame would be the constructor-fingerprint
+    // second frame `resume.py` never builds.
     !recipe.len_tail
         && recipe.return_substitute.is_none()
         && reconstructed_callee_recipe_is_portable(recipe)
+        && recipe.frame.is_none()
 }
 
 /// Stamp a resume-decoded GCREF onto its box (`RefFrontendOp._resref` /

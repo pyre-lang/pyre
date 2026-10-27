@@ -10792,6 +10792,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if reg >= callee_regs_r.len() {
             return resolved_inline_decline(op.pc, line!());
         }
+        super::assert_ref_bank_box(callee_args[i], "setup_call");
         callee_regs_r.set(reg, callee_args[i]);
         callee_state.borrow_mut().concrete_registers_r[reg] = callee_arg_concretes[i];
     }
@@ -11028,6 +11029,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return resolved_inline_decline(op.pc, line!());
         };
 
+        super::assert_ref_bank_box(callee_frame, "setup_call");
         callee_regs_r.set(frame_reg as usize, callee_frame);
         let concrete_ec = sym.concrete_execution_context();
         // `execute_new_with_vtable` already allocated the live frame.
@@ -11148,6 +11150,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 }
             }
         }
+        super::assert_ref_bank_box(callee_ec, "setup_call");
         callee_regs_r.set(ec_reg as usize, callee_ec);
         // `perform_call` threads the same concrete ExecutionContext into
         // every MIFrame.  The symbolic second red above and its concrete
@@ -19267,12 +19270,16 @@ pub(crate) fn allocate_callee_register_banks(
     let mut concrete_r = vec![ConcreteValue::Null; total_r];
     let mut concrete_i = vec![ConcreteValue::Null; total_i];
     for (i, &v) in body.constants_i.iter().enumerate() {
-        regs_i[body.num_regs_i + i] = trace_ctx.const_int(v);
+        let boxed = trace_ctx.const_int(v);
+        super::assert_int_bank_box(boxed, "allocate_callee_register_banks");
+        regs_i[body.num_regs_i + i] = boxed;
         concrete_i[body.num_regs_i + i] = ConcreteValue::Int(v);
     }
     for (i, v) in body.constants_r.iter().enumerate() {
         let v = v.get();
-        regs_r[body.num_regs_r + i] = trace_ctx.const_ref(v);
+        let boxed = trace_ctx.const_ref(v);
+        super::assert_ref_bank_box(boxed, "allocate_callee_register_banks");
+        regs_r[body.num_regs_r + i] = boxed;
         concrete_r[body.num_regs_r + i] =
             ConcreteValue::Ref(v as usize as pyre_object::PyObjectRef);
     }
@@ -19570,7 +19577,34 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
                 float_args,
             )
         }
-        other => other.map(InlineCallOutcome::from),
+        other => {
+            let outcome = other?;
+            // A completed helper walk can still hand back a box of the
+            // wrong kind (`w_int_new` NewWithVtable as the Int dest of
+            // `inline_call_r_i`).  Cut the aborted body and residualize
+            // so dest is the residual Call's result OpRef
+            // (`do_residual_call` / `execute_varargs`).
+            if let DispatchOutcome::SubReturn {
+                result: Some(value),
+            } = &outcome
+                && let Some((dst_bank, _, _)) = call_opcode_result_dst(code, pc)
+                && dst_bank != 'v'
+                && super::ensure_resultbox_type_for_bank(ctx, pc, dst_bank, *value).is_err()
+            {
+                cut_declined_subwalk(ctx, pre_fold_pos);
+                residualize_inline_call_via_fnaddr(
+                    ctx,
+                    code,
+                    pc,
+                    descr_index,
+                    int_args,
+                    ref_args,
+                    float_args,
+                )
+            } else {
+                Ok(InlineCallOutcome::from(outcome))
+            }
+        }
     }
 }
 
@@ -19887,9 +19921,11 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     // The pure patch already ran inside the hook.
     let can_raise = can_raise && recorded.inline_const_to_value().is_none();
     // `do_residual_call` writes dest before `GUARD_NOT_FORCED` so the
-    // fail_args snapshot sees the result box.  The caller still dest-writes
-    // again from `SubReturn` (`finishframe`); the second write is the same
-    // OpRef.
+    // fail_args snapshot sees the result box.  Dest is `recorded`, the
+    // residual Call's result OpRef (kind = call descr result kind =
+    // the inline_call dest kind).  The caller still dest-writes again
+    // from `SubReturn` (`finishframe`); the second write is the same
+    // OpRef.  An aborted subwalk's leftover box is never this dest.
     if let Some((op_dst_bank, dst, next_pc)) = call_opcode_result_dst(code, pc) {
         super::residual_call::write_residual_call_result_to_dst(
             ctx,
@@ -20133,24 +20169,30 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                 published_raise = Some(DispatchOutcome::SubRaise { exc, exc_concrete });
                 None
             } else {
-                let applied = match finish_inline_callee_return(&mut walk_ctx, pending.result) {
-                    Some(value) => super::residual_call::write_residual_call_result_to_dst(
-                        &mut walk_ctx,
-                        pending.caller_pc,
-                        pending.dst,
-                        pending.dst_bank,
-                        value,
-                    )
-                    .is_ok(),
-                    None => pending.dst_bank == 'v',
-                };
-                if applied {
-                    SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    None
-                } else {
-                    Some(DispatchError::UnexpectedVoidSubReturn {
+                match finish_inline_callee_return(&mut walk_ctx, pending.result) {
+                    Some(value) => {
+                        match super::residual_call::write_residual_call_result_to_dst(
+                            &mut walk_ctx,
+                            pending.caller_pc,
+                            pending.dst,
+                            pending.dst_bank,
+                            value,
+                        ) {
+                            Ok(()) => {
+                                SUBWALK_DIRECT_RESUME
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                None
+                            }
+                            Err(err) => Some(err),
+                        }
+                    }
+                    None if pending.dst_bank == 'v' => {
+                        SUBWALK_DIRECT_RESUME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        None
+                    }
+                    None => Some(DispatchError::UnexpectedVoidSubReturn {
                         pc: pending.caller_pc,
-                    })
+                    }),
                 }
             }
         } else {
@@ -21305,9 +21347,12 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         });
     }
     for (i, arg) in int_args.iter().enumerate() {
+        // pyjitpl.py setup_call: partition by box.type, never a Ref in registers_i.
+        super::assert_int_bank_box(*arg, "setup_call");
         callee_regs_i[i] = *arg;
     }
     for (i, arg) in ref_args.iter().enumerate() {
+        super::assert_ref_bank_box(*arg, "setup_call");
         callee_regs_r.set(i, *arg);
     }
     for (i, arg) in float_args.iter().enumerate() {
@@ -21353,6 +21398,7 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         if reg >= callee_regs_r.len() {
             continue;
         }
+        super::assert_ref_bank_box(opref, "setup_call");
         callee_regs_r.set(reg, opref);
         let seeded = match concrete {
             ConcreteValue::Ref(value) if !value.is_null() => {
@@ -21788,6 +21834,8 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
                 // return a constant (e.g. `LoadConst` tail), so route via
                 // the unified shadow channel.  Non-constant returns surface
                 // as the sentinel `GcRef(usize::MAX)` → Null fallback.
+                // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+                super::ensure_resultbox_type_for_bank(ctx, op.pc, dst_bank, value)?;
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'r' => {
@@ -22058,6 +22106,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         && ref_args.is_empty()
         && let Some(ConcreteValue::Int(value)) = int_arg_concretes.first().copied()
     {
+        super::assert_int_bank_box(int_args[0], "w_int_new fast path");
         // `walker_box_int` records `wrapint` and can minor-collect. Box the
         // concrete afterwards and stamp it before the next call, matching
         // `walker_read_int_mutable_cell`.
@@ -22258,6 +22307,8 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
                 // See dispatch_inline_call_dr_kind: route the SubReturn
                 // OpRef through the unified shadow channel so constant
                 // return values propagate.
+                // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+                super::ensure_resultbox_type_for_bank(ctx, op.pc, dst_bank, value)?;
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'r' => {
@@ -22519,6 +22570,8 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
                 // See dispatch_inline_call_dr_kind: route the SubReturn
                 // OpRef through the unified shadow channel so constant
                 // return values propagate.
+                // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+                super::ensure_resultbox_type_for_bank(ctx, op.pc, dst_bank, value)?;
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
                 match dst_bank {
                     'i' => {

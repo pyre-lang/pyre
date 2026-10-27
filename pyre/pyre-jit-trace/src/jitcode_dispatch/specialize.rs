@@ -9764,6 +9764,7 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     let _roots = pyre_object::gc_roots::push_roots();
     let concrete_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(concrete);
+    super::assert_int_bank_box(raw, "walker_box_int");
     let new_op = crate::helpers::emit_box_int_inline(
         ctx.trace_ctx,
         raw,
@@ -20050,6 +20051,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     // `SetfieldGc(intval=current)` shape allocation removal virtualizes.  Do
     // not feed it through pointer arithmetic: locally consumed items stay
     // virtual, while normal forcing materializes escaping items.
+    super::assert_int_bank_box(current, "walker_box_int");
     let item = crate::state::wrapint(ctx.trace_ctx, current);
 
     // Tracing executes the real range cursor advance.  The direct helper is

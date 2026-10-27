@@ -8022,6 +8022,8 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     dst_bank: char,
     result: OpRef,
 ) -> Result<(), DispatchError> {
+    // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+    super::ensure_resultbox_type_for_bank(ctx, pc, dst_bank, result)?;
     // concrete_of_opref shadow write: route the shadow write through `concrete_of_opref`
     // so a CallPure* descr whose argboxes are all constant (do_residual_call
     // path that lands a constant result via the executor.execute_varargs

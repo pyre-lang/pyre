@@ -245,7 +245,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // `box_value` resolves these via `TraceCtx::constants` so
     // downstream getfield chains see the constant's `Value::*`.
     for (i, &v) in top_constants_i.iter().enumerate() {
-        top_regs_i[top_num_regs_i + i] = trace_ctx.const_int(v);
+        let boxed = trace_ctx.const_int(v);
+        super::assert_int_bank_box(boxed, "allocate_callee_register_banks");
+        top_regs_i[top_num_regs_i + i] = boxed;
         top_concrete_i[top_num_regs_i + i] = ConcreteValue::Int(v);
     }
     // A constant-pool slot holds a KNOWN value, so a zero is the known
@@ -257,7 +259,9 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // slot).
     for (i, v) in top_constants_r.iter().enumerate() {
         let v = v.get();
-        top_regs_r.set(top_num_regs_r + i, trace_ctx.const_ref(v));
+        let boxed = trace_ctx.const_ref(v);
+        super::assert_ref_bank_box(boxed, "allocate_callee_register_banks");
+        top_regs_r.set(top_num_regs_r + i, boxed);
         top_concrete_r[top_num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in top_constants_f.iter().enumerate() {
@@ -300,12 +304,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
         });
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        super::assert_ref_bank_box(box_ref, "setup_call");
         top_regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = trace_ctx.box_value(box_ref) {
             top_concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
         }
     }
     for (i, &box_ref) in argboxes_i.iter().enumerate() {
+        super::assert_int_bank_box(box_ref, "setup_call");
         top_regs_i[i] = box_ref;
         if let Some(majit_ir::Value::Int(v)) = trace_ctx.box_value(box_ref) {
             top_concrete_i[i] = ConcreteValue::Int(v);
@@ -936,11 +942,16 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     };
     let cleared = result_register.and_then(|(bank, color)| {
         let (regs, cleared) = match bank {
-            'i' => (&mut regs_i, trace_ctx.const_int(0)),
-            'r' => (
-                &mut regs_r,
-                trace_ctx.const_ref(pyre_object::PY_NULL as i64),
-            ),
+            'i' => {
+                let cleared = trace_ctx.const_int(0);
+                super::assert_int_bank_box(cleared, "in_a_call");
+                (&mut regs_i, cleared)
+            }
+            'r' => {
+                let cleared = trace_ctx.const_ref(pyre_object::PY_NULL as i64);
+                super::assert_ref_bank_box(cleared, "in_a_call");
+                (&mut regs_r, cleared)
+            }
             'f' => (&mut regs_f, trace_ctx.const_float(0)),
             _ => return None,
         };
@@ -1047,8 +1058,18 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         // Color-indexed banks (`consume_boxes`). All three carry the cleared
         // result color (`MIFrame.get_list_of_active_boxes(in_a_call=True)`);
         // null and non-ref boxes remain.
-        registers_r: paused_register_bank(regs_r.iter().copied()),
-        registers_i: paused_register_bank(regs_i.iter().copied()),
+        registers_r: {
+            for &op in &regs_r {
+                super::assert_ref_bank_box(op, "paused_register_bank");
+            }
+            paused_register_bank(regs_r.iter().copied())
+        },
+        registers_i: {
+            for &op in &regs_i {
+                super::assert_int_bank_box(op, "paused_register_bank");
+            }
+            paused_register_bank(regs_i.iter().copied())
+        },
         registers_f: paused_register_bank(regs_f.iter().copied()),
         frame_state: None,
         caller_py_pc: None,
@@ -1598,14 +1619,18 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let mut concrete_r = vec![ConcreteValue::Null; total_r];
     let mut concrete_i = vec![ConcreteValue::Null; total_i];
     for (i, &v) in jc.constants_i.iter().enumerate() {
-        regs_i[num_regs_i + i] = ctx.const_int(v);
+        let boxed = ctx.const_int(v);
+        super::assert_int_bank_box(boxed, "allocate_callee_register_banks");
+        regs_i[num_regs_i + i] = boxed;
         concrete_i[num_regs_i + i] = ConcreteValue::Int(v);
     }
     // A null constant is a known `PY_NULL`, not an untracked slot -- same
     // reading as the top-level seeding above and as `build_callee_banks`.
     for (i, v) in jc.constants_r.iter().enumerate() {
         let v = v.get();
-        regs_r.set(num_regs_r + i, ctx.const_ref(v));
+        let boxed = ctx.const_ref(v);
+        super::assert_ref_bank_box(boxed, "allocate_callee_register_banks");
+        regs_r.set(num_regs_r + i, boxed);
         concrete_r[num_regs_r + i] = ConcreteValue::Ref(v as pyre_object::PyObjectRef);
     }
     for (i, &v) in jc.constants_f.iter().enumerate() {
@@ -1619,6 +1644,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }));
     }
     for (i, &box_ref) in argboxes_r.iter().enumerate() {
+        super::assert_ref_bank_box(box_ref, "setup_call");
         regs_r.set(i, box_ref);
         if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(box_ref) {
             concrete_r[i] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
@@ -1637,6 +1663,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         if box_ref.is_none() {
             continue;
         }
+        super::assert_int_bank_box(box_ref, "setup_call");
         regs_i[i] = box_ref;
         if let Some(majit_ir::Value::Int(v)) = ctx.box_value(box_ref) {
             concrete_i[i] = ConcreteValue::Int(v);
@@ -1663,6 +1690,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                         callee_num_regs_r: regs_r.len(),
                     }));
                 }
+                super::assert_ref_bank_box(result, "make_result_of_lastop");
                 regs_r.set(call_dst_reg, result);
                 if let Some(majit_ir::Value::Ref(majit_ir::GcRef(ptr))) = ctx.box_value(result) {
                     concrete_r[call_dst_reg] = ConcreteValue::Ref(ptr as pyre_object::PyObjectRef);
@@ -1676,6 +1704,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                         callee_num_regs_i: regs_i.len(),
                     }));
                 }
+                super::assert_int_bank_box(result, "make_result_of_lastop");
                 regs_i[call_dst_reg] = result;
                 if let Some(majit_ir::Value::Int(v)) = ctx.box_value(result) {
                     concrete_i[call_dst_reg] = ConcreteValue::Int(v);
