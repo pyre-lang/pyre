@@ -22,6 +22,11 @@ stores are recorded before ``CALL_MAY_FORCE`` (``vrefs_after_residual_call`` /
 
 ``callee_helper`` is that fold one frame out. ``helper_write`` is itself
 inlined, so ``sys._getframe(1)`` is the caller whose vref the call forced.
+
+``callee_reforce`` splits that into two residuals. ``force_then_write``
+forces the callee and then writes ``x`` through ``f_locals``. ``force_read``
+forces the same frame again. The second force must leave the write in place:
+the callee reads ``x`` and returns it.
 """
 
 import sys
@@ -50,6 +55,24 @@ def helper_write():
 def callee_helper(i):
     x = i
     helper_write()
+    return x
+
+
+def force_then_write(value):
+    frame = sys._getframe(1)
+    frame.f_locals["x"] = frame.f_locals["x"]
+    frame.f_locals["x"] = value
+
+
+def force_read():
+    frame = sys._getframe(1)
+    return frame.f_locals["x"]
+
+
+def callee_reforce(i):
+    x = i
+    force_then_write(i + 1000)
+    force_read()
     return x
 
 
@@ -84,6 +107,15 @@ def run_helper(rounds):
     return lost
 
 
+def run_reforce(rounds):
+    lost = []
+    for i in range(rounds):
+        got = callee_reforce(i)
+        if got != i + 1000:
+            lost.append((i, got))
+    return lost
+
+
 lost = run(ROUNDS)
 # Report a few, not all of them: a runtime without the write-through loses
 # every iteration, and the whole list buries the runner's output.
@@ -94,4 +126,7 @@ assert not lost_inlined, f"inlined {len(lost_inlined)} of {ROUNDS}, first: {lost
 
 lost_helper = run_helper(ROUNDS)
 assert not lost_helper, f"helper {len(lost_helper)} of {ROUNDS}, first: {lost_helper[:4]}"
+
+lost_reforce = run_reforce(ROUNDS)
+assert not lost_reforce, f"reforce {len(lost_reforce)} of {ROUNDS}, first: {lost_reforce[:4]}"
 print("OK")

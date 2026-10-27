@@ -548,6 +548,14 @@ impl Default for CalleeLocalsShadow {
 }
 
 impl CalleeLocalsShadow {
+    /// `force_virtualizable_if_necessary` / `force_now`: token cleared, so
+    /// the heap array is authoritative. A level that never folded
+    /// (`try_multiframe`, bridge resume) also has `fold_frame_reg == u16::MAX`
+    /// but keeps `frame_materialized` false and must still publish.
+    pub(crate) fn fold_retired(&self) -> bool {
+        self.frame_materialized && self.fold_frame_reg == u16::MAX
+    }
+
     /// A `NONE` value clears the slot.
     pub(crate) fn set_opref(&mut self, slot: i64, value: OpRef) {
         if value.is_none() {
@@ -2724,6 +2732,55 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
             }
         }
         None
+    }
+
+    /// An inline receiver whose [`CalleeLocalsShadow::fold_retired`] is set.
+    pub(crate) fn receiver_inline_fold_retired(&self, obj: OpRef, concrete: usize) -> bool {
+        let retired = |shadow: &CalleeLocalsShadow| {
+            inline_shadow_matches(shadow, obj, concrete) && shadow.fold_retired()
+        };
+        if self
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .is_some_and(retired)
+        {
+            return true;
+        }
+        let session = self.session.borrow();
+        for frame in &session.framestack {
+            if let Some(live) = frame.live.as_ref()
+                && live
+                    .frame_state
+                    .borrow()
+                    .callee_shadow
+                    .as_ref()
+                    .is_some_and(retired)
+            {
+                return true;
+            }
+            for parent in &frame.parents {
+                let Some(state) = parent.frame_state.as_ref() else {
+                    continue;
+                };
+                if state.borrow().callee_shadow.as_ref().is_some_and(retired) {
+                    return true;
+                }
+            }
+        }
+        for helper in &session.helper_live {
+            if helper
+                .frame_state
+                .borrow()
+                .callee_shadow
+                .as_ref()
+                .is_some_and(retired)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     /// The standing exception, read from the one session-wide slot

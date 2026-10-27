@@ -2899,9 +2899,21 @@ impl ResidualFrameChainGuard {
         // (`flush_active_frame_escape`), and the chain already naming it makes
         // that more true, not less.
         let previous_published = PUBLISHED_INLINE_FRAME.with(|slot| slot.replace(frame));
-        let previous_shadow = PUBLISHED_INLINE_SHADOW.with(|slot| {
-            slot.replace(shadow.map(|(state, reg)| PublishedInlineShadow::Pending(state, reg)))
+        // `CalleeLocalsShadow::fold_retired`: publish `Written` so a later
+        // force does not flush the pre-force slots over the heap array.
+        let installed = shadow.map(|(state, reg)| {
+            let fold_retired = state
+                .borrow()
+                .callee_shadow
+                .as_ref()
+                .is_some_and(CalleeLocalsShadow::fold_retired);
+            if fold_retired {
+                PublishedInlineShadow::Written(frame as usize)
+            } else {
+                PublishedInlineShadow::Pending(state, reg)
+            }
         });
+        let previous_shadow = PUBLISHED_INLINE_SHADOW.with(|slot| slot.replace(installed));
         Some(Self {
             ec,
             frame_root: majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(
@@ -3067,6 +3079,18 @@ fn materialize_published_callee_locals(frame: *mut pyre_interpreter::PyFrame) ->
             slot.replace(Some(PublishedInlineShadow::Pending(state, frame_reg)));
         });
         return Some(false);
+    }
+    // `CalleeLocalsShadow::fold_retired`: heap array already authoritative.
+    let fold_retired = state
+        .borrow()
+        .callee_shadow
+        .as_ref()
+        .is_some_and(CalleeLocalsShadow::fold_retired);
+    if fold_retired {
+        PUBLISHED_INLINE_SHADOW.with(|slot| {
+            slot.replace(Some(PublishedInlineShadow::Written(frame_addr)));
+        });
+        return Some(true);
     }
     if super::flush_callee_locals_region(&state, frame, frame_reg) {
         // `tracing_after_residual_call` sees a cleared `virtual_token`.
