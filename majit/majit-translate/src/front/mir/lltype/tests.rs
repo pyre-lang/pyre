@@ -24,8 +24,8 @@ use crate::front::mir::tests::{
     option_int_arg, range_contains_fixture, result_adt_node, result_enum, span_json, struct_decl,
     trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout, type_decl_meta,
     type_decl_struct, tyref_to_attr_value_type, usize_ty, vec_decl_json, vec_of, vec_type_decls,
-    vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_meta,
-    window_mut_slice, window_shared_slice, window_slice,
+    vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_local,
+    window_meta, window_mut_slice, window_place, window_shared_slice, window_slice, window_span,
 };
 
 mod slice_or_vec_container_root_spelling_tests {
@@ -4925,6 +4925,121 @@ fn transparent_gc_handle_keeps_the_wrapper_class() {
         ValueType::Ref(Some("Handle".into()))
     );
     assert_handle_class(&llbc, &ty, Some("Handle"));
+}
+
+/// A by-value store of a `#[repr(transparent)]` GC handle into an
+/// enum-variant payload is one `setfield` of the container field
+/// (`heaptracker.all_fielddescrs` / `Transformer.zero_contents`: a Ptr
+/// is not an inlined STRUCT). The FieldWrite name is `__pos_0`.
+#[test]
+fn transparent_handle_enum_payload_store_is_one_fieldwrite() {
+    let mut decls = pointer_handle_decls();
+    decls.push((6, result_enum(6)));
+    let handle_adt = serde_json::json!({
+        "Adt": {"id": 3, "generics": window_empty_generics()}
+    });
+    let object_ptr = serde_json::json!({
+        "RawPtr": [
+            {"Adt": {"id": 1, "generics": window_empty_generics()}},
+            "Mut"
+        ]
+    });
+    let result_ty = result_adt_node(6, object_ptr, handle_adt.clone());
+    let result_ref = serde_json::json!({"Ref": ["Erased", result_ty.clone(), "Mut"]});
+    let unit = serde_json::json!({"Adt": {"builtin": "Tuple", "generics": {"types": []}}});
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(
+                serde_json::json!({"Projection": [
+                    window_place(serde_json::json!({"Local": 1}), &result_ref),
+                    "Deref"
+                ]}),
+                &result_ty
+            ),
+            {"Field": [1, 0]}
+        ]}),
+        &handle_adt,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "store_handle_into_enum_payload"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [result_ref.clone(), handle_adt.clone()],
+            "output": unit.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &unit),
+                window_local(1, &result_ref),
+                window_local(2, &handle_adt)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        field_place,
+                        {"Use": [{"Copy": window_place(
+                            serde_json::json!({"Local": 2}),
+                            &handle_adt
+                        )}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let trait_impls =
+        with_fixture_gctype_impls(&decls, serde_json::json!([pyerror_deref_impl(23, 2)]));
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(decls),
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": handle_trait_decls(),
+            "trait_impls": trait_impls
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let handle_ty = serde_json::from_value::<TyRef>(serde_json::json!({
+        "Value": [9003, adt_body(3)]
+    }))
+    .expect("handle TyRef parses");
+    let gc_struct_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(
+            &handle_ty,
+            &llbc,
+            no_tombstoned_leaves(),
+            &gc_struct_ids,
+            &raw_alloc
+        )
+        .is_none(),
+        "a transparent GC handle is a Ptr leaf, not an inlined STRUCT"
+    );
+    let graph = super::lower_function(&llbc, "store_handle_into_enum_payload")
+        .expect("lower store of a transparent handle into an enum payload");
+    let writes: Vec<&str> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } => Some(field.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        writes,
+        ["__pos_0"],
+        "enum-variant handle payload is one FieldWrite of the container field; graph={}",
+        graph.dump()
+    );
 }
 
 fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {

@@ -6,9 +6,10 @@
 //! (`get_mutate_field_name`), `get_current_qmut_instance` fills it in on the
 //! first registration, and the invalidation function the rtyper installs on the
 //! real field's write path nulls it and sweeps it. Pyre has no rtyper, so
-//! [`QuasiImmutField`] is that hidden field written out — one per `?`
-//! declaration, embedded in the owner the declaration belongs to, and reached
-//! by the record-time resolver in `pyre-jit-trace::state quasi_immut_descr`.
+//! each owner holds the hidden word pair `_setup_repr` would add
+//! (`get_mutate_field_name`), and [`QuasiImmutField`] is the borrowed view
+//! over that pair, reached by the record-time resolver in
+//! `pyre-jit-trace::state quasi_immut_descr`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
@@ -154,20 +155,20 @@ impl QuasiImmut {
 }
 
 /// Heap box behind [`QuasiImmutField::lock`].
-struct QuasiImmutLock(parking_lot::Mutex<()>);
+pub struct QuasiImmutLock(parking_lot::Mutex<()>);
 
 /// Host `QuasiImmutLock` is a `Box::into_raw`'d host allocation, never a GC object.
 #[doc(hidden)]
 #[allow(non_upper_case_globals, dead_code)]
 pub const _alloc_flavor_QuasiImmutLock: &str = "raw";
 
-/// The hidden `mutate_<name>` field the rtyper synthesises for one `?`
-/// declaration (`quasiimmut.py get_mutate_field_name`), written out because
-/// pyre has no rtyper to synthesise it.
+/// Borrowed view over the hidden `mutate_<name>` word pair
+/// `rclass.py InstanceRepr._setup_repr` adds as one OBJECTPTR
+/// (`quasiimmut.py get_mutate_field_name`).
 ///
-/// Null until the first read is recorded (`get_current_qmut_instance`,
-/// quasiimmut.py); nulled by the invalidation function
-/// (`make_invalidation_function._invalidate_now`, quasiimmut.py), so
+/// The mutate word is null until the first read is recorded
+/// (`get_current_qmut_instance`); the invalidation function
+/// (`make_invalidation_function._invalidate_now`) nulls it, so
 /// the next recording starts from a fresh instance and the identity a
 /// revalidation compares really did change. The stored pointer is one strong
 /// [`Arc`] reference, so an instance a trace is still holding survives being
@@ -188,25 +189,33 @@ pub const _alloc_flavor_QuasiImmutLock: &str = "raw";
 /// the lock is allocated on first use and the field stores only the
 /// pointer. A minor collection memcpy's that word. The critical section
 /// allocates nothing GC-managed and crosses no safepoint, so it cannot
-/// park a mutator the collector is waiting for.
-#[repr(C)]
-pub struct QuasiImmutField {
-    ptr: AtomicPtr<QuasiImmut>,
-    lock: AtomicPtr<QuasiImmutLock>,
+/// park a mutator the collector is waiting for. The lock word sits
+/// immediately after the mutate word (`quasi_immut_words!`).
+#[derive(Clone, Copy)]
+pub struct QuasiImmutField<'a> {
+    ptr: &'a AtomicPtr<QuasiImmut>,
+    lock: &'a AtomicPtr<QuasiImmutLock>,
 }
 
-/// Byte offsets of the two words of [`QuasiImmutField`]. A descr group that
-/// lists an embedding struct's fields recurses into this inlined STRUCT
-/// (`heaptracker.py all_fielddescrs`).
-pub const QUASIIMMUT_FIELD_PTR_OFFSET: usize = std::mem::offset_of!(QuasiImmutField, ptr);
-pub const QUASIIMMUT_FIELD_LOCK_OFFSET: usize = std::mem::offset_of!(QuasiImmutField, lock);
+/// Null initializer for an owner's `mutate_<name>` word.
+pub const fn null_mutate_word() -> AtomicPtr<QuasiImmut> {
+    AtomicPtr::new(std::ptr::null_mut())
+}
 
-const _: () = assert!(std::mem::size_of::<QuasiImmutField>() == 2 * std::mem::size_of::<usize>());
+/// Null initializer for the lock word declared immediately after the mutate word.
+pub const fn null_mutate_lock() -> AtomicPtr<QuasiImmutLock> {
+    AtomicPtr::new(std::ptr::null_mut())
+}
 
-impl Default for QuasiImmutField {
-    fn default() -> Self {
-        Self::new()
-    }
+/// `offset_of!(Owner, lock) == offset_of!(Owner, word) + WORD`: the pair `from_mutate_word` relies on.
+#[macro_export]
+macro_rules! quasi_immut_words {
+    ($owner:ty, $word:ident, $lock:ident) => {
+        const _: () = assert!(
+            ::std::mem::offset_of!($owner, $lock)
+                == ::std::mem::offset_of!($owner, $word) + ::std::mem::size_of::<usize>()
+        );
+    };
 }
 
 /// Swap out the installed instance and invalidate it. Callers already hold
@@ -220,11 +229,17 @@ macro_rules! unlink_and_invalidate {
     }};
 }
 
-impl QuasiImmutField {
-    pub const fn new() -> Self {
+impl<'a> QuasiImmutField<'a> {
+    pub const fn new(ptr: &'a AtomicPtr<QuasiImmut>, lock: &'a AtomicPtr<QuasiImmutLock>) -> Self {
+        Self { ptr, lock }
+    }
+
+    /// The lock word is declared immediately after its `mutate_<name>` word
+    /// (see `quasi_immut_words!`), so the mutate word's address names both.
+    pub unsafe fn from_mutate_word(ptr: *const AtomicPtr<QuasiImmut>) -> Self {
         Self {
-            ptr: AtomicPtr::new(std::ptr::null_mut()),
-            lock: AtomicPtr::new(std::ptr::null_mut()),
+            ptr: unsafe { &*ptr },
+            lock: unsafe { &*ptr.add(1).cast() },
         }
     }
 
@@ -366,8 +381,7 @@ impl QuasiImmutField {
         Some(unsafe { Arc::from_raw(qmut_ptr) })
     }
 
-    /// The sweep-side counterpart of [`Drop`]: release the instance reference
-    /// and the out-of-line lock box.
+    /// Release the instance reference and the out-of-line lock box.
     ///
     /// A collector reclaiming the owner's payload runs no Rust drop glue for
     /// the fields inside it, so a destructor that only calls [`Self::take`]
@@ -395,13 +409,6 @@ impl QuasiImmutField {
     }
 }
 
-impl Drop for QuasiImmutField {
-    fn drop(&mut self) {
-        // SAFETY: `&mut self` is exclusive and drop glue runs once.
-        unsafe { self.reclaim() };
-    }
-}
-
 /// The residual half of an invalidation: unlink the instance and flip every
 /// loop flag it recorded.
 ///
@@ -414,10 +421,10 @@ impl Drop for QuasiImmutField {
 /// so a mutation on an object no loop watches still makes no call.
 ///
 /// # Safety
-/// `field` must point at a live [`QuasiImmutField`].
+/// `field` must point at a live mutate word whose lock word follows it.
 #[majit_macros::dont_look_inside]
-pub unsafe fn sweep_quasi_immut_field(field: *const QuasiImmutField) {
-    unsafe { (*field).invalidate() };
+pub unsafe fn sweep_quasi_immut_field(field: *const AtomicPtr<QuasiImmut>) {
+    unsafe { QuasiImmutField::from_mutate_word(field).invalidate() };
 }
 
 /// `rclass.py hook_setfield` and the store, under the field lock.
@@ -427,15 +434,15 @@ pub unsafe fn sweep_quasi_immut_field(field: *const QuasiImmutField) {
 /// for the old value after the sweep decided there was nothing to sweep.
 ///
 /// # Safety
-/// `field` is live. `slot` is the pointer it watches and is live for the call.
+/// `field` is a live mutate word. `slot` is the pointer it watches and is live for the call.
 #[majit_macros::dont_look_inside]
 pub unsafe fn publish_quasi_immut_ptr(
-    field: *const QuasiImmutField,
+    field: *const AtomicPtr<QuasiImmut>,
     slot: *mut crate::pyobject::PyObjectRef,
     value: crate::pyobject::PyObjectRef,
 ) {
     unsafe {
-        (*field).invalidate_then_store(|| {
+        QuasiImmutField::from_mutate_word(field).invalidate_then_store(|| {
             std::sync::atomic::AtomicPtr::from_ptr(slot).store(value, Ordering::Release);
         });
     }
@@ -444,15 +451,15 @@ pub unsafe fn publish_quasi_immut_ptr(
 /// [`QuasiImmutField::compare_exchange_ptr`] as a trace-opaque call.
 ///
 /// # Safety
-/// `field` is live. `slot` is the pointer it watches and is live for the call.
+/// `field` is a live mutate word. `slot` is the pointer it watches and is live for the call.
 #[majit_macros::dont_look_inside]
 pub unsafe fn publish_quasi_immut_cas(
-    field: *const QuasiImmutField,
+    field: *const AtomicPtr<QuasiImmut>,
     slot: *mut crate::pyobject::PyObjectRef,
     expected: crate::pyobject::PyObjectRef,
     value: crate::pyobject::PyObjectRef,
 ) -> Result<(), crate::pyobject::PyObjectRef> {
-    unsafe { (*field).compare_exchange_ptr(slot, expected, value) }
+    unsafe { QuasiImmutField::from_mutate_word(field).compare_exchange_ptr(slot, expected, value) }
 }
 
 #[cfg(test)]
@@ -480,6 +487,31 @@ pub(crate) fn test_loop_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestField {
+        ptr: AtomicPtr<QuasiImmut>,
+        lock: AtomicPtr<QuasiImmutLock>,
+    }
+    crate::quasi_immut_words!(TestField, ptr, lock);
+
+    impl TestField {
+        const fn new() -> Self {
+            Self {
+                ptr: null_mutate_word(),
+                lock: null_mutate_lock(),
+            }
+        }
+
+        fn field(&self) -> QuasiImmutField<'_> {
+            QuasiImmutField::new(&self.ptr, &self.lock)
+        }
+    }
+
+    impl Drop for TestField {
+        fn drop(&mut self) {
+            unsafe { self.field().reclaim() };
+        }
+    }
 
     /// `quasiimmut.py invalidate` flips every registered flag and empties
     /// the list, and a flag whose loop is gone is simply skipped.
@@ -536,7 +568,8 @@ mod tests {
     /// recording starts from a fresh instance.
     #[test]
     fn invalidate_unlinks_before_sweeping() {
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
+        let field = owned.field();
         assert!(!field.is_installed());
 
         let flag = Arc::new(AtomicBool::new(false));
@@ -568,7 +601,8 @@ mod tests {
 
     #[test]
     fn invalidate_then_store_publishes_under_the_field_lock() {
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
+        let field = owned.field();
         let flag = Arc::new(AtomicBool::new(false));
         let token = test_loop_token(&flag);
         field
@@ -596,7 +630,8 @@ mod tests {
     /// the lock is released.
     #[test]
     fn compare_exchange_ptr_sweeps_only_the_publication_that_wins() {
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
+        let field = owned.field();
         let flag = Arc::new(AtomicBool::new(false));
         let token = test_loop_token(&flag);
         field
@@ -625,7 +660,8 @@ mod tests {
     /// already minted a replacement.
     #[test]
     fn a_recorded_instance_reports_a_sweep_and_is_not_reused() {
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
+        let field = owned.field();
         let recorded = field.get_current_qmut_instance();
         assert!(recorded.is_current());
 
@@ -658,7 +694,8 @@ mod tests {
     /// resolve later, so reclaiming here would have been a use-after-free.
     #[test]
     fn a_swept_owner_hands_back_only_its_own_reference() {
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
+        let field = owned.field();
         // What recording bound onto the marker descr.
         let recorded = field.get_current_qmut_instance();
         assert_eq!(Arc::strong_count(&recorded), 2, "the field's and ours");
@@ -689,14 +726,15 @@ mod tests {
     /// static method and class method.
     #[test]
     fn reclaiming_a_swept_field_releases_its_lock() {
-        let untouched = QuasiImmutField::new();
-        drop(untouched.take());
+        let untouched = TestField::new();
+        drop(untouched.field().take());
         assert!(
             !untouched.lock.load(Ordering::Acquire).is_null(),
             "`take` locks first, so it mints a lock with nothing to take"
         );
 
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
+        let field = owned.field();
         let recorded = field.get_current_qmut_instance();
         assert!(
             !field.lock.load(Ordering::Acquire).is_null(),
@@ -734,14 +772,14 @@ mod tests {
         const ROUNDS: usize = 200_000;
         const RECORDER_ROUNDS: usize = 4 * ROUNDS;
 
-        let field = QuasiImmutField::new();
+        let owned = TestField::new();
         let stop = AtomicBool::new(false);
 
         std::thread::scope(|scope| {
             // Two recording threads keep re-installing the instance, so the
             // mutators below keep finding one to sweep.
             for _ in 0..2 {
-                let field = &field;
+                let field = owned.field();
                 let stop = &stop;
                 scope.spawn(move || {
                     let flag = Arc::new(AtomicBool::new(false));
@@ -760,7 +798,7 @@ mod tests {
             }
             let mutators: Vec<_> = (0..4)
                 .map(|_| {
-                    let field = &field;
+                    let field = owned.field();
                     scope.spawn(move || {
                         for _ in 0..ROUNDS {
                             field.invalidate();
@@ -774,7 +812,7 @@ mod tests {
             stop.store(true, Ordering::Relaxed);
         });
 
-        field.invalidate();
-        assert!(!field.is_installed());
+        owned.field().invalidate();
+        assert!(!owned.field().is_installed());
     }
 }

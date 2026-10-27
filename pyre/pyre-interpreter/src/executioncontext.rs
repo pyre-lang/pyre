@@ -1,7 +1,10 @@
 use pyre_object::PyObjectRef;
-use pyre_object::quasiimmut::QuasiImmutField;
+use pyre_object::quasiimmut::{
+    QuasiImmut, QuasiImmutField, QuasiImmutLock, null_mutate_lock, null_mutate_word,
+};
 use std::cell::{Cell, RefCell};
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::PyFrame;
@@ -624,29 +627,64 @@ pub enum PendingLoopExit {
     ExitFrameWithException(crate::PyError),
 }
 
-/// Clone of [`QuasiImmutField`] that starts empty.  A copied execution
-/// context must not keep the source's compiled-loop watchers.
+/// Clone of the `w_tracefunc?` hidden word pair that starts empty.  A copied
+/// execution context must not keep the source's compiled-loop watchers.
 ///
-/// Single-field `repr(transparent)` wrapper: the field offset of
-/// `ExecutionContext.mutate_w_tracefunc` is the [`QuasiImmutField`] start
+/// `repr(C)` two-word wrapper: the field offset of
+/// `ExecutionContext.mutate_w_tracefunc` is the mutate word
 /// (`quasiimmut.py get_mutate_field_name` of pyre `w_tracefunc`).
-#[repr(transparent)]
-struct WTracefuncWatchers(QuasiImmutField);
+#[repr(C)]
+struct WTracefuncWatchers {
+    mutate_w_tracefunc: AtomicPtr<QuasiImmut>,
+    mutate_w_tracefunc_lock: AtomicPtr<QuasiImmutLock>,
+}
+
+pyre_object::quasi_immut_words!(
+    WTracefuncWatchers,
+    mutate_w_tracefunc,
+    mutate_w_tracefunc_lock
+);
+
+impl WTracefuncWatchers {
+    #[inline]
+    fn field(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_w_tracefunc, &self.mutate_w_tracefunc_lock)
+    }
+}
 
 /// Twin of [`WTracefuncWatchers`] for `profilefunc?`. The field offset of
-/// `ExecutionContext.mutate_profilefunc` is the [`QuasiImmutField`] start
+/// `ExecutionContext.mutate_profilefunc` is the mutate word
 /// (`quasiimmut.py get_mutate_field_name` of pyre `profilefunc`).
-#[repr(transparent)]
-struct ProfilefuncWatchers(QuasiImmutField);
+#[repr(C)]
+struct ProfilefuncWatchers {
+    mutate_profilefunc: AtomicPtr<QuasiImmut>,
+    mutate_profilefunc_lock: AtomicPtr<QuasiImmutLock>,
+}
+
+pyre_object::quasi_immut_words!(
+    ProfilefuncWatchers,
+    mutate_profilefunc,
+    mutate_profilefunc_lock
+);
+
+impl ProfilefuncWatchers {
+    #[inline]
+    fn field(&self) -> QuasiImmutField<'_> {
+        QuasiImmutField::new(&self.mutate_profilefunc, &self.mutate_profilefunc_lock)
+    }
+}
 
 const _: () =
-    assert!(std::mem::size_of::<WTracefuncWatchers>() == std::mem::size_of::<QuasiImmutField>());
+    assert!(std::mem::size_of::<WTracefuncWatchers>() == 2 * std::mem::size_of::<usize>());
 const _: () =
-    assert!(std::mem::size_of::<ProfilefuncWatchers>() == std::mem::size_of::<QuasiImmutField>());
+    assert!(std::mem::size_of::<ProfilefuncWatchers>() == 2 * std::mem::size_of::<usize>());
 
 impl Default for WTracefuncWatchers {
     fn default() -> Self {
-        Self(QuasiImmutField::new())
+        Self {
+            mutate_w_tracefunc: null_mutate_word(),
+            mutate_w_tracefunc_lock: null_mutate_lock(),
+        }
     }
 }
 
@@ -656,15 +694,32 @@ impl Clone for WTracefuncWatchers {
     }
 }
 
+impl Drop for WTracefuncWatchers {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe { self.field().reclaim() };
+    }
+}
+
 impl Default for ProfilefuncWatchers {
     fn default() -> Self {
-        Self(QuasiImmutField::new())
+        Self {
+            mutate_profilefunc: null_mutate_word(),
+            mutate_profilefunc_lock: null_mutate_lock(),
+        }
     }
 }
 
 impl Clone for ProfilefuncWatchers {
     fn clone(&self) -> Self {
         Self::default()
+    }
+}
+
+impl Drop for ProfilefuncWatchers {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe { self.field().reclaim() };
     }
 }
 
@@ -681,7 +736,7 @@ pub struct ExecutionContext {
     /// pyre `w_tracefunc`; `executioncontext.py _immutable_fields_ =
     /// ['w_tracefunc?']`). [`Clone`] yields an empty field so a copied EC
     /// does not inherit the source's loop watchers. The wrapper is
-    /// `repr(transparent)`, so this offset is the `QuasiImmutField` start.
+    /// `repr(C)`, so this offset is the mutate word.
     mutate_w_tracefunc: WTracefuncWatchers,
     pub is_tracing: i32,
     pub compiler: PyObjectRef,
@@ -692,8 +747,8 @@ pub struct ExecutionContext {
     pub profilefunc: Option<ProfileFunc>,
     /// Hidden `mutate_profilefunc` (`quasiimmut.py get_mutate_field_name` of
     /// pyre `profilefunc`; `executioncontext.py _immutable_fields_ =
-    /// ['profilefunc?']`). The wrapper is `repr(transparent)`, so this
-    /// offset is the `QuasiImmutField` start.
+    /// ['profilefunc?']`). The wrapper is `repr(C)`, so this offset is
+    /// the mutate word.
     mutate_profilefunc: ProfilefuncWatchers,
     pub w_profilefuncarg: PyObjectRef,
     pub thread_disappeared: bool,
@@ -873,7 +928,7 @@ pub const EC_W_TRACEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, 
 pub const EC_PROFILEFUNC_OFFSET: usize = std::mem::offset_of!(ExecutionContext, profilefunc);
 
 /// Byte offset of `mutate_w_tracefunc` within `ExecutionContext`. The
-/// newtype is `repr(transparent)`, so this is the `QuasiImmutField` start.
+/// wrapper is `repr(C)`, so this is the mutate word.
 pub const EC_MUTATE_W_TRACEFUNC_OFFSET: usize =
     std::mem::offset_of!(ExecutionContext, mutate_w_tracefunc);
 
@@ -1757,8 +1812,8 @@ impl ExecutionContext {
     #[majit_macros::dont_look_inside]
     pub fn settrace(&mut self, w_func: PyObjectRef) {
         if w_func.is_null() || w_func == pyre_object::w_none() {
-            if self.mutate_w_tracefunc.0.is_installed() {
-                self.mutate_w_tracefunc.0.invalidate();
+            if self.mutate_w_tracefunc.field().is_installed() {
+                self.mutate_w_tracefunc.field().invalidate();
             }
             self.w_tracefunc = pyre_object::PY_NULL;
             return;
@@ -1771,8 +1826,8 @@ impl ExecutionContext {
         let func_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_func);
         self.force_all_frames(false);
-        if self.mutate_w_tracefunc.0.is_installed() {
-            self.mutate_w_tracefunc.0.invalidate();
+        if self.mutate_w_tracefunc.field().is_installed() {
+            self.mutate_w_tracefunc.field().invalidate();
         }
         self.w_tracefunc = pyre_object::gc_roots::shadow_stack_get(func_slot);
         crate::call::set_jit_param("trace_limit", 10000);
@@ -1785,17 +1840,17 @@ impl ExecutionContext {
 
     /// `quasiimmut.py get_current_qmut_instance` for `w_tracefunc?`.
     pub fn current_w_tracefunc_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
-        self.mutate_w_tracefunc.0.get_current_qmut_instance()
+        self.mutate_w_tracefunc.field().get_current_qmut_instance()
     }
 
     /// `quasiimmut.py get_current_qmut_instance` for `profilefunc?`.
     pub fn current_profilefunc_qmut(&self) -> std::sync::Arc<pyre_object::quasiimmut::QuasiImmut> {
-        self.mutate_profilefunc.0.get_current_qmut_instance()
+        self.mutate_profilefunc.field().get_current_qmut_instance()
     }
 
     fn store_profilefunc(&mut self, func: Option<ProfileFunc>, w_arg: PyObjectRef) {
-        if self.mutate_profilefunc.0.is_installed() {
-            self.mutate_profilefunc.0.invalidate();
+        if self.mutate_profilefunc.field().is_installed() {
+            self.mutate_profilefunc.field().invalidate();
         }
         self.profilefunc = func;
         self.w_profilefuncarg = w_arg;

@@ -9330,7 +9330,7 @@ fn struct_ptr_write_copies_inlined_struct_field_leaves() {
         .collect();
     assert!(
         header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
-        "inlined PyObject leaves must be stored through PyObject descriptors, got {header_leaves:?}"
+        "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
     );
 }
 
@@ -9380,7 +9380,7 @@ fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
         .collect();
     assert!(
         header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
-        "inlined PyObject leaves must be stored through PyObject descriptors, got {header_leaves:?}"
+        "offset-0 header is the `super` chain: inner PyObject descriptors, got {header_leaves:?}"
     );
 }
 

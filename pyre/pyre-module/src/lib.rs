@@ -223,7 +223,7 @@ fn hook_ctype_size_qmut(
     {
         Some(unsafe {
             (*(ptr as *const module::_cffi_backend::ctypeobj::W_CType))
-                .mutate_size
+                .mutate_size()
                 .get_current_qmut_instance()
         })
     }

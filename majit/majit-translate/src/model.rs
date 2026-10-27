@@ -2422,6 +2422,24 @@ pub fn cast_pointer_root(kind: &OpKind) -> Option<&str> {
     }
 }
 
+/// Operand of an `IDENTITY_OPS` op (`same_as`, `cast_pointer`).
+/// `compute_lifetimes` unions that operand with the result; the op is
+/// not a use. `__cast_pointer` is the Call spelling; `CAST_INSTANCE` is
+/// pyre's fuse-time `cast_pointer` (`is_identity_cast_path`).
+fn identity_operand(kind: &OpKind) -> Option<&crate::flowspace::model::Variable> {
+    match kind {
+        OpKind::UnaryOp { op, operand, .. } if op == "same_as" || op == "cast_pointer" => {
+            Some(operand)
+        }
+        OpKind::Call { args, .. }
+            if cast_pointer_root(kind).is_some() || cast_instance_root(kind).is_some() =>
+        {
+            args.first().and_then(LinkArg::as_variable)
+        }
+        _ => None,
+    }
+}
+
 /// [`cast_instance_root`] when `args[0]` is `operand`.
 pub fn cast_instance_of<'a>(
     kind: &'a OpKind,
@@ -4304,9 +4322,11 @@ impl<'g> ProducerIndex<'g> {
 /// constructor route stores (embedded header fields included).  The
 /// constructor route stays first: a ctor-rooted aggregate is never copied
 /// this way.  A field whose declared type is a by-value nested struct is
-/// copied per leaf through that inner struct's own descriptors
+/// copied per relative leaf of that inner struct
 /// (`heaptracker.py all_fielddescrs` recursion; `jtransform.py
-/// rewrite_op_getsubstruct`), not as one `Ref` word.  The call's unit
+/// rewrite_op_getsubstruct`). An offset-0 hop keeps the inner descr
+/// (`Transformer.zero_contents`); a nonzero hop writes `{field}.{leaf}`
+/// on the container (`nest_inline_leaf`), not as one `Ref` word.  The call's unit
 /// result, when still carried by MIR bookkeeping, becomes a `ConstNone`
 /// with the same `Void` representation.  Any indirect, disagreeing-phi,
 /// mismatched-owner, or incomplete spelling is left untouched to fail
@@ -4318,13 +4338,67 @@ pub fn lower_struct_ptr_writes(
     lower_struct_ptr_writes_with(graph, struct_field_attrs, &|_, _| None)
 }
 
-/// Immediate inlined-struct owner (`struct_copy_owner_keys` of the field's
-/// own decl) plus the leaves `collect_by_value_struct_leaves` returns.
-pub(crate) type InlineStructExpansion = (
-    String,
-    Option<majit_ir::descr::StructId>,
-    Vec<(FieldDescriptor, ValueType)>,
-);
+/// Whether an inlined-struct field sits at offset 0 in its owner, plus the
+/// leaves `collect_by_value_struct_leaves` returns.
+pub(crate) struct InlineStructExpansion {
+    pub at_offset_zero: bool,
+    pub leaves: Vec<InlineLeaf>,
+}
+
+/// A leaf of an inlined by-value struct `td`, relative to `td`.
+#[derive(Clone, Debug)]
+pub(crate) struct InlineLeaf {
+    /// After peeling the leading offset-0 hops: owner = deepest struct reached through them,
+    /// name = the remaining path (dotted when a nonzero hop remains).
+    pub field: FieldDescriptor,
+    /// The peeled hops from `td` down to `field`'s owner, each followed by '.'; "" when none.
+    pub super_path: String,
+    pub ty: ValueType,
+}
+
+/// `leaf` seen from the struct that holds `td` in `container_field`.
+/// At offset 0 the hop joins the `super` chain and `leaf.field` stays the descriptor
+/// (`heaptracker.all_fielddescrs` / `Transformer.zero_contents`: the inner struct's descr on the
+/// outer object). Otherwise the whole path is spelled on the container:
+/// `{container.name}.{super_path}{leaf.name}`, owner/owner_id from `container_field`.
+pub(crate) fn nest_inline_leaf(
+    container_field: &FieldDescriptor,
+    at_offset_zero: bool,
+    leaf: &InlineLeaf,
+) -> InlineLeaf {
+    let mut field = leaf.field.clone();
+    field.owner_declared_gc = container_field.owner_declared_gc;
+    field.base_is_deref = container_field.base_is_deref;
+    if at_offset_zero {
+        InlineLeaf {
+            field,
+            super_path: format!("{}.{}", container_field.name, leaf.super_path),
+            ty: leaf.ty.clone(),
+        }
+    } else {
+        field.name = format!(
+            "{}.{}{}",
+            container_field.name, leaf.super_path, leaf.field.name
+        );
+        field.owner_root = container_field.owner_root.clone();
+        field.owner_id = container_field.owner_id;
+        InlineLeaf {
+            field,
+            super_path: String::new(),
+            ty: leaf.ty.clone(),
+        }
+    }
+}
+
+/// Write-side spelling of `leaf` on the object that stores the inlined
+/// struct in `container_field`: `nest_inline_leaf(..).field`.
+pub(crate) fn container_leaf_descriptor(
+    container_field: &FieldDescriptor,
+    at_offset_zero: bool,
+    leaf: &InlineLeaf,
+) -> FieldDescriptor {
+    nest_inline_leaf(container_field, at_offset_zero, leaf).field
+}
 
 pub(crate) fn lower_struct_ptr_writes_with(
     graph: &mut FunctionGraph,
@@ -4593,15 +4667,15 @@ pub(crate) fn lower_struct_ptr_writes_with(
                     match expand_inline_struct(&rewrite.owner, &field.name)
                         .zip(value.as_variable().cloned())
                     {
-                        Some(((_, _, leaves), inner)) => {
-                            for (leaf, leaf_ty) in leaves {
+                        Some((expansion, inner)) => {
+                            for leaf in expansion.leaves {
                                 let read = graph.alloc_value_var();
                                 replacement.push(SpaceOperation {
                                     result: Some(read.clone()),
                                     kind: OpKind::FieldRead {
                                         base: inner.clone(),
-                                        field: leaf.clone(),
-                                        ty: leaf_ty.clone(),
+                                        field: leaf.field.clone(),
+                                        ty: leaf.ty.clone(),
                                         pure: false,
                                     },
                                 });
@@ -4609,9 +4683,13 @@ pub(crate) fn lower_struct_ptr_writes_with(
                                     result: None,
                                     kind: OpKind::FieldWrite {
                                         base: rewrite.destination.clone(),
-                                        field: leaf,
+                                        field: container_leaf_descriptor(
+                                            &field,
+                                            expansion.at_offset_zero,
+                                            &leaf,
+                                        ),
                                         value: LinkArg::Value(read),
-                                        ty: leaf_ty,
+                                        ty: leaf.ty,
                                     },
                                 });
                             }
@@ -4629,31 +4707,44 @@ pub(crate) fn lower_struct_ptr_writes_with(
                 }
             }
             FieldInit::Copy { source, fields } => {
+                let mut copies = Vec::new();
                 for (field, ty) in fields {
-                    let leaves = expand_inline_struct(&rewrite.owner, &field.name)
-                        .map(|(_, _, leaves)| leaves)
-                        .unwrap_or_else(|| vec![(field, ty)]);
-                    for (leaf, leaf_ty) in leaves {
-                        let read = graph.alloc_value_var();
-                        replacement.push(SpaceOperation {
-                            result: Some(read.clone()),
-                            kind: OpKind::FieldRead {
-                                base: source.clone(),
-                                field: leaf.clone(),
-                                ty: leaf_ty.clone(),
-                                pure: false,
-                            },
-                        });
-                        replacement.push(SpaceOperation {
-                            result: None,
-                            kind: OpKind::FieldWrite {
-                                base: rewrite.destination.clone(),
-                                field: leaf,
-                                value: LinkArg::Value(read),
-                                ty: leaf_ty,
-                            },
-                        });
+                    match expand_inline_struct(&rewrite.owner, &field.name) {
+                        Some(expansion) => {
+                            // `_reccopy_lazy` descends into both `subsrc` and `subdst`;
+                            // the read uses the same container descriptor as the write.
+                            for leaf in expansion.leaves {
+                                let write = container_leaf_descriptor(
+                                    &field,
+                                    expansion.at_offset_zero,
+                                    &leaf,
+                                );
+                                copies.push((write.clone(), write, leaf.ty));
+                            }
+                        }
+                        None => copies.push((field.clone(), field, ty)),
                     }
+                }
+                for (read_field, write_field, ty) in copies {
+                    let read = graph.alloc_value_var();
+                    replacement.push(SpaceOperation {
+                        result: Some(read.clone()),
+                        kind: OpKind::FieldRead {
+                            base: source.clone(),
+                            field: read_field,
+                            ty: ty.clone(),
+                            pure: false,
+                        },
+                    });
+                    replacement.push(SpaceOperation {
+                        result: None,
+                        kind: OpKind::FieldWrite {
+                            base: rewrite.destination.clone(),
+                            field: write_field,
+                            value: LinkArg::Value(read),
+                            ty,
+                        },
+                    });
                 }
             }
         }
@@ -4723,7 +4814,9 @@ pub(crate) fn lower_inlined_struct_field_writes(
         op: usize,
         destination: crate::flowspace::model::Variable,
         source: crate::flowspace::model::Variable,
-        leaves: Vec<(FieldDescriptor, ValueType)>,
+        field: FieldDescriptor,
+        at_offset_zero: bool,
+        leaves: Vec<InlineLeaf>,
     }
     let malloc_args = typed_malloc_arg_vars(graph);
     let mut rewrites = Vec::new();
@@ -4741,7 +4834,7 @@ pub(crate) fn lower_inlined_struct_field_writes(
             let Some(owner) = field.owner_root.as_deref() else {
                 continue;
             };
-            let Some((_, _, leaves)) = expand_inline_struct(owner, &field.name) else {
+            let Some(expansion) = expand_inline_struct(owner, &field.name) else {
                 continue;
             };
             let Some(source) = value.as_variable().cloned() else {
@@ -4755,21 +4848,23 @@ pub(crate) fn lower_inlined_struct_field_writes(
                 op: oi,
                 destination: base.clone(),
                 source,
-                leaves,
+                field: field.clone(),
+                at_offset_zero: expansion.at_offset_zero,
+                leaves: expansion.leaves,
             });
         }
     }
     let rewritten = rewrites.len();
     for rewrite in rewrites.into_iter().rev() {
         let mut replacement = Vec::new();
-        for (leaf, leaf_ty) in rewrite.leaves {
+        for leaf in rewrite.leaves {
             let read = graph.alloc_value_var();
             replacement.push(SpaceOperation {
                 result: Some(read.clone()),
                 kind: OpKind::FieldRead {
                     base: rewrite.source.clone(),
-                    field: leaf.clone(),
-                    ty: leaf_ty.clone(),
+                    field: leaf.field.clone(),
+                    ty: leaf.ty.clone(),
                     pure: false,
                 },
             });
@@ -4777,9 +4872,9 @@ pub(crate) fn lower_inlined_struct_field_writes(
                 result: None,
                 kind: OpKind::FieldWrite {
                     base: rewrite.destination.clone(),
-                    field: leaf,
+                    field: container_leaf_descriptor(&rewrite.field, rewrite.at_offset_zero, &leaf),
                     value: LinkArg::Value(read),
-                    ty: leaf_ty,
+                    ty: leaf.ty,
                 },
             });
         }
@@ -4945,36 +5040,203 @@ pub(crate) fn fuse_boxing_alloc_with(
     // `STRUCT`. `malloc_typed(value)` instead recovers it from
     // `value.ob_header.ob_type`; it must match `w_class`, since values may carry
     // a subclass there.
+    /// Walk `IDENTITY_OPS` producers back to the non-identity operand
+    /// (`compute_lifetimes` unions input and output).
+    fn skip_identity(graph: &FunctionGraph, var: &Variable) -> Variable {
+        let mut cur = var.clone();
+        let mut visited = vec![cur.clone()];
+        loop {
+            let Some(op) = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find(|o| o.result.as_ref() == Some(&cur))
+            else {
+                break;
+            };
+            let Some(operand) = identity_operand(&op.kind) else {
+                break;
+            };
+            if visited.contains(operand) {
+                break;
+            }
+            visited.push(operand.clone());
+            cur = operand.clone();
+        }
+        cur
+    }
+    /// Full `compute_lifetimes` union of `root`: link renames in both
+    /// directions and `IDENTITY_OPS` in both directions. `foreign_creation`
+    /// is a creation point other than `root`'s own producer
+    /// (`_try_inline_malloc` requires every `cp[0] == "op"` and that op
+    /// is this malloc). Several creation points also cover the
+    /// `compute_lifetimes` "dup" use (the same lifetime twice in one
+    /// link's args).
+    struct Lifetime {
+        vars: Vec<Variable>,
+        foreign_creation: bool,
+    }
+    fn lifetime(graph: &FunctionGraph, root: &Variable) -> Lifetime {
+        fn add(vars: &mut Vec<Variable>, worklist: &mut Vec<Variable>, v: &Variable) {
+            if !vars.contains(v) {
+                vars.push(v.clone());
+                worklist.push(v.clone());
+            }
+        }
+        let mut vars = vec![root.clone()];
+        let mut worklist = vec![root.clone()];
+        while let Some(var) = worklist.pop() {
+            for block in &graph.blocks {
+                for link in &block.exits {
+                    if link.target == graph.returnblock || link.target == graph.exceptblock {
+                        continue;
+                    }
+                    let Some(target) = graph.blocks.get(link.target.0) else {
+                        continue;
+                    };
+                    for (slot, arg) in link.args.iter().enumerate() {
+                        let Some(renamed) = target.inputargs.get(slot) else {
+                            continue;
+                        };
+                        if arg.as_variable() == Some(&var) {
+                            add(&mut vars, &mut worklist, renamed);
+                        }
+                        if renamed == &var
+                            && let Some(src) = arg.as_variable()
+                        {
+                            add(&mut vars, &mut worklist, src);
+                        }
+                    }
+                }
+                for op in &block.operations {
+                    let Some(operand) = identity_operand(&op.kind) else {
+                        continue;
+                    };
+                    let Some(result) = &op.result else {
+                        continue;
+                    };
+                    if operand == &var {
+                        add(&mut vars, &mut worklist, result);
+                    }
+                    if result == &var {
+                        add(&mut vars, &mut worklist, operand);
+                    }
+                }
+            }
+        }
+        let root_def = graph.blocks.iter().enumerate().find_map(|(bi, block)| {
+            block
+                .operations
+                .iter()
+                .position(|op| op.result.as_ref() == Some(root))
+                .map(|oi| (bi, oi))
+        });
+        let mut foreign_creation = graph
+            .blocks
+            .get(graph.startblock.0)
+            .is_some_and(|block| block.inputargs.iter().any(|arg| vars.contains(arg)));
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for (oi, op) in block.operations.iter().enumerate() {
+                let Some(result) = &op.result else {
+                    continue;
+                };
+                if !vars.contains(result) || identity_operand(&op.kind).is_some() {
+                    continue;
+                }
+                if root_def != Some((bi, oi)) {
+                    foreign_creation = true;
+                }
+            }
+            for link in &block.exits {
+                if link
+                    .last_exception
+                    .as_ref()
+                    .and_then(LinkArg::as_variable)
+                    .is_some_and(|v| vars.contains(v))
+                    || link
+                        .last_exc_value
+                        .as_ref()
+                        .and_then(LinkArg::as_variable)
+                        .is_some_and(|v| vars.contains(v))
+                {
+                    foreign_creation = true;
+                }
+                if link.target == graph.returnblock || link.target == graph.exceptblock {
+                    continue;
+                }
+                let Some(target) = graph.blocks.get(link.target.0) else {
+                    continue;
+                };
+                for (slot, arg) in link.args.iter().enumerate() {
+                    let Some(input) = target.inputargs.get(slot) else {
+                        continue;
+                    };
+                    if vars.contains(input) && matches!(arg, LinkArg::Const(_)) {
+                        foreign_creation = true;
+                    }
+                }
+            }
+        }
+        Lifetime {
+            vars,
+            foreign_creation,
+        }
+    }
     /// Whether the graph writes `base.field_name` at all, however many times.
     /// [`unique_store`] collapses "never written" and "written inconsistently"
     /// into one `None`; the malloc fork needs them apart, because a struct that
     /// never writes a type word is upstream's plain `new`, while one that
     /// writes several is a cluster this pass cannot read an answer out of.
+    /// `FieldWrite.base` matches the `IDENTITY_OPS` lifetime of `base`
+    /// (`compute_lifetimes`).
     fn any_store(graph: &FunctionGraph, base: &Variable, field_name: &str) -> bool {
+        let queried = skip_identity(graph, base);
+        let lifetime = lifetime(graph, &queried);
         graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
             matches!(&op.kind, OpKind::FieldWrite { base: b, field, .. }
-                if b == base && field.name.as_str() == field_name)
+                if lifetime.vars.contains(b) && field.name.as_str() == field_name)
         })
     }
     fn is_synthetic_ctor_result(graph: &FunctionGraph, var: &Variable) -> bool {
-        graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-            op.result.as_ref() == Some(var)
-                && matches!(
-                    op.kind,
-                    OpKind::Call {
-                        target: CallTarget::SyntheticTransparentCtor { .. },
-                        ..
-                    }
-                )
-        })
+        let mut cur = var.clone();
+        let mut visited = vec![cur.clone()];
+        loop {
+            let Some(op) = graph
+                .blocks
+                .iter()
+                .flat_map(|b| &b.operations)
+                .find(|o| o.result.as_ref() == Some(&cur))
+            else {
+                return false;
+            };
+            if matches!(
+                op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            ) {
+                return true;
+            }
+            let Some(operand) = identity_operand(&op.kind) else {
+                return false;
+            };
+            if visited.contains(operand) {
+                return false;
+            }
+            visited.push(operand.clone());
+            cur = operand.clone();
+        }
     }
     /// The reaching store of `base.field_name` at `site`, or `None` if
     /// absent, uninitialized on some path, or conflicting across paths.
     /// Sequential overwrites keep the latest value (`BaseMallocRemover.flowin`
-    /// assigns `newvarsmap[key] = op.args[2]`). Two disagreeing stores that
-    /// both reach `site` decline. `compute_lifetimes` disables malloc removal
-    /// for a pointer with several creation points ("aliasing problems"); it is
-    /// not a unique-value check on repeated stores of one field.
+    /// assigns `newvarsmap[key] = op.args[2]`), including `FieldWrite`s whose
+    /// `base` is in the `IDENTITY_OPS` lifetime of `base`. Two disagreeing
+    /// stores that both reach `site` decline. `compute_lifetimes` disables
+    /// malloc removal for a pointer with several creation points ("aliasing
+    /// problems"); it is not a unique-value check on repeated stores of one
+    /// field.
     struct UniqueStore<'g> {
         field: &'g FieldDescriptor,
         value: &'g LinkArg,
@@ -4995,12 +5257,6 @@ pub(crate) fn fuse_boxing_alloc_with(
         barriers: &[(usize, usize)],
     ) -> bool {
         reaches_from(graph, start.0, start.1.saturating_add(1), goal, barriers)
-    }
-    /// True when some unkilled path from the first op of `from_block` hits
-    /// `goal`. `reaches_avoiding_barriers` starts *after* its `start` op, so
-    /// a successor's first op would be skipped if we reused it.
-    fn block_reaches(graph: &FunctionGraph, from_block: usize, goal: (usize, usize)) -> bool {
-        reaches_from(graph, from_block, 0, goal, &[])
     }
     fn reaches_from(
         graph: &FunctionGraph,
@@ -5060,13 +5316,15 @@ pub(crate) fn fuse_boxing_alloc_with(
             ty: &'g ValueType,
             location: (usize, usize),
         }
+        let queried = skip_identity(graph, base);
         let definition = graph.blocks.iter().enumerate().find_map(|(bi, block)| {
             block
                 .operations
                 .iter()
-                .position(|op| op.result.as_ref() == Some(base))
+                .position(|op| op.result.as_ref() == Some(&queried))
                 .map(|oi| (bi, oi))
         })?;
+        let lifetime = lifetime(graph, &queried);
         let mut stores = Vec::new();
         for (block_idx, block) in graph.blocks.iter().enumerate() {
             for (op_idx, op) in block.operations.iter().enumerate() {
@@ -5079,10 +5337,17 @@ pub(crate) fn fuse_boxing_alloc_with(
                 else {
                     continue;
                 };
-                if b != base || field.name.as_str() != field_name {
+                if !lifetime.vars.contains(b) || field.name.as_str() != field_name {
                     continue;
                 }
                 if block_idx == definition.0 && op_idx <= definition.1 {
+                    continue;
+                }
+                // A store on a sibling creation (another incoming of a phi)
+                // is in the `compute_lifetimes` union but is not a write of
+                // this producer; `store_roots` lists those producers and
+                // requires them to agree.
+                if !reaches_avoiding_barriers(graph, definition, (block_idx, op_idx), &[]) {
                     continue;
                 }
                 stores.push(FieldStore {
@@ -5167,127 +5432,88 @@ pub(crate) fn fuse_boxing_alloc_with(
             StoreAtEach::Missing
         }
     }
-    /// True when `nested` is used between a by-value copy into the outer
-    /// field and the allocation in a way that would make a later
-    /// `FieldRead` of a missing leaf observe a mutation.
-    /// `BaseMallocRemover._try_inline_malloc` checks every use of the
-    /// variable and returns False (leaves the malloc) for any use it
-    /// does not support. A `FieldRead` of the current name is allowed;
-    /// the reaching outer copies themselves are allowed. Any other
-    /// operand mention of `nested`, or of a `Link` inputarg alias of
-    /// it, on a path from a copy to the allocation, declines. A `Link`
-    /// that only carries the value onto a successor (`Block.inputargs`
-    /// rename) is the SSA name of that value, not a use.
-    fn nested_escapes_after_copy(
+    /// True when some lifetime `FieldWrite` of `base.field_name` reaches `site`.
+    /// A store after the copy does not reach it; the `read_leaf` FieldRead at
+    /// the copy observes the copied value.
+    fn any_store_reaches(
         graph: &FunctionGraph,
-        nested: &Variable,
-        copy_locations: &[(usize, usize)],
+        base: &Variable,
+        field_name: &str,
         site: (usize, usize),
     ) -> bool {
-        copy_locations
-            .iter()
-            .any(|&loc| name_escapes_between(graph, nested, loc, site, copy_locations))
-    }
-    fn name_escapes_between(
-        graph: &FunctionGraph,
-        nested: &Variable,
-        start: (usize, usize),
-        site: (usize, usize),
-        copy_locations: &[(usize, usize)],
-    ) -> bool {
-        let n = graph.blocks.len();
-        let mut seen: Vec<(usize, Variable)> = Vec::new();
-        let mut pending = vec![(start.0, start.1.saturating_add(1), nested.clone())];
-        while let Some((block, first, current)) = pending.pop() {
-            if block >= n {
-                continue;
-            }
-            if first == 0 {
-                if seen.iter().any(|(b, v)| *b == block && v == &current) {
+        let queried = skip_identity(graph, base);
+        let lifetime = lifetime(graph, &queried);
+        let definition = graph.blocks.iter().enumerate().find_map(|(bi, block)| {
+            block
+                .operations
+                .iter()
+                .position(|op| op.result.as_ref() == Some(&queried))
+                .map(|oi| (bi, oi))
+        });
+        for (block_idx, block) in graph.blocks.iter().enumerate() {
+            for (op_idx, op) in block.operations.iter().enumerate() {
+                let OpKind::FieldWrite { base: b, field, .. } = &op.kind else {
+                    continue;
+                };
+                if !lifetime.vars.contains(b) || field.name.as_str() != field_name {
                     continue;
                 }
-                seen.push((block, current.clone()));
-            }
-            let ops_len = graph.blocks[block].operations.len();
-            let mut hit_site = false;
-            for oi in first..ops_len {
-                if (block, oi) == site {
-                    hit_site = true;
-                    break;
-                }
-                if copy_locations.iter().any(|&loc| loc == (block, oi)) {
+                if definition.is_some_and(|def| block_idx == def.0 && op_idx <= def.1) {
                     continue;
                 }
-                let op = &graph.blocks[block].operations[oi];
-                if matches!(&op.kind, OpKind::FieldRead { base, .. } if base == &current) {
+                if definition.is_some_and(|def| {
+                    !reaches_avoiding_barriers(graph, def, (block_idx, op_idx), &[])
+                }) {
                     continue;
                 }
-                if crate::inline::op_variable_refs(&op.kind)
-                    .iter()
-                    .any(|var| var == &current)
-                {
+                if reaches_avoiding_barriers(graph, (block_idx, op_idx), site, &[]) {
                     return true;
-                }
-            }
-            if hit_site || (block, ops_len) == site {
-                continue;
-            }
-            for link in &graph.blocks[block].exits {
-                let target = link.target.0;
-                if target >= n || !block_reaches(graph, target, site) {
-                    continue;
-                }
-                for (slot, arg) in link.args.iter().enumerate() {
-                    if arg.as_variable() != Some(&current) {
-                        continue;
-                    }
-                    let alias = graph.blocks[target]
-                        .inputargs
-                        .get(slot)
-                        .cloned()
-                        .unwrap_or_else(|| current.clone());
-                    pending.push((target, 0, alias));
                 }
             }
         }
         false
     }
-    /// The lifetime of `root`: `root` plus every `Block.inputargs` it is renamed to through a
-    /// link arg, transitively (`BaseMallocRemover.compute_lifetimes`). True when some op
-    /// uses a lifetime variable other than as the `base` of a `FieldWrite` / `FieldRead`, and
-    /// `allowed(location, op)` does not accept it; also true when a lifetime variable is an
-    /// `exitswitch` or reaches `graph.returnblock` / `graph.exceptblock` inputargs
-    /// (`_try_inline_malloc` returns False for any unsupported use).
+    /// The lifetime of `root` (`compute_lifetimes`). True when the set has a
+    /// foreign creation point (`_try_inline_malloc` `cp[0] != "op"`), when
+    /// some op uses a lifetime variable other than as the `base` of a
+    /// `FieldWrite` / `FieldRead` / `ptr_iszero` / `ptr_nonzero` (`FIELD_ACCESS`)
+    /// or as an `IDENTITY_OPS` operand, and `allowed(location, op)` does not
+    /// accept it; also true when a lifetime variable is an `exitswitch` or
+    /// reaches `graph.returnblock` / `graph.exceptblock` inputargs.
     fn lifetime_has_unsupported_use(
         graph: &FunctionGraph,
         root: &Variable,
         allowed: &dyn Fn((usize, usize), &OpKind) -> bool,
     ) -> bool {
-        let mut lifetime = vec![root.clone()];
-        let mut worklist = vec![root.clone()];
-        while let Some(var) = worklist.pop() {
-            for block in &graph.blocks {
-                for link in &block.exits {
-                    for (slot, arg) in link.args.iter().enumerate() {
-                        if arg.as_variable() != Some(&var) {
-                            continue;
-                        }
-                        // Link args are renames, except a link into
-                        // `returnblock` / `exceptblock`, which is an escape.
-                        if link.target == graph.returnblock || link.target == graph.exceptblock {
-                            return true;
-                        }
-                        let Some(renamed) = graph
-                            .blocks
-                            .get(link.target.0)
-                            .and_then(|target| target.inputargs.get(slot))
-                        else {
-                            return true;
-                        };
-                        if !lifetime.contains(renamed) {
-                            lifetime.push(renamed.clone());
-                            worklist.push(renamed.clone());
-                        }
+        let info = lifetime(graph, root);
+        info.foreign_creation || lifetime_uses_unsupported(graph, &info.vars, allowed)
+    }
+    /// Uses of `vars` that `_try_inline_malloc` would refuse, excluding
+    /// creation points. Header roots with several producers are listed by
+    /// `store_roots` and must agree; that is not an unsupported use.
+    fn lifetime_uses_unsupported(
+        graph: &FunctionGraph,
+        lifetime: &[Variable],
+        allowed: &dyn Fn((usize, usize), &OpKind) -> bool,
+    ) -> bool {
+        for block in &graph.blocks {
+            for link in &block.exits {
+                for (slot, arg) in link.args.iter().enumerate() {
+                    if arg.as_variable().is_none_or(|var| !lifetime.contains(var)) {
+                        continue;
+                    }
+                    // Link args are renames, except a link into
+                    // `returnblock` / `exceptblock`, which is an escape.
+                    if link.target == graph.returnblock || link.target == graph.exceptblock {
+                        return true;
+                    }
+                    if graph
+                        .blocks
+                        .get(link.target.0)
+                        .and_then(|target| target.inputargs.get(slot))
+                        .is_none()
+                    {
+                        return true;
                     }
                 }
             }
@@ -5317,11 +5543,25 @@ pub(crate) fn fuse_boxing_alloc_with(
                     if !lifetime.contains(&mentioned) {
                         continue;
                     }
+                    // `same_as` and `cast_pointer` are not recorded in usepoints
+                    // (`_try_inline_malloc`).
+                    if identity_operand(&op.kind).is_some() {
+                        continue;
+                    }
                     let field_ok = match &op.kind {
                         OpKind::FieldWrite { base, value, .. } => {
                             base == &mentioned && value.as_variable() != Some(&mentioned)
                         }
                         OpKind::FieldRead { base, .. } => base == &mentioned,
+                        // `FIELD_ACCESS` includes `ptr_iszero` / `ptr_nonzero`;
+                        // `_try_inline_malloc` accepts those uses. The
+                        // aggregate stays live, so the op is left unchanged.
+                        OpKind::UnaryOp { op, operand, .. }
+                            if (op == "ptr_iszero" || op == "ptr_nonzero")
+                                && operand == &mentioned =>
+                        {
+                            true
+                        }
                         _ => false,
                     };
                     if field_ok || allowed((block_idx, op_idx), &op.kind) {
@@ -5333,10 +5573,27 @@ pub(crate) fn fuse_boxing_alloc_with(
         }
         false
     }
-    /// Resolve `var` to producer variables through `Block.inputargs` phis.
-    /// Stores name producers rather than phis, and every incoming root must
-    /// later agree. `depth` terminates loop-carried phis. Upstream records the
-    /// same relation by unioning link args with inputargs in
+    /// Decline reason for a lifetime that `_try_inline_malloc` would refuse:
+    /// several creation points, or an unsupported use.
+    fn lifetime_decline_reason(
+        graph: &FunctionGraph,
+        root: &Variable,
+        allowed: &dyn Fn((usize, usize), &OpKind) -> bool,
+        unsupported: &'static str,
+    ) -> Option<&'static str> {
+        if lifetime(graph, root).foreign_creation {
+            Some("lifetime-has-several-creation-points")
+        } else if lifetime_has_unsupported_use(graph, root, allowed) {
+            Some(unsupported)
+        } else {
+            None
+        }
+    }
+    /// Resolve `var` to producer variables through `Block.inputargs` phis
+    /// and `IDENTITY_OPS` (`compute_lifetimes` unions both). Stores name
+    /// producers rather than phis, and every incoming root must later agree.
+    /// `depth` terminates loop-carried phis. Upstream records the same
+    /// relation by unioning link args with inputargs in
     /// `rpython/translator/backendopt/malloc.py:169`; this local pass recovers
     /// those endpoints on demand.
     fn store_roots(
@@ -5348,12 +5605,15 @@ pub(crate) fn fuse_boxing_alloc_with(
         if depth == 0 {
             return false;
         }
-        if graph
+        if let Some(op) = graph
             .blocks
             .iter()
             .flat_map(|b| &b.operations)
-            .any(|o| o.result.as_ref() == Some(var))
+            .find(|o| o.result.as_ref() == Some(var))
         {
+            if let Some(operand) = identity_operand(&op.kind) {
+                return store_roots(graph, operand, depth.saturating_sub(1), out);
+            }
             out.push(var.clone());
             return true;
         }
@@ -5382,35 +5642,6 @@ pub(crate) fn fuse_boxing_alloc_with(
         }
         !out.is_empty()
     }
-    fn is_cast_instance_of(
-        graph: &FunctionGraph,
-        var: &Variable,
-        of: &Variable,
-        depth: u32,
-    ) -> bool {
-        if depth == 0 {
-            return false;
-        }
-        graph
-            .blocks
-            .iter()
-            .flat_map(|block| &block.operations)
-            .any(|op| {
-                op.result.as_ref() == Some(var)
-                    && matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            args,
-                            ..
-                        } if segments.first().map(String::as_str)
-                            == Some(crate::runtime_names::shims::CAST_INSTANCE)
-                            && args.first().and_then(LinkArg::as_variable).is_some_and(|inner| {
-                                inner == of || is_cast_instance_of(graph, inner, of, depth - 1)
-                            })
-                    )
-            })
-    }
     fn refers_to_alloc(
         graph: &FunctionGraph,
         var: &Variable,
@@ -5423,9 +5654,7 @@ pub(crate) fn fuse_boxing_alloc_with(
         let mut roots = Vec::new();
         store_roots(graph, var, depth, &mut roots)
             && !roots.is_empty()
-            && roots
-                .iter()
-                .all(|root| root == alloc || is_cast_instance_of(graph, root, alloc, depth))
+            && roots.iter().all(|root| root == alloc)
     }
     /// The unique `core::ptr::write` that stores a value into `alloc`, and
     /// that value.  Several writes, or a write of a non-variable, decline.
@@ -5723,12 +5952,20 @@ pub(crate) fn fuse_boxing_alloc_with(
         value: LinkArg,
         ty: ValueType,
         /// When set, the rewrite emits `FieldRead` of this inner leaf from
-        /// the nested aggregate first, then `FieldWrite` of `field` (the
-        /// dotted GC-owner name). `value` is unused. A by-value store of a
-        /// finished nested value (`IntArray::empty`) has no `FieldWrite`s
-        /// on that value in this graph; `lower_inlined_struct_field_writes`
-        /// copies those leaves the same way (`heaptracker.all_fielddescrs`).
+        /// the nested aggregate at the by-value copy (`read_at`;
+        /// `BaseMallocRemover.flowin_op` order), then `FieldWrite` of
+        /// `field` (the container spelling from `nest_inline_leaf`) after
+        /// the fused allocation. `value` is unused.
+        /// A by-value store of a finished nested value (`IntArray::empty`)
+        /// has no `FieldWrite`s on that value in this graph;
+        /// `lower_inlined_struct_field_writes` copies those leaves the same
+        /// way (`heaptracker.all_fielddescrs`).
         read_leaf: Option<(Variable, FieldDescriptor)>,
+        /// `(block, op)` of the by-value copy whose value `read_leaf` copies.
+        /// The rewrite inserts the FieldRead in this block, immediately
+        /// before the copy — never at this op index in the allocation
+        /// block. Set only when `read_leaf` is.
+        read_at: Option<(usize, usize)>,
     }
     /// What the fusion keeps of the cluster's `ob_header`.
     ///
@@ -5808,8 +6045,12 @@ pub(crate) fn fuse_boxing_alloc_with(
             return None;
         }
         for root in &roots {
-            if lifetime_has_unsupported_use(graph, root, &|loc, _| header_locations.contains(&loc))
-            {
+            // Several header producers are `store_roots`'s job: they must
+            // agree on the type word. `_try_inline_malloc` would refuse the
+            // header itself; this pass reads its fields at the copy.
+            if lifetime_uses_unsupported(graph, &lifetime(graph, root).vars, &|loc, _| {
+                header_locations.contains(&loc)
+            }) {
                 crate::decline::record(
                     VTABLE_GATE,
                     "header-lifetime-has-unsupported-use",
@@ -6029,6 +6270,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                 value,
                 ty,
                 read_leaf: None,
+                read_at: None,
             }),
         })
     };
@@ -6051,6 +6293,58 @@ pub(crate) fn fuse_boxing_alloc_with(
         /// initialized an uninit box, and the `new_uninit` call when New is
         /// emitted at `assume_init`.
         dead_ops: Vec<(usize, usize)>,
+    }
+    fn bump_payload_read_at(payload: &mut Payload, block: usize, at: usize, ge: bool, by: usize) {
+        let Some((b, i)) = &mut payload.read_at else {
+            return;
+        };
+        if *b != block {
+            return;
+        }
+        let take = if ge { *i >= at } else { *i > at };
+        if take {
+            *i += by;
+        }
+    }
+    fn bump_site(site: &mut Site, block: usize, at: usize, ge: bool, by: usize) {
+        let take = |i: usize| if ge { i >= at } else { i > at };
+        if site.block == block && take(site.op) {
+            site.op += by;
+        }
+        for (b, i) in &mut site.dead_ops {
+            if *b == block && take(*i) {
+                *i += by;
+            }
+        }
+        if let Some(payload) = &mut site.w_class {
+            bump_payload_read_at(payload, block, at, ge, by);
+        }
+        for payload in &mut site.payloads {
+            bump_payload_read_at(payload, block, at, ge, by);
+        }
+    }
+    fn drop_site(site: &mut Site, block: usize, at: usize) {
+        if site.block == block && site.op > at {
+            site.op -= 1;
+        }
+        for (b, i) in &mut site.dead_ops {
+            if *b == block && *i > at {
+                *i -= 1;
+            }
+        }
+        let drop_payload = |payload: &mut Payload| {
+            if let Some((b, i)) = &mut payload.read_at {
+                if *b == block && *i > at {
+                    *i -= 1;
+                }
+            }
+        };
+        if let Some(payload) = &mut site.w_class {
+            drop_payload(payload);
+        }
+        for payload in &mut site.payloads {
+            drop_payload(payload);
+        }
     }
 
     let mut sites: Vec<Site> = Vec::new();
@@ -6216,18 +6510,25 @@ pub(crate) fn fuse_boxing_alloc_with(
                     }
                 }
             }
-            if chain
-                .iter()
-                .enumerate()
-                .any(|(depth, (level, _, locations))| {
-                    lifetime_has_unsupported_use(graph, level, &|loc, _| {
-                        cluster_rewrites.contains(&loc) || (depth > 0 && locations.contains(&loc))
+            if let Some(reason) =
+                chain
+                    .iter()
+                    .enumerate()
+                    .find_map(|(depth, (level, _, locations))| {
+                        lifetime_decline_reason(
+                            graph,
+                            level,
+                            &|loc, _| {
+                                cluster_rewrites.contains(&loc)
+                                    || (depth > 0 && locations.contains(&loc))
+                            },
+                            "aggregate-lifetime-has-unsupported-use",
+                        )
                     })
-                })
             {
                 crate::decline::record(
                     FUSE_GATE,
-                    "aggregate-lifetime-has-unsupported-use",
+                    reason,
                     format_args!("{owner} in {}", graph.name),
                 );
                 continue;
@@ -6273,45 +6574,15 @@ pub(crate) fn fuse_boxing_alloc_with(
                     // Inner leaves are read at the outer by-value store, not
                     // at the allocation: a later store to `nested.ptr` does
                     // not change the copied value. `BaseMallocRemover.flowin_op`
-                    // processes field assignments in order and keeps the value
-                    // that belongs to each assignment.
-                    let site = (rewrite_bi, rewrite_oi);
-                    if let Some((nested_owner, nested_owner_id, leaves)) =
-                        expand_inline_struct(level_owner, field_name)
-                    {
-                        // A deeper inlined struct is left residual because
-                        // `collect_by_value_struct_leaves` returns those leaves
-                        // with the sub-STRUCT's own declaring owner and a bare
-                        // name, without the intermediate path, so
-                        // `outer.payload.inner.x` would be spelled `payload.x`.
-                        // `heaptracker.all_fielddescrs` recurses keeping each
-                        // sub-STRUCT's own descrs;
-                        // `BaseMallocRemover._try_inline_malloc` returns False
-                        // for a shape it does not support.
-                        let dotted_prefix = format!("{field_name}.");
-                        let mut seen_write_names: Vec<String> = Vec::new();
-                        for (leaf, _) in &leaves {
-                            let owner_ok = leaf.owner_root.as_deref()
-                                == Some(nested_owner.as_str())
-                                && match (leaf.owner_id, nested_owner_id) {
-                                    (Some(leaf_id), Some(nested_id)) => leaf_id == nested_id,
-                                    _ => true,
-                                };
-                            if !owner_ok {
-                                complete = false;
-                                break 'levels;
-                            }
-                            let write_name = if leaf.name.starts_with(&dotted_prefix) {
-                                leaf.name.clone()
-                            } else {
-                                format!("{dotted_prefix}{}", leaf.name)
-                            };
-                            if seen_write_names.iter().any(|n| n == &write_name) {
-                                complete = false;
-                                break 'levels;
-                            }
-                            seen_write_names.push(write_name);
-                        }
+                    // snapshots `setfield` at the assignment, in whatever
+                    // block it sits, and the value then flows along links.
+                    if let Some(expansion) = expand_inline_struct(level_owner, field_name) {
+                        // Leaves are relative to the immediate inlined owner
+                        // (`collect_by_value_struct_leaves`). An offset-0 hop
+                        // keeps the inner descr (`Transformer.zero_contents`);
+                        // a nonzero hop writes `{field}.{leaf}` on the
+                        // container (`nest_inline_leaf`; `nested_struct_leaf`
+                        // sums enclosing offsets).
                         let store = match unique_store_at_each(
                             graph,
                             level,
@@ -6328,48 +6599,58 @@ pub(crate) fn fuse_boxing_alloc_with(
                             complete = false;
                             break 'levels;
                         };
+                        let mut seen_write_keys: Vec<(Option<String>, String)> = Vec::new();
+                        for leaf in &expansion.leaves {
+                            let write_field = container_leaf_descriptor(
+                                &store.field,
+                                expansion.at_offset_zero,
+                                leaf,
+                            );
+                            let key = (write_field.owner_root.clone(), write_field.name.clone());
+                            if seen_write_keys.iter().any(|seen| seen == &key) {
+                                complete = false;
+                                break 'levels;
+                            }
+                            seen_write_keys.push(key);
+                        }
                         let nested_is_ctor = is_synthetic_ctor_result(graph, nested);
                         let mut missing_leaves = Vec::new();
                         let mut explicit_leaf = false;
-                        for (leaf, leaf_ty) in leaves {
-                            let inner_name = leaf
-                                .name
-                                .strip_prefix(field_name.as_str())
-                                .and_then(|rest| rest.strip_prefix('.'))
-                                .unwrap_or(leaf.name.as_str())
-                                .to_string();
-                            let write_field = if leaf.name.starts_with(&dotted_prefix) {
-                                leaf.clone()
-                            } else {
-                                FieldDescriptor::new(
-                                    format!("{dotted_prefix}{}", leaf.name),
-                                    Some(level_owner.clone()),
-                                )
-                                .with_owner_id(majit_ir::descr::struct_id_for_name(level_owner))
-                            };
-                            match unique_store_at_each(graph, nested, &inner_name, &store.locations)
-                            {
+                        for leaf in expansion.leaves {
+                            let inner_name = leaf.field.name.clone();
+                            let write_field = container_leaf_descriptor(
+                                &store.field,
+                                expansion.at_offset_zero,
+                                &leaf,
+                            );
+                            match unique_store_at_each(
+                                graph,
+                                nested,
+                                inner_name.as_str(),
+                                &store.locations,
+                            ) {
                                 StoreAtEach::Agreed(inner) => {
                                     explicit_leaf = true;
                                     payloads.push(Payload {
                                         field: write_field,
                                         value: inner.value.clone(),
-                                        ty: leaf_ty,
+                                        ty: leaf.ty,
                                         read_leaf: None,
+                                        read_at: None,
                                     });
                                 }
                                 StoreAtEach::Missing => {
-                                    if !any_store(graph, nested, &inner_name) {
-                                        missing_leaves.push((
-                                            write_field,
-                                            leaf,
-                                            leaf_ty,
-                                            inner_name,
-                                        ));
-                                    } else {
+                                    // A lifetime store that does not reach the copy is a
+                                    // later mutation of the copied object; `flowin_op`
+                                    // snapshots at the copy. Decline only when a store
+                                    // reaches a copy and still is not unique.
+                                    if store.locations.iter().any(|&loc| {
+                                        any_store_reaches(graph, nested, inner_name.as_str(), loc)
+                                    }) {
                                         complete = false;
                                         break 'levels;
                                     }
+                                    missing_leaves.push((write_field, leaf.field, leaf.ty));
                                 }
                                 StoreAtEach::Conflict => {
                                     complete = false;
@@ -6381,45 +6662,59 @@ pub(crate) fn fuse_boxing_alloc_with(
                         // reuses statically. Apply it only when at least one
                         // leaf takes its value from an explicit store
                         // (`unique_store` / `unique_store_at_each`). When
-                        // every leaf is a `read_leaf` FieldRead at the copy,
-                        // skip: a getfield sees the value at that point
-                        // (`BaseMallocRemover.flowin_op`); uses after the
-                        // copy stay covered by `nested_escapes_after_copy`.
+                        // every leaf is a `read_leaf` FieldRead at the copy
+                        // (`BaseMallocRemover.flowin_op`), skip: the read
+                        // observes the copied value, so uses after the copy
+                        // do not change it.
                         if explicit_leaf
-                            && lifetime_has_unsupported_use(graph, nested, &|loc, _| {
-                                store.locations.contains(&loc)
-                            })
+                            && let Some(reason) = lifetime_decline_reason(
+                                graph,
+                                nested,
+                                &|loc, _| store.locations.contains(&loc),
+                                "nested-lifetime-has-unsupported-use",
+                            )
                         {
                             crate::decline::record(
                                 FUSE_GATE,
-                                "nested-lifetime-has-unsupported-use",
+                                reason,
                                 format_args!("{owner} in {}", graph.name),
                             );
                             complete = false;
                             break 'levels;
                         }
                         if !nested_is_ctor {
-                            // BaseMallocRemover._try_inline_malloc checks every
-                            // use of the variable and returns False (leaves the
-                            // malloc) for any use it does not support.
-                            if !missing_leaves.is_empty()
-                                && nested_escapes_after_copy(graph, nested, &store.locations, site)
-                            {
-                                complete = false;
-                                break 'levels;
+                            // A FieldRead at the copy observes the copied
+                            // value (`BaseMallocRemover.flowin_op`). The copy
+                            // must be the unique reaching store
+                            // (`unique_store_at_each`) and dominate the
+                            // allocation; it need not share the allocation's
+                            // block (`_try_inline_malloc`).
+                            if !missing_leaves.is_empty() {
+                                let copy_reaches = store.locations.len() == 1
+                                    && reaches_avoiding_barriers(
+                                        graph,
+                                        store.locations[0],
+                                        (rewrite_bi, rewrite_oi),
+                                        &[],
+                                    );
+                                if !copy_reaches {
+                                    crate::decline::record(
+                                        FUSE_GATE,
+                                        "nested-copy-does-not-reach-allocation",
+                                        format_args!("{owner} in {}", graph.name),
+                                    );
+                                    complete = false;
+                                    break 'levels;
+                                }
                             }
-                            for (write_field, leaf, leaf_ty, inner_name) in missing_leaves {
-                                let read_leaf = if leaf.name == inner_name {
-                                    leaf
-                                } else {
-                                    FieldDescriptor::new(inner_name, leaf.owner_root.clone())
-                                        .with_owner_id(leaf.owner_id)
-                                };
+                            let read_at = store.locations.first().copied();
+                            for (write_field, leaf, leaf_ty) in missing_leaves {
                                 payloads.push(Payload {
                                     field: write_field,
                                     value: LinkArg::Value(nested.clone()),
                                     ty: leaf_ty,
-                                    read_leaf: Some((nested.clone(), read_leaf)),
+                                    read_leaf: Some((nested.clone(), leaf)),
+                                    read_at,
                                 });
                             }
                         }
@@ -6442,6 +6737,7 @@ pub(crate) fn fuse_boxing_alloc_with(
                             value,
                             ty: payload_ty.clone(),
                             read_leaf: None,
+                            read_at: None,
                         }),
                         None => {
                             complete = false;
@@ -6538,40 +6834,76 @@ pub(crate) fn fuse_boxing_alloc_with(
     // each mutation. Uninit-box rewrite locations are `assume_init`, which
     // can invert allocation order inside one block.
     sites.sort_by_key(|site| (site.block, site.op));
-    while let Some(site) = sites.pop() {
-        let mut extras = Vec::new();
-        for payload in site.w_class.into_iter().chain(site.payloads) {
-            if let Some((source, read_leaf)) = payload.read_leaf {
-                let read = graph.alloc_value_var();
-                extras.push(SpaceOperation {
+    while let Some(mut site) = sites.pop() {
+        let mut payloads: Vec<Payload> = site
+            .w_class
+            .take()
+            .into_iter()
+            .chain(std::mem::take(&mut site.payloads))
+            .collect();
+        let mut read_order: Vec<usize> = (0..payloads.len())
+            .filter(|&i| payloads[i].read_leaf.is_some())
+            .collect();
+        read_order.sort_by(|&a, &b| {
+            payloads[b]
+                .read_at
+                .cmp(&payloads[a].read_at)
+                .then(a.cmp(&b))
+        });
+        let mut read_results: Vec<Option<Variable>> = vec![None; payloads.len()];
+        for idx in read_order {
+            let (source, read_leaf) = payloads[idx]
+                .read_leaf
+                .clone()
+                .expect("read_order selects read_leaf payloads");
+            let (block, c) = payloads[idx].read_at.expect("read_leaf records the copy");
+            let ty = payloads[idx].ty.clone();
+            let read = graph.alloc_value_var();
+            // Place each `read_leaf` FieldRead immediately before the
+            // by-value copy, in that copy's block (`flowin_op`). The
+            // result reaches the allocation through
+            // `thread_undefined_op_operands` (`SSA_to_SSI`).
+            graph.blocks[block].operations.insert(
+                c,
+                SpaceOperation {
                     result: Some(read.clone()),
                     kind: OpKind::FieldRead {
                         base: source,
                         field: read_leaf,
-                        ty: payload.ty.clone(),
+                        ty,
                         pure: false,
                     },
-                });
-                extras.push(SpaceOperation {
-                    result: None,
-                    kind: OpKind::FieldWrite {
-                        base: site.result.clone(),
-                        field: payload.field,
-                        value: LinkArg::Value(read),
-                        ty: payload.ty,
-                    },
-                });
-            } else {
-                extras.push(SpaceOperation {
-                    result: None,
-                    kind: OpKind::FieldWrite {
-                        base: site.result.clone(),
-                        field: payload.field,
-                        value: payload.value,
-                        ty: payload.ty,
-                    },
-                });
+                },
+            );
+            read_results[idx] = Some(read);
+            bump_site(&mut site, block, c, true, 1);
+            for payload in &mut payloads {
+                bump_payload_read_at(payload, block, c, true, 1);
             }
+            for remaining in &mut sites {
+                bump_site(remaining, block, c, true, 1);
+            }
+        }
+        let mut extras = Vec::new();
+        for (idx, payload) in payloads.into_iter().enumerate() {
+            let value = if payload.read_leaf.is_some() {
+                LinkArg::Value(
+                    read_results[idx]
+                        .take()
+                        .expect("read_leaf FieldRead is inserted at the copy"),
+                )
+            } else {
+                payload.value
+            };
+            extras.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: site.result.clone(),
+                    field: payload.field,
+                    value,
+                    ty: payload.ty,
+                },
+            });
         }
         let inserted = extras.len();
         {
@@ -6595,42 +6927,32 @@ pub(crate) fn fuse_boxing_alloc_with(
             // `setfield_gc`, which is the shape
             // `Transformer.rewrite_op_malloc` leaves every field the allocation
             // itself does not carry. A finished nested value is copied leaf
-            // by leaf (`FieldRead` then `FieldWrite`) first.
+            // by leaf: each `FieldRead` is placed at the by-value copy in
+            // that copy's block (`flowin_op`); the matching `FieldWrite`
+            // of the fused object follows the allocation (`all_fielddescrs`).
             for (k, extra) in extras.into_iter().enumerate() {
                 block.operations.insert(site.op + 1 + k, extra);
             }
         }
+        let block = site.block;
+        let op = site.op;
         for remaining in &mut sites {
-            if remaining.block == site.block && remaining.op > site.op {
-                remaining.op += inserted;
-            }
-            for (sbi, soi) in &mut remaining.dead_ops {
-                if *sbi == site.block && *soi > site.op {
-                    *soi += inserted;
-                }
-            }
+            bump_site(remaining, block, op, false, inserted);
         }
         let mut dead = site.dead_ops;
         for (dbi, doi) in &mut dead {
-            if *dbi == site.block && *doi > site.op {
+            if *dbi == block && *doi > op {
                 *doi += inserted;
             }
         }
         dead.sort_unstable();
         for (dbi, doi) in dead.into_iter().rev() {
-            if dbi == site.block && doi == site.op {
+            if dbi == block && doi == op {
                 continue;
             }
             graph.blocks[dbi].operations.remove(doi);
             for remaining in &mut sites {
-                if remaining.block == dbi && remaining.op > doi {
-                    remaining.op -= 1;
-                }
-                for (sbi, soi) in &mut remaining.dead_ops {
-                    if *sbi == dbi && *soi > doi {
-                        *soi -= 1;
-                    }
-                }
+                drop_site(remaining, dbi, doi);
             }
         }
     }
@@ -6678,12 +7000,41 @@ fn sink_fused_boxing_aggregates_at_raw_writes(
             if is_core_ptr_write_path(segments, args))
     };
 
+    let write_value_is_aggregate = |args: &[LinkArg], aggregate: &Variable| -> bool {
+        let Some(mut cur) = args.get(1).and_then(LinkArg::as_variable).cloned() else {
+            return false;
+        };
+        let mut visited = vec![cur.clone()];
+        loop {
+            if &cur == aggregate {
+                return true;
+            }
+            let Some(op) = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|o| o.result.as_ref() == Some(&cur))
+            else {
+                return false;
+            };
+            let Some(operand) = identity_operand(&op.kind) else {
+                return false;
+            };
+            if visited.contains(operand) {
+                return false;
+            }
+            visited.push(operand.clone());
+            cur = operand.clone();
+        }
+    };
+
     let mut sinks = Vec::new();
     for aggregate in aggregates {
         for (bi, block) in graph.blocks.iter().enumerate() {
             for (oi, op) in block.operations.iter().enumerate() {
                 if is_raw_write(&op.kind)
-                    && matches!(&op.kind, OpKind::Call { args, .. } if &args[1] == aggregate)
+                    && matches!(&op.kind, OpKind::Call { args, .. }
+                        if write_value_is_aggregate(args, aggregate))
                 {
                     sinks.push((bi, oi, aggregate.clone()));
                 }
@@ -7001,6 +7352,8 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
             return true;
         }
         match kind {
+            // A dead `same_as` (`IDENTITY_OPS`) is removable.
+            OpKind::UnaryOp { op, .. } if op == "same_as" => true,
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
@@ -7013,13 +7366,15 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
                 let is_cast = segments.first().map(String::as_str)
                     == Some(crate::runtime_names::shims::CAST_INSTANCE)
                     && args.len() == 2;
+                // A dead `__cast_pointer` (`IDENTITY_OPS`) is removable.
+                let is_cast_pointer = cast_pointer_root(kind).is_some() && args.len() == 2;
                 // The same single-argument runtime helper recognized by
                 // `get_instantiate_arg_addr`; its result feeds only the class word
                 // removed with the dead header. Identity is the CallPath
                 // `runtime_names` holds, so an unrelated function with the same
                 // leaf is never classified as removable.
                 let is_get_instantiate = is_get_instantiate_path(segments, args);
-                is_cast || is_get_instantiate
+                is_cast || is_cast_pointer || is_get_instantiate
             }
             _ => false,
         }
@@ -11026,6 +11381,23 @@ mod tests {
     }
     use super::*;
 
+    fn test_inline_expansion(
+        at_offset_zero: bool,
+        leaves: Vec<(FieldDescriptor, ValueType)>,
+    ) -> InlineStructExpansion {
+        InlineStructExpansion {
+            at_offset_zero,
+            leaves: leaves
+                .into_iter()
+                .map(|(field, ty)| InlineLeaf {
+                    field,
+                    super_path: String::new(),
+                    ty,
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn copygraph_preserves_structure_with_fresh_variable_identities() {
         use std::collections::HashSet;
@@ -12395,33 +12767,9 @@ mod tests {
 
     #[test]
     fn lower_struct_ptr_writes_copies_inlined_struct_leaves() {
-        let mut graph = FunctionGraph::new("test");
-        let entry = graph.startblock;
-        let source = graph.alloc_value_var();
-        graph.block_mut(entry).inputargs.push(source.clone());
-        let raw = graph
-            .push_op_var(entry, OpKind::ConstRefNull, true)
-            .unwrap();
-        let destination = graph
-            .push_op_var(entry, crate::model::cast_instance_call("Outer", raw), true)
-            .unwrap();
-        graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec!["core".into(), "ptr".into(), "write".into()],
-                        fun_decl_id: None,
-                        specialization: crate::parse::GraphSpecialization::Regular,
-                    },
-                    args: crate::model::call_args(vec![destination.clone(), source.clone()]),
-                    result_ty: ValueType::Void,
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(entry, None);
-
+        let inner_leaf = |name: &str| {
+            FieldDescriptor::new(name, Some("Inner".to_string())).with_base_is_deref(false)
+        };
         let attrs = std::collections::HashMap::from([(
             "Outer".to_string(),
             vec![
@@ -12429,59 +12777,107 @@ mod tests {
                 ("tail".to_string(), ValueType::Int),
             ],
         )]);
-        let inner_leaf = |name: &str| {
-            FieldDescriptor::new(name, Some("Inner".to_string())).with_base_is_deref(false)
-        };
-        let expand = |owner: &str, field: &str| {
-            (owner == "Outer" && field == "inner").then(|| {
-                (
-                    "Inner".to_string(),
-                    None,
-                    vec![
-                        (inner_leaf("head"), ValueType::Ref(None)),
-                        (inner_leaf("meta"), ValueType::Ref(None)),
-                    ],
+        for at_offset_zero in [false, true] {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let source = graph.alloc_value_var();
+            graph.block_mut(entry).inputargs.push(source.clone());
+            let raw = graph
+                .push_op_var(entry, OpKind::ConstRefNull, true)
+                .unwrap();
+            let destination = graph
+                .push_op_var(entry, crate::model::cast_instance_call("Outer", raw), true)
+                .unwrap();
+            graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec!["core".into(), "ptr".into(), "write".into()],
+                            fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
+                        },
+                        args: crate::model::call_args(vec![destination.clone(), source.clone()]),
+                        result_ty: ValueType::Void,
+                    },
+                    true,
                 )
-            })
-        };
-        assert_eq!(lower_struct_ptr_writes_with(&mut graph, &attrs, &expand), 1);
+                .unwrap();
+            graph.set_return(entry, None);
 
-        let lowered = &graph.block(entry).operations;
-        assert!(
-            !lowered.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { field, .. } if field.name == "inner"
-                )
-            }),
-            "the inlined field itself must not remain as a store"
-        );
-        let writes: Vec<_> = lowered
-            .iter()
-            .filter_map(|op| match &op.kind {
-                OpKind::FieldWrite { field, ty, .. } => Some((field.name.as_str(), ty.clone())),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            writes,
-            vec![
-                ("head", ValueType::Ref(None)),
-                ("meta", ValueType::Ref(None)),
-                ("tail", ValueType::Int),
-            ]
-        );
-        for op in lowered {
-            if let OpKind::FieldWrite { field, base, .. } = &op.kind {
-                assert_eq!(base, &destination);
-                if field.name == "head" || field.name == "meta" {
-                    assert_eq!(field.owner_root.as_deref(), Some("Inner"));
-                }
+            let expand = |owner: &str, field: &str| {
+                (owner == "Outer" && field == "inner").then(|| {
+                    test_inline_expansion(
+                        at_offset_zero,
+                        vec![
+                            (inner_leaf("head"), ValueType::Ref(None)),
+                            (inner_leaf("meta"), ValueType::Ref(None)),
+                        ],
+                    )
+                })
+            };
+            assert_eq!(lower_struct_ptr_writes_with(&mut graph, &attrs, &expand), 1);
+
+            let lowered = &graph.block(entry).operations;
+            assert!(
+                !lowered.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "inner"
+                    )
+                }),
+                "the inlined field itself must not remain as a store"
+            );
+            let writes: Vec<_> = lowered
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldWrite { field, ty, .. } => {
+                        Some((field.name.as_str(), field.owner_root.as_deref(), ty.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if at_offset_zero {
+                assert_eq!(
+                    writes,
+                    vec![
+                        ("head", Some("Inner"), ValueType::Ref(None)),
+                        ("meta", Some("Inner"), ValueType::Ref(None)),
+                        ("tail", Some("Outer"), ValueType::Int),
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    writes,
+                    vec![
+                        ("inner.head", Some("Outer"), ValueType::Ref(None)),
+                        ("inner.meta", Some("Outer"), ValueType::Ref(None)),
+                        ("tail", Some("Outer"), ValueType::Int),
+                    ]
+                );
             }
-            if let OpKind::FieldRead { field, base, .. } = &op.kind {
-                assert_eq!(base, &source);
-                if field.name == "head" || field.name == "meta" {
-                    assert_eq!(field.owner_root.as_deref(), Some("Inner"));
+            let reads: Vec<_> = lowered
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldRead { field, ty, .. } => {
+                        Some((field.name.as_str(), field.owner_root.as_deref(), ty.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                reads, writes,
+                "read uses the same container descriptor as the write"
+            );
+            for op in lowered {
+                if let OpKind::FieldWrite { base, .. } = &op.kind {
+                    assert_eq!(base, &destination);
+                }
+                if let OpKind::FieldRead { field, base, .. } = &op.kind {
+                    assert_eq!(base, &source);
+                    if !at_offset_zero && field.name == "inner.head" {
+                        assert_eq!(field.owner_root.as_deref(), Some("Outer"));
+                    }
                 }
             }
         }
@@ -12489,79 +12885,157 @@ mod tests {
 
     #[test]
     fn lower_inlined_struct_field_writes_copies_leaves() {
-        let mut graph = FunctionGraph::new("copy_header");
-        let entry = graph.startblock;
-        let dst = graph.alloc_value_var();
-        let src = graph.alloc_value_var();
-        graph.block_mut(entry).inputargs = vec![dst.clone(), src.clone()];
-        graph.push_op_var(
-            entry,
-            OpKind::FieldWrite {
-                base: dst.clone(),
-                field: FieldDescriptor::new("inner", Some("Outer".into())),
-                value: LinkArg::Value(src.clone()),
-                ty: ValueType::Ref(None),
-            },
-            false,
-        );
-        graph.set_return(entry, None);
-
         let inner_leaf = |name: &str| {
             FieldDescriptor::new(name, Some("Inner".to_string())).with_base_is_deref(false)
         };
-        let expand = |owner: &str, field: &str| {
-            (owner == "Outer" && field == "inner").then(|| {
-                (
-                    "Inner".to_string(),
-                    None,
-                    vec![
-                        (inner_leaf("head"), ValueType::Ref(None)),
-                        (inner_leaf("meta"), ValueType::Ref(None)),
-                    ],
-                )
-            })
-        };
-        assert_eq!(
-            lower_inlined_struct_field_writes(&mut graph, &expand).expect("expand"),
-            1
-        );
-
-        let lowered = &graph.block(entry).operations;
-        assert!(
-            !lowered.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::FieldWrite { field, .. } if field.name == "inner"
-                )
-            }),
-            "the inlined field itself must not remain as a store"
-        );
-        let writes: Vec<_> = lowered
-            .iter()
-            .filter_map(|op| match &op.kind {
+        for at_offset_zero in [false, true] {
+            let mut graph = FunctionGraph::new("copy_header");
+            let entry = graph.startblock;
+            let dst = graph.alloc_value_var();
+            let src = graph.alloc_value_var();
+            graph.block_mut(entry).inputargs = vec![dst.clone(), src.clone()];
+            graph.push_op_var(
+                entry,
                 OpKind::FieldWrite {
-                    field, ty, base, ..
-                } => {
-                    assert_eq!(base, &dst);
+                    base: dst.clone(),
+                    field: FieldDescriptor::new("inner", Some("Outer".into())),
+                    value: LinkArg::Value(src.clone()),
+                    ty: ValueType::Ref(None),
+                },
+                false,
+            );
+            graph.set_return(entry, None);
+
+            let expand = |owner: &str, field: &str| {
+                (owner == "Outer" && field == "inner").then(|| {
+                    test_inline_expansion(
+                        at_offset_zero,
+                        vec![
+                            (inner_leaf("head"), ValueType::Ref(None)),
+                            (inner_leaf("meta"), ValueType::Ref(None)),
+                        ],
+                    )
+                })
+            };
+            assert_eq!(
+                lower_inlined_struct_field_writes(&mut graph, &expand).expect("expand"),
+                1
+            );
+
+            let lowered = &graph.block(entry).operations;
+            assert!(
+                !lowered.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. } if field.name == "inner"
+                    )
+                }),
+                "the inlined field itself must not remain as a store"
+            );
+            let writes: Vec<_> = lowered
+                .iter()
+                .filter_map(|op| match &op.kind {
+                    OpKind::FieldWrite {
+                        field, ty, base, ..
+                    } => {
+                        assert_eq!(base, &dst);
+                        Some((field.name.as_str(), field.owner_root.as_deref(), ty.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if at_offset_zero {
+                assert_eq!(
+                    writes,
+                    vec![
+                        ("head", Some("Inner"), ValueType::Ref(None)),
+                        ("meta", Some("Inner"), ValueType::Ref(None)),
+                    ]
+                );
+            } else {
+                assert_eq!(
+                    writes,
+                    vec![
+                        ("inner.head", Some("Outer"), ValueType::Ref(None)),
+                        ("inner.meta", Some("Outer"), ValueType::Ref(None)),
+                    ]
+                );
+            }
+            for op in lowered {
+                if let OpKind::FieldRead { field, base, .. } = &op.kind {
+                    assert_eq!(base, &src);
                     assert_eq!(field.owner_root.as_deref(), Some("Inner"));
-                    Some((field.name.as_str(), ty.clone()))
                 }
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            writes,
-            vec![
-                ("head", ValueType::Ref(None)),
-                ("meta", ValueType::Ref(None)),
-            ]
-        );
-        for op in lowered {
-            if let OpKind::FieldRead { field, base, .. } = &op.kind {
-                assert_eq!(base, &src);
-                assert_eq!(field.owner_root.as_deref(), Some("Inner"));
             }
         }
+    }
+
+    #[test]
+    fn nest_inline_leaf_peels_leading_offset_zero_hops() {
+        let leaf = |name: &str, owner: &str| InlineLeaf {
+            field: FieldDescriptor::new(name, Some(owner.into()))
+                .with_base_is_deref(false)
+                .with_inline_vec(true),
+            super_path: String::new(),
+            ty: ValueType::Ref(None),
+        };
+        let container = |name: &str, owner: &str| {
+            FieldDescriptor::new(name, Some(owner.into()))
+                .with_owner_id(majit_ir::descr::struct_id_for_name(owner))
+                .with_owner_declared_gc(Some(true))
+                .with_base_is_deref(true)
+        };
+
+        // PyFrame ⊃ ob_header@0 ⊃ w_class → ("w_class", PyObject)
+        let w_class = leaf("w_class", "PyObject");
+        let nested = nest_inline_leaf(&container("ob_header", "PyFrame"), true, &w_class);
+        assert_eq!(nested.field.name, "w_class");
+        assert_eq!(nested.field.owner_root.as_deref(), Some("PyObject"));
+        assert_eq!(nested.super_path, "ob_header.");
+        assert_eq!(nested.field.owner_declared_gc, Some(true));
+        assert_eq!(nested.field.base_is_deref, Some(true));
+        assert!(nested.field.inline_vec);
+
+        // W_ExceptionExtended ⊃ base@0 ⊃ args_w → ("args_w", W_BaseException)
+        let args_w = leaf("args_w", "W_BaseException");
+        let nested = nest_inline_leaf(&container("base", "W_ExceptionExtended"), true, &args_w);
+        assert_eq!(nested.field.name, "args_w");
+        assert_eq!(nested.field.owner_root.as_deref(), Some("W_BaseException"));
+        assert_eq!(nested.super_path, "base.");
+
+        // W_ListObject ⊃ int_items@nonzero ⊃ block → ("int_items.block", W_ListObject)
+        let block = leaf("block", "IntArray");
+        let nested = nest_inline_leaf(&container("int_items", "W_ListObject"), false, &block);
+        assert_eq!(nested.field.name, "int_items.block");
+        assert_eq!(nested.field.owner_root.as_deref(), Some("W_ListObject"));
+        assert_eq!(nested.super_path, "");
+        assert_eq!(
+            nested.field.owner_id,
+            container("int_items", "W_ListObject").owner_id
+        );
+        assert_eq!(nested.field.owner_declared_gc, Some(true));
+        assert_eq!(nested.field.base_is_deref, Some(true));
+
+        // Outer{a, mid@8: Mid{b, inner@0: Inner{c}}} → ("mid.inner.c", Outer)
+        let c = leaf("c", "Inner");
+        let through_inner = nest_inline_leaf(&container("inner", "Mid"), true, &c);
+        assert_eq!(through_inner.field.name, "c");
+        assert_eq!(through_inner.field.owner_root.as_deref(), Some("Inner"));
+        assert_eq!(through_inner.super_path, "inner.");
+        let nested = nest_inline_leaf(&container("mid", "Outer"), false, &through_inner);
+        assert_eq!(nested.field.name, "mid.inner.c");
+        assert_eq!(nested.field.owner_root.as_deref(), Some("Outer"));
+        assert_eq!(nested.super_path, "");
+
+        // Outer{mid@0: Mid{b, inner@8: Inner{c}}} → ("inner.c", Mid)
+        let through_inner = nest_inline_leaf(&container("inner", "Mid"), false, &c);
+        assert_eq!(through_inner.field.name, "inner.c");
+        assert_eq!(through_inner.field.owner_root.as_deref(), Some("Mid"));
+        assert_eq!(through_inner.super_path, "");
+        let nested = nest_inline_leaf(&container("mid", "Outer"), true, &through_inner);
+        assert_eq!(nested.field.name, "inner.c");
+        assert_eq!(nested.field.owner_root.as_deref(), Some("Mid"));
+        assert_eq!(nested.super_path, "mid.");
     }
 
     /// The cast constant stays the class leaf. The result type carries the
@@ -13238,6 +13712,165 @@ mod tests {
         graph.push_op_var(blk, header_field(&header, "ob_type", &ob_type), false);
         graph.push_op_var(blk, header_field(&header, "w_class", &w_class), false);
         header
+    }
+
+    /// `agg.floatval = payload; alias = IDENTITY_OPS(agg); read = alias.floatval;
+    /// malloc_typed(agg)`. Fusion keeps the identity op and the alias FieldRead;
+    /// `compute_lifetimes` unions them so the identity is not an unsupported
+    /// use (`_try_inline_malloc` usepoints).
+    fn fuse_alias_field_read_cluster(
+        make_alias: impl FnOnce(crate::flowspace::model::Variable) -> OpKind,
+    ) -> (
+        FunctionGraph,
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+        BlockId,
+    ) {
+        type Var = crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field = |base: &Var, name: &str, value| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: Some("W_FloatObject".into()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
+                scalar_word: None,
+            },
+            value,
+            ty: ValueType::Ref(None),
+        };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", LinkArg::Value(payload.clone())),
+            false,
+        );
+        let alias = graph
+            .push_op_var(entry, make_alias(agg.clone()), true)
+            .unwrap();
+        graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: alias.clone(),
+                    field: FieldDescriptor {
+                        name: "floatval".into(),
+                        owner_root: Some("W_FloatObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ty: ValueType::Float,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+        (graph, payload, ret, alias, entry)
+    }
+
+    fn assert_fused_alias_field_read(
+        graph: &FunctionGraph,
+        entry: BlockId,
+        payload: &crate::flowspace::model::Variable,
+        ret: &crate::flowspace::model::Variable,
+        alias: &crate::flowspace::model::Variable,
+    ) {
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        assert_eq!(ops[nwv_pos].result.as_ref(), Some(ret));
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ..
+            } => {
+                assert_eq!(base, ret);
+                assert_eq!(field.name, "floatval");
+                assert_eq!(value, payload);
+            }
+            other => panic!("expected fused floatval FieldWrite, got {other:?}"),
+        }
+        assert!(
+            ops.iter().any(|op| {
+                op.result.as_ref() == Some(alias) && identity_operand(&op.kind).is_some()
+            }),
+            "the identity op must remain"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldRead { base, field, .. }
+                    if base == alias && field.name == "floatval"
+            )),
+            "the alias FieldRead must remain a FieldRead on the alias"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().map(String::as_str) == Some("malloc_typed")
+            )),
+            "malloc_typed must not survive"
+        );
     }
 
     #[test]
@@ -14259,6 +14892,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -15008,6 +15642,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -15264,6 +15899,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -15401,6 +16037,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -15837,7 +16474,7 @@ mod tests {
         );
 
         let base_is_inlined = |owner: &str, field: &str| {
-            (owner == "Derived" && field == "base").then(|| ("Base".to_string(), None, Vec::new()))
+            (owner == "Derived" && field == "base").then(|| test_inline_expansion(true, Vec::new()))
         };
         assert_eq!(
             fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
@@ -15967,6 +16604,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("Derived".into())),
@@ -15977,7 +16615,7 @@ mod tests {
         graph.set_return(entry, Some(raw.clone()));
 
         let base_is_inlined = |owner: &str, field: &str| {
-            (owner == "Derived" && field == "base").then(|| ("Base".to_string(), None, Vec::new()))
+            (owner == "Derived" && field == "base").then(|| test_inline_expansion(true, Vec::new()))
         };
         assert_eq!(
             fuse_boxing_alloc_with(&mut graph, &attrs, &base_is_inlined),
@@ -16305,13 +16943,12 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "W_ListObject".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![(
                     FieldDescriptor {
-                        name: "int_items.block".into(),
-                        owner_root: Some("W_ListObject".into()),
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
@@ -16382,6 +17019,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("IntArray".into())),
@@ -16465,6 +17103,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -16509,19 +17148,41 @@ mod tests {
             scalar_word: None,
         };
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "IntArray".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![
                     (leaf("block"), ValueType::Ref(None)),
                     (leaf("len"), ValueType::Int),
                 ],
             ))
         };
+        let copy_pos = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if base == &agg && field.name == "int_items"
+                )
+            })
+            .expect("the by-value copy of nested");
         let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
         assert_eq!(fused, 1, "the list boxing cluster must fuse");
 
         let ops = &graph.block(entry).operations;
+        for (k, leaf_name) in ["block", "len"].iter().enumerate() {
+            match &ops[copy_pos + k].kind {
+                OpKind::FieldRead { base, field, .. } => {
+                    assert_eq!(base, &nested);
+                    assert_eq!(field.name, *leaf_name);
+                }
+                other => panic!(
+                    "expected FieldRead of {leaf_name} immediately before the copy, got {other:?}"
+                ),
+            }
+        }
         let nwv_pos = ops
             .iter()
             .position(|op| {
@@ -16530,16 +17191,11 @@ mod tests {
             })
             .expect("NewWithVtable must be emitted with the captured type pointer");
         let mut writes: Vec<String> = Vec::new();
-        let mut reads: Vec<(String, crate::flowspace::model::Variable)> = Vec::new();
         for op in ops.iter().skip(nwv_pos + 1) {
-            match &op.kind {
-                OpKind::FieldWrite { base, field, .. } if base == &ret => {
-                    writes.push(field.name.clone());
-                }
-                OpKind::FieldRead { base, field, .. } if base == &nested => {
-                    reads.push((field.name.clone(), base.clone()));
-                }
-                _ => {}
+            if let OpKind::FieldWrite { base, field, .. } = &op.kind
+                && base == &ret
+            {
+                writes.push(field.name.clone());
             }
         }
         assert_eq!(
@@ -16553,22 +17209,14 @@ mod tests {
             ],
             "finished nested IntArray leaves must become dotted payload stores"
         );
-        assert_eq!(
-            reads.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
-            vec!["block", "len"],
-            "each dotted payload is FieldRead from the empty() result"
-        );
     }
 
     #[test]
-    fn fuse_boxing_alloc_declines_two_level_nested_struct_leaves() {
-        // `collect_by_value_struct_leaves` recurses into a by-value struct
-        // inside the nested field and returns those deeper leaves with the
-        // inner STRUCT's own owner and a bare name. `payload.inner.x` would
-        // be spelled `payload.x`; leave `malloc_typed` residual, matching
-        // `BaseMallocRemover._try_inline_malloc` declining a shape it does
-        // not support (`heaptracker.all_fielddescrs` keeps each sub-STRUCT's
-        // own descrs).
+    fn fuse_boxing_alloc_copies_nested_leaves_across_a_block() {
+        // Residual `IntArray::empty()` is copied in block A; the malloc
+        // lives in block B (a residual call's exception edge splits the
+        // block). `flowin_op` snapshots the copy in A; `all_fielddescrs`
+        // numbers the leaves as dotted payload stores after NewWithVtable.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
@@ -16580,9 +17228,18 @@ mod tests {
             .push_op_var(
                 entry,
                 OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("Payload"),
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "int_array".into(),
+                            "IntArray".into(),
+                            "empty".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
                     args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Ref(Some("Payload".into())),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
                 },
                 true,
             )
@@ -16647,14 +17304,28 @@ mod tests {
             field(
                 &agg,
                 "int_items",
-                LinkArg::Value(nested),
-                ValueType::Ref(Some("Payload".into())),
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
             ),
             false,
         );
+        let copy_pos = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if base == &agg && field.name == "int_items"
+                )
+            })
+            .expect("the by-value copy of nested");
+        let (alloc_block, alloc_args) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(entry, alloc_block, vec![agg.clone()]);
         let ret = graph
             .push_op_var(
-                entry,
+                alloc_block,
                 OpKind::Call {
                     target: CallTarget::FunctionPath {
                         segments: vec![
@@ -16663,14 +17334,15 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
-                    args: crate::model::call_args(vec![agg.clone()]),
+                    args: crate::model::call_args(vec![alloc_args[0].clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
                 },
                 true,
             )
             .unwrap();
-        graph.set_return(entry, Some(ret));
+        graph.set_return(alloc_block, Some(ret.clone()));
 
         let attrs = std::collections::HashMap::from([
             (
@@ -16689,14 +17361,14 @@ mod tests {
                     ("strategy".to_string(), ValueType::Int),
                     (
                         "int_items".to_string(),
-                        ValueType::Ref(Some("Payload".into())),
+                        ValueType::Ref(Some("IntArray".into())),
                     ),
                 ],
             ),
         ]);
-        let inner_leaf = |name: &str| FieldDescriptor {
+        let leaf = |name: &str| FieldDescriptor {
             name: name.into(),
-            owner_root: Some("Inner".into()),
+            owner_root: Some("IntArray".into()),
             owner_id: None,
             base_is_deref: None,
             taken_by_address: false,
@@ -16707,34 +17379,314 @@ mod tests {
             scalar_word: None,
         };
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "Payload".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![
-                    (inner_leaf("x"), ValueType::Int),
-                    (inner_leaf("y"), ValueType::Int),
+                    (leaf("block"), ValueType::Ref(None)),
+                    (leaf("len"), ValueType::Int),
                 ],
             ))
         };
         let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(fused, 1, "the list boxing cluster must fuse across a block");
+
+        let ops_a = &graph.block(entry).operations;
+        let mut reads = Vec::new();
+        for (k, leaf_name) in ["block", "len"].iter().enumerate() {
+            match &ops_a[copy_pos + k] {
+                SpaceOperation {
+                    result: Some(read),
+                    kind: OpKind::FieldRead { base, field, .. },
+                } if base == &nested && field.name == *leaf_name => {
+                    reads.push(read.clone());
+                }
+                other => panic!(
+                    "expected FieldRead of {leaf_name} immediately before the copy in block A, got {other:?}"
+                ),
+            }
+        }
+        thread_undefined_op_operands(&mut graph);
+
+        let ops_b = &graph.block(alloc_block).operations;
+        let nwv_pos = ops_b
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted in the allocation block");
+        let mut writes: Vec<(String, Option<crate::flowspace::model::Variable>)> = Vec::new();
+        for op in ops_b.iter().skip(nwv_pos + 1) {
+            if let OpKind::FieldWrite {
+                base, field, value, ..
+            } = &op.kind
+                && base == &ret
+            {
+                writes.push((field.name.clone(), value.as_variable().cloned()));
+            }
+        }
         assert_eq!(
-            fused, 0,
-            "a two-level nested struct must leave malloc_typed residual"
+            writes.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec![
+                "allocated",
+                "items",
+                "strategy",
+                "int_items.block",
+                "int_items.len",
+            ],
+            "finished nested IntArray leaves must become dotted payload stores"
         );
-        let ops = &graph.block(entry).operations;
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
-            "no fused allocation for a two-level nested struct"
-        );
-        assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.last().map(String::as_str) == Some("malloc_typed_managed")
-            )),
-            "malloc_typed_managed must remain"
-        );
+        let alloc_args_after = &graph.block(alloc_block).inputargs;
+        for (name, value) in writes.iter().skip(3) {
+            let value = value
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} FieldWrite must carry a variable"));
+            assert!(
+                alloc_args_after.contains(value),
+                "{name} FieldRead result must be threaded into block B's inputargs"
+            );
+        }
+        let link = &graph.block(entry).exits[0];
+        for (leaf_name, read) in ["block", "len"].iter().zip(reads.iter()) {
+            assert!(
+                link.args.iter().any(|arg| arg.as_variable() == Some(read)),
+                "block A must carry nested.{leaf_name} over the link to B"
+            );
+        }
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_fuses_two_level_nested_struct_leaves() {
+        // `collect_by_value_struct_leaves` peels leading offset-0 hops and
+        // keeps a relative path (`inner.x` on `Payload`) for a nonzero hop
+        // inside the inlined owner. Fusion writes `{field}.{leaf}` on the
+        // GC owner when that field is itself nonzero (`int_items.inner.x`
+        // on `W_ListObject`); at offset 0 the write keeps the inner owner.
+        for at_offset_zero in [false, true] {
+            let mut graph = FunctionGraph::new("test");
+            let entry = graph.startblock;
+            let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+            let items = graph
+                .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+                .unwrap();
+            let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+            let nested = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec![
+                                crate::runtime_names::crates::OBJECT.into(),
+                                "payload".into(),
+                                "Payload".into(),
+                                "empty".into(),
+                            ],
+                            fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
+                        },
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some("Payload".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            let header = push_boxing_header(&mut graph, entry, 4357049520);
+            let agg = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            let field = |base: &crate::flowspace::model::Variable, name: &str, value, ty| {
+                OpKind::FieldWrite {
+                    base: base.clone(),
+                    field: FieldDescriptor {
+                        name: name.into(),
+                        owner_root: Some("W_ListObject".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    value,
+                    ty,
+                }
+            };
+            graph.push_op_var(
+                entry,
+                field(
+                    &agg,
+                    "ob_header",
+                    LinkArg::Value(header),
+                    ValueType::Ref(None),
+                ),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+                false,
+            );
+            graph.push_op_var(
+                entry,
+                field(
+                    &agg,
+                    "int_items",
+                    LinkArg::Value(nested.clone()),
+                    ValueType::Ref(Some("Payload".into())),
+                ),
+                false,
+            );
+            let ret = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: vec![
+                                crate::runtime_names::crates::OBJECT.into(),
+                                "lltype".into(),
+                                "malloc_typed_managed".into(),
+                            ],
+                            fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
+                        },
+                        args: crate::model::call_args(vec![agg.clone()]),
+                        result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.set_return(entry, Some(ret.clone()));
+
+            let attrs = std::collections::HashMap::from([
+                (
+                    "PyObject".to_string(),
+                    vec![
+                        ("ob_type".to_string(), ValueType::Ref(None)),
+                        ("w_class".to_string(), ValueType::Ref(None)),
+                    ],
+                ),
+                (
+                    "W_ListObject".to_string(),
+                    vec![
+                        ("ob_header".to_string(), ValueType::Ref(None)),
+                        ("allocated".to_string(), ValueType::Int),
+                        ("items".to_string(), ValueType::Ref(None)),
+                        ("strategy".to_string(), ValueType::Int),
+                        (
+                            "int_items".to_string(),
+                            ValueType::Ref(Some("Payload".into())),
+                        ),
+                    ],
+                ),
+            ]);
+            let payload_leaf = |name: &str| FieldDescriptor {
+                name: name.into(),
+                owner_root: Some("Payload".into()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
+                scalar_word: None,
+            };
+            let expand = |owner: &str, field: &str| {
+                (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                    at_offset_zero,
+                    vec![
+                        (payload_leaf("inner.x"), ValueType::Int),
+                        (payload_leaf("inner.y"), ValueType::Int),
+                    ],
+                ))
+            };
+            let copy_pos = graph
+                .block(entry)
+                .operations
+                .iter()
+                .position(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { base, field, .. }
+                            if base == &agg && field.name == "int_items"
+                    )
+                })
+                .expect("the by-value copy of nested");
+            let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+            assert_eq!(fused, 1, "a two-level nested struct must fuse");
+
+            let ops = &graph.block(entry).operations;
+            for (k, leaf_name) in ["inner.x", "inner.y"].iter().enumerate() {
+                match &ops[copy_pos + k].kind {
+                    OpKind::FieldRead { base, field, .. } => {
+                        assert_eq!(base, &nested);
+                        assert_eq!(field.name, *leaf_name);
+                    }
+                    other => panic!(
+                        "expected FieldRead of {leaf_name} immediately before the copy, got {other:?}"
+                    ),
+                }
+            }
+            let nwv_pos = ops
+                .iter()
+                .position(|op| {
+                    matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+                })
+                .expect("NewWithVtable must be emitted with the captured type pointer");
+            let mut writes: Vec<(String, Option<&str>)> = Vec::new();
+            for op in ops.iter().skip(nwv_pos + 1) {
+                if let OpKind::FieldWrite { base, field, .. } = &op.kind
+                    && base == &ret
+                {
+                    writes.push((field.name.clone(), field.owner_root.as_deref()));
+                }
+            }
+            let nested_writes = if at_offset_zero {
+                vec![
+                    ("inner.x".to_string(), Some("Payload")),
+                    ("inner.y".to_string(), Some("Payload")),
+                ]
+            } else {
+                vec![
+                    ("int_items.inner.x".to_string(), Some("W_ListObject")),
+                    ("int_items.inner.y".to_string(), Some("W_ListObject")),
+                ]
+            };
+            assert_eq!(
+                writes,
+                [
+                    vec![
+                        ("allocated".to_string(), Some("W_ListObject")),
+                        ("items".to_string(), Some("W_ListObject")),
+                        ("strategy".to_string(), Some("W_ListObject")),
+                    ],
+                    nested_writes,
+                ]
+                .concat(),
+                "nonzero hop dots onto the GC owner; offset 0 keeps the inner owner"
+            );
+        }
     }
 
     #[test]
@@ -16864,6 +17816,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -16896,13 +17849,12 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "W_ListObject".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![(
                     FieldDescriptor {
-                        name: "int_items.block".into(),
-                        owner_root: Some("W_ListObject".into()),
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
@@ -17107,6 +18059,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -17139,13 +18092,12 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "W_ListObject".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![(
                     FieldDescriptor {
-                        name: "int_items.block".into(),
-                        owner_root: Some("W_ListObject".into()),
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
@@ -17327,6 +18279,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -17359,13 +18312,12 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "W_ListObject".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![(
                     FieldDescriptor {
-                        name: "int_items.block".into(),
-                        owner_root: Some("W_ListObject".into()),
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
@@ -17417,12 +18369,12 @@ mod tests {
     }
 
     #[test]
-    fn fuse_boxing_alloc_nested_read_back_declines_after_escaping_call() {
+    fn fuse_boxing_alloc_nested_read_back_ignores_call_after_copy() {
         // `nested` comes from a non-ctor helper. After the by-value copy
-        // into `outer.int_items`, a residual call takes `nested`; a later
-        // `FieldRead` of a missing leaf would see that mutation.
-        // `BaseMallocRemover._try_inline_malloc` leaves the malloc for an
-        // unsupported use.
+        // into `outer.int_items`, a residual call takes `nested`. The
+        // `FieldRead` of a missing leaf is placed at the copy
+        // (`BaseMallocRemover.flowin_op`), so the later call does not
+        // change the copied value.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
@@ -17442,6 +18394,7 @@ mod tests {
                             "empty".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("IntArray".into())),
@@ -17520,6 +18473,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
                 result_ty: ValueType::Void,
@@ -17537,199 +18491,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
-                    },
-                    args: crate::model::call_args(vec![agg.clone()]),
-                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
-                },
-                true,
-            )
-            .unwrap();
-        graph.set_return(entry, Some(ret));
-
-        let attrs = std::collections::HashMap::from([
-            (
-                "PyObject".to_string(),
-                vec![
-                    ("ob_type".to_string(), ValueType::Ref(None)),
-                    ("w_class".to_string(), ValueType::Ref(None)),
-                ],
-            ),
-            (
-                "W_ListObject".to_string(),
-                vec![
-                    ("ob_header".to_string(), ValueType::Ref(None)),
-                    ("allocated".to_string(), ValueType::Int),
-                    ("items".to_string(), ValueType::Ref(None)),
-                    ("strategy".to_string(), ValueType::Int),
-                    (
-                        "int_items".to_string(),
-                        ValueType::Ref(Some("IntArray".into())),
-                    ),
-                ],
-            ),
-        ]);
-        let leaf = |name: &str| FieldDescriptor {
-            name: name.into(),
-            owner_root: Some("IntArray".into()),
-            owner_id: None,
-            base_is_deref: None,
-            taken_by_address: false,
-            inline_vec: false,
-            vec_part: None,
-            owner_declared_gc: None,
-            host_index: None,
-            scalar_word: None,
-        };
-        let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "IntArray".to_string(),
-                None,
-                vec![
-                    (leaf("block"), ValueType::Ref(None)),
-                    (leaf("len"), ValueType::Int),
-                ],
-            ))
-        };
-        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
-        assert_eq!(
-            fused, 0,
-            "an escaping call of nested after the copy must leave malloc residual"
-        );
-        let ops = &graph.block(entry).operations;
-        assert!(
-            !ops.iter()
-                .any(|op| matches!(&op.kind, OpKind::NewWithVtable { .. })),
-            "no fused allocation after nested escapes"
-        );
-        assert!(
-            ops.iter().any(|op| matches!(
-                &op.kind,
-                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                    if segments.last().map(String::as_str) == Some("malloc_typed_managed")
-            )),
-            "malloc_typed_managed must remain"
-        );
-    }
-
-    #[test]
-    fn fuse_boxing_alloc_nested_read_back_ignores_call_before_copy() {
-        // The same residual call as the escaping-call decline, but it
-        // runs before the by-value copy, so a read-back leaf still
-        // observes the copied value.
-        let mut graph = FunctionGraph::new("test");
-        let entry = graph.startblock;
-        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        let items = graph
-            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
-            .unwrap();
-        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
-        let nested = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::crates::OBJECT.into(),
-                            "int_array".into(),
-                            "IntArray".into(),
-                            "empty".into(),
-                        ],
-                        fun_decl_id: None,
-                    },
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Ref(Some("IntArray".into())),
-                },
-                true,
-            )
-            .unwrap();
-        graph.push_op_var(
-            entry,
-            OpKind::Call {
-                target: CallTarget::FunctionPath {
-                    segments: vec!["helper".into(), "touch_nested".into()],
-                    fun_decl_id: None,
-                },
-                args: crate::model::call_args(vec![nested.clone()]),
-                result_ty: ValueType::Void,
-            },
-            false,
-        );
-        let header = push_boxing_header(&mut graph, entry, 4357049520);
-        let agg = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
-                    args: crate::model::call_args(vec![]),
-                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
-                },
-                true,
-            )
-            .unwrap();
-        let field =
-            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
-                base: base.clone(),
-                field: FieldDescriptor {
-                    name: name.into(),
-                    owner_root: Some("W_ListObject".into()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                    inline_vec: false,
-                    vec_part: None,
-                    owner_declared_gc: None,
-                    host_index: None,
-                    scalar_word: None,
-                },
-                value,
-                ty,
-            };
-        graph.push_op_var(
-            entry,
-            field(
-                &agg,
-                "ob_header",
-                LinkArg::Value(header),
-                ValueType::Ref(None),
-            ),
-            false,
-        );
-        graph.push_op_var(
-            entry,
-            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
-            false,
-        );
-        graph.push_op_var(
-            entry,
-            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
-            false,
-        );
-        graph.push_op_var(
-            entry,
-            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
-            false,
-        );
-        graph.push_op_var(
-            entry,
-            field(
-                &agg,
-                "int_items",
-                LinkArg::Value(nested.clone()),
-                ValueType::Ref(Some("IntArray".into())),
-            ),
-            false,
-        );
-        let ret = graph
-            .push_op_var(
-                entry,
-                OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![
-                            crate::runtime_names::crates::OBJECT.into(),
-                            "lltype".into(),
-                            "malloc_typed_managed".into(),
-                        ],
-                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -17774,22 +18536,43 @@ mod tests {
             scalar_word: None,
         };
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "IntArray".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![
                     (leaf("block"), ValueType::Ref(None)),
                     (leaf("len"), ValueType::Int),
                 ],
             ))
         };
+        let copy_pos = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if base == &agg && field.name == "int_items"
+                )
+            })
+            .expect("the by-value copy of nested");
         let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
         assert_eq!(
             fused, 1,
-            "a call of nested before the copy must not block read-back fusion"
+            "a call of nested after the copy must not block read-back fusion"
         );
-
         let ops = &graph.block(entry).operations;
+        for (k, leaf_name) in ["block", "len"].iter().enumerate() {
+            match &ops[copy_pos + k].kind {
+                OpKind::FieldRead { base, field, .. } => {
+                    assert_eq!(base, &nested);
+                    assert_eq!(field.name, *leaf_name);
+                }
+                other => panic!(
+                    "expected FieldRead of {leaf_name} immediately before the copy, got {other:?}"
+                ),
+            }
+        }
         let nwv_pos = ops
             .iter()
             .position(|op| {
@@ -17798,16 +18581,11 @@ mod tests {
             })
             .expect("NewWithVtable must be emitted with the captured type pointer");
         let mut writes: Vec<String> = Vec::new();
-        let mut reads: Vec<String> = Vec::new();
         for op in ops.iter().skip(nwv_pos + 1) {
-            match &op.kind {
-                OpKind::FieldWrite { base, field, .. } if base == &ret => {
-                    writes.push(field.name.clone());
-                }
-                OpKind::FieldRead { base, field, .. } if base == &nested => {
-                    reads.push(field.name.clone());
-                }
-                _ => {}
+            if let OpKind::FieldWrite { base, field, .. } = &op.kind
+                && base == &ret
+            {
+                writes.push(field.name.clone());
             }
         }
         assert_eq!(
@@ -17821,10 +18599,488 @@ mod tests {
             ],
             "finished nested IntArray leaves must become dotted payload stores"
         );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_nested_read_back_ignores_call_before_copy() {
+        // The same residual call as the after-copy case, but it runs
+        // before the by-value copy. The `FieldRead` is placed at the copy
+        // (`BaseMallocRemover.flowin_op`) and still observes the copied value.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "int_array".into(),
+                            "IntArray".into(),
+                            "empty".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec!["helper".into(), "touch_nested".into()],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![nested.clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let leaf = |name: &str| FieldDescriptor {
+            name: name.into(),
+            owner_root: Some("IntArray".into()),
+            owner_id: None,
+            base_is_deref: None,
+            taken_by_address: false,
+            inline_vec: false,
+            vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
+            scalar_word: None,
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
+                vec![
+                    (leaf("block"), ValueType::Ref(None)),
+                    (leaf("len"), ValueType::Int),
+                ],
+            ))
+        };
+        let copy_pos = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if base == &agg && field.name == "int_items"
+                )
+            })
+            .expect("the by-value copy of nested");
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
         assert_eq!(
-            reads.iter().map(String::as_str).collect::<Vec<_>>(),
-            vec!["block", "len"],
-            "each dotted payload is FieldRead from the empty() result"
+            fused, 1,
+            "a call of nested before the copy must not block read-back fusion"
+        );
+
+        let ops = &graph.block(entry).operations;
+        for (k, leaf_name) in ["block", "len"].iter().enumerate() {
+            match &ops[copy_pos + k].kind {
+                OpKind::FieldRead { base, field, .. } => {
+                    assert_eq!(base, &nested);
+                    assert_eq!(field.name, *leaf_name);
+                }
+                other => panic!(
+                    "expected FieldRead of {leaf_name} immediately before the copy, got {other:?}"
+                ),
+            }
+        }
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut writes: Vec<String> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            if let OpKind::FieldWrite { base, field, .. } = &op.kind
+                && base == &ret
+            {
+                writes.push(field.name.clone());
+            }
+        }
+        assert_eq!(
+            writes,
+            vec![
+                "allocated".to_string(),
+                "items".to_string(),
+                "strategy".to_string(),
+                "int_items.block".to_string(),
+                "int_items.len".to_string(),
+            ],
+            "finished nested IntArray leaves must become dotted payload stores"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_reads_copied_leaf_before_the_copy() {
+        // `nested` comes from a residual call. An alias is taken before
+        // `outer.inner = nested`; a store through that alias after the
+        // copy must not become the fused payload. The `FieldRead` sits at
+        // the copy (`BaseMallocRemover.flowin_op`).
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let allocated = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
+        let items = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0), true)
+            .unwrap();
+        let strategy = graph.push_op_var(entry, OpKind::ConstInt(1), true).unwrap();
+        let nested = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "int_array".into(),
+                            "IntArray".into(),
+                            "empty".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let alias = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: nested.clone(),
+                    result_ty: ValueType::Ref(Some("IntArray".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_ListObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value, ty| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_ListObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty,
+            };
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "ob_header",
+                LinkArg::Value(header),
+                ValueType::Ref(None),
+            ),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "allocated", LinkArg::Value(allocated), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "items", LinkArg::Value(items), ValueType::Ref(None)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "strategy", LinkArg::Value(strategy), ValueType::Int),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(
+                &agg,
+                "int_items",
+                LinkArg::Value(nested.clone()),
+                ValueType::Ref(Some("IntArray".into())),
+            ),
+            false,
+        );
+        let nine = graph.push_op_var(entry, OpKind::ConstInt(9), true).unwrap();
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: alias,
+                field: FieldDescriptor {
+                    name: "block".into(),
+                    owner_root: Some("IntArray".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(nine.clone()),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed_managed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_ListObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        let attrs = std::collections::HashMap::from([
+            (
+                "PyObject".to_string(),
+                vec![
+                    ("ob_type".to_string(), ValueType::Ref(None)),
+                    ("w_class".to_string(), ValueType::Ref(None)),
+                ],
+            ),
+            (
+                "W_ListObject".to_string(),
+                vec![
+                    ("ob_header".to_string(), ValueType::Ref(None)),
+                    ("allocated".to_string(), ValueType::Int),
+                    ("items".to_string(), ValueType::Ref(None)),
+                    ("strategy".to_string(), ValueType::Int),
+                    (
+                        "int_items".to_string(),
+                        ValueType::Ref(Some("IntArray".into())),
+                    ),
+                ],
+            ),
+        ]);
+        let expand = |owner: &str, field: &str| {
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
+                vec![(
+                    FieldDescriptor {
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ValueType::Int,
+                )],
+            ))
+        };
+        let copy_pos = graph
+            .block(entry)
+            .operations
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if base == &agg && field.name == "int_items"
+                )
+            })
+            .expect("the by-value copy of nested");
+        let fused = fuse_boxing_alloc_with(&mut graph, &attrs, &expand);
+        assert_eq!(fused, 1, "the list boxing cluster must fuse");
+
+        let ops = &graph.block(entry).operations;
+        let read = match &ops[copy_pos] {
+            SpaceOperation {
+                result: Some(read),
+                kind: OpKind::FieldRead { base, field, .. },
+            } if base == &nested && field.name == "block" => read.clone(),
+            other => panic!("expected FieldRead of nested.block at the copy, got {other:?}"),
+        };
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, vtable }
+                    if owner == "W_ListObject" && *vtable == 4357049520)
+            })
+            .expect("NewWithVtable must be emitted with the captured type pointer");
+        let mut got: Vec<(String, Option<crate::flowspace::model::Variable>)> = Vec::new();
+        for op in ops.iter().skip(nwv_pos + 1) {
+            if let OpKind::FieldWrite {
+                base, field, value, ..
+            } = &op.kind
+                && base == &ret
+            {
+                got.push((field.name.clone(), value.as_variable().cloned()));
+            }
+        }
+        assert_eq!(
+            got.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            vec!["allocated", "items", "strategy", "int_items.block"],
+            "finished nested IntArray leaf must become a dotted payload store"
+        );
+        assert_eq!(
+            got[3].1.as_ref(),
+            Some(&read),
+            "the fused FieldWrite must use the FieldRead taken at the copy"
+        );
+        assert_ne!(
+            got[3].1.as_ref(),
+            Some(&nine),
+            "a store through an alias after the copy must not become the fused payload"
         );
     }
 
@@ -17951,6 +19207,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -17983,13 +19240,12 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "W_ListObject".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![(
                     FieldDescriptor {
-                        name: "int_items.block".into(),
-                        owner_root: Some("W_ListObject".into()),
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
@@ -18720,11 +19976,39 @@ mod tests {
     }
 
     #[test]
-    fn fuse_boxing_alloc_declines_an_alias_write() {
+    fn fuse_boxing_alloc_fuses_same_as_alias_field_reads() {
+        let (mut graph, payload, ret, alias, entry) =
+            fuse_alias_field_read_cluster(|agg| OpKind::UnaryOp {
+                op: "same_as".into(),
+                operand: agg,
+                result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+            });
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "same_as of the aggregate is IDENTITY_OPS, not an unsupported use"
+        );
+        assert_fused_alias_field_read(&graph, entry, &payload, &ret, &alias);
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_fuses_cast_pointer_alias_field_reads() {
+        let (mut graph, payload, ret, alias, entry) = fuse_alias_field_read_cluster(|agg| {
+            crate::model::cast_pointer_call("W_FloatObject", agg)
+        });
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "__cast_pointer of the aggregate is IDENTITY_OPS, not an unsupported use"
+        );
+        assert_fused_alias_field_read(&graph, entry, &payload, &ret, &alias);
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_carries_an_alias_write() {
         // `a.x = 1; a.x = 2; alias = cast(a); alias.x = 3; malloc_typed(a)`:
-        // `unique_store` only reads FieldWrites whose `base` is `a`, so it
-        // would keep `x = 2`. The cast is a use `_try_inline_malloc` does
-        // not support (`BaseMallocRemover.compute_lifetimes`).
+        // `compute_lifetimes` unions `CAST_INSTANCE` with the root, so store
+        // resolution over the lifetime keeps the last store.
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let first = graph
@@ -18786,7 +20070,7 @@ mod tests {
             .unwrap();
         graph.push_op_var(
             entry,
-            field(&alias, "floatval", LinkArg::Value(third)),
+            field(&alias, "floatval", LinkArg::Value(third.clone())),
             false,
         );
         let ret = graph
@@ -18800,8 +20084,283 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(ret.clone()));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            1,
+            "a CAST_INSTANCE alias write is a store of the same object"
+        );
+        let ops = &graph.block(entry).operations;
+        let nwv_pos = ops
+            .iter()
+            .position(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            })
+            .expect("NewWithVtable must be emitted");
+        match &ops[nwv_pos + 1].kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value: LinkArg::Value(value),
+                ..
+            } => {
+                assert_eq!(base, &ret);
+                assert_eq!(field.name, "floatval");
+                assert_eq!(value, &third, "the fused payload must be the alias write");
+            }
+            other => panic!("expected floatval FieldWrite, got {other:?}"),
+        }
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite { base, field, value: LinkArg::Value(value), .. }
+                    if base == &alias && field.name == "floatval" && value == &third
+            )),
+            "the alias FieldWrite must remain"
+        );
+        assert!(
+            ops.iter().any(
+                |op| op.result.as_ref() == Some(&alias) && identity_operand(&op.kind).is_some()
+            ),
+            "the CAST_INSTANCE identity op must remain"
+        );
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must not survive"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_declines_a_phi_with_another_creation_point() {
+        // `a.x = 1; p = phi(a, b); p.x = 3; malloc_typed(a)`:
+        // `compute_lifetimes` unions a link arg with the target inputarg
+        // in both directions, so `b` joins `a`'s lifetime. Several
+        // creation points refuse (`_try_inline_malloc`).
+        type Var = crate::flowspace::model::Variable;
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let one = graph
+            .push_op_var(entry, OpKind::ConstFloat(1.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let field = |base: &Var, name: &str, value: &Var| OpKind::FieldWrite {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: name.into(),
+                owner_root: Some("W_FloatObject".into()),
+                owner_id: None,
+                base_is_deref: None,
+                taken_by_address: false,
+                inline_vec: false,
+                vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
+                scalar_word: None,
+            },
+            value: LinkArg::Value(value.clone()),
+            ty: ValueType::Ref(None),
+        };
+        let ctor = |graph: &mut FunctionGraph, blk: BlockId| {
+            graph
+                .push_op_var(
+                    blk,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                        args: crate::model::call_args(vec![]),
+                        result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                    },
+                    true,
+                )
+                .unwrap()
+        };
+        let a = ctor(&mut graph, entry);
+        graph.push_op_var(entry, field(&a, "ob_header", &header), false);
+        graph.push_op_var(entry, field(&a, "floatval", &one), false);
+        let b = ctor(&mut graph, entry);
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .unwrap();
+        let (join, join_args) = graph.create_block_with_arg_vars(1);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.closeblock(
+            entry,
+            vec![
+                Link::from_variables(&graph, vec![a.clone()], join, Some(ExitCase::Bool(true))),
+                Link::from_variables(&graph, vec![b], join, Some(ExitCase::Bool(false))),
+            ],
+        );
+        let p = join_args[0].clone();
+        let three = graph
+            .push_op_var(join, OpKind::ConstFloat(3.0f64.to_bits()), true)
+            .unwrap();
+        graph.push_op_var(join, field(&p, "floatval", &three), false);
+        let ret = graph
+            .push_op_var(
+                join,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![a.clone()]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(join, Some(ret));
+
+        assert_eq!(
+            fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
+            0,
+            "a phi with another creation point must not fuse"
+        );
+        let nwv_results: Vec<Var> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::NewWithVtable { .. } => op.result.clone(),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite {
+                            base,
+                            field,
+                            value: LinkArg::Value(value),
+                            ..
+                        } if nwv_results.contains(base)
+                            && field.name == "floatval"
+                            && value == &three
+                    )
+                }),
+            "must not fuse payload 3 through the phi"
+        );
+        assert!(
+            graph.block(join).operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                        if segments.last().map(String::as_str) == Some("malloc_typed")
+                )
+            }),
+            "malloc_typed must remain residual"
+        );
+    }
+
+    #[test]
+    fn fuse_boxing_alloc_accepts_a_null_test_of_the_aggregate() {
+        // `ptr_iszero` / `ptr_nonzero` of the aggregate is `FIELD_ACCESS`;
+        // `_try_inline_malloc` accepts it. The op is left unchanged.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstFloat(0.0f64.to_bits()), true)
+            .unwrap();
+        let header = push_boxing_header(&mut graph, entry, 4357049520);
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor("W_FloatObject"),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let field =
+            |base: &crate::flowspace::model::Variable, name: &str, value| OpKind::FieldWrite {
+                base: base.clone(),
+                field: FieldDescriptor {
+                    name: name.into(),
+                    owner_root: Some("W_FloatObject".into()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value,
+                ty: ValueType::Ref(None),
+            };
+        graph.push_op_var(
+            entry,
+            field(&agg, "ob_header", LinkArg::Value(header)),
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            field(&agg, "floatval", LinkArg::Value(payload)),
+            false,
+        );
+        let alias = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "same_as".into(),
+                    operand: agg.clone(),
+                    result_ty: ValueType::Ref(Some("W_FloatObject".into())),
+                },
+                true,
+            )
+            .unwrap();
+        let is_null = graph
+            .push_op_var(
+                entry,
+                OpKind::UnaryOp {
+                    op: "ptr_iszero".into(),
+                    operand: alias.clone(),
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        let ret = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec![
+                            crate::runtime_names::crates::OBJECT.into(),
+                            "lltype".into(),
+                            "malloc_typed".into(),
+                        ],
+                        fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
+                    },
+                    args: crate::model::call_args(vec![agg]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
                 },
                 true,
@@ -18811,18 +20370,25 @@ mod tests {
 
         assert_eq!(
             fuse_boxing_alloc(&mut graph, &numeric_boxing_attrs()),
-            0,
-            "a cast alias of the aggregate must leave malloc residual"
+            1,
+            "a ptr_iszero of a same_as alias is FIELD_ACCESS"
         );
         assert!(
             graph.block(entry).operations.iter().any(|op| {
-                matches!(
-                    &op.kind,
-                    OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
-                        if segments.last().map(String::as_str) == Some("malloc_typed")
-                )
+                op.result.as_ref() == Some(&is_null)
+                    && matches!(
+                        &op.kind,
+                        OpKind::UnaryOp { op, operand, .. }
+                            if op == "ptr_iszero" && operand == &alias
+                    )
             }),
-            "malloc_typed must remain"
+            "the null test must remain unchanged"
+        );
+        assert!(
+            graph.block(entry).operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::NewWithVtable { owner, .. } if owner == "W_FloatObject")
+            }),
+            "the cluster must still fuse"
         );
     }
 
@@ -18879,6 +20445,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
                 result_ty: ValueType::Void,
@@ -18961,6 +20528,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -18993,13 +20561,12 @@ mod tests {
             ),
         ]);
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "W_ListObject".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![(
                     FieldDescriptor {
-                        name: "int_items.block".into(),
-                        owner_root: Some("W_ListObject".into()),
+                        name: "block".into(),
+                        owner_root: Some("IntArray".into()),
                         owner_id: None,
                         base_is_deref: None,
                         taken_by_address: false,
@@ -19045,6 +20612,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_header".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header.clone()]),
                 result_ty: ValueType::Void,
@@ -19097,6 +20665,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -19193,6 +20762,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -19281,6 +20851,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["helper".into(), "touch_nested".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![nested.clone()]),
                 result_ty: ValueType::Void,
@@ -19363,6 +20934,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -19407,9 +20979,8 @@ mod tests {
             scalar_word: None,
         };
         let expand = |owner: &str, field: &str| {
-            (owner == "W_ListObject" && field == "int_items").then_some((
-                "IntArray".to_string(),
-                None,
+            (owner == "W_ListObject" && field == "int_items").then_some(test_inline_expansion(
+                false,
                 vec![
                     (leaf("block"), ValueType::Ref(None)),
                     (leaf("len"), ValueType::Int),

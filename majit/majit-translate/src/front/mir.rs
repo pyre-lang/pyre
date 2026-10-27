@@ -130,7 +130,8 @@ use majit_charon_reader::{
 use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
     Block, BlockId, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FrameState, FunctionGraph,
-    Link, LinkArg, OpKind, SpaceOperation, ValueType,
+    InlineLeaf, Link, LinkArg, OpKind, SpaceOperation, ValueType, container_leaf_descriptor,
+    nest_inline_leaf,
 };
 use serde_json::Value;
 
@@ -3204,7 +3205,11 @@ fn annotation_struct_field_type(
         }
         Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<*mut u8>".to_string(),
         Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
-        None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
+        None => {
+            let layout =
+                tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
+            field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
+        }
     }
 }
 

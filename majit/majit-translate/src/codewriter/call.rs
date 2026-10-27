@@ -5888,21 +5888,35 @@ impl CallControl {
         let rows = self.by_value_embedders.get_or_init(|| {
             let mut rows: Vec<(String, String, String)> = (&self.struct_fields.fields)
                 .into_iter()
+                .filter(|(outer, _)| {
+                    // Dual-publish also stores a leaf alias; `consider_struct`
+                    // keys on the STRUCT, which `canonical_struct_name` is.
+                    majit_ir::descr::canonical_struct_name(outer).as_str() == outer.as_str()
+                })
                 .flat_map(|(outer, fields)| {
+                    let outer = majit_ir::descr::canonical_struct_name(outer);
                     fields
                         .iter()
                         .filter(|row| self.is_known_struct(&row.ty))
-                        .map(move |row| (row.ty.clone(), outer.clone(), row.name.clone()))
+                        .map(move |row| {
+                            (
+                                majit_ir::descr::canonical_struct_name(&row.ty),
+                                outer.clone(),
+                                row.name.clone(),
+                            )
+                        })
                 })
                 .collect();
             rows.sort();
             rows
         });
-        // Sorted by `inner`, so `owner`'s rows are one contiguous run.
-        let start = rows.partition_point(|(inner, _, _)| inner.as_str() < owner);
+        // Sorted by `inner`; `fielddescrof` / `get_field_descr` key on
+        // `canonical_struct_name` of the STRUCT.
+        let owner_canon = majit_ir::descr::canonical_struct_name(owner);
+        let start = rows.partition_point(|(inner, _, _)| inner.as_str() < owner_canon.as_str());
         rows[start..]
             .iter()
-            .take_while(|(inner, _, _)| inner == owner)
+            .take_while(|(inner, _, _)| inner == &owner_canon)
             .filter(|(_, outer, fname)| {
                 crate::front::mir::is_flattened_storage_leaf(outer, fname, path)
             })
@@ -9756,26 +9770,14 @@ impl CallControl {
     /// Look up the single callee `FunctionGraph` for a direct call.
     ///
     /// Convenience accessor for call sites (majit `inline.rs`) that
-    /// still work with one `FunctionGraph` at a time.  RPython
-    /// `call.py:97-101` returns the graph value inside the list, but
-    /// majit callers want the graph stored in `function_graphs` so we keep
-    /// this lookup separate from the op-based `graphs_from`.
+    /// still work with one `FunctionGraph` at a time. `graphs_from`
+    /// returns the graph value inside the list; majit callers want the
+    /// graph stored in `function_graphs` so we keep this lookup separate
+    /// from the op-based `graphs_from`. Both share
+    /// `target_to_path_and_graph` / `direct_callee_graph_path`.
     pub fn direct_graph_for(&self, target: &CallTarget) -> Option<std::rc::Rc<FunctionGraph>> {
-        let path = self.direct_callee_graph_path(target, None)?;
-        if !self.candidate_graphs.contains(&path) {
-            return None;
-        }
-        match target {
-            CallTarget::Method {
-                name,
-                receiver_root,
-                resolved_path,
-                ..
-            } => self.function_graphs.get(&path).or_else(|| {
-                self.resolve_method(name, receiver_root.as_deref(), resolved_path.as_ref())
-            }),
-            _ => self.function_graphs.get(&path),
-        }
+        let (path, graph) = self.target_to_path_and_graph(target)?;
+        self.candidate_graphs.contains(&path).then_some(graph)
     }
 
     fn has_callable_graph(&self, path: &CallPath) -> bool {
@@ -9814,8 +9816,9 @@ impl CallControl {
     ///
     /// `target_to_path` may still return an unregistered 3+-segment
     /// FunctionPath so `fnaddr_for_target` can look up a host binding.
-    /// Discovery and emit (`graphs_from` / BFS) share this filter so they
-    /// cannot disagree on spelling.
+    /// Discovery, emit, extraeffects, and inlining share this filter so
+    /// they cannot disagree on spelling (`graphs_from` /
+    /// `analyze_direct_call`).
     fn direct_callee_graph_path(
         &self,
         target: &CallTarget,
@@ -9853,23 +9856,32 @@ impl CallControl {
     }
 
     /// Look up the registered graph alongside its `CallPath` in a single
-    /// step — `call.py:97` `funcobj.graph` direct read.  The returned
+    /// step — `graphs_from` `funcobj.graph` direct read.  The returned
     /// graph is the same identity registered under the path,
     /// without the `candidate_graphs` filter `direct_graph_for` imposes
     /// (callers that want the candidate-only view continue to use
     /// `direct_graph_for`).  The `CallPath` byproduct stays available
     /// for the `function_fnaddrs` side-table still keyed by path string.
+    ///
+    /// After `target_to_path`, `callable_graph_path` is the harvested
+    /// crate-prefix alias. `graphs_from` and `analyze_direct_call` both
+    /// read this `funcobj.graph`.
     pub(crate) fn target_to_path_and_graph(
         &self,
         target: &CallTarget,
     ) -> Option<(CallPath, std::rc::Rc<FunctionGraph>)> {
-        let path = self.target_to_path(target)?;
-        // `call.py` `CallControl.getcalldescr` reads `funcobj.graph`.
-        // `callable_graph_path` is that graph when the call spelling is a
-        // harvested crate-prefixed alias; `fnaddr_for_target` keeps `path`.
-        let graph_path = self.callable_graph_path(&path)?;
-        let graph = self.function_graphs.get(&graph_path)?;
-        Some((graph_path, graph))
+        let path = self.direct_callee_graph_path(target, None)?;
+        let graph = self.function_graphs.get(&path)?;
+        Some((path, graph))
+    }
+
+    /// Graph path `analyze_direct_call` walks for a call: the registered
+    /// graph when one exists, otherwise `target_to_path` so a
+    /// `__majit_call_target_<fn>` entry still unwraps onto `<fn>`.
+    fn readwrite_callee_path(&self, target: &CallTarget) -> Option<CallPath> {
+        self.target_to_path_and_graph(target)
+            .map(|(path, _)| path)
+            .or_else(|| self.target_to_path(target))
     }
 
     /// Convert a CallTarget to a CallPath for lookup.
@@ -12448,7 +12460,7 @@ impl CallControl {
     /// `readwrite_analyzer.analyze(op, self.seen_rw)` (`call.py`
     /// `getcalldescr`) for a `direct_call`.
     fn cached_readwrite(&self, target: &CallTarget, cache: &mut AnalysisCache) -> ReadWriteEffects {
-        match self.target_to_path(target) {
+        match self.readwrite_callee_path(target) {
             Some(path) => {
                 self.analyze_readwrite(&path, &mut ReadWriteTracker::new(), &mut cache.readwrite)
             }
@@ -12530,7 +12542,7 @@ impl CallControl {
                     OpKind::Call { target, .. } if is_lltype_malloc_target(target) => {
                         ReadWriteEffects::bottom_result()
                     }
-                    OpKind::Call { target, .. } => match self.target_to_path(target) {
+                    OpKind::Call { target, .. } => match self.readwrite_callee_path(target) {
                         Some(callee) => self.analyze_readwrite(&callee, seen, analyzed),
                         None => ReadWriteEffects::bottom_result(),
                     },
@@ -14207,6 +14219,9 @@ fn field_pos_in(cc: &CallControl, owner: &str, field_name: &str) -> usize {
     // that consumers resolve it through `FieldDescr::is_w_class()` rather than
     // by index (`pyre-jit-trace/src/descr.rs new_w_class_field_descr`); answer
     // with the same number so both sides agree on the slot nobody reads.
+    // `ob_header.ob_type` is that word under a containment path
+    // (`is_header_word` last-component rule; upstream `all_fielddescrs`
+    // skips `typeptr` by bare name at every recursion level).
     if crate::codewriter::heaptracker::is_header_word(owner, field_name) {
         return 0;
     }
@@ -26227,6 +26242,50 @@ mod tests {
         );
     }
 
+    /// Two nesting levels: `nested_struct_leaf("Outer", "mid.inner.c")` is
+    /// `offset(mid) + offset(inner) + offset(c)`.
+    #[test]
+    fn fielddescrof_resolves_two_level_nested_struct_leaf() {
+        let mut cc = CallControl::new();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "Inner".to_string(),
+            vec![("c".to_string(), "i64".to_string())],
+        );
+        fields.fields.insert(
+            "Mid".to_string(),
+            vec![
+                ("b".to_string(), "i64".to_string()),
+                ("inner".to_string(), "Inner".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "Outer".to_string(),
+            vec![
+                ("a".to_string(), "i64".to_string()),
+                ("mid".to_string(), "Mid".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(
+            ["Inner".to_string(), "Mid".to_string()]
+                .into_iter()
+                .collect(),
+        );
+        let (descr, member) = cc
+            .fielddescrof_keyed(0, "Outer", None, "mid.inner.c")
+            .expect("two-level nested leaf resolves");
+        let fd = descr.as_field_descr().expect("field descr");
+        assert_eq!(fd.offset(), 16, "a (8) + mid.b (8) + inner.c (0)");
+        assert_eq!(fd.field_size(), 8);
+        match member {
+            majit_ir::effectinfo::DescrSetMember::Field { field_name, .. } => {
+                assert_eq!(field_name, "mid.inner.c");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// The embedded object header contributes no slot, the way recursing
     /// into RPython's `OBJECT` contributes none: its one field is `typeptr`
     /// and `heaptracker.py:64-66` skips it by name.
@@ -26268,6 +26327,11 @@ mod tests {
         assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_module", 0), 4);
         assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
         assert_eq!(field_pos_in(&cc, "Method", "w_class"), 3);
+        // Containment-path spelling of the skipped vtable word, and of the
+        // counted `w_class` leaf (`is_header_word` last-component rule).
+        assert_eq!(field_pos_in(&cc, "Method", "ob.ob_type"), 0);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "ob.w_class", 0), 0);
+        assert_eq!(field_pos_in(&cc, "Method", "ob.w_class"), 0);
     }
 
     /// A `()`-payload enum variant is what makes a mint site's own field
@@ -27224,6 +27288,93 @@ mod tests {
         let whole = cc.descr_indices.field_index(&list, "int_items");
         let block = cc.descr_indices.field_index(&list, "int_items.block");
         assert_eq!(write_fields(&effects), vec![whole, block, len]);
+    }
+
+    /// A helper that Method-calls a writer of a by-value nested struct
+    /// records the GC owner's dotted leaf. `analyze_direct_call` walks
+    /// the Method (`funcobj.graph`); `add_struct` / `consider_struct`
+    /// key the effect on that owner's fielddescr. An unrelated STRUCT
+    /// that shares the leaf name is a different identity.
+    #[test]
+    fn readwrite_method_on_embedded_struct_names_the_owner_dotted_leaf() {
+        let mut cc = CallControl::new();
+        let mut cache = AnalysisCache::default();
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "int_array::IntArray".to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "W_ListObject".to_string(),
+            vec![
+                ("strategy".to_string(), "usize".to_string()),
+                ("int_items".to_string(), "int_array::IntArray".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "other::IntArray".to_string(),
+            vec![
+                ("block".to_string(), "*mut u8".to_string()),
+                ("len".to_string(), "usize".to_string()),
+            ],
+        );
+        fields.fields.insert(
+            "other::W_ListObject".to_string(),
+            vec![
+                ("strategy".to_string(), "usize".to_string()),
+                ("int_items".to_string(), "other::IntArray".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        cc.set_known_struct_names(
+            [
+                "int_array::IntArray".to_string(),
+                "other::IntArray".to_string(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+
+        let registered = CallPath::for_impl_method("int_array::IntArray", "set_len");
+        let mut set_len = FunctionGraph::new("set_len");
+        let entry = set_len.startblock;
+        let write = rw_write_field("int_array::IntArray", "len");
+        if let OpKind::FieldWrite { base, .. } = &write {
+            set_len.push_inputarg_var(entry, base.clone());
+        }
+        set_len.push_op_var(entry, write, false);
+        cc.register_function_graph(registered.clone(), set_len);
+
+        let mut helper = FunctionGraph::new("ll_set_len");
+        let entry = helper.startblock;
+        helper.push_op_var(
+            entry,
+            OpKind::Call {
+                target: CallTarget::method("set_len", Some("int_array::IntArray".into()))
+                    .with_resolved_path(registered),
+                args: Vec::new(),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        cc.register_function_graph(CallPath::from_segments(["ll_set_len"]), helper);
+
+        let effects = rw_of(&cc, &mut cache, "ll_set_len");
+        let list = Some("W_ListObject".to_string());
+        let dotted = cc.descr_indices.field_index(&list, "int_items.len");
+        assert!(
+            write_fields(&effects).contains(&dotted),
+            "Method set_len write of IntArray.len is W_ListObject.int_items.len"
+        );
+        let other = Some("other::W_ListObject".to_string());
+        let other_dotted = cc.descr_indices.field_index(&other, "int_items.len");
+        assert!(
+            !write_fields(&effects).contains(&other_dotted),
+            "a same-leaf STRUCT in another module is not this owner's dotted leaf"
+        );
     }
 
     /// Every graph a walk enters keeps its set in `_analyzed_calls`; a

@@ -7,7 +7,7 @@
 //! the class where the data lives.
 
 use crate::pyobject::PyObjectRef;
-use crate::quasiimmut::QuasiImmutField;
+use crate::quasiimmut::{QuasiImmut, QuasiImmutLock};
 use parking_lot::Mutex;
 use rustpython_wtf8::Wtf8Buf;
 use std::cell::Cell;
@@ -56,7 +56,8 @@ pub struct Terminator {
     /// owner is a `Box::into_raw` leak that is never freed, so
     /// [`QuasiImmutField`]'s `Drop` is unreachable and its inner box is
     /// reclaimed only through [`QuasiImmutField::invalidate`].
-    pub mutate_allow_unboxing: QuasiImmutField,
+    pub mutate_allow_unboxing: std::sync::atomic::AtomicPtr<QuasiImmut>,
+    pub mutate_allow_unboxing_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
     /// Which Terminator subclass this is.
     pub kind: TerminatorKind,
     /// mapdict.py `DictTerminator.devolved_dict_terminator` (null unless
@@ -68,7 +69,30 @@ pub struct Terminator {
     pub cache_attrs: AtomicPtr<Mutex<HashMap<(Wtf8Buf, u16), *const CachedAttributeHolder>>>,
 }
 
+crate::quasi_immut_words!(
+    Terminator,
+    mutate_allow_unboxing,
+    mutate_allow_unboxing_lock
+);
+
+impl Drop for Terminator {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe {
+            self.mutate_allow_unboxing().reclaim();
+        }
+    }
+}
+
 impl Terminator {
+    #[inline]
+    pub fn mutate_allow_unboxing(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_allow_unboxing,
+            &self.mutate_allow_unboxing_lock,
+        )
+    }
+
     /// Change mapdict.py:308 `allow_unboxing`, invalidating any constant-folded
     /// reads first.
     ///
@@ -85,22 +109,22 @@ impl Terminator {
         if self.allow_unboxing.get() == v {
             return;
         }
-        if self.mutate_allow_unboxing.is_installed() {
+        if self.mutate_allow_unboxing().is_installed() {
             unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_allow_unboxing) };
         }
         self.allow_unboxing.set(v);
     }
 
     pub fn current_allow_unboxing_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.mutate_allow_unboxing.get_current_qmut_instance()
+        self.mutate_allow_unboxing().get_current_qmut_instance()
     }
 
     pub fn allow_unboxing_qmut_installed(&self) -> bool {
-        self.mutate_allow_unboxing.is_installed()
+        self.mutate_allow_unboxing().is_installed()
     }
 
     pub fn force_allow_unboxing_qmut(&self) {
-        self.mutate_allow_unboxing.invalidate();
+        self.mutate_allow_unboxing().invalidate();
     }
 }
 
@@ -203,7 +227,8 @@ pub struct PlainAttribute {
     /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
     /// `Drop` is unreachable and its inner box is reclaimed only through
     /// [`QuasiImmutField::invalidate`].
-    pub mutate_ever_mutated: QuasiImmutField,
+    pub mutate_ever_mutated: std::sync::atomic::AtomicPtr<QuasiImmut>,
+    pub mutate_ever_mutated_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
     /// mapdict.py:431 `order`.
     pub order: usize,
     /// mapdict.py `AbstractAttribute.cache_attrs` — the per-node transition
@@ -215,29 +240,52 @@ pub struct PlainAttribute {
     pub unboxed: Option<UnboxedExtra>,
 }
 
+crate::quasi_immut_words!(
+    PlainAttribute,
+    mutate_ever_mutated,
+    mutate_ever_mutated_lock
+);
+
+impl Drop for PlainAttribute {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe {
+            self.mutate_ever_mutated().reclaim();
+        }
+    }
+}
+
 impl PlainAttribute {
+    #[inline]
+    pub fn mutate_ever_mutated(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(
+            &self.mutate_ever_mutated,
+            &self.mutate_ever_mutated_lock,
+        )
+    }
+
     /// Change mapdict.py:430 `ever_mutated` using the ordering, fast path, and
     /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
     pub fn set_ever_mutated(&self, v: bool) {
         if self.ever_mutated.get() == v {
             return;
         }
-        if self.mutate_ever_mutated.is_installed() {
+        if self.mutate_ever_mutated().is_installed() {
             unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
         }
         self.ever_mutated.set(v);
     }
 
     pub fn current_ever_mutated_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.mutate_ever_mutated.get_current_qmut_instance()
+        self.mutate_ever_mutated().get_current_qmut_instance()
     }
 
     pub fn ever_mutated_qmut_installed(&self) -> bool {
-        self.mutate_ever_mutated.is_installed()
+        self.mutate_ever_mutated().is_installed()
     }
 
     pub fn force_ever_mutated_qmut(&self) {
-        self.mutate_ever_mutated.invalidate();
+        self.mutate_ever_mutated().invalidate();
     }
 }
 
@@ -375,7 +423,8 @@ pub struct CachedAttributeHolder {
     /// ['attr?', 'typ?']`). The owner is a `Box::into_raw` leak that is
     /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
     /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
-    pub mutate_attr: QuasiImmutField,
+    pub mutate_attr: std::sync::atomic::AtomicPtr<QuasiImmut>,
+    pub mutate_attr_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
     /// mapdict.py:669 `_immutable_fields_` declares `typ?`; mapdict.py:676
     /// `typ` is the unbox type (`None` means boxed). [`Self::set_typ`]
     /// invalidates watchers before changing it.
@@ -385,17 +434,41 @@ pub struct CachedAttributeHolder {
     /// ['attr?', 'typ?']`). The owner is a `Box::into_raw` leak that is
     /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
     /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
-    pub mutate_typ: QuasiImmutField,
+    pub mutate_typ: std::sync::atomic::AtomicPtr<QuasiImmut>,
+    pub mutate_typ_lock: std::sync::atomic::AtomicPtr<QuasiImmutLock>,
+}
+
+crate::quasi_immut_words!(CachedAttributeHolder, mutate_attr, mutate_attr_lock);
+crate::quasi_immut_words!(CachedAttributeHolder, mutate_typ, mutate_typ_lock);
+
+impl Drop for CachedAttributeHolder {
+    fn drop(&mut self) {
+        // SAFETY: `&mut self` is exclusive and drop glue runs once.
+        unsafe {
+            self.mutate_attr().reclaim();
+            self.mutate_typ().reclaim();
+        }
+    }
 }
 
 impl CachedAttributeHolder {
+    #[inline]
+    pub fn mutate_attr(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_attr, &self.mutate_attr_lock)
+    }
+
+    #[inline]
+    pub fn mutate_typ(&self) -> crate::quasiimmut::QuasiImmutField<'_> {
+        crate::quasiimmut::QuasiImmutField::new(&self.mutate_typ, &self.mutate_typ_lock)
+    }
+
     /// Change mapdict.py:675 `attr` using the ordering, fast path, and
     /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
     pub fn set_attr(&self, a: MapRef) {
         if self.attr.get() == a {
             return;
         }
-        if self.mutate_attr.is_installed() {
+        if self.mutate_attr().is_installed() {
             unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_attr) };
         }
         self.attr.set(a);
@@ -407,34 +480,34 @@ impl CachedAttributeHolder {
         if self.typ.get() == t {
             return;
         }
-        if self.mutate_typ.is_installed() {
+        if self.mutate_typ().is_installed() {
             unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_typ) };
         }
         self.typ.set(t);
     }
 
     pub fn current_attr_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.mutate_attr.get_current_qmut_instance()
+        self.mutate_attr().get_current_qmut_instance()
     }
 
     pub fn attr_qmut_installed(&self) -> bool {
-        self.mutate_attr.is_installed()
+        self.mutate_attr().is_installed()
     }
 
     pub fn force_attr_qmut(&self) {
-        self.mutate_attr.invalidate();
+        self.mutate_attr().invalidate();
     }
 
     pub fn current_typ_qmut(&self) -> std::sync::Arc<crate::quasiimmut::QuasiImmut> {
-        self.mutate_typ.get_current_qmut_instance()
+        self.mutate_typ().get_current_qmut_instance()
     }
 
     pub fn typ_qmut_installed(&self) -> bool {
-        self.mutate_typ.is_installed()
+        self.mutate_typ().is_installed()
     }
 
     pub fn force_typ_qmut(&self) {
-        self.mutate_typ.invalidate();
+        self.mutate_typ().invalidate();
     }
 }
 
@@ -648,13 +721,15 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
 #[cfg(test)]
 mod prefix_overlay_tests {
     use super::*;
+    use crate::quasiimmut::{null_mutate_lock, null_mutate_word};
 
     fn dummy_terminator(w_cls: PyObjectRef) -> Terminator {
         Terminator {
             terminator: std::ptr::null(),
             w_cls,
             allow_unboxing: Cell::new(true),
-            mutate_allow_unboxing: QuasiImmutField::new(),
+            mutate_allow_unboxing: null_mutate_word(),
+            mutate_allow_unboxing_lock: null_mutate_lock(),
             kind: TerminatorKind::NoDict,
             devolved_dict_terminator: Cell::new(std::ptr::null()),
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
@@ -685,7 +760,7 @@ mod prefix_overlay_tests {
         // Walker pins pass `*const Terminator` / `*const PlainAttribute`
         // (the payload after the `MapNode` tag), and descr offsets are
         // `offset_of!` on those structs. `struct_ptr + mutate offset`
-        // must be the embedded `QuasiImmutField`.
+        // must be the mutate word.
         let w_cls = 0x2000 as PyObjectRef;
         let mut term_node = MapNode::Terminator(dummy_terminator(w_cls));
         let enum_ptr = &term_node as *const MapNode;
@@ -710,7 +785,8 @@ mod prefix_overlay_tests {
             num_attributes: 1,
             back: std::ptr::null(),
             ever_mutated: Cell::new(false),
-            mutate_ever_mutated: QuasiImmutField::new(),
+            mutate_ever_mutated: null_mutate_word(),
+            mutate_ever_mutated_lock: null_mutate_lock(),
             order: 0,
             cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
             unboxed: None,
@@ -730,9 +806,11 @@ mod prefix_overlay_tests {
         let holder = CachedAttributeHolder {
             order: 0,
             attr: Cell::new(std::ptr::null()),
-            mutate_attr: QuasiImmutField::new(),
+            mutate_attr: null_mutate_word(),
+            mutate_attr_lock: null_mutate_lock(),
             typ: Cell::new(None),
-            mutate_typ: QuasiImmutField::new(),
+            mutate_typ: null_mutate_word(),
+            mutate_typ_lock: null_mutate_lock(),
         };
         let holder_ptr = &holder as *const CachedAttributeHolder;
         let via_attr = (holder_ptr as *const u8)
