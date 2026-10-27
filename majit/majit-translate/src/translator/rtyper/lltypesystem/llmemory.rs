@@ -805,7 +805,8 @@ const WORD: i64 = std::mem::size_of::<usize>() as i64;
 /// ABIs, but 8 where `long double == double` (Apple AArch64). Resolved
 /// from the build target — for the in-process JIT the build target is
 /// the execution target, the same coupling RPython gets from `ctypes`.
-const SIZEOF_LONGFLOAT: i64 = if cfg!(all(target_arch = "aarch64", target_os = "macos")) {
+pub(crate) const SIZEOF_LONGFLOAT: i64 = if cfg!(all(target_arch = "aarch64", target_os = "macos"))
+{
     8
 } else {
     16

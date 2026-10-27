@@ -476,12 +476,60 @@ pub fn ptradd() -> Result<(), TyperError> {
     Err(deferred("ptradd"))
 }
 
-pub fn size_and_sign() -> Result<(), TyperError> {
-    Err(deferred("size_and_sign"))
+/// `rffi.py sizeof(tp)`: integer size when known. A `Struct` without a
+/// numeric `_hints["size"]` is `llmemory.sizeof(tp)` upstream (symbolic)
+/// and has no integer here.
+pub fn sizeof(tp: &LowLevelType) -> Result<usize, TyperError> {
+    match tp {
+        LowLevelType::FixedSizeArray(a) => Ok(sizeof(&a.OF)? * a.length),
+        LowLevelType::Struct(s) => match s._hints.get("size") {
+            Some(ConstValue::Int(n)) if *n >= 0 => Ok(*n as usize),
+            _ => {
+                // `llmemory.sizeof(tp)` is symbolic upstream and has no integer here.
+                Err(deferred("sizeof"))
+            }
+        },
+        LowLevelType::Signed | LowLevelType::Ptr(_) | LowLevelType::Address => {
+            Ok(crate::layout::target_word_size())
+        }
+        LowLevelType::Char | LowLevelType::Bool => Ok(1),
+        LowLevelType::UniChar => {
+            // `r_wchar_t.BITS/8`. `setup()` maps `wchar_t` to UniChar;
+            // `llmemory::primitive_byte_size` sizes UniChar at 4.
+            Ok(4)
+        }
+        LowLevelType::Float => Ok(8),
+        LowLevelType::SingleFloat => Ok(4),
+        LowLevelType::LongFloat => Ok(llmemory::SIZEOF_LONGFLOAT as usize),
+        LowLevelType::Unsigned => Ok(crate::layout::target_word_size()),
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => Ok(8),
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Ok(16),
+        _ => Err(TyperError::message(format!("sizeof({tp:?}): not a Number"))),
+    }
 }
 
-pub fn sizeof() -> Result<(), TyperError> {
-    Err(deferred("sizeof"))
+/// `rffi.py size_and_sign(tp)`: `(sizeof(tp), unsigned)`.
+/// `_type.SIGNED` for Number types; non-Primitive is unsigned False;
+/// `Signed` / FLOAT / DOUBLE / LONGDOUBLE / Address are False;
+/// Char / UniChar / Bool are True.
+pub fn size_and_sign(tp: &LowLevelType) -> Result<(usize, bool), TyperError> {
+    let size = sizeof(tp)?;
+    let unsigned = match tp {
+        LowLevelType::Unsigned
+        | LowLevelType::UnsignedLongLong
+        | LowLevelType::UnsignedLongLongLong => true,
+        LowLevelType::Signed | LowLevelType::SignedLongLong | LowLevelType::SignedLongLongLong => {
+            false
+        }
+        _ if !tp.is_primitive() => false,
+        LowLevelType::Float
+        | LowLevelType::SingleFloat
+        | LowLevelType::LongFloat
+        | LowLevelType::Address => false,
+        LowLevelType::Char | LowLevelType::UniChar | LowLevelType::Bool => true,
+        _ => return Err(TyperError::message(format!("size_and_sign({tp:?})"))),
+    };
+    Ok((size, unsigned))
 }
 
 pub fn offsetof() -> Result<(), TyperError> {
@@ -1460,6 +1508,33 @@ mod tests {
         let array = CArray(LowLevelType::Char);
         assert_eq!(array.OF, LowLevelType::Char);
         assert_eq!(array._hints.get("nolength"), Some(&ConstValue::Bool(true)));
+    }
+
+    #[test]
+    fn size_and_sign_raw_ptr_is_word_signed() {
+        // `rffi.py size_and_sign`: a `Ptr` is `(LONG_BIT/8, unsigned=False)`.
+        let word = crate::layout::target_word_size();
+        assert_eq!(size_and_sign(&*CCHARP).unwrap(), (word, false));
+        assert_eq!(
+            size_and_sign(&CArrayPtr(LowLevelType::Signed)).unwrap(),
+            (word, false)
+        );
+        assert_eq!(size_and_sign(&LowLevelType::Signed).unwrap(), (word, false));
+        assert_eq!(size_and_sign(&LowLevelType::Char).unwrap(), (1, true));
+        assert_eq!(
+            size_and_sign(&LowLevelType::Unsigned).unwrap(),
+            (word, true)
+        );
+        assert_eq!(
+            size_and_sign(&LowLevelType::SignedLongLong).unwrap(),
+            (8, false)
+        );
+        let four_signed =
+            LowLevelType::FixedSizeArray(Box::new(CFixedArray(LowLevelType::Signed, 4)));
+        assert_eq!(sizeof(&four_signed).unwrap(), 4 * word);
+        assert_eq!(size_and_sign(&four_signed).unwrap(), (4 * word, false));
+        assert!(sizeof(&LowLevelType::Void).is_err());
+        assert!(size_and_sign(&LowLevelType::Void).is_err());
     }
 
     #[test]

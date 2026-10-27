@@ -103,85 +103,6 @@ pub(crate) fn write_redirect_branch(at: usize, target: usize) {
     });
 }
 
-/// `x86/callbuilder.py follow_jump`: if `addr` starts with another jump,
-/// step to that target and repeat. x86 walks `JMP rel32` (`E9`); aarch64
-/// walks an unlinked `B` (`0x14`). A far veneer (x86 `MOV r11` / aarch64
-/// `MOVZ x16`) stops the walk, matching `follow_jump` ignoring anything
-/// but `E9`.
-pub(crate) fn follow_jump(mut addr: usize) -> usize {
-    loop {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let byte = unsafe { (addr as *const u8).read() };
-            if byte != 0xE9 {
-                return addr;
-            }
-            let rel = unsafe { (addr as *const u8).add(1).cast::<i32>().read_unaligned() };
-            addr = addr.wrapping_add(5).wrapping_add(rel as i64 as usize);
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            let word = unsafe { (addr as *const u32).read() };
-            if word & 0xFC00_0000 != 0x1400_0000 {
-                return addr;
-            }
-            let imm26 = word & 0x03FF_FFFF;
-            let offset = ((imm26 as i32) << 6) >> 6 << 2;
-            addr = (addr as isize).wrapping_add(offset as isize) as usize;
-        }
-        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-        {
-            return addr;
-        }
-    }
-}
-
-/// Bytes a `redirect_call_assembler` overlay occupies.
-///
-/// `x86/assembler.py redirect_call_assembler` asserts `get_relative_pos() == 5`
-/// (32-bit) or `<= 13` (64-bit). `aarch64/assembler.py redirect_call_assembler`
-/// writes one `B` (4 bytes) or a far veneer. Guard trampolines pad to
-/// [`STUB_SIZE`]; a live loop entry must not be NOP-padded.
-pub(crate) fn entry_redirect_len(at: usize, target: usize) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    {
-        let offset = target as isize - (at as isize + 5);
-        if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
-            5
-        } else {
-            13
-        }
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        let offset = target as isize - at as isize;
-        const B_REACH: isize = 1 << 27;
-        if (-B_REACH..B_REACH).contains(&offset) {
-            4
-        } else {
-            STUB_SIZE
-        }
-    }
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    {
-        let _ = (at, target);
-        STUB_SIZE
-    }
-}
-
-/// `x86/assembler.py redirect_call_assembler` `mc.copy_to_raw_memory(oldadr)`.
-///
-/// Overlay a JMP/B at a compiled loop entry. Writes only
-/// [`entry_redirect_len`] bytes so the rest of the live prologue is left
-/// intact for threads already past the first instruction.
-pub(crate) fn write_entry_redirect(at: usize, target: usize) {
-    let bytes = encode_redirect_branch(at, target);
-    let len = entry_redirect_len(at, target);
-    with_writable(at as *mut u8, len, || unsafe {
-        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, len);
-    });
-}
-
 /// Default trampoline: jump to the shared `_build_failure_recovery` helper.
 pub(crate) fn emit_recovery_stub(at: usize, recovery: usize) {
     write_redirect_branch(at, recovery);
@@ -219,41 +140,6 @@ pub(crate) fn patch_jump_for_descr(descr: &dyn FailDescr, adr_new_target: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn follow_jump_walks_a_near_jump_chain() {
-        let mut buf = vec![0u8; 64];
-        let at = buf.as_mut_ptr() as usize;
-        let mid = at + 16;
-        let end = at + 32;
-        let first = encode_redirect_branch(at, mid);
-        let first_len = entry_redirect_len(at, mid);
-        unsafe {
-            std::ptr::copy_nonoverlapping(first.as_ptr(), at as *mut u8, first_len);
-        }
-        let second = encode_redirect_branch(mid, end);
-        let second_len = entry_redirect_len(mid, end);
-        unsafe {
-            std::ptr::copy_nonoverlapping(second.as_ptr(), mid as *mut u8, second_len);
-        }
-        assert_eq!(follow_jump(at), end);
-        assert_eq!(follow_jump(end), end);
-    }
-
-    #[test]
-    fn entry_redirect_len_matches_jump_encoding() {
-        let at = 0x1000usize;
-        let near = 0x1100usize;
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(entry_redirect_len(at, near), 5);
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(entry_redirect_len(at, near), 4);
-        let far = at.wrapping_add(1usize << 40);
-        #[cfg(target_arch = "x86_64")]
-        assert_eq!(entry_redirect_len(at, far), 13);
-        #[cfg(target_arch = "aarch64")]
-        assert_eq!(entry_redirect_len(at, far), STUB_SIZE);
-    }
 
     #[test]
     fn near_redirect_encodes_a_direct_jump() {

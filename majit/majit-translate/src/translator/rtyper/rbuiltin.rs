@@ -437,6 +437,14 @@ fn install_default_typers(map: &mut HashMap<HostObject, BuiltinTyperFn>) {
             "cast_int_to_ptr",
             rtype_cast_int_to_ptr,
         ),
+        // `ForceCastEntry.specialize_call` (`ll2ctypes.py`); `rffi.cast`
+        // is `ll2ctypes.force_cast` (`rffi.py`).
+        ("rpython.rtyper.lltypesystem.rffi", "cast", rtype_force_cast),
+        (
+            "rpython.rtyper.lltypesystem.ll2ctypes",
+            "force_cast",
+            rtype_force_cast,
+        ),
         // rbuiltin.py:403-410
         (
             "rpython.rtyper.lltypesystem.lltype",
@@ -4927,6 +4935,37 @@ pub fn rtype_cast_int_to_ptr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
     ))
 }
 
+/// `ForceCastEntry.specialize_call` (`ll2ctypes.py`):
+/// `exception_cannot_occur`, `inputarg(args_r[1], 1)`,
+/// `genop('force_cast', [v_arg], RESTYPE)`.
+pub fn rtype_force_cast(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    hop.exception_cannot_occur()?;
+    let s_restype = hop
+        .args_s
+        .borrow()
+        .first()
+        .cloned()
+        .ok_or_else(|| TyperError::message("force_cast: missing RESTYPE"))?;
+    if !s_restype.is_constant() {
+        return Err(TyperError::message("force_cast: RESTYPE is not constant"));
+    }
+    let Some(ConstValue::LowLevelType(restype)) = s_restype.const_() else {
+        return Err(TyperError::message(
+            "force_cast: RESTYPE.const is not a LowLevelType",
+        ));
+    };
+    let r_arg = arg_repr(hop, 1)?;
+    let v_arg = hop.inputarg(&r_arg, 1)?;
+    Ok(hop.genop(
+        "force_cast",
+        vec![v_arg],
+        GenopResult::LLType((**restype).clone()),
+    ))
+}
+
 /// Typer for both front-end pointer-cast markers — the
 /// `__cast_instance_intrinsic` downcast narrow (#298) and the
 /// `__cast_address_intrinsic` erasure.  Either way the annotator has already
@@ -6152,6 +6191,28 @@ mod tests {
         assert!(
             lookup_typer(&host).is_some(),
             "BUILTIN_TYPER missing entry for `lltype.cast_pointer`"
+        );
+    }
+
+    #[test]
+    fn install_default_typers_registers_rffi_cast() {
+        // `ForceCastEntry` (`ll2ctypes.py`); `rffi.cast = force_cast`.
+        let rffi = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.rffi")
+            .and_then(|m| m.module_get("cast"))
+            .expect("HOST_ENV missing rffi.cast");
+        let force = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.ll2ctypes")
+            .and_then(|m| m.module_get("force_cast"))
+            .expect("HOST_ENV missing ll2ctypes.force_cast");
+        assert!(
+            lookup_typer(&rffi).is_some(),
+            "BUILTIN_TYPER missing entry for `rffi.cast`"
+        );
+        assert_eq!(rffi, force, "rffi.cast is ll2ctypes.force_cast");
+        assert!(
+            lookup_typer(&force).is_some(),
+            "BUILTIN_TYPER missing entry for `ll2ctypes.force_cast`"
         );
     }
 
@@ -7518,6 +7579,59 @@ mod tests {
         let last = llops.ops.last().expect("the llop is emitted");
         assert_eq!(result, last.result);
         assert_eq!(last.opname, "direct_ptradd");
+    }
+
+    #[test]
+    fn rtype_force_cast_emits_force_cast() {
+        // `ForceCastEntry.specialize_call` (`ll2ctypes.py`):
+        // `genop('force_cast', [v_arg], RESTYPE)`.
+        use crate::annotator::model::{SomePtr, SomeType};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+        use crate::translator::rtyper::rmodel::PtrRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let entry_ty = CArrayPtr(LowLevelType::Signed);
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            entry_ty.clone(),
+        ))));
+        hop.args_s.borrow_mut().push(s_restype);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Ptr(SomePtr::new((*ccharp).clone())));
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LowLevelType(Box::new(entry_ty.clone())),
+                LowLevelType::Void,
+            )));
+        let var = Variable::named("p");
+        var.set_concretetype(Some((*CCHARP).clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r.borrow_mut().push(None);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(*ccharp)) as Arc<dyn Repr>));
+
+        let result = rtype_force_cast(&hop, &HashMap::new())
+            .expect("ForceCastEntry rtypes")
+            .expect("force_cast returns a value");
+        let llops = hop.llops.borrow();
+        let last = llops.ops.last().expect("the llop is emitted");
+        assert_eq!(last.opname, "force_cast");
+        assert_eq!(result, last.result);
+        let Hlvalue::Variable(v) = &last.result else {
+            panic!("force_cast result is a Variable, got {:?}", last.result);
+        };
+        assert_eq!(v.concretetype(), Some(entry_ty));
+        assert!(llops._called_exception_is_here_or_cannot_occur);
     }
 
     fn dict_constructor_hop() -> (

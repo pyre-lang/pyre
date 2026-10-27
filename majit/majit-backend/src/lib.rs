@@ -1063,8 +1063,9 @@ pub struct CompiledLoopToken {
     /// What a CALL_ASSEMBLER to this loop enters, read off the descr's
     /// `loop_token.compiled_loop_token` as `rewrite.py handle_call_assembler`
     /// reads `_ll_initial_locs` and `frame_info`. `redirect_call_assembler`
-    /// replaces it on the old token (shim lookup) and overlays a JMP at
-    /// `_ll_function_addr` (`x86/assembler.py redirect_call_assembler`).
+    /// replaces it on the old token. Cranelift cannot patch the old loop's
+    /// code the way `x86/assembler.py redirect_call_assembler` does, so it
+    /// keeps the entry pointers and exit table of the loop to run here.
     /// `free_loop_and_bridges` clears it, which breaks the
     /// `CLT → target → fail descrs → rd_loop_token → CLT` cycle.
     pub call_assembler_target: parking_lot::RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>,

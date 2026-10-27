@@ -66178,10 +66178,9 @@ fn push_direct_ptradd(
     result
 }
 
-/// `lltype.cast_pointer(PTRTYPE, ptr)` (`lltype.py` `ann_cast_pointer`).
-/// `rbuiltin.py gen_cast` Ptr → Ptr (non-opaque) is one `cast_pointer`
-/// whose resulttype is `TGT`. The result carries `ptr_ty`.
-fn emit_cast_pointer(
+/// `rffi.cast(PTRTYPE, v)` (`rffi.py` `cast` = `ll2ctypes.force_cast`).
+/// `ForceCastEntry` (`ll2ctypes.py`) → `genop('force_cast', [v_arg], RESTYPE)`.
+fn emit_rffi_cast(
     graph: &mut FunctionGraph,
     bb: BlockId,
     v: Variable,
@@ -66197,8 +66196,8 @@ fn emit_cast_pointer(
                 "rpython",
                 "rtyper",
                 "lltypesystem",
-                "lltype",
-                "cast_pointer",
+                "rffi",
+                "cast",
             ]),
             args: vec![
                 crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
@@ -66211,10 +66210,11 @@ fn emit_cast_pointer(
 }
 
 /// Restore the raw entry pointer type after a byte `direct_ptradd`.
-/// `lltype.direct_ptradd` keeps its operand type (`ann_direct_ptradd`
-/// returns `s_p`); the byte offset runs on CCHARP, so the result is
-/// cast back to the raw entry type (`rbuiltin.py gen_cast` →
-/// `cast_pointer`).
+/// `ann_direct_ptradd` returns `s_p`; the byte offset runs on CCHARP, so
+/// the result is reinterpreted back to the raw entry type with `rffi.cast`
+/// (`ll2ctypes.py ForceCastEntry` → `force_cast`). A checked
+/// `lltype.cast_pointer` would reject two unrelated array pointer types
+/// (`lltype.py castable`).
 fn restore_offset_pointer_type(
     graph: &mut FunctionGraph,
     bb: BlockId,
@@ -66226,7 +66226,7 @@ fn restore_offset_pointer_type(
         && matches!(&t, LowLevelType::Ptr(p) if !p._needsgc())
         && result.concretetype().as_ref() != Some(&t)
     {
-        return emit_cast_pointer(graph, bb, result, t);
+        return emit_rffi_cast(graph, bb, result, t);
     }
     // Int-kind (`getkind` Signed) or None: no pointer annotation to restore.
     // A GC pointer plus a byte offset is an interior address, which stays CCHARP.
@@ -113159,8 +113159,8 @@ mod tests {
         }
     }
 
-    /// Byte `direct_ptradd` stamps `CCHARP`; `rbuiltin.py gen_cast`
-    /// recasts the result to the entry Ptr with one `cast_pointer`.
+    /// Byte `direct_ptradd` stamps `CCHARP`; `rffi.cast` recasts the
+    /// result to the entry Ptr (`ForceCastEntry` → `force_cast`).
     #[test]
     fn restore_offset_pointer_type_recasts_ccharp_to_entry_ptr() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -113246,18 +113246,16 @@ mod tests {
                 target: CallTarget::FunctionPath { segments, .. },
                 args,
                 ..
-            } if segments.last().map(String::as_str) == Some("cast_pointer") => {
+            } if segments.last().map(String::as_str) == Some("cast")
+                && segments.iter().any(|s| s == "rffi") =>
+            {
                 assert_eq!(after[0].result.as_ref(), Some(&restored));
                 assert_eq!(
                     restored.concretetype().as_ref(),
                     Some(&entry_ty),
-                    "cast_pointer result is the entry CArrayPtr(Signed)"
+                    "rffi.cast result is the entry CArrayPtr(Signed)"
                 );
-                assert_eq!(
-                    args.len(),
-                    2,
-                    "lltype.cast_pointer(PTRTYPE, ptr), got {args:?}"
-                );
+                assert_eq!(args.len(), 2, "rffi.cast(PTRTYPE, ptr), got {args:?}");
                 assert!(
                     matches!(
                         &args[0],
@@ -113272,7 +113270,7 @@ mod tests {
                 );
                 assert_eq!(args[1], crate::model::LinkArg::Value(ptradd));
             }
-            other => panic!("expected cast_pointer after direct_ptradd, got {other:?}"),
+            other => panic!("expected rffi.cast after direct_ptradd, got {other:?}"),
         }
         let following: Vec<&str> = after
             .iter()
@@ -113285,10 +113283,10 @@ mod tests {
             })
             .collect();
         assert!(
-            !following
-                .iter()
-                .any(|name| *name == "cast_ptr_to_int" || *name == "cast_int_to_ptr"),
-            "no int-cast recast after ptradd, got {following:?}"
+            !following.iter().any(|name| *name == "cast_pointer"
+                || *name == "cast_ptr_to_int"
+                || *name == "cast_int_to_ptr"),
+            "no cast_pointer / int-cast recast after ptradd, got {following:?}"
         );
     }
 

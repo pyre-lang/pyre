@@ -636,6 +636,9 @@ fn register_builtins() -> HashMap<String, BuiltinAnalyzer> {
     analyzer_for(&mut reg, "lltype.cast_ptr_to_int", lltype_cast_ptr_to_int);
     analyzer_for(&mut reg, "lltype.cast_int_to_ptr", lltype_cast_int_to_ptr);
     analyzer_for(&mut reg, "lltype.direct_ptradd", lltype_direct_ptradd);
+    // `rffi.cast = ll2ctypes.force_cast` (`rffi.py`); `ForceCastEntry`
+    // (`ll2ctypes.py`) keys the analyser on the HostObject qualname.
+    analyzer_for(&mut reg, "rffi.cast", rffi_cast);
     analyzer_for(
         &mut reg,
         "rpython.rlib.objectmodel.instantiate",
@@ -2810,6 +2813,31 @@ fn lltype_cast_int_to_ptr(
     Ok(SomeValue::Ptr(SomePtr::new(placeholder_ptr)))
 }
 
+/// `ForceCastEntry.compute_result_annotation` (`ll2ctypes.py`):
+/// `lltype_to_annotation(RESTYPE)` for a constant LowLevelType RESTYPE.
+/// `rffi.cast = ll2ctypes.force_cast` (`rffi.py`).
+pub(crate) fn rffi_cast(
+    _bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    kwds: &HashMap<String, Option<SomeValue>>,
+) -> Result<SomeValue, AnnotatorError> {
+    if !kwds.is_empty() || args_s.len() != 2 {
+        return Err(AnnotatorError::new(
+            "rffi.cast() expects (RESTYPE, value) positional arguments",
+        ));
+    }
+    let s_restype = arg_at(args_s, 0, "rffi.cast");
+    if !s_restype.is_constant() {
+        return Err(AnnotatorError::new("rffi.cast: RESTYPE is not constant"));
+    }
+    let Some(ConstValue::LowLevelType(ll)) = s_restype.const_() else {
+        return Err(AnnotatorError::new(
+            "rffi.cast: RESTYPE.const is not a LowLevelType",
+        ));
+    };
+    Ok(crate::translator::rtyper::llannotation::lltype_to_annotation((**ll).clone()))
+}
+
 /// Upstream `robjmodel_instantiate(s_clspbc, s_nonmovable=None)`
 /// (builtin.py:229-242).
 pub fn robjmodel_instantiate(
@@ -2878,25 +2906,6 @@ fn lltype_cast_pointer(
         ));
     }
     let s_clspbc_v = arg_at(args_s, 0, "lltype_cast_pointer");
-    // `ann_cast_pointer(PtrT, s_p)` (lltype.py): a constant LowLevelType
-    // Ptr is the raw recast (`rbuiltin.py gen_cast` Ptr→Ptr).
-    if let Some(crate::flowspace::model::ConstValue::LowLevelType(ll)) = s_clspbc_v.const_() {
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
-        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
-            return Err(AnnotatorError::new(
-                "cast_pointer() PtrT.const is not a Ptr",
-            ));
-        };
-        match arg_at(args_s, 1, "lltype_cast_pointer") {
-            SomeValue::Ptr(_) | SomeValue::Instance(_) | SomeValue::None_(_) => {}
-            other => {
-                return Err(AnnotatorError::new(format!(
-                    "cast_pointer(): casting of non-pointer: {other:?}"
-                )));
-            }
-        }
-        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
-    }
     let SomeValue::PBC(s_clspbc) = s_clspbc_v else {
         return Err(AnnotatorError::new(
             "cast_pointer() expected a constant class PBC as first argument",
@@ -4270,6 +4279,7 @@ mod tests {
         ));
         assert!(is_registered("rpython.rlib.objectmodel.instantiate"));
         assert!(is_registered("rpython.rlib.objectmodel.hlinvoke"));
+        assert!(is_registered("rffi.cast"));
         assert!(is_registered("weakref.ref"));
         assert!(is_registered("pdb.set_trace"));
         assert!(is_registered("std.alloc.alloc"));
@@ -4361,26 +4371,26 @@ mod tests {
     }
 
     #[test]
-    fn lltype_cast_pointer_raw_carrayptr_is_someptr() {
-        // `ann_cast_pointer(PtrT, s_p)` (lltype.py) for a constant
-        // LowLevelType Ptr — `rbuiltin.py gen_cast` Ptr→Ptr.
+    fn rffi_cast_raw_carrayptr_is_someptr() {
+        // `ForceCastEntry.compute_result_annotation` (`ll2ctypes.py`):
+        // `lltype_to_annotation(RESTYPE)` for constant CArrayPtr(Signed).
         use crate::annotator::model::SomeObjectTrait;
         use crate::flowspace::model::{ConstValue, Constant};
         use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
         use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
 
         let ptr_ty = CArrayPtr(LowLevelType::Signed);
-        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
-        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+        let mut s_restype = SomeValue::Type(super::super::model::SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
             ptr_ty.clone(),
         ))));
-        assert!(s_ptrt.is_constant());
+        assert!(s_restype.is_constant());
         let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
             panic!("CCHARP is a pointer");
         };
         let s_p = SomeValue::Ptr(SomePtr::new(*ccharp));
-        let out = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
-            .expect("ann_cast_pointer of CCHARP to CArrayPtr");
+        let out = rffi_cast(&bk(), &[Some(s_restype), Some(s_p)], &no_kwds())
+            .expect("ForceCastEntry of CCHARP to CArrayPtr");
         let SomeValue::Ptr(ptr) = &out else {
             panic!("expected SomePtr, got {out:?}");
         };
@@ -5868,6 +5878,8 @@ mod tests {
             ("rpython.rtyper.lltypesystem.lltype", "cast_ptr_to_int"),
             ("rpython.rtyper.lltypesystem.lltype", "cast_int_to_ptr"),
             ("rpython.rtyper.lltypesystem.lltype", "direct_ptradd"),
+            ("rpython.rtyper.lltypesystem.rffi", "cast"),
+            ("rpython.rtyper.lltypesystem.ll2ctypes", "force_cast"),
         ];
         let mut missing: Vec<(String, String)> = Vec::new();
         for (module_path, attr) in cases {
@@ -5909,10 +5921,24 @@ mod tests {
         let direct_ptradd = lltype
             .module_get("direct_ptradd")
             .expect("F1 registered direct_ptradd attr on lltype");
+        let rffi = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.rffi")
+            .expect("rffi module registered in HOST_ENV bootstrap");
+        let rffi_cast = rffi
+            .module_get("cast")
+            .expect("ForceCastEntry registered rffi.cast");
+        let ll2ctypes = HOST_ENV
+            .import_module("rpython.rtyper.lltypesystem.ll2ctypes")
+            .expect("ll2ctypes module registered in HOST_ENV bootstrap");
+        let force_cast = ll2ctypes
+            .module_get("force_cast")
+            .expect("ForceCastEntry registered ll2ctypes.force_cast");
         // What `immutablevalue_hostobject` will use as analyser_name.
         let q_p2i = cast_p2i.qualname();
         let q_i2p = cast_i2p.qualname();
         let q_add = direct_ptradd.qualname();
+        let q_cast = rffi_cast.qualname();
+        let q_force = force_cast.qualname();
         assert!(
             super::is_registered(q_p2i),
             "F2 analyzer must be registered under the qualname \
@@ -5931,6 +5957,18 @@ mod tests {
              bookkeeper produces. Got qualname {q_add:?} which is \
              NOT in BUILTIN_ANALYZERS — call_builtin would fail."
         );
+        assert!(
+            super::is_registered(q_cast),
+            "ForceCastEntry analyzer must be registered under the qualname \
+             bookkeeper produces. Got qualname {q_cast:?} which is \
+             NOT in BUILTIN_ANALYZERS — call_builtin would fail."
+        );
+        assert!(
+            super::is_registered(q_force),
+            "ll2ctypes.force_cast shares rffi.cast's HostObject; qualname \
+             {q_force:?} must hit BUILTIN_ANALYZERS"
+        );
+        assert_eq!(rffi_cast, force_cast, "rffi.cast is ll2ctypes.force_cast");
     }
 
     #[test]

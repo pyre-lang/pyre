@@ -1075,6 +1075,23 @@ fn transduce_op(
         }
         // `jtransform.py Transformer.rewrite_op_debug_assert` returns [].
         "debug_assert" => {}
+        // `ForceCastEntry` (`ll2ctypes.py`) emits `force_cast`. The rich
+        // graph keeps the opname so `Transformer.rewrite_op_force_cast`
+        // can alias same-size raw ptr/int.
+        "force_cast" => {
+            let operand = materialize(out, block, &op.args[0]);
+            let result = expect_var(&op.result);
+            let result_ty = value_type_of(&result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: "force_cast".to_string(),
+                    operand,
+                    result_ty,
+                },
+                result,
+            );
+        }
         other => panic!("jtransform_opname::lower_graph: unsupported opname {other:?}"),
     }
 }

@@ -985,7 +985,6 @@ pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
         "same_as"
             | "deref"
             | "cast_opaque_ptr"
-            | "cast_pointer"
             | "cast_bool_to_int"
             | "cast_bool_to_uint"
             | "cast_int_to_uint"
@@ -999,7 +998,6 @@ pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
     is_identity_cast_path(segments)
         || is_ptr_from_ref_path(segments)
         || is_lltype_cast_path(segments, "cast_opaque_ptr")
-        || is_lltype_cast_path(segments, "cast_pointer")
         || is_current_gc_ref_path(segments)
 }
 
@@ -3578,6 +3576,52 @@ impl<'a> Transformer<'a> {
         );
     }
 
+    /// `jtransform.py rewrite_op_force_cast`. Same concretetype or GC→GC
+    /// is `same_as`. Otherwise the arg is not GC; int→int (a raw `Ptr`
+    /// counts as int: `rffi.size_and_sign` is `(WORD, unsigned=False)`)
+    /// uses `_int_to_int_cast`, which returns None when dest size is
+    /// `sizeof(Signed)`.
+    fn rewrite_op_force_cast(
+        &self,
+        v_arg: &crate::flowspace::model::Variable,
+        v_result: Option<&crate::flowspace::model::Variable>,
+    ) -> RewriteResult {
+        use crate::translator::rtyper::lltypesystem::rffi;
+
+        let src = v_arg.concretetype();
+        let dst = v_result.and_then(|r| r.concretetype());
+        let (Some(src_ty), Some(dst_ty)) = (src.as_ref(), dst.as_ref()) else {
+            return RewriteResult::Keep;
+        };
+        if src_ty == dst_ty {
+            return RewriteResult::Identity(v_arg.clone());
+        }
+        let src_gc = force_cast_is_gc(src_ty);
+        let dst_gc = force_cast_is_gc(dst_ty);
+        if src_gc && dst_gc {
+            return RewriteResult::Identity(v_arg.clone());
+        }
+        assert!(!src_gc, "rewrite_op_force_cast: GC source with non-GC dest");
+        if force_cast_is_float(src_ty) || force_cast_is_float(dst_ty) {
+            return RewriteResult::Keep;
+        }
+        let (size1, _) =
+            rffi::size_and_sign(src_ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast: {e}"));
+        let (size2, _) =
+            rffi::size_and_sign(dst_ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast: {e}"));
+        let word = crate::layout::target_word_size();
+        // `_int_to_int_cast` after the longlong arms: size1/size2 fit in
+        // Signed; dest LONG/ULONG returns None.
+        assert!(
+            size1 <= word,
+            "rewrite_op_force_cast: source wider than Signed"
+        );
+        if size2 == word {
+            return RewriteResult::Identity(v_arg.clone());
+        }
+        RewriteResult::Keep
+    }
+
     /// Stamp the synthetic kind from a `ValueType` source, skipping
     /// `ValueType::Unknown` so the fallback Unknown→Ref defaulting in
     /// `value_type_to_kind` does not clobber a real `concretetype`
@@ -3949,6 +3993,15 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if is_same_as_identity_unary(unop_name) => RewriteResult::Identity(operand.clone()),
+            // `jtransform.py rewrite_op_force_cast`: same-size raw ptr/int
+            // is `_int_to_int_cast` returning None (identity).
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "force_cast" => {
+                self.rewrite_op_force_cast(operand, op.result.as_ref())
+            }
             // `rewrite_op_force_cast` / `_int_to_int_cast`: int → raw-pointer
             // is an int→int identity (`history.getkind` of the raw `Ptr`).
             OpKind::UnaryOp {
@@ -8392,6 +8445,13 @@ impl<'a> Transformer<'a> {
             // op. `current_gc_ref` is the residual stand-in for the GC
             // transform's livevar reload (`rgc` rewrites the same box
             // in place) and folds the same way.
+            // `rffi.cast` / `ll2ctypes.force_cast` (`ForceCastEntry` →
+            // `force_cast`). `call_arg_vars` drops the RESTYPE Constant,
+            // so the Call reaches here with one operand.
+            if is_rffi_cast_path(segments) && args.len() == 1 {
+                let src = resolve_alias(&args[0], &self.aliases);
+                return self.rewrite_op_force_cast(&src, op.result.as_ref());
+            }
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
                 // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
                 // `__cast_instance_intrinsic` onto a flavor-raw ADT
@@ -15273,6 +15333,27 @@ fn path_segments_end_with(segments: &[String], tail: &[&str]) -> bool {
 /// (`pointer_cast_function_names_do_not_alias`).
 pub(crate) fn is_lltype_cast_path(segments: &[String], name: &str) -> bool {
     path_segments_end_with(segments, &["lltype", name])
+}
+
+/// `rffi.cast` / `ll2ctypes.force_cast` (`rffi.py` `cast = force_cast`).
+fn is_rffi_cast_path(segments: &[String]) -> bool {
+    path_segments_end_with(segments, &["rffi", "cast"])
+        || path_segments_end_with(segments, &["ll2ctypes", "force_cast"])
+}
+
+/// `rgc.lltype_is_gc` / `jtransform.py Transformer._is_gc`.
+fn force_cast_is_gc(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+    match ty {
+        LowLevelType::Ptr(p) => p.TO._gckind() == GcKind::Gc,
+        LowLevelType::InteriorPtr(ip) => ip.TO._gckind() == GcKind::Gc,
+        _ => false,
+    }
+}
+
+fn force_cast_is_float(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    matches!(ty, LowLevelType::Float | LowLevelType::SingleFloat)
 }
 
 /// Residual stand-in for the GC transform's livevar reload.
@@ -27113,46 +27194,6 @@ mod tests {
         }
     }
 
-    /// `lltype.cast_pointer` (`rbuiltin.py gen_cast` Ptr→Ptr) folds to
-    /// the operand alias (`jtransform.py rewrite_op_cast_pointer` →
-    /// `rewrite_op_same_as`).
-    #[test]
-    fn lltype_cast_pointer_call_elides_to_operand_alias() {
-        let config = GraphTransformConfig::default();
-        let mut transformer = Transformer::new(&config);
-        let mut graph = FunctionGraph::new("lltype_cast_pointer");
-        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let target = CallTarget::function_path([
-            "rpython",
-            "rtyper",
-            "lltypesystem",
-            "lltype",
-            "cast_pointer",
-        ]);
-        let result_ty = ValueType::Int;
-        let op = SpaceOperation {
-            result: Some(result_var),
-            kind: OpKind::Call {
-                target: target.clone(),
-                args: crate::model::call_args(vec![arg.clone()]),
-                result_ty: result_ty.clone(),
-            },
-        };
-        let rewritten = transformer.rewrite_op_direct_call(
-            &op,
-            &target,
-            std::slice::from_ref(&arg),
-            &result_ty,
-            "lltype_cast_pointer",
-            &mut graph,
-        );
-        match rewritten {
-            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
-            _ => panic!("expected Identity alias to the operand"),
-        }
-    }
-
     /// `ptr::from_ref` is rustc `return r` / rtyper `cast_pointer` /
     /// `rewrite_op_same_as`. The host Call must alias, not residualise.
     #[test]
@@ -27372,19 +27413,6 @@ mod tests {
         match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
             RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
             _ => panic!("expected the explicit opaque cast to alias its operand"),
-        }
-        let recast = graph.alloc_value_var_with_type(ConcreteType::Signed);
-        let op = SpaceOperation {
-            result: Some(recast),
-            kind: OpKind::UnaryOp {
-                op: "cast_pointer".into(),
-                operand: ptr.clone(),
-                result_ty: ValueType::Int,
-            },
-        };
-        match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
-            RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
-            _ => panic!("expected cast_pointer to alias its operand"),
         }
     }
 
@@ -31329,6 +31357,182 @@ mod tests {
                 }
                 _ => panic!("expected UnaryOp rewrite for {result_ty:?}"),
             }
+        }
+    }
+
+    /// `rewrite_op_force_cast` / `_int_to_int_cast`: CCHARP →
+    /// CArrayPtr(Signed) is same-size raw, so the UnaryOp aliases.
+    #[test]
+    fn force_cast_unary_same_size_raw_ptr_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("force_cast_unary");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        arg.set_concretetype(Some((*CCHARP).clone()));
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        result.set_concretetype(Some(CArrayPtr(LowLevelType::Signed)));
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: "force_cast".into(),
+                operand: arg.clone(),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_operation(&op, "force_cast_unary", &mut graph) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// `rffi.cast` Call with RESTYPE dropped by `call_arg_vars` aliases
+    /// the operand (`rewrite_op_force_cast`).
+    #[test]
+    fn rffi_cast_call_same_size_raw_ptr_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("rffi_cast_call");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        arg.set_concretetype(Some((*CCHARP).clone()));
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        result.set_concretetype(Some(CArrayPtr(LowLevelType::Signed)));
+        let target =
+            CallTarget::function_path(["rpython", "rtyper", "lltypesystem", "rffi", "cast"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "rffi_cast_call",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
+    /// Annotate `rffi.cast` → rtype `force_cast` → jtransform identity.
+    #[test]
+    fn rffi_cast_ccharp_to_carrayptr_annotate_rtype_jtransform_is_identity() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::builtin::rffi_cast;
+        use crate::annotator::model::{SomeType, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+        use crate::translator::rtyper::rbuiltin::rtype_force_cast;
+        use crate::translator::rtyper::rmodel::{PtrRepr, Repr};
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let entry_ty = CArrayPtr(LowLevelType::Signed);
+        let mut s_restype = SomeValue::Type(SomeType::new());
+        s_restype.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            entry_ty.clone(),
+        ))));
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_p = SomeValue::Ptr(SomePtr::new((*ccharp).clone()));
+        let bk = Rc::new(Bookkeeper::new());
+        let annotated = rffi_cast(
+            &bk,
+            &[Some(s_restype.clone()), Some(s_p.clone())],
+            &HashMap::new(),
+        )
+        .expect("ForceCastEntry annotates");
+        let SomeValue::Ptr(ptr) = &annotated else {
+            panic!("expected SomePtr, got {annotated:?}");
+        };
+        assert_eq!(
+            LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone())),
+            entry_ty
+        );
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let spaceop = crate::flowspace::model::SpaceOperation::new(
+            "simple_call",
+            Vec::new(),
+            Hlvalue::Variable(Variable::new()),
+        );
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper, spaceop, Vec::new(), llops);
+        hop.args_s.borrow_mut().push(s_restype);
+        hop.args_s.borrow_mut().push(s_p);
+        hop.args_v
+            .borrow_mut()
+            .push(Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::LowLevelType(Box::new(entry_ty.clone())),
+                LowLevelType::Void,
+            )));
+        let var = Variable::named("p");
+        var.set_concretetype(Some((*CCHARP).clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(var));
+        hop.args_r.borrow_mut().push(None);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(Arc::new(PtrRepr::new(*ccharp)) as Arc<dyn Repr>));
+        let rtyped = rtype_force_cast(&hop, &HashMap::new())
+            .expect("ForceCastEntry rtypes")
+            .expect("force_cast returns a value");
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.last().expect("llop").opname, "force_cast");
+        let Hlvalue::Variable(rtyped_var) = &rtyped else {
+            panic!("expected Variable, got {rtyped:?}");
+        };
+        assert_eq!(rtyped_var.concretetype(), Some(entry_ty.clone()));
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("rffi_cast_e2e");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        arg.set_concretetype(Some((*CCHARP).clone()));
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        result.set_concretetype(Some(entry_ty));
+        let target =
+            CallTarget::function_path(["rpython", "rtyper", "lltypesystem", "rffi", "cast"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "rffi_cast_e2e",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
         }
     }
 

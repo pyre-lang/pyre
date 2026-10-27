@@ -2684,6 +2684,16 @@ impl HostEnv {
             ),
         );
 
+        // `rffi.cast = ll2ctypes.force_cast` (`rffi.py`). `ForceCastEntry`
+        // (`ll2ctypes.py`) annotates `lltype_to_annotation(RESTYPE)` and
+        // rtypes `genop('force_cast', [v_arg], RESTYPE)`. Share one
+        // HostObject Arc so `BUILTIN_TYPER` identity-keys both spellings.
+        let rffi_cast = HostObject::new_builtin_callable("rffi.cast");
+        let rffi = HostObject::new_module("rpython.rtyper.lltypesystem.rffi");
+        rffi.module_set("cast", rffi_cast.clone());
+        let ll2ctypes = HostObject::new_module("rpython.rtyper.lltypesystem.ll2ctypes");
+        ll2ctypes.module_set("force_cast", rffi_cast);
+
         let mut mods = self.modules.lock();
         mods.insert("__builtin__".into(), self.builtin_module.clone());
         mods.insert("os".into(), os);
@@ -2695,6 +2705,8 @@ impl HostEnv {
         mods.insert("collections".into(), collections);
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
+        mods.insert("rpython.rtyper.lltypesystem.rffi".into(), rffi);
+        mods.insert("rpython.rtyper.lltypesystem.ll2ctypes".into(), ll2ctypes);
         mods.insert("weakref".into(), weakref_mod);
         mods.insert("core.ptr".into(), core_ptr);
         mods.insert("core.mem".into(), core_mem);
