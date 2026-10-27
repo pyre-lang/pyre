@@ -1425,7 +1425,8 @@ fn producer_kind(
                 | OpKind::BinOp { result_ty: ty, .. }
                 | OpKind::UnaryOp { result_ty: ty, .. }
                 | OpKind::ArrayRead { item_ty: ty, .. }
-                | OpKind::RawLoad { item_ty: ty, .. } => ProducerKind::Typed(ty.clone()),
+                | OpKind::RawLoad { item_ty: ty, .. }
+                | OpKind::GcLoadIndexed { item_ty: ty, .. } => ProducerKind::Typed(ty.clone()),
                 OpKind::ConstInt(_) | OpKind::ConstFnAddr { .. } | OpKind::ConstUInt(_) => {
                     ProducerKind::Typed(ValueType::Int)
                 }
@@ -2126,6 +2127,7 @@ pub(crate) fn op_operand_vars(kind: &OpKind) -> Vec<Variable> {
         OpKind::RawFree { ptr } => vec![ptr.clone()],
 
         OpKind::RawLoad { base, offset, .. } => vec![base.clone(), offset.clone()],
+        OpKind::GcLoadIndexed { base, index, .. } => vec![base.clone(), index.clone()],
         OpKind::RawStore {
             base,
             offset,
@@ -11130,6 +11132,7 @@ fn concrete_type_of_producer(kind: &OpKind) -> Option<crate::model::ConcreteType
         | OpKind::InteriorFieldRead { item_ty: ty, .. }
         | OpKind::VableArrayRead { item_ty: ty, .. }
         | OpKind::RawLoad { item_ty: ty, .. }
+        | OpKind::GcLoadIndexed { item_ty: ty, .. }
         | OpKind::ConstSymbolic { ty, .. } => concrete_type_of_value(ty),
         OpKind::ConstInt(_)
         | OpKind::ConstFnAddr { .. }

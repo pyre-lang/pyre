@@ -643,6 +643,23 @@ pub(crate) fn remap_op_kind(
             itemsize: *itemsize,
             is_item_signed: *is_item_signed,
         },
+        OpKind::GcLoadIndexed {
+            base,
+            index,
+            scale,
+            base_ofs,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::GcLoadIndexed {
+            base: remap_var(base),
+            index: remap_var(index),
+            scale: *scale,
+            base_ofs: *base_ofs,
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        },
         OpKind::RawStore {
             base,
             offset,
@@ -1194,6 +1211,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
     let clone_var = |var: &crate::flowspace::model::Variable| var.clone();
     match kind {
         OpKind::RawLoad { base, offset, .. } => vec![clone_var(base), clone_var(offset)],
+        OpKind::GcLoadIndexed { base, index, .. } => vec![clone_var(base), clone_var(index)],
         OpKind::RawStore {
             base,
             offset,
@@ -1468,8 +1486,8 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
 pub fn is_pure_op(kind: &OpKind) -> bool {
     match kind {
         // `raw_load` reads mutable raw memory and `raw_store` writes it:
-        // neither is pure.
-        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => false,
+        // neither is pure. `gc_load_indexed` reads a mutable GC object.
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } | OpKind::GcLoadIndexed { .. } => false,
         // `new` / `new_with_vtable` / `new_array_clear` heap-allocate fresh
         // objects: NOT pure.  CSE must never coalesce two allocations, or
         // Python `is` object identity would break.

@@ -265,6 +265,12 @@ pub unsafe fn plain_attribute_force_ever_mutated_qmut(attribute: *const PlainAtt
     unsafe { (*attribute).force_ever_mutated_qmut() };
 }
 
+/// Map nodes are `lltype::malloc_raw` allocations that are never freed,
+/// never GC objects.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_MapNode: &str = "raw";
+
 /// mapdict.py `AbstractAttribute` plus its two concrete subclasses.
 ///
 /// `repr(C)` pins the enum tag then the variant payload so
@@ -507,6 +513,14 @@ struct MapNodeTerminatorView {
     w_cls: PyObjectRef,
 }
 
+/// Both overlays view a raw [`MapNode`], so they share its flavor.
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_MapNodeAbstractAttribute: &str = "raw";
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _alloc_flavor_MapNodeTerminatorView: &str = "raw";
+
 const _: () = {
     assert!(std::mem::offset_of!(Terminator, terminator) == 0);
     assert!(std::mem::offset_of!(Terminator, w_cls) == std::mem::size_of::<MapRef>());
@@ -580,7 +594,7 @@ pub unsafe fn instance_getclass(obj: PyObjectRef) -> PyObjectRef {
         if off == 0 {
             return unsafe { (*obj).w_class };
         }
-        unsafe { *((obj as *const u8).add(off) as *const usize) }
+        unsafe { majit_ir::llop::gc_load_indexed::<usize, _>(obj, off, 1, 0) }
     };
     if map_word == 0 {
         return unsafe { (*obj).w_class };

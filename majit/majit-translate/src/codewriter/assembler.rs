@@ -3762,6 +3762,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::Input { .. } => "Input",
                 OpKind::RawLoad { .. } => "RawLoad",
                 OpKind::RawStore { .. } => "RawStore",
+                OpKind::GcLoadIndexed { .. } => "GcLoadIndexed",
                 OpKind::ConstInt(_) => "ConstInt",
                 OpKind::ConstFnAddr { .. } => "ConstFnAddr",
                 OpKind::ConstUInt(_) => "ConstUInt",
@@ -6719,6 +6720,10 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::RawStore { item_ty, .. } => match item_ty {
             crate::model::ValueType::Float => "raw_store_f".into(),
             _ => "raw_store_i".into(),
+        },
+        OpKind::GcLoadIndexed { item_ty, .. } => match item_ty {
+            crate::model::ValueType::Float => "gc_load_indexed_f".into(),
+            _ => "gc_load_indexed_i".into(),
         },
         // RPython: ConstInt is NOT a standalone op; see encode_op comment.
         // Pyre materialises constants as an int_copy from pool-region reg.

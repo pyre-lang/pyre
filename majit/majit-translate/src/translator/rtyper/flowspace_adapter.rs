@@ -1490,9 +1490,10 @@ pub(crate) fn op_canraise(kind: &OpKind) -> bool {
         // `rlib/jit.py Entry.specialize_call` is
         // `exception_cannot_occur`; promote kinds lower to `same_as`.
         OpKind::Hint { .. } => false,
-        // `raw_load` / `raw_store` are llops with empty `canraise`
-        // (`LL_OPERATIONS['raw_load']` / `['raw_store']`).
-        OpKind::RawLoad { .. } | OpKind::RawStore { .. } => false,
+        // `raw_load` / `raw_store` / `gc_load_indexed` are llops with empty
+        // `canraise` (`LL_OPERATIONS['raw_load']` / `['raw_store']` /
+        // `['gc_load_indexed']`).
+        OpKind::RawLoad { .. } | OpKind::RawStore { .. } | OpKind::GcLoadIndexed { .. } => false,
         // `core::cmp::{eq..ge}` / `core::slice::{len,iter}` /
         // `core::num::wrapping_mul` lower to pure, non-raising flowspace
         // ops (see `nonraising_core_bridge_opname`); classify the
@@ -4520,6 +4521,32 @@ pub fn translate_op(
                 result,
             )])
         }
+        // `llop.gc_load_indexed(TYPE, base, index, scale, base_ofs)`:
+        // RESULTTYPE travels first as for `raw_load`; `scale` and
+        // `base_ofs` are the constants `rewrite_op_gc_load_indexed` asks for.
+        OpKind::GcLoadIndexed {
+            base,
+            index,
+            scale,
+            base_ofs,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => {
+            let item_ll = raw_item_lltype(item_ty, *itemsize, *is_item_signed)?;
+            let type_hl =
+                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(Box::new(item_ll))));
+            let base_hl = lookup_operand(value_map, base, op, "base")?;
+            let index_hl = lookup_operand(value_map, index, op, "index")?;
+            let scale_hl = Hlvalue::Constant(Constant::new(ConstValue::Int(*scale)));
+            let base_ofs_hl = Hlvalue::Constant(Constant::new(ConstValue::Int(*base_ofs)));
+            let result = resolve_result_hlvalue(op, value_map)?;
+            Ok(vec![FlowspaceOp::new(
+                "gc_load_indexed",
+                vec![type_hl, base_hl, index_hl, scale_hl, base_ofs_hl],
+                result,
+            )])
+        }
 
         // ─── Stage-invariant fail-loud catch-all ───
         // No remaining variants reach here legitimately: every legitimate
@@ -4642,6 +4669,7 @@ fn opkind_variant_name(kind: &OpKind) -> &'static str {
         OpKind::GetSlice { .. } => "GetSlice",
         OpKind::RawLoad { .. } => "RawLoad",
         OpKind::RawStore { .. } => "RawStore",
+        OpKind::GcLoadIndexed { .. } => "GcLoadIndexed",
         OpKind::Hint { .. } => "Hint",
         OpKind::LoweredBlackholeOp { .. } => "LoweredBlackholeOp",
         OpKind::LoadStatic { .. } => "LoadStatic",
@@ -8702,6 +8730,50 @@ mod tests {
             result.annotation.borrow().is_none(),
             "TYPE travels on the op; flowin binds the result"
         );
+    }
+
+    #[test]
+    fn translate_op_gc_load_indexed_keeps_constant_scale_and_offset() {
+        // `llop.gc_load_indexed(TYPE, base, index, scale, base_ofs)`.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_gc_load_indexed_fixture");
+        let vars = mint_vars(&mut graph, 4);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::GcLoadIndexed {
+                base: vars[1].clone(),
+                index: vars[2].clone(),
+                scale: 1,
+                base_ofs: 72,
+                item_ty: ValueType::Unsigned,
+                itemsize: 8,
+                is_item_signed: false,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &empty_call_registry())
+            .expect("GcLoadIndexed arm must lower");
+        let [lowered] = translated.as_slice() else {
+            panic!("expected one op, got {translated:?}");
+        };
+        assert_eq!(lowered.opname, "gc_load_indexed");
+        assert_eq!(lowered.args.len(), 5);
+        match &lowered.args[0] {
+            Hlvalue::Constant(c) => assert!(
+                matches!(&c.value, ConstValue::LowLevelType(ll) if matches!(**ll, LowLevelType::Unsigned)),
+                "TYPE must be Unsigned, got {:?}",
+                c.value
+            ),
+            other => panic!("TYPE must be Constant, got {other:?}"),
+        }
+        for (arg, want) in lowered.args[3..].iter().zip([1, 72]) {
+            match arg {
+                Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(want)),
+                other => panic!("scale/base_ofs must be Constant, got {other:?}"),
+            }
+        }
     }
 
     #[test]

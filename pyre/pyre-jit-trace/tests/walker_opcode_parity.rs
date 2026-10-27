@@ -295,6 +295,8 @@ const PYRE_ONLY: &[&str] = &[
     "ref_push/r",
     // Raw float store.
     "raw_store_f/iifd",
+    // `pyjitpl.py opimpl_gc_load_indexed_i`. Majit's tracer has no arm.
+    "gc_load_indexed_i/riiii>i",
     // `pyjitpl.py` `_opimpl_getinteriorfield_gc_any` /
     // `execute_setinteriorfield_gc`. Majit's tracer has no arm.
     "getinteriorfield_gc_f/rid>f",
@@ -331,7 +333,6 @@ const PYRE_ONLY: &[&str] = &[
 const NEITHER: &[&str] = &[
     "check_neg_index/rid>i",
     "gc_load_indexed_f/riiii>f",
-    "gc_load_indexed_i/riiii>i",
     "getlistitem_gc_f/ridd>f",
     "getlistitem_gc_i/ridd>i",
     "getlistitem_gc_r/ridd>r",

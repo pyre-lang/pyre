@@ -2351,6 +2351,44 @@ impl RPythonTyper {
                     GenopResult::LLType(result_lltype),
                 ))
             }
+            // High-level `gc_load_indexed` is `(TYPE, base, index, scale,
+            // base_ofs)`; the llop drops TYPE and keeps the GC `base` in its
+            // own repr. `rewrite_op_gc_load_indexed` reads
+            // `T = op.result.concretetype`.
+            "gc_load_indexed" => {
+                if hop.nb_args() != 5 {
+                    return Err(TyperError::message(
+                        "gc_load_indexed: llop.gc_load_indexed(TYPE, base, index, scale, \
+                         base_ofs) needs 5 args",
+                    ));
+                }
+                let r_base = hop
+                    .args_r
+                    .borrow()
+                    .get(1)
+                    .cloned()
+                    .flatten()
+                    .ok_or_else(|| TyperError::message("gc_load_indexed: missing base repr"))?;
+                let v_base = hop.inputarg(&r_base, 1)?;
+                let v_index = hop.inputarg_llop_intkind_or_signed(2)?;
+                let v_scale = hop.inputarg_llop_intkind_or_signed(3)?;
+                let v_base_ofs = hop.inputarg_llop_intkind_or_signed(4)?;
+                hop.exception_cannot_occur()?;
+                let result_lltype = hop
+                    .r_result
+                    .borrow()
+                    .as_ref()
+                    .ok_or_else(|| {
+                        TyperError::message("gc_load_indexed: r_result not populated before genop")
+                    })?
+                    .lowleveltype()
+                    .clone();
+                Ok(hop.genop(
+                    "gc_load_indexed",
+                    vec![v_base, v_index, v_scale, v_base_ofs],
+                    GenopResult::LLType(result_lltype),
+                ))
+            }
             "raw_store" => {
                 let v_addr = hop.inputarg_llop_intkind_or_signed(0)?;
                 let v_offs = hop.inputarg_llop_intkind_or_signed(1)?;

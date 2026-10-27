@@ -1302,6 +1302,19 @@ pub enum OpKind {
         itemsize: usize,
         is_item_signed: bool,
     },
+    /// `llop.gc_load_indexed(T, base, index, scale, base_ofs)`: the item at
+    /// byte `base_ofs + index * scale` inside the GC object `base`
+    /// (`jtransform.py rewrite_op_gc_load_indexed`). `scale` and `base_ofs`
+    /// are constants; the item is described as in [`OpKind::RawLoad`].
+    GcLoadIndexed {
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
+        scale: i64,
+        base_ofs: i64,
+        item_ty: ValueType,
+        itemsize: usize,
+        is_item_signed: bool,
+    },
     /// RPython: getinteriorfield_gc_i/r/f — read a field of an array-of-structs element.
     /// effectinfo.py add_interiorfield: generates "readinteriorfield" effect.
     /// effectinfo.py:327-340: also implicitly generates "readarray" effect.

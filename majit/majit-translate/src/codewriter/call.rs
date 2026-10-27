@@ -13559,8 +13559,11 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. } | OpKind::ArrayLen { .. } => {
             RaiseClass::No
         }
-        // RPython LL: raw_load, raw_store → cannot raise
-        OpKind::RawLoad { .. } | OpKind::RawStore { .. } | OpKind::RawFree { .. } => RaiseClass::No,
+        // RPython LL: raw_load, raw_store, gc_load_indexed → cannot raise
+        OpKind::RawLoad { .. }
+        | OpKind::RawStore { .. }
+        | OpKind::RawFree { .. }
+        | OpKind::GcLoadIndexed { .. } => RaiseClass::No,
         // RPython LL: getinteriorfield_gc, setinteriorfield_gc → cannot raise
         OpKind::InteriorFieldRead { .. } | OpKind::InteriorFieldWrite { .. } => RaiseClass::No,
         // `canraise.py analyze_simple_operation`: `LL_OPERATIONS[op.opname].canraise`.

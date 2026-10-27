@@ -1720,7 +1720,8 @@ fn kind_produces_unsigned(kind: &OpKind) -> bool {
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. }
-        | OpKind::RawLoad { item_ty, .. } => *item_ty == ValueType::Unsigned,
+        | OpKind::RawLoad { item_ty, .. }
+        | OpKind::GcLoadIndexed { item_ty, .. } => *item_ty == ValueType::Unsigned,
         OpKind::Call { result_ty, .. }
         | OpKind::IndirectCall { result_ty, .. }
         | OpKind::BinOp { result_ty, .. }
@@ -4084,6 +4085,44 @@ impl<'a> Transformer<'a> {
                     });
                     RewriteResult::Replace(ops)
                 }
+            }
+            // `rewrite_op_gc_load_indexed`: `kind != 'r'`, and the item size
+            // of `arraydescrof(rffi.CArray(T))` is hard-coded as the trailing
+            // `bytes` operand, negated for a signed item.
+            OpKind::GcLoadIndexed {
+                base,
+                index,
+                scale,
+                base_ofs,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            } => {
+                let kind = match item_ty {
+                    ValueType::Float => 'f',
+                    ValueType::Ref(_) => panic!("gc_load_indexed of a GC reference"),
+                    _ => 'i',
+                };
+                let itemsize = *itemsize as i64;
+                let bytes = if *is_item_signed { -itemsize } else { itemsize };
+                let c_int = |n: i64| {
+                    crate::model::LinkArg::Const(crate::flowspace::model::Constant::new(
+                        crate::flowspace::model::ConstValue::Int(n),
+                    ))
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::LoweredBlackholeOp {
+                        opname: format!("gc_load_indexed_{kind}"),
+                        args: vec![
+                            crate::model::LinkArg::from(base.clone()),
+                            crate::model::LinkArg::from(index.clone()),
+                            c_int(*scale),
+                            c_int(*base_ofs),
+                            c_int(bytes),
+                        ],
+                    },
+                }])
             }
             OpKind::RawStore {
                 base,
@@ -8462,6 +8501,16 @@ impl<'a> Transformer<'a> {
                     );
                 }
                 return RewriteResult::Identity(arg);
+            }
+            // A raw-pointer dest (`*const T`) is int-kind
+            // (`history.getkind`), so the cast is `rewrite_op_force_cast`'s
+            // same-size `_int_to_int_cast`: the result aliases the int word.
+            if is_lltype_cast_path(segments, "cast_int_to_ptr")
+                && args.len() == 1
+                && matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+            {
+                self.stamp_int_banked_cast_int_to_ptr_result(graph, op.result.clone());
+                return RewriteResult::Identity(resolve_alias(&args[0], &self.aliases));
             }
             if args.len() == 1
                 && path_segments_end_with(segments, &["longlong2float", "float2longlong"])
@@ -14685,6 +14734,23 @@ fn remap_op(
             itemsize: *itemsize,
             is_item_signed: *is_item_signed,
         },
+        OpKind::GcLoadIndexed {
+            base,
+            index,
+            scale,
+            base_ofs,
+            item_ty,
+            itemsize,
+            is_item_signed,
+        } => OpKind::GcLoadIndexed {
+            base: remap_value(base, aliases),
+            index: remap_value(index, aliases),
+            scale: *scale,
+            base_ofs: *base_ofs,
+            item_ty: item_ty.clone(),
+            itemsize: *itemsize,
+            is_item_signed: *is_item_signed,
+        },
         OpKind::NewTuple { args } => OpKind::NewTuple {
             args: args.iter().map(|a| remap_value(a, aliases)).collect(),
         },
@@ -15490,7 +15556,8 @@ fn declared_result_value_type(kind: &OpKind) -> Option<ValueType> {
         OpKind::ArrayRead { item_ty, .. }
         | OpKind::InteriorFieldRead { item_ty, .. }
         | OpKind::VableArrayRead { item_ty, .. }
-        | OpKind::RawLoad { item_ty, .. } => Some(item_ty.clone()),
+        | OpKind::RawLoad { item_ty, .. }
+        | OpKind::GcLoadIndexed { item_ty, .. } => Some(item_ty.clone()),
         OpKind::Call { result_ty, .. }
         | OpKind::IndirectCall { result_ty, .. }
         | OpKind::BinOp { result_ty, .. }
@@ -31284,6 +31351,100 @@ mod tests {
             ConcreteType::Signed,
             "flavor-raw dest is int-kind"
         );
+    }
+
+    /// `(p as *const u8)` lowers to `cast_int_to_ptr(cast_ptr_to_int(p))`
+    /// with a raw-pointer (int-kind) dest. That cast is the same-size
+    /// `_int_to_int_cast` alias, never a residual call to `lltype`.
+    #[test]
+    fn cast_int_to_ptr_to_raw_pointer_is_the_int_word() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("cast_to_raw_pointer");
+        let as_int = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&as_int, ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let int_to_ptr = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_int_to_ptr",
+        ]);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: int_to_ptr.clone(),
+                args: crate::model::call_args(vec![as_int.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_op_direct_call(
+            &op,
+            &int_to_ptr,
+            std::slice::from_ref(&as_int),
+            &ValueType::Int,
+            "cast_int_to_ptr",
+            &mut graph,
+        ) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, as_int),
+            RewriteResult::Replace(_) => panic!("expected Identity of int word, got Replace"),
+            RewriteResult::Keep => panic!("expected Identity of int word, got Keep"),
+        }
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result),
+            ConcreteType::Signed
+        );
+    }
+
+    /// `rewrite_op_gc_load_indexed` keeps `[base, index, scale, base_ofs]`
+    /// and appends the item size as `bytes`, negated for a signed item.
+    #[test]
+    fn gc_load_indexed_appends_signed_item_bytes() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("gc_load_indexed");
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let index = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::GcLoadIndexed {
+                base: base.clone(),
+                index: index.clone(),
+                scale: 1,
+                base_ofs: 16,
+                item_ty: ValueType::Int,
+                itemsize: 4,
+                is_item_signed: true,
+            },
+        };
+        let RewriteResult::Replace(ops) =
+            transformer.rewrite_operation(&op, "gc_load_indexed", &mut graph)
+        else {
+            panic!("gc_load_indexed must lower");
+        };
+        let [lowered] = ops.as_slice() else {
+            panic!("expected one op, got {ops:?}");
+        };
+        assert_eq!(lowered.result.as_ref(), Some(&result));
+        let OpKind::LoweredBlackholeOp { opname, args } = &lowered.kind else {
+            panic!("expected gc_load_indexed_i, got {:?}", lowered.kind);
+        };
+        assert_eq!(opname, "gc_load_indexed_i");
+        let consts: Vec<i64> = args[2..]
+            .iter()
+            .map(|arg| match arg {
+                crate::model::LinkArg::Const(c) => match c.value {
+                    crate::flowspace::model::ConstValue::Int(n) => n,
+                    ref other => panic!("expected an int constant, got {other:?}"),
+                },
+                other => panic!("expected a constant, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(args[0].as_variable(), Some(&base));
+        assert_eq!(args[1].as_variable(), Some(&index));
+        assert_eq!(consts, [1, 16, -4]);
     }
 
     /// `Transformer._handle_str2unicode_call` records the Str2Unicode
