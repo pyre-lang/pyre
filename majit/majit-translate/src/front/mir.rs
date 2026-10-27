@@ -9868,7 +9868,7 @@ impl<'a> Lowering<'a> {
         );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
-            pair_len_shadows(body, llbc, &name);
+            pair_len_shadows(body, llbc, &name, accum);
         let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
@@ -37567,9 +37567,9 @@ impl<'a> Lowering<'a> {
     /// container deref above.  Gated on the receiver being a string value
     /// (`tyref_is_string_value`: `str`/`String`/`Wtf8`/`Wtf8Buf`), more
     /// precise than the impl owner-leaf, plus the `str`-typed result so
-    /// `String`'s sibling `AsRef<[u8]>` / `AsRef<OsStr>` / `AsRef<Path>`
-    /// impls — whose `&[u8]`/etc. result is a *different* value-model
-    /// family — keep their ordinary lowering.
+    /// `AsRef<[u8]>` is the `as_bytes` byte view
+    /// ([`Self::is_string_as_bytes_identity`]) and `AsRef<OsStr>` /
+    /// `AsRef<Path>` keep their ordinary lowering.
     fn is_string_to_str_identity(
         &self,
         reg: &RegularCall,
@@ -38504,8 +38504,12 @@ impl<'a> Lowering<'a> {
             return Ok((self.ensure_window_ccharp(mir_bb, args[0].clone()), len));
         }
         let first_ty = arg_tys.first().and_then(Option::as_ref);
+        let w1_str = first_ty.is_some_and(|ty| {
+            tyref_is_string_value(ty, self.llbc)
+                || tyref_raw_ptr_pointee_is_string_value(ty, self.llbc)
+        });
         let str_src = args.len() == 1
-            && (self.is_string_as_bytes_identity(reg, first_ty, dest_ty)
+            && ((self.is_string_as_bytes_identity(reg, first_ty, dest_ty) && w1_str)
                 || self.is_utf8_payload_bytes_identity(reg)
                 || self.is_bytes_block_chars(reg)
                 || self.is_w_bytes_data(reg)
@@ -38744,7 +38748,13 @@ impl<'a> Lowering<'a> {
         // yields `u8` and the string is already its bytes. `str::chars`
         // yields Unicode scalars (`Utf8StringIterator`), so it is not a
         // byte view and keeps the ordinary call.
-        let byte_view = leaf == Some("bytes") && path.contains("str");
+        // `<String as AsRef<[u8]>>::as_ref` is `as_bytes`.
+        // A Rust-heap `String` receiver keeps the pre-existing `as_bytes`
+        // identity for len / eq / iteration consumers; its window conversion
+        // is a separate follow-up.
+        let byte_view = leaf == Some("as_bytes")
+            || (leaf == Some("bytes") && path.contains("str"))
+            || is_as_ref_byte_view(leaf, dest_ty, self.llbc);
         if !byte_view {
             return false;
         }
@@ -50150,9 +50160,14 @@ fn is_string_identity_call(llbc: &Llbc, call: &CallPayload) -> bool {
         return true;
     }
     match np.rsplit("::").next() {
+        // A Rust-heap `String` receiver keeps the pre-existing `as_bytes`
+        // identity for len / eq / iteration consumers; its window conversion
+        // is a separate follow-up.
+        Some("as_bytes") => true,
         Some("bytes") if np.contains("str") => true,
-        Some("as_ref" | "as_str" | "as_str_unchecked" | "borrow") => {
+        Some(leaf @ ("as_ref" | "as_str" | "as_str_unchecked" | "borrow")) => {
             tyref_strips_to_str(&call.dest.ty, llbc)
+                || is_as_ref_byte_view(Some(leaf), &call.dest.ty, llbc)
         }
         Some("deref" | "deref_mut") => tyref_is_string_family(&call.dest.ty, llbc),
         _ => false,
@@ -69325,6 +69340,14 @@ fn tyref_strips_to_str(ty: &TyRef, llbc: &Llbc) -> bool {
         == Some("Str")
 }
 
+/// `<String as AsRef<[u8]>>::as_ref` / `<str as AsRef<[u8]>>::as_ref`: std
+/// defines it as `self.as_bytes()`, so on a string-family receiver it is the
+/// same byte view as `as_bytes`.
+fn is_as_ref_byte_view(leaf: Option<&str>, dest_ty: &TyRef, llbc: &Llbc) -> bool {
+    leaf == Some("as_ref")
+        && (tyref_is_shared_u8_slice(dest_ty, llbc) || tyref_is_adt_shared_u8_slice(dest_ty, llbc))
+}
+
 /// Whether a `TyRef` resolves (behind `Ref` / dedup wrappers) to a
 /// string-family value whose storage is rstr `STR`:
 /// the `rustpython_wtf8` `Wtf8` / `Wtf8Buf` wrappers, pyre's `BytesBlock`
@@ -82396,9 +82419,10 @@ fn pair_len_shadows(
     body: &Unstructured,
     llbc: &Llbc,
     graph_name: &str,
+    accum: &AccumulatorFacts,
 ) -> (Vec<Option<usize>>, Vec<bool>, Vec<bool>, Vec<bool>) {
     let views = objectptr_pair_view_locals(body, llbc);
-    let (mut str_views, list_views, list_view_fixed) = body_owner_view_locals(body, llbc);
+    let (mut str_views, list_views, list_view_fixed) = body_owner_view_locals(body, llbc, accum);
     // `RDict` / `HashMap` key parameters are `space.bytes_w` / `str`
     // (`BytesDictStrategy.unwrap`), one `Ptr(STR)` word. A window ABI on
     // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
@@ -82416,11 +82440,11 @@ fn tyref_is_w1_str(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_is_string_value(ty, llbc) || tyref_raw_ptr_pointee_is_string_value(ty, llbc)
 }
 
-/// W1 STR receiver: a string-family / W1 STR value, or a
-/// `#[repr(transparent)]` newtype whose single non-ZST field is a W1 STR
-/// source pointer (`*mut BytesBlock`, `*const Utf8Str`, …).
+/// W1 STR receiver: a W1 STR value (not a Rust-heap `String`, which is a
+/// `{cap, ptr, len}` instance), or a `#[repr(transparent)]` newtype whose
+/// single non-ZST field is a W1 STR.
 fn tyref_is_w1_str_receiver(ty: &TyRef, llbc: &Llbc) -> bool {
-    if tyref_is_string_family(ty, llbc) || tyref_is_w1_str(ty, llbc) {
+    if tyref_is_w1_str(ty, llbc) {
         return true;
     }
     let Some((index, _)) = tyref_transparent_nonzst_field(ty, llbc) else {
@@ -82435,9 +82459,9 @@ fn tyref_is_w1_str_receiver(ty: &TyRef, llbc: &Llbc) -> bool {
     let TypeDeclKind::Struct(fields) = &decl.kind else {
         return false;
     };
-    fields.get(index).is_some_and(|field| {
-        tyref_is_w1_str(&field.ty, llbc) || tyref_is_string_family(&field.ty, llbc)
-    })
+    fields
+        .get(index)
+        .is_some_and(|field| tyref_is_w1_str(&field.ty, llbc))
 }
 
 /// Shared `&[u8]` / `*const [u8]` spelled as Charon ADT `builtin: "Slice"`
@@ -82501,7 +82525,7 @@ fn tyref_is_adt_shared_u8_slice(ty: &TyRef, llbc: &Llbc) -> bool {
 /// Covers both Charon spellings of shared `&[u8]`: top-level `Slice` and
 /// ADT `builtin: "Slice"`.
 fn tyref_is_w1_str_view_dest(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_u8_window(ty, llbc)
+    tyref_is_shared_u8_slice(ty, llbc)
         || tyref_strips_to_str(ty, llbc)
         || tyref_is_adt_shared_u8_slice(ty, llbc)
 }
@@ -82634,7 +82658,8 @@ fn is_as_view_noop(
     if tyref_is_w1_str_receiver(first, llbc) && tyref_is_w1_str_view_dest(dest_ty, llbc) {
         return true;
     }
-    tyref_is_u8_list(first, llbc) && tyref_is_u8_window(dest_ty, llbc)
+    tyref_is_u8_list(first, llbc)
+        && (tyref_is_shared_u8_slice(dest_ty, llbc) || tyref_is_adt_shared_u8_slice(dest_ty, llbc))
 }
 
 /// A 1-arg call whose dest is a shared `&[u8]` / `*const [u8]` and whose
@@ -82669,12 +82694,33 @@ fn call_dest_is_w1_str_source(call: &CallPayload, llbc: &Llbc) -> bool {
         || leaf == "w_str_storage"
 }
 
+/// A 1-arg `as_*` / `str::bytes`-style identity call whose argument is the
+/// identity temp of a builder-mode accumulator: `ll_build`
+/// (`AbstractStringBuilderRepr.rtype_method_build`) makes the receiver a
+/// `Ptr(STR)`, so the window dest is a W1 STR view of the built string.
+fn call_dest_is_built_str_view(call: &CallPayload, accum: &AccumulatorFacts) -> bool {
+    if !accum.has_builder || call.args.len() != 1 {
+        return false;
+    }
+    let Some(rt) = operand_local(call.args.first()) else {
+        return false;
+    };
+    let Some(&Some(c)) = accum.identity_accumulator.get(rt) else {
+        return false;
+    };
+    accum.builder_mode.get(c).copied() == Some(true)
+}
+
 /// Body locals whose every window-typed def is a W1 STR source or a W2
 /// list view (or a Use/Ref/Cast/reborrow of one). Parameters keep the
 /// two-word window ABI, except `RDict` / `HashMap` key formals
 /// (`mark_dict_method_str_view_keys`). A mixed STR/list/window local is
 /// excluded so it keeps a length shadow.
-fn body_owner_view_locals(body: &Unstructured, llbc: &Llbc) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
+fn body_owner_view_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+    accum: &AccumulatorFacts,
+) -> (Vec<bool>, Vec<bool>, Vec<bool>) {
     let n = body.locals.locals.len();
     let arg_count = body.locals.arg_count as usize;
     let mut str_view = vec![false; n];
@@ -82691,7 +82737,9 @@ fn body_owner_view_locals(body: &Unstructured, llbc: &Llbc) -> (Vec<bool>, Vec<b
         {
             let dest = dest as usize;
             if is_body_local(dest) && tyref_is_u8_window(&call.dest.ty, llbc) {
-                if call_dest_is_w1_str_source(&call, llbc) {
+                if call_dest_is_w1_str_source(&call, llbc)
+                    || call_dest_is_built_str_view(&call, accum)
+                {
                     str_view[dest] = true;
                     w1_call_def[dest] = true;
                 } else if call_dest_is_w2_list_source(&call, llbc) {
@@ -98817,12 +98865,134 @@ mod tests {
         );
     }
 
-    /// `String::as_bytes` into a shared `&[u8]` parameter is the STR
-    /// identity; the window is borrowed at the callee.
+    /// An `as_*` whose dest is `Option<&[u8]>` is not a view no-op: the
+    /// Option is a different representation class from the STR receiver.
     #[test]
-    fn string_as_bytes_into_window_param_is_identity() {
+    fn as_star_into_option_dest_is_not_a_view_noop() {
         use crate::model::{CallTarget, OpKind};
 
+        let block_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let k_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+        });
+        let k_value = serde_json::json!({"Value": [0, k_adt.clone()]});
+        let k_ref = serde_json::json!({"Ref": ["Erased", k_adt.clone(), "Shared"]});
+        let block_ptr = serde_json::json!({"RawPtr": [block_adt.clone(), "Mut"]});
+        let option_ty = option_adt_node(2, window_shared_slice());
+        let block = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["pyre_object", "bytesobject", "BytesBlock"], true),
+            "kind": {"Struct": [
+                {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+                {"name": "length", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let key = serde_json::json!({
+            "def_id": 1,
+            "item_meta": window_meta(&["fixture", "K"], true),
+            "kind": {"Struct": [
+                {"name": null, "ty": block_ptr, "attr_info": null}
+            ]},
+            "layout": [{
+                "key": "fixture-target",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"transparent": true}
+                }
+            }]
+        });
+        let impl_seg = serde_json::json!({"Impl": {"Ty": {
+            "skip_binder": k_value,
+            "kind": "InherentImplBlock"
+        }}});
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_opt = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["fixture", 0]},
+                    {"Ident": ["K", 0]},
+                    impl_seg,
+                    {"Ident": ["as_opt", 0]}
+                ],
+                "span": window_span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "signature": {"is_unsafe": false, "inputs": [k_ref.clone()], "output": option_ty.clone()},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": window_span(), "ty": option_ty.clone()},
+                    {"index": 1, "name": "self", "span": window_span(), "ty": k_ref.clone()}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }]
+            }}
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "f"], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [k_ref.clone()],
+                "output": option_ty.clone()
+            },
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &option_ty),
+                    window_local(1, &k_ref)
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &k_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &option_ty)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![block, key, option_enum(2)], vec![caller, as_opt]);
+        let graph = super::lower_function(&llbc, "f").expect("lower as_opt into Option dest");
+        let ops = window_graph_ops(&graph);
+        let as_opt_call = ops.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("as_opt"),
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "as_opt",
+            _ => false,
+        });
+        assert!(
+            as_opt_call,
+            "as_opt into Option<&[u8]> is not a view no-op; graph={}",
+            graph.dump()
+        );
+    }
+
+    /// Heap `String::as_bytes` into a shared `&[u8]` parameter keeps the
+    /// residual `as_bytes` call; the receiver is not a W1 STR.
+    #[test]
+    fn heap_string_as_bytes_into_window_param_keeps_call() {
         let string_adt = serde_json::json!({
             "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
         });
@@ -98903,48 +99073,112 @@ mod tests {
             .expect("lower String::as_bytes into window param");
         let leafs = window_call_leafs(&graph);
         assert!(
-            !leafs.iter().any(|leaf| leaf == "as_bytes"),
-            "String::as_bytes is identity, not a residual call; leafs={leafs:?} graph={}",
+            leafs.iter().any(|leaf| leaf == "as_bytes"),
+            "heap String::as_bytes keeps the residual call; leafs={leafs:?} graph={}",
             graph.dump()
         );
-        let getattr = window_graph_ops(&graph).iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::Call {
-                    target: CallTarget::Method { name, .. },
-                    ..
-                } if name == "as_bytes"
-            )
-        });
         assert!(
-            !getattr,
-            "String::as_bytes is not getattr; graph={}",
+            !leafs
+                .iter()
+                .any(|leaf| leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING),
+            "heap String::as_bytes is not get_raw_address_of_string; leafs={leafs:?} graph={}",
             graph.dump()
         );
-        let at_call = graph.blocks.iter().any(|block| {
-            let has_window_ops = block.operations.iter().any(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => matches!(
-                    segments.last().map(String::as_str),
-                    Some("__strlen") | Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
-                ),
-                _ => false,
-            });
-            let has_callee = block.operations.iter().any(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    args,
-                    ..
-                } => segments.last().map(String::as_str) == Some("window_param") && args.len() == 2,
-                _ => false,
-            });
-            has_window_ops && has_callee
+    }
+
+    /// Heap `String::as_ref` into a shared `&[u8]` parameter keeps the
+    /// residual `as_ref` call; the receiver is not a W1 STR.
+    #[test]
+    fn heap_string_as_ref_bytes_into_window_param_keeps_call() {
+        let string_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
         });
+        let string_ref = serde_json::json!({"Ref": ["Erased", string_adt.clone(), "Shared"]});
+        let shared = window_shared_slice();
+        let unit = serde_json::json!({"Tuple": []});
+        let string_td = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["alloc", "string", "String"], true),
+            "kind": {"Struct": [
+                {"name": "ptr", "ty": window_usize(), "attr_info": null},
+                {"name": "len", "ty": window_usize(), "attr_info": null},
+                {"name": "cap", "ty": window_usize(), "attr_info": null}
+            ]}
+        });
+        let (unwind, ret) = window_unwind_and_return_blocks();
+        let as_ref = window_opaque_fun(
+            1,
+            &["alloc", "string", "<Impl>", "as_ref"],
+            vec![string_ref.clone()],
+            shared.clone(),
+        );
+        let callee = window_opaque_fun(
+            2,
+            &["fixture", "window_param"],
+            vec![shared.clone()],
+            unit.clone(),
+        );
+        let s_place = window_place(serde_json::json!({"Local": 1}), &string_adt);
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "string_as_ref_window_param"], true),
+            "signature": {"is_unsafe": false, "inputs": [string_adt.clone()], "output": unit},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &unit),
+                    window_local(1, &string_adt),
+                    window_local(2, &string_ref),
+                    window_local(3, &shared)
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 2}), &string_ref),
+                                {"Ref": {"place": s_place, "kind": "Shared", "ptr_metadata": null}}
+                            ]}
+                        }],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &string_ref)}],
+                            "dest": window_place(serde_json::json!({"Local": 3}), &shared)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    unwind,
+                    {
+                        "statements": [],
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 2},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &shared)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &unit)
+                        }, "target": 3, "on_unwind": 1}}}
+                    },
+                    ret
+                ]
+            }}
+        });
+        let llbc = window_llbc(vec![string_td], vec![caller, as_ref, callee]);
+        let graph = super::lower_function(&llbc, "string_as_ref_window_param")
+            .expect("lower String::as_ref into window param");
+        let leafs = window_call_leafs(&graph);
         assert!(
-            at_call,
-            "g receives the STR view at the window-param call; graph={}",
+            leafs.iter().any(|leaf| leaf == "as_ref"),
+            "heap String::as_ref keeps the residual call; leafs={leafs:?} graph={}",
+            graph.dump()
+        );
+        assert!(
+            !leafs
+                .iter()
+                .any(|leaf| leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING),
+            "heap String::as_ref is not get_raw_address_of_string; leafs={leafs:?} graph={}",
             graph.dump()
         );
     }
@@ -124260,6 +124494,113 @@ mod tests {
         })
     }
 
+    fn string_adt() -> Value {
+        json!({"Adt": {"id": 0, "builtin": null, "generics": str_builder_generics()}})
+    }
+
+    fn string_decl() -> Value {
+        json!({
+            "def_id": 0,
+            "item_meta": type_decl_meta(&["alloc", "string", "String"]),
+            "kind": {"Struct": [
+                {"name": "ptr", "ty": window_usize(), "attr_info": null},
+                {"name": "len", "ty": window_usize(), "attr_info": null},
+                {"name": "cap", "ty": window_usize(), "attr_info": null}
+            ]}
+        })
+    }
+
+    fn string_impl_seg() -> Value {
+        json!({"Impl": {"Ty": {
+            "params": {
+                "regions": [], "types": [], "const_generics": [], "trait_clauses": [],
+                "regions_outlive": [], "types_outlive": [], "trait_type_constraints": []
+            },
+            "skip_binder": {"Value": [0, string_adt()]},
+            "kind": "InherentImplBlock"
+        }}})
+    }
+
+    fn ref_string(kind: &str) -> Value {
+        json!({"Ref": [{"Erased": null}, string_adt(), kind]})
+    }
+
+    fn string_new_decl() -> Value {
+        json!({
+            "def_id": 1,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("alloc"),
+                ident_seg("string"),
+                ident_seg("String"),
+                string_impl_seg(),
+                ident_seg("new"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": string_adt()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn string_push_str_decl() -> Value {
+        json!({
+            "def_id": 2,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("alloc"),
+                ident_seg("string"),
+                ident_seg("String"),
+                string_impl_seg(),
+                ident_seg("push_str"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_string("Mut"), word_ty()],
+                "output": unit_ty()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn string_as_bytes_decl() -> Value {
+        json!({
+            "def_id": 3,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("alloc"),
+                ident_seg("string"),
+                ident_seg("String"),
+                string_impl_seg(),
+                ident_seg("as_bytes"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_string("Shared")],
+                "output": window_shared_slice()
+            },
+            "body": "Opaque"
+        })
+    }
+
+    fn string_as_ref_bytes_decl() -> Value {
+        json!({
+            "def_id": 3,
+            "item_meta": str_builder_meta(vec![
+                ident_seg("alloc"),
+                ident_seg("string"),
+                ident_seg("String"),
+                string_impl_seg(),
+                ident_seg("as_ref"),
+            ], false),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_string("Shared")],
+                "output": window_shared_slice()
+            },
+            "body": "Opaque"
+        })
+    }
+
     fn deref_decl() -> Value {
         json!({
             "def_id": 4,
@@ -124597,6 +124938,265 @@ mod tests {
             ],
         );
         assert_builder_identity_lowering(&graph, "ctor_push_as_bytes");
+    }
+
+    /// `String::new(); s.push_str(x); g(s.as_bytes())` with `g(&[u8])`.
+    /// `ll_build` (`AbstractStringBuilderRepr.rtype_method_build`) makes
+    /// the receiver a `Ptr(STR)`, so the window dest is a W1 STR view of
+    /// the built string rather than a residual `as_bytes` of the builder.
+    #[test]
+    fn builder_as_bytes_into_window_param_builds_the_str() {
+        let string = string_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_string("Mut");
+        let shared = ref_string("Shared");
+        let window = window_shared_slice();
+        let graph = lower_owned_concat(
+            "builder_as_bytes_window_param",
+            vec![string_decl()],
+            vec![
+                subject_decl(
+                    "builder_as_bytes_window_param",
+                    1,
+                    vec![word.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &word),
+                        local_of(2, &string),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                        local_of(5, &shared),
+                        local_of(6, &window),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &string), 1, 5)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &string), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(4, &unit),
+                                2,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, &shared),
+                                ref_rvalue(place_of(2, &string), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(5, &shared))],
+                                place_of(6, &window),
+                                3,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(6, &window))],
+                                place_of(0, &unit),
+                                4,
+                                5,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                string_new_decl(),
+                string_push_str_decl(),
+                string_as_bytes_decl(),
+                opaque_decl(4, &["fixture", "g"], vec![window.clone()], unit),
+            ],
+        );
+        assert!(
+            has_path_leaf(&graph, crate::runtime_names::shims::STRINGBUILDER_BUILD),
+            "as_bytes of a builder into a window param must ll_build: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(&graph, "as_bytes"),
+            "as_bytes must not stay residual: {graph:#?}"
+        );
+        let new_ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::STRINGBUILDER_NEW) =>
+                {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        let fed_by_new =
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } => {
+                        let leaf = segments.last().map(String::as_str);
+                        let watches_g = leaf == Some("g");
+                        let watches_window = leaf
+                            == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                            || leaf == Some("__strlen");
+                        (watches_g || watches_window)
+                            && args.iter().any(|arg| new_ids.contains(&arg.id()))
+                    }
+                    _ => false,
+                });
+        assert!(
+            !fed_by_new,
+            "g (or the window conversion feeding it) must not take the StringBuilder: {graph:#?}"
+        );
+    }
+
+    /// `String::new(); s.push_str(x); g(s.as_ref())` with `g(&[u8])`.
+    /// `<String as AsRef<[u8]>>::as_ref` is `as_bytes`, so `ll_build`
+    /// (`AbstractStringBuilderRepr.rtype_method_build`) makes the receiver
+    /// a `Ptr(STR)` and the window dest is a W1 STR view of the built
+    /// string rather than a residual `as_ref` of the builder.
+    #[test]
+    fn builder_as_ref_bytes_into_window_param_builds_the_str() {
+        let string = string_adt();
+        let word = word_ty();
+        let unit = unit_ty();
+        let borrow = ref_string("Mut");
+        let shared = ref_string("Shared");
+        let window = window_shared_slice();
+        let graph = lower_owned_concat(
+            "builder_as_ref_window_param",
+            vec![string_decl()],
+            vec![
+                subject_decl(
+                    "builder_as_ref_window_param",
+                    1,
+                    vec![word.clone()],
+                    unit.clone(),
+                    vec![
+                        local_of(0, &unit),
+                        local_of(1, &word),
+                        local_of(2, &string),
+                        local_of(3, &borrow),
+                        local_of(4, &unit),
+                        local_of(5, &shared),
+                        local_of(6, &window),
+                    ],
+                    vec![
+                        bb(vec![], call_term(1, vec![], place_of(2, &string), 1, 5)),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(3, &borrow),
+                                ref_rvalue(place_of(2, &string), "Mut"),
+                            )],
+                            call_term(
+                                2,
+                                vec![move_op(place_of(3, &borrow)), copy_op(place_of(1, &word))],
+                                place_of(4, &unit),
+                                2,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![assign_stmt(
+                                place_of(5, &shared),
+                                ref_rvalue(place_of(2, &string), "Shared"),
+                            )],
+                            call_term(
+                                3,
+                                vec![move_op(place_of(5, &shared))],
+                                place_of(6, &window),
+                                3,
+                                5,
+                            ),
+                        ),
+                        bb(
+                            vec![],
+                            call_term(
+                                4,
+                                vec![move_op(place_of(6, &window))],
+                                place_of(0, &unit),
+                                4,
+                                5,
+                            ),
+                        ),
+                        bb(vec![], json!("Return")),
+                        bb(vec![], json!("UnwindResume")),
+                    ],
+                ),
+                string_new_decl(),
+                string_push_str_decl(),
+                string_as_ref_bytes_decl(),
+                opaque_decl(4, &["fixture", "g"], vec![window.clone()], unit),
+            ],
+        );
+        assert!(
+            has_path_leaf(&graph, crate::runtime_names::shims::STRINGBUILDER_BUILD),
+            "as_ref of a builder into a window param must ll_build: {graph:#?}"
+        );
+        assert!(
+            !has_path_leaf(&graph, "as_ref"),
+            "as_ref must not stay residual: {graph:#?}"
+        );
+        let new_ids: std::collections::HashSet<u64> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str)
+                    == Some(crate::runtime_names::shims::STRINGBUILDER_NEW) =>
+                {
+                    op.result.as_ref().map(|v| v.id())
+                }
+                _ => None,
+            })
+            .collect();
+        let fed_by_new =
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } => {
+                        let leaf = segments.last().map(String::as_str);
+                        let watches_g = leaf == Some("g");
+                        let watches_window = leaf
+                            == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+                            || leaf == Some("__strlen");
+                        (watches_g || watches_window)
+                            && args.iter().any(|arg| new_ids.contains(&arg.id()))
+                    }
+                    _ => false,
+                });
+        assert!(
+            !fed_by_new,
+            "g (or the window conversion feeding it) must not take the StringBuilder: {graph:#?}"
+        );
     }
 
     /// `Wtf8Buf::new(); buf.push_str(s); Deref::deref(&buf).as_bytes()` —
