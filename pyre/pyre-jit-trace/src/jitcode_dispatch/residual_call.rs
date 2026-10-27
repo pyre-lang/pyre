@@ -6035,20 +6035,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
                     && let Some(idx) = info.static_field_index_by_name("last_instr")
                 {
-                    // Record under the PARENT-STRUCT field descr, the resolution
-                    // `vable_setfield` applies through `vable_static_record_descr`;
-                    // `vable_setfield_descr` is a raw pass-through and does not.
-                    // The vinfo's own `static_field_descrs[i]` numbers the field by
-                    // the vinfo `[token, statics, arrays]` order, which diverges
-                    // from PyFrame's struct declaration order, so the store pairs
-                    // against the wrong slot.  `virtualizable.py:71` builds the
-                    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
-                    // upstream's vinfo descr and the descr an ordinary
-                    // `setfield_gc` carries are one object and the question cannot
-                    // arise there.  Here it decides whether this publish and
+                    // Record under `cpu.fielddescrof(VTYPE, name)`, the listed
+                    // SizeDescr row `VirtualizableInfo.__init__` stores in
+                    // `static_field_descrs`. That is the same Arc an ordinary
+                    // `setfield_gc` carries, so this publish and
                     // `emit_traceback_node`'s store — same frame, same offset —
-                    // supersede each other or survive as two independent
-                    // locations flushed in an arbitrary order.
+                    // supersede each other.
                     let descr = info.static_field_struct_descr(idx);
                     ctx.trace_ctx
                         .vable_setfield_descr(vable_ref, last_instr, descr);
@@ -7840,9 +7832,8 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     );
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let idx = info.static_field_index_by_name("last_instr")?;
-    // Parent-struct descr, matching the publish in
-    // `try_execute_residual_call_via_executor_inner`: the vinfo's own static
-    // descr numbers fields in vinfo order, which is not PyFrame's.
+    // Listed `cpu.fielddescrof` row, matching the publish in
+    // `try_execute_residual_call_via_executor_inner`.
     let descr = info.static_field_struct_descr(idx);
     ctx.trace_ctx
         .vable_setfield_descr(vable_ref, last_instr, descr);

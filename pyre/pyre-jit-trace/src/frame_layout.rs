@@ -364,4 +364,115 @@ mod tests {
             "finalize_arc stamps get_vinfo on the listed geometry"
         );
     }
+
+    /// `virtualizable.py` `static_field_descrs = [cpu.fielddescrof(VTYPE, name)
+    /// for name in static_fields]`: each vinfo static descr is the
+    /// `PYFRAME_DESCR_GROUP` row, `static_field_by_descrs` keys those rows,
+    /// and `descr.vinfo = self` is stamped on them.
+    #[test]
+    fn pyframe_vinfo_static_field_descrs_are_the_size_descrs_listed_rows() {
+        let info = build_pyframe_virtualizable_info();
+        let listed: [(&str, majit_ir::DescrRef); 4] = [
+            ("last_instr", crate::descr::pyframe_next_instr_descr()),
+            ("pycode", crate::descr::pyframe_code_descr()),
+            ("valuestackdepth", crate::descr::pyframe_stack_depth_descr()),
+            ("debugdata", crate::descr::pyframe_debugdata_descr()),
+        ];
+        assert_eq!(info.static_fields.len(), listed.len());
+        for (i, (name, group_row)) in listed.iter().enumerate() {
+            assert_eq!(info.static_fields[i].name, *name);
+            let vinfo_row = super::pyframe_static_field_descr(i as u16);
+            assert!(
+                std::sync::Arc::ptr_eq(&vinfo_row, group_row),
+                "static_field_descrs[{i}] ({name}) is the PYFRAME_DESCR_GROUP row"
+            );
+            assert_eq!(
+                info.static_field_by_descr(group_row),
+                Some(i),
+                "static_field_by_descrs keys the listed {name} row"
+            );
+            let fd = vinfo_row.as_field_descr().expect("static FieldDescr");
+            assert!(
+                fd.get_vinfo().is_some(),
+                "finalize_arc stamps get_vinfo on listed {name}"
+            );
+            assert!(std::sync::Arc::ptr_eq(
+                &info.static_field_struct_descr(i),
+                &vinfo_row
+            ));
+        }
+    }
+
+    /// `virtualizable.py` `array_field_descrs = [cpu.fielddescrof(VTYPE, name)
+    /// for name in array_fields]`: the locals array-pointer descr is the
+    /// `locals_cells_stack_w` group row.
+    #[test]
+    fn pyframe_vinfo_array_field_descr_is_the_locals_cells_stack_w_row() {
+        let info = build_pyframe_virtualizable_info();
+        let listed = crate::descr::pyframe_locals_cells_stack_descr();
+        let vinfo_row = super::pyframe_array_field_descr(0);
+        assert!(
+            std::sync::Arc::ptr_eq(&vinfo_row, &listed),
+            "array_field_descrs[0] is the locals_cells_stack_w group row"
+        );
+        assert_eq!(info.array_field_by_descr(&listed), Some(0));
+        assert!(
+            vinfo_row
+                .as_field_descr()
+                .expect("array FieldDescr")
+                .get_vinfo()
+                .is_some(),
+            "finalize_arc stamps get_vinfo on listed locals_cells_stack_w"
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            &info.array_pointer_struct_descr(0),
+            &vinfo_row
+        ));
+    }
+
+    /// HeapCache keys `CacheEntry` on `Descr::index()`. Writing
+    /// `PyFrame.locals_cells_stack_w` (array pointer or items) must not
+    /// clear the `FrameDebugData.w_f_trace` entry — the two descrs are
+    /// distinct interned objects (`descr.py get_field_descr`).
+    #[test]
+    fn writing_locals_cells_stack_w_keeps_w_f_trace_heapcache_entry() {
+        use majit_ir::{Descr, OpRef};
+        use majit_metainterp::heapcache::{
+            HeapCache, HeapCacheViewMut, SameConstantOracle, TestHeapcBoxes,
+        };
+
+        struct IdentityOracle;
+        impl SameConstantOracle for IdentityOracle {
+            fn same_constant(&self, a: OpRef, b: OpRef) -> bool {
+                a == b
+            }
+        }
+        const ORACLE: &dyn SameConstantOracle = &IdentityOracle;
+
+        let locals = super::pyframe_array_field_descr(0);
+        let items = super::pyframe_array_item_descr(0);
+        let w_f_trace = crate::descr::frame_debug_data_w_f_trace_descr();
+        assert_ne!(locals.index(), w_f_trace.index());
+        assert_ne!(items.index(), w_f_trace.index());
+        assert_ne!(locals.index(), 0);
+        assert_ne!(w_f_trace.index(), 0);
+
+        let mut cache = HeapCache::new();
+        let mut boxes = TestHeapcBoxes::new();
+        let mut view = HeapCacheViewMut::new(&mut cache, &mut boxes);
+        let frame = OpRef::ref_op(0);
+        let debugdata = OpRef::ref_op(1);
+        let array = OpRef::ref_op(2);
+        let trace_fn = OpRef::ref_op(3);
+        let item = OpRef::ref_op(4);
+
+        view.getfield_now_known(debugdata, w_f_trace.index(), trace_fn, ORACLE);
+        view.setfield_cached(frame, locals.index(), array, ORACLE);
+        view.setarrayitem_cache(array, Some(0), items.index(), item, ORACLE);
+        assert_eq!(
+            view.getfield_cached(debugdata, w_f_trace.index(), ORACLE),
+            Some(trace_fn),
+            "a locals_cells_stack_w write must not clear the w_f_trace CacheEntry"
+        );
+    }
 }
