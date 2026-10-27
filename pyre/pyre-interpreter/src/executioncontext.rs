@@ -2671,9 +2671,7 @@ impl ExecutionContext {
         crate::baseobjspace::space_builtin()
     }
 
-    /// Direct lookup into the builtins storage, bypassing the dict-object
-    /// wrapper (whose internal hash table does not see entries inserted
-    /// through `install_default_builtins` on the underlying DictStorage).
+    /// Direct lookup into the builtins storage.
     /// Used by `LOAD_GLOBAL` / `LOAD_NAME` to reach builtins like `print`
     /// when the frame's `w_globals` lacks the name (pypy/interpreter/
     /// pyopcode.py LOAD_GLOBAL builtin fallback).

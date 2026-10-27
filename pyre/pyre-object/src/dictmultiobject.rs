@@ -9527,6 +9527,24 @@ mod tests {
     }
 
     #[test]
+    fn mstrategy_store_invalidates_quasi_immutable_watchers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let md = w_module_dict_new();
+        unsafe {
+            let flag = Arc::new(AtomicBool::new(false));
+            let token = crate::quasiimmut::test_loop_token(&flag);
+            (*(md as *const W_ModuleDictObject))
+                .mutate_mstrategy()
+                .get_current_qmut_instance()
+                .register_loop_token(&token);
+            assert!(!flag.load(Ordering::Acquire));
+            w_module_dict_switch_to_object_strategy(md);
+            assert!(flag.load(Ordering::Acquire));
+        }
+    }
+
+    #[test]
     fn strategy_holder_kind_matches_the_singleton() {
         assert_eq!(object_dict_strategy_ref().kind, StrategyKind::Object);
         assert_eq!(empty_dict_strategy_ref().kind, StrategyKind::Empty);

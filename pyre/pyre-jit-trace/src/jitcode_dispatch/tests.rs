@@ -3309,6 +3309,7 @@ fn opref_concrete_keeps_a_no_concrete_ref_null() {
 fn portal_may_force_records_the_callee_execution_context() {
     use pyre_interpreter::compile_exec;
 
+    pyre_interpreter::test_hooks::install_hash_hook();
     extern "C" fn portal_runner_stub() -> i64 {
         0
     }
@@ -7616,6 +7617,7 @@ fn read_retired_callee_local(
 /// `LOAD_FAST_CHECK` never sees a null live word behind a stale shadow.
 #[test]
 fn null_live_vable_slot_reads_null_not_the_shadow() {
+    pyre_interpreter::test_hooks::install_hash_hook();
     let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
     let code = function
         .constants

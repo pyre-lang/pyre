@@ -14263,6 +14263,9 @@ mod tests {
 
     #[test]
     fn materialized_inline_frame_slots_are_symbolic_heap_reads() {
+        // libtest runs each test on a fresh thread; `HASH_W_HOOK` is TLS
+        // and `space.builtin` is built once per process.
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let values = [w_int_new(11), pyre_object::w_none(), w_int_new(33)];
@@ -14318,6 +14321,7 @@ mod tests {
 
     #[test]
     fn materialized_inline_frame_consumes_pending_ref_array_write() {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(a, b):\n    return a\n");
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let values = [w_int_new(11), w_int_new(22)];
@@ -14365,6 +14369,7 @@ mod tests {
         // (resume.py consume_boxes), so the image must not be read
         // for it: the caller's `overlay_stream_ref_slots` owns that slot and
         // would otherwise be overwriting a stale array entry.
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code).expect("frame allocation");
         let values = [w_int_new(11), w_int_new(22), w_int_new(33)];
@@ -15281,6 +15286,7 @@ mod tests {
     fn trace_too_long_publishes_forwarded_for_iter_stack_and_coordinate() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(xs):\n    for x in xs:\n        pass\n");
         let mut live = PyFrame::new(code).expect("frame allocation");
         let mut snapshot = live.snapshot_for_tracing().expect("frame allocation");
@@ -15662,6 +15668,7 @@ mod tests {
     fn test_pypyjit_live_values_with_ec_insert_execution_context_after_frame() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
@@ -15862,6 +15869,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_interpreter::{ConstantData, compile_exec};
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
             .expect("test code should compile");
         let code = module
@@ -15999,6 +16007,7 @@ mod tests {
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = PyFrame::new(code.clone()).expect("frame allocation");
         frame.fix_array_ptrs();
@@ -16102,6 +16111,7 @@ mod tests {
     fn test_virtualizable_array_lengths_uses_full_array() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = PyFrame::new(code).expect("frame allocation");
         frame.fix_array_ptrs();
@@ -16291,6 +16301,7 @@ mod tests {
         use majit_metainterp::jitcode::JitCodeBuilder;
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
 
         let raw_code = compile_exec("len(x)").expect("test code should compile");
@@ -16547,6 +16558,7 @@ mod tests {
         use majit_ir::resumedata::RebuiltValue;
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
         let raw_code = compile_exec("None").expect("test code should compile");
         let mut frame = PyFrame::new(raw_code).expect("frame allocation");
@@ -17152,6 +17164,7 @@ mod tests {
     fn bridge_semantic_maps_keep_width_but_drop_pcdep_at_non_live_jitcode_offset() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
 
         let raw_code = compile_exec("x = 1").expect("test code should compile");
@@ -17277,6 +17290,7 @@ mod tests {
     fn test_close_loop_args_uses_full_root_virtualizable_array_capacity() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
         let code = compile_exec("len(x)").expect("test code should compile");
         let mut frame = PyFrame::new(code).expect("frame allocation");
@@ -17451,6 +17465,7 @@ mod tests {
     fn merge_point_stack_depth_recovers_the_header_depth() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
         let code = compile_exec("for i in x:\n    pass\n").expect("test code should compile");
         let mut frame = PyFrame::new(code).expect("frame allocation");

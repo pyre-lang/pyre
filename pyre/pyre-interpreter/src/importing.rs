@@ -1995,6 +1995,7 @@ fn builtin_modules_get(
         );
         return Ok(Some(w_builtin));
     }
+    let _ = execution_context;
     let (static_name, module_def) = {
         let table = BUILTIN_MODULES.lock();
         let Some((static_name, def)) = table.get_key_value(name) else {
@@ -9726,6 +9727,27 @@ mod tests {
         assert!(
             matches!(normalized.components().next(), Some(Component::Prefix(_))),
             "{normalized:?}"
+        );
+    }
+
+    #[test]
+    fn space_builtin_is_the_builtins_module() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let _ = crate::baseobjspace::ensure_space_builtin();
+        install_builtin_modules();
+        let space = crate::baseobjspace::space_builtin();
+        let table = builtin_modules_get("builtins", std::ptr::null())
+            .expect("builtins table lookup")
+            .expect("builtins table entry");
+        assert!(
+            std::ptr::eq(space, table),
+            "space.builtin is the builtins table entry"
+        );
+        let ec = crate::PyExecutionContext::default();
+        assert!(
+            std::ptr::eq(space, ec.get_builtin()),
+            "ExecutionContext::get_builtin is space.builtin"
         );
     }
 }

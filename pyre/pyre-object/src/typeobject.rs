@@ -1400,10 +1400,11 @@ pub unsafe fn w_type_read_version_tag_field(obj: PyObjectRef) -> u64 {
 /// invariant required by the object and pointer arguments for the entire call.
 #[majit_macros::dont_look_inside]
 pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
-    w_type_notify_mutate_version_tag(obj);
-    (*(obj as *const W_TypeObject))
-        .version_tag
-        .store(v, std::sync::atomic::Ordering::Release);
+    let t = obj as *const W_TypeObject;
+    crate::quasi_immut_store!((*t).mutate_version_tag() =>
+        (*t).version_tag
+            .store(v, std::sync::atomic::Ordering::Release);
+    );
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for this type's

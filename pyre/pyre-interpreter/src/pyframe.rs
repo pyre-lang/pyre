@@ -8279,4 +8279,29 @@ x = 7
         );
         assert_eq!(boxed.w_builtin, roots.get(installed_slot));
     }
+
+    #[test]
+    fn frame_without_builtin_field_reads_space_builtin() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let _ = crate::baseobjspace::ensure_space_builtin();
+        let code = crate::compile_exec("x = 1\n").expect("compile");
+        let w_code = crate::pycode::box_code_constant(&code);
+        let globals = pyre_object::w_dict_new();
+        let frame = super::createframe_obj(w_code as *const (), globals, std::ptr::null(), None)
+            .expect("frame");
+        assert!(
+            frame.w_builtin.is_null(),
+            "ordinary constructors store NULL"
+        );
+        let space = crate::baseobjspace::space_builtin();
+        assert!(
+            std::ptr::eq(frame.get_builtin(), space),
+            "NULL field reads space.builtin"
+        );
+        assert!(
+            std::ptr::eq(crate::PyExecutionContext::default().get_builtin(), space),
+            "same-thread ExecutionContext::get_builtin is space.builtin"
+        );
+    }
 }
