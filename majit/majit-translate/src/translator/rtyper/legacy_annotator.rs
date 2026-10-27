@@ -102,7 +102,7 @@ pub fn annotate_with_bookkeeper(graph: &FunctionGraph, bookkeeper: Option<&Rc<Bo
                     };
                     let incoming = typed_null_raw_incoming(bookkeeper, &op.kind)
                         .unwrap_or(Incoming::Flat(inferred));
-                    if merge_binding(result, incoming, bookkeeper) {
+                    if merge_op_result(result, incoming, bookkeeper) {
                         changed = true;
                     }
                 }
@@ -317,6 +317,28 @@ fn merge_value_type(
     merge_binding(dst, Incoming::Flat(src_ty), bookkeeper)
 }
 
+/// Op-result binding (`annrpython.py consider_op` → `setbinding`): the
+/// op's annotation is recomputed, not unioned with a second source.
+/// `infer_op_type` is a `ValueType` projection with no flags or classdef,
+/// so an existing instance annotation that projects to the same type is
+/// what the op already produced and is kept.
+fn merge_op_result(
+    var: &Variable,
+    incoming: Incoming,
+    bookkeeper: Option<&Rc<Bookkeeper>>,
+) -> bool {
+    if let Incoming::Flat(ty) = &incoming
+        && matches!(
+            read_binding_some(var).as_deref(),
+            Some(SomeValue::Instance(_))
+        )
+        && read_binding(var) == declared_ref_valuetype(ty.clone(), bookkeeper)
+    {
+        return false;
+    }
+    merge_binding(var, incoming, bookkeeper)
+}
+
 /// Join `incoming` into `var.annotation`. Instance unions go through
 /// `union` (`annrpython.py mergeinputargs`, `binaryop.py
 /// pairtype(SomeInstance, SomeInstance).union`) so `can_be_None` is
@@ -396,13 +418,6 @@ fn merge_instance_pair(var: &Variable, existing: &SomeValue, incoming_sv: &SomeV
 
 fn merge_flat(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>) -> bool {
     let ty = declared_ref_valuetype(ty, bookkeeper);
-    // A flat `ValueType` cannot add flags or a classdef the existing
-    // annotation already has.
-    let has_annotation = var.annotation.borrow().is_some();
-    let existing_is_none = matches!(read_binding_some(var).as_deref(), Some(SomeValue::None_(_)));
-    if has_annotation && !existing_is_none && read_binding(var) == ty {
-        return false;
-    }
     let incoming = shell_for(&ty, bookkeeper);
     if let (Some(existing), Some(incoming_sv)) = (read_binding_some(var), incoming.as_ref())
         && matches!(
@@ -1025,8 +1040,11 @@ mod tests {
         );
     }
 
+    /// Op-result re-inference keeps flags (`annrpython.py consider_op`
+    /// `setbinding`); a same-class flat shell on a link intersects them
+    /// (`binaryop.py pairtype(SomeInstance, SomeInstance).union`).
     #[test]
-    fn flat_merge_keeps_existing_flags_and_class() {
+    fn op_result_keeps_flags_link_flat_intersects_them() {
         use crate::annotator::classdesc::ClassDef;
 
         let bk = Rc::new(Bookkeeper::new());
@@ -1036,16 +1054,21 @@ mod tests {
             .unwrap_or_else(|| ClassDef::new_standalone("bytecode::CodeObject", None));
         let mut flags = std::collections::BTreeMap::new();
         flags.insert("access_directly".to_string(), true);
-        let mut graph = FunctionGraph::new("flat_merge_keeps_flags");
-        let var = graph.alloc_value_var();
-        *var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(SomeInstance::new(
-            Some(classdef.clone()),
-            false,
-            flags,
-        ))));
-        let before = read_binding_some(&var);
+        let mut graph = FunctionGraph::new("op_result_keeps_flags");
+        let seed =
+            |graph: &mut FunctionGraph| {
+                let var = graph.alloc_value_var();
+                *var.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(
+                    SomeInstance::new(Some(classdef.clone()), false, flags.clone()),
+                )));
+                var
+            };
         let name = classdef.borrow().name.clone();
-        let changed = merge_binding(
+
+        // (a) op-result re-inference keeps the existing instance annotation.
+        let var = seed(&mut graph);
+        let before = read_binding_some(&var);
+        let changed = merge_op_result(
             &var,
             Incoming::Flat(ValueType::Ref(Some(name.clone()))),
             Some(&bk),
@@ -1056,18 +1079,17 @@ mod tests {
             (Some(a), Some(b)) => {
                 assert!(Rc::ptr_eq(a, b) || a == b);
             }
-            _ => panic!("flat merge must keep the existing annotation"),
+            _ => panic!("op-result merge must keep the existing annotation"),
         }
 
-        let var2 = graph.alloc_value_var();
-        let mut flags = std::collections::BTreeMap::new();
-        flags.insert("access_directly".to_string(), true);
-        *var2.annotation.borrow_mut() = Some(Rc::new(SomeValue::Instance(SomeInstance::new(
-            Some(classdef.clone()),
-            false,
-            flags,
-        ))));
-        merge_binding(&var2, Incoming::Flat(ValueType::Ref(Some(name))), None);
+        // (b) same keep with no bookkeeper.
+        let var2 = seed(&mut graph);
+        let changed = merge_op_result(
+            &var2,
+            Incoming::Flat(ValueType::Ref(Some(name.clone()))),
+            None,
+        );
+        assert!(!changed);
         match read_binding_some(&var2).as_deref() {
             Some(SomeValue::Instance(inst)) => {
                 assert!(
@@ -1079,6 +1101,28 @@ mod tests {
                 assert_eq!(inst.flags.get("access_directly"), Some(&true));
             }
             other => panic!("expected flagged instance, got {other:?}"),
+        }
+
+        // (c) a link-join flat shell intersects flags (keeps a flag only
+        // when both sides have it).
+        let var3 = seed(&mut graph);
+        let changed = merge_binding(&var3, Incoming::Flat(ValueType::Ref(Some(name))), Some(&bk));
+        assert!(changed);
+        match read_binding_some(&var3).as_deref() {
+            Some(SomeValue::Instance(inst)) => {
+                assert!(
+                    inst.classdef
+                        .as_ref()
+                        .is_some_and(|cd| Rc::ptr_eq(cd, &classdef)),
+                    "classdef must stay"
+                );
+                assert!(
+                    inst.flags.is_empty(),
+                    "flat shell has no flags, union drops them; got {:?}",
+                    inst.flags
+                );
+            }
+            other => panic!("expected instance with empty flags, got {other:?}"),
         }
     }
 
