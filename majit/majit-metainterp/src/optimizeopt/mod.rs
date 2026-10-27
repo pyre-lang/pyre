@@ -3166,11 +3166,16 @@ impl OptContext {
     }
 
     /// `replace_op_with`: carry the terminal's `Info` onto `new_op`, then
-    /// `old.set_forwarded(new_op)`. `ptr_eq` skips a one-node cycle, including
-    /// when the terminal walk already landed on `new_op`.
+    /// `old.set_forwarded(new_op)` except for a void result. `ptr_eq` skips a
+    /// one-node cycle, including when the terminal walk already landed on
+    /// `new_op`.
     pub(crate) fn link_replaced_producer(old: &majit_ir::OpRc, new_op: &majit_ir::OpRc) {
         use majit_ir::forwarding::ForwardingHost;
         if OpRc::ptr_eq(old, new_op) {
+            return;
+        }
+        // optimizer.py `replace_op_with`: a void result is not forwarded.
+        if new_op.result_type() == Type::Void {
             return;
         }
         let terminal = Operand::from_bound_op(old).get_box_replacement(false);

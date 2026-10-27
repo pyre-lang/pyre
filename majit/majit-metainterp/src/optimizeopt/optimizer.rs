@@ -41,9 +41,13 @@ use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes};
 /// optimizer.py OptimizationResult: result of an optimization pass.
 #[derive(Debug)]
 pub enum OptimizationResult {
-    /// Emit this operation (possibly modified).
+    /// optimizer.py `Optimization.emit`: hand this (possibly modified) op to
+    /// the next pass; only the final emission after the walk appends it. An
+    /// unchanged opcode is stamped onto the walked-in op, a changed one
+    /// becomes the producer at that position before the next pass runs.
     Emit(Op),
-    /// Replace with a different operation; continue with the next pass.
+    /// Replace with a different operation and continue with the next pass;
+    /// the new op is minted at final emission.
     Replace(Op),
     /// optimizer.py `send_extra_operation(newop, opt=None)` — re-dispatch
     /// the new op from the first optimization, dropping the original.
@@ -5162,14 +5166,18 @@ impl Optimizer {
         // pass-through reaches final emission structurally identical to the
         // recorder input op, so only then may emit reuse that input op as the
         // producer (one box per value); a Replace mints a distinct op that is
-        // not the operand-wrapped input op.
+        // not the operand-wrapped input op. An opcode-changing `Emit` mints
+        // its producer at once (`minted`), so only `Replace` defers minting.
         let mut replaced = false;
+        // The producer an opcode-changing `Emit` minted (`replace_op_with`);
+        // later passes, postprocess and final emission use it in place of `op_rc`.
+        let mut minted: Option<majit_ir::OpRc> = None;
 
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
             let result = {
                 let pass = &mut self.passes[pass_idx];
-                pass.propagate_forward(&current_op, op_rc, ctx)
+                pass.propagate_forward(&current_op, minted.as_ref().unwrap_or(op_rc), ctx)
             };
             // A leaf site deep in the pass may have recorded a deferred
             // `InvalidLoop` (e.g. `get_const_info_mut_box`) while still
@@ -5195,15 +5203,20 @@ impl Optimizer {
                     if self.passes[pass_idx].have_postprocess_op(op.opcode) {
                         postprocess_passes.push(pass_idx);
                     }
-                    if op.opcode == op_rc.opcode {
+                    let walk_rc = minted.as_ref().unwrap_or(op_rc);
+                    if op.opcode == walk_rc.opcode && op.num_args() == walk_rc.num_args() {
                         // heap.py optimize_SETFIELD_GC ends in emit(op) of the
                         // same ResOperation: stamp it onto the walked-in op so
-                        // the `!replaced` fall-through appends that one Rc.
-                        OptContext::stamp_emitted_op(&op, op_rc);
+                        // the fall-through appends that one Rc.
+                        OptContext::stamp_emitted_op(&op, walk_rc);
                     } else {
-                        // An opcode change mints a second object at this
-                        // position; the fall-through mints and links it.
-                        replaced = true;
+                        // rewrite.py `replace_op_with`: the new op becomes the
+                        // producer at this position before the next pass sees it;
+                        // this also covers an argument-count change.
+                        let created = OpRc::new(op.clone());
+                        OptContext::link_replaced_producer(walk_rc, &created);
+                        minted = Some(created);
+                        replaced = false;
                     }
                     current_op = std::borrow::Cow::Owned(op);
                 }
@@ -5261,7 +5274,11 @@ impl Optimizer {
                     // RPython's send_extra_operation does not unwind these —
                     // they belong to the original chain.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&current_op, op_rc, ctx);
+                        self.passes[pp_idx].propagate_postprocess(
+                            &current_op,
+                            minted.as_ref().unwrap_or(op_rc),
+                            ctx,
+                        );
                     }
                     self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
@@ -5279,7 +5296,11 @@ impl Optimizer {
                     // `opt_results` collected before it still run, in reverse.
                     // Same loop as the Restart arm above.
                     for &pp_idx in postprocess_passes.iter().rev() {
-                        self.passes[pp_idx].propagate_postprocess(&current_op, op_rc, ctx);
+                        self.passes[pp_idx].propagate_postprocess(
+                            &current_op,
+                            minted.as_ref().unwrap_or(op_rc),
+                            ctx,
+                        );
                     }
                     self.drain_pending_finish_guard_postprocess(ctx);
                     return Ok(());
@@ -5301,14 +5322,15 @@ impl Optimizer {
         }
 
         // If no pass handled it, emit as-is. An unreplaced pass-through is the
-        // recorder input op verbatim (args re-resolved), so emit may append
-        // that same Rc — no second ResOperation().
+        // recorder input op verbatim (args re-resolved) or an Emit-minted
+        // producer, so emit may append that same Rc — no second ResOperation().
         let emitted_rc = if !replaced {
-            self.emit_operation_inner(op_rc.clone(), ctx, true)?;
-            op_rc.clone()
+            let rc = minted.unwrap_or_else(|| op_rc.clone());
+            self.emit_operation_inner(rc.clone(), ctx, true)?;
+            rc
         } else {
             let created = OpRc::new((*current_op).clone());
-            OptContext::link_replaced_producer(op_rc, &created);
+            OptContext::link_replaced_producer(minted.as_ref().unwrap_or(op_rc), &created);
             self.emit_operation_inner(created.clone(), ctx, false)?;
             created
         };
