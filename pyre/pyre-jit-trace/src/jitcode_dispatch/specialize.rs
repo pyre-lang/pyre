@@ -9751,6 +9751,7 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     let _roots = pyre_object::gc_roots::push_roots();
     let concrete_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(concrete);
+    super::assert_int_bank_box(raw, "walker_box_int");
     let new_op = crate::helpers::emit_box_int_inline(
         ctx.trace_ctx,
         raw,
@@ -16602,7 +16603,10 @@ pub(crate) fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker
 ///
 /// The parent re-executes the Python opcode from this `-live-`. On a
 /// loop-header opcode that is the op2 `-live-` after `jit_merge_point`
-/// (`jtransform.py handle_jit_marker__jit_merge_point`).
+/// (`jtransform.py handle_jit_marker__jit_merge_point`). Converted helpers
+/// use this twin so COMPARE_OP re-pops its operands. CallResult collapse
+/// uses [`collapsed_call_result_resume_marker`]: the opcode-start twin
+/// re-runs the pops after `_opimpl_setarrayitem_vable` already wrote NULL.
 pub(crate) fn collapsed_parent_resume_marker(
     payload: &crate::PyJitCode,
     jit_pc: usize,
@@ -16610,6 +16614,26 @@ pub(crate) fn collapsed_parent_resume_marker(
     payload
         .resume_marker_for_jitcode_pc(jit_pc)
         .map(|m| loop_header_guard_resume_marker(payload, m))
+}
+
+/// Parent resume coordinate for a collapsed [`HelperReturn::CallResult`]
+/// helper. The parent re-executes the CALL from this `-live-`.
+///
+/// `get_list_of_active_boxes` (`pyjitpl.py`) keys a plain guard at
+/// `pc = self.pc - SIZE_LIVE_OP`. `handle_regular_call` /
+/// `handle_residual_call` (`jtransform.py`) emit that preceding `-live-`
+/// after the pops, with the CALL args still in registers. A portal
+/// CallResult helper is not numbered (`capture_resumedata` only numbers
+/// `framestack` `MIFrame`s; `portal_helper_call_result_does_not_number_a_call_entry_section`),
+/// so this is the CALL-entry seat. [`collapsed_parent_resume_marker`] is
+/// the opcode-start twin and would re-run those pops on the NULL slots
+/// `_opimpl_setarrayitem_vable` already wrote.
+pub(crate) fn collapsed_call_result_resume_marker(
+    payload: &crate::PyJitCode,
+    call_jit_pc: usize,
+) -> Option<usize> {
+    super::resume_snapshot::preceding_live_marker(payload, call_jit_pc)
+        .or_else(|| collapsed_parent_resume_marker(payload, call_jit_pc))
 }
 
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
@@ -16659,10 +16683,12 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     } else {
         unsafe {
             let jc = &*sym.jitcode();
-            (
-                jc.index as u32,
-                collapsed_parent_resume_marker(&jc.payload, op_pc),
-            )
+            let marker = if nested_entry.ret == HelperReturn::CallResult {
+                collapsed_call_result_resume_marker(&jc.payload, op_pc)
+            } else {
+                collapsed_parent_resume_marker(&jc.payload, op_pc)
+            };
+            (jc.index as u32, marker)
         }
     };
     // `_opimpl_setfield_vable` already left the abort-point scalars on the
@@ -20267,6 +20293,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
     // `SetfieldGc(intval=current)` shape allocation removal virtualizes.  Do
     // not feed it through pointer arithmetic: locally consumed items stay
     // virtual, while normal forcing materializes escaping items.
+    super::assert_int_bank_box(current, "walker_box_int");
     let item = crate::state::wrapint(ctx.trace_ctx, current);
 
     // Tracing executes the real range cursor advance.  The direct helper is

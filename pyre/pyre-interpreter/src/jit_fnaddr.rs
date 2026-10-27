@@ -235,6 +235,33 @@ extern "C" fn ll_list_obj_resize_ge_word(obj: i64, newsize: i64) {
     }
 }
 
+/// `descr.py CallDescr.create_call_stub`: call with the actual RESULT type,
+/// then cast to Signed. A raw `-> bool` target defines only the low byte of
+/// the result on x86, while our residual dispatcher reads a whole word.
+/// `w_list_append_inner` inlines these strategy gates
+/// (`is_float_strategy_item` / `is_bytes_strategy_item` /
+/// `is_ascii_strategy_item`); their jitcodes stay symbolic until the
+/// widened address is published.
+extern "C" fn is_float_strategy_item_word(item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::is_float_strategy_item_word");
+    unsafe {
+        pyre_object::listobject::is_float_strategy_item(item as usize as pyre_object::PyObjectRef)
+            as i64
+    }
+}
+
+extern "C" fn is_bytes_strategy_item_word(item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::is_bytes_strategy_item_word");
+    pyre_object::listobject::is_bytes_strategy_item(item as usize as pyre_object::PyObjectRef)
+        as i64
+}
+
+extern "C" fn is_ascii_strategy_item_word(item: i64) -> i64 {
+    majit_ir::icf_identity!("jit_fnaddr::is_ascii_strategy_item_word");
+    pyre_object::listobject::is_ascii_strategy_item(item as usize as pyre_object::PyObjectRef)
+        as i64
+}
+
 /// One-word residual ABI for `w_dict_lookup_int_strategy`. A miss is NULL.
 /// `Option<PyObjectRef>` is two words with no pointer niche, so the Rust
 /// item would return the `Some` discriminant; `llmodel.py bh_call_r` reads
@@ -4699,6 +4726,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::W_ListObject::object_push",
         pyre_object::W_ListObject::object_push,
     );
+    // Charon method graphs keep the defining module
+    // (`listobject::W_ListObject::object_push`). The 2-segment key above is
+    // `fnaddr_for_target`'s `CallTarget::Method` fallback; the 3-segment key
+    // is what `get_jitcode` resolves for that graph.
+    up2!(
+        &mut entries,
+        "pyre_object::listobject::W_ListObject::object_push",
+        pyre_object::W_ListObject::object_push,
+    );
     p2!(
         &mut entries,
         "pyre_object::IntArray::push",
@@ -4706,8 +4742,33 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     );
     p2!(
         &mut entries,
+        "pyre_object::int_array::IntArray::push",
+        pyre_object::IntArray::push,
+    );
+    p2!(
+        &mut entries,
         "pyre_object::FloatArray::push",
         pyre_object::FloatArray::push,
+    );
+    p2!(
+        &mut entries,
+        "pyre_object::BytesArray::push",
+        pyre_object::bytes_array::BytesArray::push,
+    );
+    p2!(
+        &mut entries,
+        "pyre_object::bytes_array::BytesArray::push",
+        pyre_object::bytes_array::BytesArray::push,
+    );
+    p1!(
+        &mut entries,
+        "pyre_object::BytesArray::spare_capacity",
+        pyre_object::bytes_array::BytesArray::spare_capacity,
+    );
+    p1!(
+        &mut entries,
+        "pyre_object::bytes_array::BytesArray::spare_capacity",
+        pyre_object::bytes_array::BytesArray::spare_capacity,
     );
     // The same resume needs the jitcode *shells* it inline-calls to carry a
     // real address: `blackhole.py bhimpl_inline_call_ir_v bhimpl_inline_call_*` calls
@@ -4792,6 +4853,71 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::ll_list_obj_resize_ge",
         ll_list_obj_resize_ge_word,
     );
+    // Guard-failure resume walks `w_list_append` from pc 15 and inlines
+    // `w_list_append_inner`. `blackhole.py bhimpl_inline_call_*` then needs
+    // a callable `jitcode.fnaddr` (`call.py getfunctionptr(graph)`); a
+    // `symbolic_fnaddr_for_path` hash aborts the bridge. The inner body's
+    // remaining callees after `switch/id` are the same residual surface.
+    upa1!(
+        &mut entries,
+        "pyre_object::listobject::w_list_lock_release",
+        "pyre_object::w_list_lock_release",
+        pyre_object::listobject::w_list_lock_release,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::listobject::plain_int_w",
+        "pyre_object::plain_int_w",
+        pyre_object::listobject::plain_int_w,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::floatobject::w_float_get_value",
+        "pyre_object::w_float_get_value",
+        pyre_object::floatobject::w_float_get_value,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::bytesobject::w_bytes_block",
+        "pyre_object::w_bytes_block",
+        pyre_object::bytesobject::w_bytes_block,
+    );
+    upa1!(
+        &mut entries,
+        "pyre_object::unicodeobject::w_str_storage",
+        "pyre_object::w_str_storage",
+        pyre_object::unicodeobject::w_str_storage,
+    );
+    // Bool strategy gates: `descr.py CallDescr.create_call_stub` widens
+    // RESULT to Signed. A raw `-> bool` target defines only `al` on SysV
+    // x86_64 (`bh_try_gc_owns_object`).
+    cpa1!(
+        &mut entries,
+        "pyre_object::listobject::is_float_strategy_item",
+        "pyre_object::is_float_strategy_item",
+        is_float_strategy_item_word,
+    );
+    cpa1!(
+        &mut entries,
+        "pyre_object::listobject::is_bytes_strategy_item",
+        "pyre_object::is_bytes_strategy_item",
+        is_bytes_strategy_item_word,
+    );
+    cpa1!(
+        &mut entries,
+        "pyre_object::listobject::is_ascii_strategy_item",
+        "pyre_object::is_ascii_strategy_item",
+        is_ascii_strategy_item_word,
+    );
+    // `int_or_float_encode_item` / `int_or_float_encode_int` return
+    // `Option<i64>`. The jitcode boxes that as a GcRef (`new` +
+    // discriminant `setfield_gc_i` + `ref_return`); the native item is
+    // two registers with no pointer niche (`ResidualRet`). Publishing
+    // either the raw fn or a one-word adapter would return the Some
+    // discriminant, not a boxed option. `option::Option::is_some` on that
+    // GcRef is the same graph. Leave them symbolic; residualize of the
+    // now-callable inner shell does not interpret those bodies.
+
     // The fold descends the Option-returning Rust body. Residual/blackhole
     // calls use the one-word bridges: `Option<PyObjectRef>` has no pointer
     // niche, so the raw function would return the Some discriminant.
@@ -7992,8 +8118,9 @@ mod tests {
         dict_entries_insert_hashed_word, dict_entries_key_obj_at_word,
         dict_entries_probe_hashed_word, dict_entries_probe_object_word,
         dyn_impl_vtable_addr_for_path, dyn_impl_vtable_const_path, dyn_impl_vtables,
-        finditem_str_named_word, is_abi_unsound_argument_residual, is_dyn_impl_vtable_const_path,
-        is_exact_type_word, is_list_write_barrier, is_plain_int1_word,
+        finditem_str_named_word, is_abi_unsound_argument_residual, is_ascii_strategy_item_word,
+        is_bytes_strategy_item_word, is_dyn_impl_vtable_const_path, is_exact_type_word,
+        is_float_strategy_item_word, is_list_write_barrier, is_plain_int1_word,
         is_pyframe_operand_stack_accessor, is_rerunnable_bookkeeping_residual,
         jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs,
         ll_list_ascii_resize_ge_word, ll_list_float_resize_ge_word, ll_list_int_resize_ge_word,
@@ -8642,6 +8769,57 @@ mod tests {
             pyre_object::listobject::is_plain_int1 as *const () as usize as i64,
             "must not publish the bool-returning item"
         );
+    }
+
+    #[test]
+    fn list_append_inner_fnaddrs_are_callable() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let inner = pyre_object::listobject::w_list_append_inner as *const () as usize as i64;
+        for path in [
+            "pyre_object::listobject::w_list_append_inner",
+            "pyre_object::w_list_append_inner",
+        ] {
+            assert_eq!(bindings.get(path), Some(&inner), "missing {path}");
+        }
+        let object_push = pyre_object::W_ListObject::object_push as *const () as usize as i64;
+        assert_eq!(
+            bindings.get("pyre_object::listobject::W_ListObject::object_push"),
+            Some(&object_push),
+            "Charon 3-segment object_push"
+        );
+        let int_push = pyre_object::IntArray::push as *const () as usize as i64;
+        assert_eq!(
+            bindings.get("pyre_object::int_array::IntArray::push"),
+            Some(&int_push),
+            "Charon 3-segment IntArray::push"
+        );
+        let bytes_push = pyre_object::bytes_array::BytesArray::push as *const () as usize as i64;
+        for path in [
+            "pyre_object::bytes_array::BytesArray::push",
+            "pyre_object::BytesArray::push",
+        ] {
+            assert_eq!(bindings.get(path), Some(&bytes_push), "missing {path}");
+        }
+        for (path, expected) in [
+            (
+                "pyre_object::listobject::is_float_strategy_item",
+                is_float_strategy_item_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::listobject::is_bytes_strategy_item",
+                is_bytes_strategy_item_word as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::listobject::is_ascii_strategy_item",
+                is_ascii_strategy_item_word as *const () as usize as i64,
+            ),
+        ] {
+            assert_eq!(
+                bindings.get(path).copied(),
+                Some(occupied_published_addr(path, expected)),
+                "{path} must widen the bool before the residual reads a word"
+            );
+        }
     }
 
     #[test]

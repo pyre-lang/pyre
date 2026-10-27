@@ -9464,6 +9464,8 @@ pub(crate) fn write_residual_call_result_to_dst<Sym: WalkSym>(
     dst_bank: char,
     result: OpRef,
 ) -> Result<(), DispatchError> {
+    // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+    super::ensure_resultbox_type_for_bank(ctx, pc, dst_bank, result)?;
     // concrete_of_opref shadow write: route the shadow write through `concrete_of_opref`
     // so a CallPure* descr whose argboxes are all constant (do_residual_call
     // path that lands a constant result via the executor.execute_varargs
@@ -10935,7 +10937,15 @@ pub(crate) fn record_ordinary_residual_after_execute<Sym: WalkSym>(
     let rewrite_first = list_write_barrier && list_wb_records_before_invalidate(ctx, funcptr);
     // `box_value` temporaries end with the predicate. A `Value::Ref` copied
     // here would not be a root across the record below.
-    let pure = call_opcode.is_call_pure() && value.is_some();
+    // `MIFrame.execute_varargs`: `if pure and not last_exc_value and op`.
+    // A raising `bh_call_*` still boxes a dummy word (`executor.py _do_call`),
+    // so `value` is `Some`; `record_result_of_call_pure` must not fold it.
+    let last_exc_set = ctx.last_exc_value().is_some()
+        || matches!(
+            ctx.last_exc_value_concrete(),
+            ConcreteValue::Ref(p) if !p.is_null()
+        );
+    let pure = call_opcode.is_call_pure() && value.is_some() && !last_exc_set;
     let args_known = pure
         && allboxes
             .iter()

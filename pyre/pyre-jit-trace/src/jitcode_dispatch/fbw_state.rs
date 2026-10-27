@@ -4012,7 +4012,10 @@ pub(crate) fn fbw_ensure_boxed_for_ca<Sym: WalkSym>(
     };
     let _ = op_pc;
     let boxed = match ty {
-        Type::Int => crate::state::wrapint(ctx.trace_ctx, value),
+        Type::Int => {
+            assert_int_bank_box(value, "walker_box_int");
+            crate::state::wrapint(ctx.trace_ctx, value)
+        }
         Type::Float => crate::state::wrapfloat(ctx.trace_ctx, value),
         Type::Ref | Type::Void => value,
     };
@@ -4073,7 +4076,8 @@ pub(crate) fn fbw_record_top_level_frame_finished<Sym: WalkSym>(
 
 /// Shared top-level finish path for the three value-returning arms
 /// (`ref_return` / `int_return` / `float_return`).  Re-boxes `result` to
-/// `Type::Ref`, publishes the return coordinate into `last_instr`, and stashes
+/// `Type::Ref`, publishes the return coordinate into `last_instr`, forces
+/// the walker's virtualizable image onto the live portal frame, and stashes
 /// the finish payload for `full_body_walk_trace`.  Deliberately
 /// does NOT record the `FINISH` op: under the gate the compile consumer
 /// (`finish_and_compile` -> `recorder.finish`, mod.rs) records it from
@@ -4091,6 +4095,7 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 ) -> Result<(OpRef, Type), DispatchError> {
     let finish_value = fbw_ensure_boxed_for_ca(ctx, op_pc, result)?;
     fbw_publish_exit_last_instr(ctx, op_pc);
+    fbw_force_virtualizable_to_live_frame(ctx);
     let payload = (finish_value, Type::Ref);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     Ok(payload)
@@ -4098,7 +4103,8 @@ pub(crate) fn fbw_terminate_with_finish<Sym: WalkSym>(
 
 /// Void variant of [`fbw_terminate_with_finish`] for the top-level
 /// `void_return/` portal exit (`compile_done_with_this_frame`'s VOID
-/// branch, pyjitpl.py).  Publishes the return coordinate, then stashes a
+/// branch, pyjitpl.py).  Publishes the return coordinate, forces the
+/// walker's virtualizable image onto the live portal frame, then stashes a
 /// `Type::Void`-marked payload so
 /// [`crate::trace::full_body_walk_trace`] builds a `TraceAction::Finish`
 /// with no args (`done_with_this_frame_descr_from_types(&[])` resolves the
@@ -4111,9 +4117,65 @@ pub(crate) fn fbw_terminate_void_with_finish<Sym: WalkSym>(
     op_pc: usize,
 ) -> Result<(OpRef, Type), DispatchError> {
     fbw_publish_exit_last_instr(ctx, op_pc);
+    fbw_force_virtualizable_to_live_frame(ctx);
     let payload = (OpRef::NONE, Type::Void);
     ctx.session.borrow_mut().finish_payload = Some(payload);
     Ok(payload)
+}
+
+/// Write the walker's virtualizable image onto the live portal frame
+/// before a top-level Finish is delivered.
+///
+/// `gen_store_back_in_vable` (`pyjitpl.py`) `execute_and_record`s
+/// SETFIELD_GC / SETARRAYITEM_GC, so tracing mutates the real
+/// virtualizable before `compile_done_with_this_frame`. The walker
+/// records those ops (`TraceCtx::gen_store_back_in_vable`, cpu=None)
+/// and a standard-portal `setfield_vable_i_imm` updates
+/// `virtualizable_boxes` without `store_live_frame_static_int`.
+/// `FinishConcrete::Return` then hands `Done` without a blackhole, so
+/// `valuestackdepth` and the post-pop slots stay on the boxes.
+///
+/// `interp_jit.py` `PyFrame.dispatch` `except Yield` does
+/// `hint(self, force_virtualizable=True)` then `return w_result`;
+/// compiled FINISH and `bhimpl_ref_return` force the same way. Write
+/// the boxes onto `WalkSession::recording_frame_ptr` (the live
+/// `PyFrame` `dispatch_via_miframe` seeded).
+pub(crate) fn fbw_force_virtualizable_to_live_frame<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) {
+    let frame = ctx.session.borrow().recording_frame_ptr;
+    if frame == 0 {
+        return;
+    }
+    fbw_arm_durable_frame_undo(frame);
+    if crate::state::flush_known_virtualizable_to_frame(ctx.trace_ctx, frame) {
+        return;
+    }
+    // `write_boxes` declines the whole image when any slot is Void /
+    // NO_CONCRETE. A portal Finish still owes the live frame every
+    // known static Int (`valuestackdepth`, `last_instr`) and every
+    // known array item — the same fields `setfield_vable_i_imm` /
+    // `setarrayitem_vable` already hold in the boxes.
+    let Some(info) = ctx.trace_ctx.virtualizable_info() else {
+        return;
+    };
+    let static_count = info.num_static_extra_boxes;
+    for index in 0..static_count {
+        if let Some((_, Value::Int(n))) = ctx.trace_ctx.virtualizable_entry_at(index) {
+            crate::state::store_live_frame_static_int(frame, index, n);
+        }
+    }
+    let Some(len) = crate::state::concrete_frame_array_len(frame) else {
+        return;
+    };
+    for j in 0..len {
+        let Some((_, value)) = ctx.trace_ctx.virtualizable_entry_at(static_count + j) else {
+            continue;
+        };
+        match value {
+            Value::Void => {}
+            Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE => {}
+            other => crate::state::store_live_frame_array_slot(frame, j, other),
+        }
+    }
 }
 
 /// Publish the exiting instruction's Python coordinate into the standard

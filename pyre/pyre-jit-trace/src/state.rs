@@ -916,10 +916,18 @@ pub fn ensure_build_time_jitcode_at(index: usize) -> Option<std::sync::Arc<crate
 
     let canonical = crate::jitcode_runtime::get_jitcode_by_index(index)?;
     let runtime = majit_metainterp::JitCode::from_canonical((*canonical).clone());
+    // Assembler `has_abort_flag` is not serialized on frozen helper
+    // JitCode. Scan the body so the published flag matches `abort/`
+    // in the bytecode (`ssa_emitter.rs` `has_abort_flag`). Capture
+    // still numbers per-pc (`helper_resume_can_reach_abort`);
+    // `call_jit.rs` `resolve_jitcode` keeps the transparent-helper
+    // exemption that flag would otherwise impose.
+    let has_abort =
+        crate::jitcode_runtime::decoded_ops(runtime.code.as_slice()).any(|op| op.opname == "abort");
     let payload = std::sync::Arc::new(crate::PyJitCode::from_core_degenerate(
         std::sync::Arc::new(runtime),
         std::ptr::null(),
-        false,
+        has_abort,
     ));
     install_build_time_jitcode_at(index, std::sync::Arc::clone(&payload));
     Some(payload)
@@ -2333,9 +2341,10 @@ pub fn depth_based_vsd_for_wcode(w_code: usize, py_pc: usize) -> Option<usize> {
 /// wrapper is a managed-heap `CODE_TYPE` and `try_gc_owns_object` is the
 /// range check that does not deref. A synthetic test green
 /// (`const_ref(0x1_0000)`) is neither: decline so `w_code_get_ptr` does
-/// not load `code_ptr` from PAGEZERO. Unit tests that have a real frame
-/// pass the raw `CodeObject*` (`pyframe_get_pycode`); `createframe`
-/// registers that pointer as the live-wrapper key.
+/// not load `code_ptr` from PAGEZERO. A real-frame wrapper — GC-owned, or
+/// a unit-test leaked `Box` whose owns-object hook is not installed —
+/// still unwraps through `w_code_get_ptr` (`PyFrame.pycode`,
+/// `live_root_code_key`).
 fn w_code_as_raw_code_object(w_code: usize) -> Option<*const pyre_interpreter::CodeObject> {
     if w_code == 0 {
         return None;
@@ -2343,13 +2352,16 @@ fn w_code_as_raw_code_object(w_code: usize) -> Option<*const pyre_interpreter::C
     if !pyre_interpreter::live_code_wrapper(w_code as *const ()).is_null() {
         return Some(w_code as *const pyre_interpreter::CodeObject);
     }
-    if !pyre_object::gc_hook::try_gc_owns_object(w_code as pyre_object::gc_hook::GCREF) {
+    if w_code <= 0x1_0000 {
         return None;
     }
-    if !unsafe { py_type_check(w_code as PyObjectRef, &pyre_interpreter::pycode::CODE_TYPE) } {
+    let obj = w_code as PyObjectRef;
+    if pyre_object::gc_hook::try_gc_owns_object(obj as pyre_object::gc_hook::GCREF)
+        && !unsafe { py_type_check(obj, &pyre_interpreter::pycode::CODE_TYPE) }
+    {
         return None;
     }
-    let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as PyObjectRef) };
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(obj) };
     if raw.is_null() { None } else { Some(raw) }
 }
 
@@ -9594,12 +9606,15 @@ fn reconstruct_helper_mi_frame_recipe(
     let Some(pjc) = pyjitcode_for_jitcode_index(frame.jitcode_index) else {
         decline!("HelperNoPjc");
     };
-    if pjc.has_abort_opcode() {
-        decline!("HelperHasAbort");
-    }
     let pc = frame.pc as usize;
     if !pjc.jitcode.can_decode_live_vars(pc, op_live()) {
         decline!("HelperNoLive");
+    }
+    // Whole-helper `has_abort_opcode` would refuse an Integer-arm pc of
+    // a body that still has `abort/` on another arm. The blackhole is
+    // seated at this section's pc (`convert_and_run_from_pyjitpl`).
+    if crate::jitcode_dispatch::helper_resume_can_reach_abort(frame.jitcode_index as usize, pc) {
+        decline!("HelperHasAbort");
     }
     let reg_indices = frame_liveness_reg_indices_by_bank_from_pc(frame.jitcode_index, frame.pc);
     let values: Vec<&majit_ir::resumedata::RebuiltValue> = frame.values.iter().collect();
@@ -17972,7 +17987,14 @@ pub(crate) fn assemble_bridge_inline_pending(
 /// catching middle that cannot be reconstructed declines before any
 /// `carrier_ec_leave` shortens `topframeref`.
 fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
-    !recipe.len_tail && !recipe.ctor_tail && reconstructed_callee_recipe_is_portable(recipe)
+    // A decoded `frame` red is already in the trace (`consume_boxes` /
+    // `decode_ref_color_bank`) before `prepare_resume_from_failure`.
+    // Emitting another PyFrame would be the constructor-fingerprint
+    // second frame `resume.py` never builds.
+    !recipe.len_tail
+        && !recipe.ctor_tail
+        && reconstructed_callee_recipe_is_portable(recipe)
+        && recipe.frame.is_none()
 }
 
 /// Stamp a resume-decoded GCREF onto its box (`RefFrontendOp._resref` /
