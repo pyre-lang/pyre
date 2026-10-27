@@ -170,7 +170,7 @@ fn identity_forward(op: &SpaceOperation) -> Option<Carry> {
     match &op.kind {
         OpKind::UnaryOp {
             op: name, operand, ..
-        } if crate::codewriter::jtransform::is_same_as_identity_unary(name) => op
+        } if crate::codewriter::jtransform::is_same_as_follow_unary(name) => op
             .result
             .as_ref()
             .map(|var| Carry::Forward(operand.id(), var.id())),
@@ -1366,11 +1366,20 @@ pub enum RwOperand {
         array_type_id: Option<String>,
         ir_type: majit_ir::value::Type,
         len_offset: Option<usize>,
+        /// `consider_array(T)` (`effectinfo.py`): `ARRAY.OF is not Void`
+        /// and `isinstance(ARRAY, lltype.GcArray)`.
+        consider: bool,
     },
     InteriorField {
         array_type_id: Option<String>,
         field_name: String,
         len_offset: Option<usize>,
+        /// `isinstance(T, lltype.Array) and consider_array(T)`
+        /// (`effectinfo.py` extraef loop / `add_interiorfield`).
+        consider: bool,
+        /// `getattr(T.OF, fieldname) is lltype.Void`
+        /// (`effectinfo.py` `add_interiorfield`).
+        field_is_void: bool,
     },
 }
 
@@ -1510,11 +1519,14 @@ impl FreshMallocs {
                 };
                 this.allvariables.insert(result.clone());
                 match &op.kind {
-                    // `malloc` / `malloc_varsize` / `new`.
+                    // `malloc` / `malloc_varsize` / `new`. A raw-flavor
+                    // malloc lowers to `OpKind::RawMalloc`
+                    // (`OpKind::raw_malloc_with_flags`).
                     OpKind::New { .. }
                     | OpKind::NewWithVtable { .. }
                     | OpKind::NewArray { .. }
-                    | OpKind::NewArrayClear { .. } => continue,
+                    | OpKind::NewArrayClear { .. }
+                    | OpKind::RawMalloc { .. } => continue,
                     // The allocator Call is that `malloc` before
                     // `jtransform.py rewrite_op_malloc` lowers it to `new`.
                     OpKind::Call { target, .. } if is_lltype_malloc_target(target) => continue,
@@ -11601,6 +11613,11 @@ impl CallControl {
                         {
                             break 'walk true;
                         }
+                        OpKind::LoweredBlackholeOp { opname, .. }
+                            if llop_canmallocgc(opname) =>
+                        {
+                            break 'walk true;
+                        }
                         // The Call is the llop, not a graph to recurse into.
                         // `CollectAnalyzer.analyze_simple_operation` answers
                         // True only for `malloc` / `malloc_varsize` with
@@ -12563,7 +12580,238 @@ impl CallControl {
                 array_type_id,
                 graphinfo,
             ),
+            // `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`):
+            // `gc_add_memory_pressure` returns `top_set`.
+            OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_add_memory_pressure" => {
+                ReadWriteEffects::top_result()
+            }
+            // `WriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`):
+            // `gc_store_indexed` is empty when `args[0]` is a fresh malloc,
+            // else `_gc_store_indexed_result` (`op.args[4]`).
+            OpKind::LoweredBlackholeOp { opname, args } if opname == "gc_store_indexed" => {
+                if let Some(LinkArg::Value(base)) = args.first()
+                    && graphinfo.fresh_mallocs.is_fresh_malloc(base)
+                {
+                    ReadWriteEffects::bottom_result()
+                } else {
+                    self.readwrite_gc_indexed(args, 4, false)
+                }
+            }
+            // `ReadWriteAnalyzer.analyze_simple_operation` (`writeanalyze.py`):
+            // `gc_load_indexed` is `_gc_load_indexed_result` (`op.args[3]`),
+            // with no freshness skip.
+            OpKind::LoweredBlackholeOp { opname, args } if opname == "gc_load_indexed" => {
+                self.readwrite_gc_indexed(args, 3, true)
+            }
             _ => ReadWriteEffects::bottom_result(),
+        }
+    }
+
+    /// `_gc_store_indexed_result` / `_gc_load_indexed_result`
+    /// (`writeanalyze.py`): effect of the `AddressOffset` at `offset_index`.
+    fn readwrite_gc_indexed(
+        &self,
+        args: &[LinkArg],
+        offset_index: usize,
+        read: bool,
+    ) -> ReadWriteEffects {
+        match args.get(offset_index).and_then(linkarg_address_offset) {
+            Some(ofs) => self.readwrite_effect_for_offset(ofs, read),
+            // `_get_effect_for_offset` `assert False, 'implement me'` on a
+            // non-offset (`.value` on a Variable also fails).
+            None => panic!("_get_effect_for_offset: implement me"),
+        }
+    }
+
+    /// `_get_effect_for_offset(self, ofs, prefix='')` (`writeanalyze.py`),
+    /// mapped into this analyzer's [`ReadWriteEffects`]. The effect depends
+    /// only on the offset: a FieldOffset is always
+    /// `(prefix + 'interiorfield', Ptr(TYPE), fldname)`, an ArrayItemsOffset
+    /// `(prefix + 'array', Ptr(TYPE))`. `consider_array` /
+    /// `add_interiorfield` (`effectinfo.py`) filter at publish time via
+    /// [`RwOperand`] `consider`.
+    fn readwrite_effect_for_offset(
+        &self,
+        ofs: &crate::translator::rtyper::lltypesystem::llmemory::AddressOffset,
+        read: bool,
+    ) -> ReadWriteEffects {
+        use crate::translator::rtyper::lltypesystem::llmemory::AddressOffset;
+        match ofs {
+            AddressOffset::CompositeOffset(composite) => {
+                let first = &composite.offsets[0];
+                for sub in composite.offsets.iter().skip(1) {
+                    match sub {
+                        AddressOffset::ArrayItemsOffset(_) => {}
+                        _ => panic!("_get_effect_for_offset: implement me"),
+                    }
+                }
+                self.readwrite_effect_for_offset(first, read)
+            }
+            AddressOffset::FieldOffset(offset) => {
+                use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+                if let Some(arr) = offset_array(&offset.TYPE) {
+                    let consider = consider_array(arr);
+                    // `getattr(T.OF, fieldname) is lltype.Void`
+                    // (`effectinfo.py` `add_interiorfield`).
+                    let field_is_void = !match &arr.OF {
+                        LowLevelType::Struct(st) => st
+                            .getattr_field_type(&offset.fldname)
+                            .is_some_and(|ty| !matches!(ty, LowLevelType::Void)),
+                        _ => false,
+                    };
+                    let (array_type_id, len_offset) = if consider {
+                        let array_type_id = Some(array_type_id_of_lltype(arr));
+                        let len_offset = array_len_offset_from_hints(arr);
+                        (array_type_id, len_offset)
+                    } else {
+                        (Some(arr._short_name()), None)
+                    };
+                    let tag = if read {
+                        RwTag::ReadInteriorField
+                    } else {
+                        RwTag::InteriorField
+                    };
+                    let index = self
+                        .descr_indices
+                        .interiorfield_index(&array_type_id, &offset.fldname);
+                    ReadWriteEffects::singleton(
+                        RwKey {
+                            tag,
+                            index,
+                            owner_id: None,
+                        },
+                        RwOperand::InteriorField {
+                            array_type_id,
+                            field_name: offset.fldname.clone(),
+                            len_offset,
+                            consider,
+                            field_is_void,
+                        },
+                    )
+                } else if let Some(st) = offset_struct(&offset.TYPE) {
+                    // `_get_effect_for_offset` (`writeanalyze.py`) still
+                    // returns `('interiorfield', Ptr(T), fldname)` for a
+                    // FieldOffset over a Struct. `add_interiorfield`
+                    // (`effectinfo.py`) returns without a descr
+                    // ("let's not consider structs for now") via
+                    // `consider: false`.
+                    let array_type_id = Some(st._name.clone());
+                    let tag = if read {
+                        RwTag::ReadInteriorField
+                    } else {
+                        RwTag::InteriorField
+                    };
+                    let index = self
+                        .descr_indices
+                        .interiorfield_index(&array_type_id, &offset.fldname);
+                    ReadWriteEffects::singleton(
+                        RwKey {
+                            tag,
+                            index,
+                            owner_id: None,
+                        },
+                        RwOperand::InteriorField {
+                            array_type_id,
+                            field_name: offset.fldname.clone(),
+                            len_offset: None,
+                            consider: false,
+                            field_is_void: false,
+                        },
+                    )
+                } else if let Some(fsa) = offset_fixedsizearray(&offset.TYPE) {
+                    // `_get_effect_for_offset` (`writeanalyze.py`) still
+                    // returns `('interiorfield', Ptr(T), fldname)` for a
+                    // FieldOffset over a FixedSizeArray. `add_interiorfield`
+                    // (`effectinfo.py`) returns for any non-Array.
+                    let array_type_id = Some(fsa._short_name());
+                    let tag = if read {
+                        RwTag::ReadInteriorField
+                    } else {
+                        RwTag::InteriorField
+                    };
+                    let index = self
+                        .descr_indices
+                        .interiorfield_index(&array_type_id, &offset.fldname);
+                    ReadWriteEffects::singleton(
+                        RwKey {
+                            tag,
+                            index,
+                            owner_id: None,
+                        },
+                        RwOperand::InteriorField {
+                            array_type_id,
+                            field_name: offset.fldname.clone(),
+                            len_offset: None,
+                            consider: false,
+                            field_is_void: false,
+                        },
+                    )
+                } else {
+                    panic!("_get_effect_for_offset: implement me")
+                }
+            }
+            AddressOffset::ArrayItemsOffset(offset) => {
+                if let Some(arr) = offset_array(&offset.0) {
+                    let consider = consider_array(arr);
+                    let item_ty = offset_array_item_value_type(&arr.OF);
+                    let (array_type_id, len_offset) = if consider {
+                        let array_type_id = Some(array_type_id_of_lltype(arr));
+                        let len_offset = array_len_offset_from_hints(arr);
+                        (array_type_id, len_offset)
+                    } else {
+                        (Some(arr._short_name()), None)
+                    };
+                    let tag = if read { RwTag::ReadArray } else { RwTag::Array };
+                    let index = self.descr_indices.array_index(
+                        value_type_discriminant(&item_ty),
+                        &array_type_id,
+                        len_offset,
+                    );
+                    ReadWriteEffects::singleton(
+                        RwKey {
+                            tag,
+                            index,
+                            owner_id: None,
+                        },
+                        RwOperand::Array {
+                            array_type_id,
+                            ir_type: effect_array_ir_type(&item_ty),
+                            len_offset,
+                            consider,
+                        },
+                    )
+                } else if let Some(fsa) = offset_fixedsizearray(&offset.0) {
+                    // `_get_effect_for_offset` (`writeanalyze.py`) returns
+                    // `(prefix + 'array', Ptr(TYPE))` for any array
+                    // container. `consider_array` (`effectinfo.py`) is
+                    // false: a FixedSizeArray is not a GcArray.
+                    let array_type_id = Some(fsa._short_name());
+                    let item_ty = offset_array_item_value_type(&fsa.OF);
+                    let tag = if read { RwTag::ReadArray } else { RwTag::Array };
+                    let len_offset = None;
+                    let index = self.descr_indices.array_index(
+                        value_type_discriminant(&item_ty),
+                        &array_type_id,
+                        len_offset,
+                    );
+                    ReadWriteEffects::singleton(
+                        RwKey {
+                            tag,
+                            index,
+                            owner_id: None,
+                        },
+                        RwOperand::Array {
+                            array_type_id,
+                            ir_type: effect_array_ir_type(&item_ty),
+                            len_offset,
+                            consider: false,
+                        },
+                    )
+                } else {
+                    panic!("_get_effect_for_offset: implement me");
+                }
+            }
+            _ => panic!("_get_effect_for_offset: implement me"),
         }
     }
 
@@ -12665,6 +12913,7 @@ impl CallControl {
                 array_type_id: resolved_id,
                 ir_type: effect_array_ir_type(item_ty),
                 len_offset,
+                consider: true,
             },
         )
     }
@@ -12705,8 +12954,109 @@ impl CallControl {
                 array_type_id: resolved_id,
                 field_name: field_name.to_string(),
                 len_offset,
+                consider: true,
+                field_is_void: false,
             },
         )
+    }
+}
+
+/// `op.args[i].value` when that slot is an `AddressOffset` Constant.
+fn linkarg_address_offset(
+    arg: &LinkArg,
+) -> Option<&crate::translator::rtyper::lltypesystem::llmemory::AddressOffset> {
+    match arg {
+        LinkArg::Const(c) => match &c.value {
+            crate::flowspace::model::ConstValue::AddressOffset(ofs) => Some(ofs),
+            _ => None,
+        },
+        LinkArg::Value(_) => None,
+    }
+}
+
+/// ARRAY container of a FieldOffset / ArrayItemsOffset `TYPE`.
+fn offset_array(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<&crate::translator::rtyper::lltypesystem::lltype::Array> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::Array(arr) => Some(arr),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Array(arr) => Some(arr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// STRUCT container of a FieldOffset `TYPE`.
+fn offset_struct(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<&crate::translator::rtyper::lltypesystem::lltype::Struct> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::Struct(st) => Some(st),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::Struct(st) => Some(st),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// FIXEDSIZEARRAY container of a FieldOffset / ArrayItemsOffset `TYPE`.
+fn offset_fixedsizearray(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Option<&crate::translator::rtyper::lltypesystem::lltype::FixedSizeArray> {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+    match ty {
+        LowLevelType::FixedSizeArray(fsa) => Some(fsa),
+        LowLevelType::Ptr(ptr) => match &ptr.TO {
+            PtrTarget::FixedSizeArray(fsa) => Some(fsa),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The item type is part of the array effect's identity here; an
+/// interior-field array uses the same `Ref` identity as the `extraef` loop in
+/// `effectinfo_from_writeanalyze`, because upstream keys both by `Ptr(ARRAY)`
+/// (`writeanalyze.py` `_get_effect_for_offset`).
+fn offset_array_item_value_type(
+    of: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> crate::model::ValueType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match of {
+        LowLevelType::Struct(_) | LowLevelType::FixedSizeArray(_) | LowLevelType::Array(_) => {
+            crate::model::ValueType::Ref(None)
+        }
+        _ => effect_value_type_from_lltype(of).unwrap_or(crate::model::ValueType::Int),
+    }
+}
+
+/// `consider_array(ARRAY)` (`effectinfo.py`): `ARRAY.OF is not Void` and
+/// `isinstance(ARRAY, lltype.GcArray)`.
+fn consider_array(arr: &crate::translator::rtyper::lltypesystem::lltype::Array) -> bool {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+    !matches!(arr.OF, LowLevelType::Void) && arr._gckind == GcKind::Gc
+}
+
+/// Length-word offset for `cpu.arraydescrof(ARRAY)` / `interiorfielddescrof`.
+/// `descr.py get_array_descr` reads `ARRAY_INSIDE._hints['nolength']`: no
+/// length word (`None`) when that hint is true, else the length sits at 0.
+fn array_len_offset_from_hints(
+    arr: &crate::translator::rtyper::lltypesystem::lltype::Array,
+) -> Option<usize> {
+    if arr
+        ._hints
+        .get("nolength")
+        .and_then(ConstValue::truthy)
+        .unwrap_or(false)
+    {
+        None
+    } else {
+        Some(0)
     }
 }
 
@@ -12829,10 +13179,16 @@ fn add_array(
         array_type_id,
         ir_type,
         len_offset,
+        consider,
     } = operand
     else {
         unreachable!("array effect {operand:?} carries no array");
     };
+    // `consider_array` (`effectinfo.py`): Void OF or a non-GcArray
+    // returns before `cpu.arraydescrof`.
+    if !consider {
+        return;
+    }
     indices.push(index);
     descrs.push(cc.arraydescrof_keyed(index, array_type_id, *ir_type, *len_offset));
 }
@@ -12849,11 +13205,18 @@ fn add_interiorfield(
     let RwOperand::InteriorField {
         array_type_id,
         field_name,
+        consider,
+        field_is_void,
         ..
     } = operand
     else {
         unreachable!("interiorfield effect {operand:?} carries no interior field");
     };
+    // `add_interiorfield` (`effectinfo.py`): not an `lltype.Array`,
+    // not `consider_array`, or a Void field returns before appending.
+    if !consider || *field_is_void {
+        return;
+    }
     indices.push(index);
     if let Some((descr, key)) = cc.interiorfielddescrof_keyed(index, array_type_id, field_name) {
         descrs.push((descr, Some(key)));
@@ -12899,11 +13262,19 @@ pub fn effectinfo_from_writeanalyze(
         let RwOperand::InteriorField {
             array_type_id,
             len_offset,
+            consider,
             ..
         } = operand
         else {
             unreachable!("interiorfield effect {operand:?} carries no interior field");
         };
+        // `effectinfo_from_writeanalyze` extra effects (`effectinfo.py`):
+        // only an interiorfield on a `consider_array` Array is also
+        // recorded as an array effect. The Void-field test belongs to
+        // `add_interiorfield`.
+        if !consider {
+            continue;
+        }
         let index = cc.descr_indices.array_index(
             value_type_discriminant(&crate::model::ValueType::Ref(None)),
             array_type_id,
@@ -12921,6 +13292,7 @@ pub fn effectinfo_from_writeanalyze(
                     array_type_id: array_type_id.clone(),
                     ir_type: majit_ir::value::Type::Ref,
                     len_offset: *len_offset,
+                    consider: true,
                 },
             ));
         }
@@ -14343,14 +14715,17 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         // after rtyping).
         OpKind::GetSlice { .. } => RaiseClass::No,
         // `LoweredBlackholeOp` carries register-shaped blackhole insns
-        // lowered from the rtyper helper graphs.  String allocation
-        // (`newstr`/`newunicode`) has `canraise = (MemoryError,)`; the
-        // read/write/length insns (`strlen`/`strgetitem`/`strsetitem`/
-        // `unicode*`) cannot raise (LL_OPERATIONS `canraise = ()`).
-        OpKind::LoweredBlackholeOp { opname, .. } => match opname.as_str() {
-            "newstr" | "newunicode" => RaiseClass::MemoryErrorOnly,
-            _ => RaiseClass::No,
-        },
+        // (`newstr`/`strlen`/…) and generic llops whose converters keep
+        // `SpaceOperation.args` as mixed `LinkArg`s.  Llops consult
+        // `LL_OPERATIONS[opname].canraise` (`canraise.py
+        // RaiseAnalyzer.analyze_simple_operation`); blackhole-only names
+        // keep `newstr`/`newunicode` as MemoryErrorOnly.
+        OpKind::LoweredBlackholeOp { opname, .. } => {
+            llop_raise_class(opname).unwrap_or_else(|| match opname.as_str() {
+                "newstr" | "newunicode" => RaiseClass::MemoryErrorOnly,
+                _ => RaiseClass::No,
+            })
+        }
         // `LoadStatic` reads a `static` declaration's address — a
         // compile-time constant.  `LOAD_GLOBAL` analog
         // (`flowspace/flowcontext.py`); cannot raise.
@@ -15446,16 +15821,18 @@ fn effect_transduce_op(
                 result,
             );
         }
-        name @ ("cast_ptr_to_adr" | "cast_adr_to_ptr" | "cast_primitive" | "cast_bool_to_int"
-        | "cast_char_to_int" | "cast_int_to_char" | "cast_opaque_ptr" | "cast_pointer"
-        | "cast_int_to_uint" | "cast_uint_to_int") => {
+        name @ ("same_as" | "cast_ptr_to_adr" | "cast_adr_to_ptr" | "cast_primitive"
+        | "cast_bool_to_int" | "cast_char_to_int" | "cast_int_to_char"
+        | "cast_opaque_ptr" | "cast_pointer" | "cast_int_to_uint" | "cast_uint_to_int") => {
+            // `FreshMallocs.__init__` (`writeanalyze.py`) aliases only
+            // `cast_pointer` / `same_as`. Other casts keep their llop name
+            // so their result is nonfresh.
             let operand = effect_materialize(out, block, &op.args[0]);
             let result = effect_expect_var(&op.result);
-            let _ = name;
             out.push_op_with_result_var(
                 block,
                 OpKind::UnaryOp {
-                    op: "same_as".to_string(),
+                    op: name.to_string(),
                     operand,
                     result_ty: effect_value_type_of(&result),
                 },
@@ -15483,35 +15860,33 @@ fn effect_transduce_op(
                 result,
             );
         }
-        name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
-            // `canraise.py analyze_simple_operation` reads
-            // `LL_OPERATIONS[op.opname].canraise`. UnaryOp keeps that
-            // opname so `op_can_raise` / CollectAnalyzer consult
-            // `ll_operations()`. `gc_id`: `LLOp(sideeffects=False,
-            // canmallocgc=True)` so `canraise=(MemoryError,)`.
+        name @ ("gc_id"
+        | "gc_fq_register"
+        | "debug_assert"
+        | "gc_writebarrier"
+        | "gc_add_memory_pressure"
+        | "gc_store_indexed"
+        | "gc_load_indexed") => {
+            // Generic llops keep the original argument list
+            // (`SpaceOperation.args`); analyzers read the opname
+            // (`GraphAnalyzer.analyze_simple_operation`).
+            // `canraise.py RaiseAnalyzer.analyze_simple_operation` /
+            // `collectanalyze.py CollectAnalyzer.analyze_simple_operation`
+            // consult `LL_OPERATIONS[op.opname]`.
+            // `gc_id`: `LLOp(sideeffects=False, canmallocgc=True)` so
+            // `canraise=(MemoryError,)`.
             // `gc_fq_register`: `LLOp()` so `canraise=()`.
             // `debug_assert`: `LLOp(tryfold=True)` so `canraise=()`.
             // `gc_writebarrier`: `LLOp(canrun=True)` so `canraise=()`.
-            // Extra Variable operands stay materialised so they remain
-            // defined; Constant extras (the fq `SpecTag`, the assert
-            // message) are already values. The last arg is the pointer
-            // (or assert-message) operand.
-            let Some((last, rest)) = op.args.split_last() else {
-                panic!("effect_graph_from_rtyped_helper: {name} has no operand");
-            };
-            for arg in rest {
-                if matches!(arg, crate::flowspace::model::Hlvalue::Variable(_)) {
-                    let _ = effect_materialize(out, block, arg);
-                }
-            }
-            let operand = effect_materialize(out, block, last);
+            // `gc_add_memory_pressure` / `gc_store_indexed` / `gc_load_indexed`
+            // keep the same shape so `readwrite_simple_operation` can read
+            // the opname and original operands (`writeanalyze.py`).
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
-                OpKind::UnaryOp {
-                    op: name.to_string(),
-                    operand,
-                    result_ty: effect_value_type_of(&result),
+                OpKind::LoweredBlackholeOp {
+                    opname: name.to_string(),
+                    args: op.args.iter().map(|a| effect_linkarg(a)).collect(),
                 },
                 result,
             );
@@ -15693,22 +16068,17 @@ fn effect_transduce_op(
         }
         "raw_memcopy" => {
             // `lloperation.py`: `LLOp(revdb_protect=True)`.
+            // Generic llops keep the original argument list
+            // (`SpaceOperation.args`); analyzers read the opname
+            // (`GraphAnalyzer.analyze_simple_operation`).
             // `writeanalyze.py analyze_simple_operation` does not
             // record raw memory writes as struct/array field writes.
-            // UnaryOp keeps the llop name so RaiseAnalyzer /
-            // CollectAnalyzer consult `ll_operations()`. The dest
-            // address is `op.args[1]` (`rstr.py copy_string_to_raw`).
-            for arg in &op.args {
-                let _ = effect_materialize(out, block, arg);
-            }
-            let dest = effect_materialize(out, block, &op.args[1]);
             let result = effect_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
-                OpKind::UnaryOp {
-                    op: "raw_memcopy".to_string(),
-                    operand: dest,
-                    result_ty: effect_value_type_of(&result),
+                OpKind::LoweredBlackholeOp {
+                    opname: "raw_memcopy".to_string(),
+                    args: op.args.iter().map(|a| effect_linkarg(a)).collect(),
                 },
                 result,
             );
@@ -27085,7 +27455,7 @@ mod tests {
         assert!(
             converted.iter_block_ops().any(|(_, op)| matches!(
                 &op.kind,
-                OpKind::UnaryOp { op, .. } if op == "gc_fq_register"
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_fq_register"
             )),
             "gc_fq_register stays a simple llop: {:?}",
             converted
@@ -27111,6 +27481,17 @@ mod tests {
             result,
         );
         let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_id"
+            )),
+            "gc_id stays a simple llop: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["gid"]);
         cc.register_function_graph(path.clone(), converted);
@@ -27469,7 +27850,7 @@ mod tests {
     }
 
     /// `lloperation.py`: `raw_memcopy` is `LLOp(revdb_protect=True)`;
-    /// UnaryOp keeps the llop name so analyzers consult `ll_operations()`.
+    /// generic llops keep the original argument list (`SpaceOperation.args`).
     #[test]
     fn effect_graph_raw_memcopy_keeps_opname() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -27478,23 +27859,24 @@ mod tests {
         let dest = variable_with_lltype("dst", LowLevelType::Address);
         let n = variable_with_lltype("n", LowLevelType::Signed);
         let result = variable_with_lltype("v", LowLevelType::Void);
-        let graph = rtyped_one_op(
-            "rmc",
-            "raw_memcopy",
-            vec![
-                crate::flowspace::model::Hlvalue::Variable(src),
-                crate::flowspace::model::Hlvalue::Variable(dest.clone()),
-                crate::flowspace::model::Hlvalue::Variable(n),
-            ],
-            result,
-        );
+        let args = vec![
+            crate::flowspace::model::Hlvalue::Variable(src),
+            crate::flowspace::model::Hlvalue::Variable(dest),
+            crate::flowspace::model::Hlvalue::Variable(n),
+        ];
+        let graph = rtyped_one_op("rmc", "raw_memcopy", args.clone(), result);
         let converted = effect_graph_from_rtyped_helper(&graph);
-        assert!(
-            converted.iter_block_ops().any(|(_, op)| matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, operand, .. }
-                    if op == "raw_memcopy" && operand == &dest
-            )),
+        let got = converted
+            .iter_block_ops()
+            .find_map(|(_, op)| match &op.kind {
+                OpKind::LoweredBlackholeOp { opname, args } if opname == "raw_memcopy" => {
+                    Some(args.clone())
+                }
+                _ => None,
+            });
+        assert_eq!(
+            got,
+            Some(args.iter().map(|a| effect_linkarg(a)).collect()),
             "raw_memcopy: {:?}",
             converted
                 .iter_block_ops()
@@ -27502,6 +27884,1015 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(converted_raise("rmc", graph), CanRaise::No);
+    }
+
+    fn converted_readwrite(
+        name: &str,
+        graph: crate::flowspace::model::FunctionGraph,
+    ) -> ReadWriteEffects {
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(CallPath::from_segments([name]), converted);
+        cc.analyze_readwrite(
+            &CallPath::from_segments([name]),
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        )
+    }
+
+    fn rtyped_one_op_with_inputs(
+        name: &str,
+        opname: &str,
+        inputs: Vec<crate::flowspace::model::Variable>,
+        args: Vec<crate::flowspace::model::Hlvalue>,
+        result: crate::flowspace::model::Variable,
+    ) -> crate::flowspace::model::FunctionGraph {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, FunctionGraph as FlowGraph, Hlvalue, Link, SpaceOperation,
+        };
+        let start = Block::shared(inputs.into_iter().map(Hlvalue::Variable).collect());
+        let graph =
+            FlowGraph::with_return_var(name, start.clone(), Hlvalue::Variable(result.clone()));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            args,
+            Hlvalue::Variable(result.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(result)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        graph
+    }
+
+    /// `WriteAnalyzer.analyze_simple_operation`: `gc_add_memory_pressure`
+    /// returns `top_set`.
+    #[test]
+    fn effect_graph_gc_add_memory_pressure_is_top_readwrite() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op("gamp", "gc_add_memory_pressure", vec![], result);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        assert!(
+            converted.iter_block_ops().any(|(_, op)| matches!(
+                &op.kind,
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "gc_add_memory_pressure"
+            )),
+            "gc_add_memory_pressure: {:?}",
+            converted
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ReadWriteEffects::is_top_result(&converted_readwrite("gamp", graph)),
+            "gc_add_memory_pressure is top_set"
+        );
+    }
+
+    /// `_get_effect_for_offset` always yields an interiorfield tuple for a
+    /// FieldOffset; `add_interiorfield` returns without a descr when `T.TO`
+    /// is not an `lltype.Array` ("let's not consider structs for now").
+    #[test]
+    fn effect_graph_gc_store_indexed_struct_field_offset_has_no_descr() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::gc("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let st_ll = LowLevelType::Struct(Box::new(st));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(st_ll.clone()).expect("struct ptr"));
+        let base = variable_with_lltype("s", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: st_ll,
+            fldname: "x".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_field",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_field", graph);
+        assert!(
+            !ReadWriteEffects::is_top_result(&effects),
+            "struct FieldOffset gc_store_indexed is not top"
+        );
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("struct FieldOffset gc_store_indexed is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::InteriorField);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::InteriorField {
+                    consider: false,
+                    field_name,
+                    ..
+                } if field_name == "x"
+            ),
+            "interiorfield consider:false for a Struct FieldOffset, got {operand:?}"
+        );
+        let mut indices = Vec::new();
+        let mut descrs = Vec::new();
+        add_interiorfield(
+            &mut indices,
+            &mut descrs,
+            key.index,
+            operand,
+            &CallControl::new(),
+        );
+        assert!(indices.is_empty(), "add_interiorfield publishes no index");
+        assert!(descrs.is_empty(), "add_interiorfield publishes no descr");
+    }
+
+    /// `_get_effect_for_offset`: ArrayItemsOffset →
+    /// `(prefix + 'array', Ptr(TYPE))`.
+    #[test]
+    fn effect_graph_gc_store_indexed_array_items_offset_is_array_write() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, ArrayItemsOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let arr = Array::gc(LowLevelType::Signed);
+        let expected_id = array_type_id_of_lltype(&arr);
+        let array_ll = LowLevelType::Array(Box::new(arr));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ll));
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_items",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_items", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("ArrayItemsOffset gc_store_indexed is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::Array);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::Array {
+                    array_type_id,
+                    consider: true,
+                    ..
+                } if array_type_id.as_deref() == Some(expected_id.as_str())
+            ),
+            "array write of Array(Signed), got {operand:?}"
+        );
+    }
+
+    /// `_get_effect_for_offset`: ArrayItemsOffset over a raw (non-GC)
+    /// `Array(Signed)` is an array effect with `consider: false`;
+    /// `add_array` (`effectinfo.py` `consider_array`) publishes nothing.
+    #[test]
+    fn effect_graph_gc_store_indexed_raw_array_items_offset_not_considered() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, ArrayItemsOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let arr = Array::new(LowLevelType::Signed);
+        let array_ll = LowLevelType::Array(Box::new(arr));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ll));
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_raw_items",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_raw_items", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("raw ArrayItemsOffset gc_store_indexed is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::Array);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::Array {
+                    consider: false,
+                    ..
+                }
+            ),
+            "raw Array(Signed) is not consider_array, got {operand:?}"
+        );
+        let mut indices = Vec::new();
+        let mut descrs = Vec::new();
+        add_array(
+            &mut indices,
+            &mut descrs,
+            key.index,
+            operand,
+            &CallControl::new(),
+        );
+        assert!(indices.is_empty(), "add_array publishes no index");
+        assert!(descrs.is_empty(), "add_array publishes no descr");
+    }
+
+    /// FieldOffset over a GC `Array(Struct)` Void field: `add_interiorfield`
+    /// (`effectinfo.py`) returns, but extraef still records the array write.
+    #[test]
+    fn effect_graph_gc_store_indexed_void_interior_field_still_has_extra_array() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new(
+            "S",
+            vec![
+                ("x".to_string(), LowLevelType::Void),
+                ("y".to_string(), LowLevelType::Signed),
+            ],
+        );
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(st)))));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: array_ll,
+            fldname: "x".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_void_ifield",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_void_ifield", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("Void-field FieldOffset gc_store_indexed is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::InteriorField);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::InteriorField {
+                    consider: true,
+                    field_is_void: true,
+                    field_name,
+                    ..
+                } if field_name == "x"
+            ),
+            "Void interior field keeps consider_array, got {operand:?}"
+        );
+        let mut indices = Vec::new();
+        let mut descrs = Vec::new();
+        add_interiorfield(
+            &mut indices,
+            &mut descrs,
+            key.index,
+            operand,
+            &CallControl::new(),
+        );
+        assert!(indices.is_empty(), "add_interiorfield publishes no index");
+        assert!(descrs.is_empty(), "add_interiorfield publishes no descr");
+        let ei = effectinfo_from_writeanalyze(
+            &effects,
+            ExtraEffect::CanRaise,
+            OopSpecIndex::None,
+            false,
+            true,
+            None,
+            "gsi_void_ifield",
+            &CallControl::new(),
+            EffectInfo::_NO_CALL_RELEASE_GIL_TARGET,
+        );
+        assert!(
+            ei._write_descrs_arrays
+                .as_ref()
+                .is_some_and(|v| !v.is_empty()),
+            "extraef still records the array write, got {ei:?}"
+        );
+    }
+
+    /// `writeanalyze.py` `_get_effect_for_offset` keys an ArrayItemsOffset
+    /// by `Ptr(ARRAY)`; `effectinfo_from_writeanalyze` extraef keys the extra
+    /// array effect of an interiorfield the same way. A GcArray of inline
+    /// structs must share that identity so the two set elements dedup.
+    #[test]
+    fn effect_graph_gc_store_indexed_struct_array_items_shares_extraef_array_index() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link,
+            SpaceOperation,
+        };
+        use crate::translator::rtyper::lltypesystem::llmemory::{
+            AddressOffset, ArrayItemsOffset, FieldOffset,
+        };
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(st)))));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let items_ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ll.clone()));
+        let field_ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: array_ll,
+            fldname: "x".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let start = Block::shared(vec![Hlvalue::Variable(base.clone())]);
+        let graph = FlowGraph::with_return_var(
+            "gsi_items_ifield",
+            start.clone(),
+            Hlvalue::Variable(result.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "gc_store_indexed",
+            vec![
+                Hlvalue::Variable(base.clone()),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(items_ofs), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "gc_store_indexed",
+            vec![
+                Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(field_ofs), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(result.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(result)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let converted = effect_graph_from_rtyped_helper(&graph);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(CallPath::from_segments(["gsi_items_ifield"]), converted);
+        let effects = cc.analyze_readwrite(
+            &CallPath::from_segments(["gsi_items_ifield"]),
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        );
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("GcArray(Struct) ArrayItemsOffset + FieldOffset is not top");
+        };
+        let (items_key, _) = set
+            .iter()
+            .find(|(key, _)| key.tag == RwTag::Array)
+            .expect("ArrayItemsOffset array effect");
+        let (ifield_array_type_id, ifield_len_offset) = set
+            .iter()
+            .find(|(key, _)| key.tag == RwTag::InteriorField)
+            .map(|(_, operand)| match operand {
+                RwOperand::InteriorField {
+                    array_type_id,
+                    len_offset,
+                    ..
+                } => (array_type_id, *len_offset),
+                other => panic!("interiorfield operand, got {other:?}"),
+            })
+            .expect("FieldOffset interiorfield effect");
+        let extra_index = cc.descr_indices.array_index(
+            value_type_discriminant(&crate::model::ValueType::Ref(None)),
+            ifield_array_type_id,
+            ifield_len_offset,
+        );
+        assert_eq!(
+            items_key.index, extra_index,
+            "ArrayItemsOffset index vs extraef array_index"
+        );
+    }
+
+    /// `_get_effect_for_offset`: ArrayItemsOffset over a raw (non-GC)
+    /// `Array(LongFloat)` is an array effect with `consider: false`.
+    #[test]
+    fn effect_graph_gc_store_indexed_raw_array_longfloat_items_offset_not_considered() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, ArrayItemsOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let arr = Array::new(LowLevelType::LongFloat);
+        let array_ll = LowLevelType::Array(Box::new(arr));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ll));
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_raw_longfloat",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_raw_longfloat", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("raw Array(LongFloat) ArrayItemsOffset is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::Array);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::Array {
+                    consider: false,
+                    ..
+                }
+            ),
+            "raw Array(LongFloat) is not consider_array, got {operand:?}"
+        );
+    }
+
+    /// `_get_effect_for_offset`: ArrayItemsOffset over a
+    /// `FixedSizeArray(Signed, 3)` is an array effect with `consider: false`.
+    #[test]
+    fn effect_graph_gc_store_indexed_fixedsizearray_items_offset_not_considered() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, ArrayItemsOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArray, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let fsa = FixedSizeArray::new(LowLevelType::Signed, 3);
+        let fsa_ll = LowLevelType::FixedSizeArray(Box::new(fsa));
+        let ptr_ll = LowLevelType::from(Ptr::from_container_type(fsa_ll.clone()).expect("fsa ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(fsa_ll));
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_fsa_items",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_fsa_items", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("FixedSizeArray ArrayItemsOffset is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::Array);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::Array {
+                    consider: false,
+                    ..
+                }
+            ),
+            "FixedSizeArray is not consider_array, got {operand:?}"
+        );
+    }
+
+    /// `_get_effect_for_offset`: FieldOffset over a FixedSizeArray is an
+    /// interiorfield effect with `consider: false`.
+    #[test]
+    fn effect_graph_gc_store_indexed_fixedsizearray_field_offset_not_considered() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{FixedSizeArray, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let fsa = FixedSizeArray::new(LowLevelType::Signed, 3);
+        let fsa_ll = LowLevelType::FixedSizeArray(Box::new(fsa));
+        let ptr_ll = LowLevelType::from(Ptr::from_container_type(fsa_ll.clone()).expect("fsa ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: fsa_ll,
+            fldname: "item0".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_fsa_field",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_fsa_field", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("FixedSizeArray FieldOffset is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::InteriorField);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::InteriorField {
+                    consider: false,
+                    field_is_void: false,
+                    ..
+                }
+            ),
+            "FixedSizeArray FieldOffset is not consider_array, got {operand:?}"
+        );
+    }
+
+    /// `_gc_load_indexed_result` reads `op.args[3]`; `_get_effect_for_offset`
+    /// maps a FieldOffset of an Array to a readinteriorfield tuple.
+    #[test]
+    fn effect_graph_gc_load_indexed_array_of_struct_field_is_read_interiorfield() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Struct(Box::new(st)))));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: array_ll,
+            fldname: "x".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Signed);
+        let graph = rtyped_one_op_with_inputs(
+            "gli_ifield",
+            "gc_load_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gli_ifield", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("FieldOffset gc_load_indexed is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::ReadInteriorField);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::InteriorField {
+                    field_name,
+                    consider: true,
+                    ..
+                } if field_name == "x"
+            ),
+            "readinteriorfield of x, got {operand:?}"
+        );
+    }
+
+    /// `_get_effect_for_offset` ArrayItemsOffset: `len_offset` follows
+    /// `ARRAY._hints['nolength']` (`descr.py get_array_descr`).
+    #[test]
+    fn effect_graph_gc_store_indexed_array_items_offset_len_offset_from_hints() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, ArrayItemsOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        fn items_len_offset(arr: Array, name: &str) -> Option<usize> {
+            let array_ll = LowLevelType::Array(Box::new(arr));
+            let ptr_ll =
+                LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+            let base = variable_with_lltype("a", ptr_ll);
+            let ofs = AddressOffset::ArrayItemsOffset(ArrayItemsOffset(array_ll));
+            let result = variable_with_lltype("v", LowLevelType::Void);
+            let graph = rtyped_one_op_with_inputs(
+                name,
+                "gc_store_indexed",
+                vec![base.clone()],
+                vec![
+                    crate::flowspace::model::Hlvalue::Variable(base),
+                    constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                    constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                    constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                    constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+                ],
+                result,
+            );
+            let effects = converted_readwrite(name, graph);
+            let ReadWriteEffects::Set(set) = &effects else {
+                panic!("{name} ArrayItemsOffset is not top");
+            };
+            match set.first().map(|(_, operand)| operand) {
+                Some(RwOperand::Array { len_offset, .. }) => *len_offset,
+                other => panic!("{name} expected RwOperand::Array, got {other:?}"),
+            }
+        }
+        let nolength = Array::gc_with_hints(
+            LowLevelType::Signed,
+            vec![("nolength".to_string(), ConstValue::Bool(true))],
+        );
+        assert_eq!(items_len_offset(nolength, "gsi_items_nolength"), None);
+        assert_eq!(
+            items_len_offset(Array::gc(LowLevelType::Signed), "gsi_items_length"),
+            Some(0)
+        );
+        // `get_array_descr` (`descr.py`) uses truthiness of
+        // `ARRAY_INSIDE._hints.get('nolength', False)`.
+        assert_eq!(
+            items_len_offset(
+                Array::gc_with_hints(
+                    LowLevelType::Signed,
+                    vec![("nolength".to_string(), ConstValue::Int(1))],
+                ),
+                "gsi_items_nolength_int1",
+            ),
+            None
+        );
+        assert_eq!(
+            items_len_offset(
+                Array::gc_with_hints(
+                    LowLevelType::Signed,
+                    vec![("nolength".to_string(), ConstValue::Int(0))],
+                ),
+                "gsi_items_nolength_int0",
+            ),
+            Some(0)
+        );
+    }
+
+    /// `array_len_offset_from_hints`: `nolength` is truthiness
+    /// (`get_array_descr` / `ARRAY_INSIDE._hints.get('nolength', False)`).
+    #[test]
+    fn array_len_offset_from_hints_uses_truthiness() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType};
+        assert_eq!(
+            array_len_offset_from_hints(&Array::gc_with_hints(
+                LowLevelType::Signed,
+                vec![("nolength".to_string(), ConstValue::Int(1))],
+            )),
+            None
+        );
+        assert_eq!(
+            array_len_offset_from_hints(&Array::gc_with_hints(
+                LowLevelType::Signed,
+                vec![("nolength".to_string(), ConstValue::Int(0))],
+            )),
+            Some(0)
+        );
+    }
+
+    /// `_get_effect_for_offset` FieldOffset: a `nolength` GcArray of
+    /// structs publishes `RwOperand::InteriorField` with `len_offset == None`.
+    #[test]
+    fn effect_graph_gc_store_indexed_nolength_struct_array_field_offset_has_no_len() {
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let arr = Array::gc_with_hints(
+            LowLevelType::Struct(Box::new(st)),
+            vec![("nolength".to_string(), ConstValue::Bool(true))],
+        );
+        let array_ll = LowLevelType::Array(Box::new(arr));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let base = variable_with_lltype("a", ptr_ll);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: array_ll,
+            fldname: "x".to_string(),
+        });
+        let result = variable_with_lltype("v", LowLevelType::Void);
+        let graph = rtyped_one_op_with_inputs(
+            "gsi_nolength_ifield",
+            "gc_store_indexed",
+            vec![base.clone()],
+            vec![
+                crate::flowspace::model::Hlvalue::Variable(base),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            result,
+        );
+        let effects = converted_readwrite("gsi_nolength_ifield", graph);
+        let ReadWriteEffects::Set(set) = &effects else {
+            panic!("nolength FieldOffset gc_store_indexed is not top");
+        };
+        assert_eq!(set.len(), 1);
+        let (key, operand) = set.first().unwrap();
+        assert_eq!(key.tag, RwTag::InteriorField);
+        assert!(
+            matches!(
+                operand,
+                RwOperand::InteriorField {
+                    len_offset: None,
+                    consider: true,
+                    field_name,
+                    ..
+                } if field_name == "x"
+            ),
+            "nolength GcArray(Struct) FieldOffset has len_offset None, got {operand:?}"
+        );
+    }
+
+    /// `WriteAnalyzer.analyze_simple_operation`: `gc_store_indexed` of a
+    /// fresh malloc is `empty_set`.
+    #[test]
+    fn effect_graph_gc_store_indexed_fresh_malloc_is_empty() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link,
+            SpaceOperation,
+        };
+        use crate::translator::rtyper::lltypesystem::llmemory::{AddressOffset, FieldOffset};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rmodel::lowlevel_type_const;
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::gc("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let st_ll = LowLevelType::Struct(Box::new(st));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(st_ll.clone()).expect("struct ptr"));
+        let p = variable_with_lltype("p", ptr_ll);
+        let void = variable_with_lltype("v", LowLevelType::Void);
+        let ofs = AddressOffset::FieldOffset(FieldOffset {
+            TYPE: st_ll.clone(),
+            fldname: "x".to_string(),
+        });
+        let start = Block::shared(vec![]);
+        let graph =
+            FlowGraph::with_return_var("gsi_fresh", start.clone(), Hlvalue::Variable(void.clone()));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc",
+            vec![lowlevel_type_const(st_ll), malloc_flags("gc")],
+            Hlvalue::Variable(p.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "gc_store_indexed",
+            vec![
+                Hlvalue::Variable(p),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+                constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(void.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(void)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let effects = converted_readwrite("gsi_fresh", graph);
+        match effects {
+            ReadWriteEffects::Set(set) => assert!(
+                set.is_empty(),
+                "fresh-malloc gc_store_indexed is empty, got {set:?}"
+            ),
+            ReadWriteEffects::Top => panic!("fresh-malloc gc_store_indexed is not top"),
+        }
+    }
+
+    /// `FreshMallocs.__init__` (`writeanalyze.py`): a raw-flavor `malloc`
+    /// result is fresh, so a `setfield` into it is `empty_set`.
+    #[test]
+    fn effect_graph_raw_malloc_setfield_has_no_write_effect() {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link,
+            SpaceOperation,
+        };
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rmodel::lowlevel_type_const;
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::new("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let st_ll = LowLevelType::Struct(Box::new(st));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(st_ll.clone()).expect("struct ptr"));
+        let p = variable_with_lltype("p", ptr_ll);
+        let void = variable_with_lltype("v", LowLevelType::Void);
+        let start = Block::shared(vec![]);
+        let graph = FlowGraph::with_return_var(
+            "raw_malloc_sf",
+            start.clone(),
+            Hlvalue::Variable(void.clone()),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc",
+            vec![lowlevel_type_const(st_ll), malloc_flags("raw")],
+            Hlvalue::Variable(p.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(p),
+                constant_with_lltype(ConstValue::byte_str("x"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(void.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(void)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let effects = converted_readwrite("raw_malloc_sf", graph);
+        match effects {
+            ReadWriteEffects::Set(set) => {
+                assert!(set.is_empty(), "raw-malloc setfield is empty, got {set:?}")
+            }
+            ReadWriteEffects::Top => panic!("raw-malloc setfield is not top"),
+        }
+    }
+
+    fn malloc_unary_setfield_graph(
+        name: &str,
+        unary_op: &str,
+    ) -> crate::flowspace::model::FunctionGraph {
+        use crate::flowspace::model::{
+            Block, BlockRefExt, ConstValue, FunctionGraph as FlowGraph, Hlvalue, Link,
+            SpaceOperation,
+        };
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+        use crate::translator::rtyper::rmodel::lowlevel_type_const;
+        use crate::translator::rtyper::rtyper::{constant_with_lltype, variable_with_lltype};
+        let st = Struct::gc("S", vec![("x".to_string(), LowLevelType::Signed)]);
+        let st_ll = LowLevelType::Struct(Box::new(st));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(st_ll.clone()).expect("struct ptr"));
+        let p = variable_with_lltype("p", ptr_ll.clone());
+        let aliased = variable_with_lltype("alias", ptr_ll);
+        let void = variable_with_lltype("v", LowLevelType::Void);
+        let start = Block::shared(vec![]);
+        let graph =
+            FlowGraph::with_return_var(name, start.clone(), Hlvalue::Variable(void.clone()));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc",
+            vec![lowlevel_type_const(st_ll), malloc_flags("gc")],
+            Hlvalue::Variable(p.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            unary_op,
+            vec![Hlvalue::Variable(p)],
+            Hlvalue::Variable(aliased.clone()),
+        ));
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "setfield",
+            vec![
+                Hlvalue::Variable(aliased),
+                constant_with_lltype(ConstValue::byte_str("x"), LowLevelType::Void),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(void.clone()),
+        ));
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(void)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        graph
+    }
+
+    fn converted_search_readwrite(
+        name: &str,
+        graph: crate::flowspace::model::FunctionGraph,
+    ) -> ReadWriteEffects {
+        let converted = crate::rlib::rstring::effect_graph_from_search_helper(&graph);
+        let mut cc = CallControl::new();
+        cc.register_function_graph(CallPath::from_segments([name]), converted);
+        cc.analyze_readwrite(
+            &CallPath::from_segments([name]),
+            &mut ReadWriteTracker::new(),
+            &mut UnionFind::new(|_| Dependency::new(ReadWriteEffects::bottom_result())),
+        )
+    }
+
+    /// `FreshMallocs.__init__` (`writeanalyze.py`): a search-helper
+    /// `malloc` → `same_as` / `cast_pointer` → `setfield` writes a fresh
+    /// object, so the write is `empty_set`.
+    #[test]
+    fn search_helper_malloc_same_as_and_cast_pointer_setfield_has_no_write_effect() {
+        for alias in ["same_as", "cast_pointer"] {
+            let name = format!("search_fresh_{alias}");
+            let graph = malloc_unary_setfield_graph(&name, alias);
+            let converted = crate::rlib::rstring::effect_graph_from_search_helper(&graph);
+            assert!(
+                converted.iter_block_ops().any(|(_, op)| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == alias
+                )),
+                "{alias} UnaryOp: {:?}",
+                converted
+                    .iter_block_ops()
+                    .map(|(_, op)| format!("{:?}", op.kind))
+                    .collect::<Vec<_>>()
+            );
+            match converted_search_readwrite(&name, graph) {
+                ReadWriteEffects::Set(set) => assert!(
+                    set.is_empty(),
+                    "search-helper {alias} setfield is empty, got {set:?}"
+                ),
+                ReadWriteEffects::Top => panic!("search-helper {alias} setfield is not top"),
+            }
+        }
+    }
+
+    /// `FreshMallocs.__init__` (`writeanalyze.py`): `cast_ptr_to_adr` /
+    /// `cast_primitive` of a malloc is nonfresh, so the following
+    /// `setfield` is a write effect.
+    #[test]
+    fn effect_graph_malloc_non_alias_cast_result_is_nonfresh() {
+        for cast in ["cast_ptr_to_adr", "cast_primitive"] {
+            let name = format!("effect_nonfresh_{cast}");
+            let graph = malloc_unary_setfield_graph(&name, cast);
+            let converted = effect_graph_from_rtyped_helper(&graph);
+            assert!(
+                converted.iter_block_ops().any(|(_, op)| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == cast
+                )),
+                "{cast} UnaryOp: {:?}",
+                converted
+                    .iter_block_ops()
+                    .map(|(_, op)| format!("{:?}", op.kind))
+                    .collect::<Vec<_>>()
+            );
+            match converted_readwrite(&name, graph) {
+                ReadWriteEffects::Set(set) => assert!(
+                    !set.is_empty(),
+                    "effect-graph {cast} setfield is a write, got {set:?}"
+                ),
+                ReadWriteEffects::Top => {}
+            }
+        }
     }
 
     /// `jtransform.py rewrite_op_keepalive` emits `-live-`.
@@ -27552,7 +28943,7 @@ mod tests {
         assert!(
             converted.iter_block_ops().any(|(_, op)| matches!(
                 &op.kind,
-                OpKind::UnaryOp { op, .. } if op == "debug_assert"
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "debug_assert"
             )),
             "debug_assert: {:?}",
             converted

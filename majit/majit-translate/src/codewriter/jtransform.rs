@@ -1015,6 +1015,31 @@ pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
     )
 }
 
+/// Unary names that forward a value the way `same_as` does.
+///
+/// `FreshMallocs.__init__` (`writeanalyze.py`) still treats only
+/// `cast_pointer` / `same_as` as freshness aliases. Consumers that follow
+/// `same_as` to recover a value also accept the casts the effect-graph
+/// converters used to emit as `same_as`.
+pub(crate) fn is_same_as_follow_unary(name: &str) -> bool {
+    is_same_as_identity_unary(name)
+        || matches!(
+            name,
+            "cast_pointer"
+                | "cast_ptr_to_adr"
+                | "cast_adr_to_ptr"
+                | "cast_primitive"
+                | "cast_bool_to_int"
+                | "cast_char_to_int"
+                | "cast_int_to_char"
+                | "cast_opaque_ptr"
+                | "cast_int_to_uint"
+                | "cast_uint_to_int"
+                | "cast_unichar_to_int"
+                | "cast_int_to_unichar"
+        )
+}
+
 /// Call paths `rewrite_op_direct_call` folds to the operand alias, the
 /// same `same_as` drop as [`is_same_as_identity_unary`].
 /// `jtransform.py rewrite_op_cast_pointer` → `rewrite_op_same_as`.
@@ -2217,6 +2242,8 @@ fn variable_has_bool_repr(
         let classified = if let Some(op) = index.producer.get(&variable.id()) {
             match &op.kind {
                 // These operations preserve their operand representation.
+                // A cast (`cast_primitive`, ...) may change it: Bool stays
+                // Bool only through `same_as` (`BoolRepr.rtype_bool`).
                 OpKind::Hint { value, .. } => classify(index, value, cache, visiting),
                 OpKind::UnaryOp { op, operand, .. }
                     if matches!(op.as_str(), "same_as" | "deref") =>
@@ -14592,7 +14619,7 @@ fn fn_const_target_from_op(
         {
             Some(target.clone())
         }
-        OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+        OpKind::UnaryOp { op, operand, .. } if is_same_as_follow_unary(op) => {
             fn_const_target_for_var(graph, operand, depth)
         }
         OpKind::Hint { value, .. } => fn_const_target_for_var(graph, value, depth),
@@ -17524,6 +17551,47 @@ mod tests {
                 crate::annotator::model::SomeInstance::new(None, false, flags),
             ),
         ));
+    }
+
+    #[test]
+    fn same_as_follow_unary_covers_converter_cast_arms() {
+        // `effect_transduce_op` (`codewriter/call.rs`) and
+        // `search_transduce_op` (`rlib/rstring.rs`) keep these llop names
+        // on UnaryOp. Every name in those cast arms must still be
+        // followed as `same_as` (`same_as` itself via identity).
+        let effect_transduce_op_cast_arm = [
+            "same_as",
+            "cast_ptr_to_adr",
+            "cast_adr_to_ptr",
+            "cast_primitive",
+            "cast_bool_to_int",
+            "cast_char_to_int",
+            "cast_int_to_char",
+            "cast_opaque_ptr",
+            "cast_pointer",
+            "cast_int_to_uint",
+            "cast_uint_to_int",
+        ];
+        let search_transduce_op_cast_arm = [
+            "cast_ptr_to_adr",
+            "cast_adr_to_ptr",
+            "cast_primitive",
+            "cast_bool_to_int",
+            "cast_char_to_int",
+            "cast_int_to_char",
+            "cast_unichar_to_int",
+            "cast_int_to_unichar",
+        ];
+        for name in effect_transduce_op_cast_arm
+            .iter()
+            .chain(search_transduce_op_cast_arm.iter())
+        {
+            assert!(
+                is_same_as_follow_unary(name),
+                "{name} must be followed as same_as"
+            );
+        }
+        assert!(is_same_as_identity_unary("same_as"));
     }
 
     #[test]

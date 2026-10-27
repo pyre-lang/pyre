@@ -339,7 +339,7 @@ mod tests {
                     }
                     _ => false,
                 },
-                OpKind::UnaryOp { op, .. } => op == "gc_id",
+                OpKind::LoweredBlackholeOp { opname, .. } => opname == "gc_id",
                 OpKind::New { .. } => true,
                 _ => false,
             }),
@@ -367,7 +367,7 @@ mod tests {
                     }
                     _ => false,
                 },
-                OpKind::UnaryOp { op, .. } => op == "gc_fq_register",
+                OpKind::LoweredBlackholeOp { opname, .. } => opname == "gc_fq_register",
                 _ => false,
             }),
             "gc_fq_register: {kinds:?}"
@@ -471,7 +471,7 @@ mod tests {
         assert!(
             copy.iter_block_ops().any(|(_, op)| matches!(
                 &op.kind,
-                OpKind::UnaryOp { op, .. } if op == "raw_memcopy"
+                OpKind::LoweredBlackholeOp { opname, .. } if opname == "raw_memcopy"
             )),
             "copy_string_to_raw raw_memcopy"
         );
