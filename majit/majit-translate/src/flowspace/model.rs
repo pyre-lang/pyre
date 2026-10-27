@@ -2748,6 +2748,11 @@ impl HostEnv {
         self.builtins.get(name).cloned()
     }
 
+    /// exceptions.__dict__.values() analogue
+    pub fn builtin_values(&self) -> Vec<HostObject> {
+        self.builtins.values().cloned().collect()
+    }
+
     pub fn builtin_module(&self) -> HostObject {
         self.builtin_module.clone()
     }
