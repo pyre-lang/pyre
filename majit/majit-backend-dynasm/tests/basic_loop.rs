@@ -1391,3 +1391,73 @@ fn test_int_add_wide_immediate_is_not_truncated() {
         "7 + 2^32 must not truncate the immediate"
     );
 }
+
+/// `emit_op_gc_store_indexed` combines `index + ofs` in `r.ip0` (x16).
+/// `load_imm_float` also uses x16 (`AssemblerARM64.load`). Materializing
+/// the `ConstFloatLoc` after that ADD would store at `base + pool_addr`.
+/// Eight live float inputs fill `all_vfp_regs`, so the 1.0 stays a
+/// `ConstFloatLoc` through `prepare_op_gc_store_indexed`.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn gc_store_indexed_const_float_survives_ip0_index_combine() {
+    let mut storage = vec![0xA5u8; 64];
+    let base_ptr = storage.as_mut_ptr();
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let token = JitCellToken::new(47);
+
+    let mut inputargs = vec![
+        InputArg::from_type_rc(Type::Ref, 0),
+        InputArg::from_type_rc(Type::Int, 1),
+    ];
+    for k in 0..8u32 {
+        inputargs.push(InputArg::from_type_rc(Type::Float, k + 2));
+    }
+    let base = OpRef::input_arg_ref(0);
+    let index = OpRef::input_arg_int(1);
+
+    let store = Op::new(
+        OpCode::GcStoreIndexed,
+        &[
+            rb(base),
+            rb(index),
+            rb(OpRef::const_float(1.0)),
+            rb(OpRef::const_int(1)),
+            rb(OpRef::const_int(8)),
+            rb(OpRef::const_int(8)),
+        ],
+    );
+    store.pos().set(OpRef::void_op(10));
+
+    let mut finish_args = vec![rb(index)];
+    let mut fail_types = vec![Type::Int];
+    for k in 0..8u32 {
+        finish_args.push(rb(OpRef::input_arg_float(k + 2)));
+        fail_types.push(Type::Float);
+    }
+    let finish = Op::new(OpCode::Finish, &finish_args);
+    finish.pos().set(OpRef::void_op(11));
+    finish.set_fail_arg_types(fail_types);
+    finish.setfailargs(finish_args.clone().into());
+
+    let ops_rc: Vec<OpRc> = vec![store, finish].into_iter().map(OpRc::new).collect();
+    backend
+        .compile_loop(&inputargs, &ops_rc, &token)
+        .expect("compile GcStoreIndexed of ConstFloat");
+
+    let mut args = vec![Value::Ref(GcRef(base_ptr as usize)), Value::Int(16)];
+    for k in 0..8 {
+        args.push(Value::Float(k as f64 + 2.0));
+    }
+    let frame = backend.execute_token(&token, &args);
+    assert!(backend.get_latest_descr(&frame).is_finish());
+    let at = unsafe { base_ptr.add(24) };
+    let stored = f64::from_le_bytes(
+        unsafe { std::slice::from_raw_parts(at, 8) }
+            .try_into()
+            .unwrap(),
+    );
+    assert_eq!(stored, 1.0, "ConstFloat 1.0 must land at base + index + 8");
+    assert_eq!(storage[23], 0xA5);
+    assert_eq!(storage[32], 0xA5);
+}

@@ -3385,6 +3385,24 @@ impl<'a> AssemblerARM64<'a> {
                         Some(Loc::Immed(i) | Loc::ImmedFloat(i)) => i.value,
                         _ => 0,
                     };
+                    // `emit_op_gc_store_indexed` then `_write_to_mem`: upstream
+                    // already has `value_loc` in a VFP / core register before it
+                    // overwrites `r.ip0` with `index + ofs`. This emitter still
+                    // materializes `ConstFloatLoc` here (`load_imm_float` →
+                    // `AssemblerARM64.load` into `r.ip0`), so the value must
+                    // land in d14 before `ADD_ri(ip0, index, ofs)`.
+                    let val_reg = match value_loc {
+                        Loc::Reg(r) => *r,
+                        Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                            self.emit_mov_imm64(17, i.value);
+                            crate::regloc::RegLoc::new(17, false)
+                        }
+                        Loc::ConstFloat(c) => {
+                            self.load_imm_float(14, *c);
+                            crate::regloc::RegLoc::new(14, true)
+                        }
+                        _ => crate::regloc::RegLoc::new(17, false),
+                    };
                     // aarch64/opassembler.py:385-392: combine ofs into ip0 = index + ofs.
                     // check_imm_arg() in regalloc.py:161 allows 0..4095; for any
                     // value outside that (including negatives) RPython falls back
@@ -3404,18 +3422,6 @@ impl<'a> AssemblerARM64<'a> {
                         crate::regloc::RegLoc::new(16, false)
                     } else {
                         *index
-                    };
-                    let val_reg = match value_loc {
-                        Loc::Reg(r) => *r,
-                        Loc::Immed(i) | Loc::ImmedFloat(i) => {
-                            self.emit_mov_imm64(17, i.value);
-                            crate::regloc::RegLoc::new(17, false)
-                        }
-                        Loc::ConstFloat(c) => {
-                            self.load_imm_float(14, *c);
-                            crate::regloc::RegLoc::new(14, true)
-                        }
-                        _ => crate::regloc::RegLoc::new(17, false),
                     };
                     // aarch64/opassembler.py:393-394:
                     //   scale = get_scale(size_loc.value)
