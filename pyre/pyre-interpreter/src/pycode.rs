@@ -766,9 +766,8 @@ pub struct PyCode {
     /// `chars().count()` — which a traceback walk pays on every hop
     /// (`tb.tb_frame.f_code.co_name`).
     ///
-    /// Realized at construction like [`w_filename`] (`pycode.py
-    /// self.co_name = name`). [`w_code_name_obj`] still fills a null slot
-    /// for wrappers that skipped `w_code_new_owned`.
+    /// `PY_NULL` until first realized by [`w_code_name_obj`]; the storage,
+    /// immortality and root-walk argument are `w_qualname`'s verbatim.
     ///
     /// `code.replace` / `code_new` store the passed `co_name` object (a str
     /// subclass included).
@@ -915,8 +914,8 @@ pub unsafe fn w_code_qualname_obj(w_code: PyObjectRef) -> PyObjectRef {
     }
 }
 
-/// `pycode.py self.co_name = name` — the shared wrapped name, realized at
-/// construction (`w_code_new_owned`) and retained on the code object.
+/// `pycode.py self.co_name = name` — the shared wrapped name, realized on
+/// first demand and retained on the code object.
 ///
 /// The counterpart of [`w_code_qualname_obj`], for the same reason and with the
 /// same lifetime argument: `function.py self.name = forcename or
@@ -1393,9 +1392,6 @@ fn w_code_new_owned(
         let w_filename =
             unsafe { realize_w_filename(std::ptr::null(), code_ptr as *const crate::CodeObject) };
         let _ = filename_roots.pin_root(w_filename);
-        // `pycode.py PyCode.__init__`: `self.co_name = name` before publish.
-        let w_name = unsafe { w_str_new(&(*(code_ptr as *const crate::CodeObject)).obj_name) };
-        let _ = filename_roots.pin_root(w_name);
     }
     let obj = PyCode {
         ob_header: PyObject {
@@ -1441,15 +1437,12 @@ fn w_code_new_owned(
     let obj = pyre_object::gc_roots::pin_root(obj);
     if code_ptr_aligned {
         let w_filename = pyre_object::gc_roots::shadow_stack_get(filename_slot);
-        let w_name = pyre_object::gc_roots::shadow_stack_get(filename_slot + 1);
         let published = publish_code_slot_store_rooting(
             pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            &[w_filename, w_name],
+            &[w_filename],
         );
         unsafe {
-            let owner = published.owner() as *mut PyCode;
-            (*owner).w_filename = published.get(0);
-            (*owner).w_name = published.get(1);
+            (*(published.owner() as *mut PyCode)).w_filename = published.get(0);
         }
     }
     // Claim the graph before the fill loop: each nested constant publishes its

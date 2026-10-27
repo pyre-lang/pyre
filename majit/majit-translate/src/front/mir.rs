@@ -65849,14 +65849,15 @@ fn emit_rffi_cast_to_carray_ptr(
 }
 
 /// 2-arg `lltype.cast_int_to_ptr(PtrT, int)` (`lltype.py`
-/// `ann_cast_int_to_ptr`). `ptr_ty` is the result concretetype.
-fn emit_cast_int_to_ptr_type(
+/// `ann_cast_int_to_ptr`). The result is a raw `CArrayPtr` / `CCHARP`.
+fn emit_cast_int_to_carray_ptr(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     addr: Variable,
-    ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
     use crate::flowspace::model::ConstValue;
+    let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
     let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     raw.set_concretetype(Some(ptr_ty.clone()));
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -65877,17 +65878,6 @@ fn emit_cast_int_to_ptr_type(
         },
     });
     raw
-}
-
-/// 2-arg `lltype.cast_int_to_ptr` onto `CArrayPtr` / `CCHARP`.
-fn emit_cast_int_to_carray_ptr(
-    graph: &mut FunctionGraph,
-    bb_id: BlockId,
-    addr: Variable,
-    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
-) -> Variable {
-    let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
-    emit_cast_int_to_ptr_type(graph, bb_id, addr, ptr_ty)
 }
 
 /// `cast_int_to_ptr(CCHARP, int)` so a window data word is `CCHARP` rather
@@ -65989,9 +65979,43 @@ fn push_direct_ptradd(
     result
 }
 
+/// `lltype.cast_pointer(PTRTYPE, ptr)` (`lltype.py` `ann_cast_pointer`).
+/// `rbuiltin.py gen_cast` Ptr → Ptr (non-opaque) is one `cast_pointer`
+/// whose resulttype is `TGT`. The result carries `ptr_ty`.
+fn emit_cast_pointer(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    v: Variable,
+    ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    raw.set_concretetype(Some(ptr_ty.clone()));
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_pointer",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(v),
+            ],
+            result_ty: ValueType::Int,
+        },
+    });
+    raw
+}
+
 /// Restore the raw entry pointer type after a byte `direct_ptradd`.
-/// `ann_direct_ptradd` returns `s_p`; `rffi.py` `ptradd` is
-/// `rffi.cast(CCHARP, p)` → `rffi.ptradd` → `rffi.cast(PTRTYPE, q)`.
+/// `lltype.direct_ptradd` keeps its operand type (`ann_direct_ptradd`
+/// returns `s_p`); the byte offset runs on CCHARP, so the result is
+/// cast back to the raw entry type (`rbuiltin.py gen_cast` →
+/// `cast_pointer`).
 fn restore_offset_pointer_type(
     graph: &mut FunctionGraph,
     bb: BlockId,
@@ -66003,8 +66027,7 @@ fn restore_offset_pointer_type(
         && matches!(&t, LowLevelType::Ptr(p) if !p._needsgc())
         && result.concretetype().as_ref() != Some(&t)
     {
-        let addr = push_cast_ptr_to_int(graph, bb, result);
-        return emit_cast_int_to_ptr_type(graph, bb, addr, t);
+        return emit_cast_pointer(graph, bb, result, t);
     }
     // Int-kind (`getkind` Signed) or None: no pointer annotation to restore.
     // A GC pointer plus a byte offset is an interior address, which stays CCHARP.
@@ -112879,8 +112902,8 @@ mod tests {
         }
     }
 
-    /// Byte `direct_ptradd` stamps `CCHARP`; `ann_direct_ptradd` then
-    /// restores `s_p` (`rffi.py` `ptradd`).
+    /// Byte `direct_ptradd` stamps `CCHARP`; `rbuiltin.py gen_cast`
+    /// recasts the result to the entry Ptr with one `cast_pointer`.
     #[test]
     fn restore_offset_pointer_type_recasts_ccharp_to_entry_ptr() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
@@ -112942,6 +112965,73 @@ mod tests {
             restored.concretetype().as_ref(),
             Some(&entry_ty),
             "restored result is the entry CArrayPtr(Signed)"
+        );
+        let ptradd_idx = graph
+            .block(bb)
+            .operations
+            .iter()
+            .position(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+                _ => false,
+            })
+            .expect("direct_ptradd index");
+        let after = &graph.block(bb).operations[ptradd_idx + 1..];
+        assert_eq!(
+            after.len(),
+            1,
+            "one recast after direct_ptradd, got {after:?}"
+        );
+        match &after[0].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("cast_pointer") => {
+                assert_eq!(after[0].result.as_ref(), Some(&restored));
+                assert_eq!(
+                    restored.concretetype().as_ref(),
+                    Some(&entry_ty),
+                    "cast_pointer result is the entry CArrayPtr(Signed)"
+                );
+                assert_eq!(
+                    args.len(),
+                    2,
+                    "lltype.cast_pointer(PTRTYPE, ptr), got {args:?}"
+                );
+                assert!(
+                    matches!(
+                        &args[0],
+                        crate::model::LinkArg::Const(c)
+                            if matches!(
+                                c.value,
+                                crate::flowspace::model::ConstValue::LowLevelType(_)
+                            )
+                    ),
+                    "PTRTYPE is the entry LowLevelType, got {:?}",
+                    args[0]
+                );
+                assert_eq!(args[1], crate::model::LinkArg::Value(ptradd));
+            }
+            other => panic!("expected cast_pointer after direct_ptradd, got {other:?}"),
+        }
+        let following: Vec<&str> = after
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !following
+                .iter()
+                .any(|name| *name == "cast_ptr_to_int" || *name == "cast_int_to_ptr"),
+            "no int-cast recast after ptradd, got {following:?}"
         );
     }
 

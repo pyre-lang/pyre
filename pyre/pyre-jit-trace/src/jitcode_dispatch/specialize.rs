@@ -1063,9 +1063,9 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
             (unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) })
                 as pyre_object::PyObjectRef
         }
-        // `w_name` is stored at construction (`PyCode.__init__ self.co_name`);
-        // a null here is a wrapper that skipped `w_code_new_owned` and
-        // declines so the residual can realize it.
+        // `w_name` is realized on first demand, so an unread code object
+        // carries a null here; that declines below and the residual realizes
+        // it for the next attempt.
         TracebackWalkField::CoName => unsafe {
             (*(concrete_obj as *const pyre_interpreter::pycode::PyCode)).w_name
         },

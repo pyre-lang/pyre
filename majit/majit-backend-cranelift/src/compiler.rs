@@ -5676,13 +5676,9 @@ fn resolve_call_assembler_target(
     let Some(target) = lookup_call_assembler_target(token) else {
         return Ok(None);
     };
-    let descr_addr = token.ll_function_addr();
-    if descr_addr != 0 && !target.body_ptr.is_null() {
-        debug_assert_eq!(
-            descr_addr, target.body_ptr as usize,
-            "CALL_ASSEMBLER descr token address disagrees with its CLT's target"
-        );
-    }
+    // After `redirect_call_assembler` `_ll_function_addr` is the overlay
+    // site (`assembler.py` `oldadr`) and `body_ptr` is the new loop.
+    // CALL_ASSEMBLER calls the overlay site.
 
     // A null `code_ptr` has no compiled code or finish descriptors. Return
     // None so codegen uses the shim fallback.
@@ -6830,6 +6826,34 @@ fn emit_host_call(
     let fref = module.declare_func_in_func(func_id, builder.func);
     let call = builder.ins().call(fref, args);
     return_type.map(|_| builder.inst_results(call)[0])
+}
+
+/// Direct Tail call of a compiled loop body.
+///
+/// `assembler.py` `_call_assembler_emit_call` calls `_ll_function_addr`
+/// as an immediate. Residual calls already bake the same way (`host_{addr}`
+/// Import + `call`); CALL_ASSEMBLER can too once `redirect_call_assembler`
+/// overlays a JMP at the old entry (`x86/assembler.py redirect_call_assembler`).
+fn emit_call_assembler_body_call(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    body_call_conv: cranelift_codegen::isa::CallConv,
+    func_ptr: usize,
+    jf_ptr: CValue,
+    dispatch_key: CValue,
+) -> CValue {
+    let mut sig = Signature::new(body_call_conv);
+    sig.params.push(AbiParam::new(ptr_type));
+    sig.params.push(AbiParam::new(cl_types::I32));
+    sig.returns.push(AbiParam::new(ptr_type));
+    let name = format!("ca_body_{func_ptr:x}");
+    let func_id = module
+        .declare_function(&name, Linkage::Import, &sig)
+        .expect("call-assembler body import");
+    let fref = module.declare_func_in_func(func_id, builder.func);
+    let call = builder.ins().call(fref, &[jf_ptr, dispatch_key]);
+    builder.inst_results(call)[0]
 }
 
 /// `regalloc.py before_call()`: write the paired `GUARD_NOT_FORCED`'s fail
@@ -11646,7 +11670,9 @@ impl CraneliftBackend {
         // Host shims are imported as `host_{addr}` so `emit_host_call` can
         // emit a direct `call` (rel32) instead of `movabs` + `call_indirect`.
         jit_builder.symbol_lookup_fn(Box::new(|name: &str| {
-            let hex = name.strip_prefix("host_")?;
+            let hex = name
+                .strip_prefix("host_")
+                .or_else(|| name.strip_prefix("ca_body_"))?;
             usize::from_str_radix(hex, 16)
                 .ok()
                 .map(|addr| addr as *const u8)
@@ -16163,64 +16189,68 @@ impl CraneliftBackend {
                     let ca_merge_block = builder.create_block();
                     builder.append_block_param(ca_merge_block, cl_types::I64);
 
-                    // Direct call via the descr-carried token: always load the
-                    // entry address from the token's `_ll_function_addr` slot
-                    // at runtime, never bake it as an immediate.  Unlike
-                    // dynasm, cranelift does not patch an old loop's entry
-                    // code on `redirect_call_assembler` (assembler.py:1138) —
-                    // it stores the new address into the OLD token's slot, so
-                    // a baked immediate would pin every call to a redirected
-                    // tmp-callback body forever (portal round-trip per call).
-                    // A slot that still contains 0 (recursive target still
-                    // tracing) falls back to the shim via the runtime null
-                    // check until `register_call_assembler_target` stores the
-                    // real address. Descrs without an Arc fall back to the
-                    // helper shim instead of a number-keyed dispatch slot.
+                    // `llsupport/assembler.py call_assembler` /
+                    // `_call_assembler_emit_call(self.imm(descr._ll_function_addr))`:
+                    // bake the entry as an immediate. `redirect_call_assembler`
+                    // overlays a JMP at that address (`x86/assembler.py
+                    // redirect_call_assembler`), so a later retrace of the
+                    // callee does not need the slot reloaded. A slot that
+                    // still contains 0 (recursive target still tracing)
+                    // falls back to load-from-slot + null diamond until
+                    // `register_call_assembler_target` stores the real
+                    // address. Descrs without an Arc fall back to the helper
+                    // shim instead of a number-keyed dispatch slot.
+                    let baked_addr = descr_token
+                        .map(|token| token.ll_function_addr())
+                        .filter(|&addr| addr != 0);
                     let descr_addr_slot =
                         descr_token.map(|token| token.ll_function_addr_slot() as usize);
+                    let emit_ca_shim = baked_addr.is_none();
+                    let mut slot_code_addr = None;
+                    let mut shim_fallback_block = None;
 
-                    if let Some(addr_slot) = descr_addr_slot {
+                    if baked_addr.is_some() || descr_addr_slot.is_some() {
                         // No separate out_slot: callee writes outputs to args_slot (shared).
 
-                        // Load code_ptr from the token slot.  RPython's
-                        // call_assembler path compares the returned jf_descr
-                        // against the CPU's DoneWithThisFrame* descr for the
-                        // CALL_ASSEMBLER result type; it is not target-local.
-                        // Keep the finish descr as a compile-time immediate
-                        // like dynasm instead of reloading it on every
-                        // recursive call.
-                        // RPython done_with_this_frame parity: compare jf_descr
-                        // with the finish FailDescr pointer directly.
-                        let code_addr = {
-                            let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
-                            builder
-                                .ins()
-                                .load(ptr_type, MemFlagsData::trusted(), entry_ptr, 0)
-                        };
+                        // RPython's call_assembler path compares the returned
+                        // jf_descr against the CPU's DoneWithThisFrame* descr
+                        // for the CALL_ASSEMBLER result type; it is not
+                        // target-local. Keep the finish descr as a
+                        // compile-time immediate like dynasm instead of
+                        // reloading it on every recursive call.
                         let expected_finish_descr_ptr = attached_descrs
                             .done_with_this_frame_descr_ptr_for_type(op.opcode.result_type())
                             as i64;
                         let expected_finish_descr = builder
                             .ins()
                             .iconst(cl_types::I64, expected_finish_descr_ptr);
-                        // assembler.py:call_assembler() parity:
-                        // CMP + conditional branch: null → shim, else → direct call.
-                        let direct_call_block = builder.create_block();
-                        let shim_fallback_block = builder.create_block();
-                        let null_ptr = builder.ins().iconst(ptr_type, 0);
-                        let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
-                        builder.ins().brif(
-                            is_null,
-                            shim_fallback_block,
-                            &[],
-                            direct_call_block,
-                            &[],
-                        );
 
-                        // ── Direct call to compiled code ──
-                        // assembler.py:_call_assembler_emit_call
-                        builder.switch_to_block(direct_call_block);
-                        builder.seal_block(direct_call_block);
+                        if baked_addr.is_none() {
+                            // assembler.py:call_assembler() parity:
+                            // CMP + conditional branch: null → shim, else → direct call.
+                            let addr_slot = descr_addr_slot
+                                .expect("slot-only CALL_ASSEMBLER has an _ll_function_addr slot");
+                            let code_addr = {
+                                let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
+                                builder
+                                    .ins()
+                                    .load(ptr_type, MemFlagsData::trusted(), entry_ptr, 0)
+                            };
+                            slot_code_addr = Some(code_addr);
+                            let direct_call_block = builder.create_block();
+                            let shim_block = builder.create_block();
+                            shim_fallback_block = Some(shim_block);
+                            let null_ptr = builder.ins().iconst(ptr_type, 0);
+                            let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
+                            builder
+                                .ins()
+                                .brif(is_null, shim_block, &[], direct_call_block, &[]);
+
+                            // ── Direct call to compiled code ──
+                            // assembler.py:_call_assembler_emit_call
+                            builder.switch_to_block(direct_call_block);
+                            builder.seal_block(direct_call_block);
+                        }
 
                         // assembler.py _call_assembler_emit_call:
                         // Spill caller's GC refs, then direct-call the callee.
@@ -16250,18 +16280,31 @@ impl CraneliftBackend {
                         // CALL_ASSEMBLER enters the callee at its preamble
                         // (dispatch_key 0); the callee is a freshly entered
                         // function, not an external-JUMP LABEL re-entry.
-                        let mut sig = Signature::new(body_call_conv);
-                        sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-                        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
-                        let sig_ref = builder.import_signature(sig);
                         let ca_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
-                        let call_inst = builder.ins().call_indirect(
-                            sig_ref,
-                            code_addr,
-                            &[args_ptr, ca_dispatch_key],
-                        );
-                        let result_jf = builder.inst_results(call_inst)[0];
+                        let result_jf = if let Some(baked) = baked_addr {
+                            emit_call_assembler_body_call(
+                                module,
+                                &mut builder,
+                                ptr_type,
+                                body_call_conv,
+                                baked,
+                                args_ptr,
+                                ca_dispatch_key,
+                            )
+                        } else {
+                            let mut sig = Signature::new(body_call_conv);
+                            sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
+                            sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
+                            sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
+                            let sig_ref = builder.import_signature(sig);
+                            let call_inst = builder.ins().call_indirect(
+                                sig_ref,
+                                slot_code_addr
+                                    .expect("slot-only CALL_ASSEMBLER loaded _ll_function_addr"),
+                                &[args_ptr, ca_dispatch_key],
+                            );
+                            builder.inst_results(call_inst)[0]
+                        };
 
                         // _reload_frame_if_necessary: GC may have moved
                         // the caller's jitframe during the call.
@@ -16431,102 +16474,116 @@ impl CraneliftBackend {
                             .ins()
                             .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
 
-                        // ── Fallback: null code_ptr, unknown finish, or deadframe ──
-                        builder.switch_to_block(shim_fallback_block);
-                        builder.seal_block(shim_fallback_block);
+                        if let Some(shim_fallback_block) = shim_fallback_block {
+                            // ── Fallback: null code_ptr, unknown finish, or deadframe ──
+                            builder.switch_to_block(shim_fallback_block);
+                            builder.seal_block(shim_fallback_block);
+                        }
                     }
 
-                    // Shim call (always present as fallback, or sole path
-                    // when target isn't resolved or has non-primitive result)
+                    if emit_ca_shim {
+                        // Shim call (fallback, or sole path when the target
+                        // isn't resolved). A baked `_ll_function_addr` skips
+                        // this: `opt_level=none` would still compile a dead
+                        // shim (`llsupport/assembler.py call_assembler` has
+                        // no equivalent).
 
-                    // After switch_to_block(shim_fallback_block), the cached
-                    // jf_ptr local may correspond to a value defined in a
-                    // different block on the upstream tree. Read the fresh
-                    // jitframe pointer through the Variable so Cranelift
-                    // threads it through the necessary block params.
-                    jf_ptr = builder.ins().get_pinned_reg(ptr_type);
-                    spill_ref_roots(
-                        &mut builder,
-                        &opref_var_map,
-                        jf_ptr,
-                        &live_ref_root_slots,
-                        &defined_ref_vars,
-                        &stale_ref_vars,
-                        &demoted_failarg_slots,
-                        ref_root_base_ofs,
-                    );
-                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    let result = emit_host_call(
-                        module,
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        call_assembler_shim as *const () as usize,
-                        &[
-                            target_token,
-                            args_ptr_i64,
-                            outcome_ptr_i64,
-                            expected_result_kind,
-                        ],
-                        Some(cl_types::I64),
-                    );
-                    // _reload_frame_if_necessary (assembler.py:405-412):
-                    // GC may have moved the jitframe during the shim call.
-                    // Reload jf_ptr from shadow stack before reading from it.
-                    jf_ptr =
-                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
-                    builder.ins().set_pinned_reg(jf_ptr);
-                    emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    reload_ref_roots(
-                        &mut builder,
-                        &opref_var_map,
-                        jf_ptr,
-                        &live_ref_root_slots,
-                        &defined_ref_vars,
-                        &demoted_failarg_slots,
-                        ref_root_base_ofs,
-                    );
-                    mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
+                        // After switch_to_block(shim_fallback_block), the cached
+                        // jf_ptr local may correspond to a value defined in a
+                        // different block on the upstream tree. Read the fresh
+                        // jitframe pointer through the Variable so Cranelift
+                        // threads it through the necessary block params.
+                        jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+                        spill_ref_roots(
+                            &mut builder,
+                            &opref_var_map,
+                            jf_ptr,
+                            &live_ref_root_slots,
+                            &defined_ref_vars,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        let result = emit_host_call(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            call_assembler_shim as *const () as usize,
+                            &[
+                                target_token,
+                                args_ptr_i64,
+                                outcome_ptr_i64,
+                                expected_result_kind,
+                            ],
+                            Some(cl_types::I64),
+                        );
+                        // `_reload_frame_if_necessary`:
+                        // GC may have moved the jitframe during the shim call.
+                        // Reload jf_ptr from shadow stack before reading from it.
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
+                        builder.ins().set_pinned_reg(jf_ptr);
+                        emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        reload_ref_roots(
+                            &mut builder,
+                            &opref_var_map,
+                            jf_ptr,
+                            &live_ref_root_slots,
+                            &defined_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
 
-                    let outcome_kind =
-                        builder
+                        let outcome_kind =
+                            builder
+                                .ins()
+                                .stack_load(ptr_type, cl_types::I64, outcome_slot, 0);
+                        let finish_kind = builder
                             .ins()
-                            .stack_load(ptr_type, cl_types::I64, outcome_slot, 0);
-                    let finish_kind = builder
-                        .ins()
-                        .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
-                    let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
-                    let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
-                    builder.ins().brif(
-                        is_finish,
-                        ca_merge_block,
-                        &[BlockArg::from(result.unwrap())],
-                        exit_block,
-                        &[],
-                    );
+                            .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
+                        let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
+                        let exit_block = builder.create_block();
+                        builder.set_cold_block(exit_block);
+                        builder.ins().brif(
+                            is_finish,
+                            ca_merge_block,
+                            &[BlockArg::from(result.unwrap())],
+                            exit_block,
+                            &[],
+                        );
 
-                    builder.switch_to_block(exit_block);
-                    builder.seal_block(exit_block);
-                    let deadframe_handle =
-                        builder
+                        builder.switch_to_block(exit_block);
+                        builder.seal_block(exit_block);
+                        let deadframe_handle =
+                            builder
+                                .ins()
+                                .stack_load(ptr_type, cl_types::I64, outcome_slot, 8);
+                        builder.ins().store(
+                            MemFlagsData::trusted(),
+                            deadframe_handle,
+                            jf_ptr,
+                            JF_FRAME_ITEM0_OFS,
+                        );
+                        let sentinel = builder
                             .ins()
-                            .stack_load(ptr_type, cl_types::I64, outcome_slot, 8);
-                    builder.ins().store(
-                        MemFlagsData::trusted(),
-                        deadframe_handle,
-                        jf_ptr,
-                        JF_FRAME_ITEM0_OFS,
-                    );
-                    let sentinel = builder
-                        .ins()
-                        .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
-                    builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), sentinel, jf_ptr, JF_DESCR_OFS);
-                    // assembler.py:1130-1136 _call_footer_shadowstack — inline SUB
-                    emit_call_footer_shadowstack(&mut builder, ptr_type);
-                    builder.ins().return_(&[jf_ptr]);
+                            .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
+                        builder.ins().store(
+                            MemFlagsData::trusted(),
+                            sentinel,
+                            jf_ptr,
+                            JF_DESCR_OFS,
+                        );
+                        // assembler.py `_call_footer_shadowstack` — inline SUB
+                        emit_call_footer_shadowstack(&mut builder, ptr_type);
+                        builder.ins().return_(&[jf_ptr]);
+                    }
 
                     // ── Merge: result from cache or shim ──
                     builder.switch_to_block(ca_merge_block);
@@ -23244,9 +23301,20 @@ impl majit_backend::Backend for CraneliftBackend {
         // (`assert old_nbargs == new_nbargs`) and only then copies frame
         // info and patches.
         let new_target = validate_redirect_call_assembler_target(old, new)?;
+        let old_addr = old.ll_function_addr();
         let new_addr = new.ll_function_addr();
-        if new_addr != 0 {
-            old.set_ll_function_addr(new_addr);
+        // `x86/assembler.py redirect_call_assembler` / `aarch64/assembler.py
+        // redirect_call_assembler`: overwrite the instructions at the old
+        // `_ll_function_addr` with a JMP/B to the new one. The slot stays
+        // the overlay site so a later redirect of the same token patches
+        // the same bytes (`mc.copy_to_raw_memory(oldadr)`). `mc.JMP(imm(
+        // follow_jump(target)))` skips a JMP already sitting at the new
+        // entry so a chain of redirects is one hop.
+        if old_addr != 0 && new_addr != 0 {
+            let target = crate::stub::follow_jump(new_addr);
+            if old_addr != target {
+                crate::stub::write_entry_redirect(old_addr, target);
+            }
         }
         // `x86/assembler.py redirect_call_assembler` `update_frame_info`
         // parity: propagate the new loop's frame depth onto the old token
@@ -33295,6 +33363,84 @@ mod tests {
 
         let frame = backend.execute_token(&caller_token, &[Value::Int(40)]);
         assert_eq!(backend.get_int_value(&frame, 0), 42);
+    }
+
+    #[test]
+    fn test_call_assembler_redirect_after_caller_compiled() {
+        let mut backend = make_call_assembler_backend();
+
+        let callee_inputargs = vec![InputArg::new_int_rc(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let mut callee_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        callee_constants.insert(100, 1);
+        backend.set_constants(callee_constants);
+
+        let callee_token = Arc::new(JitCellToken::new(1_500_610));
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, callee_token.as_ref())
+            .unwrap();
+
+        let caller_inputargs = vec![InputArg::new_int_rc(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef::input_arg_int(0)],
+                1,
+                make_call_assembler_descr(&callee_token, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend.set_constants(indexmap::IndexMap::new());
+        let caller_token = JitCellToken::new(1_500_611);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
+            .unwrap();
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller_token, &[Value::Int(0)]), 0),
+            1
+        );
+
+        let mut repl_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        repl_constants.insert(100, 100);
+        backend.set_constants(repl_constants);
+        let replacement = JitCellToken::new(1_500_612);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &replacement)
+            .unwrap();
+        let overlay = callee_token.ll_function_addr();
+        backend
+            .redirect_call_assembler(callee_token.as_ref(), &replacement)
+            .unwrap();
+        assert_eq!(callee_token.ll_function_addr(), overlay);
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller_token, &[Value::Int(0)]), 0),
+            100
+        );
+
+        let mut second_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        second_constants.insert(100, 7);
+        backend.set_constants(second_constants);
+        let second = JitCellToken::new(1_500_613);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &second)
+            .unwrap();
+        backend
+            .redirect_call_assembler(callee_token.as_ref(), &second)
+            .unwrap();
+        assert_eq!(callee_token.ll_function_addr(), overlay);
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller_token, &[Value::Int(0)]), 0),
+            7
+        );
     }
 
     #[test]

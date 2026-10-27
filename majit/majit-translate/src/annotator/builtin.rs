@@ -2878,6 +2878,25 @@ fn lltype_cast_pointer(
         ));
     }
     let s_clspbc_v = arg_at(args_s, 0, "lltype_cast_pointer");
+    // `ann_cast_pointer(PtrT, s_p)` (lltype.py): a constant LowLevelType
+    // Ptr is the raw recast (`rbuiltin.py gen_cast` Ptr→Ptr).
+    if let Some(crate::flowspace::model::ConstValue::LowLevelType(ll)) = s_clspbc_v.const_() {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
+            return Err(AnnotatorError::new(
+                "cast_pointer() PtrT.const is not a Ptr",
+            ));
+        };
+        match arg_at(args_s, 1, "lltype_cast_pointer") {
+            SomeValue::Ptr(_) | SomeValue::Instance(_) | SomeValue::None_(_) => {}
+            other => {
+                return Err(AnnotatorError::new(format!(
+                    "cast_pointer(): casting of non-pointer: {other:?}"
+                )));
+            }
+        }
+        return Ok(SomeValue::Ptr(SomePtr::new((**ptr_ty).clone())));
+    }
     let SomeValue::PBC(s_clspbc) = s_clspbc_v else {
         return Err(AnnotatorError::new(
             "cast_pointer() expected a constant class PBC as first argument",
@@ -4339,6 +4358,38 @@ mod tests {
             }
             other => panic!("expected SomeInstance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_raw_carrayptr_is_someptr() {
+        // `ann_cast_pointer(PtrT, s_p)` (lltype.py) for a constant
+        // LowLevelType Ptr — `rbuiltin.py gen_cast` Ptr→Ptr.
+        use crate::annotator::model::SomeObjectTrait;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+
+        let ptr_ty = CArrayPtr(LowLevelType::Signed);
+        let mut s_ptrt = SomeValue::Type(super::super::model::SomeType::new());
+        s_ptrt.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(
+            ptr_ty.clone(),
+        ))));
+        assert!(s_ptrt.is_constant());
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_p = SomeValue::Ptr(SomePtr::new(*ccharp));
+        let out = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
+            .expect("ann_cast_pointer of CCHARP to CArrayPtr");
+        let SomeValue::Ptr(ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone())), ptr_ty);
+        assert_eq!(
+            crate::model::getkind(&LowLevelType::Ptr(Box::new(ptr.ll_ptrtype.clone()))),
+            crate::model::ConcreteType::Signed,
+            "CArrayPtr kinds as Signed"
+        );
     }
 
     #[test]

@@ -985,6 +985,7 @@ pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
         "same_as"
             | "deref"
             | "cast_opaque_ptr"
+            | "cast_pointer"
             | "cast_bool_to_int"
             | "cast_bool_to_uint"
             | "cast_int_to_uint"
@@ -998,6 +999,7 @@ pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
     is_identity_cast_path(segments)
         || is_ptr_from_ref_path(segments)
         || is_lltype_cast_path(segments, "cast_opaque_ptr")
+        || is_lltype_cast_path(segments, "cast_pointer")
         || is_current_gc_ref_path(segments)
 }
 
@@ -27111,6 +27113,46 @@ mod tests {
         }
     }
 
+    /// `lltype.cast_pointer` (`rbuiltin.py gen_cast` Ptr→Ptr) folds to
+    /// the operand alias (`jtransform.py rewrite_op_cast_pointer` →
+    /// `rewrite_op_same_as`).
+    #[test]
+    fn lltype_cast_pointer_call_elides_to_operand_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("lltype_cast_pointer");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_pointer",
+        ]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "lltype_cast_pointer",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
     /// `ptr::from_ref` is rustc `return r` / rtyper `cast_pointer` /
     /// `rewrite_op_same_as`. The host Call must alias, not residualise.
     #[test]
@@ -27330,6 +27372,19 @@ mod tests {
         match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
             RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
             _ => panic!("expected the explicit opaque cast to alias its operand"),
+        }
+        let recast = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(recast),
+            kind: OpKind::UnaryOp {
+                op: "cast_pointer".into(),
+                operand: ptr.clone(),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
+            _ => panic!("expected cast_pointer to alias its operand"),
         }
     }
 
