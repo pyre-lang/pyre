@@ -376,13 +376,17 @@ mod tests {
         // `rstr.py copy_string_to_raw` / `copy_raw_to_string`: interior
         // NULs stay. The Address conversion lives inside those residuals.
         let src = b"addr\0copy";
-        let dst = str2charp(src, true);
-        assert_eq!(unsafe { charpsize2str(dst, src.len()) }, src);
+        let dst = str2charp(src, true).unwrap();
+        assert_eq!(unsafe { charpsize2str(dst, src.len()) }.unwrap(), src);
         unsafe { free_charp(dst, true) };
-        let (buf, llobj, flag) = get_nonmovingbuffer_ll(src);
-        assert_eq!(flag, 0x06);
-        assert_eq!(unsafe { charpsize2str(buf, src.len()) }, src);
+        let llobj = crate::lltypesystem::rstr::alloc_immortal_str(src);
+        let (buf, llobj, flag) = get_nonmovingbuffer_ll(llobj).unwrap();
+        // No collector: `can_move` is false, so the pointer is inside the
+        // immortal STR (`FLAG_INSIDE_NONMOVABLE`).
+        assert_eq!(flag, 0x04);
+        assert_eq!(unsafe { charpsize2str(buf, src.len()) }.unwrap(), src);
         unsafe { free_nonmovingbuffer_ll(buf, llobj, flag) };
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(llobj, src.len()) };
     }
 
     #[test]

@@ -50,7 +50,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete};
+use crate::codewriter::type_state::{ConcreteType, valuetype_to_concrete_for_legacy};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
     AlwaysInline, Block, BlockKey, BlockRef, BlockRefExt, ConstValue, Constant, GraphFunc,
@@ -5253,12 +5253,14 @@ fn drive_lifted_subject(
 
     if do_rtype {
         select_rtyped_representatives(&mut value_to_var, &value_to_var_candidates)?;
+        let harvest = call_registry.bookkeeper().raw_alloc_flavor_structs();
         reconcile_projection_aliases(
             legacy,
             &mut value_to_var,
             &mut constant_hlvalues,
             &mut constant_concretetypes,
             Some(&rtyper),
+            &harvest,
         );
         map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
     }
@@ -7221,16 +7223,19 @@ fn lltype_for_named_ref(
 /// `real=Unknown` against the legacy walker's `GcRef` — the legacy
 /// walker types the same slot from this identical `result_ty` at
 /// `legacy_resolve::infer_concrete_from_op` (`OpKind::Call { result_ty }
-/// => valuetype_to_concrete(result_ty)`).
+/// => valuetype_to_concrete_for_legacy(result_ty)`), plus its final
+/// kind backfill.
 ///
 /// A twin with an annotator binding is typed through
 /// `RPythonTyper.setconcretetype` (`bindingrepr` → `getrepr` →
 /// `SomeInstance.rtyper_makerepr` → `getinstancerepr`). Only a
 /// variable with **no** binding may use the front-end `result_ty`:
 /// - `Ref(Some(name))`: `project_struct_field_type(name)` then
-///   `getinstancerepr` when that is `SomeInstance(classdef)`. An alias
-///   (`PyObjectRef`) resolves to the same classdef as the pointee.
-///   No classdef → `llmemory.GCREF`, never `OBJECTPTR`.
+///   `getinstancerepr` when that is `SomeInstance(classdef)`.
+///   `rclass.py getgcflavor` reads `_alloc_flavor_` off that classdesc,
+///   so a harvested raw owner is `Ptr(raw)` (`history.getkind` Signed).
+///   An alias (`PyObjectRef`) resolves to the same classdef as the
+///   pointee. No classdef → `llmemory.GCREF`, never `OBJECTPTR`.
 /// - `Ref(None)` is `llmemory.GCREF` (`Ptr(Opaque)`).
 ///
 /// One equally erased scalar shape is admitted, but only at the producer
@@ -7265,7 +7270,9 @@ fn backfill_untyped_call_results(
     legacy: &LegacyGraph,
     value_to_var: &LegacyToTyped,
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) {
+    use crate::translator::rtyper::lltypesystem::lltype::GCREF;
     for block in &legacy.blocks {
         for op in &block.operations {
             let crate::model::OpKind::Call {
@@ -7305,7 +7312,8 @@ fn backfill_untyped_call_results(
                 }
                 continue;
             }
-            let declared_kind = valuetype_to_concrete(result_ty);
+            let declared_kind =
+                valuetype_to_concrete_for_legacy(result_ty, raw_alloc_flavor_structs);
             let closure_scalar_call = matches!(
                 target,
                 crate::model::CallTarget::Method {
@@ -7321,9 +7329,7 @@ fn backfill_untyped_call_results(
                 crate::model::ValueType::Ref(Some(name)) if !name.is_empty() => {
                     Some(lltype_for_named_ref(rtyper, name))
                 }
-                crate::model::ValueType::Ref(None) => {
-                    Some(crate::translator::rtyper::lltypesystem::lltype::GCREF.clone())
-                }
+                crate::model::ValueType::Ref(None) => Some(GCREF.clone()),
                 crate::model::ValueType::Str | crate::model::ValueType::StringBuilder => {
                     valuetype_to_lltype(result_ty)
                 }
@@ -7331,6 +7337,7 @@ fn backfill_untyped_call_results(
                     ConcreteType::Signed | ConcreteType::Float if closure_scalar_call => {
                         crate::model::concrete_to_canonical_lltype(declared_kind)
                     }
+                    ConcreteType::GcRef => Some(GCREF.clone()),
                     _ => None,
                 },
             };
@@ -7413,8 +7420,9 @@ fn reconcile_projection_aliases(
     constants: &mut HashMap<Variable, Hlvalue>,
     constant_types: &mut HashMap<Variable, LowLevelType>,
     rtyper: Option<&Rc<crate::translator::rtyper::rtyper::RPythonTyper>>,
+    raw_alloc_flavor_structs: &HashSet<String>,
 ) {
-    backfill_untyped_call_results(legacy, value_to_var, rtyper);
+    backfill_untyped_call_results(legacy, value_to_var, rtyper, raw_alloc_flavor_structs);
     loop {
         let hint_changed = reconcile_elided_hint_results(legacy, value_to_var);
         let phi_changed =
@@ -7592,6 +7600,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
         &mut constant_values,
         &mut constants,
         rtyper.as_ref(),
+        &call_registry.bookkeeper().raw_alloc_flavor_structs(),
     );
     map_block_inputargs_from_flowspace(legacy, &block_map, &mut value_to_var);
 
@@ -11941,6 +11950,7 @@ mod tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
             None,
+            &HashSet::new(),
         );
         for alias in aliases {
             assert_eq!(variables.get(&alias), Some(&typed_source));
@@ -12149,7 +12159,7 @@ mod tests {
                     ),
                     result_ty.clone(),
                 );
-                backfill_untyped_call_results(&graph, &value_to_var, None);
+                backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
                 assert_eq!(
                     kind_of_in(&value_to_var, &result),
                     expected,
@@ -12170,7 +12180,7 @@ mod tests {
             },
             ValueType::Int,
         );
-        backfill_untyped_call_results(&graph, &value_to_var, None);
+        backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
         assert_eq!(
             kind_of_in(&value_to_var, &result),
             ConcreteType::Void,
@@ -12197,7 +12207,7 @@ mod tests {
                     .expect("twin")
                     .set_concretetype(None);
             }
-            backfill_untyped_call_results(&graph, &value_to_var, None);
+            backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
             assert_eq!(
                 value_to_var.get(&result).expect("twin").concretetype(),
                 Some(GCREF.clone()),
@@ -12222,7 +12232,7 @@ mod tests {
             .get(&result)
             .expect("twin")
             .set_concretetype(None);
-        backfill_untyped_call_results(&graph, &value_to_var, None);
+        backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
         assert_eq!(
             value_to_var.get(&result).expect("twin").concretetype(),
             Some(GCREF.clone()),
@@ -12263,7 +12273,7 @@ mod tests {
             .get(&result)
             .expect("twin")
             .set_concretetype(None);
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         let expected =
             getinstancerepr(&rtyper, Some(&function_cd), Flavor::Gc).expect("getinstancerepr");
         Repr::setup(expected.as_ref()).expect("setup");
@@ -12320,7 +12330,7 @@ mod tests {
             .get(&result)
             .expect("twin")
             .set_concretetype(None);
-        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper));
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
         let expected =
             getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
         Repr::setup(expected.as_ref()).expect("setup");
@@ -12400,6 +12410,80 @@ mod tests {
             layout_result.concretetype(),
             Some(expected.lowleveltype().clone()),
             "CAST dest intern uses the ByteStr leaf when result_ty is the layout owner"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_stamps_flavor_raw_ref_as_signed() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(
+            "bytecode::CodeObject".to_string(),
+            vec![("co_name".to_string(), "PyObjectRef".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(fields));
+        let registry = CallRegistry::new(bk.clone());
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("bytecode::CodeObject")
+            .expect("CodeObject classdef");
+        classdef
+            .borrow()
+            .classdesc
+            .borrow()
+            .pyobj
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let (_, rtyper) = registry.ensure_session().expect("session");
+
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["w_code_get_ptr".to_string()],
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("bytecode::CodeObject".to_string())),
+        );
+        value_to_var
+            .get(&result)
+            .expect("twin")
+            .set_concretetype(None);
+        backfill_untyped_call_results(&graph, &value_to_var, Some(&rtyper), &HashSet::new());
+        let expected =
+            getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(expected.as_ref()).expect("setup");
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::Signed,
+            "rclass.py getgcflavor of a raw *const T is int"
+        );
+        assert_eq!(
+            value_to_var.get(&result).expect("twin").concretetype(),
+            Some(expected.lowleveltype().clone()),
+            "registered raw named Ref is getinstancerepr, history.getkind Signed"
+        );
+    }
+
+    #[test]
+    fn backfill_untyped_call_results_gc_ref_without_harvest_stays_gcref() {
+        let (graph, result, value_to_var) = backfill_call_result_fixture(
+            crate::model::CallTarget::FunctionPath {
+                segments: vec!["w_code_get_ptr".to_string()],
+                fun_decl_id: None,
+                generic_rust_args: Vec::new(),
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            ValueType::Ref(Some("bytecode::CodeObject".to_string())),
+        );
+        backfill_untyped_call_results(&graph, &value_to_var, None, &HashSet::new());
+        assert_eq!(
+            kind_of_in(&value_to_var, &result),
+            ConcreteType::GcRef,
+            "a Ref with no harvest key stays the GCREF backfill"
         );
     }
 
@@ -13284,6 +13368,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
             }],
             exitswitch: None,
@@ -14039,6 +14124,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
             };
             let (exitswitch, exits) = if raises {
@@ -17809,7 +17895,7 @@ mod tests {
             ("Vec<isize>", LowLevelType::Signed),
             ("Vec<usize>", LowLevelType::Unsigned),
             ("Vec<f64>", LowLevelType::Float),
-            ("Vec<*mut u8>", (*GCREF).clone()),
+            ("Vec<GCREF>", (*GCREF).clone()),
         ] {
             let header = rust_vec_lltype(&item);
             let key = to_vec_registry_key(&bare_segs, Some(&header)).expect("item key");
@@ -17913,7 +17999,7 @@ mod tests {
         );
 
         let (graph, result) =
-            slice_to_vec_call_graph(Some(rust_vec_lltype(&*GCREF)), Some("Vec<*mut u8>"));
+            slice_to_vec_call_graph(Some(rust_vec_lltype(&*GCREF)), Some("Vec<GCREF>"));
         let (map, _) =
             specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
                 .expect("one-word to_vec annotates");

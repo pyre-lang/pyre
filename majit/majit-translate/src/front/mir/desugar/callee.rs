@@ -1386,7 +1386,7 @@ pub(in crate::front::mir) fn is_string_identity_call(llbc: &Llbc, call: &CallPay
         Some("as_bytes") => true,
         Some("bytes") if np.contains("str") => true,
         Some(leaf @ ("as_ref" | "as_str" | "as_str_unchecked" | "borrow")) => {
-            tyref_strips_to_str(&call.dest.ty, llbc)
+            (tyref_strips_to_str(&call.dest.ty, llbc) && !tyref_is_rust_heap_string(first_ty, llbc))
                 || is_as_ref_byte_view(Some(leaf), &call.dest.ty, llbc)
         }
         Some("deref" | "deref_mut") => tyref_is_string_family(&call.dest.ty, llbc),

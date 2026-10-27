@@ -4365,6 +4365,41 @@ pub fn translate_op(
                             fmt_op_result(op),
                         )));
                     }
+                    // A storage-raw aggregate is an lltype Struct, not an
+                    // RPython class. `lltype.py ann_malloc` must see its
+                    // container type so the result stays SomePtr through
+                    // rtyping (`history.py getkind` then reports int).
+                    if let Some(crate::annotator::model::SomeValue::Ptr(ptr)) = call_registry
+                        .bookkeeper()
+                        .raw_struct_ptr_annotation(class_host.qualname())
+                        && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(
+                            st,
+                        ) = ptr.ll_ptrtype.TO
+                    {
+                        let malloc = HOST_ENV
+                            .import_module("rpython.rtyper.lltypesystem.lltype")
+                            .and_then(|module| module.module_get("malloc"))
+                            .ok_or_else(|| {
+                                TyperError::message("lltype.malloc missing from HOST_ENV")
+                            })?;
+                        let shape = ConstValue::Tuple(vec![
+                            ConstValue::Int(1),
+                            ConstValue::Tuple(vec![ConstValue::byte_str("flavor")]),
+                            ConstValue::Bool(false),
+                        ]);
+                        return Ok(vec![FlowspaceOp::new(
+                            "call_args",
+                            vec![
+                                Hlvalue::Constant(Constant::new(ConstValue::HostObject(malloc))),
+                                Hlvalue::Constant(Constant::new(shape)),
+                                Hlvalue::Constant(Constant::new(ConstValue::LowLevelType(
+                                    Box::new(LowLevelType::Struct(Box::new(st))),
+                                ))),
+                                Hlvalue::Constant(Constant::new(ConstValue::byte_str("raw"))),
+                            ],
+                            result,
+                        )]);
+                    }
                     Ok(vec![instantiate_op(class_host, result)?])
                 }
                 // The untranslated marker body is a no-op. The codewriter
@@ -5625,7 +5660,12 @@ pub(crate) fn derive_subject_inputcells(
                         .is_some_and(|reg| split_struct_template_rows_known(reg, root))
                         // A `MutRef<T>` cell is a synthetic one-field class with no
                         // struct-field rows, interned by qualname like its constructor.
-                        || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef";
+                        || majit_ir::descr::strip_instantiation_suffix(root) == "MutRef"
+                        // A graph that getattr/setattr's this owner FORCE's those
+                        // attrs (`SomeInstance.getattr`). Template rows are the
+                        // harvest; a standalone CodeWriter still has the FieldRead
+                        // owner on the op.
+                        || graph_accesses_struct_fields(legacy, root);
                     if known {
                         // A `&FixedObjectArray` receiver models as its
                         // `_items` element list, not the wrapping struct
@@ -5762,6 +5802,26 @@ pub(crate) fn derive_subject_inputcells(
         }
     }
     Ok(cells)
+}
+
+/// True when this graph getattr/setattr's `root`. Those ops FORCE the
+/// attr onto the classdef (`SomeInstance.getattr`); intern the class
+/// even when harvest has not yet published template rows.
+fn graph_accesses_struct_fields(legacy: &FunctionGraph, root: &str) -> bool {
+    for block in &legacy.blocks {
+        for op in &block.operations {
+            let owner = match &op.kind {
+                OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. } => {
+                    field.owner_root.as_deref()
+                }
+                _ => None,
+            };
+            if owner == Some(root) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Exact registry key, or template rows of a split struct whose harvest
@@ -7999,6 +8059,32 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+
+        // The same struct constructed inside a graph must select PtrRepr,
+        // just like a caller-supplied pointer (`lltype.py ann_malloc`).
+        let mut ctor_graph = LegacyGraph::new("scope_new");
+        let value = ctor_graph
+            .push_op_var(
+                ctor_graph.startblock,
+                OpKind::Call {
+                    target: crate::model::CallTarget::synthetic_transparent_ctor(owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        ctor_graph.set_return(ctor_graph.startblock, Some(value.clone()));
+        let registry = CallRegistry::new(bk);
+        let (typed, _) = crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var(
+            &ctor_graph, &registry,
+        ).expect("raw struct constructor must annotate and rtype");
+        let lltype = typed[&value].concretetype().expect("typed constructor");
+        assert_eq!(
+            crate::model::getkind(&lltype),
+            crate::model::ConcreteType::Signed
+        );
+        assert!(matches!(lltype, LowLevelType::Ptr(ref ptr) if ptr.TO._gckind() == GcKind::Raw));
     }
 
     #[test]
@@ -13055,6 +13141,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
         };
         let translated = translate_op(&op, &value_map, &empty_call_registry())

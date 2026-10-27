@@ -2242,7 +2242,7 @@ pub fn jit_int_in_small_cache_range(value: i64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pyre_interpreter::PyExecutionContext;
+    use pyre_interpreter::alloc_execution_context;
     use pyre_interpreter::{ConstantData, compile_exec};
 
     /// Verifies that `#[elidable_cannot_raise]` emits the
@@ -2289,7 +2289,7 @@ mod tests {
         // that path instead of the legacy raw storage pointer so the
         // test exercises the same dispatch the JIT trace helpers will
         // see once the remaining caller cutover lands.
-        let ctx = PyExecutionContext::default();
+        let ctx = alloc_execution_context();
         let w_builtin = ctx.get_builtin();
         let w_builtin_dict = unsafe { pyre_object::w_module_get_w_dict(w_builtin) };
         let abs = unsafe { pyre_object::w_dict_getitem_str(w_builtin_dict, "abs") }

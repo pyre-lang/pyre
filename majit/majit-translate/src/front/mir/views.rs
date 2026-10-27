@@ -962,9 +962,7 @@ impl<'a> Lowering<'a> {
         result_ty: ValueType,
     ) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let result = self.alloc_legacy_result(&result_ty);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result.clone()),
             kind: OpKind::Call {
@@ -1687,6 +1685,28 @@ impl<'a> Lowering<'a> {
         Ok((carried[0].clone(), carried[1].clone()))
     }
 
+    /// Fat-box FieldRead `var` is a data/len word of, peeling lltype
+    /// pointer casts. `None` when `var` is not that box or a part of one.
+    pub(in crate::front::mir) fn fat_box_origin_of(&self, var: &Variable) -> Option<Variable> {
+        let var = self
+            .cast_ptr_to_int_src
+            .get(var)
+            .cloned()
+            .unwrap_or_else(|| var.clone());
+        resolve_fat_box_origin(&self.graph, &self.fat_box_vars, &var)
+    }
+
+    /// `from_raw_parts(p, n)` of a fat box's own FatData and FatLen is
+    /// that box. A subslice (different `n`) stays `None`.
+    pub(in crate::front::mir) fn fat_box_whole_slice_from_raw_parts(
+        &self,
+        ptr: &Variable,
+        len: &Variable,
+    ) -> Option<Variable> {
+        let origin = self.fat_box_origin_of(ptr)?;
+        fat_len_is_of_box(&self.graph, &self.fat_box_vars, &origin, len).then_some(origin)
+    }
+
     /// `seq[i]`: `ll_slice_getitem_fast` after `index < len`.
     pub(in crate::front::mir) fn pair_getitem(
         &mut self,
@@ -2021,11 +2041,15 @@ impl<'a> Lowering<'a> {
             Some(inner) => (inner, true),
             None => (payload, false),
         };
-        let spelling = tyref_to_ast_string(&item, self.llbc);
-        let kind = majit_ir::rvec::rust_slice_item_kind_for_spelling(
-            &format!("[{spelling}]"),
-            crate::layout::target_word_size(),
-        )?;
+        let kind = tyref_node(&item, self.llbc)
+            .and_then(|node| rust_vec_item_kind_of_item_node(node, self.llbc))
+            .or_else(|| {
+                let spelling = tyref_to_ast_string(&item, self.llbc);
+                majit_ir::rvec::rust_slice_item_kind_for_spelling(
+                    &format!("[{spelling}]"),
+                    crate::layout::target_word_size(),
+                )
+            })?;
         PAIR_SLICE_ITEM_KINDS
             .contains(&kind)
             .then_some((kind, by_ref))
@@ -2629,6 +2653,19 @@ impl<'a> Lowering<'a> {
             .first()
             .and_then(Option::as_ref)
             .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc));
+        let name_segs: Vec<String> = path_segments_respecting_angles(&name);
+        let vec_view = rust_vec_slice_view(&name);
+        // One-word-item rust-vec header deref / as_slice, including a
+        // byte item (`Vec<u8>`, no helper kind). The slice is the
+        // `(p, l)` pair; the Vec header ptr/len are the view. Decided
+        // before the u8-window dest arm so `Vec<u8>::deref` does not
+        // take the pair-return length-slot residual.
+        let vec_header_view = args.len() == 1
+            && arg_tys.first().and_then(Option::as_ref).is_some_and(|ty| {
+                tyref_is_rust_vec_header(ty, self.llbc)
+                    && (vec_kind.is_some() || tyref_rust_vec_item_is_u8(ty, self.llbc))
+            })
+            && (vec_view.is_some() || is_deref_call(reg, self.llbc));
         let arg_is_range_full = arg_tys
             .get(1)
             .and_then(Option::as_ref)
@@ -2724,6 +2761,15 @@ impl<'a> Lowering<'a> {
                     args[0].clone()
                 };
                 self.bind_str_source_to_dest(mir_bb, dest_local, header);
+            } else if vec_header_view {
+                let (ptr, len) = self.pair_of_vec(
+                    mir_bb,
+                    vec_kind.unwrap_or(majit_ir::rvec::VecItemKind::Int),
+                    args[0].clone(),
+                );
+                let ptr = self.ensure_window_ccharp(mir_bb, ptr);
+                let owner = args.first().and_then(|v| self.owner_for_window_source(v));
+                self.bind_pair_local(mir_bb, dest_local, ptr, len, owner);
             } else {
                 let (ptr, len) = self.lower_window_dest_call(
                     mir_bb,
@@ -2751,21 +2797,7 @@ impl<'a> Lowering<'a> {
                 _ => None,
             };
             let src_owner = args.first().and_then(|v| self.owner_for_window_source(v));
-            let name_segs: Vec<String> = path_segments_respecting_angles(&name);
             let vec_index = matches!(rust_vec_std_leaf(&name_segs), Some("index" | "index_mut"));
-            let vec_view = rust_vec_slice_view(&name);
-            // Rust-vec header deref / as_slice. Header-word Items/Length
-            // are kind-independent (`rlist.py` `ll_items` / `ll_length`).
-            // `core::ops::deref::<Impl>::deref` may not match
-            // `rust_vec_std_leaf`. A one-word item (`Vec<i64>`) and a
-            // byte item (`Vec<u8>`, no helper kind) both split the
-            // header; a payload-enum item stays the one-word residual dest.
-            let vec_header_view = args.len() == 1
-                && arg_tys.first().and_then(Option::as_ref).is_some_and(|ty| {
-                    tyref_is_rust_vec_header(ty, self.llbc)
-                        && (vec_kind.is_some() || tyref_rust_vec_item_is_u8(ty, self.llbc))
-                })
-                && (vec_view.is_some() || is_deref_call(reg, self.llbc));
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
@@ -3602,10 +3634,36 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .map(|sig| &sig.output)
             .unwrap_or(&fd.signature.output);
-        let is_pair_or_window =
-            |ty: &TyRef| self.pair_slice_kind(ty).is_some() || tyref_is_u8_window(ty, self.llbc);
+        // A specialized body substitutes `&[T]` to a concrete item; that
+        // slot is the two-word ABI. An opaque helper keeps unsubstituted
+        // `TypeVar` / `TraitType` as one word (`core::slice::<Impl>::get`)
+        // so the length stays in the caller frame.
+        // `rstr.py copy_string_to_raw` src is `STR` next to a CCHARP
+        // dst (`mark_residual_str_params`). A constructor residual
+        // (`w_bytes_from_bytes(&[u8])`) keeps the two-word window.
+        let residual_str = fun_decl_is_dont_look_inside(fd, self.dont_look_inside)
+            && inputs.iter().any(|ty| tyref_is_u8_window(ty, self.llbc))
+            && inputs.iter().any(|ty| tyref_is_raw_u8_ptr(ty, self.llbc));
+        let is_pair_or_window = |ty: &TyRef| {
+            if tyref_is_u8_window(ty, self.llbc) {
+                return true;
+            }
+            if substituted.is_none() && tyref_slice_item_is_generic_param(ty, self.llbc) {
+                return false;
+            }
+            self.pair_slice_kind(ty).is_some()
+        };
         (
-            inputs.iter().map(is_pair_or_window).collect(),
+            inputs
+                .iter()
+                .map(|ty| {
+                    if residual_str && tyref_is_u8_window(ty, self.llbc) {
+                        false
+                    } else {
+                        is_pair_or_window(ty)
+                    }
+                })
+                .collect(),
             is_pair_or_window(output),
         )
     }
@@ -3829,6 +3887,7 @@ pub(in crate::front::mir) fn fat_field_producer_of(
                         args,
                         ..
                     } if segments.last().map(|s| s.as_str()) == Some("cast_int_to_ptr")
+                        || segments.last().map(|s| s.as_str()) == Some("cast_ptr_to_int")
                         || segments.last().map(|s| s.as_str()) == Some("same_as") =>
                     {
                         next = args
@@ -4301,6 +4360,209 @@ pub(in crate::front::mir) fn fat_field_producer(
         }
     }
     agreed
+}
+
+/// Fat-box FieldRead `var` is a data/len word of, or `var` itself when it
+/// is that box. Walks `same_as` / lltype pointer casts and a residual
+/// `from_raw_parts` that rebuilt the whole slice from those parts.
+/// Each step is a strictly earlier producer; a repeated variable ends
+/// the walk.
+pub(in crate::front::mir) fn resolve_fat_box_origin(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    var: &Variable,
+) -> Option<Variable> {
+    let mut visited: Vec<Variable> = Vec::new();
+    resolve_fat_box_origin_visited(graph, fat_box_vars, var, &mut visited)
+}
+
+fn resolve_fat_box_origin_visited(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    var: &Variable,
+    visited: &mut Vec<Variable>,
+) -> Option<Variable> {
+    if visited.iter().any(|seen| seen == var) {
+        return None;
+    }
+    visited.push(var.clone());
+    if let Some(src) = fat_box_same_as_or_cast_src(graph, var) {
+        return resolve_fat_box_origin_visited(graph, fat_box_vars, &src, visited);
+    }
+    if fat_box_vars.iter().any(|marked| marked == var) {
+        return Some(var.clone());
+    }
+    if constants_field_read(graph, var).is_some() {
+        return Some(var.clone());
+    }
+    if let Some((base, field, _)) = fat_field_producer_of(graph, var)
+        && matches!(
+            field.vec_part,
+            Some(
+                crate::model::VecFieldPart::FatData
+                    | crate::model::VecFieldPart::FatLen
+                    | crate::model::VecFieldPart::FatMeta
+                    | crate::model::VecFieldPart::FatVtable
+            )
+        )
+    {
+        if let Some(found) = find_marked_fat_box(graph, fat_box_vars, &base, &field) {
+            return Some(found);
+        }
+        if let Some(found) = sibling_whole_field_read(graph, &base, &field) {
+            return Some(found);
+        }
+    }
+    if let Some((ptr, len)) = from_raw_parts_result_args(graph, var) {
+        let origin = resolve_fat_box_origin_visited(graph, fat_box_vars, &ptr, visited)?;
+        if fat_len_is_of_box(graph, fat_box_vars, &origin, &len) {
+            return Some(origin);
+        }
+    }
+    None
+}
+
+fn fat_box_same_as_or_cast_src(graph: &FunctionGraph, var: &Variable) -> Option<Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::UnaryOp {
+                    op: name, operand, ..
+                } if name == "same_as" => Some(operand.clone()),
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if matches!(
+                    segments.last().map(|s| s.as_str()),
+                    Some("same_as" | "cast_int_to_ptr" | "cast_ptr_to_int")
+                ) =>
+                {
+                    args.first()
+                        .and_then(crate::model::LinkArg::as_variable)
+                        .cloned()
+                }
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
+fn find_marked_fat_box(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    base: &Variable,
+    field: &FieldDescriptor,
+) -> Option<Variable> {
+    for marked in fat_box_vars {
+        let Some((got_base, got_field, _)) =
+            direct_fat_field_read(graph, std::slice::from_ref(marked), marked)
+                .or_else(|| constants_field_read(graph, marked))
+        else {
+            continue;
+        };
+        if &got_base == base
+            && got_field.name == field.name
+            && got_field.owner_root == field.owner_root
+        {
+            return Some(marked.clone());
+        }
+    }
+    None
+}
+
+fn sibling_whole_field_read(
+    graph: &FunctionGraph,
+    base: &Variable,
+    field: &FieldDescriptor,
+) -> Option<Variable> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let OpKind::FieldRead {
+                base: got_base,
+                field: got_field,
+                ..
+            } = &op.kind
+                && got_base == base
+                && got_field.name == field.name
+                && got_field.owner_root == field.owner_root
+                && got_field.vec_part.is_none()
+            {
+                return op.result.clone();
+            }
+        }
+    }
+    None
+}
+
+pub(in crate::front::mir) fn fat_len_is_of_box(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    box_var: &Variable,
+    len_var: &Variable,
+) -> bool {
+    let len_var = peel_copy_var(graph, len_var);
+    let Some((len_base, len_field, _)) = fat_field_producer_of(graph, &len_var) else {
+        return false;
+    };
+    if len_field.vec_part != Some(crate::model::VecFieldPart::FatLen) {
+        return false;
+    }
+    let Some((box_base, box_field, _)) = fat_field_producer(graph, fat_box_vars, box_var)
+        .or_else(|| constants_field_read(graph, box_var))
+        .or_else(|| {
+            sibling_whole_field_read(graph, &len_base, &len_field).and_then(|whole| {
+                fat_field_producer(graph, fat_box_vars, &whole)
+                    .or_else(|| constants_field_read(graph, &whole))
+            })
+        })
+    else {
+        return false;
+    };
+    len_base == box_base
+        && len_field.name == box_field.name
+        && len_field.owner_root == box_field.owner_root
+}
+
+fn from_raw_parts_result_args(
+    graph: &FunctionGraph,
+    dest: &Variable,
+) -> Option<(Variable, Variable)> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(dest) {
+                continue;
+            }
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if !call_segments_are_slice_from_raw_parts(segments) {
+                continue;
+            }
+            let ptr = args.first().and_then(crate::model::LinkArg::as_variable)?;
+            let len = args.get(1).and_then(crate::model::LinkArg::as_variable)?;
+            return Some((ptr.clone(), len.clone()));
+        }
+    }
+    None
+}
+
+fn call_segments_are_slice_from_raw_parts(segments: &[String]) -> bool {
+    let Some(leaf) = segments.last() else {
+        return false;
+    };
+    (leaf == "from_raw_parts" || leaf == "from_raw_parts_mut")
+        && segments.iter().any(|s| s == "slice")
+        && segments.iter().any(|s| s == "raw")
 }
 
 /// `<[T]>::to_vec` — Rust MIR `alloc::slice::<Impl>::to_vec`, a slice→owned-Vec
@@ -4886,6 +5148,34 @@ pub(in crate::front::mir) fn tyref_object_pointer_slice_mutability<'l>(
     .then_some(kind)
 }
 
+/// Unsubstituted `&[T]` / `*const [T]` whose item is still a `TypeVar`
+/// or `TraitType`. An opaque std helper keeps that one-word ABI
+/// (`pair_or_window_fun_inputs`); a specialized body substitutes first.
+pub(in crate::front::mir) fn tyref_slice_item_is_generic_param(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(pointee) = (match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array().and_then(|arr| arr.get(1)),
+        (None, Some(raw)) => raw.as_array().and_then(|arr| arr.first()),
+        (None, None) => None,
+    }) else {
+        return false;
+    };
+    let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
+        return false;
+    };
+    let Some(item) = pointee
+        .get("Slice")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(|item| strip_ty_indirections(item, llbc))
+    else {
+        return false;
+    };
+    item.get("TraitType").is_some() || item.get("TypeVar").is_some()
+}
+
 /// The item kind of a `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]` whose
 /// items are one word: a fat pointer, one level over a slice.  `&[u8]`, `&str` and a borrow of
 /// a fixed-length array answer `None`.
@@ -5326,13 +5616,11 @@ pub(in crate::front::mir) fn pair_len_shadows(
     llbc: &Llbc,
     graph_name: &str,
     accum: &AccumulatorFacts,
+    residual: bool,
 ) -> (Vec<Option<usize>>, Vec<bool>, Vec<bool>, Vec<bool>) {
     let views = objectptr_pair_view_locals(body, llbc);
     let (mut str_views, list_views, list_view_fixed) = body_owner_view_locals(body, llbc, accum);
-    // `RDict` / `HashMap` key parameters are `space.bytes_w` / `str`
-    // (`BytesDictStrategy.unwrap`), one `Ptr(STR)` word. A window ABI on
-    // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
-    mark_dict_method_str_view_keys(graph_name, body, llbc, &mut str_views);
+    mark_param_str_views(graph_name, &body.locals, llbc, residual, &mut str_views);
     let raw_vec_views = raw_vec_pair_view_locals(body, llbc);
     (
         pair_len_shadows_of(
@@ -5540,7 +5828,7 @@ pub(in crate::front::mir) fn rvalue_list_view_is_fixed(rvalue: &Rvalue, llbc: &L
 }
 
 /// A 1-arg call whose dest is a shared `&[u8]` and whose first argument
-/// is a W2 list owner (`Vec<u8>` / `&mut [u8]` / `Box<[u8]>`).
+/// is a W2 list owner (`Vec<u8>` / `&mut [u8]` / `Box<[u8]>` / `*mut [u8]`).
 pub(in crate::front::mir) fn call_dest_is_w2_list_source(call: &CallPayload, llbc: &Llbc) -> bool {
     if !tyref_is_u8_window(&call.dest.ty, llbc) || call.args.len() != 1 {
         return false;
@@ -5861,23 +6149,82 @@ pub(in crate::front::mir) fn rdict_method_leaf_if_owner(name: &str) -> Option<&s
     crate::translator::rtyper::flowspace_adapter::rdict_type_leaf(owner).then_some(leaf)
 }
 
+/// Parameter STR-view marks shared by the declaration header and the body.
+/// `pygraph.py` has no flowed body, so this is the only STR-view the
+/// startblock can name; `pair_len_shadows` then unions owner-view locals.
+pub(in crate::front::mir) fn mark_param_str_views(
+    graph_name: &str,
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+    residual: bool,
+    str_views: &mut [bool],
+) {
+    // `RDict` / `HashMap` key parameters are `space.bytes_w` / `str`
+    // (`BytesDictStrategy.unwrap`), one `Ptr(STR)` word. A window ABI on
+    // those formals splices the key and harvests `equivalent` (`PartialEq::eq`).
+    mark_dict_method_str_view_keys(graph_name, locals, llbc, str_views);
+    // `rstr.py copy_string_to_raw` src is `STR` next to a CCHARP dst.
+    // A constructor residual (`w_bytes_from_bytes`) keeps the window.
+    if residual {
+        mark_residual_str_params(locals, llbc, str_views);
+    }
+}
+
+/// `dont_look_inside` residual formals that are a shared `&[u8]`.
+/// `rstr.py copy_string_to_raw` takes `STR` next to a CCHARP dst; the
+/// residual's `FUNC.ARGS` has to name the same one-word src. A
+/// constructor residual (`w_bytes_from_bytes(&[u8])`) has no CCHARP
+/// sibling and keeps the two-word window (`jit_w_bytes_from_u8`).
+pub(in crate::front::mir) fn mark_residual_str_params(
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+    str_views: &mut [bool],
+) {
+    let arg_count = locals.arg_count as usize;
+    let mut has_window = false;
+    let mut has_ccharp = false;
+    for i in 1..=arg_count {
+        let Some(local) = locals.locals.get(i) else {
+            continue;
+        };
+        if tyref_is_u8_window(&local.ty, llbc) {
+            has_window = true;
+        }
+        if tyref_is_raw_u8_ptr(&local.ty, llbc) {
+            has_ccharp = true;
+        }
+    }
+    if !has_window || !has_ccharp {
+        return;
+    }
+    for i in 1..=arg_count {
+        if i < str_views.len()
+            && locals
+                .locals
+                .get(i)
+                .is_some_and(|local| tyref_is_u8_window(&local.ty, llbc))
+        {
+            str_views[i] = true;
+        }
+    }
+}
+
 /// Key formals of [`is_rdict_borrowed_key_method`] that are a shared
 /// `&[u8]` stay `Ptr(STR)` (`space.bytes_w`). Local 0 is the return; local 1
 /// is the receiver.
 pub(in crate::front::mir) fn mark_dict_method_str_view_keys(
     graph_name: &str,
-    body: &Unstructured,
+    locals: &majit_charon_reader::ullbc::Locals,
     llbc: &Llbc,
     str_views: &mut [bool],
 ) {
     if !is_rdict_borrowed_key_method(graph_name) {
         return;
     }
-    let arg_count = body.locals.arg_count as usize;
+    let arg_count = locals.arg_count as usize;
     for i in 2..=arg_count {
         if i < str_views.len()
-            && body
-                .locals
+            && locals
                 .locals
                 .get(i)
                 .is_some_and(|local| tyref_is_u8_window(&local.ty, llbc))
@@ -7134,8 +7481,6 @@ pub(in crate::front::mir) fn rust_vec_deref_feeds_only_reverse(
     reverses > 0
 }
 
-/// Slice methods [`Lowering::is_pair_call`] splits. A dest passed as an
-/// argument to any other callee stays the one-word helper ABI.
 pub(in crate::front::mir) fn path_is_pair_slice_method(path: &str) -> bool {
     matches!(
         path,

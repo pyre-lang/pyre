@@ -200,10 +200,7 @@ fn type_error_names_the_installed_class() -> bool {
 fn simple_weak_set_contains_identity() -> (usize, usize, usize, usize) {
     const NONE: (usize, usize, usize, usize) = (0, 0, 0, 0);
     let Some(method) = (unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            simple_weak_set_type(),
-            "__contains__",
-        )
+        pyre_interpreter::baseobjspace::lookup_in_type(simple_weak_set_type(), "__contains__")
     }) else {
         return NONE;
     };

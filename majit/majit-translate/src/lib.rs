@@ -2121,19 +2121,7 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind = match program.struct_fields.harvested_raw_storage(struct_name) {
-                Some(true) => crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
-                Some(false) => crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
-                None if crate::front::mir::struct_id_is_declared_gc(
-                    &declared_gc,
-                    sid,
-                    struct_name,
-                ) =>
-                {
-                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-                }
-                None => crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
-            };
+            layout.gckind = crate::front::mir::declared_gckind(sid, struct_name, &declared_gc);
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {
@@ -2147,6 +2135,7 @@ fn analyze_pipeline_from_module_paths(
             call_control.set_struct_layout(sid, layout);
         }
     }
+    call_control.set_declared_gc_struct_ids(declared_gc);
     if census_struct_layouts {
         let struct_id_count = struct_layout_variants.len();
         let aliased_struct_ids = struct_layout_variants
@@ -5075,6 +5064,7 @@ mod harvested_funcobj_hints_tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -5105,6 +5095,7 @@ mod harvested_funcobj_hints_tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_eq!(
@@ -5222,6 +5213,7 @@ mod harvested_funcobj_hints_tests {
                     None,
                     &mut cache,
                     None,
+                    None,
                 );
                 assert_eq!(
                     descriptor.extra_info.extraeffect,
@@ -5270,6 +5262,7 @@ mod harvested_funcobj_hints_tests {
                             OopSpecIndex::None,
                             None,
                             &mut cache,
+                            None,
                             None,
                         );
                         assert_eq!(
@@ -5363,6 +5356,7 @@ mod harvested_funcobj_hints_tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -5389,6 +5383,7 @@ mod harvested_funcobj_hints_tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_ne!(
@@ -5419,6 +5414,7 @@ mod harvested_funcobj_hints_tests {
             OopSpecIndex::None,
             None,
             &mut AnalysisCache::default(),
+            None,
             None,
         );
         assert_eq!(

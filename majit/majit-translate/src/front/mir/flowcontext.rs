@@ -446,6 +446,13 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// rust-heap `String` ABI. `finish` rejects the graph when that
     /// call is still a `Call` after format collapse.
     pub(in crate::front::mir) rust_heap_string_attr_call_results: Vec<u64>,
+    /// Nesting of Field/Index projections whose inner place is being
+    /// resolved. FieldRead further-projected is
+    /// `field_read_result_is_later_base` at jtransform (the result is a
+    /// later FieldRead/FieldWrite base). ArrayRead `taken_by_address`
+    /// is `ITEM_TYPE` being a ContainerType (`rptr.py` `rtype_getitem`)
+    /// at any depth.
+    pub(in crate::front::mir) projection_base_depth: u32,
     /// Results of calls whose declared type is a fat `&dyn` or `Box<dyn>`.
     /// `FunctionGraph::set_return` carries one word, so
     /// [`crate::front::dyn_fat`] splices these callees and reads `method_*`
@@ -680,10 +687,11 @@ pub(in crate::front::mir) struct Lowering<'a> {
 /// `ValueType::Str` is rstr `STR` (`history.py` `getkind` `'ref'`).
 /// Keep the `STRPTR` lltype so `<[u8]>::as_ptr` emits `cast_ptr_to_int`
 /// of the string (`slice_as_ptr_word`) and `strgetitem` takes that
-/// GCREF (`/ri>i`), not the chars pointer.
+/// GCREF (`/ri>i`), not the chars pointer. Canonical `GcRef` is
+/// `OBJECTPTR`; `stamp_as_rstr_str` writes `STRPTR` after it.
 pub(in crate::front::mir) fn paint_str_param_gcref(var: &Variable, ty: &ValueType) {
     if matches!(ty, ValueType::Str) {
-        FunctionGraph::set_concretetype_of_inline(var, crate::model::ConcreteType::GcRef);
+        stamp_as_rstr_str(var);
         return;
     }
     let want = concretetype_for_field(ty);
@@ -713,7 +721,12 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
-    let len_shadow = pair_len_shadows_of(&graph.name, locals, llbc, &[], &[], &[], &[]);
+    // Same STR-view marks as the body (`pair_len_shadows`): dict keys and
+    // a `dont_look_inside` residual's shared `&[u8]` (`rstr.py` `STR`).
+    // `pygraph.py` has no flowed body, so owner-view locals stay empty.
+    let mut str_views = vec![false; n_locals];
+    mark_param_str_views(&graph.name, locals, llbc, residual_raw_addr, &mut str_views);
+    let len_shadow = pair_len_shadows_of(&graph.name, locals, llbc, &[], &str_views, &[], &[]);
     let n_slots = n_locals + len_shadow.iter().flatten().count();
     let ret_len_slot_local = ret_len_slot_index(locals, llbc, &len_shadow, n_slots);
     // Arguments become startblock inputargs in source order
@@ -936,9 +949,17 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                 // Same bank as a window data word (`getkind` of a raw Ptr).
                 (ValueType::Unsigned, Some("CCHARP".to_string()))
             }
+            None if str_views.get(i).copied().unwrap_or(false)
+                && tyref_is_u8_window(&local.ty, llbc) =>
+            {
+                (ValueType::Str, None)
+            }
             None => (ty, class_root),
         };
         paint_str_param_gcref(&var, &ty);
+        if class_root.as_deref() == Some("CCHARP") {
+            stamp_as_ccharp(&var);
+        }
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
@@ -1010,12 +1031,11 @@ fn copy_agreed_concretetypes(prev: &FrameState, ex: &FrameState, merged: &FrameS
         if dst.id() == a.id() || dst.id() == b.id() {
             continue;
         }
-        let (Some(ct_a), Some(ct_b)) = (a.concretetype(), b.concretetype()) else {
-            continue;
+        let agreed = match (a.concretetype(), b.concretetype()) {
+            (Some(ct_a), Some(ct_b)) if ct_a == ct_b => Some(ct_a),
+            _ => None,
         };
-        if ct_a == ct_b {
-            dst.set_concretetype(Some(ct_a));
-        }
+        dst.set_concretetype(agreed);
     }
 }
 
@@ -1387,7 +1407,7 @@ impl<'a> Lowering<'a> {
         );
         let n_locals = body.locals.locals.len();
         let (len_shadow, str_view_locals, list_view_locals, list_view_fixed) =
-            pair_len_shadows(body, llbc, &name, accum);
+            pair_len_shadows(body, llbc, &name, accum, self_dont_look_inside);
         let mut graph = FunctionGraph::new(name);
         let raw_array = raw_array_roles(body, llbc);
         let slice_next_iter = slice_next_iters(body, llbc);
@@ -1620,19 +1640,22 @@ impl<'a> Lowering<'a> {
                     (ValueType::Unsigned, Some("CCHARP".to_string()))
                 }
                 Some(_) => (ValueType::Unsigned, None),
-                None if str_view_locals.get(i).copied().unwrap_or(false)
-                    && tyref_is_u8_window(&local.ty, llbc) =>
-                {
-                    (ValueType::Str, None)
-                }
                 None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, llbc) => {
                     // Every raw `*u8` parameter is CCHARP (`rffi.py` `CCHARP`).
                     // Same bank as a window data word (`getkind` of a raw Ptr).
                     (ValueType::Unsigned, Some("CCHARP".to_string()))
                 }
+                None if str_view_locals.get(i).copied().unwrap_or(false)
+                    && tyref_is_u8_window(&local.ty, llbc) =>
+                {
+                    (ValueType::Str, None)
+                }
                 None => (ty, class_root),
             };
             paint_str_param_gcref(&var, &ty);
+            if class_root.as_deref() == Some("CCHARP") {
+                stamp_as_ccharp(&var);
+            }
             input_ops.push(SpaceOperation {
                 result: Some(var.clone()),
                 kind: OpKind::Input {
@@ -2021,6 +2044,7 @@ impl<'a> Lowering<'a> {
             fat_box_vars: Vec::new(),
             exception_rstr_attr_vars: Vec::new(),
             rust_heap_string_attr_call_results: Vec::new(),
+            projection_base_depth: 0,
             dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
@@ -2302,6 +2326,9 @@ impl<'a> Lowering<'a> {
             let (Some(src), Some(dst)) = (&source.entries[slot], &copied.entries[slot]) else {
                 continue;
             };
+            if src.id() != dst.id() {
+                copy_concretetype(src, dst);
+            }
             self.inherit_copied_var(src, dst);
         }
     }
@@ -2313,7 +2340,6 @@ impl<'a> Lowering<'a> {
     pub(in crate::front::mir) fn inherit_copied_var(&mut self, src: &Variable, dst: &Variable) {
         if src.id() != dst.id() {
             self.input_copied_from.insert(dst.id(), src.id());
-            copy_concretetype(src, dst);
         }
         if let Some(orig) = self.cast_ptr_to_int_src.get(src).cloned() {
             self.cast_ptr_to_int_src.insert(dst.clone(), orig);
@@ -2859,8 +2885,13 @@ impl<'a> Lowering<'a> {
                             ))
                         })?;
                         copy_agreed_concretetypes(&prev, &ex, &merged);
-                        self.note_copied_block_inputs(&prev, &merged);
-                        self.note_copied_block_inputs(&ex, &merged);
+                        for source in [&prev, &ex] {
+                            for (src, dst) in source.entries.iter().zip(&merged.entries) {
+                                if let (Some(src), Some(dst)) = (src, dst) {
+                                    self.inherit_copied_var(src, dst);
+                                }
+                            }
+                        }
                         merged
                     }
                 };
@@ -3621,6 +3652,7 @@ impl<'a> Lowering<'a> {
                         ))
                     })?
                     .one()?;
+                self.stamp_declared_return(&ret);
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
@@ -4406,19 +4438,12 @@ impl<'a> Lowering<'a> {
                         continue;
                     }
                     let owner_is_str = self.len_shadow.iter().enumerate().any(|(owner, slot)| {
-                        *slot == Some(local_idx)
-                            && (self.local_holds_str_view(owner)
-                                || self
-                                    .local_var
-                                    .get(owner)
-                                    .and_then(|entry| entry.as_ref())
-                                    .and_then(|value| value.one().ok())
-                                    .is_some())
+                        *slot == Some(local_idx) && self.local_holds_str_view(owner)
                     });
                     if owner_is_str {
-                        return Err(LowerError::Unsupported(
-                            "STR view joins a window".to_string(),
-                        ));
+                        return Err(LowerError::Unsupported(format!(
+                            "STR view joins a window (bb{from_bb} → bb{target_bb} local {local_idx})"
+                        )));
                     }
                     let n_locals = self.body.locals.locals.len();
                     let ty = if local_idx < n_locals {

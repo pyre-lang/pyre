@@ -6,9 +6,11 @@
 //! `FunctionPath` / `Method` calls to those bodies (Opaque in the LLBC),
 //! and every caller then dies at `translate_op` with an unregistered
 //! `CallRegistry` miss.  A pointer cast or a transparent one-field
-//! layout is `same_as`.  `Cell::get` / `Cell::set` are a field
-//! load/store of that word (`getfield` / `setfield` on the owning
-//! struct).  A payload that sits beside other fields is a field read.
+//! layout is `same_as`.  `Cell::set` is a field store of that word
+//! (`setfield` on the owning struct).  `Cell::get` of a struct field
+//! is that field's value read in `lower_call` (`is_cell_get` /
+//! `address_field_read_of`).  A payload that sits beside other fields
+//! is a field read.
 //! An opaque layout stays a residual call.  `Default` on a machine-word
 //! integer / bool is a typed zero.
 //!
@@ -184,25 +186,6 @@ pub(crate) fn lower_std_primitive_op(
     else {
         return op_kind;
     };
-    // `Cell::get` is a load of the inner word (`getfield` on the owning
-    // struct). `same_as` would alias the cell address as `T`. Layout may
-    // be missing when Charon left `Cell` Opaque; the destination type is
-    // still `T`.
-    if args.len() == 1 && is_std_cell_method(target, receiver_path, "get") {
-        let Some(operand) = args[0].as_variable().cloned() else {
-            return op_kind;
-        };
-        let name = layout
-            .and_then(|fields| fields.first())
-            .map(|(name, _)| name.as_str())
-            .unwrap_or("value");
-        return cell_word_read(
-            operand,
-            name,
-            cell_field_owner(receiver_path),
-            result_ty.clone(),
-        );
-    }
     if args.len() == 2 && is_std_cell_method(target, receiver_path, "set") {
         let Some(base) = args[0].as_variable().cloned() else {
             return op_kind;
@@ -445,22 +428,6 @@ fn payload_field_read(
     }
 }
 
-/// Interior-mutable cell word. `pure: false` so a later store is visible
-/// (`bookkeeper.py` does not treat `UnsafeCell` as `immutablevalue`).
-fn cell_word_read(
-    operand: Variable,
-    name: &str,
-    owner: Option<&str>,
-    result_ty: ValueType,
-) -> OpKind {
-    OpKind::FieldRead {
-        base: operand,
-        field: FieldDescriptor::new(name, owner.map(str::to_string)),
-        ty: result_ty,
-        pure: false,
-    }
-}
-
 fn cell_word_write(
     base: Variable,
     name: &str,
@@ -627,74 +594,8 @@ mod tests {
     }
 
     #[test]
-    fn cell_get_is_a_load_when_layout_is_unknown() {
-        // `Cell::get(&Cell<T>) -> T` is a load of the inner word, even
-        // when Charon left `Cell` Opaque without a field list.
-        let v = dummy_var();
-        let get = lower_std_primitive_op(
-            call(
-                path(&["core", "cell", "Cell", "get"]),
-                vec![v.clone()],
-                ValueType::Int,
-            ),
-            Some("core::cell::Cell"),
-            None,
-            Some("I64"),
-            None,
-            false,
-            false,
-            None,
-            false,
-        );
-        match get {
-            OpKind::FieldRead {
-                base,
-                field,
-                ty,
-                pure,
-            } => {
-                assert_eq!(base, v);
-                assert_eq!(field.name, "value");
-                assert_eq!(ty, ValueType::Int);
-                assert!(!pure);
-            }
-            other => panic!("Cell::get must be a field load, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn cell_get_and_atomic_new_are_identity() {
         let v = dummy_var();
-        let get = lower_std_primitive_op(
-            call(
-                path(&["core", "cell", "Cell", "get"]),
-                vec![v.clone()],
-                ValueType::Int,
-            ),
-            Some("core::cell::Cell"),
-            None,
-            Some("I64"),
-            None,
-            false,
-            true,
-            Some(&[("value".into(), ValueType::Int)]),
-            false,
-        );
-        match get {
-            OpKind::FieldRead {
-                base,
-                field,
-                ty,
-                pure,
-            } => {
-                assert_eq!(base, v);
-                assert_eq!(field.name, "value");
-                assert_eq!(ty, ValueType::Int);
-                assert!(!pure);
-            }
-            other => panic!("Cell::get must be a field load, got {other:?}"),
-        }
-
         let new = lower_std_primitive_op(
             call(
                 path(&["core", "sync", "atomic", "<Impl>", "new"]),
@@ -720,32 +621,6 @@ mod tests {
     fn cell_impl_get_and_set_are_the_inner_word() {
         let v = dummy_var();
         let stored = dummy_var();
-        let get = lower_std_primitive_op(
-            call(
-                path(&["core", "cell", "<Impl>", "get"]),
-                vec![v.clone()],
-                ValueType::Unsigned,
-            ),
-            None,
-            None,
-            None,
-            Some("Usize"),
-            false,
-            false,
-            None,
-            false,
-        );
-        match get {
-            OpKind::FieldRead {
-                base, field, pure, ..
-            } => {
-                assert_eq!(base, v);
-                assert_eq!(field.name, "value");
-                assert!(!pure);
-            }
-            other => panic!("core::cell::<Impl>::get must be a field load, got {other:?}"),
-        }
-
         let set = lower_std_primitive_op(
             call(
                 path(&["core", "cell", "Cell", "set"]),

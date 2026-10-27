@@ -4122,6 +4122,11 @@ pub struct CallControl {
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
     /// raw object from a JIT-GC object.
     struct_storage: HashMap<majit_ir::descr::StructId, (bool, bool)>,
+    /// `DeclaredGcFacts::gc_struct_ids` from the program harvest.
+    /// `None` on a `CallControl` that did not run that harvest (unit
+    /// fixtures). `Some` means the harvest ran; a struct absent from the
+    /// set has no `GcType` declaration.
+    declared_gc_struct_ids: Option<HashSet<majit_ir::descr::StructId>>,
     /// Build-time `HostStaticAddrs.pytypes` rows. An exception-class
     /// constant is emitted as the address of its `interp_exceptions`
     /// `PyType` static, which the load-time patch rewrites.
@@ -4244,12 +4249,11 @@ pub struct StructLayout {
     /// Alignment of the struct: Charon `TypeLayout.align` when the
     /// layout was registered, otherwise the max of the fields' alignments.
     pub align: usize,
-    /// `Struct._gckind` / `GcStruct._gckind`. `Gc` when the type implements
-    /// majit-gc `GcType`, is field 0 of a `Gc` type, or its own field 0 is
-    /// `Gc` (`Struct._note_inlined_into`), or when it is not raw storage
-    /// (`adt_def_is_raw_storage`: a GC pointer field cannot sit in a raw
-    /// `Struct`, `lltype.py` `Struct.__init__` / `Ptr._is_atomic`). `Raw`
-    /// when the fields are only raw words. Set when the layout is
+    /// `Struct._gckind` / `GcStruct._gckind`. For an LLBC TypeDecl, `Gc`
+    /// when the type implements majit-gc `GcType` or is on that field-0
+    /// chain (`DeclaredGcFacts`); otherwise `Raw`. A synthetic rtyper
+    /// identity with no TypeDecl carries the gckind of its repr
+    /// (`TupleRepr` is `Ptr(GcStruct)`). Set when the layout is
     /// registered; readers must not treat a missing layout as either kind.
     pub gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
     /// Per-field layout: (field_name, offset, size, type).
@@ -4321,6 +4325,13 @@ fn is_known_by_value_struct(
     type_name: &str,
 ) -> bool {
     let type_name = type_name.trim();
+    // Inline `Vec<T>` / `String` headers are FLAG_STRUCT three-word
+    // values (`field_layout_is_inline_vec`; `alloc::string::String { vec:
+    // Vec<u8> }`). Classify them in `get_type_flag` instead of flattening
+    // a known-struct size.
+    if crate::vec_layout::field_layout_is_inline_vec(type_name) {
+        return false;
+    }
     // A by-value struct is spelled as a nominal path.  Every non-nominal
     // carrier opens with a sigil — `*mut`/`*const`, `&`/`&mut`, `[T]`/`[T; N]`,
     // `(A, B)`, `dyn`/`impl` — so reject on the leading token structurally
@@ -4332,14 +4343,37 @@ fn is_known_by_value_struct(
         || type_name.starts_with("Box<")
         || type_name.starts_with("Arc<")
         || type_name.starts_with("Rc<")
-        || type_name.starts_with("Vec<")
         || type_name.starts_with("Option<")
-        || type_name == "String"
         || atomic_wrapper_leaf(type_name, &HashSet::new()).is_some()
     {
         return false;
     }
-    known_structs.contains(type_name) || majit_ir::descr::positional_shape_id(type_name).is_some()
+    if known_structs.contains(type_name)
+        || majit_ir::descr::positional_shape_id(type_name).is_some()
+    {
+        return true;
+    }
+    // `generic_owner_lookup`: registry and layout keys drop the argument
+    // list (`Raw<f64>` → `Raw`). A template field `Constants<??TypeVar#0>`
+    // is the known struct `Constants`.
+    let key = layout_struct_key(type_name);
+    key != type_name
+        && (known_structs.contains(key) || majit_ir::descr::positional_shape_id(key).is_some())
+}
+
+/// Path before a generic argument list. `bookkeeper.rs` `generic_owner_lookup`.
+fn layout_struct_key(type_name: &str) -> &str {
+    type_name
+        .split_once('<')
+        .map(|(bare, _)| bare)
+        .unwrap_or(type_name)
+}
+
+fn layout_metric<'a, T>(map: &'a HashMap<String, T>, type_str: &str) -> Option<&'a T> {
+    map.get(type_str).or_else(|| {
+        let key = layout_struct_key(type_str);
+        (key != type_str).then(|| map.get(key)).flatten()
+    })
 }
 
 /// Pointee spelling of an `AtomicPtr<T>`.
@@ -4426,8 +4460,7 @@ impl StructLayout {
                 // heaptracker.py:64-67
                 // typeptr is still counted for offset calculation below.
                 let sz = if is_known_by_value_struct(known_structs, type_str) {
-                    known_struct_sizes
-                        .get(type_str.as_str())
+                    layout_metric(known_struct_sizes, type_str)
                         .copied()
                         .unwrap_or(crate::layout::target_word_size())
                 } else {
@@ -4479,10 +4512,10 @@ impl StructLayout {
             .iter()
             .map(|(_, ty)| {
                 if is_known_by_value_struct(known_structs, ty) {
-                    if let Some(&align) = known_struct_aligns.get(ty.as_str()) {
+                    if let Some(&align) = layout_metric(known_struct_aligns, ty) {
                         align
                     } else {
-                        match known_struct_sizes.get(ty.as_str()).copied() {
+                        match layout_metric(known_struct_sizes, ty).copied() {
                             Some(size) if size == 0 || size.is_power_of_two() => size,
                             Some(size) => {
                                 panic!("type `{ty}` has size {size} but no field alignment")
@@ -4824,6 +4857,7 @@ impl CallControl {
             trait_unique_impls: HashMap::new(),
             trait_family_registrations: Vec::new(),
             struct_storage: HashMap::new(),
+            declared_gc_struct_ids: None,
             exc_pytype_rows: Vec::new(),
             // `symbolic.get_array_token(GcArray(T))[0]`: items sit past the
             // length prefix. Rust's prefix is `usize` (pointer word).
@@ -5058,6 +5092,17 @@ impl CallControl {
         self.struct_storage.get(&struct_id).copied()
     }
 
+    /// Install the program-wide `GcType` harvest (`harvest_declared_gc_facts`
+    /// / `DeclaredGcFacts::gc_struct_ids`).
+    pub fn set_declared_gc_struct_ids(&mut self, ids: HashSet<majit_ir::descr::StructId>) {
+        self.declared_gc_struct_ids = Some(ids);
+    }
+
+    /// The harvest set when this session ran `harvest_declared_gc_facts`.
+    pub fn declared_gc_struct_ids(&self) -> Option<&HashSet<majit_ir::descr::StructId>> {
+        self.declared_gc_struct_ids.as_ref()
+    }
+
     /// Resolve a registered [`StructLayout`] by a struct / enum-variant
     /// name in any spelling, through the name → StructId resolver.
     /// `None` for an unknown or cross-module-ambiguous name — the layout
@@ -5108,14 +5153,21 @@ impl CallControl {
         } else {
             &self.known_struct_names
         };
-        let layout = std::rc::Rc::new(StructLayout::from_type_strings(
+        // `rtuple.py TupleRepr`: a non-empty tuple is `malloc(GcStruct)`,
+        // so `_gckind` is gc by construction. `MutRef<T>` is the one-field
+        // GC cell. A shaped `Array<T;N>` is the same on-demand positional
+        // identity (`positional_shape_rows`). None of these has a TypeDecl;
+        // the fact lives on this layout for SizeDescr to read.
+        let mut layout = StructLayout::from_type_strings(
             &pairs,
             known_structs,
             &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             &self.raw_alloc_flavor_structs,
-        ));
+        );
+        layout.gckind = crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc;
+        let layout = std::rc::Rc::new(layout);
         self.struct_layouts.borrow_mut().insert(sid, layout.clone());
         Some(layout)
     }
@@ -5126,7 +5178,21 @@ impl CallControl {
         &self,
         name: &str,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::GcKind> {
-        Some(self.struct_layout_for(name)?.gckind)
+        if let Some(layout) = self.struct_layout_for(name) {
+            return Some(layout.gckind);
+        }
+        // A generic TypeDecl instantiation may have no harvested layout
+        // of its own; the template TypeDecl still carries the declared
+        // gckind (`lib.rs` layout.gckind).
+        let sid = majit_ir::descr::struct_id_for_name(name)?;
+        let template = majit_ir::descr::struct_template_id_for_name(name)?;
+        if template == sid {
+            return None;
+        }
+        self.struct_layouts
+            .borrow()
+            .get(&template)
+            .map(|layout| layout.gckind)
     }
 
     /// Host layout of `owner`, when Charon recorded one.
@@ -12146,6 +12212,7 @@ impl CallControl {
         extraeffect: Option<ExtraEffect>,
         cache: &mut AnalysisCache,
         extradescrs: Option<Vec<DescrRef>>,
+        calling_graph: Option<&str>,
     ) -> CallDescriptor {
         // Extract the direct-call target (if any) and indirect-call family
         // (if any).  Exactly one is Some after the initial dispatch;
@@ -12229,7 +12296,8 @@ impl CallControl {
                     // (voids dropped) raises. Kinds, not only arity.
                     if arg_types != expected_arg_types {
                         panic!(
-                            "operation calling {target}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
+                            "operation {op:?} in {}: calling a function with signature {expected_arg_types:?}, but passing actual arguments (ignoring voids) of types {arg_types:?}",
+                            calling_graph.unwrap_or("None"),
                         );
                     }
                     // call.py `getcalldescr`: RESULT != FUNC.RESULT raises.
@@ -12243,7 +12311,8 @@ impl CallControl {
                         && result_type != expected_result
                     {
                         panic!(
-                            "operation calling {target}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
+                            "{op:?} in {}: calling a function with signature {expected_result:?}, but the actual return type is {result_type:?}",
+                            calling_graph.unwrap_or("None"),
                         );
                     }
                 }
@@ -14527,8 +14596,7 @@ fn field_metadata(
     raw_alloc_flavor_structs: &HashSet<String>,
 ) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
     if is_known_by_value_struct(known_structs, type_str) {
-        let nested_size = known_struct_sizes
-            .get(type_str)
+        let nested_size = layout_metric(known_struct_sizes, type_str)
             .copied()
             .unwrap_or(crate::layout::target_word_size());
         (
@@ -14647,6 +14715,7 @@ pub(crate) fn get_type_flag(
         // inline substruct (`lltype._note_inlined_into`); loading one word
         // at the field offset reads `cap`. The field *value* is the
         // interior address (`direct_fieldptr`).
+        // `alloc::string::String { vec: Vec<u8> }` is that header.
         s if crate::vec_layout::field_layout_is_inline_vec(s) => (
             ArrayFlag::Struct,
             majit_ir::value::Type::Ref,
@@ -14696,8 +14765,7 @@ pub(crate) fn get_type_flag(
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
             || s.starts_with("Rc<")
-            || s.starts_with("Option<")
-            || s == "String" =>
+            || s.starts_with("Option<") =>
         {
             (
                 ArrayFlag::Pointer,
@@ -16106,6 +16174,7 @@ fn effect_transduce_op(
                     nolength,
                     gckind,
                     pure: false,
+                    taken_by_address: false,
                 },
                 result,
             );
@@ -16900,6 +16969,58 @@ mod tests {
         assert_eq!(get_type_flag("*mut u8", &empty), fallback);
         assert_eq!(get_type_flag("*const PyObject", &empty), fallback);
         assert_eq!(get_type_flag("*mut PyObject", &empty), fallback);
+    }
+
+    /// A template field `Constants<??TypeVar#0>` is the known struct
+    /// `Constants` (`generic_owner_lookup`). `get_type_flag` of the
+    /// unresolved spelling would be FLAG_POINTER.
+    #[test]
+    fn field_metadata_generic_known_struct_is_flag_struct() {
+        let mut known = HashSet::new();
+        known.insert("Constants".to_string());
+        let mut sizes = HashMap::new();
+        sizes.insert("Constants".to_string(), 16);
+        let (flag, ty, size) =
+            field_metadata("Constants<??TypeVar#0>", &known, &sizes, &HashSet::new());
+        assert_eq!(flag, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(ty, majit_ir::value::Type::Ref);
+        assert_eq!(size, 16);
+        let (box_flag, _, box_size) =
+            field_metadata("Box<[ConstantData]>", &known, &sizes, &HashSet::new());
+        assert_eq!(box_flag, majit_ir::descr::ArrayFlag::Pointer);
+        assert_eq!(box_size, crate::layout::target_word_size());
+    }
+
+    /// A by-value `String` field is the inline `Vec<u8>` header
+    /// (`alloc::string::String { vec: Vec<u8> }`).
+    #[test]
+    fn field_metadata_string_is_inline_vec_u8_header() {
+        let word = crate::layout::target_word_size();
+        let empty_known = HashSet::new();
+        let empty_sizes = HashMap::new();
+        let empty_raw = HashSet::new();
+        let string = field_metadata("String", &empty_known, &empty_sizes, &empty_raw);
+        let vec_u8 = field_metadata("Vec<u8>", &empty_known, &empty_sizes, &empty_raw);
+        assert_eq!(string.0, majit_ir::descr::ArrayFlag::Struct);
+        assert_eq!(string.1, majit_ir::value::Type::Ref);
+        assert_eq!(string.2, 3 * word);
+        assert_eq!(string, vec_u8);
+        let alloc = field_metadata(
+            "alloc::string::String",
+            &empty_known,
+            &empty_sizes,
+            &empty_raw,
+        );
+        assert_eq!(alloc, string);
+        let mut known = HashSet::new();
+        known.insert("String".to_string());
+        let mut sizes = HashMap::new();
+        sizes.insert("String".to_string(), word);
+        let still = field_metadata("String", &known, &sizes, &empty_raw);
+        assert_eq!(still, string);
+        let borrowed = field_metadata("&String", &empty_known, &empty_sizes, &empty_raw);
+        assert_eq!(borrowed.0, majit_ir::descr::ArrayFlag::Pointer);
+        assert_eq!(borrowed.2, word);
     }
 
     /// `BuildHasherDefault<H>` is `PhantomData` (`hash.rs`); RPython's
@@ -22178,6 +22299,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -22195,6 +22317,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
     }
@@ -22244,6 +22367,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descr.result_ir_type(), Type::Int);
@@ -22393,6 +22517,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -22439,6 +22564,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
     }
@@ -23384,6 +23510,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(!descriptor.extra_info.can_invalidate);
@@ -23406,6 +23533,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
@@ -23434,6 +23562,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
     }
@@ -23456,6 +23585,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -23482,6 +23612,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -23544,6 +23675,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         assert!(!descriptor.extra_info.has_random_effects());
@@ -23580,6 +23712,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -23624,6 +23757,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -23659,6 +23793,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -23888,6 +24023,7 @@ mod tests {
             Some(ExtraEffect::ElidableCannotRaise),
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -23930,6 +24066,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
@@ -23950,6 +24087,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
@@ -23999,6 +24137,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         // Should have non-empty bitsets for field reads and writes.
@@ -24050,6 +24189,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         assert!(
@@ -24083,6 +24223,7 @@ mod tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
         });
@@ -24110,6 +24251,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
@@ -24159,6 +24301,7 @@ mod tests {
                 None,
                 &mut cache,
                 None,
+                None,
             );
             assert_eq!(
                 descriptor.extra_info.extraeffect,
@@ -24197,6 +24340,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
     }
@@ -24224,6 +24368,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             );
             assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
@@ -24264,6 +24409,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         // `effectinfo.py` `effectinfo_from_writeanalyze`: a top read/write
         // set is `EF_RANDOM_EFFECTS` with `None` descr lists. A cannot-raise
@@ -24296,6 +24442,7 @@ mod tests {
             Some(ExtraEffect::ElidableCannotRaise),
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             descriptor.extra_info.extraeffect,
@@ -24311,6 +24458,7 @@ mod tests {
             OopSpecIndex::IntPyDiv,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CannotRaise);
@@ -24378,6 +24526,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -24448,6 +24597,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_eq!(
@@ -24850,6 +25000,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         // Write is set, but readonly should NOT have the same bit set.
@@ -26173,6 +26324,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -26199,6 +26351,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             )
         };
@@ -26253,6 +26406,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
     }
 
@@ -26289,6 +26443,7 @@ mod tests {
                 OopSpecIndex::None,
                 None,
                 &mut cache,
+                None,
                 None,
             )
         };
@@ -26577,6 +26732,7 @@ mod tests {
             None,
             &mut cache,
             extras,
+            None,
         );
         let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
         assert_eq!(got.len(), 2);
@@ -26617,6 +26773,7 @@ mod tests {
             Some(ExtraEffect::RandomEffects),
             &mut cache,
             extras,
+            None,
         );
         let got = descriptor.extra_info.extradescrs.as_ref().unwrap();
         assert_eq!(got.len(), 1);
@@ -27412,6 +27569,7 @@ mod tests {
             None,
             &mut cache,
             None,
+            None,
         );
         assert_eq!(
             matching.extra_info.extraeffect,
@@ -27428,6 +27586,7 @@ mod tests {
                     OopSpecIndex::None,
                     None,
                     &mut cache,
+                    None,
                     None,
                 );
             })) else {
@@ -28284,6 +28443,7 @@ mod tests {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         assert_ne!(

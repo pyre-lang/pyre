@@ -289,12 +289,7 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         let base = self.interior_header_base(bb_id, &alias)?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
-        let owner_declared_gc = container_declared_gc(
-            &inner.ty,
-            self.llbc,
-            self.gc_struct_ids,
-            self.immutable_fields,
-        );
+        let owner_declared_gc = field_owner_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
         let item_ty = adt_field_read_value_type(
             place_ty,
             field_ty,
@@ -833,7 +828,7 @@ impl<'a> Lowering<'a> {
         // `[variant, index]`). The read side resolves that index through
         // the base type; capture the type before `inner` is consumed.
         let field_base_ty = clone_tyref(&inner.ty);
-        let base = self.resolve_place(mir_bb, inner)?;
+        let base = self.resolve_projection_base(mir_bb, inner)?;
         let bb_id = self.emit_bb(mir_bb);
         let op = match &elem {
             ProjectionElem::Atom(s) if s == "Deref" => {
@@ -1187,11 +1182,10 @@ impl<'a> Lowering<'a> {
                             Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
-                                    .with_owner_declared_gc(container_declared_gc(
+                                    .with_owner_declared_gc(field_owner_declared_gc(
                                         &field_base_ty,
                                         self.llbc,
                                         self.gc_struct_ids,
-                                        self.immutable_fields,
                                     ))
                                     .with_base_is_deref(base_is_deref)
                                     .with_host_index(host_index)
@@ -1227,7 +1221,7 @@ impl<'a> Lowering<'a> {
                     // fallback keeps non-Adt containers lowering as
                     // before.
                     let (field, ty) = match self.resolve_adt_field(&field_base_ty, field_payload) {
-                        Some((owner_root, field_name, _field_ty, owner_id, host_index)) => {
+                        Some((owner_root, field_name, declared_field_ty, owner_id, host_index)) => {
                             // Rust type-checks every assignment against the
                             // projected place's substituted field type.  A
                             // reference or raw pointer to a named ADT is
@@ -1250,11 +1244,10 @@ impl<'a> Lowering<'a> {
                             // `PyObject ∪ PyErrorObject`.
                             value =
                                 self.recast_error_carrier_field_store(bb_id, &field_base_ty, value);
-                            let owner_declared_gc = container_declared_gc(
+                            let owner_declared_gc = field_owner_declared_gc(
                                 &field_base_ty,
                                 self.llbc,
                                 self.gc_struct_ids,
-                                self.immutable_fields,
                             );
                             let field_dest_ty =
                                 tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
@@ -1270,6 +1263,10 @@ impl<'a> Lowering<'a> {
                                     )
                                     .or_else(|| scalar_fixed_array_item(dest_ty, self.llbc))
                                     .unwrap_or_else(|| {
+                                        // Annotator SomePtr on overlay
+                                        // FieldWrites. `history.py` getkind
+                                        // `'int'` is FUNC.RESULT / stamp,
+                                        // not this lltype.
                                         tyref_to_value_type_with(
                                             &field_dest_ty,
                                             self.llbc,
@@ -1287,7 +1284,7 @@ impl<'a> Lowering<'a> {
                             if let Some(dest) = interior_dest
                                 && self.interior_field_alias.contains_key(&dest)
                             {
-                                let field = FieldDescriptor::new(
+                                let mut field = FieldDescriptor::new(
                                     field_name.clone(),
                                     Some(owner_root.clone()),
                                 )
@@ -1295,6 +1292,14 @@ impl<'a> Lowering<'a> {
                                 .with_owner_declared_gc(owner_declared_gc)
                                 .with_base_is_deref(true)
                                 .with_host_index(host_index);
+                                if let Some(word) = self.llbc_scalar_field_word(
+                                    &field_base_ty,
+                                    host_index,
+                                    &declared_field_ty,
+                                    dest_ty,
+                                ) {
+                                    field = field.with_scalar_word(word);
+                                }
                                 self.emit_interior_field_write(
                                     mir_bb,
                                     bb_id,
@@ -1305,14 +1310,20 @@ impl<'a> Lowering<'a> {
                                 )?;
                                 return Ok(());
                             }
-                            (
-                                FieldDescriptor::new(field_name, Some(owner_root))
-                                    .with_owner_id(owner_id)
-                                    .with_owner_declared_gc(owner_declared_gc)
-                                    .with_base_is_deref(base_is_deref)
-                                    .with_host_index(host_index),
-                                ty,
-                            )
+                            let mut field = FieldDescriptor::new(field_name, Some(owner_root))
+                                .with_owner_id(owner_id)
+                                .with_owner_declared_gc(owner_declared_gc)
+                                .with_base_is_deref(base_is_deref)
+                                .with_host_index(host_index);
+                            if let Some(word) = self.llbc_scalar_field_word(
+                                &field_base_ty,
+                                host_index,
+                                &declared_field_ty,
+                                dest_ty,
+                            ) {
+                                field = field.with_scalar_word(word);
+                            }
+                            (field, ty)
                         }
                         None => {
                             if let Some((owner, name, ty, word)) =
@@ -1448,6 +1459,35 @@ impl<'a> Lowering<'a> {
                 value: LinkArg::Value(value),
                 ty: ValueType::Ref(None),
             }));
+        }
+        // `*(&obj.cell).as_ptr() = v` is `obj.cell = v`. The cell
+        // address is a `taken_by_address` FieldRead; a store through it
+        // would assemble `setfield_gc` on the interior
+        // (`jtransform.py` `rewrite_op_setfield` barriers a gc STRUCT).
+        if let Some(OpKind::FieldRead {
+            base: owner,
+            mut field,
+            ..
+        }) = self.address_field_read_of(bb_id, &base)
+        {
+            let ty = tyref_to_value_type_with(
+                dest_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            );
+            let payload = tyref_is_primitive_scalar(dest_ty, self.llbc)
+                || matches!(ty, ValueType::Ref(_) | ValueType::Str);
+            if payload {
+                field.taken_by_address = false;
+                return Ok(Some(OpKind::FieldWrite {
+                    base: owner,
+                    field,
+                    value: LinkArg::Value(value),
+                    ty,
+                }));
+            }
         }
         if let Some(local) = inner_local {
             let place = Place {
@@ -2377,6 +2417,13 @@ impl<'a> Lowering<'a> {
                     if self.is_gc_current_object_address_adapter_graph() {
                         return Ok((None, arg));
                     }
+                    // This adapter returns `l.items`, not its host interior
+                    // address (`rlist.py ll_items`); preserve that GC pointer.
+                    if graph_is_items_block_base_accessor(&self.graph.name)
+                        && tyref_is_raw_u8_ptr(dest_ty, self.llbc)
+                    {
+                        return Ok((None, arg));
+                    }
                     // A prebuilt singleton kept in a `OnceLock<usize>` reads
                     // back as the registered object itself
                     // ([`Lowering::prebuilt_once_value_locals`]). The word is
@@ -2580,6 +2627,29 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
+                    // An address word cast to a raw-flavored instance pointer is
+                    // `cast_int_to_ptr` of the raw `InstanceRepr` lowleveltype
+                    // (`rbuiltin.py` `gen_cast`); routing it through GCREF would
+                    // need a GC→raw cast that `lltype.castable` forbids.
+                    // Flavor-raw class root (`rclass.py getgcflavor`) before
+                    // the storage-raw overlay word, the same order
+                    // [`ty_is_raw_address`] uses.
+                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && matches!(dst_kind, ValueType::Ref(_))
+                        && let Some(root) = flavor_raw_pointer_class_root(
+                            dest_ty,
+                            self.llbc,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(crate::model::cast_instance_call(root, arg.clone())),
+                            res,
+                        ));
+                    }
                     // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
                     // Overlay `as *const T` must not alias or fold back to
                     // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
@@ -2592,27 +2662,6 @@ impl<'a> Lowering<'a> {
                         dest_ty,
                     ) {
                         return Ok((None, raw));
-                    }
-                    // An address word cast to a raw-flavored instance pointer is
-                    // `cast_int_to_ptr` of the raw `InstanceRepr` lowleveltype
-                    // (`rbuiltin.py` `gen_cast`); routing it through GCREF would
-                    // need a GC→raw cast that `lltype.castable` forbids.
-                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
-                        && matches!(dst_kind, ValueType::Ref(_))
-                        && let Some(root) = flavor_raw_pointer_class_root(
-                            dest_ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    {
-                        let res = self
-                            .graph
-                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        return Ok((
-                            Some(crate::model::cast_instance_call(root, arg.clone())),
-                            res,
-                        ));
                     }
                     // `p as usize as *mut T` is `lltype.cast_opaque_ptr`
                     // (`lltype.py` `ann_cast_opaque_ptr`). Recover the
@@ -2636,7 +2685,6 @@ impl<'a> Lowering<'a> {
                         && flavor_raw_pointer_class_root(
                             dest_ty,
                             self.llbc,
-                            self.tombstoned_leaves,
                             &self.raw_alloc_flavor_structs,
                         )
                         .is_none()
@@ -2907,9 +2955,10 @@ impl<'a> Lowering<'a> {
                 let projection = self.place_borrow_takes_address(&place)
                     && !tyref_is_string_builder(&place.ty, self.llbc);
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
+                let place_ty = clone_tyref(&place.ty);
                 // A Deref reborrow of an existing `&[u8]` keeps the identity.
                 let v = self.resolve_place(mir_bb, place)?;
-                self.mark_place_address_of(mir_bb, projection, before, &v);
+                self.mark_place_address_of(mir_bb, projection, before, &v, &place_ty);
                 Ok((None, v))
             }
             // `RawPtr { place, ... }` — `&raw const x` / `&raw mut x`.
@@ -2928,8 +2977,9 @@ impl<'a> Lowering<'a> {
                 }
                 let projection = self.place_borrow_takes_address(&place);
                 let before = self.graph.block(self.emit_bb(mir_bb)).operations.len();
+                let place_ty = clone_tyref(&place.ty);
                 let v = self.resolve_place(mir_bb, place)?;
-                self.mark_place_address_of(mir_bb, projection, before, &v);
+                self.mark_place_address_of(mir_bb, projection, before, &v, &place_ty);
                 Ok((None, v))
             }
             // `Repeat(elem, elem_ty, count)` — `[v; N]` literal. The
@@ -3059,13 +3109,15 @@ impl<'a> Lowering<'a> {
                 // and a dest GCREF (`rgc.cast_instance_to_gcref`) must reach
                 // the marker even when Charon spells the kind as something
                 // other than `RawPtr` (`*const () as *const CodeObject`).
-                let dest_flavor_raw = flavor_raw_pointer_class_root(
-                    &ty,
-                    self.llbc,
-                    self.tombstoned_leaves,
-                    &self.raw_alloc_flavor_structs,
-                )
-                .is_some();
+                let dest_flavor_raw =
+                    flavor_raw_pointer_class_root(&ty, self.llbc, &self.raw_alloc_flavor_structs)
+                        .is_some();
+                // Same `rlist.py ll_items` normalization as the UnaryOp cast.
+                if graph_is_items_block_base_accessor(&self.graph.name)
+                    && tyref_is_raw_u8_ptr(&ty, self.llbc)
+                {
+                    return Ok((None, v));
+                }
                 // Dest `*u8` from an int-kind / CCHARP source is the same
                 // CCHARP value. A GC-ref source is `rffi.cast` onto CCHARP
                 // except inside an items-base accessor (`cast_ptr_to_adr`).
@@ -3238,16 +3290,22 @@ impl<'a> Lowering<'a> {
                     let bb_id = self.emit_bb(mir_bb);
                     return Ok((None, self.bind_array_view_len_in_block(bb_id, logical_len)));
                 }
-                let len_leaf = if self
+                let string_byte_view = self
                     .string_byte_view_locals
                     .iter()
-                    .any(|local| place_references_local(&place, *local))
-                {
+                    .any(|local| place_references_local(&place, *local));
+                let base = self.resolve_place(mir_bb, place)?;
+                if !string_byte_view {
+                    let bb_id = self.emit_bb(mir_bb);
+                    if let Some(len) = self.fat_len_of(bb_id, &base) {
+                        return Ok((None, len));
+                    }
+                }
+                let len_leaf = if string_byte_view {
                     "__strlen"
                 } else {
                     "__len"
                 };
-                let base = self.resolve_place(mir_bb, place)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -3532,13 +3590,9 @@ impl<'a> Lowering<'a> {
                                 },
                             );
                         }
-                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor
-                                .ctor_name
-                                .split('<')
-                                .next()
-                                .unwrap_or(ctor.ctor_name.as_str())
-                                == "RangeTo"
+                        // `Bookkeeper.getuniqueclassdef` follows the class
+                        // identity, not how its qualified name was partitioned.
+                        if ctor.result_owner.split('<').next() == Some("core::ops::range::RangeTo")
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangeto_sites.push(
@@ -3548,13 +3602,10 @@ impl<'a> Lowering<'a> {
                                 },
                             );
                         }
-                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor
-                                .ctor_name
-                                .split('<')
-                                .next()
-                                .unwrap_or(ctor.ctor_name.as_str())
-                                == "RangeFrom"
+                        // `Bookkeeper.getuniqueclassdef` follows the class
+                        // identity, not how its qualified name was partitioned.
+                        if ctor.result_owner.split('<').next()
+                            == Some("core::ops::range::RangeFrom")
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangefrom_sites.push(
@@ -3944,12 +3995,8 @@ impl<'a> Lowering<'a> {
                         res,
                     ));
                 }
-                let disc_owner_gc = container_declared_gc(
-                    &place.ty,
-                    self.llbc,
-                    self.gc_struct_ids,
-                    self.immutable_fields,
-                );
+                let disc_owner_gc =
+                    field_owner_declared_gc(&place.ty, self.llbc, self.gc_struct_ids);
                 let recast_tagged_sum =
                     crate::front::result_exc::tyref_is_option(&place.ty, self.llbc);
                 let mut base = self.resolve_place(mir_bb, place)?;
@@ -4427,12 +4474,8 @@ impl<'a> Lowering<'a> {
                 if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
                     && v.as_object().and_then(|m| m.get("Field")).is_some()
                 {
-                    let owner_gc = container_declared_gc(
-                        &inner.ty,
-                        self.llbc,
-                        self.gc_struct_ids,
-                        self.immutable_fields,
-                    );
+                    let owner_gc =
+                        field_owner_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
                     if let Some(raw) =
                         raw_field_address_value_type(&place.ty, &place.ty, owner_gc, self.llbc)
                     {
@@ -4499,6 +4542,11 @@ impl<'a> Lowering<'a> {
         if tyref_is_rust_vec_header(dest_ty, self.llbc) {
             return None;
         }
+        if let Some(root) =
+            flavor_raw_pointer_class_root(dest_ty, self.llbc, &self.raw_alloc_flavor_structs)
+        {
+            return Some(crate::model::cast_instance_call(root, arg.clone()));
+        }
         if let Some(root) = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves) {
             // ByteStr is the intern leaf (`Function`, `PyObject`):
             // `bookkeeper.py` `getuniqueclassdef`, `stamp_named_ref_call_dests`.
@@ -4561,15 +4609,33 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
     ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
+        // Flavor-raw class root (`rclass.py getgcflavor`) before the
+        // storage-raw overlay word, the same order [`ty_is_raw_address`]
+        // uses. A flavor-raw instance pointer stays the class instance;
+        // its cast is `cast_instance`.
+        if flavor_raw_pointer_class_root(dest_ty, self.llbc, &self.raw_alloc_flavor_structs)
+            .is_some()
+        {
+            return None;
+        }
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
-        let node = declared_raw_adt_node(
-            pointee,
+        let node = declared_raw_adt_node(pointee, self.llbc, self.gc_struct_ids)?;
+        let id = adt_node_def_id(node)?;
+        // Refusal guard, not a kind classifier: a declared-Raw struct
+        // that still holds a mutable GC pointer is not a raw `SomePtr`
+        // overlay (`jtransform.py rewrite_op_getfield` refuses
+        // `getfield_raw_r`). Answers "not an overlay", never "this is Gc".
+        if !adt_def_is_raw_storage(
+            id,
             self.llbc,
             self.gc_struct_ids,
             self.immutable_fields,
-        )?;
-        let id = adt_node_def_id(node)?;
+            &mut Vec::new(),
+            None,
+        ) {
+            return None;
+        }
         let decl = self.llbc.type_by_id(id)?;
         let TypeDeclKind::Struct(_) = &decl.kind else {
             return None;
@@ -4676,12 +4742,7 @@ impl<'a> Lowering<'a> {
             tyref_node(&payload, self.llbc).and_then(|n| type_node_peel_aliases(n, self.llbc))?;
         let pointee = one_level_pointer_pointee(payload_node, self.llbc)?;
         let pointee = strip_ty_indirections(pointee, self.llbc).unwrap_or(pointee);
-        let adt = declared_raw_adt_node(
-            pointee,
-            self.llbc,
-            self.gc_struct_ids,
-            self.immutable_fields,
-        )?;
+        let adt = declared_raw_adt_node(pointee, self.llbc, self.gc_struct_ids)?;
         let id = adt_node_def_id(adt)?;
         let decl = self.llbc.type_by_id(id)?;
         if type_decl_is_fieldless_enum(decl, self.llbc) {
@@ -4783,12 +4844,82 @@ impl<'a> Lowering<'a> {
             .get(dest_local)
             .and_then(|slot| slot.as_ref().and_then(|value| value.one().ok()));
         if let Some(var) = dest_var {
+            if graph_is_items_block_base_accessor(&self.graph.name)
+                || var.concretetype().as_ref().is_some_and(lltype_is_ccharp)
+            {
+                return;
+            }
             if self.var_is_int_kind(&var) {
-                stamp_as_ccharp(&var);
-            } else if !graph_is_items_block_base_accessor(&self.graph.name) {
+                // `rbuiltin.py rtype_cast_int_to_ptr` creates a result with
+                // the destination repr; do not change the source Variable's type.
+                let bb_id = self.emit_bb(mir_bb);
+                let ccharp = emit_cast_int_to_ccharp(&mut self.graph, bb_id, var);
+                self.local_var[dest_local] = Some(LocalValue::One(ccharp));
+            } else {
                 let ccharp = self.emit_gc_ref_as_ccharp(mir_bb, var);
                 self.local_var[dest_local] = Some(LocalValue::One(ccharp));
             }
+        }
+    }
+
+    /// Result cell stamped through `valuetype_to_concrete_for_legacy`.
+    pub(in crate::front::mir) fn alloc_legacy_result(&mut self, ty: &ValueType) -> Variable {
+        let concrete = crate::codewriter::type_state::valuetype_to_concrete_for_legacy(
+            ty,
+            &self.raw_alloc_flavor_structs,
+        );
+        self.graph.alloc_value_var_with_type(concrete)
+    }
+
+    /// `flatten.py make_return` reads `getkind(returnblock.inputargs[0].concretetype)`.
+    /// Stamp that cell (and the returned value) from the declared output type,
+    /// the same `FUNC.RESULT` step `valuetype_to_concrete_for_legacy` owns.
+    pub(in crate::front::mir) fn stamp_declared_return(&mut self, ret: &Variable) {
+        let Some(local0) = self.body.locals.locals.first() else {
+            return;
+        };
+        let declared_ty = tyref_to_value_type_with(
+            &local0.ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        );
+        // Items-base adapters return PyPy's GcArray header (`rlist.py ll_items`).
+        // The host's `*u8` spelling describes the interior address it replaces.
+        // `history.py getkind` of a by-value raw struct is `'int'`, the
+        // same kind FUNC.RESULT and the caller's result use.
+        let declared_ty = if graph_is_items_block_base_accessor(&self.graph.name) {
+            ValueType::Ref(None)
+        } else if tyref_call_signature_raw_value(
+            &local0.ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+        ) {
+            // Looked-inside by-value raw overlay (`DictOperationGuard::new1`):
+            // `flatten.py` `make_return` reads getkind of the returnblock.
+            // A payload-enum owner (`Fmt`) stays the interned instance.
+            raw_value_getkind(declared_ty, &[&local0.ty], self.llbc, self.gc_struct_ids)
+        } else {
+            declared_ty
+        };
+        // Flavor-raw `Ref(Some(name))` is Signed at the CFG
+        // (`valuetype_to_concrete_for_legacy` / `history.getkind` int).
+        // A looked-inside overlay that stayed `Ref(None)` is GcRef.
+        let concrete = crate::codewriter::type_state::valuetype_to_concrete_for_legacy(
+            &declared_ty,
+            &self.raw_alloc_flavor_structs,
+        );
+        if concrete == crate::model::ConcreteType::Unknown {
+            return;
+        }
+        FunctionGraph::set_concretetype_of_inline(ret, concrete);
+        if let Some(returnvar) = self.graph.blocks[self.graph.returnblock.0]
+            .inputargs
+            .first()
+        {
+            FunctionGraph::set_concretetype_of_inline(returnvar, concrete);
         }
     }
 
@@ -4991,14 +5122,20 @@ impl<'a> Lowering<'a> {
                 )
             } else {
                 let kind = self.instance_narrow_for_type(dest_ty, arg, src_root)?;
-                let res = self
-                    .graph
-                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                let res_ty = match &kind {
+                    OpKind::Call { result_ty, .. } => result_ty.clone(),
+                    _ => tyref_to_value_type_with(
+                        dest_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    ),
+                };
+                let res = self.alloc_legacy_result(&res_ty);
                 return Some((kind, res));
             };
-        let res = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let res = self.alloc_legacy_result(&result_ty);
         Some((
             OpKind::Call {
                 target: CallTarget::function_path(segments),
@@ -5487,6 +5624,9 @@ impl<'a> Lowering<'a> {
             });
             return var;
         }
+        if let DecodedConst::Str(s) = decoded {
+            return emit_str_const(&mut self.graph, bb_id, &s);
+        }
         let op = decoded_const_to_op(decoded);
         let var = self
             .graph
@@ -5539,6 +5679,24 @@ impl<'a> Lowering<'a> {
         }
         let marked = self.fat_box_vars.clone();
         retarget_fat_operand(&mut self.graph, &marked, bb_id, var, part)
+    }
+
+    /// FatLen of `var`, or of the fat box `var` is a data/len word of.
+    /// `<[T]>::len` / `Rvalue::Len` of a FatData word still answers with
+    /// the sibling metadata word (`rlist.py` `ll_length`).
+    pub(in crate::front::mir) fn fat_len_of(
+        &mut self,
+        bb_id: BlockId,
+        var: &Variable,
+    ) -> Option<Variable> {
+        if let Some(len) = self.fat_component(bb_id, var, crate::model::VecFieldPart::FatLen) {
+            return Some(len);
+        }
+        let origin = self.fat_box_origin_of(var)?;
+        if &origin == var {
+            return None;
+        }
+        self.fat_component(bb_id, &origin, crate::model::VecFieldPart::FatLen)
     }
 
     /// Window `{data, len}` words of a fat box. Data is `CCHARP`.
@@ -5920,15 +6078,28 @@ impl<'a> Lowering<'a> {
         if self.tyref_is_fieldless_enum(&place.ty) {
             return false;
         }
-        Self::place_ref_is_address_of(place)
-            && tyref_transparent_inner_value_type(
-                &place.ty,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            )
-            .is_none()
+        if !Self::place_ref_is_address_of(place) {
+            return false;
+        }
+        // `UnsafeCell<T>` and a transparent wrapper whose payload is
+        // `UnsafeCell` (`Cell<T>`). Included `Cell<T>` peels to the inner
+        // word for value paint, the same way `CodeFlags` does; a field
+        // borrow is still the cell address so `Cell::get` rewrites to
+        // that field's getfield.
+        if tyref_is_unsafecell(&place.ty, self.llbc)
+            || tyref_transparent_instantiated_inner_ty(&place.ty, self.llbc)
+                .is_some_and(|inner| tyref_is_unsafecell(&inner, self.llbc))
+        {
+            return true;
+        }
+        tyref_transparent_inner_value_type(
+            &place.ty,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )
+        .is_none()
     }
 
     /// Record that the `Variable` just resolved for a place is the
@@ -5970,21 +6141,52 @@ impl<'a> Lowering<'a> {
         projection: bool,
         before: usize,
         v: &Variable,
+        place_ty: &TyRef,
     ) {
         if !projection {
             return;
         }
         let bb_id = self.emit_bb(mir_bb);
-        let block = self.graph.block_mut(bb_id);
-        if block.operations.len() <= before {
+        if self.graph.block(bb_id).operations.len() <= before {
             return;
         }
+        let mark_array = match self.graph.block(bb_id).operations.last() {
+            Some(op) if op.result.as_ref() == Some(v) => match &op.kind {
+                OpKind::ArrayRead { .. } => tyref_is_container_type(place_ty, self.llbc),
+                _ => false,
+            },
+            _ => false,
+        };
+        let block = self.graph.block_mut(bb_id);
         if let Some(op) = block.operations.last_mut()
             && op.result.as_ref() == Some(v)
-            && let OpKind::FieldRead { field, .. } = &mut op.kind
         {
-            field.taken_by_address = true;
+            match &mut op.kind {
+                OpKind::FieldRead { field, .. } => {
+                    field.taken_by_address = true;
+                }
+                OpKind::ArrayRead {
+                    taken_by_address, ..
+                } if mark_array => {
+                    *taken_by_address = true;
+                }
+                _ => {}
+            }
         }
+    }
+
+    /// Resolve the inner place of a Field/Index projection as a later
+    /// projection base (`field_read_result_is_later_base` for FieldRead).
+    /// Decrements even when the inner resolve fails.
+    pub(in crate::front::mir) fn resolve_projection_base(
+        &mut self,
+        mir_bb: usize,
+        inner: Place,
+    ) -> Result<Variable, LowerError> {
+        self.projection_base_depth = self.projection_base_depth.saturating_add(1);
+        let result = self.resolve_place(mir_bb, inner);
+        self.projection_base_depth = self.projection_base_depth.saturating_sub(1);
+        result
     }
 
     /// Charon `ProjectionElem::Offset`: `ptr.offset(n)` is `&raw (*ptr).offset(bytes)`
@@ -6217,18 +6419,31 @@ impl<'a> Lowering<'a> {
             }
             // A reference-item `Option<&T>` is one word: the item itself,
             // since a reference aliases its referent, or the null pointer
-            // for `None`.
+            // for `None`. `option_pair_item` is that item's getkind;
+            // `tyref_is_niche_option_ptr` is the same question when the
+            // Option payload is a pointer niche the spelling path missed.
             PlaceKind::Local(i)
                 if matches!(
                     self.local_var
                         .get(i as usize)
                         .and_then(|slot| slot.as_ref()),
                     Some(LocalValue::ItemAddr(_))
-                ) && self
-                    .option_pair_item(i as usize)
-                    .is_some_and(|(kind, _)| kind == majit_ir::rvec::VecItemKind::Ref)
-                    && self.tyref_is_niche_option_ptr(&place_ty) =>
+                ) =>
             {
+                let kind = self
+                    .option_pair_item(i as usize)
+                    .and_then(|(kind, by_ref)| {
+                        (by_ref || self.tyref_is_niche_option_ptr(&place_ty)).then_some(kind)
+                    })
+                    .or_else(|| {
+                        self.tyref_is_niche_option_ptr(&place_ty)
+                            .then_some(majit_ir::rvec::VecItemKind::Ref)
+                    });
+                let Some(kind) = kind else {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: slice item reference local {i} read as one value"
+                    )));
+                };
                 let addr = self.item_addr_var(mir_bb, i as usize)?;
                 let value_ty = self.with_item_class_root(
                     tyref_to_value_type_with(
@@ -6240,31 +6455,16 @@ impl<'a> Lowering<'a> {
                     ),
                     &place_ty,
                 );
-                let helper_ty = Self::pair_helper_item_ty(majit_ir::rvec::VecItemKind::Ref);
+                let helper_ty = Self::pair_helper_item_ty(kind);
                 let null = self.push_niche_null_ptr(mir_bb, &place_ty);
                 let null = self.retype_word(mir_bb, null, &value_ty, &helper_ty);
                 let item = self.emit_path_call(
                     mir_bb,
-                    majit_ir::rvec::slice_helper_path(
-                        majit_ir::rvec::SliceOp::LoadOr,
-                        majit_ir::rvec::VecItemKind::Ref,
-                    ),
+                    majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::LoadOr, kind),
                     vec![addr, null],
                     helper_ty.clone(),
                 );
                 Ok(self.retype_word(mir_bb, item, &helper_ty, &value_ty))
-            }
-            PlaceKind::Local(i)
-                if matches!(
-                    self.local_var
-                        .get(i as usize)
-                        .and_then(|slot| slot.as_ref()),
-                    Some(LocalValue::ItemAddr(_))
-                ) =>
-            {
-                Err(LowerError::Unsupported(format!(
-                    "bb{mir_bb}: slice item reference local {i} read as one value"
-                )))
             }
             PlaceKind::Local(i)
                 if self
@@ -6535,36 +6735,44 @@ impl<'a> Lowering<'a> {
                     // ptr-identity-cast arm applies before its own field reads.
                     let narrow_root: Option<String> = match &inner.kind {
                         PlaceKind::Projection(pre, ProjectionElem::Atom(s)) if s == "Deref" => {
-                            let stripped = tyref_node(&pre.ty, self.llbc)
-                                .and_then(|n| strip_ty_wrappers(n, self.llbc));
-                            // `(*p).f` on a raw address is `getfield_raw` at the
-                            // host offset. A cast onto the gc shell is the Gc
-                            // pointee's narrow.
-                            if stripped.as_ref().is_some_and(|n| {
-                                raw_ptr_node_is_declared_raw(n, self.llbc, self.gc_struct_ids)
-                            }) {
+                            // A `*mut Utf8Str` is rstr `Ptr(STR)`
+                            // (`rpython/rtyper/lltypesystem/rstr.py` `STR`),
+                            // already painted `ValueType::Str`. It is not a
+                            // `SomeInstance` of a class (`LLHelpers.ll_strlen`).
+                            if tyref_raw_ptr_pointee_is_string_value(&pre.ty, self.llbc) {
                                 None
                             } else {
-                                stripped.and_then(|n| {
-                                    raw_ptr_pointee_class_root_with(
-                                        n,
-                                        self.llbc,
-                                        self.tombstoned_leaves,
-                                    )
-                                    .or_else(|| {
-                                        let root = adt_node_class_root_with(
+                                let stripped = tyref_node(&pre.ty, self.llbc)
+                                    .and_then(|n| strip_ty_wrappers(n, self.llbc));
+                                // `(*p).f` on a raw address is `getfield_raw` at the
+                                // host offset. A cast onto the gc shell is the Gc
+                                // pointee's narrow.
+                                if stripped.as_ref().is_some_and(|n| {
+                                    raw_ptr_node_is_declared_raw(n, self.llbc, self.gc_struct_ids)
+                                }) {
+                                    None
+                                } else {
+                                    stripped.and_then(|n| {
+                                        raw_ptr_pointee_class_root_with(
                                             n,
                                             self.llbc,
                                             self.tombstoned_leaves,
-                                        )?;
-                                        // `&ObjectKey` is the dict key the
-                                        // `eq` body reads `.hash` from. Other
-                                        // structs stay uncast: a blanket
-                                        // narrow paints `Tuple` onto values
-                                        // that are already tuples.
-                                        (root == "ObjectKey").then_some(root)
+                                        )
+                                        .or_else(|| {
+                                            let root = adt_node_class_root_with(
+                                                n,
+                                                self.llbc,
+                                                self.tombstoned_leaves,
+                                            )?;
+                                            // `&ObjectKey` is the dict key the
+                                            // `eq` body reads `.hash` from. Other
+                                            // structs stay uncast: a blanket
+                                            // narrow paints `Tuple` onto values
+                                            // that are already tuples.
+                                            (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
+                                        })
                                     })
-                                })
+                                }
                             }
                         }
                         _ => None,
@@ -6664,20 +6872,18 @@ impl<'a> Lowering<'a> {
                         return Ok(res);
                     }
                     let field_pure = immutable_static_id.is_some();
-                    let owner_declared_gc = container_declared_gc(
-                        &inner.ty,
-                        self.llbc,
-                        self.gc_struct_ids,
-                        self.immutable_fields,
-                    );
-                    // Captured before `resolve_place` moves `inner`. A
+                    let owner_declared_gc =
+                        field_owner_declared_gc(&inner.ty, self.llbc, self.gc_struct_ids);
+                    let scalar_word =
+                        self.llbc_scalar_field_word(&inner.ty, host_index, &field_ty, &place_ty);
+                    // Captured before `resolve_projection_base` moves `inner`. A
                     // by-value `String` attr of a marked exception class
                     // is rstr `Ptr(STR)` at the read, same as the row
                     // registered for the class.
                     let read_rstr_attr = self.exception_disc_info_for_ty(&inner.ty).is_some()
                         && (tyref_is_by_value_alloc_string(&field_ty, self.llbc)
                             || tyref_is_by_value_alloc_string(&place_ty, self.llbc));
-                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let base = self.resolve_projection_base(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
                     let base = if let Some(root) = narrow_root {
                         let narrowed = self
@@ -6775,6 +6981,9 @@ impl<'a> Lowering<'a> {
                             field_ty_is_inline_vec(&field_ty, self.llbc)
                                 || field_ty_is_inline_vec(&place_ty, self.llbc),
                         );
+                    if let Some(word) = scalar_word {
+                        field = field.with_scalar_word(word);
+                    }
                     if dyn_vtable {
                         field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
                     }
@@ -6799,6 +7008,8 @@ impl<'a> Lowering<'a> {
                         || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
                         || tyref_is_u8_window(&field_ty, self.llbc)
                         || tyref_is_u8_window(&place_ty, self.llbc)
+                        || tyref_transparent_inner_is_inline_fat_ptr(&field_ty, self.llbc)
+                        || tyref_transparent_inner_is_inline_fat_ptr(&place_ty, self.llbc)
                         || constants_box
                     {
                         self.fat_box_vars.push(res.clone());
@@ -6844,7 +7055,7 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
-                            kind: crate::model::cast_instance_call("PyObject", res),
+                            kind: crate::model::cast_instance_call(W_ROOT_CLASS_ROOT, res),
                         });
                         return Ok(narrowed);
                     }
@@ -6876,7 +7087,7 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: suffix index read from an array with no length"
                         )));
                     }
-                    let idx_var = self.index_offset_var(mir_bb, index_payload)?;
+                    let mut idx_var = self.index_offset_var(mir_bb, index_payload)?;
                     let copied_bytes = self.graph.name.ends_with("::copied_byte_vec");
                     let string_byte_view = copied_bytes
                         || self
@@ -6914,34 +7125,51 @@ impl<'a> Lowering<'a> {
                         let loaded = self.emit_window_raw_load(mir_bb, data, idx_var);
                         return Ok(loaded);
                     }
-                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let base = self.resolve_projection_base(mir_bb, *inner)?;
                     let bb_id = self.emit_bb(mir_bb);
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let container_item = tyref_is_container_type(&place_ty, self.llbc);
+                    let res = self.graph.alloc_value_var_with_type(if container_item {
+                        crate::model::ConcreteType::Signed
+                    } else {
+                        crate::model::ConcreteType::Unknown
+                    });
                     let element_is_pointer_word = self.var_tracks_pointer_word_array(&base);
                     if element_is_pointer_word {
                         self.pointer_word_vars.insert(res.clone());
                     }
                     // `Box<[T]>`'s data word has no length header. `[u8]` is
                     // the length-prefixed byte block, so only this base is
-                    // remapped onto `Vec<T>`.
-                    let fat_data = if string_byte_view || list_view {
+                    // remapped onto `Vec<T>`. Every item type uses that
+                    // raw-items identity.
+                    let fat_owner = if string_byte_view || list_view {
                         None
                     } else {
-                        self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatData)
+                        Some(
+                            self.fat_box_origin_of(&base)
+                                .unwrap_or_else(|| base.clone()),
+                        )
                     };
+                    let fat_data = fat_owner.as_ref().and_then(|owner| {
+                        self.fat_component(bb_id, owner, crate::model::VecFieldPart::FatData)
+                    });
+                    let fat_len = fat_data.as_ref().and_then(|_| {
+                        self.fat_component(
+                            bb_id,
+                            fat_owner.as_ref().expect("fat_data implies fat_owner"),
+                            crate::model::VecFieldPart::FatLen,
+                        )
+                    });
+                    let is_fat_items = fat_data.is_some();
                     let base = if let Some(data) = fat_data {
                         if !string_array_view {
-                            let remapped =
-                                crate::front::typestr::fat_box_scalar_array_id(&index_spelling)
-                                    .or_else(|| {
-                                        array_type_id.as_deref().and_then(
-                                            crate::front::typestr::fat_box_scalar_array_id,
-                                        )
-                                    });
+                            let remapped = crate::front::typestr::fat_box_array_id(&index_spelling)
+                                .or_else(|| {
+                                    array_type_id
+                                        .as_deref()
+                                        .and_then(crate::front::typestr::fat_box_array_id)
+                                });
                             if let Some(id) = remapped {
-                                array_type_id = Some(id.to_string());
+                                array_type_id = Some(id);
                                 nolength = crate::front::typestr::nolength_from_array_type_id(
                                     array_type_id.as_deref(),
                                 );
@@ -6973,7 +7201,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         base
                     };
-                    let (base, string_byte_view) = if string_byte_view {
+                    let (mut base, string_byte_view) = if string_byte_view {
                         match self.take_string_repr_gcref(&base) {
                             Some(recovered) => (recovered, true),
                             None => (base, false),
@@ -6981,6 +7209,28 @@ impl<'a> Lowering<'a> {
                     } else {
                         (base, false)
                     };
+                    if is_fat_items && !string_byte_view {
+                        let Some(len) = fat_len else {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: fat-box Index resolved FatData via \
+                                 fat_component (retarget_fat_operand of a marked \
+                                 fat_box_var) but the sibling FatLen part is not \
+                                 in reach"
+                            )));
+                        };
+                        if fat_item_is_one_word_gc_ref(&place_ty, self.llbc, self.gc_struct_ids) {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: raw items region of one-word GC \
+                                 pointer {}; RPython has no \
+                                 getarrayitem_raw_r",
+                                tyref_to_ast_string(&place_ty, self.llbc)
+                            )));
+                        }
+                        let (ptr, index) = self.guard_item_index(mir_bb, len, base, idx_var)?;
+                        base = ptr;
+                        idx_var = index;
+                    }
+                    let bb_id = self.emit_bb(mir_bb);
                     let kind = if string_byte_view {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -6997,6 +7247,10 @@ impl<'a> Lowering<'a> {
                             },
                         }
                     } else {
+                        // ContainerType `rtype_getitem` is `getarraysubstruct`
+                        // at any projection depth, including a top-level
+                        // `names[idx]` of `Vec<String>` / `Box<[String]>`.
+                        let taken_by_address = container_item;
                         OpKind::ArrayRead {
                             base,
                             index: idx_var,
@@ -7019,6 +7273,7 @@ impl<'a> Lowering<'a> {
                             array_type_id,
                             nolength,
                             pure: false,
+                            taken_by_address,
                         }
                     };
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -7167,7 +7422,7 @@ impl<'a> Lowering<'a> {
                             &inner.kind,
                             PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
                         );
-                        let base = self.resolve_place(mir_bb, *inner)?;
+                        let base = self.resolve_projection_base(mir_bb, *inner)?;
                         let bb_id = self.emit_bb(mir_bb);
                         let base = if base_is_deref {
                             let narrowed = self
@@ -7337,6 +7592,7 @@ impl<'a> Lowering<'a> {
                                 array_type_id.as_str(),
                             )),
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     return Ok(loaded);
@@ -7379,6 +7635,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     return Ok(loaded);
@@ -7557,7 +7814,7 @@ impl<'a> Lowering<'a> {
                 if fmt_path_ends_with(&segments, &["pyobject", "PY_NULL"])
                     && tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
                         .as_deref()
-                        == Some("PyObject")
+                        == Some(W_ROOT_CLASS_ROOT)
                 {
                     let bb_id = self.emit_bb(mir_bb);
                     let raw = self.graph.push_null_mut_ptr(bb_id);
@@ -7566,7 +7823,7 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: crate::model::cast_instance_call("PyObject", raw),
+                        kind: crate::model::cast_instance_call(W_ROOT_CLASS_ROOT, raw),
                     });
                     return Ok(res);
                 }
@@ -8136,13 +8393,17 @@ impl<'a> Lowering<'a> {
         // (`tyref_to_attr_value_type_for_struct_field`,
         // `adt_field_read_value_type`); the constructor store is the
         // same field lltype.
-        let owner_is_closure_env = tyref_is_closure_env(dest_ty, self.llbc);
-        let owner_declared_gc = container_declared_gc(
-            dest_ty,
-            self.llbc,
-            self.gc_struct_ids,
-            self.immutable_fields,
-        );
+        let owner_is_closure_env = tyref_is_closure_env(dest_ty, self.llbc)
+            || kind
+                .as_object()
+                .and_then(|m| m.get("Adt")?.as_array()?.first())
+                .and_then(|head| {
+                    head.as_u64()
+                        .or_else(|| head.as_object().and_then(type_decl_ref_adt_id))
+                })
+                .and_then(|id| self.llbc.type_by_id(id))
+                .is_some_and(type_decl_is_closure_env);
+        let owner_declared_gc = field_owner_declared_gc(dest_ty, self.llbc, self.gc_struct_ids);
         let fields: Vec<AggregateField> = (0..n_operands)
             .map(|i| {
                 let (name, field_ty) = field_rows
@@ -8195,13 +8456,25 @@ impl<'a> Lowering<'a> {
                                 &self.raw_alloc_flavor_structs,
                             )
                         } else {
-                            tyref_aggregate_field_value_type(declared, self.llbc, &field_ty)
+                            tyref_aggregate_field_value_type_with(
+                                declared,
+                                self.llbc,
+                                &field_ty,
+                                self.tombstoned_leaves,
+                                self.gc_struct_ids,
+                                &self.raw_alloc_flavor_structs,
+                            )
                         }
                     }
                     None => tuple_field_value_type(&field_ty),
                 };
                 let skip_signed_paint = declared_ty.is_some_and(|declared| {
-                    tyref_is_raw_alloc_flavor_pointer(declared, self.llbc)
+                    flavor_raw_pointer_class_root(
+                        declared,
+                        self.llbc,
+                        &self.raw_alloc_flavor_structs,
+                    )
+                    .is_some()
                         || (owner_is_closure_env
                             && tyref_is_raw_alloc_flavor_adt(declared, self.llbc))
                 });
@@ -8867,6 +9140,53 @@ impl<'a> Lowering<'a> {
             &hint.enum_path,
             Some(owner),
         ))
+    }
+    /// Layout word of a named copy-scalar field, from the owner's LLBC
+    /// layout. `fielddescrof` takes Parent / Layout first; this word is
+    /// the empty-CallControl fallback (`resolve_field_layout` ScalarWord).
+    /// Kind classifiers do not read it.
+    pub(in crate::front::mir) fn llbc_scalar_field_word(
+        &self,
+        base_ty: &TyRef,
+        host_index: Option<(u32, u32)>,
+        field_ty: &TyRef,
+        place_ty: &TyRef,
+    ) -> Option<crate::model::ScalarFieldWord> {
+        let (variant_idx, field_idx) = host_index?;
+        let head = self.field_base_adt(base_ty)?;
+        let type_id = type_decl_ref_adt_id(head)?;
+        let td = self.llbc.type_by_id(type_id)?;
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let layout = td.layout_for_target(self.llbc, &target)?;
+        let offset = usize::try_from(layout.field_offset(
+            usize::try_from(variant_idx).ok()?,
+            usize::try_from(field_idx).ok()?,
+        )?)
+        .ok()?;
+        let place = tyref_node(place_ty, self.llbc)
+            .and_then(|n| strip_ty_indirections(n, self.llbc))
+            .or_else(|| {
+                tyref_node(field_ty, self.llbc).and_then(|n| strip_ty_indirections(n, self.llbc))
+            })?;
+        let (ty, size, signed) = if json_ty_is_copy_scalar(place, self.llbc) {
+            json_ty_raw_store_descr(place, self.llbc)?
+        } else {
+            fieldless_enum_raw_store_descr(place_ty, self.llbc)
+                .or_else(|| fieldless_enum_raw_store_descr(field_ty, self.llbc))?
+        };
+        let width = match (&ty, signed, size) {
+            (ValueType::Int, true, 1 | 2 | 4 | 8) => crate::model::ScalarFieldWidth::Signed,
+            (ValueType::Int | ValueType::Unsigned, false, 1 | 2 | 4 | 8) => {
+                crate::model::ScalarFieldWidth::Unsigned
+            }
+            (ValueType::Float, _, 8) => crate::model::ScalarFieldWidth::Float,
+            _ => return None,
+        };
+        Some(crate::model::ScalarFieldWord {
+            offset,
+            size,
+            width,
+        })
     }
 
     /// Scalar field of an opaque dependency struct.

@@ -2142,15 +2142,8 @@ impl AssemblerEncode for Assembler {
                 // `getfield_raw_r` with the `_pure` suffix stripped.
                 if !is_gc && result_kind == 'r' && !*pure {
                     panic!(
-                        "getfield_raw_r (without _pure) not supported — graph {:?}, \
-                         owner {:?}, field {}, ty {:?}, taken_by_address {}, \
-                         owner_declared_gc {:?}",
-                        self.current_graph_name,
-                        field.owner_root,
-                        field.name,
-                        ty,
-                        field.taken_by_address,
-                        field.owner_declared_gc,
+                        "getfield_raw_r (without _pure) not supported — graph {:?}",
+                        self.current_graph_name
                     );
                 }
                 let mut opname = if is_gc {
@@ -2783,6 +2776,7 @@ impl AssemblerEncode for Assembler {
                 nolength,
                 gckind,
                 pure,
+                taken_by_address: _,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind_var(base, regallocs);
                 let is_gc = gckind.is_gc();
@@ -5709,10 +5703,31 @@ pub(crate) fn bh_size_spec_from_callcontrol(
             );
         }
     }
+    // `descr.py get_size_descr` keys on the lltype STRUCT's `_gckind`.
+    // 1. `struct_storage` is the embedding override (`rclass.CLASSTYPE` /
+    //    `pyobject::PyType`: static raw, no GcHeader).
+    // 2. An LLBC TypeDecl answers from `layout.gckind` (`GcType` impl or
+    //    field 0 of one; else Raw). `lib.rs` stamps that on the layout.
+    // 3. A synthetic rtyper identity with no TypeDecl (`TupleRepr`
+    //    `Ptr(GcStruct)`, `MutRef<T>`, shaped `Array<T;N>`) carries the
+    //    same fact from `CallControl::layout_of`, which mints the layout.
+    // 4. No layout: the previous SizeDescr default.
     let (is_gc_managed, headerless) = cc
         .struct_storage_for(owner)
         .or_else(|| cc.struct_storage_for(template_owner))
-        .unwrap_or((true, false));
+        .unwrap_or_else(|| {
+            match cc
+                .declared_gckind_for(owner)
+                .or_else(|| cc.declared_gckind_for(template_owner))
+            {
+                Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc) => (true, false),
+                Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw)
+                | Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Prebuilt) => {
+                    (false, false)
+                }
+                None => (true, false),
+            }
+        });
     Some(crate::jitcode::BhSizeSpec {
         size,
         is_gc_managed,
@@ -13670,6 +13685,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -13911,6 +13927,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -14028,6 +14045,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure,
+                    taken_by_address: false,
                 },
                 true,
             )

@@ -2417,7 +2417,7 @@ pub extern "C" fn jit_get_iter(iterable: PyObjectRef) -> PyObjectRef {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::PyExecutionContext;
+    use crate::alloc_execution_context;
     use pyre_object::{w_int_get_value, w_int_new};
 
     #[test]
@@ -2435,7 +2435,7 @@ mod tests {
 
     #[test]
     fn test_classify_callable_names_the_builtin_arm() {
-        let ctx = PyExecutionContext::default();
+        let ctx = alloc_execution_context();
         let abs = ctx.lookup_builtin("abs").expect("abs builtin must exist");
         assert_eq!(
             classify_callable(abs).expect("builtin dispatch should succeed"),

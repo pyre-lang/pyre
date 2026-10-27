@@ -1742,21 +1742,6 @@ pub(crate) fn attach_foldable_const_lits(llbc: &Llbc, entries: &[(String, OpKind
     }
 }
 
-/// `usize` as a field type: Address-width unsigned, getkind `'int'`.
-pub(in crate::front::mir) fn field_ty_is_usize(ty: &TyRef, llbc: &Llbc) -> bool {
-    let Some(node) = tyref_node(ty, llbc) else {
-        return false;
-    };
-    let value = strip_ty_indirections(node, llbc).unwrap_or(node);
-    value
-        .as_object()
-        .and_then(|obj| obj.get("Scalar"))
-        .and_then(|scalar| scalar.get("Integer"))
-        .and_then(|int| int.get("Unsigned"))
-        .and_then(serde_json::Value::as_str)
-        == Some("Usize")
-}
-
 /// Link complete transparent-scalar declarations to opaque dependency views.
 ///
 /// Charon keeps `repr(transparent)` in an external declaration's layout but
@@ -1782,17 +1767,11 @@ pub(crate) fn discover_transparent_scalar_kinds(
             continue;
         };
         let inner = tyref_to_value_type(&field.ty, llbc);
-        // A pointer-width unsigned field of a raw transparent wrapper is
-        // Address (`history.py` `getkind` `'int'`). The defining crate
-        // types that wrapper as Int via `tyref_is_raw_struct_value`; the
-        // linked kind has to match, or an Opaque dependent peels the
-        // `usize` as Unsigned. Narrower unsigned (u32 `CodeFlags`) stays
-        // Unsigned.
+        // A transparent scalar retains the inner repr, including unsigned
+        // machine words (`rint.py IntegerRepr`). Sharing the JIT's int kind
+        // with Address does not make a stored usize a signed integer.
         let kind = match inner {
             ValueType::Int => majit_charon_reader::TransparentScalarKind::Signed,
-            ValueType::Unsigned if field_ty_is_usize(&field.ty, llbc) => {
-                majit_charon_reader::TransparentScalarKind::Signed
-            }
             ValueType::Unsigned => majit_charon_reader::TransparentScalarKind::Unsigned,
             ValueType::Bool => majit_charon_reader::TransparentScalarKind::Bool,
             ValueType::Float => majit_charon_reader::TransparentScalarKind::Float,
@@ -1839,6 +1818,7 @@ pub(crate) fn discover_raw_struct_paths(
             gc_struct_ids,
             immutable_fields,
             &mut stack,
+            None,
         ) {
             paths.push(decl.item_meta.name_path());
         }
@@ -2283,6 +2263,7 @@ pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKin
         // `Ptr(STR)` (getkind `r`). The `__str_const` path is never
         // registered: the flowspace adapter pre-folds it to
         // `Constant('text')` (`flowspace_adapter.rs::is_str_const_define`).
+        // `emit_str_const` stamps the same `ValueType::Str` / `STRPTR`.
         DecodedConst::Str(s) => OpKind::Call {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), s],
@@ -2291,7 +2272,7 @@ pub(in crate::front::mir) fn decoded_const_to_op(decoded: DecodedConst) -> OpKin
                 specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
-            result_ty: ValueType::Ref(None),
+            result_ty: ValueType::Str,
         },
         // A function item used as a *value* rather than called. Upstream
         // materialises `Constant(funcptr)` of lltype `Ptr(FuncType)`
@@ -3897,7 +3878,9 @@ pub(in crate::front::mir) fn size_align_of_tyexpr_depth(
         // A nominal ADT is thin only with ptr_metadata "None"
         // (`lltypelayout.py` `get_fixed_size`). Length / VTable /
         // InheritFrom stays unharvested so `size_of` remains a Call.
-        if pointee.get("Adt").is_some() {
+        if let Some(adt) = pointee.get("Adt")
+            && adt.get("builtin").is_none_or(serde_json::Value::is_null)
+        {
             if !nominal_adt_pointee(llbc, pointee) {
                 return None;
             }

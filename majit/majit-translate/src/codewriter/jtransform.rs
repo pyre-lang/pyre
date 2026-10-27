@@ -725,6 +725,9 @@ pub struct Transformer<'a> {
     /// `r_uint` / `intmask` identity aliases erase that annotation.
     /// `prefix_unsigned_binop` reads the pre-alias operands against this set.
     unsigned_vars: std::collections::HashSet<u64>,
+    /// RPython `Transformer.graph` (`jtransform.py transform`). The graph
+    /// name is `getcalldescr(..., calling_graph=self.graph)`.
+    graph: Option<String>,
 }
 
 /// RPython: `jtransform.py` `vable_flags` values — the `flags` dict
@@ -2677,6 +2680,28 @@ fn inline_struct_field_offset(
     Some(row.offset)
 }
 
+/// Byte offset of a `taken_by_address` field on a raw owner, any flag.
+///
+/// `rewrite_op_getsubstruct` is `int_add(ptr, offsetof)` for `_gckind ==
+/// 'raw'`. `inline_aggregate_offset` / `inline_struct_field_offset` only
+/// name `FLAG_STRUCT` rows; a one-word pointer slot (`UnsafeCell.value`)
+/// is still that interior address, not `getfield_raw_r` of the word.
+fn raw_taken_field_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<usize> {
+    if !field.taken_by_address || field.vec_part.is_some() {
+        return None;
+    }
+    let owner = field.owner_root.as_deref()?;
+    let layout = cc.and_then(|cc| cc.struct_layout_for(owner))?;
+    layout
+        .fields
+        .iter()
+        .find(|row| row.name == field.name)
+        .map(|row| row.offset)
+}
+
 /// Inputargs that receive `root` on every incoming edge. A join fed by only
 /// one such edge is not this word on the other edge, so it stays a phi.
 ///
@@ -3165,6 +3190,7 @@ impl<'a> Transformer<'a> {
             analysis_cache: crate::call::AnalysisCache::default(),
             excmatch: None,
             unsigned_vars: std::collections::HashSet::new(),
+            graph: None,
         }
     }
 
@@ -3289,6 +3315,7 @@ impl<'a> Transformer<'a> {
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
+        self.graph = Some(graph_name.clone());
         drop_guarded_gc_write_barriers(&mut rewritten);
         self.immutable_array_vars = Some(collect_immutable_array_vars(
             &rewritten,
@@ -4679,28 +4706,15 @@ impl<'a> Transformer<'a> {
         self.stamp_value_kind(graph, value, ty);
     }
 
-    /// RPython `op.result.concretetype` is set by the rtyper, so jtransform
-    /// reads it directly. Pyre's front-end can leave a callee return type
-    /// as `ValueType::Unknown`, or `Ref` without its raw/GC distinction.
-    /// The rtyper's
-    /// backward-inference pass classifies `op.result` from its consumer-op
-    /// constraints, and that classification is stamped on the result
-    /// Variable's `concretetype` cell via `apply_to_graph` before this
-    /// pass runs.  Reading `FunctionGraph::concretetype_of(&v)` therefore
-    /// propagates the same `result_kind` the rtyper already chose,
-    /// instead of
-    /// falling back to `value_type_to_kind(Unknown) == 'r'`.
+    /// `jtransform.py handle_regular_call` goes through `rewrite_call`,
+    /// which sets `reskind = getkind(op.result.concretetype)[0]`.
+    /// `call.py getcalldescr` sets `RESULT = op.result.concretetype`.
+    /// Both read the rtyper cell; there is no second classification from
+    /// a front type.  `FunctionGraph::concretetype_of` is that cell.
     fn resolve_call_result_kind(
         &self,
         result: Option<&crate::flowspace::model::Variable>,
-        result_ty: &ValueType,
     ) -> Option<char> {
-        if !matches!(result_ty, ValueType::Unknown | ValueType::Ref(_)) {
-            return None;
-        }
-        if self.flavor_raw_ref_is_int_banked(result_ty) {
-            return Some('i');
-        }
         let var = result?;
         match FunctionGraph::concretetype_of(var) {
             crate::codewriter::type_state::ConcreteType::Signed => Some('i'),
@@ -4711,11 +4725,11 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    /// RPython uses one `op.result.concretetype` for both
-    /// `getkind(...)[0]` (opcode suffix) and `getcalldescr(..., RESULT)`.
-    /// Keep the Rust port on that same source of truth so `Unknown`
-    /// results resolved by `type_state` cannot produce `_i` opnames with
-    /// Ref-return calldescrs.
+    /// `jtransform.py handle_regular_call` / `rewrite_call`
+    /// `reskind = getkind(op.result.concretetype)[0]`, and
+    /// `call.py getcalldescr` `RESULT = op.result.concretetype`.
+    /// One cell for the opcode suffix and the calldescr RESULT.
+    /// `ir_type` follows that same kind.
     fn resolve_call_result(
         &self,
         result: Option<&crate::flowspace::model::Variable>,
@@ -4731,14 +4745,15 @@ impl<'a> Transformer<'a> {
         let kind = if result.is_none() {
             'v'
         } else {
-            self.resolve_call_result_kind(result, result_ty)
-                .unwrap_or_else(|| {
-                    if self.flavor_raw_ref_is_int_banked(result_ty) {
-                        'i'
-                    } else {
-                        value_type_to_kind(result_ty)
-                    }
-                })
+            self.resolve_call_result_kind(result).unwrap_or_else(|| {
+                // Pre-rtyper-cell path: the result Variable has no
+                // concretetype yet, so classify from the front type.
+                if self.flavor_raw_ref_is_int_banked(result_ty) {
+                    'i'
+                } else {
+                    value_type_to_kind(result_ty)
+                }
+            })
         };
         let ir_type = match kind {
             'i' => majit_ir::value::Type::Int,
@@ -5397,6 +5412,13 @@ impl<'a> Transformer<'a> {
                     RewriteResult::Replace(ops)
                 }
             }
+            // `rewrite_op_getarraysubstruct`: address of a raw `nolength`
+            // struct item. Intercept before `split_raw_ref_array_access`,
+            // which would load the item's first word as a GC pointer.
+            OpKind::ArrayRead {
+                taken_by_address: true,
+                ..
+            } => self.rewrite_op_getarraysubstruct(op, graph),
             // A raw array has no GC-reference items: the raw item buffer of
             // a Rust `Vec` of references holds them as words.
             OpKind::ArrayRead { .. } | OpKind::ArrayWrite { .. }
@@ -8192,15 +8214,82 @@ impl<'a> Transformer<'a> {
             result: Some(shift.clone()),
             kind: OpKind::ConstInt(offset as i64),
         });
+        emit_raw_address_add(&mut ops, op.result.clone(), addr, shift, "add");
+        RewriteResult::Replace(ops)
+    }
+
+    /// `jtransform.py rewrite_op_getarraysubstruct` → `rewrite_op_direct_ptradd`:
+    /// `int_mul(index, sizeof(T))` then `int_add(base, prod)`, result kind `'i'`.
+    /// A GC array (`nolength: false`) is the same `Abort RawAddr` a GC
+    /// owner gets for `getsubstruct`. A headerless inline fixed array
+    /// (`[[u8;1];20]`) is the same `nolength` raw region
+    /// `rewrite_op_getarrayitem` already reads; there is no second identity
+    /// test.
+    fn rewrite_op_getarraysubstruct(
+        &mut self,
+        op: &SpaceOperation,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let OpKind::ArrayRead {
+            base,
+            index,
+            item_ty,
+            array_type_id,
+            nolength,
+            ..
+        } = &op.kind
+        else {
+            unreachable!("rewrite_op_getarraysubstruct called on non-ArrayRead op")
+        };
+        if !*nolength {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            }]);
+        }
+        let Some(item_bytes) = raw_array_item_bytes(
+            array_type_id.as_deref(),
+            item_ty,
+            self.callcontrol.as_deref(),
+        ) else {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            }]);
+        };
+        let index = index.clone();
+        let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+        self.stamp_value_kind_from_value_type(graph, op.result.clone(), &ValueType::Int);
+        let by = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
         ops.push(SpaceOperation {
-            result: op.result.clone(),
+            result: Some(by.clone()),
+            kind: OpKind::ConstInt(item_bytes as i64),
+        });
+        let prod = self.fresh_synthetic_variable_typed(
+            graph,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        ops.push(SpaceOperation {
+            result: Some(prod.clone()),
             kind: OpKind::BinOp {
-                op: "add".to_string(),
-                lhs: addr,
-                rhs: shift,
+                op: "int_mul".to_string(),
+                lhs: index,
+                rhs: by,
                 result_ty: ValueType::Int,
             },
         });
+        emit_raw_address_add(&mut ops, op.result.clone(), addr, prod, "int_add");
         RewriteResult::Replace(ops)
     }
 
@@ -8905,6 +8994,18 @@ impl<'a> Transformer<'a> {
             };
             return self.rewrite_raw_substruct_address(op, base, offset, graph);
         }
+        // A one-word pointer / scalar slot taken by address is the same
+        // `getsubstruct` (`int_add`) as a `FLAG_STRUCT` row. Leaving it as
+        // `getfield` is `getfield_raw_r` of the word, which
+        // `rewrite_op_getfield` refuses.
+        if let Some(offset) = raw_taken_field_offset(field, self.callcontrol.as_deref())
+            && !crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+        {
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return self.rewrite_raw_substruct_address(op, base, offset, graph);
+        }
         // A place read of the same aggregate (`(*raw).inline.field`) does
         // not set `taken_by_address`. On a raw container that read is still
         // `rewrite_op_getsubstruct`: the result is the interior address.
@@ -9364,6 +9465,8 @@ impl<'a> Transformer<'a> {
         // A host integer 0 is `ConstPtr(NULL)` (`history.py` `CONST_NULL`).
         // The same kind comes from the field: a `Ref` / `Str` store of
         // integer 0 is a null pointer, not `CONST_0`.
+        // A flavor-raw `Ref(Some)` is int at `history.getkind`
+        // (`rclass.py getgcflavor`); 0 stays `CONST_0`.
         if (matches!(ty, ValueType::Ref(_) | ValueType::Str)
             || field.owner_root.as_deref().is_some_and(|owner| {
                 crate::virtualizable_decl::virtualizable_llfield_type(owner, &field.name)
@@ -9371,6 +9474,7 @@ impl<'a> Transformer<'a> {
                         llty == *crate::translator::rtyper::lltypesystem::lltype::GCREF
                     })
             }))
+            && !self.flavor_raw_ref_is_int_banked(ty)
             && crate::model::link_arg_is_int_zero(graph, value)
         {
             let null = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
@@ -9482,18 +9586,27 @@ impl<'a> Transformer<'a> {
                 },
             ]);
         }
-        if &typed_ty != ty {
+        // Front `Ref(Some(flavor))` is still a raw `Ptr` at
+        // `history.getkind` (`rclass.py getgcflavor`). The store is the
+        // word, same as `split_raw_ref_array_access`.
+        let rewrite_ty = if self.flavor_raw_ref_is_int_banked(ty) {
+            ValueType::Int
+        } else {
+            typed_ty.clone()
+        };
+        if &rewrite_ty != ty {
             // `jtransform.py rewrite_op_setfield` takes `getkind` from
             // the field lltype (`RESULT = v_value.concretetype`); the
             // stored value already has that kind. A Ref/Str field whose
             // SSA value is Int/Unsigned is a producer lowering bug —
             // `history.py` `getkind`, rtyper `lowleveltype`.
             if matches!(ty, ValueType::Ref(_) | ValueType::Str)
-                && matches!(typed_ty, ValueType::Int | ValueType::Unsigned)
+                && matches!(rewrite_ty, ValueType::Int | ValueType::Unsigned)
+                && !self.flavor_raw_ref_is_int_banked(ty)
             {
                 panic!(
                     "rewrite_op_setfield kind mismatch in {graph_name}: \
-                     field {field:?} is {ty:?} but value {value:?} is {typed_ty:?}; \
+                     field {field:?} is {ty:?} but value {value:?} is {rewrite_ty:?}; \
                      getkind comes from the field lltype \
                      (`jtransform.py` rewrite_op_setfield, `history.py` getkind)"
                 );
@@ -9508,7 +9621,7 @@ impl<'a> Transformer<'a> {
                     base: base_var,
                     field: field.clone(),
                     value: value.clone(),
-                    ty: typed_ty,
+                    ty: rewrite_ty,
                 },
             }]);
         }
@@ -9572,6 +9685,7 @@ impl<'a> Transformer<'a> {
                             nolength: *nolength,
                             gckind: crate::model::ArrayGcKind::Raw,
                             pure: false,
+                            taken_by_address: false,
                         },
                     }]));
                 }
@@ -9587,6 +9701,7 @@ impl<'a> Transformer<'a> {
                             nolength: *nolength,
                             gckind: crate::model::ArrayGcKind::Raw,
                             pure: false,
+                            taken_by_address: false,
                         },
                     },
                     SpaceOperation {
@@ -9705,16 +9820,40 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
-        let (array_type_id, nolength, source_gckind, source_pure) = match &op.kind {
+        let (array_type_id, nolength, source_gckind, source_pure, taken_by_address) = match &op.kind
+        {
             OpKind::ArrayRead {
                 array_type_id,
                 nolength,
                 gckind,
                 pure,
+                taken_by_address,
                 ..
-            } => (array_type_id.clone(), *nolength, *gckind, *pure),
+            } => (
+                array_type_id.clone(),
+                *nolength,
+                *gckind,
+                *pure,
+                *taken_by_address,
+            ),
             _ => unreachable!("rewrite_op_getarrayitem called on non-ArrayRead op"),
         };
+        // RPython has no GC pointers in raw arrays. Do not emit
+        // `getarrayitem_raw_r`. Address-taken items already rewrote as
+        // `getarraysubstruct`.
+        if nolength
+            && !taken_by_address
+            && matches!(
+                typed_item_ty,
+                ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+            )
+        {
+            panic!(
+                "getarrayitem_raw_r not supported \
+                 (jtransform.py rewrite_op_getarrayitem) — graph {graph_name}, \
+                 array_type_id {array_type_id:?}, item_ty {typed_item_ty:?}"
+            );
+        }
         // `rewrite_op_getarrayitem`: `immut = ARRAY._immutable_field(None)`
         // → `pure = '_pure'`. The front leaves ordinary reads `pure: false`;
         // the array type's immutability lives on
@@ -9763,6 +9902,7 @@ impl<'a> Transformer<'a> {
                     nolength,
                     gckind,
                     pure,
+                    taken_by_address,
                 },
             }]);
         }
@@ -9971,6 +10111,7 @@ impl<'a> Transformer<'a> {
                     nolength: true,
                     gckind: crate::model::ArrayGcKind::Raw,
                     pure: false,
+                    taken_by_address: false,
                 },
             };
             return match self.rewrite_op_getarrayitem(
@@ -10727,6 +10868,25 @@ impl<'a> Transformer<'a> {
                 );
             }
         }
+        // `lltype.py ann_malloc` / `rbuiltin.py rtype_malloc` selected a raw
+        // Struct pointer for this constructor. Consume that repr exactly as
+        // `jtransform.py rewrite_op_malloc` does: the escaping aggregate must
+        // be allocated, never replaced by a null placeholder.
+        if let CallTarget::SyntheticTransparentCtor {
+            is_struct: true, ..
+        } = target
+            && args.is_empty()
+            && let Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(ptr)) =
+                op.result.as_ref().and_then(|result| result.concretetype())
+            && let crate::translator::rtyper::lltypesystem::lltype::PtrTarget::Struct(st) = ptr.TO
+            && st._gckind == crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        {
+            let malloc = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::raw_malloc(st._name, false, None),
+            };
+            return self.rewrite_op_raw_malloc(&malloc, graph_name, graph);
+        }
         // A niladic named-struct ctor is an allocation, exactly like the tuple
         // and array forms above: `front::mir` emits the constructor with empty
         // args and the operands follow it as `FieldWrite`s in program order,
@@ -10785,22 +10945,6 @@ impl<'a> Transformer<'a> {
                 has_vtable,
                 Vec::new(),
             );
-        }
-        // A raw stack struct (`DictOperationGuard`) is Int, not a GC
-        // `Ref`. It is not allocatable and not a callable. Left as a
-        // call it mints a symbolic fnaddr. Scalar-replace removes the
-        // ctor when the fields stay in this graph; a leftover is a
-        // dummy, not a residual.
-        if let CallTarget::SyntheticTransparentCtor {
-            is_struct: true, ..
-        } = target
-            && args.is_empty()
-            && matches!(result_ty, ValueType::Int)
-        {
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::ConstInt(0),
-            }]);
         }
         // RPython `rtyper` lowers a heap-carried sum-type variant to
         // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
@@ -11286,6 +11430,7 @@ impl<'a> Transformer<'a> {
                         extraeffect,
                         &mut self.analysis_cache,
                         None,
+                        self.graph.as_deref(),
                     );
                     if let Some((info, _, true)) = classified {
                         descriptor.extra_info = info;
@@ -11565,6 +11710,7 @@ impl<'a> Transformer<'a> {
                 extraeffect_override,
                 &mut self.analysis_cache,
                 None,
+                self.graph.as_deref(),
             )
         };
 
@@ -12122,6 +12268,7 @@ impl<'a> Transformer<'a> {
             Some(effectinfo),
             &mut self.analysis_cache,
             None,
+            self.graph.as_deref(),
         );
         let func = spec.fnaddr as u64;
         cc.callinfocollection
@@ -12567,6 +12714,7 @@ impl<'a> Transformer<'a> {
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
+                                taken_by_address: false,
                             },
                         },
                     ],
@@ -12610,6 +12758,7 @@ impl<'a> Transformer<'a> {
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: true,
+                                taken_by_address: false,
                             },
                         },
                     ],
@@ -12781,6 +12930,7 @@ impl<'a> Transformer<'a> {
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
+                                taken_by_address: false,
                             },
                         },
                     ],
@@ -13162,6 +13312,7 @@ impl<'a> Transformer<'a> {
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
+                                taken_by_address: false,
                             },
                         },
                     ],
@@ -13216,6 +13367,7 @@ impl<'a> Transformer<'a> {
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
+                                taken_by_address: false,
                             },
                         },
                     ],
@@ -13340,6 +13492,7 @@ impl<'a> Transformer<'a> {
                                 nolength: false,
                                 gckind: crate::model::ArrayGcKind::Gc,
                                 pure: false,
+                                taken_by_address: false,
                             },
                         },
                     ],
@@ -13498,6 +13651,7 @@ impl<'a> Transformer<'a> {
                         nolength: true,
                         gckind: crate::model::ArrayGcKind::Raw,
                         pure: false,
+                        taken_by_address: false,
                     },
                 });
                 if let Some(result) = cast_result {
@@ -14146,6 +14300,7 @@ impl<'a> Transformer<'a> {
                 extraeffect,
                 &mut self.analysis_cache,
                 extradescrs,
+                self.graph.as_deref(),
             )
         };
         // jtransform.py `_handle_oopspec_call`: `if extraeffect is not None:
@@ -14246,6 +14401,7 @@ impl<'a> Transformer<'a> {
                 None,
                 &mut self.analysis_cache,
                 None,
+                self.graph.as_deref(),
             )
         };
         // jtransform.py:1677: assert not forces_virtual_or_virtualizable.
@@ -14696,6 +14852,7 @@ impl<'a> Transformer<'a> {
                 None,
                 &mut self.analysis_cache,
                 None,
+                self.graph.as_deref(),
             )
         };
         // jtransform.py:301: assert calldescr.get_extra_info().check_is_elidable()
@@ -15006,6 +15163,7 @@ impl<'a> Transformer<'a> {
             None,
             &mut self.analysis_cache,
             None,
+            self.graph.as_deref(),
         );
         match cc_mut.guess_call_kind(op) {
             crate::call::CallKind::Regular => {
@@ -15884,6 +16042,62 @@ fn fn_const_target_from_field_write(
     found
 }
 
+fn emit_raw_address_add(
+    ops: &mut Vec<SpaceOperation>,
+    result: Option<crate::flowspace::model::Variable>,
+    addr: crate::flowspace::model::Variable,
+    shift: crate::flowspace::model::Variable,
+    opname: &str,
+) {
+    ops.push(SpaceOperation {
+        result,
+        kind: OpKind::BinOp {
+            op: opname.to_string(),
+            lhs: addr,
+            rhs: shift,
+            result_ty: ValueType::Int,
+        },
+    });
+}
+
+/// `sizeof(T)` for `rewrite_op_getarraysubstruct`. Inline Vec/String is
+/// three words; a known struct uses its layout size. A shaped `[T; N]`
+/// item (`[u8;1]` of `[[u8;1];20]`) keeps the array spelling: stripping
+/// brackets would yield `u8;1`. Size is `get_type_flag`'s shaped-array
+/// arm, the same ARRAY.OF size `arraydescrof_concrete` uses for a
+/// non-struct item.
+fn raw_array_item_bytes(
+    array_type_id: Option<&str>,
+    item_ty: &ValueType,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<usize> {
+    let spelling = if let Some(elem) =
+        array_type_id.and_then(crate::codewriter::call::extract_element_type_from_str)
+    {
+        if crate::front::mir::shaped_array_parts(&elem).is_some() {
+            let empty = std::collections::HashSet::new();
+            let flavors = cc.map(|cc| &cc.raw_alloc_flavor_structs).unwrap_or(&empty);
+            let size = crate::codewriter::call::get_type_flag(&elem, flavors).2;
+            return (size > 0).then_some(size);
+        }
+        elem.strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(&elem)
+            .to_string()
+    } else {
+        match item_ty {
+            ValueType::Ref(Some(name)) => name.clone(),
+            _ => return None,
+        }
+    };
+    if crate::vec_layout::field_layout_is_inline_vec(&spelling) {
+        return Some(3 * crate::layout::target_word_size());
+    }
+    cc.and_then(|cc| cc.struct_layout_for(&spelling))
+        .map(|layout| layout.size)
+        .filter(|&size| size > 0)
+}
+
 fn item_spelling_from_array_type_id(id: &str) -> Option<String> {
     let id = id.trim();
     if id == crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID {
@@ -16130,6 +16344,7 @@ fn rewrite_shaped_array_field(
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
             pure: false,
+            taken_by_address: false,
         }
     };
     Some(RewriteResult::Replace(vec![
@@ -16744,6 +16959,7 @@ fn remap_op_renamings(
             nolength,
             gckind,
             pure,
+            taken_by_address,
         } => OpKind::ArrayRead {
             base: remap_value(base, aliases),
             index: remap_value(index, aliases),
@@ -16755,6 +16971,7 @@ fn remap_op_renamings(
             // alias remap — never hardcode it (rlist.py:724
             // ll_getitem_foldable_nonneg).
             pure: *pure,
+            taken_by_address: *taken_by_address,
         },
         OpKind::ArrayLen {
             base,
@@ -20110,8 +20327,9 @@ mod tests {
         );
     }
 
-    /// Moving a multi-variant enum out of a slice slot is a load and a store
-    /// of the GC reference the codewriter already carries for that value.
+    /// Moving a multi-variant enum out of a GC array slot is a load and a
+    /// store of the GC reference the codewriter carries for that value.
+    /// `jtransform.py rewrite_op_getarrayitem` has no raw-array Ref load.
     /// The address of the word-sized cell is not an interior substructure, so
     /// the lowered graph has no abort.
     #[test]
@@ -20132,7 +20350,7 @@ mod tests {
             StructLayout {
                 size: 24,
                 align: word,
-                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc,
                 fields: vec![
                     StructFieldLayout {
                         name: "cell".to_string(),
@@ -20185,9 +20403,10 @@ mod tests {
                     index: index.clone(),
                     item_ty: ValueType::Ref(None),
                     array_type_id: Some("enum_slice".into()),
-                    nolength: true,
-                    gckind: crate::model::ArrayGcKind::Raw,
+                    nolength: false,
+                    gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -20203,8 +20422,8 @@ mod tests {
                 value: LinkArg::Value(empty),
                 item_ty: ValueType::Ref(None),
                 array_type_id: Some("enum_slice".into()),
-                nolength: true,
-                gckind: crate::model::ArrayGcKind::Raw,
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
             },
             false,
         );
@@ -24199,6 +24418,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -24286,6 +24506,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -25210,6 +25431,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -25248,6 +25470,7 @@ mod tests {
                     nolength: false,
                     gckind: built,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -25303,6 +25526,350 @@ mod tests {
             crate::model::ArrayGcKind::Gc,
         );
         assert_eq!(gckind, crate::model::ArrayGcKind::Raw);
+    }
+    #[test]
+    fn address_taken_raw_string_item_is_getarraysubstruct() {
+        let mut graph = FunctionGraph::new("names_index");
+        let base = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "items".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: ValueType::Ref(Some("String".into())),
+                    array_type_id: Some("Vec<String>".into()),
+                    nolength: true,
+                    gckind: crate::model::ArrayGcKind::Gc,
+                    pure: false,
+                    taken_by_address: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Unknown,
+        );
+
+        let config = GraphTransformConfig::default();
+        let rewritten = Transformer::new(&config).transform(&graph);
+        let ops = &rewritten.graph.block(graph.startblock).operations;
+        let word = 3 * crate::layout::target_word_size() as i64;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == word)),
+            "sizeof(String) is 24, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, result_ty, .. }
+                    if op == "int_mul" && *result_ty == ValueType::Int
+            )),
+            "getarraysubstruct int_mul, got {ops:?}"
+        );
+        let add = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp { op, result_ty, .. }
+                    if op == "int_add" && *result_ty == ValueType::Int
+            )
+        });
+        let add = add.expect("getarraysubstruct int_add");
+        assert_eq!(
+            add.result.as_ref().map(FunctionGraph::concretetype_of),
+            Some(crate::codewriter::type_state::ConcreteType::Signed),
+            "address kind is 'i'"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+            "address-taken raw item is not getarrayitem, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn address_taken_gc_array_is_abort_raw_addr() {
+        let mut graph = FunctionGraph::new("gc_substruct");
+        let base = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "items".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty: ValueType::Ref(Some("String".into())),
+                array_type_id: Some("[String]".into()),
+                nolength: false,
+                gckind: crate::model::ArrayGcKind::Gc,
+                pure: false,
+                taken_by_address: true,
+            },
+            true,
+        );
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let rewritten = Transformer::new(&config).transform(&graph);
+        assert!(
+            rewritten
+                .graph
+                .block(graph.startblock)
+                .operations
+                .iter()
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    }
+                )),
+            "GC array getarraysubstruct is Abort RawAddr"
+        );
+    }
+
+    #[test]
+    fn scalar_raw_u8_item_stays_arrayread() {
+        let mut graph = FunctionGraph::new("box_u8_index");
+        let base = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "items".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: ValueType::Unsigned,
+                    array_type_id: Some("Vec<u8>".into()),
+                    nolength: true,
+                    gckind: crate::model::ArrayGcKind::Gc,
+                    pure: false,
+                    taken_by_address: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let config = GraphTransformConfig::default();
+        let rewritten = Transformer::new(&config).transform(&graph);
+        let ops = &rewritten.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayRead {
+                    nolength: true,
+                    taken_by_address: false,
+                    array_type_id: Some(id),
+                    ..
+                } if id == "Vec<u8>"
+            )),
+            "scalar Box<[u8]> index stays a raw item read, got {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, .. } if op == "int_mul"
+            )),
+            "scalar item read is not getarraysubstruct, got {ops:?}"
+        );
+    }
+
+    #[test]
+    fn nested_fixed_u8_item_is_getarraysubstruct() {
+        // `t.cc[i][0]`: outer item is `[u8;1]` (ContainerType, 1 byte),
+        // inner item is `u8`. The outer ArrayRead is the interior address
+        // (`getarraysubstruct`); the inner is `getarrayitem_raw_i`.
+        let item_bytes =
+            crate::codewriter::call::get_type_flag("[u8;1]", &std::collections::HashSet::new()).2
+                as i64;
+        assert_eq!(item_bytes, 1, "sizeof([u8;1]) from get_type_flag");
+
+        let mut graph = FunctionGraph::new("cc_index");
+        let base = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "cc".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let item_addr = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base,
+                    index,
+                    item_ty: ValueType::Ref(None),
+                    array_type_id: Some("[[u8;1];20]".into()),
+                    nolength: true,
+                    gckind: crate::model::ArrayGcKind::Raw,
+                    pure: false,
+                    taken_by_address: true,
+                },
+                true,
+            )
+            .unwrap();
+        let zero = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        let byte = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: item_addr.clone(),
+                    index: zero,
+                    item_ty: ValueType::Unsigned,
+                    array_type_id: Some("[u8;1]".into()),
+                    nolength: true,
+                    gckind: crate::model::ArrayGcKind::Raw,
+                    pure: false,
+                    taken_by_address: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(byte.clone()));
+        FunctionGraph::set_concretetype_of_inline(
+            &item_addr,
+            crate::codewriter::type_state::ConcreteType::Unknown,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &byte,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        let config = GraphTransformConfig::default();
+        let rewritten = Transformer::new(&config).transform(&graph);
+        let ops = &rewritten.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter()
+                .any(|op| matches!(&op.kind, OpKind::ConstInt(n) if *n == item_bytes)),
+            "sizeof([u8;1]) is 1, got {ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::BinOp { op, result_ty, .. }
+                    if op == "int_mul" && *result_ty == ValueType::Int
+            )),
+            "outer [u8;1] access is getarraysubstruct int_mul, got {ops:?}"
+        );
+        let add = ops.iter().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::BinOp { op, result_ty, .. }
+                    if op == "int_add" && *result_ty == ValueType::Int
+            )
+        });
+        let add = add.expect("getarraysubstruct int_add");
+        assert_eq!(
+            add.result.as_ref().map(FunctionGraph::concretetype_of),
+            Some(crate::codewriter::type_state::ConcreteType::Signed),
+            "address kind is 'i'"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayRead {
+                    nolength: true,
+                    gckind: crate::model::ArrayGcKind::Raw,
+                    taken_by_address: false,
+                    item_ty: ValueType::Unsigned | ValueType::Int,
+                    array_type_id: Some(id),
+                    ..
+                } if id == "[u8;1]"
+            )),
+            "inner [0] is getarrayitem_raw_i, got {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ArrayRead {
+                    item_ty: ValueType::Ref(_),
+                    ..
+                }
+            )),
+            "no getarrayitem_raw_r / getarrayitem_gc of the [u8;1] item, got {ops:?}"
+        );
     }
 
     /// A method call whose override says `Residual` lowers to the const
@@ -30083,6 +30650,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -30155,6 +30723,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -30223,6 +30792,7 @@ mod tests {
                 nolength: false,
                 gckind: crate::model::ArrayGcKind::Gc,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -30294,6 +30864,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: true,
+                    taken_by_address: false,
                 },
                 true,
             )
@@ -32443,6 +33014,7 @@ mod tests {
                 nolength,
                 gckind,
                 pure,
+                ..
             } => {
                 assert_eq!(base, &s);
                 assert_eq!(index, &i);
@@ -33155,6 +33727,66 @@ mod tests {
             .find(|op| op.result.as_ref() == Some(&result_var))
             .expect("we_are_jitted op must survive as a const-define");
         assert!(matches!(folded.kind, OpKind::ConstBool(true)));
+    }
+
+    /// An escaping raw aggregate is the allocated raw Ptr selected by
+    /// rtyping (`jtransform.py rewrite_op_malloc`), never a null dummy.
+    #[test]
+    fn escaping_raw_struct_ctor_allocates_its_declared_layout() {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Ptr, Struct};
+        let config = GraphTransformConfig::default();
+        let owner = "Tuple<i64>";
+        let sid = majit_ir::descr::struct_id_for_name(owner).expect("shape id");
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(sid, raw_tuple_i64_layout());
+        let mut graph = FunctionGraph::new("escaping_raw_struct_ctor");
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(Vec::new(), owner),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let body =
+            Struct::registry_fields(owner, vec![("f".into(), LowLevelType::Signed)], GcKind::Raw);
+        result.set_concretetype(Some(LowLevelType::Ptr(Box::new(
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).unwrap(),
+        ))));
+        graph.set_return(graph.startblock, Some(result.clone()));
+        // jtransform consumes a graph already typed by the rtyper.
+        graph.block(graph.returnblock).inputargs[0].set_concretetype(result.concretetype());
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed
+            .graph
+            .block(transformed.graph.startblock)
+            .operations;
+        let (path, _, args) = raw_malloc_residual(ops);
+        assert!(path.ends_with("ll_raw_malloc_fixedsize"), "{path}");
+        let [size] = args else {
+            panic!("fixed-size allocation args: {args:?}")
+        };
+        assert!(
+            ops.iter().any(
+                |op| op.result.as_ref() == Some(size) && matches!(op.kind, OpKind::ConstInt(8))
+            )
+        );
+        assert!(!ops.iter().any(|op| op.result.as_ref() == Some(&result)
+            && matches!(op.kind, OpKind::ConstRefNull | OpKind::ConstInt(0))));
+        assert_eq!(
+            FunctionGraph::concretetype_of(
+                &transformed
+                    .graph
+                    .block(transformed.graph.returnblock)
+                    .inputargs[0]
+            ),
+            ConcreteType::Signed
+        );
     }
 
     /// Reject when arg/result IR kinds disagree — that means the
@@ -34578,6 +35210,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             );
@@ -34624,6 +35257,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             );
@@ -34701,6 +35335,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             );
@@ -35152,6 +35787,7 @@ mod tests {
                 nolength: true,
                 gckind: crate::model::ArrayGcKind::Raw,
                 pure: false,
+                taken_by_address: false,
             },
             true,
         );
@@ -36346,6 +36982,166 @@ mod tests {
             ConcreteType::Signed,
             "flavor-raw Ref(Some) call dest is int-banked"
         );
+    }
+
+    /// lib.rs clones `program.raw_alloc_flavor_structs` onto CallControl
+    /// before any graph is transformed; `transform_graph_to_jitcode`
+    /// always `.with_callcontrol(callcontrol)`. At `stack_base`
+    /// transform, `self.callcontrol` is Some and the intern key is in
+    /// that set.
+    #[test]
+    fn production_stack_base_callcontrol_is_some_and_contains_codeobject() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs
+            .insert("bytecode::CodeObject".to_string());
+        let transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        assert!(
+            transformer.callcontrol.is_some(),
+            "transform_graph_to_jitcode always with_callcontrol"
+        );
+        let cc_ref = transformer.callcontrol.as_deref().unwrap();
+        assert!(
+            crate::front::llbc_hints::alloc_flavor_raw_contains(
+                &cc_ref.raw_alloc_flavor_structs,
+                "bytecode::CodeObject",
+            ),
+            "lib.rs clones the harvest intern key onto CallControl"
+        );
+        assert!(
+            transformer.flavor_raw_ref_is_int_banked(&ValueType::Ref(Some(
+                "bytecode::CodeObject".to_string()
+            )))
+        );
+    }
+
+    /// Cell Signed, front `Ref(Some("bytecode::CodeObject"))`, no flavor
+    /// set: kind is `'i'` from the cell (`jtransform.py rewrite_call`
+    /// `reskind = getkind(op.result.concretetype)[0]`).
+    #[test]
+    fn resolve_call_result_signed_cell_wins_without_flavor() {
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        assert!(transformer.callcontrol.is_none());
+        let mut graph = FunctionGraph::new("stack_base");
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_ty = ValueType::Ref(Some("bytecode::CodeObject".to_string()));
+        let resolved = transformer.resolve_call_result(Some(&result), &result_ty);
+        assert_eq!(resolved.kind, 'i', "Signed cell is getkind int");
+        assert_eq!(resolved.ir_type, majit_ir::value::Type::Int);
+    }
+
+    /// Cell GcRef wins over front `Int` (`call.py getcalldescr`
+    /// `RESULT = op.result.concretetype`).
+    #[test]
+    fn resolve_call_result_gcref_cell_wins_over_int_result_ty() {
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("caller");
+        let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let result_ty = ValueType::Int;
+        let resolved = transformer.resolve_call_result(Some(&result), &result_ty);
+        assert_eq!(resolved.kind, 'r', "GcRef cell is getkind ref");
+        assert_eq!(resolved.ir_type, majit_ir::value::Type::Ref);
+    }
+
+    /// Front `Ref(Some("QuasiImmut"))` FieldWrite of a Signed word is
+    /// int-banked (`history.getkind` of the raw `Ptr`, `rclass.py
+    /// getgcflavor`). `rewrite_op_setfield` rewrites the field ty to Int.
+    #[test]
+    fn rewrite_op_setfield_flavor_raw_ref_int_value_is_int_banked() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs.insert("QuasiImmut".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("new_terminator");
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let value = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let field = crate::model::FieldDescriptor::new("ptr", Some("QuasiImmutField".into()));
+        let ty = ValueType::Ref(Some("QuasiImmut".to_string()));
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: base,
+                field: field.clone(),
+                value: LinkArg::Value(value.clone()),
+                ty: ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_setfield(
+            &op,
+            &field,
+            &LinkArg::Value(value),
+            &ty,
+            "new_terminator",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::FieldWrite { ty, .. },
+                        ..
+                    }] if *ty == ValueType::Int
+                ));
+            }
+            RewriteResult::Keep => panic!("expected FieldWrite ty Int, got Keep"),
+            RewriteResult::Identity(_) => panic!("expected FieldWrite ty Int, got Identity"),
+            RewriteResult::Constant(_) => panic!("expected FieldWrite ty Int, got Constant"),
+        }
+    }
+
+    /// Flavor-raw `Ref(Some)` store of integer 0 is `CONST_0`, not
+    /// `ConstPtr(NULL)` (`history.getkind` of the raw `Ptr` is `'int'`).
+    #[test]
+    fn rewrite_op_setfield_flavor_raw_ref_int_zero_stays_const_0() {
+        let config = GraphTransformConfig::default();
+        let mut cc = crate::call::CallControl::new();
+        cc.raw_alloc_flavor_structs.insert("QuasiImmut".to_string());
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("new_terminator");
+        let base = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        let zero = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(0), true)
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&zero, ConcreteType::Signed);
+        let field = crate::model::FieldDescriptor::new("ptr", Some("QuasiImmutField".into()));
+        let ty = ValueType::Ref(Some("QuasiImmut".to_string()));
+        let value = LinkArg::Value(zero);
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: base,
+                field: field.clone(),
+                value: value.clone(),
+                ty: ty.clone(),
+            },
+        };
+        match transformer.rewrite_op_setfield(
+            &op,
+            &field,
+            &value,
+            &ty,
+            "new_terminator",
+            &mut graph,
+        ) {
+            RewriteResult::Replace(ops) => {
+                assert!(
+                    !ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+                    "flavor-raw 0 must not become ConstRefNull, got {ops:?}"
+                );
+                assert!(matches!(
+                    ops.as_slice(),
+                    [SpaceOperation {
+                        kind: OpKind::FieldWrite { ty, .. },
+                        ..
+                    }] if *ty == ValueType::Int
+                ));
+            }
+            RewriteResult::Keep => panic!("expected FieldWrite ty Int, got Keep"),
+            RewriteResult::Identity(_) => panic!("expected FieldWrite ty Int, got Identity"),
+            RewriteResult::Constant(_) => panic!("expected FieldWrite ty Int, got Constant"),
+        }
     }
 
     /// `rewrite_op_hint` `promote=True`: `'%s_guard_value' % getkind(v.concretetype)`.
@@ -39804,6 +40600,7 @@ mod tests {
                 nolength,
                 gckind,
                 pure,
+                taken_by_address: _,
             } = &body[1].kind
             else {
                 panic!("expected ArrayRead, got {:?}", body[1].kind);
@@ -41310,6 +42107,7 @@ mod tests {
                 nolength,
                 gckind,
                 pure,
+                taken_by_address: _,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);
@@ -41382,6 +42180,7 @@ mod tests {
                 nolength,
                 gckind,
                 pure,
+                taken_by_address: _,
             } => {
                 assert_eq!(base, &block);
                 assert_eq!(idx, &index);

@@ -721,10 +721,11 @@ fn front_graph_carries_no_synthesized_exception_edges() {
 /// answer `Ref` for every container that was not `front::range_iter`'s
 /// `range()` builtin, because the `iter` op carries the iterator and not
 /// the container's item type — so this graph typed a raw `i64` into the
-/// ref register bank.  `result_ty` is not a hint the rtyper can overrule:
-/// `resolve_call_result_kind` consults `concretetype` only when
-/// `result_ty` is `Unknown`, and `authoritative_result_types` stamps the
-/// derived kind back over it.
+/// ref register bank.  `resolve_call_result` reads `op.result.concretetype`
+/// first (`jtransform.py rewrite_call` `reskind = getkind(op.result.concretetype)[0]`);
+/// `result_ty` is the pre-rtyper-cell path when that cell is still
+/// `Unknown`. `authoritative_result_types` stamps the rewritten
+/// `result_kind` back over it.
 #[test]
 fn branch_loop_sum_next_yields_an_int_element() {
     use majit_translate::model::{CallTarget, OpKind, ValueType};
@@ -2741,6 +2742,7 @@ fn mem_replace_through_box_deref_names_enum_fields() {
             OopSpecIndex::None,
             None,
             &mut cache,
+            None,
             None,
         );
         let named: Vec<String> = descriptor

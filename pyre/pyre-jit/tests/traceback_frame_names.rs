@@ -5,12 +5,10 @@
 //! record the application traceback before it searches the exception table,
 //! the same order as `pyopcode.py handle_operation_error`.
 
-use std::rc::Rc;
-
 use pyre_interpreter::call::{register_build_class, set_last_exec_ctx};
 use pyre_interpreter::importing;
 use pyre_interpreter::pyframe::PyFrame;
-use pyre_interpreter::{Mode, PyExecutionContext, compile_source_with_filename};
+use pyre_interpreter::{Mode, alloc_execution_context, compile_source_with_filename};
 use pyre_jit::eval::{eval_with_jit, init_jit_hooks};
 
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -33,8 +31,8 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
 
     register_build_class();
 
-    let execution_context = Rc::new(PyExecutionContext::default());
-    set_last_exec_ctx(Rc::as_ptr(&execution_context));
+    let execution_context = alloc_execution_context();
+    set_last_exec_ctx(execution_context.as_ptr());
 
     let mut frame = PyFrame::new_with_context(code, execution_context)
         .map_err(|e| format!("frame setup error: {}", e.message_text()))?;

@@ -229,6 +229,12 @@ impl<'a> Lowering<'a> {
             .get(0)?,
             self.llbc,
         )?;
+        // A Vec header is the Int address (`RustVecRepr`), including
+        // `Option<&Vec<T>>`. The Option<&T> peel below would otherwise
+        // name the Vec ADT as a GC instance class.
+        if tyref_is_rust_vec_header(&TyRef::Other(payload.clone()), self.llbc) {
+            return None;
+        }
         if let Some(root) =
             raw_ptr_pointee_class_root_with(payload, self.llbc, self.tombstoned_leaves)
         {
@@ -380,6 +386,12 @@ impl<'a> Lowering<'a> {
         let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
+        // Vec header Int niche: `None` is `option_niche_int_null`, not a
+        // GC `Vec<…>` instance. Decided before the Option<&T> string /
+        // name-prefix arms.
+        if tyref_is_rust_vec_header(&TyRef::Other(payload.clone()), self.llbc) {
+            return None;
+        }
         let stripped = strip_ty_wrappers(payload, self.llbc)?;
         let rendered = charon_type_value_to_ast_string(stripped, self.llbc, 0);
         let payload_ty = tyref_enum_payload_value_type(
@@ -553,6 +565,7 @@ impl<'a> Lowering<'a> {
             payload_ty,
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
+            int_null: self.option_niche_int_null(dest_ty),
             payload_narrow_root,
             array_type_id: None,
             object_array_type_id: None,
@@ -643,6 +656,7 @@ impl<'a> Lowering<'a> {
             object_array_type_id: None,
             niche,
             niche_null_cast: self.option_niche_null_cast(dest_ty),
+            int_null: self.option_niche_int_null(dest_ty),
             payload_narrow_root,
         })
     }
@@ -1891,8 +1905,8 @@ impl<'a> Lowering<'a> {
     /// `Option<&T>` with a thin (Sized) ADT pointee, or a raw pointer to a
     /// thin nominal ADT. It also includes the exact Rust container spellings
     /// that translate to one RPython GC pointer: `Option<Vec<T>>` of a
-    /// multi-word item becomes a nullable `SomeList`, a shared
-    /// `Option<&[PyObjectRef]>` is the same nullable GcArray list
+    /// multi-word item is the Vec header's Int word (`RustVecRepr`), a
+    /// shared `Option<&[PyObjectRef]>` is the nullable GcArray list
     /// (`rlist.py` `FixedSizeListRepr` / `ll_fixed_items`), and
     /// `Option<&str>` / `Option<String>` (and the other string-family
     /// payloads [`node_is_string_value`] already projects) become a
@@ -1965,7 +1979,10 @@ impl<'a> Lowering<'a> {
     /// iter_next the null-test shape (its matcher must accept the
     /// `niche_disc_vars` bool switch) BEFORE relying on the fold there.
     pub(in crate::front::mir) fn tyref_is_niche_option_ptr(&self, ty: &TyRef) -> bool {
-        tyref_is_niche_option(ty, self.llbc)
+        // A two-variant enum of one fieldless arm plus one string-family
+        // payload is the same nullable STR word as `Option<Wtf8Buf>`,
+        // without sharing `Some.__pos_0` across Option instantiations.
+        tyref_is_nullable_str_enum(ty, self.llbc) || tyref_is_niche_option(ty, self.llbc)
     }
 
     /// `true` when `option_ty` is a niche nullable `Option<P>` and `P`

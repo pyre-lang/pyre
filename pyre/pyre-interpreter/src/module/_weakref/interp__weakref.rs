@@ -2775,46 +2775,15 @@ mod tests {
         let callable = callable_proxy_type();
         unsafe {
             for tp in [weakproxy, callable] {
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, 
-                            "__instancecheck__"
-                        )
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, 
-                            "__subclasscheck__"
-                        )
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__divmod__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__rdivmod__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__matmul__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__rmatmul__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__imatmul__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__bytes__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__reversed__")
-                    .is_some()
-                );
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__instancecheck__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__subclasscheck__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__divmod__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__rdivmod__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__matmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__rmatmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__imatmul__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__bytes__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__reversed__").is_some());
             }
         }
     }
@@ -2832,22 +2801,12 @@ mod tests {
         unsafe {
             for tp in [weakproxy, callable] {
                 for name in ["__lt__", "__le__", "__gt__", "__ge__", "__eq__", "__ne__"] {
-                    let (source, _) = crate::baseobjspace::lookup_where_pair(
-                        tp,
-                        name,
-                    )
-                    .unwrap();
+                    let (source, _) = crate::baseobjspace::lookup_where_pair(tp, name).unwrap();
                     assert!(std::ptr::eq(source, tp));
                 }
                 // Forwarded ops should land on both typedefs.
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__add__")
-                    .is_some()
-                );
-                assert!(
-                    crate::baseobjspace::lookup_in_type(tp, "__len__")
-                    .is_some()
-                );
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__add__").is_some());
+                assert!(crate::baseobjspace::lookup_in_type(tp, "__len__").is_some());
             }
         }
     }

@@ -119,6 +119,9 @@ fn loads_fixture_corpus() {
     // `option_raw_struct_from_int`. `SomeRawStruct` is a type, so it
     // contributes no body.
     //
+    // + 1 for `CastCcharpToVoidP::ccharp_to_voidp`, the `*const u8` to
+    // VOIDP trait method (`cast_into_ccharp_to_voidp_stays_int`).
+    //
     // Measured on Charon 0.1.301 (nightly-2026.10.29) with
     // `--reconstruct-panic-calls --inline-anon-consts`: drop glue is no
     // longer its own local item, and this artefact holds 106.

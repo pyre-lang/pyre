@@ -23,13 +23,13 @@ use crate::front::mir::tests::{
     empty_struct_attrs, fixture_item_meta, fixture_llbc, graph_call_leaves, graph_ops, i64_field,
     ident_path, interior_bb, interior_caller, interior_i64, interior_local, interior_meta,
     interior_opaque, interior_raw_mut, interior_return, interior_usize, leftover_fmt_message_paths,
-    llbc_with_types, lower_object_fn, ok_ctor_shape, option_adt_node, option_enum, option_int_arg,
-    option_ok_or_else_site, push_fn_const, replace_struct_ctors, result_adt_node, result_enum,
-    rows, same_as_count, some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops,
-    struct_decl, struct_news, tyref_to_attr_value_type, window_call_leafs, window_empty_generics,
-    window_graph_ops, window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun,
-    window_place, window_shared_slice, window_slice, window_span, window_u8,
-    window_unwind_and_return_blocks, window_usize,
+    llbc_with_types, llbc_with_types_and_traits, lower_object_fn, ok_ctor_shape, option_adt_node,
+    option_enum, option_int_arg, option_ok_or_else_site, push_fn_const, replace_struct_ctors,
+    result_adt_node, result_enum, rows, same_as_count, some_ctor_ops, some_ctor_shape,
+    struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news, tyref_to_attr_value_type,
+    window_call_leafs, window_empty_generics, window_graph_ops, window_llbc, window_local,
+    window_meta, window_mut_u8_ptr, window_opaque_fun, window_place, window_shared_slice,
+    window_slice, window_span, window_u8, window_unwind_and_return_blocks, window_usize,
 };
 
 /// Per-graph simplification after lowering — the model-layer slice of
@@ -11085,7 +11085,27 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
         ],
         vec![interior_bb(vec![], interior_return())],
     );
-    let llbc = llbc_with_types(
+    let gctype_trait = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["majit_gc", "header", "GcType"], true)
+    });
+    let gctype_self = serde_json::json!({
+        "Value": [gc_entries, {
+            "Adt": {
+                "id": gc_entries,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        }]
+    });
+    let gctype_impl = serde_json::json!({
+        "impl_trait": {"id": 0, "generics": {"types": [gctype_self]}}
+    });
+    let llbc = llbc_with_types_and_traits(
         "pyre_object",
         vec![
             struct_decl(obj_ty, &["pyre_object", "pyobject", "PyObject"], vec![]),
@@ -11118,6 +11138,8 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
             ),
         ],
         vec![malloc, generic],
+        vec![gctype_trait],
+        vec![gctype_impl],
     );
     use crate::model::ValueType;
     let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();

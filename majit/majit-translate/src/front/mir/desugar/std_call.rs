@@ -432,12 +432,50 @@ impl<'a> Lowering<'a> {
             self.instantiated_elem_align_of_var(&found.0, &found.2),
             dest_ty.and_then(|ty| self.instantiated_elem_align_from_tyref(ty, &found.2)),
         );
-        let offset = Self::array_field_items_offset(
-            self.array_field_tail_offset(&found.1, &found.2, instantiated_align),
-            &found.1,
-            &found.2,
-        )?;
+        let offset = self.array_field_tail_offset(&found.1, &found.2, instantiated_align);
+        if offset.is_none() && !self.owner_field_is_array_tail(&found.1, &found.2) {
+            return Ok(None);
+        }
+        let offset = Self::array_field_items_offset(offset, &found.1, &found.2)?;
         Ok(Some((found.0, offset)))
+    }
+
+    /// Whether `owner.field` is a `[T; N]` tail on some matching Struct decl.
+    /// Used to distinguish "not an array field" (`Ok(None)`) from "array
+    /// field whose items offset is unknown" (translation error).
+    pub(in crate::front::mir) fn owner_field_is_array_tail(
+        &self,
+        owner: &str,
+        field_name: &str,
+    ) -> bool {
+        let leaf = owner
+            .rsplit("::")
+            .next()
+            .unwrap_or(owner)
+            .split('<')
+            .next()
+            .unwrap_or(owner);
+        self.llbc.iter_type_decls().any(|td| {
+            let name = td.item_meta.name_path();
+            let td_leaf = name.rsplit("::").next().unwrap_or("");
+            if td_leaf.split('<').next().unwrap_or(td_leaf) != leaf {
+                return false;
+            }
+            let TypeDeclKind::Struct(fields) = &td.kind else {
+                return false;
+            };
+            fields.iter().any(|field| {
+                field.name.as_deref() == Some(field_name)
+                    && tyref_node(&field.ty, self.llbc)
+                        .and_then(|node| strip_ty_wrappers(node, self.llbc))
+                        .is_some_and(|stripped| {
+                            stripped
+                                .get("Array")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some()
+                        })
+            })
+        })
     }
 
     /// Alignment of the array element named by MIR local `var`.
@@ -2977,6 +3015,12 @@ impl<'a> Lowering<'a> {
         if !first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc)) {
             return false;
         }
+        // A rust-heap `String` (behind `&`) is a Vec-shaped header and
+        // does not share a repr class with `&str` Str. That `as_*` stays
+        // the residual call.
+        if first_arg_ty.is_some_and(|ty| tyref_is_rust_heap_string(ty, self.llbc)) {
+            return false;
+        }
         tyref_strips_to_str(dest_ty, self.llbc)
     }
 
@@ -4392,9 +4436,7 @@ impl<'a> Lowering<'a> {
         args: Vec<Variable>,
         result_ty: ValueType,
     ) -> Variable {
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let result = self.alloc_legacy_result(&result_ty);
         let target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
@@ -7029,11 +7071,6 @@ impl<'a> Lowering<'a> {
             .is_some_and(|(owner, leaf)| leaf_is_word(&leaf) && owner_is_cell(&owner))
     }
 
-    /// `Cell::get(&self) -> T`: load of the inner word.
-    pub(in crate::front::mir) fn is_cell_word_get(&self, reg: &RegularCall) -> bool {
-        self.is_std_cell_word_method(reg, "get")
-    }
-
     /// `Cell::set(&self, val)`: store of the inner word.
     pub(in crate::front::mir) fn is_cell_word_set(&self, reg: &RegularCall) -> bool {
         self.is_std_cell_word_method(reg, "set")
@@ -8375,39 +8412,6 @@ impl<'a> Lowering<'a> {
             return Some(arg.clone());
         }
         None
-    }
-
-    /// An Opaque TypeDecl with exactly one type argument (std `Cell<T>`):
-    /// the payload is that argument. RPython has no Cell — the field *is*
-    /// the value. Used only when `is_identity_wrapper_target` already
-    /// selected the call, so a one-parameter Opaque such as `Box<T>` does
-    /// not grow a synthetic field.
-    pub(in crate::front::mir) fn opaque_one_type_param_payload_layout(
-        &self,
-        ty: &TyRef,
-    ) -> Option<Vec<(String, ValueType)>> {
-        let peeled = self
-            .tyref_peel_ref_to_pointee(ty)
-            .unwrap_or_else(|| ty.clone());
-        let id = self.tyref_adt_def_id(&peeled)?;
-        let td = self.llbc.type_by_id(id)?;
-        if !matches!(td.kind, TypeDeclKind::Opaque) {
-            return None;
-        }
-        let payload = self.tyref_adt_type_arg(&peeled, 0)?;
-        if self.tyref_adt_type_arg(&peeled, 1).is_some() {
-            return None;
-        }
-        Some(vec![(
-            "value".into(),
-            tyref_to_value_type_with(
-                &payload,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
-        )])
     }
 }
 

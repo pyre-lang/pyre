@@ -99,6 +99,15 @@ use crate::typedef::leak_typedef;
 /// Immutable after creation. Shared between types that have the same
 /// instance layout (e.g. a class without __slots__ shares its base's layout).
 /// Identity comparison via pointer equality.
+// `typeobject.py Layout._immutable_ = True`: every field is sealed before
+// publication by leak_layout, including the resolved dict slot.
+#[majit_macros::jit_immutable_fields(
+    "typedef",
+    "nslots",
+    "newslotnames",
+    "base_layout",
+    "dict_data_slot"
+)]
 pub struct Layout {
     /// `Layout.__init__` — the TypeDef that this layout is for.
     pub typedef: *const TypeDef,

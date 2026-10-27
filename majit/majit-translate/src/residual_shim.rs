@@ -52,6 +52,10 @@ pub struct ResidualShimTarget {
     /// UFCS / inherent path. False rejects an Impl item the catalog could
     /// not rewrite — the LLBC `Impl` path element, not a rendered `"<Impl>"`.
     pub impl_callable: bool,
+    /// Parallel to `arg_rust_types`: reconstruction for a nullable-STR enum
+    /// argument, filled from the TypeDecl at catalog time.
+    #[serde(default)]
+    pub(crate) nullable_str_enum_args: Vec<Option<crate::front::mir::NullableStrEnum>>,
 }
 
 /// Counts printed by the consuming build script.
@@ -93,6 +97,7 @@ pub struct LlbcFnCatalogEntry {
     /// `callable_path` was rewritten to UFCS or `Owner::method`. False when
     /// the Impl item could not be named in Rust.
     pub impl_callable: bool,
+    pub(crate) nullable_str_enum_args: Vec<Option<crate::front::mir::NullableStrEnum>>,
 }
 
 /// Return side of a catalogued FunDecl.
@@ -128,6 +133,12 @@ pub fn catalog_from_llbc(llbc: &Llbc) -> Vec<LlbcFnCatalogEntry> {
                 rust_ty_catalog_ok(&rust).then_some(rust)
             })
             .collect::<Option<Vec<_>>>();
+        let nullable_str_enum_args = fd
+            .signature
+            .inputs
+            .iter()
+            .map(|ty| crate::front::mir::tyref_nullable_str_enum(ty, llbc))
+            .collect();
         let ret_rust_type = shim_return_ty(&fd.signature.output, llbc)
             .filter(|ret| rust_ty_catalog_ok(&ret.rust_type) || ret.rust_type == "()");
         entries.push(LlbcFnCatalogEntry {
@@ -142,6 +153,7 @@ pub fn catalog_from_llbc(llbc: &Llbc) -> Vec<LlbcFnCatalogEntry> {
             arg_rust_types,
             ret_rust_type,
             impl_callable,
+            nullable_str_enum_args,
         });
     }
     entries
@@ -355,6 +367,7 @@ pub fn collect_residual_shim_targets(
             unsupported_type,
             generic_rust_args,
             impl_callable: entry.impl_callable,
+            nullable_str_enum_args: entry.nullable_str_enum_args.clone(),
         });
     }
     targets.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1050,8 +1063,16 @@ fn shim_body(target: &ResidualShimTarget) -> String {
             let class = classes.get(word_i).copied().unwrap_or('i');
             let word = format!("__a{word_i}");
             word_i += 1;
-            let conv = from_word_expr(rust_ty, class, &word);
-            lines.push_str(&format!("    let __p{i} = {conv};\n"));
+            let nullable_str = target
+                .nullable_str_enum_args
+                .get(i)
+                .and_then(|shape| shape.as_ref());
+            let conv = from_word_expr(rust_ty, class, &word, nullable_str);
+            if nullable_str.is_some() {
+                lines.push_str(&format!("    let __p{i}: {rust_ty} = {conv};\n"));
+            } else {
+                lines.push_str(&format!("    let __p{i} = {conv};\n"));
+            }
         }
         args.push(format!("__p{i}"));
     }
@@ -1104,7 +1125,24 @@ fn pair_slice_from_words(rust_ty: &str, ptr: &str, len: &str) -> String {
     }
 }
 
-fn from_word_expr(rust_ty: &str, class: char, word: &str) -> String {
+fn from_word_expr(
+    rust_ty: &str,
+    class: char,
+    word: &str,
+    nullable_str: Option<&crate::front::mir::NullableStrEnum>,
+) -> String {
+    // A two-variant enum of one fieldless arm plus one string-family
+    // payload is a nullable rstr `STR`. Rebuild it from that word with
+    // the variant names the TypeDecl supplied; `residual_word_to_value`
+    // would `ptr::read` the native enum from the STR.
+    if let Some(shape) = nullable_str {
+        return format!(
+            "if {word} == 0 {{ {enum_path}::{fieldless} }} else {{ {enum_path}::{payload}(unsafe {{ ::pyre_interpreter::error::wtf8buf_from_residual_str({word}) }}) }}",
+            enum_path = shape.enum_path,
+            fieldless = shape.fieldless_variant,
+            payload = shape.payload_variant,
+        );
+    }
     match class {
         'f' | 'L' => format!(
             "<{rust_ty} as ::majit_ir::helper_fnaddr::ResidualFromF64>::from_residual_f64({word})"
@@ -1321,17 +1359,6 @@ fn shim_adt(
     // `Ptr`). Catalog the VALUE type so `residual_word_to_value` can
     // `ptr::read` it from that address. `rust_ty_abi_words` stays 1.
     Some(name)
-}
-
-/// One residual-call ABI word: Charon's layout size/align both fit in
-/// `i64`. Missing layout is a refusal, not a name-based guess.
-#[cfg(test)]
-fn type_decl_fits_abi_word(td: &majit_charon_reader::ullbc::TypeDecl, llbc: &Llbc) -> bool {
-    let target = std::env::var("TARGET").unwrap_or_default();
-    let Some((size, align)) = td.size_align_for_target(llbc, &target) else {
-        return false;
-    };
-    size.unwrap_or(u64::MAX) <= 8 && align.unwrap_or(u64::MAX) <= 8
 }
 
 fn adt_type_args(
@@ -1581,6 +1608,7 @@ mod tests {
             unsupported_type: false,
             generic_rust_args: Vec::new(),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }
     }
 
@@ -1617,6 +1645,7 @@ mod tests {
                 is_exc: false,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
         assert_eq!(targets.len(), 1);
@@ -1652,6 +1681,7 @@ mod tests {
                 is_exc: false,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets = collect_residual_shim_targets(&declined, &descrs, &fnaddrs, &catalog);
         assert!(targets.is_empty());
@@ -1701,6 +1731,7 @@ mod tests {
                 is_exc: false,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets =
             collect_residual_shim_targets(&HashSet::new(), &descrs, &HashMap::new(), &catalog);
@@ -1736,6 +1767,7 @@ mod tests {
                 is_exc: false,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
         assert_eq!(targets.len(), 1);
@@ -1777,6 +1809,7 @@ mod tests {
                 is_exc: true,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
         assert_eq!(targets.len(), 1);
@@ -1804,6 +1837,7 @@ mod tests {
             unsupported_type: false,
             generic_rust_args: Vec::new(),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         };
         let src = generate_residual_shim_source(&[&target]);
         assert!(src.contains("from_raw_parts"));
@@ -1856,6 +1890,7 @@ mod tests {
                 is_exc: false,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets = collect_residual_shim_targets(&declined, &descrs, &HashMap::new(), &catalog);
         assert_eq!(targets.len(), 1);
@@ -1900,6 +1935,7 @@ mod tests {
             unsupported_type: false,
             generic_rust_args: Vec::new(),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         };
         let nameability = Nameability {
             reachable_crates: BTreeSet::from(["pyre_interpreter".into()]),
@@ -1972,6 +2008,7 @@ mod tests {
             unsupported_type: false,
             generic_rust_args: Vec::new(),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         };
         let src = generate_residual_shim_source(&[&target]);
         assert!(src.contains("object_gcarray_slice"));
@@ -2193,6 +2230,7 @@ mod tests {
                 is_exc: true,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets =
             collect_residual_shim_targets(&HashSet::new(), &descrs, &HashMap::new(), &catalog);
@@ -2237,6 +2275,7 @@ mod tests {
                 is_exc: true,
             }),
             impl_callable: true,
+            nullable_str_enum_args: Vec::new(),
         }];
         let targets =
             collect_residual_shim_targets(&HashSet::new(), &descrs, &HashMap::new(), &catalog);
@@ -2331,25 +2370,152 @@ mod tests {
             .iter()
             .find(|entry| entry.path.ends_with("::make_pyerror") && !entry.is_method);
         if let Some(entry) = make_pyerror {
-            let args = entry
-                .arg_rust_types
-                .as_ref()
-                .expect("DisplayMessage is catalogued as a by-value type");
-            let message = args.iter().find(|ty| ty.ends_with("::DisplayMessage"));
-            let message = message.expect("make_pyerror takes DisplayMessage");
-            assert_eq!(
-                rust_ty_abi_words(message),
-                1,
-                "by-value DisplayMessage is one address word"
-            );
-            let td = llbc
-                .iter_type_decls()
-                .find(|td| td.item_meta.name_path().ends_with("::DisplayMessage"))
-                .expect("DisplayMessage TypeDecl");
-            assert!(
-                !type_decl_fits_abi_word(td, &llbc),
-                "DisplayMessage is larger than one ABI word; the shim ptr::reads it"
-            );
+            // The current owner takes `&Wtf8`, a Rust wide reference, rather
+            // than the old by-value DisplayMessage. The one-word catalog must
+            // refuse it; its explicit runtime adapter supplies the STR ABI.
+            assert!(entry.arg_rust_types.is_none());
+            assert!(entry.nullable_str_enum_args.iter().all(Option::is_none));
         }
+    }
+
+    fn interpreter_llbc() -> Option<majit_charon_reader::Llbc> {
+        let path = std::path::Path::new(crate::runtime_names::artifacts::INTERPRETER_ULLBC);
+        path.exists()
+            .then(|| majit_charon_reader::Llbc::load(&path).expect("load pyre-interpreter.ullbc"))
+    }
+
+    fn type_decl_named<'a>(
+        llbc: &'a majit_charon_reader::Llbc,
+        suffix: &str,
+    ) -> &'a majit_charon_reader::ullbc::TypeDecl {
+        llbc.iter_type_decls()
+            .find(|td| td.item_meta.name_path().ends_with(suffix))
+            .unwrap_or_else(|| panic!("{suffix} TypeDecl"))
+    }
+
+    #[test]
+    fn make_pyerror_rebuilds_display_message_from_the_str_word() {
+        let Some(llbc) = interpreter_llbc() else {
+            return;
+        };
+        let td = type_decl_named(&llbc, "::DisplayMessage");
+        let shape = crate::front::mir::type_decl_nullable_str_enum(td, &llbc)
+            .expect("DisplayMessage TypeDecl is a nullable STR enum");
+        let mut target = sample_target();
+        target.path = "pyre_interpreter::error::make_pyerror".into();
+        target.rust_path = "pyre_interpreter::error::make_pyerror".into();
+        target.arg_classes = "irriirrrr".into();
+        target.arg_rust_types = vec![
+            "pyre_interpreter::error::PyErrorKind".into(),
+            "pyre_interpreter::error::DisplayMessage".into(),
+            "*mut pyre_object::pyobject::PyObject".into(),
+            "bool".into(),
+            "bool".into(),
+            "i32".into(),
+            "*mut pyre_object::pyobject::PyObject".into(),
+            "*mut pyre_object::pyobject::PyObject".into(),
+            "*mut pyre_object::pyobject::PyObject".into(),
+        ];
+        target.ret_rust_type = "pyre_interpreter::error::PyError".into();
+        target.crate_name = "pyre_interpreter".into();
+        let mut args = vec![None; target.arg_rust_types.len()];
+        args[1] = Some(shape.clone());
+        target.nullable_str_enum_args = args;
+        let src = generate_residual_shim_source(&[&target]);
+        let expected = format!(
+            "{}::{}(unsafe {{ ::pyre_interpreter::error::wtf8buf_from_residual_str(__a1) }})",
+            shape.enum_path, shape.payload_variant
+        );
+        assert!(
+            src.contains(&expected),
+            "DisplayMessage is rebuilt from the STR word with TypeDecl names: {src}"
+        );
+        assert!(
+            src.contains(&format!("{}::{}", shape.enum_path, shape.fieldless_variant)),
+            "null word is the fieldless variant: {src}"
+        );
+        assert!(
+            !src.contains("residual_word_to_value(__a1)"),
+            "ptr::read of DisplayMessage from a STR frees a non-malloc Wtf8Buf: {src}"
+        );
+        assert!(
+            !src.contains("display_message_from_residual_str"),
+            "no DisplayMessage-named helper: {src}"
+        );
+    }
+
+    #[test]
+    fn nullable_str_enum_shim_uses_typedecl_variant_names() {
+        let mut target = sample_target();
+        target.arg_classes = "r".into();
+        target.arg_rust_types = vec!["other_crate::AltMsg".into()];
+        target.nullable_str_enum_args = vec![Some(crate::front::mir::NullableStrEnum {
+            enum_path: "other_crate::AltMsg".into(),
+            fieldless_variant: "Quiet".into(),
+            payload_variant: "Said".into(),
+        })];
+        let src = generate_residual_shim_source(&[&target]);
+        assert!(
+            src.contains("other_crate::AltMsg::Quiet"),
+            "null word is the fieldless variant from the TypeDecl: {src}"
+        );
+        assert!(
+            src.contains(
+                "other_crate::AltMsg::Said(unsafe { ::pyre_interpreter::error::wtf8buf_from_residual_str(__a0) })"
+            ),
+            "payload variant wraps the STR word: {src}"
+        );
+        assert!(
+            !src.contains("residual_word_to_value(__a0)"),
+            "ptr::read of the enum from a STR: {src}"
+        );
+    }
+
+    #[test]
+    fn second_nullable_str_enum_shares_niche_and_two_payload_does_not() {
+        let Some(llbc) = interpreter_llbc() else {
+            return;
+        };
+        let display = type_decl_named(&llbc, "::DisplayMessage");
+        let alt = type_decl_named(&llbc, "::AltStrMessage");
+        let two = type_decl_named(&llbc, "::TwoPayloadStr");
+        let display_shape =
+            crate::front::mir::type_decl_nullable_str_enum(display, &llbc).expect("DisplayMessage");
+        let alt_shape =
+            crate::front::mir::type_decl_nullable_str_enum(alt, &llbc).expect("AltStrMessage");
+        assert_ne!(display_shape.enum_path, alt_shape.enum_path);
+        assert_eq!(
+            crate::front::mir::tyref_to_value_type(
+                &crate::front::mir::type_decl_adt_tyref(display.def_id),
+                &llbc
+            ),
+            crate::model::ValueType::Str
+        );
+        assert_eq!(
+            crate::front::mir::tyref_to_value_type(
+                &crate::front::mir::type_decl_adt_tyref(alt.def_id),
+                &llbc
+            ),
+            crate::model::ValueType::Str
+        );
+        assert!(crate::front::mir::type_decl_nullable_str_enum(two, &llbc).is_none());
+        let two_ty = crate::front::mir::type_decl_adt_tyref(two.def_id);
+        assert_ne!(
+            crate::front::mir::tyref_to_value_type(&two_ty, &llbc),
+            crate::model::ValueType::Str
+        );
+        let mut target = sample_target();
+        target.arg_classes = "r".into();
+        target.arg_rust_types = vec![alt_shape.enum_path.clone()];
+        target.nullable_str_enum_args = vec![Some(alt_shape.clone())];
+        let src = generate_residual_shim_source(&[&target]);
+        assert!(src.contains(&format!(
+            "{}::{}",
+            alt_shape.enum_path, alt_shape.fieldless_variant
+        )));
+        assert!(src.contains(&format!(
+            "{}::{}(unsafe {{ ::pyre_interpreter::error::wtf8buf_from_residual_str(__a0) }})",
+            alt_shape.enum_path, alt_shape.payload_variant
+        )));
     }
 }

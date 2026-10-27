@@ -878,6 +878,12 @@ pub(crate) fn getslice_marker_segments_with_fallback(
     fallback: Option<(ValueType, Option<String>)>,
 ) -> Vec<String> {
     let mut segments = vec![leaf.to_string()];
+    // `rstr.py` `ll_stringslice_*` takes `STR`. The window dest of
+    // `slice::index` is `&[u8]`, whose result-ty fallback is the list
+    // item kind `int`; that suffix would mint `ll_listslice_*`.
+    if slice_is_str(graph, slice) {
+        return segments;
+    }
     if let Some(suffix) = slice_marker_suffix(graph, slice).or_else(|| {
         fallback.and_then(|(item_ty, array_type_id)| {
             crate::codewriter::getslice::listslice_marker_suffix(&item_ty, array_type_id.as_deref())
@@ -994,6 +1000,36 @@ pub(crate) fn identity_from_array_type_id(id: &str) -> Option<(ValueType, Option
         _ => return None,
     };
     Some((item_ty, Some(id.to_string())))
+}
+
+/// `true` when `slice` is rstr `STR` (`ValueType::Str` / `STRPTR`).
+fn slice_is_str(graph: &FunctionGraph, slice: &Variable) -> bool {
+    if slice.concretetype().as_ref()
+        == Some(&*crate::translator::rtyper::lltypesystem::rstr::STRPTR)
+    {
+        return true;
+    }
+    let classes = crate::codewriter::getslice::LinkClasses::of(graph);
+    let same = |v: &Variable| classes.same(v, slice);
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        if !op.result.as_ref().is_some_and(&same) {
+            continue;
+        }
+        match &op.kind {
+            OpKind::Input {
+                ty: ValueType::Str, ..
+            }
+            | OpKind::Call {
+                result_ty: ValueType::Str,
+                ..
+            }
+            | OpKind::FieldRead {
+                ty: ValueType::Str, ..
+            } => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `true` when `slice` lives in the integer register bank — a Vec header
@@ -2149,6 +2185,7 @@ mod tests {
                     nolength: false,
                     gckind: crate::model::ArrayGcKind::Gc,
                     pure: false,
+                    taken_by_address: false,
                 },
                 true,
             )

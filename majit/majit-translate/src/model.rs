@@ -1380,6 +1380,12 @@ pub enum OpKind {
         /// (`rewrite_op_getarrayitem`: `pure = ''` when
         /// `ARRAY._gckind != 'gc'`).
         pure: bool,
+        /// Address of an inline item, not the item's value. Same flag
+        /// FieldRead records on [`FieldDescriptor::taken_by_address`]:
+        /// `&base[i]` of a by-value multi-word item (String / Vec header
+        /// / inline struct) is `getarraysubstruct`, which RPython lowers
+        /// through `rewrite_op_direct_ptradd`.
+        taken_by_address: bool,
     },
     /// `arraylen_gc(array, arraydescr)` — read a GcArray's length
     /// header (`len(l.items)`, rlist.py:251).  Carries only the array
@@ -7657,6 +7663,25 @@ pub(crate) fn prune_dead_boxing_remnants(graph: &mut FunctionGraph) -> usize {
     removed
 }
 
+/// `object_array_unsize_newlist` stamps `Ptr(GcArray(GCREF))` on a
+/// high-level `newlist` so `rewrite_fixed_newlist` (`do_fixed_newlist`)
+/// can expand it. `newlist` is `CanRemove`; an erased `pin_roots` leaves
+/// that list unread, and dropping it here removes the ARRAY the expansion
+/// plants.
+fn newlist_holds_fixed_gcarray(op: &SpaceOperation) -> bool {
+    if !matches!(&op.kind, OpKind::NewList { .. }) {
+        return false;
+    }
+    let Some(ct) = op.result.as_ref().and_then(|v| v.concretetype()) else {
+        return false;
+    };
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    matches!(
+        ct,
+        LowLevelType::Ptr(p) if matches!(&p.TO, PtrTarget::Array(a) if a._gckind == GcKind::Gc)
+    )
+}
+
 /// Remove dead operations and input arguments using the backward dataflow from
 /// `simplify.transform_dead_op_vars_in_blocks`.
 ///
@@ -7876,7 +7901,9 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             // `simplify.py:441-445`:
             //   if not canremove(op, block):    read_vars.update(args)
             //   else:                           dependencies[result] += args
-            let removable = can_remove_op(&op.kind) && Some(i) != raising_op_idx;
+            let removable = can_remove_op(&op.kind)
+                && Some(i) != raising_op_idx
+                && !newlist_holds_fixed_gcarray(op);
             if let Some(result_var) = op.result.clone()
                 && removable
             {
@@ -8004,7 +8031,11 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 Some(r) => !read_vars.contains(r),
                 None => false,
             };
-            if dead && can_remove_op(&op.kind) && Some(i) != raising_op_idx {
+            if dead
+                && can_remove_op(&op.kind)
+                && Some(i) != raising_op_idx
+                && !newlist_holds_fixed_gcarray(op)
+            {
                 dead_op_positions.push((block.id, i));
             }
         }
@@ -22659,10 +22690,10 @@ mod tests {
         );
     }
 
-    /// Disagreeing Variables mint a phi (`framestate.py` `Variable()`)
-    /// whose `concretetype` is the shared bindingrepr.
+    /// `framestate.py union` mints Variable() before annotation/rtyping,
+    /// even when both predecessors already have a concrete representation.
     #[test]
-    fn union_phi_carries_signed_concretetype_when_both_sides_are_signed() {
+    fn union_phi_is_untyped_before_rtyping() {
         let mut graph = FunctionGraph::new("union_ct");
         let v_a = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let v_b = graph.alloc_value_var_with_type(ConcreteType::Signed);
@@ -22682,8 +22713,8 @@ mod tests {
         assert_ne!(phi.id(), v_b.id());
         assert_eq!(
             FunctionGraph::concretetype_of(phi),
-            ConcreteType::Signed,
-            "merge phi carries Signed when both predecessors do"
+            ConcreteType::Unknown,
+            "flowspace generalization does not infer the phi's representation"
         );
     }
 

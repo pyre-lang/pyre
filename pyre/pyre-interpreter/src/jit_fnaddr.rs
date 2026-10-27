@@ -7892,36 +7892,18 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(0));
     }
 
-    /// `#[getfunctionptr]` publishes the word-ABI trampoline, not the raw
-    /// `&[PyObjectRef]` / `Result` item (`get_jitcode_calldescr` /
-    /// `getfunctionptr`).
+    /// `baseobjspace.py call_function` has no JIT hint; look-inside is an
+    /// `inline_call`, not a residual address.
     #[test]
-    fn jit_trace_fnaddrs_publishes_getfunctionptr_call_residuals() {
+    fn jit_trace_fnaddrs_does_not_publish_look_inside_call_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let get_and_call: extern "C" fn(i64, i64, i64, i64) -> i64 =
-            crate::baseobjspace::__majit_call_target_get_and_call_function;
-        let get_and_call = get_and_call as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::baseobjspace::get_and_call_function"],
-            get_and_call
+        assert!(
+            !bindings.contains_key("pyre_interpreter::baseobjspace::get_and_call_function"),
+            "look-inside graph is an inline_call, not a residual address"
         );
-        let raw_get = crate::baseobjspace::get_and_call_function as *const () as usize as i64;
-        assert_ne!(
-            get_and_call, raw_get,
-            "must not publish the raw slice/Result item"
-        );
-
-        let call_impl: extern "C" fn(i64, i64) -> i64 =
-            crate::call::__majit_call_target_call_function_impl_result;
-        let call_impl = call_impl as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::call::call_function_impl_result"],
-            call_impl
-        );
-        let raw_call = crate::call::call_function_impl_result as *const () as usize as i64;
-        assert_ne!(
-            call_impl, raw_call,
-            "must not publish the raw slice/Result item"
+        assert!(
+            !bindings.contains_key("pyre_interpreter::call::call_function_impl_result"),
+            "look-inside graph is an inline_call, not a residual address"
         );
     }
 

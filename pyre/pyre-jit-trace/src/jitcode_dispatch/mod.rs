@@ -11896,12 +11896,7 @@ unsafe fn lookup_instance_dunder_call(
     if version_tag == 0 {
         return None;
     }
-    let method = unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            w_class,
-            "__call__",
-        )
-    }?;
+    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__call__") }?;
     Some((method, w_class, version_tag))
 }
 

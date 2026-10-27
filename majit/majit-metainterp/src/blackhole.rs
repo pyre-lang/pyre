@@ -10988,6 +10988,19 @@ impl IrfLists {
         self.pop_roots();
         (&self.ai, &self.ar, &self.af)
     }
+
+    /// `framework.py` `push_roots` only around a collecting call.
+    #[inline]
+    fn banks_for_call(
+        &mut self,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
+    ) -> (&BhArgList, &BhArgList, &BhArgList) {
+        self.pop_roots();
+        if !calldescr.extra_info.check_can_collect() {
+            self._roots.release();
+        }
+        (&self.ai, &self.ar, &self.af)
+    }
 }
 
 struct IrLists {
@@ -11010,6 +11023,19 @@ impl IrLists {
         self.pop_roots();
         (&self.ai, &self.ar)
     }
+
+    /// `framework.py` `push_roots` only around a collecting call.
+    #[inline]
+    fn banks_for_call(
+        &mut self,
+        calldescr: &majit_jitcode::jitcode::BhCallDescr,
+    ) -> (&BhArgList, &BhArgList) {
+        self.pop_roots();
+        if !calldescr.extra_info.check_can_collect() {
+            self._roots.release();
+        }
+        (&self.ai, &self.ar)
+    }
 }
 
 struct RList {
@@ -11028,6 +11054,16 @@ impl RList {
     #[inline]
     fn bank(&mut self) -> &BhArgList {
         self.pop_roots();
+        &self.ar
+    }
+
+    /// `framework.py` `push_roots` only around a collecting call.
+    #[inline]
+    fn bank_for_call(&mut self, calldescr: &majit_jitcode::jitcode::BhCallDescr) -> &BhArgList {
+        self.pop_roots();
+        if !calldescr.extra_info.check_can_collect() {
+            self._roots.release();
+        }
         &self.ar
     }
 }
@@ -11265,7 +11301,7 @@ fn handler_residual_call_irf_i(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let (ai, ar, af) = lists.banks();
+    let (ai, ar, af) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_irf_i.
     bh.last_exc().set(0);
@@ -11284,7 +11320,7 @@ fn handler_residual_call_irf_r(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let (ai, ar, af) = lists.banks();
+    let (ai, ar, af) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_irf_r.
     bh.last_exc().set(0);
@@ -11303,7 +11339,7 @@ fn handler_residual_call_irf_f(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let (ai, ar, af) = lists.banks();
+    let (ai, ar, af) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_irf_f.
     bh.last_exc().set(0);
@@ -11321,7 +11357,7 @@ fn handler_residual_call_irf_v(
     let mut lists = read_irf(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
-    let (ai, ar, af) = lists.banks();
+    let (ai, ar, af) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py routes through bhimpl_residual_call_irf_v
     // which forwards to cpu.bh_call_v.
@@ -11341,7 +11377,7 @@ fn handler_residual_call_ir_i(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let (ai, ar) = lists.banks();
+    let (ai, ar) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_ir_i.
     bh.last_exc().set(0);
@@ -11360,7 +11396,7 @@ fn handler_residual_call_ir_r(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let (ai, ar) = lists.banks();
+    let (ai, ar) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_ir_r.
     bh.last_exc().set(0);
@@ -11378,7 +11414,7 @@ fn handler_residual_call_ir_v(
     let mut lists = read_ir(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
-    let (ai, ar) = lists.banks();
+    let (ai, ar) = lists.banks_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_ir_v.
     bh.last_exc().set(0);
@@ -11397,7 +11433,7 @@ fn handler_residual_call_r_i(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let ar = lists.bank();
+    let ar = lists.bank_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_r_i.
     bh.last_exc().set(0);
@@ -11416,7 +11452,7 @@ fn handler_residual_call_r_r(
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
     let dst = code[p] as usize;
-    let ar = lists.bank();
+    let ar = lists.bank_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_r_r.
     bh.last_exc().set(0);
@@ -11434,7 +11470,7 @@ fn handler_residual_call_r_v(
     let mut lists = read_r(bh, code, position + 1);
     let (calldescr_handle, p) = read_calldescr(bh, code, lists.pos);
     let calldescr = calldescr_handle.get();
-    let ar = lists.bank();
+    let ar = lists.bank_for_call(calldescr);
     bh_null_arg_report(bh, ar, position);
     // blackhole.py → bhimpl_residual_call_r_v.
     bh.last_exc().set(0);

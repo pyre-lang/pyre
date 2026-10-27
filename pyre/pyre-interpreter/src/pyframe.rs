@@ -6553,7 +6553,10 @@ impl PyFrame {
         live.push(w_globals);
         live.push(closure);
         live.extend_from_slice(args);
-        let root_base = _roots.pin_roots(&live);
+        // Free-function `pin_roots`: `_roots.pin_roots(&live)` casts the
+        // Vec to RootScope (`__cast_instance_intrinsic`) and skips the
+        // looked-inside `funccall_valuestack` graph.
+        let root_base = pyre_object::gc_roots::pin_roots(&live);
         let w_builtin = crate::baseobjspace::frame_builtin_obj_checked(
             _roots.get(root_base + 1),
             execution_context,
@@ -6596,7 +6599,7 @@ impl PyFrame {
         live.push(w_globals);
         live.push(closure);
         live.extend_from_slice(args);
-        let root_base = _roots.pin_roots(&live);
+        let root_base = pyre_object::gc_roots::pin_roots(&live);
         let w_builtin =
             crate::baseobjspace::frame_builtin_obj(_roots.get(root_base + 1), execution_context);
         // Reload the argument tail of `live` from the forwarded slots; the
@@ -6642,10 +6645,18 @@ impl PyFrame {
         // and `args` would still be off the root stack while the scalars ran
         // theirs.
         //
-        // Through the bracket's own cell rather than the free functions, which
-        // re-resolve the thread local on every call.
-        let root_base = _roots.publish(&[code as PyObjectRef, w_globals, closure, w_builtin]);
-        let args_base = _roots.publish(args);
+        // Free-function publish: `_roots.publish(&[...])` / `_roots.publish(args)`
+        // lower the slice as a List and the annotator casts it to RootScope,
+        // which skips the looked-inside `funccall_valuestack` graph. Both
+        // slices still go out before the one `normalize` so no value is
+        // invisible when the first query safepoint runs.
+        let root_base = pyre_object::gc_roots::publish_roots(&[
+            code as PyObjectRef,
+            w_globals,
+            closure,
+            w_builtin,
+        ]);
+        let args_base = pyre_object::gc_roots::publish_roots(args);
         _roots.normalize(root_base, 4 + args.len());
         // pyframe.py `__init__`: the sizes are the PyCode's own
         // `co_nlocals` / `co_cellvars` / `co_freevars` / `co_stacksize`.
@@ -6669,8 +6680,8 @@ impl PyFrame {
         // slot is the only thing that keeps it off the next sweep. It joins the
         // bracket the call inputs already opened: its lifetime is the rest of
         // this function body, so it needs no owner of its own.
-        let locals_idx = _roots.publish(&[locals_cells_stack_w as PyObjectRef]);
-        _roots.normalize(locals_idx, 1);
+        let locals_idx = pyre_object::gc_roots::shadow_stack_len();
+        let _ = _roots.pin_root(locals_cells_stack_w as PyObjectRef);
 
         {
             // Bind positional arguments directly -- no intermediate Vec.

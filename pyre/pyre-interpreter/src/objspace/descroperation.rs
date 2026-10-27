@@ -4323,7 +4323,6 @@ pub fn init_interned_binop_names() {
     set_shortcut_binop(&FLOAT_TYPE, &FLOAT_BINOP_SHORTCUTS as *const _ as *mut ());
 }
 
-
 /// Unary special-method name, carried as a word for the same reason as
 /// [`BinopDunder`].
 #[derive(Clone, Copy)]
@@ -4607,11 +4606,7 @@ unsafe fn numeric_base_type_of_overriding_subclass(
 /// subclass routes through dispatch: a non-overriding subclass keeps the
 /// Rust fast path, which both matches the builtin result and avoids
 /// re-entering the inherited slot (it would recurse back into this op).
-unsafe fn numeric_operand_overrides(
-    obj: PyObjectRef,
-    dunder: &str,
-    rdunder: &str,
-) -> bool {
+unsafe fn numeric_operand_overrides(obj: PyObjectRef, dunder: &str, rdunder: &str) -> bool {
     let Some(t) = numeric_base_type_of_overriding_subclass(obj) else {
         return false;
     };
@@ -4889,89 +4884,14 @@ pub(crate) unsafe fn obj_has_binop_shortcut(obj: PyObjectRef) -> bool {
 #[allow(non_upper_case_globals)]
 pub const _elidable_function_obj_has_binop_shortcut: bool = true;
 
-/// `typedef.py use_special_method_shortcut` — one function pointer
-/// per binop, the `W_Root.shortcut___mod__` class attribute after
-/// `getattr(self, shortcut_name)`.
-type BinopShortcutFn = unsafe fn(PyObjectRef, PyObjectRef) -> PyResult;
+/// `typedef.py use_special_method_shortcut` — a non-null token stored
+/// on the builtin type. `try_binop_shortcut` still does `space.lookup`;
+/// the pointer is only tested for null (`obj_has_binop_shortcut`).
+struct BinopShortcutVtable;
 
-struct BinopShortcutVtable {
-    add: Option<BinopShortcutFn>,
-    sub: Option<BinopShortcutFn>,
-    mul: Option<BinopShortcutFn>,
-    floordiv: Option<BinopShortcutFn>,
-    mod_: Option<BinopShortcutFn>,
-    lshift: Option<BinopShortcutFn>,
-    rshift: Option<BinopShortcutFn>,
-    and: Option<BinopShortcutFn>,
-    or: Option<BinopShortcutFn>,
-    xor: Option<BinopShortcutFn>,
-}
-
-unsafe fn bool_and_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bool_descr_and(a, b))
-}
-unsafe fn bool_or_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bool_descr_or(a, b))
-}
-unsafe fn bool_xor_shortcut(a: PyObjectRef, b: PyObjectRef) -> PyResult {
-    Ok(bool_descr_xor(a, b))
-}
-
-static INT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
-    add: Some(int_add),
-    sub: Some(int_sub),
-    mul: Some(int_mul),
-    floordiv: Some(int_floordiv),
-    mod_: Some(int_mod),
-    lshift: Some(int_lshift),
-    rshift: Some(int_rshift),
-    and: Some(int_bitand),
-    or: Some(int_bitor),
-    xor: Some(int_bitxor),
-};
-
-static BOOL_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
-    add: Some(int_add),
-    sub: Some(int_sub),
-    mul: Some(int_mul),
-    floordiv: Some(int_floordiv),
-    mod_: Some(int_mod),
-    lshift: Some(int_lshift),
-    rshift: Some(int_rshift),
-    and: Some(bool_and_shortcut),
-    or: Some(bool_or_shortcut),
-    xor: Some(bool_xor_shortcut),
-};
-
-static FLOAT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable {
-    add: Some(float_add),
-    sub: Some(float_sub),
-    mul: Some(float_mul),
-    floordiv: Some(float_floordiv),
-    mod_: Some(float_mod),
-    lshift: None,
-    rshift: None,
-    and: None,
-    or: None,
-    xor: None,
-};
-
-#[inline(always)]
-fn binop_shortcut_fn(vtable: &BinopShortcutVtable, op: BinopDunder) -> Option<BinopShortcutFn> {
-    match op {
-        BinopDunder::Add => vtable.add,
-        BinopDunder::Sub => vtable.sub,
-        BinopDunder::Mul => vtable.mul,
-        BinopDunder::FloorDiv => vtable.floordiv,
-        BinopDunder::Mod => vtable.mod_,
-        BinopDunder::LShift => vtable.lshift,
-        BinopDunder::RShift => vtable.rshift,
-        BinopDunder::And => vtable.and,
-        BinopDunder::Or => vtable.or,
-        BinopDunder::Xor => vtable.xor,
-        BinopDunder::TrueDiv | BinopDunder::Pow | BinopDunder::DivMod | BinopDunder::MatMul => None,
-    }
-}
+static INT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable;
+static BOOL_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable;
+static FLOAT_BINOP_SHORTCUTS: BinopShortcutVtable = BinopShortcutVtable;
 
 /// `descroperation.py shortcut_binop`: `space.lookup` + `get_and_call_function`.
 ///
@@ -5011,8 +4931,13 @@ pub(crate) fn try_binop_shortcut(
 /// Signature is `(w_obj1, w_obj2, op)` — three words.  Upstream's
 /// generated `binop_mod_impl(space, w_obj1, w_obj2)` closes over the
 /// TypeError symbol; a `&str` argument is two words and shifts `op`.
-pub(crate) fn binop_with_shortcut(a: PyObjectRef, b: PyObjectRef, op: BinopDunder) -> PyResult {
-    if let Some(w_res) = try_binop_shortcut(a, b, op)? {
+pub(crate) fn binop_with_shortcut(
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
+    op: BinopDunder,
+) -> PyResult {
+    // The shortcut can allocate (`lookup` + `get_and_call_function`).
+    if let Some(w_res) = pyre_object::with_roots!(a, b => try_binop_shortcut(a, b, op))? {
         return Ok(w_res);
     }
     let symbol = op.symbol();
@@ -5082,8 +5007,8 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         }
         if is_str(a) {
             let str_type = crate::typedef::gettypefor(&pyre_object::STR_TYPE);
-            let uses_builtin_add =
-                str_type.is_some_and(|str_type| !dunder_overridden(a, "__add__", str_type.as_ptr()));
+            let uses_builtin_add = str_type
+                .is_some_and(|str_type| !dunder_overridden(a, "__add__", str_type.as_ptr()));
             if uses_builtin_add {
                 if let Some(result) = pyre_object::with_roots!(a, b => try_reflected_binary_special(a, b, "__radd__"))?
                 {
@@ -5115,8 +5040,8 @@ pub(crate) fn add_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
             // wording either way: its `slot_nb_add` stands in for the base's
             // `sq_concat`, so nothing reaches this refusal.
             let list_type = crate::typedef::gettypefor(&pyre_object::LIST_TYPE);
-            let uses_builtin_add =
-                list_type.is_some_and(|list_type| !dunder_overridden(a, "__add__", list_type.as_ptr()));
+            let uses_builtin_add = list_type
+                .is_some_and(|list_type| !dunder_overridden(a, "__add__", list_type.as_ptr()));
             if uses_builtin_add {
                 if let Some(result) = pyre_object::with_roots!(a, b => try_reflected_binary_special(a, b, "__radd__"))?
                 {
@@ -5341,17 +5266,11 @@ pub(crate) fn mul_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
         let operands = pyre_object::gc_roots::pin_roots(&[a, b]);
         let dispatched = match (a_seq, b_seq) {
             (true, true) => None,
-            (true, false) => match lookup_type_special(
-                b,
-                "__rmul__",
-            ) {
+            (true, false) => match lookup_type_special(b, "__rmul__") {
                 Some(method) => try_call_special(method, &[b, a])?,
                 None => None,
             },
-            (false, true) => match lookup_type_special(
-                a,
-                "__mul__",
-            ) {
+            (false, true) => match lookup_type_special(a, "__mul__") {
                 Some(method) => try_call_special(method, &[a, b])?,
                 None => None,
             },
@@ -5921,10 +5840,7 @@ pub(crate) fn xor_builtin(a: PyObjectRef, b: PyObjectRef) -> PyResult {
 // reflected operand.
 
 /// `space.lookup(w_obj, dunder)` — descroperation.py.
-pub(crate) unsafe fn lookup_type_special(
-    obj: PyObjectRef,
-    dunder: &str,
-) -> Option<PyObjectRef> {
+pub(crate) unsafe fn lookup_type_special(obj: PyObjectRef, dunder: &str) -> Option<PyObjectRef> {
     crate::typedef::r#type(obj).and_then(|tp| lookup_in_type(tp.as_ptr(), dunder))
 }
 
@@ -6139,18 +6055,13 @@ fn try_dispatch_ternary_pow_special(
         let _roots = pyre_object::gc_roots::push_roots();
         let operands = pyre_object::gc_roots::pin_roots(&[*base, *exp, *modulus]);
         let operand = |i: usize| pyre_object::gc_roots::shadow_stack_get(operands + i);
-        let (w_base_src, w_base_impl) = match lookup_where_with_method_cache(
-            w_base_type.as_ptr(),
-            "__pow__",
-        ) {
-            Some((src, imp)) => (Some(src), Some(imp)),
-            None => (None, None),
-        };
+        let (w_base_src, w_base_impl) =
+            match lookup_where_with_method_cache(w_base_type.as_ptr(), "__pow__") {
+                Some((src, imp)) => (Some(src), Some(imp)),
+                None => (None, None),
+            };
         let (w_exp_src, w_exp_impl) = if w_base_type != w_exp_type {
-            match lookup_where_with_method_cache(
-                w_exp_type.as_ptr(),
-                "__rpow__",
-            ) {
+            match lookup_where_with_method_cache(w_exp_type.as_ptr(), "__rpow__") {
                 Some((src, imp)) => (Some(src), Some(imp)),
                 None => (None, None),
             }
@@ -6241,12 +6152,7 @@ pub(crate) fn try_inplace_special(
         return Ok(None);
     }
     // descroperation.py:826 — only when the lhs in-place method exists.
-    if let Some(method) = unsafe {
-        lookup_type_special(
-            lhs,
-            idunder,
-        )
-    } {
+    if let Some(method) = unsafe { lookup_type_special(lhs, idunder) } {
         // descroperation.py:831 seq_bug_compat — for `+=` / `*=` where the
         // lhs is a builtin sequence and the rhs is not, try the rhs
         // reflected method before the lhs in-place method.
@@ -6257,12 +6163,7 @@ pub(crate) fn try_inplace_special(
             && crate::baseobjspace::flag_sequence_bug_compat(lhs_type.as_ptr())
             && !crate::baseobjspace::flag_sequence_bug_compat(rhs_type.as_ptr())
         {
-            unsafe {
-                lookup_type_special(
-                    rhs,
-                    rd,
-                )
-            }
+            unsafe { lookup_type_special(rhs, rd) }
         } else {
             None
         };

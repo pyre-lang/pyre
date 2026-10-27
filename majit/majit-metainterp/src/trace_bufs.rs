@@ -823,6 +823,7 @@ fn host_fixed_list_alloc(payload: usize) -> *mut u8 {
 pub struct ListRootGuard {
     slot: majit_gc::shadow_stack::ShadowStackSlot,
     depth: usize,
+    released: bool,
 }
 
 impl ListRootGuard {
@@ -835,7 +836,11 @@ impl ListRootGuard {
             // skips a null content the same way `if content:` does.
             slot.push(g);
         }
-        Self { slot, depth }
+        Self {
+            slot,
+            depth,
+            released: false,
+        }
     }
 
     /// `framework.py` `pop_roots` / `shadowstack.py` `gc_pop_roots`: the
@@ -844,12 +849,27 @@ impl ListRootGuard {
     pub fn get(&self, i: usize) -> GcRef {
         self.slot.get(self.depth + i)
     }
+
+    /// Pop the list slots now. `framework.py` `push_roots` only covers a
+    /// collecting call; a residual that cannot collect must not leave
+    /// these slots on the same shadow stack as a truncate helper
+    /// (`try_pop_to` / `FrameAnchor` Drop / `root_scope_close`).
+    #[inline]
+    pub fn release(&mut self) {
+        if self.released {
+            return;
+        }
+        self.slot.pop_to(self.depth);
+        self.released = true;
+    }
 }
 
 impl Drop for ListRootGuard {
     #[inline]
     fn drop(&mut self) {
-        self.slot.pop_to(self.depth);
+        if !self.released {
+            self.slot.pop_to(self.depth);
+        }
     }
 }
 

@@ -2071,6 +2071,45 @@ pub(in crate::front::mir) fn lower_object_fn(name_path: &str) -> crate::model::F
     })
 }
 
+/// `history.py getkind` of the raw Ptr returned by the guard constructor
+/// must agree with its FUNC.RESULT on the returnblock's SSI input.
+#[test]
+fn raw_guard_constructor_return_uses_the_declared_int_kind() {
+    let graph = lower_object_fn("pyre_object::dictmultiobject::<Impl>::new1");
+    let returnvar = &graph.block(graph.returnblock).inputargs[0];
+    assert_eq!(
+        FunctionGraph::concretetype_of(returnvar),
+        crate::model::ConcreteType::Signed
+    );
+    assert!(
+        !graph.blocks.iter().flat_map(|block| &block.operations).any(
+            |op| matches!(&op.kind, OpKind::FieldRead { field, .. }
+                if field.name == "save_point"
+                    && field.owner_root.as_deref().is_some_and(|root| root.ends_with("RootScope")))
+        ),
+        "the transparent RootScope value is already its usize word: {}",
+        graph.dump()
+    );
+    let llbc = Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("object LLBC");
+    let program = super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        &[llbc],
+        crate::HostStaticAddrs::default(),
+        &["gc_roots"],
+        &["push_roots"],
+    )
+    .expect("root bracket metadata");
+    let push_roots = program
+        .functions
+        .iter()
+        .find(|f| f.name == "push_roots")
+        .expect("push_roots");
+    assert_eq!(
+        push_roots.return_type.as_deref(),
+        Some("u64"),
+        "save_point is usize"
+    );
+}
+
 pub(in crate::front::mir) fn calls_leaf(graph: &crate::model::FunctionGraph, leaf: &str) -> bool {
     use crate::model::{CallTarget, OpKind};
     graph
@@ -4511,6 +4550,138 @@ fn heap_string_as_ref_bytes_into_window_param_keeps_call() {
         "heap String::as_ref is not get_raw_address_of_string; leafs={leafs:?} graph={}",
         graph.dump()
     );
+}
+
+/// heap `String::as_ref` into a `&str` tuple field keeps the residual
+/// call: rust-heap `String` and `&str` do not share a repr class. The
+/// FieldWrite value kind equals the field kind.
+#[test]
+fn heap_string_as_ref_into_str_tuple_field_keeps_call() {
+    use crate::codewriter::type_state::valuetype_to_concrete;
+    use crate::model::{FunctionGraph, LinkArg, OpKind, ValueType};
+
+    let string_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let string_ref = serde_json::json!({"Ref": ["Erased", string_adt.clone(), "Shared"]});
+    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let tuple = tuple_ty(vec![str_ty.clone(), bool_ty.clone()]);
+    let string_td = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["alloc", "string", "String"], true),
+        "kind": {"Struct": [
+            {"name": "ptr", "ty": window_usize(), "attr_info": null},
+            {"name": "len", "ty": window_usize(), "attr_info": null},
+            {"name": "cap", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let (unwind, _) = window_unwind_and_return_blocks();
+    let as_ref = window_opaque_fun(
+        1,
+        &["alloc", "string", "<Impl>", "as_ref"],
+        vec![string_ref.clone()],
+        str_ty.clone(),
+    );
+    let s_place = window_place(serde_json::json!({"Local": 1}), &string_adt);
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "string_as_ref_tuple_field"], true),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [string_adt.clone(), bool_ty.clone()],
+            "output": tuple.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &tuple),
+                window_local(1, &string_adt),
+                window_local(2, &bool_ty),
+                window_local(3, &string_ref),
+                window_local(4, &str_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &string_ref),
+                            {"Ref": {"place": s_place, "kind": "Shared", "ptr_metadata": null}}
+                        ]}
+                    }],
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &string_ref)}],
+                        "dest": window_place(serde_json::json!({"Local": 4}), &str_ty)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &tuple),
+                            {"Aggregate": [
+                                "Tuple",
+                                [
+                                    {"Move": window_place(serde_json::json!({"Local": 4}), &str_ty)},
+                                    {"Copy": window_place(serde_json::json!({"Local": 2}), &bool_ty)}
+                                ]
+                            ]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![string_td], vec![caller, as_ref]);
+    let graph = super::lower_function(&llbc, "string_as_ref_tuple_field")
+        .expect("lower String::as_ref into &str tuple field");
+    let leafs = window_call_leafs(&graph);
+    assert!(
+        leafs.iter().any(|leaf| leaf == "as_ref"),
+        "heap String::as_ref keeps the residual call; leafs={leafs:?} graph={}",
+        graph.dump()
+    );
+    let writes: Vec<_> = window_graph_ops(&graph)
+        .into_iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                field, ty, value, ..
+            } if field.name == "__pos_0" => Some((ty.clone(), value.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !writes.is_empty(),
+        "tuple ctor writes __pos_0; graph={}",
+        graph.dump()
+    );
+    for (ty, value) in writes {
+        assert!(
+            matches!(ty, ValueType::Str),
+            "__pos_0 field is Str, got {ty:?}; graph={}",
+            graph.dump()
+        );
+        let LinkArg::Value(v) = value else {
+            panic!(
+                "__pos_0 stored value is not a Variable; graph={}",
+                graph.dump()
+            );
+        };
+        assert_eq!(
+            FunctionGraph::concretetype_of(&v),
+            valuetype_to_concrete(&ty),
+            "FieldWrite value kind equals the field kind; ty={ty:?} graph={}",
+            graph.dump()
+        );
+    }
 }
 
 /// Keep-gain: `FmtArg::Bytes(qualname.as_bytes())` writes a window
@@ -7294,6 +7465,28 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
     dest_ty: serde_json::Value,
     type_decls: Vec<serde_json::Value>,
 ) -> Llbc {
+    std_extern_call_fixture_with_types_dest(
+        caller_name,
+        callee_name,
+        arg_tys,
+        dest_ty,
+        type_decls,
+        false,
+    )
+}
+
+fn unsigned_usize_const(text: &str) -> serde_json::Value {
+    serde_json::json!([{"Integer": {"Unsigned": ["Usize", text]}}, usize_ty()])
+}
+
+pub(in crate::front::mir) fn std_extern_call_fixture_with_types_dest(
+    caller_name: &str,
+    callee_name: &[&str],
+    arg_tys: &[serde_json::Value],
+    dest_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    temp_dest: bool,
+) -> Llbc {
     let span = || {
         serde_json::json!({
             "data": {
@@ -7332,11 +7525,16 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
         "const_generics": [],
         "trait_refs": []
     });
+    let ret_ty = if temp_dest {
+        serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
+    } else {
+        dest_ty.clone()
+    };
     let mut locals = vec![serde_json::json!({
         "index": 0,
         "name": null,
         "span": span(),
-        "ty": dest_ty.clone()
+        "ty": ret_ty.clone()
     })];
     for (i, ty) in arg_tys.iter().enumerate() {
         locals.push(serde_json::json!({
@@ -7346,6 +7544,18 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
             "ty": ty
         }));
     }
+    let call_dest = if temp_dest {
+        let idx = locals.len();
+        locals.push(serde_json::json!({
+            "index": idx,
+            "name": null,
+            "span": span(),
+            "ty": dest_ty.clone()
+        }));
+        idx
+    } else {
+        0
+    };
     let call_args: Vec<serde_json::Value> = arg_tys
         .iter()
         .enumerate()
@@ -7361,7 +7571,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
         "signature": {
             "is_unsafe": false,
             "inputs": arg_tys.to_vec(),
-            "output": dest_ty.clone()
+            "output": ret_ty.clone()
         },
         "body": {
             "Unstructured": {
@@ -7386,7 +7596,7 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
                                             }
                                         },
                                         "args": call_args,
-                                        "dest": {"kind": {"Local": 0}, "ty": dest_ty.clone()}
+                                        "dest": {"kind": {"Local": call_dest}, "ty": dest_ty.clone()}
                                     },
                                     "target": 2,
                                     "on_unwind": 1
@@ -7400,7 +7610,18 @@ pub(in crate::front::mir) fn std_extern_call_fixture_with_types(
                         "terminator": {"span": span(), "kind": "UnwindResume"}
                     },
                     {
-                        "statements": [],
+                        "statements": if temp_dest {
+                            serde_json::json!([{
+                                "span": span(),
+                                "kind": {"Assign": [
+                                    {"kind": {"Local": 0}, "ty": ret_ty.clone()},
+                                    {"Use": [{"Const": unsigned_usize_const("0")}, "Yes"]}
+                                ]},
+                                "comments_before": []
+                            }])
+                        } else {
+                            serde_json::json!([])
+                        },
                         "kind": "Regular",
                         "terminator": {"span": span(), "kind": "Return"}
                     }
@@ -8224,8 +8445,8 @@ fn std_trait_call_fixture(
 }
 
 #[test]
-fn trait_as_ref_str_of_string_is_identity() {
-    let string_adt = serde_json::json!({
+fn trait_as_ref_str_of_wtf8_is_identity() {
+    let wtf8_adt = serde_json::json!({
         "Adt": {
             "id": 0,
             "builtin": null,
@@ -8237,31 +8458,30 @@ fn trait_as_ref_str_of_string_is_identity() {
             }
         }
     });
-    let recv = serde_json::json!({"Ref": ["Erased", string_adt, "Shared"]});
+    let recv = serde_json::json!({"Ref": ["Erased", wtf8_adt, "Shared"]});
     let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
-    let string_decl = serde_json::json!({
+    let wtf8_decl = serde_json::json!({
         "def_id": 0,
-        "item_meta": window_meta(&["alloc", "string", "String"], false),
+        "item_meta": window_meta(&["rustpython_wtf8", "Wtf8"], false),
         "kind": {"Struct": [
-            {"name": "ptr", "ty": window_usize(), "attr_info": null},
-            {"name": "len", "ty": window_usize(), "attr_info": null},
-            {"name": "cap", "ty": window_usize(), "attr_info": null}
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
         ]}
     });
     let llbc = std_trait_call_fixture(
-        "string_as_ref_str",
+        "wtf8_as_ref_str",
         &["core", "convert", "AsRef"],
         "as_ref",
         &[recv],
         str_ty,
-        vec![string_decl],
+        vec![wtf8_decl],
     );
-    let graph = crate::test_support::lower_function(&llbc, "string_as_ref_str")
-        .expect("lower <String as AsRef<str>>::as_ref");
+    let graph = crate::test_support::lower_function(&llbc, "wtf8_as_ref_str")
+        .expect("lower <Wtf8 as AsRef<str>>::as_ref");
     let ops = graph_ops(&graph);
     assert!(
         !call_leafs(&ops).iter().any(|leaf| *leaf == "as_ref"),
-        "Trait AsRef::as_ref of a string-family receiver to &str is identity; ops={ops:?} graph={}",
+        "Trait AsRef::as_ref of an rstr STR receiver to &str is identity; ops={ops:?} graph={}",
         graph.dump()
     );
 }
@@ -9439,11 +9659,10 @@ fn return_merge_arm_value_types(graph: &crate::model::FunctionGraph) -> Vec<Valu
                 let LinkArg::Value(v) = arg else {
                     continue;
                 };
-                let def = graph
-                    .blocks
-                    .iter()
-                    .flat_map(|b| b.operations.iter())
-                    .find(|op| op.result.as_ref() == Some(v));
+                // A return may carry an SSI block input rather than the
+                // producing operation's Variable (`framestate.py getoutputargs`).
+                let def = super::resolve_to_producer_op(graph, v)
+                    .and_then(|(block, index)| graph.block(block).operations.get(index));
                 if let Some(ty) = def.and_then(|op| match &op.kind {
                     OpKind::Call { result_ty, .. }
                     | OpKind::BinOp { result_ty, .. }
@@ -9477,8 +9696,9 @@ fn null_or_offset_pointer_return_arms_share_one_value_type() {
         .expect("lower items_block_items_base");
     let ops = graph_ops(&graph);
     assert!(
-        call_leafs(&ops).iter().any(|leaf| *leaf == "null_mut"),
-        "null arm must stay null_mut(); ops={ops:?}"
+        call_leafs(&ops).iter().any(|leaf| *leaf == "null_mut")
+            || ops.iter().any(|op| matches!(op.kind, OpKind::ConstRefNull)),
+        "null arm is a managed nullptr (lltype.py nullptr); ops={ops:?}"
     );
     assert!(
         !ops.iter()
@@ -13643,10 +13863,10 @@ pub(in crate::front::mir) fn llbc_with_types_impls(
     funs: Vec<serde_json::Value>,
     trait_impls: Vec<serde_json::Value>,
 ) -> Llbc {
-    llbc_with_types_traits(crate_name, types, funs, vec![], trait_impls)
+    llbc_with_types_and_traits(crate_name, types, funs, vec![], trait_impls)
 }
 
-fn llbc_with_types_traits(
+pub(in crate::front::mir) fn llbc_with_types_and_traits(
     crate_name: &str,
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
@@ -14022,7 +14242,7 @@ fn option_map_or_llbc(
     gc_type_id: Option<u64>,
 ) -> Llbc {
     match gc_type_id {
-        Some(id) => llbc_with_types_traits(
+        Some(id) => llbc_with_types_and_traits(
             "fixture",
             type_decls,
             funs,
@@ -25320,7 +25540,7 @@ fn pyerror_ptr_ctor_emits_one_cast_instance() {
             }}
         }]
     });
-    let llbc = llbc_with_types_traits(
+    let llbc = llbc_with_types_and_traits(
         "fixture",
         vec![
             interior_struct(0, &["fixture", "PyObject"], &[], 0, &[], false),
@@ -26048,8 +26268,7 @@ fn charpsize2str_cp_input_is_ccharp() {
         crate::test_support::lower_function(llbc, "charpsize2str").expect("lower charpsize2str");
     let mut cp_root = None;
     let mut cp_ty = None;
-    let mut list_ptr = 0usize;
-    let mut copy_bytes = 0usize;
+    let mut copy_raw = Vec::new();
     for op in graph.blocks.iter().flat_map(|block| &block.operations) {
         match &op.kind {
             OpKind::Input {
@@ -26063,16 +26282,10 @@ fn charpsize2str_cp_input_is_ccharp() {
             }
             OpKind::Call {
                 target: CallTarget::FunctionPath { segments, .. },
+                args,
                 ..
-            } => {
-                if segments.last().map(String::as_str)
-                    == Some(crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST)
-                {
-                    list_ptr += 1;
-                }
-                if segments.last().map(String::as_str) == Some("copy_bytes") {
-                    copy_bytes += 1;
-                }
+            } if segments.last().map(String::as_str) == Some("copy_raw_to_string") => {
+                copy_raw.push(args.clone());
             }
             _ => {}
         }
@@ -26089,21 +26302,27 @@ fn charpsize2str_cp_input_is_ccharp() {
         "CCHARP getkind is int; graph={}",
         graph.dump()
     );
-    assert!(
-        list_ptr >= 1,
-        "Vec<u8>::as_mut_ptr is nonmoving_raw_ptr_for_resizable_list; graph={}",
+    assert_eq!(
+        copy_raw.len(),
+        1,
+        "charpsize2str residual-calls copy_raw_to_string; graph={}",
         graph.dump()
     );
-    assert!(
-        copy_bytes >= 1,
-        "charpsize2str still calls copy_bytes; graph={}",
+    let dst_ty = copy_raw[0].get(1).and_then(|arg| match arg {
+        crate::model::LinkArg::Value(v) => Some(crate::model::FunctionGraph::concretetype_of(v)),
+        _ => None,
+    });
+    assert_eq!(
+        dst_ty,
+        Some(crate::model::ConcreteType::GcRef),
+        "copy_raw_to_string dst is the W2 `&mut [u8]` list; graph={}",
         graph.dump()
     );
 }
 
-/// `str2charp` `copy_bytes` dst is CCHARP (`rffi.py` `CCHARP`).
+/// `str2charp` `copy_string_to_raw` dst is CCHARP (`rffi.py` `CCHARP`).
 #[test]
-fn str2charp_copy_bytes_dst_is_ccharp() {
+fn str2charp_copy_string_to_raw_dst_is_ccharp() {
     use crate::model::{CallTarget, ConcreteType, OpKind, getkind};
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -26121,22 +26340,30 @@ fn str2charp_copy_bytes_dst_is_ccharp() {
         else {
             continue;
         };
-        if segments.last().map(String::as_str) != Some("copy_bytes") {
+        if segments.last().map(String::as_str) != Some("copy_string_to_raw") {
             continue;
         }
         found = true;
-        assert_eq!(args.len(), 3, "copy_bytes arity; graph={}", graph.dump());
+        assert_eq!(
+            args.len(),
+            3,
+            "copy_string_to_raw arity; graph={}",
+            graph.dump()
+        );
         for (i, arg) in args.iter().enumerate() {
-            if i == 2 {
+            if i != 1 {
                 continue;
             }
             let var = arg.as_variable().unwrap_or_else(|| {
-                panic!("copy_bytes arg {i} is a pointer; graph={}", graph.dump())
+                panic!(
+                    "copy_string_to_raw arg {i} is a pointer; graph={}",
+                    graph.dump()
+                )
             });
             let ct = var.concretetype();
             assert!(
                 ct.as_ref().is_some_and(super::lltype_is_ccharp),
-                "copy_bytes arg {i} is CCHARP; ct={ct:?} graph={}",
+                "copy_string_to_raw arg {i} is CCHARP; ct={ct:?} graph={}",
                 graph.dump()
             );
             assert_eq!(
@@ -26147,7 +26374,11 @@ fn str2charp_copy_bytes_dst_is_ccharp() {
             );
         }
     }
-    assert!(found, "str2charp calls copy_bytes; graph={}", graph.dump());
+    assert!(
+        found,
+        "str2charp calls copy_string_to_raw; graph={}",
+        graph.dump()
+    );
 }
 
 /// A unit-returning fn's raw `*u8` parameter is still `CCHARP`
@@ -26425,8 +26656,8 @@ fn raw_u8_call_result_is_ccharp() {
 }
 
 /// `f() -> *mut i8`, `.cast::<u8>()`, then `h(p: *mut u8) -> Vec<u8>`:
-/// the `h` actual is CCHARP produced by `rffi.cast` (`cast_ptr_to_int`
-/// then `cast_int_to_ptr`), not a stamp on `f`'s Ref-banked result.
+/// the `h` actual is a fresh typed CCHARP result. The raw source is already
+/// int-kind (`history.py getkind`), so no GC pointer-to-int cast is needed.
 #[test]
 fn raw_i8_cast_to_u8_emits_rffi_cast() {
     let i8_ty = mut_i8_ty_json();
@@ -26491,8 +26722,8 @@ fn raw_i8_cast_to_u8_emits_rffi_cast() {
 }
 
 /// `fn f(p: *mut i8) -> *mut u8 { p.cast::<u8>() }`: the return is
-/// CCHARP produced by `rffi.cast` (`cast_ptr_to_int` then
-/// `cast_int_to_ptr`), not a Ref alias of `p`.
+/// a fresh CCHARP (`rbuiltin.py rtype_cast_int_to_ptr`), preserving the
+/// source Variable's representation even though both JIT kinds are int.
 #[test]
 fn raw_i8_method_cast_to_u8_returns_ccharp() {
     use crate::model::{CallTarget, ConcreteType, LinkArg, OpKind, getkind};
@@ -26600,8 +26831,8 @@ fn raw_i8_method_cast_to_u8_returns_ccharp() {
             _ => false,
         });
     assert!(
-        saw_cast_ptr_to_int,
-        "cast_ptr_to_int in f (p is a Ref *mut i8); graph={}",
+        !saw_cast_ptr_to_int,
+        "raw *mut i8 is already int-kind (history.py getkind); graph={}",
         graph.dump()
     );
 }
@@ -26761,8 +26992,8 @@ fn assert_h_actual_from_rffi_cast_not_f_result(graph: &FunctionGraph) {
             _ => false,
         });
     assert!(
-        saw_cast_ptr_to_int,
-        "cast_ptr_to_int in g (f's Ref result may be a block inputarg); graph={}",
+        !saw_cast_ptr_to_int,
+        "f's raw pointer result is already int-kind (history.py getkind); graph={}",
         graph.dump()
     );
 }
@@ -28068,11 +28299,9 @@ fn opaque_bitflags_empty_global_read_stays_residual() {
 
 /// `Gc` from a majit-gc `GcType` impl, from field 0 of that type
 /// (and that field's own field 0), from a struct whose field 0 is
-/// already `Gc` (`Struct._note_inlined_into`), from a struct that
-/// stores a GC pointer (`adt_def_is_raw_storage` is false), and
-/// `Raw` for a type with no impl, for a struct headed by a raw
-/// field 0, and for an impl of another crate's trait that is also
-/// named `GcType`.
+/// already `Gc` (`Struct._note_inlined_into`), and `Raw` for a type
+/// with no impl, for a struct headed by a raw field 0, and for an
+/// impl of another crate's trait that is also named `GcType`.
 #[test]
 fn declared_gckind_follows_gctype_impl_and_field0_parent() {
     use crate::translator::rtyper::lltypesystem::lltype::GcKind;
@@ -28127,13 +28356,6 @@ fn declared_gckind_follows_gctype_impl_and_field0_parent() {
                 struct_decl(5, &["fixture", "HeadedByImpl"], Some(0)),
                 struct_decl(6, &["fixture", "HeadedByInner"], Some(2)),
                 struct_decl(7, &["fixture", "HeadedByRaw"], Some(3)),
-                {
-                    "def_id": 8,
-                    "item_meta": meta(&["fixture", "RaiseCause"]),
-                    "kind": {"Struct": [
-                        {"name": "w_cause", "ty": {"RawPtr": [adt(0), "Mut"]}}
-                    ]}
-                },
             ],
             "fun_decls": [],
             "global_decls": [],
@@ -28155,10 +28377,205 @@ fn declared_gckind_follows_gctype_impl_and_field0_parent() {
     assert_eq!(kinds.get("HeadedByImpl"), Some(&GcKind::Gc));
     assert_eq!(kinds.get("HeadedByInner"), Some(&GcKind::Gc));
     assert_eq!(kinds.get("HeadedByRaw"), Some(&GcKind::Raw));
-    // Holds a GC pointer and is not on the field-0 chain.
-    // `Struct.__init__` cannot inline a gc container; `Ptr._is_atomic`
-    // is false unless `TO._gckind == 'raw'`.
-    assert_eq!(kinds.get("RaiseCause"), Some(&GcKind::Gc));
+}
+
+/// `Struct._note_inlined_into` inlines a container as field 0. A
+/// `repr(transparent)` scalar newtype (`VersionTag(pub u64)`) is not a
+/// container, so the field-0 harvest must not pull it into `gc_struct_ids`.
+#[test]
+fn harvest_gc_struct_ids_does_not_contain_transparent_scalar_field0() {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    let meta = |segs: &[&str]| {
+        serde_json::json!({
+            "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span.clone(),
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        })
+    };
+    let adt = |id: u64| {
+        serde_json::json!({
+            "Value": [id, {"Adt": {"id": id, "generics": {
+                "regions": [], "types": [], "const_generics": [], "trait_refs": []
+            }}}]
+        })
+    };
+    let u64_ty = serde_json::json!({
+        "Value": [99, {"Scalar": {"Integer": {"Unsigned": "U64"}}}]
+    });
+    let version_tag = serde_json::json!({
+        "def_id": 1,
+        "item_meta": meta(&["fixture", "VersionTag"]),
+        "kind": {"Struct": [{"name": "__pos_0", "ty": u64_ty}]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }]
+    });
+    let outer = serde_json::json!({
+        "def_id": 0,
+        "item_meta": meta(&["fixture", "ModuleDictStrategy"]),
+        "kind": {"Struct": [{"name": "version", "ty": adt(1)}]}
+    });
+    let inner = serde_json::json!({
+        "def_id": 2,
+        "item_meta": meta(&["fixture", "Inner"]),
+        "kind": {"Struct": []}
+    });
+    let parent = serde_json::json!({
+        "def_id": 3,
+        "item_meta": meta(&["fixture", "Parent"]),
+        "kind": {"Struct": [{"name": "head", "ty": adt(2)}]}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [outer, version_tag, inner, parent],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [
+                {"def_id": 0, "item_meta": meta(&["majit_gc", "header", "GcType"])}
+            ],
+            "trait_impls": [
+                {"impl_trait": {"id": 0, "generics": {"types": [adt(0)]}}},
+                {"impl_trait": {"id": 0, "generics": {"types": [adt(3)]}}}
+            ]
+        }
+    });
+    let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+        .expect("fixture Llbc parses");
+    let facts = super::harvest_declared_gc_facts(&llbc);
+    let gc = facts.gc_struct_ids();
+    let sid = |path: &str| {
+        let td = llbc
+            .iter_type_decls()
+            .find(|td| td.item_meta.name_path() == path)
+            .unwrap_or_else(|| panic!("{path} in fixture"));
+        super::struct_id_for_type_decl(td)
+    };
+    assert!(
+        gc.contains(&sid("fixture::ModuleDictStrategy")),
+        "GcType seed stays Gc"
+    );
+    assert!(gc.contains(&sid("fixture::Parent")), "GcType seed stays Gc");
+    assert!(
+        gc.contains(&sid("fixture::Inner")),
+        "empty struct field-0 is a container and stays inlined"
+    );
+    assert!(
+        !gc.contains(&sid("fixture::VersionTag")),
+        "transparent scalar newtype is not an inlined container"
+    );
+}
+
+/// Production harvest: `celldict::VersionTag` is a transparent u64
+/// newtype sitting as field 0 of a `GcType` struct. The field-0 edge
+/// is not recorded, so the wrapper is not in `gc_struct_ids`.
+#[test]
+fn harvest_gc_struct_ids_does_not_contain_version_tag() {
+    let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+    let llbc = Llbc::load(path).expect("load pyre-object LLBC");
+    let facts = super::harvest_declared_gc_facts(&llbc);
+    let gc = facts.gc_struct_ids();
+    let mut tags = Vec::new();
+    for td in llbc.iter_type_decls() {
+        let name = td.item_meta.name_path();
+        if name.rsplit("::").next() != Some("VersionTag") {
+            continue;
+        }
+        let sid = super::struct_id_for_type_decl(td);
+        tags.push(name.to_string());
+        assert!(
+            !gc.contains(&sid),
+            "{name} is a transparent scalar newtype, not an inlined container"
+        );
+    }
+    assert!(!tags.is_empty(), "expected VersionTag in pyre-object LLBC");
+}
+
+/// HEAD recorded any Struct/Enum field 0. The ContainerType gate drops
+/// those edges whose field-0 type is not a container. Print the dropped
+/// `(owner, field0)` pairs over the five production LLBCs.
+#[test]
+fn field0_harvest_drops_non_container_types() {
+    fn head_field0<'a>(
+        llbc: &'a Llbc,
+        td: &'a majit_charon_reader::ullbc::TypeDecl,
+    ) -> Option<&'a majit_charon_reader::ullbc::TypeDecl> {
+        if td.published_struct_copy {
+            return None;
+        }
+        let majit_charon_reader::ullbc::TypeDeclKind::Struct(fields) = &td.kind else {
+            return None;
+        };
+        let field = fields.first()?;
+        let node = super::strip_ty_indirections(super::tyref_node(&field.ty, llbc)?, llbc)?;
+        if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
+            return None;
+        }
+        let inner = llbc.type_by_id(super::adt_node_def_id(node)?)?;
+        if inner.published_struct_copy {
+            return None;
+        }
+        match &inner.kind {
+            majit_charon_reader::ullbc::TypeDeclKind::Struct(_)
+            | majit_charon_reader::ullbc::TypeDeclKind::Enum(_) => Some(inner),
+            _ => None,
+        }
+    }
+    let artefacts = [
+        (
+            "interpreter",
+            crate::runtime_names::artifacts::INTERPRETER_ULLBC,
+        ),
+        ("object", crate::runtime_names::artifacts::OBJECT_ULLBC),
+        ("module", crate::runtime_names::artifacts::MODULE_ULLBC),
+        ("rlib", crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC),
+        ("jit", crate::runtime_names::artifacts::JIT_ULLBC),
+    ];
+    let mut all_dropped = Vec::new();
+    for (label, path) in artefacts {
+        let llbc = Llbc::load(path).unwrap_or_else(|err| panic!("load {path}: {err}"));
+        let mut dropped = Vec::new();
+        for td in llbc.iter_type_decls() {
+            if super::type_decl_is_builtin_adt(td) {
+                continue;
+            }
+            let Some(inner) = head_field0(&llbc, td) else {
+                continue;
+            };
+            if super::struct_field0_type_id(&llbc, td).is_some() {
+                continue;
+            }
+            dropped.push((td.item_meta.name_path(), inner.item_meta.name_path()));
+        }
+        dropped.sort();
+        eprintln!("DROPPED_FIELD0 {label} count={}", dropped.len());
+        for (owner, field0) in &dropped {
+            eprintln!("DROPPED_FIELD0 {label}: {owner} -> {field0}");
+        }
+        all_dropped.extend(
+            dropped
+                .into_iter()
+                .map(|(owner, field0)| (label, owner, field0)),
+        );
+    }
+    assert!(
+        all_dropped
+            .iter()
+            .any(|(_, _, field0)| field0.rsplit("::").next() == Some("VersionTag")),
+        "VersionTag field-0 edge is dropped; dropped={all_dropped:?}"
+    );
 }
 
 /// Layout gckind follows a `GcType` impl, including a generic template
@@ -31502,3 +31919,27 @@ fn ascii_setitem_writes_items_block() {
 
 #[path = "exception_class_use_tests.rs"]
 mod exception_class_use_tests;
+
+/// A positional ctor write keeps the item TyRef kind. Spelling
+/// `tuple_field_value_type("*mut usize")` is `Ref`; overlaying that
+/// made `mapdict::slots` `__pos_0` a `setfield` of Signed into Ref.
+#[test]
+fn positional_ctor_keeps_tyref_int_over_spelling_ref() {
+    use crate::model::ValueType;
+    assert_eq!(
+        super::positional_ctor_field_value_type(
+            "Tuple<*mut usize,*mut *mut ItemsBlock>",
+            "__pos_0",
+            ValueType::Int,
+        ),
+        ValueType::Int
+    );
+    assert_eq!(
+        super::positional_ctor_field_value_type(
+            "Tuple<*mut usize,*mut *mut ItemsBlock>",
+            "__pos_1",
+            ValueType::Int,
+        ),
+        ValueType::Int
+    );
+}

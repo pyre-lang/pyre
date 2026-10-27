@@ -2544,12 +2544,9 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(mut call_descr) = (unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_type.as_ptr(),
-            "__call__",
-        )
-    }) else {
+    let Some(mut call_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
+    else {
         return Ok(None);
     };
     let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, w_type.as_ptr())) }?
@@ -2572,12 +2569,9 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
     };
-    let Some(mut call_descr) = (unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_type.as_ptr(),
-            "__call__",
-        )
-    }) else {
+    let Some(mut call_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__call__") })
+    else {
         return Ok(None);
     };
     let bound = unsafe { pyre_object::with_roots!(call_descr => crate::baseobjspace::get(call_descr, callable, w_type.as_ptr())) }?
@@ -2597,12 +2591,8 @@ fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, 
         return Ok(None);
     };
     let w_type = w_type.as_ptr();
-    let Some(mut call_fn) = (unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_type,
-            "__call__",
-        )
-    }) else {
+    let Some(mut call_fn) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, "__call__") })
+    else {
         return Ok(None);
     };
     // `A.__call__ = A()` makes this edge feed itself, and the callers below
@@ -3106,12 +3096,7 @@ pub(crate) fn resolve_kwargs(
         // back to __new__ (e.g. immutable types, metaclasses).
         // PyPy: typeobject.py descr_call → Arguments._match_signature
         //   resolves against the winning __init__ or __new__.
-        let init_fn = unsafe {
-            crate::baseobjspace::lookup_in_type(
-                callable,
-                "__init__",
-            )
-        };
+        let init_fn = unsafe { crate::baseobjspace::lookup_in_type(callable, "__init__") };
         if let Some(init_fn) = init_fn {
             if unsafe { crate::is_function(init_fn) } {
                 (init_fn, 1usize) // __init__(self, ...) → skip self
@@ -3123,12 +3108,9 @@ pub(crate) fn resolve_kwargs(
                     pyre_object::PY_NULL
                 };
                 let w_winner = calculate_metaclass(callable, bases_arg).unwrap_or(callable);
-                if let Some(new_fn) = unsafe {
-                    crate::baseobjspace::lookup_in_type(
-                        w_winner,
-                        "__new__",
-                    )
-                } {
+                if let Some(new_fn) =
+                    unsafe { crate::baseobjspace::lookup_in_type(w_winner, "__new__") }
+                {
                     let new_fn = unsafe { unwrap_static_new(new_fn) };
                     if unsafe { crate::is_function(new_fn) } {
                         (new_fn, 1usize)
@@ -5310,12 +5292,7 @@ fn type_declares_vectorcall(_w_type: PyObjectRef) -> bool {
 /// `is_builtin_code`'s `is_function` set.  Read the carrier, not the
 /// public class.
 fn type_slot_accepts_keywords(w_type: PyObjectRef, name: &str) -> bool {
-    let Some(func) = (unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_type,
-            name,
-        )
-    }) else {
+    let Some(func) = (unsafe { crate::baseobjspace::lookup_in_type(w_type, name) }) else {
         return false;
     };
     if !unsafe { crate::function::is_function_carrier(func) } {
@@ -5794,12 +5771,9 @@ pub fn type_call_init_after_new(
     if let Some(w_insttype) = type_call_init_type(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         current_type(),
-    ) && let Some(init_fn) = unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_insttype,
-            "__init__",
-        )
-    } {
+    ) && let Some(init_fn) =
+        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+    {
         let mut init_args = Vec::with_capacity(1 + args_len);
         init_args.push(pyre_object::gc_roots::shadow_stack_get(instance_slot));
         extend_current_args(&mut init_args);
@@ -6116,12 +6090,7 @@ fn call_metaclass_with_kwargs(
         Vec::new()
     };
     // Find the metaclass __new__ method
-    let new_fn = unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_metaclass(),
-            "__new__",
-        )
-    };
+    let new_fn = unsafe { crate::baseobjspace::lookup_in_type(w_metaclass(), "__new__") };
 
     let instance = if let Some(new_fn) = new_fn {
         let new_fn = unsafe { unwrap_static_new(new_fn) };
@@ -6210,12 +6179,9 @@ fn call_metaclass_with_kwargs(
     if let Some(w_insttype) = type_call_init_type(
         pyre_object::gc_roots::shadow_stack_get(instance_slot),
         w_metaclass(),
-    ) && let Some(init_fn) = unsafe {
-        crate::baseobjspace::lookup_in_type(
-            w_insttype,
-            "__init__",
-        )
-    } {
+    ) && let Some(init_fn) =
+        unsafe { crate::baseobjspace::lookup_in_type(w_insttype, "__init__") }
+    {
         let is_user_fn = unsafe { crate::is_function(init_fn) }
             && unsafe {
                 !crate::is_builtin_code(crate::getcode(init_fn) as pyre_object::PyObjectRef)

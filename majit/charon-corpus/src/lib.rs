@@ -162,11 +162,7 @@ pub fn bool_then_some(c: bool, x: i64) -> Option<i64> {
 
 #[inline(never)]
 fn option_source(keep: bool, value: i64) -> Option<i64> {
-    if keep {
-        Some(value)
-    } else {
-        None
-    }
+    if keep { Some(value) } else { None }
 }
 
 #[inline(never)]
@@ -511,11 +507,7 @@ pub fn scalar_slot_get(v: &Vec<i64>, i: usize) -> i64 {
 #[inline(never)]
 pub fn char_unwrap_or_join(align: Option<char>) -> i64 {
     let a = align.unwrap_or('>');
-    if a == '^' {
-        1
-    } else {
-        0
-    }
+    if a == '^' { 1 } else { 0 }
 }
 
 /// The shape `bitflags!` expands to: a `repr(transparent)` public flag type

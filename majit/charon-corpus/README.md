@@ -52,7 +52,7 @@ nightly; it only needs the `.llbc` JSON.
 # 1. regenerate the checked-in fixture, in place (run from this directory).
 #    <charon> is ../../../.pyre-build/charon/<platform>/<version>/charon by default —
 #    the location `install-charon.py` writes to.
-<charon> cargo --ullbc --reconstruct-panic-calls --inline-anon-consts --dest-file "$PWD/corpus.ullbc"
+<charon> cargo --ullbc --reconstruct-panic-calls --inline-anon-consts --start-from crate --start-from-if-exists '{impl majit_gc::header::GcType for _}' --dest-file "$PWD/corpus.ullbc"
 
 # (`../../scripts/extract-llbc.py corpus` runs the same extraction through the
 #  fingerprinting driver, but its artefact lands in `target/llbc/corpus.ullbc`,

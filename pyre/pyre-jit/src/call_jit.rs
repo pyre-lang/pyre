@@ -4619,9 +4619,14 @@ fn trace_and_compile_from_bridge_body(
             false,
         ) {
             let pc = resume.resume_pc().unwrap_or(usize::MAX);
-            let compiled = driver
-                .meta_interp()
-                .bridge_was_compiled(green_key, trace_id, fail_index);
+            // `assembler.py patch_jump_for_descr` marks the guard once a
+            // bridge is attached (`Backend::bridge_attached`).
+            let compiled = {
+                use majit_backend::Backend;
+                descr_arc
+                    .as_fail_descr()
+                    .is_some_and(|fd| driver.meta_interp().backend().bridge_attached(fd))
+            };
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bridge-trace] interpret-from-resume key={} trace={} fail={} \
@@ -8414,9 +8419,7 @@ pub extern "C" fn bh_load_method_self_fn(
         return pyre_object::PY_NULL;
     }
     let name = code.names[idx].as_ref();
-    let w_name =
-        unsafe { pyre_interpreter::pycode::w_code_getname_w_or_new(w_code_ptr, idx, name) };
-    pyre_interpreter::eval::compute_load_method_bound(obj, attr, w_name)
+    pyre_interpreter::eval::compute_load_method_bound(obj, attr, name)
 }
 
 #[inline]
@@ -8834,7 +8837,7 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
             let roots = pyre_object::gc_roots::push_roots();
             let base = roots.publish(&[
                 exc,
-                cause.as_ref().map_or(std::ptr::null_mut(), |c| c.w_cause),
+                cause.map_or(std::ptr::null_mut(), |c| c.as_pyobject_ref()),
             ]);
             roots.normalize(base, 2);
             let result = {
@@ -8842,8 +8845,15 @@ pub extern "C" fn bh_normalize_raise_varargs_with_frame(
                 pyre_interpreter::call::call_function_impl_result(exc, &[])
             };
             exc = roots.get(base);
-            if let Some(c) = cause.as_mut() {
-                c.w_cause = roots.get(base + 1);
+            if cause.is_some() {
+                let forwarded = roots.get(base + 1);
+                cause = if forwarded.is_null() {
+                    None
+                } else {
+                    Some(pyre_interpreter::eval::RaiseCauseRef::from_pyobject_ref(
+                        forwarded,
+                    ))
+                };
             }
             match result {
                 Ok(obj) if pyre_object::is_exception(obj) => obj,

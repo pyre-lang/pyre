@@ -3742,6 +3742,29 @@ fn published_struct_field_layout(
     }
 }
 
+/// Canonical `*mut Vec<…>` spelling of a one-word-item Vec header pointer.
+///
+/// `Some` when `ty` is a `Vec` / `VecDeque` / `[T]` (`tyref_rust_vec_layout`)
+/// whose item kind is Int, Ref, or Float. `None` otherwise, including an
+/// item kind the projector does not name — callers then take
+/// [`annotation_struct_field_type`] / [`tyref_to_field_layout_string`].
+pub(in crate::front::mir) fn rust_vec_header_ptr_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<String> {
+    tyref_rust_vec_layout(ty, llbc)?;
+    match tyref_rust_vec_item_kind(ty, llbc) {
+        Some(majit_ir::rvec::VecItemKind::Int) => {
+            let item =
+                tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
+            Some(format!("*mut Vec<{item}>"))
+        }
+        Some(majit_ir::rvec::VecItemKind::Ref) => Some("*mut Vec<GCREF>".to_string()),
+        Some(majit_ir::rvec::VecItemKind::Float) => Some("*mut Vec<f64>".to_string()),
+        None => None,
+    }
+}
+
 /// Type string `Bookkeeper::project_struct_field_type` consumes for a
 /// declared field. A stored `*mut Vec<T>` / `&Vec<T>` of one-word items is a
 /// canonical header-pointer spelling `project_rust_vec` accepts. An integer
@@ -3757,17 +3780,15 @@ fn annotation_struct_field_type(
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> String {
     match tyref_rust_vec_layout(ty, llbc) {
-        Some(RustVecLayout::HeaderPtr) => match tyref_rust_vec_item_kind(ty, llbc) {
-            Some(majit_ir::rvec::VecItemKind::Int) => {
-                let item =
-                    tyref_rust_vec_item_spelling(ty, llbc).unwrap_or_else(|| "usize".to_string());
-                format!("*mut Vec<{item}>")
-            }
-            Some(majit_ir::rvec::VecItemKind::Ref) => "*mut Vec<GCREF>".to_string(),
-            Some(majit_ir::rvec::VecItemKind::Float) => "*mut Vec<f64>".to_string(),
-            None => tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs),
-        },
-        Some(RustVecLayout::ByValue) | None => {
+        Some(RustVecLayout::HeaderPtr) => {
+            rust_vec_header_ptr_spelling(ty, llbc).unwrap_or_else(|| {
+                tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+            })
+        }
+        Some(RustVecLayout::ByValue) => {
+            tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs)
+        }
+        None => {
             let layout =
                 tyref_to_field_layout_string(ty, llbc, gc_struct_ids, raw_alloc_flavor_structs);
             field_row_struct_identity(ty, llbc, &layout).unwrap_or(layout)
@@ -4018,7 +4039,14 @@ fn note_raw_word_owner(
     immutable_fields: &ImmutableFieldsTable,
 ) {
     let mut stack = Vec::new();
-    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
+    if !adt_def_is_raw_storage(
+        td.def_id,
+        llbc,
+        gc_struct_ids,
+        immutable_fields,
+        &mut stack,
+        None,
+    ) {
         return;
     }
     let name = td.item_meta.name_path();
@@ -5197,8 +5225,8 @@ impl DeclaredGcFacts {
     ///
     /// (a) a majit-gc `GcType` impl, (b) field 0 of a `Gc` type, (c) a
     /// type whose field 0 is `Gc`. (b) and (c) run to a fixpoint over
-    /// the field-0 edges. A type absent from this set is `Raw` only
-    /// when [`adt_def_is_raw_storage`] holds (`declared_gckind_by_name`).
+    /// the field-0 edges. A type absent from this set is `Raw`
+    /// ([`declared_gckind`]).
     pub(crate) fn gc_struct_ids(&self) -> std::collections::HashSet<majit_ir::descr::StructId> {
         let mut children: std::collections::HashMap<
             majit_ir::descr::StructId,
@@ -5246,6 +5274,22 @@ pub(crate) fn struct_id_is_declared_gc(
             .is_some_and(|template| gc_struct_ids.contains(&template))
 }
 
+/// Declared `Struct._gckind`: a `GcType` seed (or its field-0 parent) is
+/// `Gc`, every other identity is `Raw`. `history.py getkind` of `Ptr(TO)`
+/// reads `TO._gckind`; the rtyper stamps that from `layout.gckind`.
+pub(crate) fn declared_gckind(
+    sid: majit_ir::descr::StructId,
+    name: &str,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+    if struct_id_is_declared_gc(gc_struct_ids, sid, name) {
+        GcKind::Gc
+    } else {
+        GcKind::Raw
+    }
+}
+
 fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
 }
@@ -5261,12 +5305,16 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
     crate_name == Some("majit_gc") && name == Some("GcType")
 }
 
-/// By-value field 0 of a struct, when that field is itself a struct.
+/// By-value field 0 of a struct, when that field is a container that is
+/// itself a struct.
 ///
 /// `lltype.py` `Struct._first_struct` returns the first field only when
 /// `isinstance(FIRSTTYPE, Struct)` and `self._gckind == FIRSTTYPE._gckind`.
 /// That is the only parent relation (`castable`, `_upcast`). An Enum is
-/// never a parent. A reference or raw pointer is not the inlined parent
+/// never a parent. A `repr(transparent)` newtype whose sole non-ZST field
+/// is a scalar is not a container (`tyref_is_container_type`): the value
+/// paint peels it to its inner word, so it is not a Struct in lltype terms.
+/// A reference or raw pointer is not the inlined parent either
 /// (`Struct.__init__` inlines a container only as the first field). `Ref`
 /// and `RawPtr` stay in place here; only an `Adt` node yields an id.
 fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::StructId> {
@@ -5277,6 +5325,9 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
         return None;
     };
     let field = fields.first()?;
+    if !tyref_is_container_type(&field.ty, llbc) {
+        return None;
+    }
     let node = strip_ty_indirections(tyref_node(&field.ty, llbc)?, llbc)?;
     if node.get("Ref").is_some() || node.get("RawPtr").is_some() {
         return None;
@@ -5322,6 +5373,14 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
         };
         facts.seeds.push(struct_id_for_type_decl(td));
     }
+    // A closure env is a compiler-synthesized aggregate (`src: Closure`).
+    // The source cannot declare `GcType` on it. RPython has no closure;
+    // the nearest shape is `rtuple.py TupleRepr` = `Ptr(GcStruct)`.
+    for td in llbc.iter_type_decls() {
+        if type_decl_is_closure_env(td) {
+            facts.seeds.push(struct_id_for_type_decl(td));
+        }
+    }
     for td in llbc.iter_type_decls() {
         if type_decl_is_builtin_adt(td) {
             continue;
@@ -5336,12 +5395,9 @@ pub(crate) fn harvest_declared_gc_facts(llbc: &Llbc) -> DeclaredGcFacts {
 
 /// Declared `GcKind` of every struct and enum in `llbcs`, keyed by the
 /// crate-stripped type path. `Gc` follows [`DeclaredGcFacts::gc_struct_ids`]
-/// (the field-0 fixpoint) or a type that is not raw storage
-/// ([`adt_def_is_raw_storage`]): a GC pointer field cannot sit in a raw
-/// `Struct` (`lltype.py` `Struct.__init__` "cannot inline %s container";
-/// `Ptr._is_atomic` is only true when `TO._gckind == 'raw'`). Every other
-/// analysed struct or enum is `Raw`.
+/// (the field-0 fixpoint). Every other analysed struct or enum is `Raw`.
 #[cfg(test)]
+
 pub(crate) fn declared_gckind_by_name(
     llbcs: &[Llbc],
 ) -> std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::GcKind> {
@@ -5350,7 +5406,6 @@ pub(crate) fn declared_gckind_by_name(
         facts.absorb(harvest_declared_gc_facts(llbc));
     }
     let gc = facts.gc_struct_ids();
-    let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(llbcs);
     let mut out = std::collections::HashMap::new();
     for llbc in llbcs {
         for td in llbc.iter_type_decls() {
@@ -5364,27 +5419,11 @@ pub(crate) fn declared_gckind_by_name(
                 continue;
             }
             let canon = strip_crate_prefix(&td.item_meta.name_path());
-            let kind = declared_gckind_of_type_decl(td, llbc, &gc, &immutable_fields);
+            let kind = declared_gckind(struct_id_for_type_decl(td), &canon, &gc);
             out.insert(canon, kind);
         }
     }
     out
-}
-
-/// One `GcKind` for `td`: the field-0 `Gc` set, else [`adt_def_is_raw_storage`].
-fn declared_gckind_of_type_decl(
-    td: &TypeDecl,
-    llbc: &Llbc,
-    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
-    immutable_fields: &ImmutableFieldsTable,
-) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
-    use crate::translator::rtyper::lltypesystem::lltype::GcKind;
-    let mut stack = Vec::new();
-    if adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, immutable_fields, &mut stack) {
-        GcKind::Raw
-    } else {
-        GcKind::Gc
-    }
 }
 
 /// Per-LLBC fragment of the duplicate-leaf verdict. The streaming frontend
@@ -6398,7 +6437,7 @@ pub(crate) use self::gcroot::{
 #[cfg(test)]
 pub(crate) use self::lltype::stamp_fn_ptr_spelling;
 pub(crate) use self::lltype::{
-    ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
+    NullableStrEnum, ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fixed_array_lowers_to_gcarray, fixed_list_reader,
@@ -6406,8 +6445,9 @@ pub(crate) use self::lltype::{
     is_rstr_str_layout_declaration, is_str_family_class_root, is_str_length_field_class_root,
     is_str_oopspec_class_root, items_block_accessor_returns_its_block, llbc_exception_class_hints,
     nonzero_option_zero, output_type_is_objectptr, push_unichr, resolve_trait_assoc_type,
-    same_nominal_adt, strip_crate_prefix, type_decl_ref_adt_id, type_decl_ref_builtin,
-    type_decl_ref_generics, tyref_is_fat_dyn, unichr_call,
+    same_nominal_adt, strip_crate_prefix, type_decl_adt_tyref, type_decl_nullable_str_enum,
+    type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
+    tyref_nullable_str_enum, tyref_to_value_type, unichr_call,
 };
 pub use self::lltype::{collect_unsafe_fn_stubs_from_llbc, slice_array_type_id};
 pub(crate) use self::malloc::forward_identity;

@@ -56,7 +56,7 @@ use std::collections::{HashMap, VecDeque};
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{
     CallFunc, FunDecl, Operand, Place, PlaceKind, ProjectionElem, RegularCall, Rvalue, SpanRef,
-    StmtKind, TermKind, TyRef, TypeDeclKind, Unstructured, UnwindKind,
+    StmtKind, TermKind, TyRef, TypeDecl, TypeDeclKind, Unstructured, UnwindKind,
 };
 use serde_json::{Value, json};
 
@@ -135,6 +135,104 @@ fn leaf_is_depth_independent(leaf: Leaf) -> bool {
     matches!(leaf, Leaf::Identity | Leaf::ReloadTop)
 }
 
+fn tyref_json<'a>(ty: &'a TyRef, llbc: &'a Llbc) -> Option<&'a serde_json::Value> {
+    match ty {
+        TyRef::Inline { value: (_, v) } => Some(v),
+        TyRef::Other(v) => Some(v),
+        TyRef::Dedup { id } => llbc.dedup_body(*id),
+    }
+}
+
+fn peel_ty_json<'a>(
+    mut node: &'a serde_json::Value,
+    llbc: &'a Llbc,
+) -> Option<&'a serde_json::Value> {
+    for _ in 0..24 {
+        let obj = node.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            node = llbc.dedup_body(id)?;
+            continue;
+        }
+        if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+            && arr.len() == 2
+        {
+            node = &arr[1];
+            continue;
+        }
+        return Some(node);
+    }
+    None
+}
+
+fn tyref_is_usize_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_json(ty, llbc).and_then(|n| peel_ty_json(n, llbc)) else {
+        return false;
+    };
+    node.get("Scalar")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|scalar| scalar.get("Integer"))
+        .and_then(serde_json::Value::as_object)
+        .and_then(|int| int.get("Unsigned"))
+        .and_then(serde_json::Value::as_str)
+        == Some("Usize")
+}
+
+fn tyref_is_phantom_marker(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_json(ty, llbc).and_then(|n| peel_ty_json(n, llbc)) else {
+        return false;
+    };
+    let Some(adt) = node.get("Adt").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(td) = super::type_decl_ref_adt_id(adt).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    match &td.kind {
+        TypeDeclKind::Struct(fields) if fields.is_empty() => true,
+        // `PhantomData<T>` is a ZST; Charon records the foreign decl as
+        // Opaque with one type argument.
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => adt
+            .get("generics")
+            .and_then(|g| g.get("types"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|types| types.len() == 1),
+        _ => false,
+    }
+}
+
+/// `#[repr(transparent)]` stack-depth word: one `usize` field plus a
+/// `PhantomData` marker, excluding the `gc_roots` RootScope which has the
+/// same layout.
+fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(td) = super::output_adt_def_id_free(ty, llbc).and_then(|id| llbc.type_by_id(id))
+    else {
+        return false;
+    };
+    type_decl_is_frame_anchor(td, llbc)
+}
+
+fn type_decl_is_frame_anchor(td: &TypeDecl, llbc: &Llbc) -> bool {
+    if super::gc_root_scope_type_path(&td.item_meta.name_path()) {
+        return false;
+    }
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return false;
+    };
+    if fields.len() != 2 {
+        return false;
+    }
+    let mut usize_fields = 0usize;
+    let mut marker_fields = 0usize;
+    for field in fields {
+        if tyref_is_usize_scalar(&field.ty, llbc) {
+            usize_fields += 1;
+        } else if tyref_is_phantom_marker(&field.ty, llbc) {
+            marker_fields += 1;
+        }
+    }
+    usize_fields == 1 && marker_fields == 1
+}
+
 /// Classify a `gc_roots` callee, and say whether it takes the guard as its
 /// first argument.  `None` for a callee outside the module.
 ///
@@ -191,6 +289,45 @@ fn classify_call(
     if leaf == "gc_current_object_address" && segments.contains(&"majit_gc") {
         return Some((Leaf::Identity, false));
     }
+    // FrameAnchor is the interpreter's one-word publication of a live
+    // PyFrame (`eval::FrameAnchor`). The translator erases it the way
+    // gctransform drops `push_roots` / `pop_roots`. method=false: arg0
+    // is the depth word (push dest is the index; live/release take that
+    // word). A method=true Close would treat the receiver as a Guard
+    // and miss the Index dest of PushIndex (`close-without-guard`).
+    if leaf.starts_with("frame_anchor_") {
+        let kind = match leaf {
+            "frame_anchor_push" | "frame_anchor_push_jit_abi" | "frame_anchor_new_jit_abi" => {
+                Leaf::PushIndex
+            }
+            "frame_anchor_live"
+            | "frame_anchor_live_jit_abi"
+            | "frame_anchor_live_method_jit_abi" => Leaf::Get,
+            "frame_anchor_release"
+            | "frame_anchor_release_jit_abi"
+            | "frame_anchor_drop_jit_abi"
+            | "frame_anchor_drop_in_place_jit_abi" => Leaf::Close,
+            _ => return None,
+        };
+        return Some((kind, false));
+    }
+    let names_frame_anchor =
+        |ty: &majit_charon_reader::ullbc::TyRef| tyref_is_frame_anchor(ty, llbc);
+    let receiver_ty = match call.args.first() {
+        Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
+        _ => None,
+    };
+    if names_frame_anchor(&call.dest.ty) && matches!(leaf, "new" | "from_raw") {
+        return Some((Leaf::PushIndex, false));
+    }
+    if receiver_ty.is_some_and(names_frame_anchor) {
+        let kind = match leaf {
+            "live" => Leaf::Get,
+            "drop" | "drop_in_place" => Leaf::Close,
+            _ => return None,
+        };
+        return Some((kind, false));
+    }
     if !segments.contains(&super::ROOT_SCOPE_MODULE) {
         return None;
     }
@@ -204,10 +341,6 @@ fn classify_call(
             && super::output_adt_def_id_free(ty, llbc)
                 .and_then(|id| llbc.type_by_id(id))
                 .is_some_and(|t| super::gc_root_scope_type_path(&t.item_meta.name_path()))
-    };
-    let receiver_ty = match call.args.first() {
-        Some(Operand::Copy(p) | Operand::Move(p)) => Some(&p.ty),
-        _ => None,
     };
     let is_method =
         segments.contains(&super::ROOT_SCOPE_TYPE) || segments.iter().any(|s| s.starts_with('<'));
@@ -1648,17 +1781,6 @@ fn analyze_in(
                         _ => None,
                     }
                 }
-                Rvalue::Aggregate(_, operands) => {
-                    let mut found = None;
-                    for op in operands {
-                        if let Some(Special::Index(k)) =
-                            operand_local(op).and_then(|l| plan.specials.get(&l))
-                        {
-                            found = Some(Special::Index(*k));
-                        }
-                    }
-                    found
-                }
                 Rvalue::BinaryOp(op, lhs, rhs) => match binop_is_index_arith(op) {
                     Some(arith) => {
                         let spec_of = |o: &Operand| {
@@ -1751,66 +1873,69 @@ fn analyze_in(
         let term_json = block.terminator.kind_value();
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
-                let Some(&(leaf, method)) = classified.get(&bb) else {
-                    // A closure whose body is `shadow_stack_get` of a captured
-                    // index (or `captured + const`) is a Get of that slot.
-                    // `RootBracketPlan.capture_temps` already answers this at
-                    // lowering; the codewriter must not see the bracket
-                    // (`gctransform` `push_roots` runs after `make_jitcodes`).
-                    if let Some((answer, carriers)) = try_slot_getter_call(
-                        body,
-                        llbc,
-                        call,
-                        &plan.specials,
-                        &stmt_assigned,
-                        &call_dests,
-                        &forward_blocks,
-                        &mut getter_cache,
-                    ) {
-                        let dest_json = &term_json["Call"]["call"]["dest"];
-                        let stmts = match answer {
-                            GetterAnswer::Scalar(k) => {
-                                if k >= depth {
-                                    return Err("get-above-depth".into());
-                                }
-                                let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
-                                vec![assign_json(
-                                    dest_json.clone(),
-                                    json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
-                                )]
+                // A closure whose body is `shadow_stack_get` of a captured
+                // index (or `captured + const`) is a Get of that slot.
+                // `RootBracketPlan.capture_temps` already answers this at
+                // lowering; the codewriter must not see the bracket
+                // (`gctransform` `push_roots` runs after `make_jitcodes`).
+                // Peel before `look_through`: that classifier paints the
+                // same body as `Leaf::Get` of wrapper arg 0, whose call-site
+                // arg 0 is the receiver, not the captured index.
+                if let Some((answer, carriers)) = try_slot_getter_call(
+                    body,
+                    llbc,
+                    call,
+                    &plan.specials,
+                    &stmt_assigned,
+                    &call_dests,
+                    &forward_blocks,
+                    &mut getter_cache,
+                ) {
+                    let dest_json = &term_json["Call"]["call"]["dest"];
+                    let stmts = match answer {
+                        GetterAnswer::Scalar(k) => {
+                            if k >= depth {
+                                return Err("get-above-depth".into());
                             }
-                            GetterAnswer::Slice { slice_local, k } => {
-                                if open == 0 {
-                                    return Err("get-above-depth".into());
-                                }
-                                vec![assign_json(
-                                    dest_json.clone(),
-                                    slice_elem_use(body, slice_local, dest_json, k)?,
-                                )]
-                            }
-                        };
-                        plan.terms.insert(
-                            bb,
-                            TermRewrite {
-                                target: *target,
-                                stmts,
-                            },
-                        );
-                        getter_bbs.insert(bb);
-                        for local in carriers {
-                            capture_temps.insert(local);
+                            let ty = plan.slot_ty.clone().ok_or("get-before-any-pin")?;
+                            vec![assign_json(
+                                dest_json.clone(),
+                                json!({ "Use": [{ "Copy": local_place_json(slot_local(k), &ty) }, "Yes"] }),
+                            )]
                         }
-                        reach(
-                            &mut depth_in,
-                            &mut open_in,
-                            &mut queue,
-                            &plan.specials,
-                            *target,
-                            depth,
-                            open,
-                        )?;
-                        continue;
+                        GetterAnswer::Slice { slice_local, k } => {
+                            if open == 0 {
+                                return Err("get-above-depth".into());
+                            }
+                            vec![assign_json(
+                                dest_json.clone(),
+                                slice_elem_use(body, slice_local, dest_json, k)?,
+                            )]
+                        }
+                    };
+                    plan.terms.insert(
+                        bb,
+                        TermRewrite {
+                            target: *target,
+                            stmts,
+                        },
+                    );
+                    getter_bbs.insert(bb);
+                    for local in carriers {
+                        capture_temps.insert(local);
                     }
+                    reach(
+                        &mut depth_in,
+                        &mut open_in,
+                        &mut queue,
+                        &plan.specials,
+                        *target,
+                        depth,
+                        open,
+                    )?;
+                    continue;
+                }
+                let Some(&(leaf, method)) = classified.get(&bb) else {
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
                     // become slot locals (`eval_slice_index` / `getindex_w`).
@@ -5790,7 +5915,7 @@ mod tests {
         ];
         let body = body_of(32, blocks);
         match analyze(&body, &llbc) {
-            Err("capture-escapes") => {}
+            Err(reason) if reason == "capture-escapes" => {}
             Ok(Some(_)) => panic!("expected capture-escapes, got accepted"),
             Ok(None) => panic!("expected capture-escapes, got no bracket"),
             Err(reason) => panic!("expected capture-escapes, got {reason}"),
@@ -5802,7 +5927,7 @@ mod tests {
         let llbc = getter_llbc();
         let body = long_rshift_shape_body(true);
         match analyze(&body, &llbc) {
-            Err("get-above-depth") => {}
+            Err(reason) if reason == "get-above-depth" => {}
             Ok(Some(_)) => panic!("expected get-above-depth, got accepted"),
             Ok(None) => panic!("expected get-above-depth, got no bracket"),
             Err(reason) => panic!("expected get-above-depth, got {reason}"),
@@ -5815,7 +5940,7 @@ mod tests {
         let fd = llbc.fn_by_id(5).expect("capture getter");
         let body = fd.unstructured().expect("getter body");
         match analyze(&body, &llbc) {
-            Err("index-not-static") => {}
+            Err(reason) if reason == "index-not-static" => {}
             Ok(Some(_)) => panic!("expected index-not-static, got accepted"),
             Ok(None) => panic!("expected index-not-static, got no bracket"),
             Err(reason) => panic!("expected index-not-static, got {reason}"),
@@ -5959,7 +6084,7 @@ mod tests {
             ],
         );
         match analyze(&body, &llbc) {
-            Err("index-not-static") => {}
+            Err(reason) if reason == "index-not-static" => {}
             Ok(Some(_)) => panic!("expected index-not-static, got accepted"),
             Ok(None) => panic!("expected index-not-static, got no bracket"),
             Err(reason) => panic!("expected index-not-static, got {reason}"),
@@ -5971,7 +6096,7 @@ mod tests {
         let llbc = incoming_slice_llbc();
         let body = dict_descr_keys_shape_body(true);
         match analyze(&body, &llbc) {
-            Err("get-above-depth") => {}
+            Err(reason) if reason == "get-above-depth" => {}
             Ok(Some(_)) => panic!("expected get-above-depth, got accepted"),
             Ok(None) => panic!("expected get-above-depth, got no bracket"),
             Err(reason) => panic!("expected get-above-depth, got {reason}"),
@@ -6580,6 +6705,56 @@ mod tests {
             &erased,
             &llbc,
             "shadow_stack::try_pop_to"
+        ));
+    }
+
+    /// Free-fn `frame_anchor_push` / `live` / `release` are the same
+    /// PushIndex / Get / Close leaves as `shadow_stack::{push,get,try_pop_to}`.
+    #[test]
+    fn erase_frame_anchor_push_get_close_erases_bracket() {
+        let copy = |i| json!({"Copy": place(i)});
+        let body_json = two_arg_body(
+            vec![
+                bb(call_fun(1, vec![copy(1)], 3, 1)),
+                bb(call_fun(2, vec![copy(3)], 4, 2)),
+                bb(call_fun(3, vec![copy(3)], 5, 3)),
+                bb(json!("Return")),
+            ],
+            6,
+        );
+        let funs = vec![
+            json!(null),
+            opaque_fun(
+                1,
+                &["pyre_interpreter", "eval", "frame_anchor_push"],
+                json!("Opaque"),
+            ),
+            opaque_fun(
+                2,
+                &["pyre_interpreter", "eval", "frame_anchor_live"],
+                json!("Opaque"),
+            ),
+            opaque_fun(
+                3,
+                &["pyre_interpreter", "eval", "frame_anchor_release"],
+                json!("Opaque"),
+            ),
+            opaque_fun(4, &["lib", "anchor"], json!({ "Unstructured": body_json })),
+        ];
+        let llbc = cached_slot_llbc(funs);
+        let fd = llbc.fn_by_id(4).expect("subject");
+        let body = fd.unstructured().expect("stripped body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected frame_anchor push/get/close erase, got no bracket"),
+            Err(reason) => panic!("expected frame_anchor push/get/close erase, got {reason}"),
+        };
+        assert!(no_call_path_contains(&erased, &llbc, "frame_anchor_push"));
+        assert!(no_call_path_contains(&erased, &llbc, "frame_anchor_live"));
+        assert!(no_call_path_contains(
+            &erased,
+            &llbc,
+            "frame_anchor_release"
         ));
     }
 

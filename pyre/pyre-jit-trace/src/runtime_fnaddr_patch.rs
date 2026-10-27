@@ -3021,7 +3021,8 @@ mod tests {
             constants_r_index: 0,
             bytes: b"__add__".to_vec(),
             precomputed_hash: 0,
-            as_unicode_object: true,
+            kind: StrConstKind::UnicodeObject,
+            container_index: None,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);

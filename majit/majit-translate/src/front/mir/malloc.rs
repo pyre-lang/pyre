@@ -472,15 +472,29 @@ pub(in crate::front::mir) fn concretetype_for_field(ty: &ValueType) -> crate::mo
 
 /// `rtyper.py` `setconcretetype` from `FUNC.RESULT` / the op's result
 /// kind. `IndirectCall` carries the same `result_ty` cell as `Call`.
+/// Call results go through [`valuetype_to_concrete_for_legacy`] so a
+/// flavor-raw `Ref(Some(intern_key))` is `Signed` (`history.getkind` of
+/// that raw `Ptr`).
 pub(in crate::front::mir) fn concretetype_for_op_kind(
     op_kind: &OpKind,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> crate::model::ConcreteType {
     match op_kind {
-        OpKind::Call { result_ty: ty, .. }
-        | OpKind::IndirectCall { result_ty: ty, .. }
-        | OpKind::BinOp { result_ty: ty, .. }
-        | OpKind::UnaryOp { result_ty: ty, .. } => concretetype_for_field(ty),
+        OpKind::Call { result_ty: ty, .. } | OpKind::IndirectCall { result_ty: ty, .. } => {
+            crate::codewriter::type_state::valuetype_to_concrete_for_legacy(
+                ty,
+                raw_alloc_flavor_structs,
+            )
+        }
+        OpKind::BinOp { result_ty: ty, .. } | OpKind::UnaryOp { result_ty: ty, .. } => {
+            concretetype_for_field(ty)
+        }
         OpKind::FieldRead { ty, .. } | OpKind::Input { ty, .. } => concretetype_for_field(ty),
+        // `hint` is `same_as` of its value (`unaryop.py` `hint(self, *args_s):
+        // return self`; `jtransform.py` `rewrite_op_hint`). Stamp the dest
+        // from that word; Unknown here left `promote(self.version.0)` untyped
+        // so the annotator rebuilt a `VersionTag` instance.
+        OpKind::Hint { value, .. } => FunctionGraph::concretetype_of(value),
         OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)

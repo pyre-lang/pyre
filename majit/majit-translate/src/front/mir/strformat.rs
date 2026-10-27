@@ -1004,6 +1004,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
             pure: true,
+            taken_by_address: false,
         },
     });
     let lo_char = alloc(graph);
@@ -1017,6 +1018,7 @@ pub(in crate::front::mir) fn emit_lower_hex_byte_02_ops(
             nolength: false,
             gckind: crate::model::ArrayGcKind::Gc,
             pure: true,
+            taken_by_address: false,
         },
     });
     let hi = alloc(graph);

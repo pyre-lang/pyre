@@ -4025,12 +4025,8 @@ impl UserDelAction {
         let _ = pyre_object::gc_roots::pin_root(w_type.as_ptr());
         let type_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let w_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
-        let Some(w_del) = (unsafe {
-            crate::baseobjspace::lookup_in_type(
-                w_type(),
-                "__del__",
-            )
-        }) else {
+        let Some(w_del) = (unsafe { crate::baseobjspace::lookup_in_type(w_type(), "__del__") })
+        else {
             return;
         };
         if !self.begin_finalizer(current()) {

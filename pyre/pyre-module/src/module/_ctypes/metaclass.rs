@@ -420,14 +420,7 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
             || (unsafe { pyre_object::is_list(slots) }
                 && unsafe { pyre_object::w_list_len(slots) } == 0)
     });
-    if slots_empty
-        && unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(
-                cls,
-                name,
-            )
-        }
-        .is_none()
+    if slots_empty && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) }.is_none()
     {
         return Err(pyre_interpreter::PyError::attribute_error(format!(
             "'{}' object has no attribute '{}'",
@@ -435,7 +428,7 @@ fn structure_setattr(args: &[PyObjectRef]) -> PyResult {
             name,
         )));
     }
-    pyre_interpreter::baseobjspace::object_setattr(obj, args[1], args[2])
+    pyre_interpreter::baseobjspace::object_setattr(obj, name, args[2])
 }
 
 fn finish_aggregate_base(tp: PyObjectRef, metaclass: PyObjectRef, paramfunc: &'static str) {
@@ -785,12 +778,7 @@ fn first_base_stginfo(cls: PyObjectRef) -> Option<PyObjectRef> {
 }
 
 fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
-    match unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            cls,
-            name,
-        )
-    } {
+    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, name) } {
         Some(o) if unsafe { pyre_object::is_int(o) } => {
             (unsafe { pyre_object::w_int_get_value(o) }).max(0) as usize
         }
@@ -799,12 +787,7 @@ fn usize_attr(cls: PyObjectRef, name: &str, default: usize) -> usize {
 }
 
 fn align_attr(cls: PyObjectRef) -> Result<usize, pyre_interpreter::PyError> {
-    match unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            cls,
-            "_align_",
-        )
-    } {
+    match unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_align_") } {
         Some(o) if unsafe { pyre_object::is_int(o) } => {
             let value = unsafe { pyre_object::w_int_get_value(o) };
             if value < 0 {
@@ -1135,13 +1118,7 @@ fn process_fields(cls: PyObjectRef, fields: PyObjectRef, is_union: bool) -> PyRe
     reload_entry_tys(&mut entries);
     if pack > 0
         && !cfg!(windows)
-        && unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(
-                cls(),
-                "_layout_",
-            )
-        }
-        .is_none()
+        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls(), "_layout_") }.is_none()
     {
         reload_entry_tys(&mut entries);
         pyre_interpreter::warn::warn_deprecation(
@@ -1570,14 +1547,9 @@ fn pointer_type_set(args: &[PyObjectRef]) -> PyResult {
 
 fn fields_get(args: &[PyObjectRef]) -> PyResult {
     let cls = args[1];
-    unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            cls,
-            "_fields_",
-        )
-    }
-    .filter(|&f| !f.is_null())
-    .ok_or_else(|| pyre_interpreter::PyError::attribute_error("_fields_"))
+    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_fields_") }
+        .filter(|&f| !f.is_null())
+        .ok_or_else(|| pyre_interpreter::PyError::attribute_error("_fields_"))
 }
 
 fn fields_set(args: &[PyObjectRef]) -> PyResult {
@@ -1710,20 +1682,9 @@ fn field_needs_swap(obj: PyObjectRef, proto: PyObjectRef, size: usize) -> bool {
         return false;
     }
     let oc = unsafe { pyre_object::w_instance_get_type(obj) };
-    unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            oc,
-            "_swappedbytes_",
-        )
-    }
-    .is_some()
-        || unsafe {
-            pyre_interpreter::baseobjspace::lookup_in_type(
-                proto,
-                "_swappedbytes_",
-            )
-        }
-        .is_some()
+    unsafe { pyre_interpreter::baseobjspace::lookup_in_type(oc, "_swappedbytes_") }.is_some()
+        || unsafe { pyre_interpreter::baseobjspace::lookup_in_type(proto, "_swappedbytes_") }
+            .is_some()
 }
 
 fn cfield_get(args: &[PyObjectRef]) -> PyResult {
@@ -2190,14 +2151,7 @@ fn structure_new(args: &[PyObjectRef]) -> PyResult {
         ));
     }
     let mut cls = args[0];
-    if unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            cls,
-            "_abstract_",
-        )
-    }
-    .is_some()
-    {
+    if unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_abstract_") }.is_some() {
         return Err(pyre_interpreter::PyError::type_error("abstract class"));
     }
     let mut info = stginfo::stginfo_of(cls)
@@ -3025,13 +2979,8 @@ fn cpointertype_init(args: &[PyObjectRef]) -> PyResult {
 /// `PyCPointerType` layout: pointer-sized `StgInfo` with `ISPOINTER`, and
 /// memoise the pointer type on the pointed-to type (`POINTER` identity).
 fn pointer_init_stginfo(mut cls: PyObjectRef) -> PyResult {
-    let proto = unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(
-            cls,
-            "_type_",
-        )
-    }
-    .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
+    let proto = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_type_") }
+        .filter(|&t| !t.is_null() && unsafe { pyre_object::is_type(t) });
     let has_proto = proto.is_some();
     // `proto` is read again after every layout query below.
     let roots = pyre_object::gc_roots::push_roots();

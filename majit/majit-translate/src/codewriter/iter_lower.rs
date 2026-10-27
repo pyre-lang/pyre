@@ -535,6 +535,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                             array_type_id.as_deref(),
                         ),
                         pure: false,
+                        taken_by_address: false,
                     },
                     site.item.clone(),
                 );
@@ -570,6 +571,7 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
                             array_type_id.as_deref(),
                         ),
                         pure: false,
+                        taken_by_address: false,
                     },
                 );
                 FunctionGraph::set_concretetype_of_inline(&item, valuetype_to_concrete(item_ty));

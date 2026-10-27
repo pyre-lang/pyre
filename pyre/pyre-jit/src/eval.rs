@@ -1888,7 +1888,8 @@ enum JitAction {
 
 use crate::jit::descr::{
     BUILTIN_CODE_GC_TYPE_ID, FRAME_DEBUG_DATA_GC_TYPE_ID, FUNCTION_GC_TYPE_ID, JITFRAME_GC_TYPE_ID,
-    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
+    OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, PYFRAME_GC_TYPE_ID, RAISE_CAUSE_GC_TYPE_ID,
+    RANGE_ITER_GC_TYPE_ID,
     SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
     SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BASE_EXCEPTION_GC_TYPE_ID,
     W_BOOL_GC_TYPE_ID, W_BYTEARRAY_GC_TYPE_ID, W_BYTES_GC_TYPE_ID, W_CELL_GC_TYPE_ID,
@@ -3793,6 +3794,14 @@ fn build_gc() -> Box<MiniMarkGC> {
         ],
     ));
     debug_assert_eq!(frame_debug_data_tid, FRAME_DEBUG_DATA_GC_TYPE_ID);
+    // RaiseCause is a plain GC object (`GcType`). Both fields are GC
+    // references; `Option<PyError>` is two words, so the custom trace
+    // visits `w_cause` and the PyError word inside `invalid`.
+    let raise_cause_tid = gc.register_type(TypeInfo::with_custom_trace(
+        std::mem::size_of::<pyre_interpreter::eval::RaiseCause>(),
+        pyre_interpreter::eval::raise_cause_trace,
+    ));
+    debug_assert_eq!(raise_cause_tid, RAISE_CAUSE_GC_TYPE_ID);
     // setobject.py W_SetIterObject — AUTO-ID typed payload. Its live `w_set`
     // edge is traced, preserving a source owned solely by an iterator. Keep
     // this at the absolute tail of the type-id chain: inserting it before the
@@ -11807,10 +11816,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                     // asynchronously injected exception must be catchable by
                     // the target frame's surrounding try/except.
                     f = reload_loop_frame!(f, root_slot);
-                    let next_instr = pyre_interpreter::eval::handle_exception(
-                        unsafe { &mut *f },
-                        &mut err,
-                    );
+                    let next_instr =
+                        pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
                     if next_instr >= 0 {
                         f = reload_loop_frame!(f, root_slot);
                         unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr as usize);
@@ -11953,10 +11960,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                             unsafe { &mut *f }.set_frame_finished_execution(true);
                             return Err(err);
                         }
-                        let handler_pc = pyre_interpreter::eval::handle_exception(
-                            unsafe { &mut *f },
-                            &mut err,
-                        );
+                        let handler_pc =
+                            pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
                         if handler_pc >= 0 {
                             // handle_exception may allocate → re-seed.
                             f = reload_loop_frame!(f, root_slot);
@@ -11989,10 +11994,8 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                 // execute_opcode_step (above) is a collection point and this arm
                 // re-reads the frame; seed a fresh pointer.
                 f = reload_loop_frame!(f, root_slot);
-                let handler_pc = pyre_interpreter::eval::handle_exception(
-                    unsafe { &mut *f },
-                    &mut err,
-                );
+                let handler_pc =
+                    pyre_interpreter::eval::handle_exception(unsafe { &mut *f }, &mut err);
                 if handler_pc >= 0 {
                     // handle_exception may allocate → re-seed before the write.
                     f = reload_loop_frame!(f, root_slot);

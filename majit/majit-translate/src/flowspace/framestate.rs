@@ -366,13 +366,11 @@ pub fn union(w1: Option<&Hlvalue>, w2: Option<&Hlvalue>) -> Result<Option<Hlvalu
     match (w1, w2) {
         (Some(a), Some(b)) if a == b => Ok(Some(a.clone())),
         (None, _) | (_, None) => Ok(None),
-        (Some(Hlvalue::Variable(v1)), Some(Hlvalue::Variable(v2))) => Ok(Some(Hlvalue::Variable(
-            phi_variable_from_vars(Some(v1), Some(v2)),
-        ))),
-        (Some(Hlvalue::Variable(v)), Some(Hlvalue::Constant(_)))
-        | (Some(Hlvalue::Constant(_)), Some(Hlvalue::Variable(v))) => Ok(Some(Hlvalue::Variable(
-            phi_variable_from_vars(Some(v), None),
-        ))),
+        (Some(Hlvalue::Variable(_)), _) | (_, Some(Hlvalue::Variable(_))) => {
+            // `framestate.py union`: generalization creates an untyped Variable;
+            // the annotator/rtyper supplies its representation after flow building.
+            Ok(Some(Hlvalue::Variable(Variable::new())))
+        }
         (Some(Hlvalue::Constant(c1)), Some(Hlvalue::Constant(c2))) => {
             if matches!(c1.value, ConstValue::SpecTag(_))
                 || matches!(c2.value, ConstValue::SpecTag(_))
@@ -383,24 +381,6 @@ pub fn union(w1: Option<&Hlvalue>, w2: Option<&Hlvalue>) -> Result<Option<Hlvalu
             }
         }
     }
-}
-
-/// Fresh phi Variable (`framestate.py` `return Variable()`). When both
-/// sides already carry the same `concretetype`, or only one side does,
-/// stamp that bindingrepr (`rtyper.py` `setconcretetype` on the merge
-/// Variable). A Call dest's successor Discriminant reads this cell
-/// (`rnone.py` `rtype_is_None`).
-fn phi_variable_from_vars(v1: Option<&Variable>, v2: Option<&Variable>) -> Variable {
-    let phi = Variable::new();
-    match (
-        v1.and_then(Variable::concretetype),
-        v2.and_then(Variable::concretetype),
-    ) {
-        (Some(a), Some(b)) if a == b => phi.set_concretetype(Some(a)),
-        (Some(a), None) | (None, Some(a)) => phi.set_concretetype(Some(a)),
-        _ => {}
-    }
-    phi
 }
 
 /// Stack union. Per upstream, stack cells may hold FlowSignal as well
@@ -587,6 +567,34 @@ mod test {
         let fs1 = build_state(vec![Some(Hlvalue::Constant(fresh_spectag_constant()))]);
         let fs2 = build_state(vec![Some(Hlvalue::Constant(fresh_spectag_constant()))]);
         assert!(fs1.union(&fs2).is_none());
+    }
+
+    #[test]
+    fn union_generalization_does_not_inherit_a_predecessor_type() {
+        // `framestate.py union` returns Variable(), even when both input
+        // Variables happen to carry an already assigned representation.
+        let typed = Variable::new();
+        typed.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        ));
+        let also_typed = Variable::new();
+        also_typed.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Signed,
+        ));
+        for other in [
+            Hlvalue::Variable(Variable::new()),
+            Hlvalue::Variable(also_typed),
+            Hlvalue::Constant(Constant::new(ConstValue::Int(1))),
+        ] {
+            let left = Hlvalue::Variable(typed.clone());
+            for (a, b) in [(&left, &other), (&other, &left)] {
+                let Some(Hlvalue::Variable(phi)) = union(Some(a), Some(b)).unwrap() else {
+                    panic!("union must generalize to a Variable");
+                };
+                assert_ne!(phi, typed);
+                assert!(phi.concretetype().is_none());
+            }
+        }
     }
 
     #[test]

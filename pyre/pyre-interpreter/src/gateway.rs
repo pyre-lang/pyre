@@ -3086,12 +3086,9 @@ fn path_or_fd_w(
             // without losing that observable descriptor value.
             (Vec::new(), obj_slot, fd, true)
         } else {
-            let Some(fspath_descr) = crate::typedef::r#type(obj).and_then(|pt| {
-                crate::baseobjspace::lookup_in_type(
-                    pt.as_ptr(),
-                    "__fspath__",
-                )
-            }) else {
+            let Some(fspath_descr) = crate::typedef::r#type(obj)
+                .and_then(|pt| crate::baseobjspace::lookup_in_type(pt.as_ptr(), "__fspath__"))
+            else {
                 return Err(reject(obj));
             };
             let fspath_slot = pyre_object::gc_roots::shadow_stack_len();

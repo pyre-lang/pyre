@@ -9477,8 +9477,7 @@ mod tests {
                 "a function is a non-data descriptor"
             );
             assert!(
-                crate::baseobjspace::lookup_in_type(spec_cls, "_initializing")
-                .is_some(),
+                crate::baseobjspace::lookup_in_type(spec_cls, "_initializing").is_some(),
                 "the type still exposes _initializing after the dict miss"
             );
         }

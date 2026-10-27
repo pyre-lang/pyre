@@ -439,6 +439,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                             gckind: crate::model::ArrayGcKind::Gc,
                             pure: false,
+                            taken_by_address: false,
                         },
                     });
                     Some(loaded)
