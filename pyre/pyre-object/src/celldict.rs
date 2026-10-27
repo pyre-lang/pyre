@@ -820,6 +820,16 @@ pub struct ModuleDictStrategy {
     pub mutate_version: crate::quasiimmut::QuasiImmutField,
 }
 
+/// MiniMark-allocated by `gc_alloc_storage_box` with the tid from
+/// `module_dict_strategy_gc_type_id`; this impl declares the gckind only (allocation keeps that
+/// tid).
+impl crate::lltype::GcType for ModuleDictStrategy {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 /// Byte offset of `mutate_version` within [`ModuleDictStrategy`].
 /// `rclass.py InstanceRepr._setup_repr` / `quasiimmut.py get_mutate_field_name`.
 pub const MODULE_DICT_MUTATE_VERSION_OFFSET: usize =

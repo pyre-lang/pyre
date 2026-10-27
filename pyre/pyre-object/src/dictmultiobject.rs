@@ -7102,6 +7102,15 @@ pub struct DictStrategyRef {
     pub owner: GCREF,
 }
 
+/// MiniMark-allocated by `gc_alloc_storage_box` with the tid from `dict_strategy_ref_gc_type_id`;
+/// this impl declares the gckind only (allocation keeps that tid).
+impl crate::lltype::GcType for DictStrategyRef {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 /// The holders below wrap only the stateless unit-struct singletons, which are
 /// shared process-wide exactly as `space.fromcache(StrategyCls)` shares them
 /// upstream.  `DictStrategy` itself cannot carry a `Sync` bound —

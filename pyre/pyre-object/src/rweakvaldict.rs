@@ -86,6 +86,15 @@ pub struct WeakDictEntries<K> {
     pub items: [WeakDictEntry<K>; 0],
 }
 
+/// MiniMark-allocated by `alloc_entries` with the tid from `weakdict_entries_gc_type_id`; this
+/// impl declares the gckind only (allocation keeps that tid).
+impl<K> crate::lltype::GcType for WeakDictEntries<K> {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 /// `WEAKDICT` / `weakvaldict`.
 #[repr(C)]
 pub struct WeakDict<K> {

@@ -373,6 +373,15 @@ pub struct RDict<K, V, S = RandomState> {
     hash_builder: S,
 }
 
+/// MiniMark-allocated by `gc_alloc_young_storage_box` with the tid from `clone_to_young_box`;
+/// this impl declares the gckind only (allocation keeps that tid).
+impl<K, V, S> crate::lltype::GcType for RDict<K, V, S> {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 const _: () = {
     type ZstHasher = std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>;
     assert!(
