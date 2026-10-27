@@ -93,6 +93,23 @@ pub fn rust_vec_item_kind(ty: &LowLevelType) -> Option<VecItemKind> {
     rust_vec_item_lltype(ty).and_then(vec_item_kind_of)
 }
 
+/// Registry-key segment of one item lowleveltype `rust_vec_lltype` accepts.
+///
+/// `rlist.py` `ll_copy` specializes per LIST type, so `Signed` and
+/// `Unsigned` are different rows even though both are the int register
+/// kind. `llannotation.py` `lltype_to_annotation` maps them to distinct
+/// `SomeInteger` annotations. An item lowleveltype outside this set
+/// answers `None`.
+pub fn rust_vec_item_key_segment(item: &LowLevelType) -> Option<&'static str> {
+    match item {
+        LowLevelType::Signed => Some("Signed"),
+        LowLevelType::Unsigned => Some("Unsigned"),
+        LowLevelType::Float => Some("Float"),
+        other if other == &*GCREF => Some("GCREF"),
+        _ => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct RustVecRepr {
     state: ReprState,

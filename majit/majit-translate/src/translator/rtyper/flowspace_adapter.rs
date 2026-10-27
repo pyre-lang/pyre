@@ -3844,9 +3844,12 @@ pub fn translate_op(
                         ));
                     }
                     // A one-word `<[T]>::to_vec` reads the header
-                    // `stamp_rust_vec_header` wrote and selects that
-                    // kind's `project_rust_vec` row (`to_vec_registry_key`).
-                    // Every other call leaves the path unkeyed.
+                    // `stamp_rust_vec_header` wrote and selects that item
+                    // lowleveltype's `project_rust_vec` row
+                    // (`to_vec_registry_key`). `rlist.py` `ll_copy`
+                    // specializes per LIST type; `llannotation.py`
+                    // `lltype_to_annotation` keeps `Signed` and `Unsigned`
+                    // distinct. Every other call leaves the path unkeyed.
                     let stamped_to_vec =
                         if crate::translator::rtyper::call_registry::is_alloc_slice_to_vec(segments)
                         {

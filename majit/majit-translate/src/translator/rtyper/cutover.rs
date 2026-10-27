@@ -4060,32 +4060,30 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
     register_one_word_slice_to_vec_externals(registry);
 }
 
-/// One `register_external` row per [`majit_ir::rvec::VecItemKind`].
+/// One `register_external` row per item lowleveltype of a one-word `Vec`.
 ///
-/// The key is the register kind (`to_vec_registry_key`). The Int row is
-/// declared from `Vec<usize>`, whose item is unsigned (`project_rust_vec`,
-/// `rint.py` `unsigned_repr`). `Vec<isize>` / `Vec<i64>` project a signed
-/// `SomeRustVec` and do not share that shell; the key does not grow a
-/// fourth kind. Float and reference rows stay `Vec<f64>` / `Vec<*mut u8>`.
+/// `rlist.py` `ll_copy` specializes per LIST type, i.e. per item
+/// lowleveltype. `llannotation.py` `lltype_to_annotation` keeps `Signed`
+/// and `Unsigned` distinct, so each spelling has its own
+/// `project_rust_vec` shell: `Vec<isize>`, `Vec<usize>`, `Vec<f64>`,
+/// `Vec<*mut u8>`. The key is `to_vec_registry_key` of `rust_vec_lltype`
+/// of that same item.
 fn register_one_word_slice_to_vec_externals(registry: &CallRegistry) {
     use crate::translator::rtyper::call_registry::to_vec_registry_key;
-    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
     use crate::translator::rtyper::rrustvec::rust_vec_lltype;
-    use majit_ir::rvec::VecItemKind;
 
     let bare = ["alloc", "slice", "<Impl>", "to_vec"]
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    for kind in VecItemKind::ALL {
-        let (spelling, item) = match kind {
-            VecItemKind::Int => ("Vec<usize>", LowLevelType::Signed),
-            VecItemKind::Float => ("Vec<f64>", LowLevelType::Float),
-            VecItemKind::Ref => (
-                "Vec<*mut u8>",
-                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
-            ),
-        };
+    let rows = [
+        ("Vec<isize>", LowLevelType::Signed),
+        ("Vec<usize>", LowLevelType::Unsigned),
+        ("Vec<f64>", LowLevelType::Float),
+        ("Vec<*mut u8>", GCREF.clone()),
+    ];
+    for (spelling, item) in rows {
         let header = rust_vec_lltype(&item);
         let key = to_vec_registry_key(&bare, Some(&header))
             .expect("a one-word Vec header selects a to_vec registry row");
@@ -12854,7 +12852,10 @@ mod tests {
 
     /// `<[T]>::to_vec` into a one-word `Vec<T>` is born `SomeRustVec`
     /// (`Bookkeeper::project_rust_vec` / `extfunc.py register_external`).
-    /// A call whose result is not that header keeps the `GCREF` row.
+    /// The row is the item lowleveltype: `rlist.py` `ll_copy` specializes
+    /// per LIST type, and `llannotation.py` `lltype_to_annotation` keeps
+    /// `Signed` and `Unsigned` distinct. A call whose result is not that
+    /// header keeps the `GCREF` row.
     #[test]
     fn slice_to_vec_of_one_word_vec_annotates_rustvec() {
         let _lock = anchor_lock();
@@ -12881,25 +12882,49 @@ mod tests {
             "a to_vec that is not a one-word Vec stays the GCREF external"
         );
 
-        for kind in VecItemKind::ALL {
-            let (spelling, item) = match kind {
-                VecItemKind::Int => ("Vec<usize>", LowLevelType::Signed),
-                VecItemKind::Float => ("Vec<f64>", LowLevelType::Float),
-                VecItemKind::Ref => ("Vec<*mut u8>", GCREF.clone()),
-            };
+        let mut signed_key = None;
+        let mut unsigned_key = None;
+        for (spelling, item) in [
+            ("Vec<isize>", LowLevelType::Signed),
+            ("Vec<usize>", LowLevelType::Unsigned),
+            ("Vec<f64>", LowLevelType::Float),
+            ("Vec<*mut u8>", GCREF.clone()),
+        ] {
             let header = rust_vec_lltype(&item);
-            let key = to_vec_registry_key(&bare_segs, Some(&header)).expect("kind key");
+            let key = to_vec_registry_key(&bare_segs, Some(&header)).expect("item key");
+            let shell = stub_link_result(&registry.lookup(&key).expect("item row"));
             let expected = registry
                 .bookkeeper()
                 .project_rust_vec(spelling)
                 .unwrap_or_else(|| panic!("{spelling} projects"));
-            assert_eq!(
-                stub_link_result(&registry.lookup(&key).expect("kind row")),
-                expected,
-                "{spelling}"
-            );
+            assert_eq!(shell, expected, "{spelling}");
             assert_ne!(key, bare);
+            if matches!(&item, LowLevelType::Signed | LowLevelType::Unsigned) {
+                let unsigned = matches!(&item, LowLevelType::Unsigned);
+                let SomeValue::RustVec(vec) = &shell else {
+                    panic!("{spelling} shell is SomeRustVec, got {shell:?}");
+                };
+                let SomeValue::Integer(s_int) = &*vec.s_item else {
+                    panic!("{spelling} item is SomeInteger, got {:?}", vec.s_item);
+                };
+                assert_eq!(s_int.unsigned, unsigned, "{spelling}");
+                let slot = if unsigned {
+                    &mut unsigned_key
+                } else {
+                    &mut signed_key
+                };
+                *slot = Some(key);
+            }
         }
+        assert_ne!(
+            signed_key.expect("Signed to_vec row"),
+            unsigned_key.expect("Unsigned to_vec row"),
+            "Signed and Unsigned item lowleveltypes do not share a to_vec row"
+        );
+        assert!(
+            to_vec_registry_key(&bare_segs, Some(&rust_vec_lltype(&LowLevelType::Bool))).is_none(),
+            "an item lowleveltype with no segment keeps the bare path"
+        );
 
         let (graph, result) =
             slice_to_vec_call_graph(Some(rust_vec_lltype(&GCREF.clone())), Some("Vec<*mut u8>"));
