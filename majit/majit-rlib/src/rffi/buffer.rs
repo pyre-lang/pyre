@@ -39,7 +39,7 @@ pub struct OutOfRange {
 /// `lltype.malloc(..., flavor='raw')` raises `MemoryError`.
 pub fn str2charp(s: &[u8], track_allocation: bool) -> Result<CCHARP, MemoryError> {
     let _ = track_allocation;
-    let bytes = s.len().checked_add(1).expect("str2charp length overflow");
+    let bytes = s.len().checked_add(1).ok_or(MemoryError)?;
     unsafe {
         let array = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
         copy_bytes(s.as_ptr(), array.cast(), s.len());
@@ -152,9 +152,7 @@ pub fn str2constcharp(s: &[u8], track_allocation: bool) -> Result<CONST_CCHARP, 
 pub fn get_nonmovingbuffer_ll(data: &[u8]) -> Result<(CCHARP, (), u8), MemoryError> {
     let count = data.len();
     // `count + (TYPEP is CCHARP)`: a byte string gets one extra byte.
-    let bytes = count
-        .checked_add(1)
-        .expect("get_nonmovingbuffer_ll length overflow");
+    let bytes = count.checked_add(1).ok_or(MemoryError)?;
     unsafe {
         let buf = raw_malloc_or_memory_error(bytes)?.cast::<super::CHAR>();
         copy_bytes(data.as_ptr(), buf.cast(), count);
@@ -275,7 +273,7 @@ pub unsafe fn keep_buffer_alive_until_here(_raw_buf: CCHARP, gc_buf: Vec<u8>, _c
 /// `liststr2charpp`. NULL-terminated `char**`; each entry is a [`str2charp`].
 pub fn liststr2charpp(list: &[&[u8]]) -> Result<super::CCHARPP, MemoryError> {
     let n = list.len();
-    let n1 = n.checked_add(1).expect("liststr2charpp length overflow");
+    let n1 = n.checked_add(1).ok_or(MemoryError)?;
     // `ovfcheck(itemsize * n)` in `transform.py _ll_compute_size` is MemoryError.
     let bytes = n1
         .checked_mul(core::mem::size_of::<CCHARP>())
@@ -377,17 +375,18 @@ pub unsafe fn wcharp2utf8n(w: CWCHARP, maxlen: usize) -> Result<(Vec<u8>, usize)
 /// Allocates `utf8len + 2` units (`utf82wcharp`: one for the terminator, one
 /// for a trailing incomplete sequence). `utf8len` is the code-point count, not
 /// the byte length; upstream asserts it against `codepoints_in_utf8` before
-/// walking the whole string. The check stays on outside tests too, because a
-/// short count would make the walk write past the block. `track_allocation`
-/// is the same debug-tracker flag as [`str2charp`].
+/// walking the whole string. The count check is debug-only, as upstream checks
+/// it only `if not we_are_translated()`; callers pass the `W_UnicodeObject`'s
+/// stored length. `track_allocation` is the same debug-tracker flag as
+/// [`str2charp`].
 pub fn utf82wcharp(
     utf8: &[u8],
     utf8len: usize,
     track_allocation: bool,
 ) -> Result<CWCHARP, MemoryError> {
     let _ = track_allocation;
-    assert_eq!(utf8len, codepoint_len(utf8));
-    let chars = utf8len.checked_add(2).expect("utf82wcharp length overflow");
+    debug_assert_eq!(utf8len, codepoint_len(utf8));
+    let chars = utf8len.checked_add(2).ok_or(MemoryError)?;
     // `ovfcheck(itemsize * n)` in `transform.py _ll_compute_size` is MemoryError.
     let bytes = chars
         .checked_mul(core::mem::size_of::<Wchar>())
@@ -424,7 +423,7 @@ pub fn utf82wcharp_ex(
         }
         wlen += 1;
     }
-    let n = wlen.checked_add(3).expect("utf82wcharp_ex length overflow");
+    let n = wlen.checked_add(3).ok_or(MemoryError)?;
     // `ovfcheck(itemsize * n)` in `transform.py _ll_compute_size` is MemoryError.
     let bytes = n
         .checked_mul(core::mem::size_of::<Wchar>())
@@ -1421,17 +1420,19 @@ mod tests {
         ll_raw_free(empty);
 
         let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        fn hook() {}
+        majit_gc::set_active_raise_memory_error(Some(hook));
         assert_eq!(ll_raw_malloc_varsize(i64::MAX, 0, 2), 0);
         assert_eq!(ll_raw_malloc_varsize_zero(i64::MAX, 8, 8), 0);
         // n=-1, basesize=0, itemsize=8 → tot_size=-8, MemoryError.
         assert_eq!(ll_raw_malloc_varsize(-1, 0, 8), 0);
         assert_eq!(ll_raw_malloc_varsize_no_length(i64::MAX, 0, 2), 0);
         assert_eq!(ll_raw_malloc_varsize_with_length(i64::MAX, 8, 8, 0), 0);
+        majit_gc::set_active_raise_memory_error(None);
     }
 
     /// Overflowing `ll_raw_malloc_varsize*` raises MemoryError through
     /// the backend hook (`set_active_raise_memory_error`) and returns 0.
-    /// With no hook it still returns 0.
     #[test]
     fn raw_malloc_varsize_overflow_invokes_memory_error_hook() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1441,10 +1442,6 @@ mod tests {
         }
         let _guard = RAISE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
         HITS.store(0, Ordering::SeqCst);
-        majit_gc::set_active_raise_memory_error(None);
-        assert_eq!(ll_raw_malloc_varsize(i64::MAX, 0, 2), 0);
-        assert_eq!(HITS.load(Ordering::SeqCst), 0);
-
         majit_gc::set_active_raise_memory_error(Some(hook));
         let result = ll_raw_malloc_varsize(i64::MAX, 0, 2);
         majit_gc::set_active_raise_memory_error(None);

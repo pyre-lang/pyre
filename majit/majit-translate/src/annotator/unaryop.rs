@@ -5926,7 +5926,7 @@ mod tests {
             },
             "f",
             None,
-            None,
+            None::<String>,
         );
         let mut s_ptr = super::super::model::SomePtr::new(Ptr {
             TO: PtrTarget::Func(FuncType {

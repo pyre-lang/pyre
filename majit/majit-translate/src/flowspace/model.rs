@@ -2895,8 +2895,10 @@ pub enum ConstValue {
     Tuple(Vec<ConstValue>),
     /// Python list constant. Flowspace treats tuple/list starred args
     /// identically at this phase: each element is rewrapped into an
-    /// individual `Constant`.
-    List(Vec<ConstValue>),
+    /// individual `Constant`. `Arc` is the shared handle for one host
+    /// list object; clones share the allocation the way Python
+    /// references share one list.
+    List(Arc<Vec<ConstValue>>),
     /// Boolean constant — used as `Link.exitcase` for if/else
     /// switches (`True` / `False`).
     Bool(bool),
@@ -3196,7 +3198,8 @@ impl Hash for ConstValue {
             }
             ConstValue::ByteStr(value) => value.hash(state),
             ConstValue::UniStr(value) => value.hash(state),
-            ConstValue::Tuple(items) | ConstValue::List(items) => items.hash(state),
+            ConstValue::Tuple(items) => items.hash(state),
+            ConstValue::List(items) => items.hash(state),
             ConstValue::Bool(value) => value.hash(state),
             ConstValue::None => {}
             ConstValue::Code(code) => code._hashable_identity().hash(state),
@@ -3983,7 +3986,8 @@ impl ConstValue {
             ConstValue::Dict(items) => Some(!items.is_empty()),
             ConstValue::ByteStr(s) => Some(!s.is_empty()),
             ConstValue::UniStr(s) => Some(!s.is_empty()),
-            ConstValue::Tuple(items) | ConstValue::List(items) => Some(!items.is_empty()),
+            ConstValue::Tuple(items) => Some(!items.is_empty()),
+            ConstValue::List(items) => Some(!items.is_empty()),
             ConstValue::Bool(value) => Some(*value),
             ConstValue::None => Some(false),
             ConstValue::Code(_) => Some(true),
@@ -4020,7 +4024,8 @@ impl ConstValue {
 
     pub fn sequence_items(&self) -> Option<&[ConstValue]> {
         match self {
-            ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.as_slice()),
+            ConstValue::Tuple(items) => Some(items.as_slice()),
+            ConstValue::List(items) => Some(items.as_slice()),
             _ => None,
         }
     }
@@ -4033,7 +4038,8 @@ impl ConstValue {
     /// iteration matches Python semantics), dict (iteration over keys).
     pub fn iter_items(&self) -> Option<Vec<ConstValue>> {
         match self {
-            ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.clone()),
+            ConstValue::Tuple(items) => Some(items.clone()),
+            ConstValue::List(items) => Some(items.as_ref().clone()),
             ConstValue::ByteStr(value) => Some(
                 value
                     .iter()
@@ -4840,6 +4846,11 @@ pub struct GraphFunc {
     /// it to pick `EF_ELIDABLE_*`. `false` mirrors the "attribute absent"
     /// default (`getattr(func, '_elidable_function_', False)`).
     pub _elidable_function_: bool,
+    /// Upstream `func.oopspec` set by `rlib/jit.py oopspec`. `None`
+    /// mirrors the attribute-absent case (`hasattr(func, 'oopspec')`
+    /// is false). `look_inside_iff` moves this onto the trampoline
+    /// (`trampoline.oopspec = func.oopspec; del func.oopspec`).
+    pub oopspec: Option<String>,
     /// Upstream function attribute consulted by
     /// `description.py:222-224`.
     ///
@@ -4980,6 +4991,7 @@ impl GraphFunc {
             _jit_unroll_safe_: false,
             _jit_llop_: None,
             _elidable_function_: false,
+            oopspec: None,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
             _always_inline_: AlwaysInline::Absent,
@@ -6181,8 +6193,8 @@ mod tests {
 
     #[test]
     fn list_constants_use_hashable_identity_fallback() {
-        let a = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
-        let b = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let a = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
+        let b = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
         let c = a.clone();
 
         let hash_of = |v: &Constant| {
@@ -6199,12 +6211,12 @@ mod tests {
 
     #[test]
     fn tuple_with_unhashable_item_uses_hashable_identity_fallback() {
-        let a = Constant::new(ConstValue::Tuple(vec![ConstValue::List(vec![
+        let a = Constant::new(ConstValue::Tuple(vec![ConstValue::List(Arc::new(vec![
             ConstValue::Int(1),
-        ])]));
-        let b = Constant::new(ConstValue::Tuple(vec![ConstValue::List(vec![
+        ]))]));
+        let b = Constant::new(ConstValue::Tuple(vec![ConstValue::List(Arc::new(vec![
             ConstValue::Int(1),
-        ])]));
+        ]))]));
         let c = a.clone();
 
         let hash_of = |v: &Constant| {

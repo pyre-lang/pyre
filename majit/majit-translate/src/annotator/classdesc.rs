@@ -775,8 +775,22 @@ impl InstanceSource {
                 value if value.as_text().is_some() => {
                     result.push(value.as_text().unwrap().to_string())
                 }
-                ConstValue::Tuple(items) | ConstValue::List(items) => {
+                ConstValue::Tuple(items) => {
                     for item in items {
+                        match item {
+                            value if value.as_text().is_some() => {
+                                result.push(value.as_text().unwrap().to_string())
+                            }
+                            _ => {
+                                return Err(AnnotatorError::new(
+                                    "__slots__ must be a sequence of strings",
+                                ));
+                            }
+                        }
+                    }
+                }
+                ConstValue::List(items) => {
+                    for item in items.iter() {
                         match item {
                             value if value.as_text().is_some() => {
                                 result.push(value.as_text().unwrap().to_string())
@@ -2460,7 +2474,8 @@ impl ClassDesc {
         v: &ConstValue,
     ) -> Result<Vec<String>, AnnotatorError> {
         let items: &[ConstValue] = match v {
-            ConstValue::Tuple(items) | ConstValue::List(items) => items,
+            ConstValue::Tuple(items) => items.as_slice(),
+            ConstValue::List(items) => items.as_slice(),
             value if value.as_text().is_some() => {
                 return Ok(vec![value.as_text().unwrap().to_string()]);
             }

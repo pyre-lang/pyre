@@ -461,7 +461,7 @@ mod tests {
             },
             "callee",
             graph_key,
-            None,
+            None::<String>,
         );
         SpaceOperation::new(
             "direct_call",

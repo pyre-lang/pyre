@@ -126,7 +126,7 @@ pub fn annotate(
         ftype,
         &name,
         Some(GraphKey::of(&graph.graph).as_usize()),
-        None,
+        None::<String>,
     );
     let ptr_type = LowLevelType::Ptr(Box::new(fptr._TYPE.clone()));
     inputconst_from_lltype(&ptr_type, &ConstValue::LLPtr(Box::new(fptr))).map_err(|e| TaskError {

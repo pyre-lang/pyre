@@ -1114,8 +1114,12 @@ pub enum OpKind {
     /// a call passes `&` / `&mut` of a primitive into a raw
     /// scalar-pointer parameter: the borrow aliases the word, and
     /// `history.py` `getkind` of that parameter is the address.
+    #[allow(non_snake_case)]
     RawMalloc {
         owner: String,
+        /// `op.args[0].value` of the raw `malloc` / `malloc_varsize`: the `Struct` / `Array` being allocated. `None` only for the
+        /// front-end scalar spill, which has no lltype.
+        TYPE: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
         /// `flags['zero']`; default false.
         zero: bool,
         /// `flags.get('track_allocation', True)`.
@@ -1909,13 +1913,15 @@ impl OpKind {
         zero: bool,
         length: Option<crate::flowspace::model::Variable>,
     ) -> Self {
-        Self::raw_malloc_with_flags(owner, zero, true, false, Vec::new(), length)
+        Self::raw_malloc_with_flags(owner, None, zero, true, false, Vec::new(), length)
     }
 
     /// `lltype.malloc(..., flavor='raw')` carrying the flags dict
     /// `_rewrite_raw_malloc` pops from `op.args[1].value`.
+    #[allow(non_snake_case)]
     pub fn raw_malloc_with_flags(
         owner: impl Into<String>,
+        TYPE: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
         zero: bool,
         track_allocation: bool,
         add_memory_pressure: bool,
@@ -1924,6 +1930,7 @@ impl OpKind {
     ) -> Self {
         OpKind::RawMalloc {
             owner: owner.into(),
+            TYPE,
             zero,
             track_allocation,
             add_memory_pressure,
@@ -2030,12 +2037,20 @@ impl Link {
     }
 
     pub fn new_mixed(args: Vec<LinkArg>, target: BlockId, exitcase: Option<ExitCase>) -> Self {
+        // `RPythonTyper._convert_link` (`insert_link_conversions`) sets
+        // `link.llexitcase` from a primitive `exitcase`.  Bool branches
+        // always carry that slot (`BoolRepr.convert_const`);
+        // `Transformer.follow_constant_exit` compares `llexitcase` only.
+        let llexitcase = match &exitcase {
+            Some(ExitCase::Bool(value)) => Some(ConstValue::Bool(*value)),
+            _ => None,
+        };
         Self {
             args,
             target,
             exitcase,
             prevblock: None,
-            llexitcase: None,
+            llexitcase,
             last_exception: None,
             last_exc_value: None,
         }

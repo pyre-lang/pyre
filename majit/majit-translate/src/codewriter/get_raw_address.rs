@@ -116,9 +116,6 @@ fn bind_fnaddr(cc: &mut CallControl, dest_leaf: &str, src_leaf: &str) {
 /// the lookup/resize helpers they call) for `getcalldescr` analyzers
 /// without a tracing prohibition and without
 /// `add_candidate_graph_if_look_inside`.
-const COPY_STRING_TO_RAW_OOPSPEC: &str =
-    "stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)";
-
 fn register_buf_effect_graph(cc: &mut CallControl) {
     let path = CallPath::from_segments([BUF_LEAF]);
     if cc.has_function_graph(&path) {
@@ -130,18 +127,6 @@ fn register_buf_effect_graph(cc: &mut CallControl) {
     cc.register_function_graph(path, graph);
     for (name, gref) in callees {
         let callee_path = CallPath::from_segments([name.as_str()]);
-        if name == "copy_string_to_raw" {
-            cc.mark_oopspec(callee_path.clone(), COPY_STRING_TO_RAW_OOPSPEC.to_string());
-            cc.mark_oopspec_argnames(
-                callee_path.clone(),
-                vec![
-                    "src".to_string(),
-                    "ptrdst".to_string(),
-                    "srcstart".to_string(),
-                    "length".to_string(),
-                ],
-            );
-        }
         if cc.has_function_graph(&callee_path) {
             continue;
         }
@@ -426,7 +411,16 @@ mod tests {
         let target = CallTarget::function_path(["copy_string_to_raw"]);
         assert_eq!(
             cc.get_oopspec(&target).as_deref(),
-            Some(COPY_STRING_TO_RAW_OOPSPEC)
+            Some("stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)")
+        );
+        assert_eq!(
+            cc.get_oopspec_argnames(&target),
+            Some(vec![
+                "src".to_string(),
+                "ptrdst".to_string(),
+                "srcstart".to_string(),
+                "length".to_string(),
+            ])
         );
         assert!(
             cc.has_function_graph(&CallPath::from_segments(["copy_string_to_raw"])),

@@ -38,6 +38,7 @@
 //!   / 2 classification so those phases can populate their own tables.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::flowcontext::FlowingError;
 use super::model::{ConstValue, Constant, Hlvalue, SpaceOperation, Variable};
@@ -1344,9 +1345,8 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }
         (OpKind::Len, [ConstValue::ByteStr(s)]) => Some(ConstValue::Int(s.len() as i64)),
         (OpKind::Len, [ConstValue::UniStr(s)]) => Some(ConstValue::Int(s.chars().count() as i64)),
-        (OpKind::Len, [ConstValue::Tuple(items) | ConstValue::List(items)]) => {
-            Some(ConstValue::Int(items.len() as i64))
-        }
+        (OpKind::Len, [ConstValue::Tuple(items)]) => Some(ConstValue::Int(items.len() as i64)),
+        (OpKind::Len, [ConstValue::List(items)]) => Some(ConstValue::Int(items.len() as i64)),
         (OpKind::Len, [ConstValue::Dict(items)]) => Some(ConstValue::Int(items.len() as i64)),
 
         // binary identity
@@ -1377,9 +1377,9 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             Some(ConstValue::Tuple(out))
         }
         (OpKind::Add, [ConstValue::List(a), ConstValue::List(b)]) => {
-            let mut out = a.clone();
+            let mut out = a.as_ref().clone();
             out.extend(b.iter().cloned());
-            Some(ConstValue::List(out))
+            Some(ConstValue::List(Arc::new(out)))
         }
 
         // binary arithmetic (numeric, with Python 3 coercion)
@@ -2064,7 +2064,10 @@ pub(crate) fn python_eq_const(a: &ConstValue, b: &ConstValue) -> bool {
         // `(True,) == (1,)` is True even though Bool/Int are
         // distinct variants. Cross-container types stay distinct
         // (`(1,) == [1]` is False in Python 3).
-        (C::Tuple(xs), C::Tuple(ys)) | (C::List(xs), C::List(ys)) => {
+        (C::Tuple(xs), C::Tuple(ys)) => {
+            xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| python_eq_const(x, y))
+        }
+        (C::List(xs), C::List(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys.iter()).all(|(x, y)| python_eq_const(x, y))
         }
         _ => a == b,
@@ -4545,7 +4548,7 @@ mod tests {
         );
         // List vs Tuple — distinct container types remain unequal
         // (Python 3: `[1] == (1,)` is False).
-        let lst = ConstValue::List(vec![ConstValue::Int(1)]);
+        let lst = ConstValue::List(Arc::new(vec![ConstValue::Int(1)]));
         let tup = ConstValue::Tuple(vec![ConstValue::Int(1)]);
         assert_eq!(
             fold(OpKind::Eq, vec![c(lst), c(tup)]),

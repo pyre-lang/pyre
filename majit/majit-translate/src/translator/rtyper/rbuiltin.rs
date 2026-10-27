@@ -6568,7 +6568,7 @@ mod tests {
             },
             "dummy_cond_call_fn",
             None,
-            None,
+            None::<String>,
         );
         let ptr_ty = fptr._TYPE.clone();
         let fptr_ll = LowLevelType::Ptr(Box::new(ptr_ty.clone()));
@@ -6652,7 +6652,7 @@ mod tests {
             },
             "dummy_cond_call_void_fn",
             None,
-            None,
+            None::<String>,
         );
         let ptr_ty = fptr._TYPE.clone();
         let fptr_ll = LowLevelType::Ptr(Box::new(ptr_ty.clone()));

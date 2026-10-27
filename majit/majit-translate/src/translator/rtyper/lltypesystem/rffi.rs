@@ -300,7 +300,7 @@ pub fn COpaquePtr(name: Option<&str>) -> LowLevelType {
 /// used by `extfunc.py`. Full wrapper generation remains with the broader
 /// `rffi.py` runtime port.
 pub fn llexternal(name: &str, args: Vec<LowLevelType>, result: LowLevelType) -> _ptr {
-    functionptr_with_external_name(FuncType { args, result }, name, None)
+    functionptr_with_external_name(FuncType { args, result }, name, None::<String>)
 }
 
 /// RPython `make(STRUCT, **fields)` (`rffi.py`).
@@ -1071,6 +1071,8 @@ fn build_copy_string_to_raw_helper_graph(name: &str) -> Result<PyGraph, TyperErr
         Constant::new(ConstValue::Dict(Default::default())),
     );
     func._always_inline_ = AlwaysInline::True;
+    // `rstr.py copy_string_to_raw`: `@jit.oopspec('stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)')`.
+    func.oopspec = Some("stroruni.copy_string_to_raw(src, ptrdst, srcstart, length)".to_string());
     graph.func = Some(func.clone());
     Ok(helper_pygraph_from_graph(
         graph,

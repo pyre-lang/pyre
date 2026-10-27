@@ -29,6 +29,7 @@ use indexmap::{IndexMap, IndexSet};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::{Rc, Weak};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::argument::{ArgumentsForTranslation, simple_args};
@@ -55,13 +56,56 @@ use crate::tool::algo::unionfind::UnionFind;
 ///
 /// `Constant(x)` is `Hashable` (`uid.py`): a hashable value uses
 /// `(type(x), x)`, an unhashable `r_dict` / `dict` / `list` uses
-/// `id(x)`. List/dict callers that still hold a `Constant` use
-/// [`ImmutableCacheKey::Constant`]; a prebuilt `objectmodel.r_dict`
-/// is a `HostObject` whose Hash/Eq is `Arc::ptr_eq` (`id(x)`).
+/// `id(x)`. The list arm keys by the list object
+/// ([`ImmutableCacheKey::PrebuiltList`]), the dict arm by the dict
+/// object ([`ImmutableCacheKey::PrebuiltDict`]), and a prebuilt
+/// `objectmodel.r_dict` host instance by
+/// [`ImmutableCacheKey::HostObject`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ImmutableCacheKey {
-    Constant(u64),
     HostObject(HostObject),
+    PrebuiltDict(ArcIdentity),
+    PrebuiltList(ListArcIdentity),
+}
+
+/// `Hashable.key = id(value)` for an unhashable prebuilt dict: the `Arc`
+/// allocation is the dict object. Holding the `Arc` keeps that identity
+/// from being reused while the cache entry lives.
+#[derive(Clone, Debug)]
+pub struct ArcIdentity(Arc<IndexMap<ConstValue, ConstValue>>);
+
+impl PartialEq for ArcIdentity {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &o.0)
+    }
+}
+
+impl Eq for ArcIdentity {}
+
+impl std::hash::Hash for ArcIdentity {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(h);
+    }
+}
+
+/// `Hashable.key = id(value)` for an unhashable prebuilt list: the `Arc`
+/// allocation is the list object. Holding the `Arc` keeps that identity
+/// from being reused while the cache entry lives.
+#[derive(Clone, Debug)]
+pub struct ListArcIdentity(Arc<Vec<ConstValue>>);
+
+impl PartialEq for ListArcIdentity {
+    fn eq(&self, o: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &o.0)
+    }
+}
+
+impl Eq for ListArcIdentity {}
+
+impl std::hash::Hash for ListArcIdentity {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        (Arc::as_ptr(&self.0) as usize).hash(h);
+    }
 }
 
 // Exists to localise prepass nondeterminism (gh#1139).
@@ -298,9 +342,7 @@ pub struct Bookkeeper {
     /// [`super::model::s_impossible_value`] as the
     /// seed for the first hit.
     pub _jit_annotation_cache: RefCell<HashMap<HostObject, HashMap<String, SomeValue>>>,
-    /// RPython `self.immutable_cache = {}` (bookkeeper.py), keyed by
-    /// the identity of `Constant(x)` for the List / Dict / OrderedDict /
-    /// r_dict branches of `immutablevalue` (bookkeeper.py).
+    /// RPython `self.immutable_cache = {}` (bookkeeper.py).
     /// Upstream's cache memoises the returned `SomeList` / `SomeDict` so
     /// downstream `generalize_key` / `generalize` mutations on the
     /// cached `DictDef` / `ListDef` persist across calls.
@@ -312,9 +354,11 @@ pub struct Bookkeeper {
     /// `annotation()` call builds a fresh DictDef and the mutation
     /// dissolves.
     ///
-    /// `Hashable` (`uid.py`) uses `id(x)` for an unhashable `r_dict`;
-    /// two `Constant` wrappers of the same host object share that key.
-    /// [`ImmutableCacheKey::HostObject`] is that `id(x)` arm.
+    /// `Hashable` (`uid.py`) uses `id(x)` for an unhashable list /
+    /// dict / `r_dict`. Two `Constant` wrappers of the same list object
+    /// share [`ImmutableCacheKey::PrebuiltList`]; of the same dict
+    /// object, [`ImmutableCacheKey::PrebuiltDict`]; an `r_dict` host
+    /// instance shares [`ImmutableCacheKey::HostObject`].
     pub immutable_cache: RefCell<HashMap<ImmutableCacheKey, SomeValue>>,
     /// RPython `self.pending_specializations = []` (bookkeeper.py).
     ///
@@ -4771,7 +4815,10 @@ impl Bookkeeper {
                 };
                 let contains = match &c.value {
                     // upstream `_attrs_` is typically a tuple of strings.
-                    ConstValue::Tuple(vs) | ConstValue::List(vs) => {
+                    ConstValue::Tuple(vs) => {
+                        vs.iter().any(|v| v.as_text() == Some(attr_name.as_str()))
+                    }
+                    ConstValue::List(vs) => {
                         vs.iter().any(|v| v.as_text() == Some(attr_name.as_str()))
                     }
                     _ => false,
@@ -5017,29 +5064,34 @@ impl Bookkeeper {
         x: &ConstValue,
         items: &[ConstValue],
     ) -> Result<SomeValue, AnnotatorError> {
-        if let Some(key) = key
-            && let Some(hit) = self
-                .immutable_cache
-                .borrow()
-                .get(&ImmutableCacheKey::Constant(key.id))
-                .cloned()
+        // `bookkeeper.py Bookkeeper.immutablevalue` list arm:
+        // `key = Constant(x)` then `immutable_cache[key]`. Unhashable
+        // lists key by `id(x)` (`uid.py Hashable`); the Arc allocation
+        // is that list object.
+        let cache_key = prebuilt_dict_cache_key(x);
+        if let Some(cache_key) = &cache_key
+            && let Some(hit) = self.immutable_cache.borrow().get(cache_key).cloned()
         {
             return Ok(hit);
         }
         let listdef = ListDef::new(Some(self.clone()), SomeValue::Impossible, false, false);
         let mut result = SomeList::new(listdef.clone());
-        result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
-        if let Some(key) = key {
-            self.immutable_cache.borrow_mut().insert(
-                ImmutableCacheKey::Constant(key.id),
-                SomeValue::List(result.clone()),
-            );
+        if let Some(cache_key) = &cache_key {
+            self.immutable_cache
+                .borrow_mut()
+                .insert(cache_key.clone(), SomeValue::List(result.clone()));
         }
         for e in items {
             let s_e = self.immutablevalue(e)?;
             listdef
                 .generalize(&s_e)
                 .map_err(|e| AnnotatorError::new(e.msg))?;
+        }
+        result.base.const_box = Some(key.cloned().unwrap_or_else(|| Constant::new(x.clone())));
+        if let Some(cache_key) = cache_key {
+            self.immutable_cache
+                .borrow_mut()
+                .insert(cache_key, SomeValue::List(result.clone()));
         }
         Ok(SomeValue::List(result))
     }
@@ -5051,7 +5103,7 @@ impl Bookkeeper {
         key: Option<&Constant>,
         x: &ConstValue,
     ) -> Result<SomeValue, AnnotatorError> {
-        let cache_key = prebuilt_dict_cache_key(key, x);
+        let cache_key = prebuilt_dict_cache_key(x);
         if let Some(cache_key) = &cache_key
             && let Some(hit) = self.immutable_cache.borrow().get(cache_key).cloned()
         {
@@ -5125,12 +5177,14 @@ impl Bookkeeper {
     }
 
     /// RPython `Bookkeeper.immutablevalue(Constant(x))` for callers that
-    /// still have the original `Constant` object and therefore its
-    /// identity. List/dict branches must preserve that identity so
-    /// `self.immutable_cache[key]` matches upstream.
+    /// still have the original `Constant` object. List/dict branches
+    /// key the cache by `id(x)` (`uid.py Hashable`) and store that
+    /// wrapper on `const_box`.
     pub fn immutableconstant(self: &Rc<Self>, c: &Constant) -> Result<SomeValue, AnnotatorError> {
         match &c.value {
-            ConstValue::List(items) => self.immutable_list_with_key(Some(c), &c.value, items),
+            ConstValue::List(items) => {
+                self.immutable_list_with_key(Some(c), &c.value, items.as_slice())
+            }
             ConstValue::Dict(_) => self.immutable_dict_with_key(Some(c), &c.value),
             // Legacy `ConstUInt` stored as `ConstValue::Int` with
             // `concretetype = Unsigned`. Prefer `ConstValue::UInt`; this
@@ -5162,7 +5216,7 @@ impl Bookkeeper {
     /// float / str / char / unicode / bytearray / tuple / None) are
     /// ported line-by-line. Callers that still have the original
     /// [`Constant`] object should use [`Self::immutableconstant`] so
-    /// list/dict branches can preserve `Constant(x)` identity.
+    /// list/dict branches can store that wrapper on `const_box`.
     ///
     /// The function / class / bound-method / weakref / frozen-PBC /
     /// property / instance branches (bookkeeper.py:218-348) route
@@ -5247,7 +5301,7 @@ impl Bookkeeper {
                     .collect::<Result<Vec<_>, _>>()?;
                 Ok(SomeValue::Tuple(SomeTuple::new(items_s)))
             }
-            ConstValue::List(items) => self.immutable_list_with_key(None, x, items),
+            ConstValue::List(items) => self.immutable_list_with_key(None, x, items.as_slice()),
             ConstValue::Dict(_) => self.immutable_dict_with_key(None, x),
             ConstValue::HostObject(obj) => self.immutablevalue_hostobject(obj, x),
             ConstValue::Function(func) => {
@@ -5351,9 +5405,9 @@ impl Bookkeeper {
     ) -> Result<SomeValue, AnnotatorError> {
         // `bookkeeper.py immutablevalue`: `tp is dict or tp is r_dict or
         // tp is OrderedDict or tp is r_ordereddict` sits immediately
-        // before the weakref arm. A prebuilt `objectmodel.r_dict` is a
-        // host instance of that class.
-        if is_objectmodel_r_dict_instance(obj) {
+        // before the weakref arm. The host-instance half of that
+        // exact-type gate is [`is_prebuilt_dict_host_instance`].
+        if is_prebuilt_dict_host_instance(obj) {
             return self.immutable_dict_with_key(None, raw);
         }
         // upstream bookkeeper.py — `tp is weakref.ReferenceType`:
@@ -6299,7 +6353,7 @@ fn collections_ordered_dict_class() -> Option<HostObject> {
     crate::flowspace::model::HOST_ENV.lookup_builtin("OrderedDict")
 }
 
-/// `bookkeeper.py immutablevalue`: `issubclass(tp, r_dict)`.
+/// `bookkeeper.py immutablevalue`: `is_r_dict = issubclass(tp, r_dict)` (r_ordereddict is a subclass).
 fn is_objectmodel_r_dict_class(cls: &HostObject) -> bool {
     objectmodel_r_dict_class()
         .as_ref()
@@ -6313,10 +6367,29 @@ fn is_objectmodel_r_ordereddict_class(cls: &HostObject) -> bool {
         .is_some_and(|canonical| cls == canonical)
 }
 
-/// `bookkeeper.py immutablevalue`: `tp is r_dict` / `issubclass(tp, r_dict)`.
+/// `issubclass(type(obj), r_dict)`; reached only after the exact-type gate.
 pub(crate) fn is_objectmodel_r_dict_instance(obj: &HostObject) -> bool {
     obj.instance_class()
         .is_some_and(is_objectmodel_r_dict_class)
+}
+
+/// `bookkeeper.py immutablevalue`: `tp is r_dict or tp is OrderedDict or tp is r_ordereddict` (the host-instance half of the dict arm's exact-type gate).
+fn is_prebuilt_dict_host_class(cls: &HostObject) -> bool {
+    objectmodel_r_dict_class()
+        .as_ref()
+        .is_some_and(|canonical| cls == canonical)
+        || objectmodel_r_ordereddict_class()
+            .as_ref()
+            .is_some_and(|canonical| cls == canonical)
+        || collections_ordered_dict_class()
+            .as_ref()
+            .is_some_and(|canonical| cls == canonical)
+}
+
+/// Host instance whose type *is* `r_dict`, `OrderedDict`, or `r_ordereddict`.
+pub(crate) fn is_prebuilt_dict_host_instance(obj: &HostObject) -> bool {
+    obj.instance_class()
+        .is_some_and(is_prebuilt_dict_host_class)
 }
 
 /// `bookkeeper.py immutablevalue`: `tp is OrderedDict or tp is r_ordereddict`.
@@ -6339,11 +6412,10 @@ fn is_prebuilt_r_dict_tp(x: &ConstValue) -> bool {
     }
 }
 
-fn prebuilt_dict_cache_key(key: Option<&Constant>, x: &ConstValue) -> Option<ImmutableCacheKey> {
-    if let Some(key) = key {
-        return Some(ImmutableCacheKey::Constant(key.id));
-    }
+fn prebuilt_dict_cache_key(x: &ConstValue) -> Option<ImmutableCacheKey> {
     match x {
+        ConstValue::List(l) => Some(ImmutableCacheKey::PrebuiltList(ListArcIdentity(l.clone()))),
+        ConstValue::Dict(d) => Some(ImmutableCacheKey::PrebuiltDict(ArcIdentity(d.clone()))),
         ConstValue::HostObject(obj) => Some(ImmutableCacheKey::HostObject(obj.clone())),
         _ => None,
     }
@@ -10222,10 +10294,10 @@ mod tests {
     fn immutablevalue_list_generalizes_elements() {
         let bk = bk();
         let s = bk
-            .immutablevalue(&ConstValue::List(vec![
+            .immutablevalue(&ConstValue::List(Arc::new(vec![
                 ConstValue::Int(1),
                 ConstValue::Int(-1),
-            ]))
+            ])))
             .unwrap();
         match s {
             SomeValue::List(sl) => {
@@ -10245,7 +10317,7 @@ mod tests {
     #[test]
     fn immutableconstant_list_reuses_same_constant_identity() {
         let bk = bk();
-        let key = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let key = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
         let a = bk.immutableconstant(&key).unwrap();
         let b = bk.immutableconstant(&key).unwrap();
         let (SomeValue::List(a), SomeValue::List(b)) = (a, b) else {
@@ -10259,8 +10331,8 @@ mod tests {
     #[test]
     fn immutableconstant_list_distinguishes_equal_but_distinct_constants() {
         let bk = bk();
-        let a_key = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
-        let b_key = Constant::new(ConstValue::List(vec![ConstValue::Int(1)]));
+        let a_key = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
+        let b_key = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
         let a = bk.immutableconstant(&a_key).unwrap();
         let b = bk.immutableconstant(&b_key).unwrap();
         let (SomeValue::List(a), SomeValue::List(b)) = (a, b) else {
@@ -10269,6 +10341,40 @@ mod tests {
         assert!(!a.listdef.same_as(&b.listdef));
         assert_eq!(a.base.const_box.as_ref().map(|c| c.id), Some(a_key.id));
         assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(b_key.id));
+    }
+
+    /// `bookkeeper.py Bookkeeper.immutablevalue` list arm: `key = Constant(x)`
+    /// then `immutable_cache[key]`. Unhashable lists key by `id(x)`
+    /// (`uid.py Hashable`), so two wrappers of one list object share a
+    /// ListDef; equal contents in distinct allocations do not.
+    #[test]
+    fn immutablevalue_same_list_object_shares_listdef() {
+        let bk = bk();
+        let items = Arc::new(vec![ConstValue::Int(1)]);
+        let a_key = Constant::new(ConstValue::List(items.clone()));
+        let b_key = Constant::new(ConstValue::List(items));
+        assert_ne!(a_key.id, b_key.id);
+        let a = bk.immutablevalue(&a_key.value).unwrap();
+        let b = bk.immutablevalue(&b_key.value).unwrap();
+        let (SomeValue::List(a), SomeValue::List(b)) = (a, b) else {
+            panic!("expected SomeList");
+        };
+        assert!(
+            a.listdef.same_as(&b.listdef),
+            "two Constant wrappers of the same list share one ListDef"
+        );
+
+        let c_key = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
+        let d_key = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
+        let c = bk.immutablevalue(&c_key.value).unwrap();
+        let d = bk.immutablevalue(&d_key.value).unwrap();
+        let (SomeValue::List(c), SomeValue::List(d)) = (c, d) else {
+            panic!("expected SomeList");
+        };
+        assert!(
+            !c.listdef.same_as(&d.listdef),
+            "equal contents in distinct list objects keep distinct ListDefs"
+        );
     }
 
     #[test]
@@ -10288,6 +10394,29 @@ mod tests {
         assert_ne!(a.dictdef, b.dictdef);
         assert_eq!(a.base.const_box.as_ref().map(|c| c.id), Some(a_key.id));
         assert_eq!(b.base.const_box.as_ref().map(|c| c.id), Some(b_key.id));
+    }
+
+    /// `uid.py Hashable.__init__`: `Constant(x).key` is `id(x)` for an
+    /// unhashable dict, so two `Constant` wrappers of the same dict
+    /// object share `immutable_cache`.
+    #[test]
+    fn prebuilt_dict_rewrapped_in_two_constants_shares_one_dictdef() {
+        let bk = bk();
+        let mut items = IndexMap::new();
+        items.insert(ConstValue::Int(1), ConstValue::Int(2));
+        let dict = ConstValue::Dict(std::sync::Arc::new(items));
+        let a_key = Constant::new(dict.clone());
+        let b_key = Constant::new(dict);
+        assert_ne!(a_key.id, b_key.id);
+        let a = bk.immutableconstant(&a_key).unwrap();
+        let b = bk.immutableconstant(&b_key).unwrap();
+        let (SomeValue::Dict(a), SomeValue::Dict(b)) = (a, b) else {
+            panic!("expected SomeDict");
+        };
+        assert!(
+            a.dictdef.same_as(&b.dictdef),
+            "two Constant wrappers of the same dict share one DictDef"
+        );
     }
 
     fn canonical_r_dict_class() -> HostObject {
@@ -10466,14 +10595,15 @@ mod tests {
         );
     }
 
-    /// `bookkeeper.py immutablevalue`: `is_r_dict = issubclass(tp, r_dict)`.
+    /// `bookkeeper.py immutablevalue`: `is_r_dict = issubclass(tp, r_dict)`
+    /// is consulted only after the exact-type gate. A custom subclass
+    /// still satisfies `issubclass`, but does not enter the dict arm.
     #[test]
-    fn immutablevalue_r_dict_subclass_is_r_dict() {
+    fn immutablevalue_r_dict_subclass_keeps_issubclass_but_skips_dict_arm() {
         use crate::annotator::model::SomeValue;
         use crate::flowspace::model::HostObject;
 
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let bk = ann.bookkeeper.clone();
+        let bk = bk();
         let key_eq = HostObject::new_user_function(compiled_graph_func(
             "def key_eq(a, b):\n    return a == b\n",
             Vec::new(),
@@ -10484,15 +10614,33 @@ mod tests {
         ));
         let subclass = HostObject::new_class("pkg.MyRDict", vec![canonical_r_dict_class()]);
         let r_dict = prebuilt_r_dict_on(subclass, key_eq, key_hash, &[(1, 10)]);
-        let s = bk
-            .immutablevalue(&ConstValue::HostObject(r_dict))
-            .expect("r_dict subclass immutablevalue");
-        let SomeValue::Dict(sd) = s else {
-            panic!("expected SomeDict, got {s:?}");
-        };
         assert!(
-            sd.dictdef.custom_eq_hash(),
-            "subclass of r_dict keeps is_r_dict"
+            is_objectmodel_r_dict_instance(&r_dict),
+            "issubclass(MyRDict, r_dict)"
+        );
+        let s = bk.immutablevalue(&ConstValue::HostObject(r_dict));
+        assert!(
+            !matches!(s, Ok(SomeValue::Dict(_))),
+            "subclass of r_dict is not the dict arm, got {s:?}"
+        );
+    }
+
+    /// `bookkeeper.py immutablevalue`: the dict arm is `tp is dict or
+    /// tp is r_dict or tp is OrderedDict or tp is r_ordereddict`.
+    /// A subclass of `r_dict` that is not those types is an ordinary
+    /// instance.
+    #[test]
+    fn prebuilt_r_dict_subclass_instance_is_ordinary_instance() {
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::HostObject;
+
+        let bk = bk();
+        let subclass = HostObject::new_class("pkg.MyRDict", vec![canonical_r_dict_class()]);
+        let inst = HostObject::new_instance(subclass, vec![]);
+        let s = bk.immutablevalue(&ConstValue::HostObject(inst));
+        assert!(
+            !matches!(s, Ok(SomeValue::Dict(_))),
+            "MyRDict subclass of r_dict is not the dict arm, got {s:?}"
         );
     }
 

@@ -14200,6 +14200,10 @@ pub(crate) fn effect_graph_from_rtyped_helper(
         if func._jit_unroll_safe_ {
             out.func.unroll_safe = true;
         }
+        out.func.oopspec = func.oopspec.clone();
+        if func.oopspec.is_some() {
+            out.func.oopspec_argnames = startblock_oopspec_argnames(graph);
+        }
     }
     if out
         .block(out.returnblock)
@@ -14214,6 +14218,31 @@ pub(crate) fn effect_graph_from_rtyped_helper(
         out.return_type = Some("i64".into());
     }
     out
+}
+
+/// Bare startblock inputarg names for `FuncEffects.oopspec_argnames`.
+/// Same source as `OpKind::Input { name }` (`Variable::name_prefix` when
+/// renamed); strip the intern trailing `_` so the names match harvested
+/// `#[oopspec]` argnames (no numbering suffix).
+fn startblock_oopspec_argnames(graph: &crate::flowspace::model::FunctionGraph) -> Vec<String> {
+    use crate::flowspace::model::Hlvalue;
+    graph
+        .startblock
+        .borrow()
+        .inputargs
+        .iter()
+        .filter_map(|hlv| match hlv {
+            Hlvalue::Variable(v) => {
+                let name = if v.renamed() {
+                    v.name_prefix()
+                } else {
+                    "arg".to_string()
+                };
+                Some(name.strip_suffix('_').unwrap_or(&name).to_string())
+            }
+            Hlvalue::Constant(_) => None,
+        })
+        .collect()
 }
 
 fn effect_value_type_from_concrete(kind: crate::model::ConcreteType) -> crate::model::ValueType {
@@ -14445,6 +14474,24 @@ fn effect_malloc_owner(hlv: &crate::flowspace::model::Hlvalue) -> String {
                 LowLevelType::Array(a) => format!("Array({})", a.OF.short_name()),
                 other => other.short_name(),
             },
+            other => panic!(
+                "effect_graph_from_rtyped_helper: malloc first operand is not a LowLevelType const: {other:?}"
+            ),
+        },
+        Hlvalue::Variable(_) => {
+            panic!("effect_graph_from_rtyped_helper: malloc first operand is a Variable")
+        }
+    }
+}
+
+/// `_rewrite_raw_malloc` `TYPE = op.args[0].value`.
+fn effect_malloc_type(
+    hlv: &crate::flowspace::model::Hlvalue,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    match hlv {
+        Hlvalue::Constant(c) => match &c.value {
+            ConstValue::LowLevelType(lltype) => (**lltype).clone(),
             other => panic!(
                 "effect_graph_from_rtyped_helper: malloc first operand is not a LowLevelType const: {other:?}"
             ),
@@ -14747,6 +14794,7 @@ fn effect_transduce_op(
                     effect_malloc_raw_flags(&op.args[1]);
                 OpKind::raw_malloc_with_flags(
                     owner,
+                    Some(effect_malloc_type(&op.args[0])),
                     zero,
                     track_allocation,
                     add_memory_pressure,
@@ -14768,6 +14816,7 @@ fn effect_transduce_op(
                     block,
                     OpKind::raw_malloc_with_flags(
                         effect_malloc_owner(&op.args[0]),
+                        Some(effect_malloc_type(&op.args[0])),
                         zero,
                         track_allocation,
                         add_memory_pressure,
@@ -21743,7 +21792,7 @@ mod tests {
         phi_sources.insert(
             forwarded,
             Some(LinkArg::from(crate::flowspace::model::ConstValue::List(
-                vec![],
+                std::sync::Arc::new(vec![]),
             ))),
         );
 

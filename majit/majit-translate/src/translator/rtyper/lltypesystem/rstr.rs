@@ -55,7 +55,7 @@ use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     _func, _ptr, _ptr_obj, Array, ForwardReference, FuncType, GcKind, LowLevelType, LowLevelValue,
-    MallocFlavor, Ptr, PtrTarget, Struct, functionptr, malloc,
+    MallocFlavor, Ptr, PtrTarget, Struct, functionptr_for_graph_with_type, malloc,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -8702,15 +8702,20 @@ pub(crate) fn build_ll_strhash_internal_helper_graph(
 ///         return 0
 /// ```
 ///
-/// 2-block CFG plus the returnblock:
+/// `jit.conditional_call_elidable` is `_always_inline_ = 'try'`
+/// (`rlib/jit.py conditional_call_elidable`), so the call is the
+/// inlined `we_are_jitted()` switch: true → `jit_conditional_call_value`;
+/// false → `if h == 0: direct_call(_ll_strhash, s)`.
+///
+/// CFG plus the returnblock:
 /// - **start**: `nz = ptr_nonzero(s)`. True → `block_lookup`;
 ///   False → returnblock(`Signed(0)`).
-/// - **block_lookup**: `h = getfield(s, 'hash')`, `result =
-///   jit_conditional_call_value(h, _ll_strhash_funcptr, s)`. Link to
-///   returnblock with `result`. The `jit_conditional_call_value`
-///   lloperation returns `h` if `h != 0`, otherwise calls
-///   `_ll_strhash(s)` and caches the result back into `s.hash`
-///   (rstr.py:396-398 semantics).
+/// - **block_lookup**: `h = getfield(s, 'hash')`; exitswitch SpecTag
+///   `we_are_jitted` (true first).
+/// - **block_jit**: `result = jit_conditional_call_value(h,
+///   _ll_strhash_funcptr, s)` → returnblock.
+/// - **block_interp**: `z = int_eq(h, 0)`; True → `block_call`
+///   `direct_call(_ll_strhash, s)`; False → return `h`.
 ///
 /// Sub-helper chain: `ll_strhash` -> `_ll_strhash` -> `_hash_string`.
 /// All three are registered in the helper-cache and shared across
@@ -8757,9 +8762,26 @@ pub(crate) fn build_ll_strhash_helper_graph(
         Hlvalue::Variable(return_var),
     );
 
-    // block_lookup: takes (s); reads cached hash + conditional call.
+    // block_lookup: takes (s); reads cached hash; we_are_jitted switch.
     let s_for_lookup = variable_with_lltype("s", ptr_lltype.clone());
     let block_lookup = Block::shared(vec![Hlvalue::Variable(s_for_lookup.clone())]);
+
+    let s_jit = variable_with_lltype("s", ptr_lltype.clone());
+    let h_jit = variable_with_lltype("h", LowLevelType::Signed);
+    let block_jit = Block::shared(vec![
+        Hlvalue::Variable(s_jit.clone()),
+        Hlvalue::Variable(h_jit.clone()),
+    ]);
+
+    let s_interp = variable_with_lltype("s", ptr_lltype.clone());
+    let h_interp = variable_with_lltype("h", LowLevelType::Signed);
+    let block_interp = Block::shared(vec![
+        Hlvalue::Variable(s_interp.clone()),
+        Hlvalue::Variable(h_interp.clone()),
+    ]);
+
+    let s_call = variable_with_lltype("s", ptr_lltype.clone());
+    let block_call = Block::shared(vec![Hlvalue::Variable(s_call.clone())]);
 
     // start: ptr_nonzero(s); branch.
     let nz = variable_with_lltype("nz", LowLevelType::Bool);
@@ -8784,7 +8806,7 @@ pub(crate) fn build_ll_strhash_helper_graph(
         .into_ref(),
     ]);
 
-    // block_lookup: getfield(s, 'hash') + jit_conditional_call_value.
+    // block_lookup: getfield(s, 'hash'); exitswitch we_are_jitted (true first).
     let h = variable_with_lltype("h", LowLevelType::Signed);
     block_lookup
         .borrow_mut()
@@ -8794,22 +8816,87 @@ pub(crate) fn build_ll_strhash_helper_graph(
             vec![Hlvalue::Variable(s_for_lookup.clone()), hash_field_const()],
             Hlvalue::Variable(h.clone()),
         ));
+    block_lookup.borrow_mut().exitswitch = Some(Hlvalue::Constant(Constant::with_concretetype(
+        ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID),
+        LowLevelType::Bool,
+    )));
+    block_lookup.closeblock(vec![
+        Link::new(
+            vec![
+                Hlvalue::Variable(s_for_lookup.clone()),
+                Hlvalue::Variable(h.clone()),
+            ],
+            Some(block_jit.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(s_for_lookup), Hlvalue::Variable(h)],
+            Some(block_interp.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // block_jit: jit_conditional_call_value(h, _ll_strhash, s).
     let result = variable_with_lltype("result", LowLevelType::Signed);
-    block_lookup
+    block_jit.borrow_mut().operations.push(SpaceOperation::new(
+        "jit_conditional_call_value",
+        vec![
+            Hlvalue::Variable(h_jit),
+            Hlvalue::Constant(c_internal_funcptr.clone()),
+            Hlvalue::Variable(s_jit),
+        ],
+        Hlvalue::Variable(result.clone()),
+    ));
+    block_jit.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(result)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    // block_interp: if h == 0: direct_call(_ll_strhash, s) else return h.
+    let z = variable_with_lltype("z", LowLevelType::Bool);
+    block_interp
         .borrow_mut()
         .operations
         .push(SpaceOperation::new(
-            "jit_conditional_call_value",
-            vec![
-                Hlvalue::Variable(h),
-                Hlvalue::Constant(c_internal_funcptr),
-                Hlvalue::Variable(s_for_lookup),
-            ],
-            Hlvalue::Variable(result.clone()),
+            "int_eq",
+            vec![Hlvalue::Variable(h_interp.clone()), signed_const(0)],
+            Hlvalue::Variable(z.clone()),
         ));
-    block_lookup.closeblock(vec![
+    block_interp.borrow_mut().exitswitch = Some(Hlvalue::Variable(z));
+    block_interp.closeblock(vec![
         Link::new(
-            vec![Hlvalue::Variable(result)],
+            vec![Hlvalue::Variable(s_interp)],
+            Some(block_call.clone()),
+            Some(bool_true()),
+        )
+        .into_ref(),
+        Link::new(
+            vec![Hlvalue::Variable(h_interp)],
+            Some(graph.returnblock.clone()),
+            Some(bool_false()),
+        )
+        .into_ref(),
+    ]);
+
+    // block_call: r = direct_call(_ll_strhash, s).
+    let r = variable_with_lltype("r", LowLevelType::Signed);
+    block_call.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(c_internal_funcptr),
+            Hlvalue::Variable(s_call),
+        ],
+        Hlvalue::Variable(r.clone()),
+    ));
+    block_call.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(r)],
             Some(graph.returnblock.clone()),
             None,
         )
@@ -9374,8 +9461,11 @@ fn build_jit_intrinsic_false_body_graph(name: &str, arg_lltype: LowLevelType) ->
 
 /// `rlib/jit.py isconstant` / `isvirtual` body graph: ordinary
 /// annotated graph on `translator.graphs` (`TranslationContext.graphs`,
-/// `FunctionDesc.cachedgraph`). One graph per `specialize:call_location`
-/// site.
+/// `FunctionDesc.cachedgraph`). The funcptr owns that graph
+/// (`lltype.py getfunctionptr` / `_func.graph`) so `LLFrame.perform_call`
+/// runs it. `_name` stays `majit_rlib::jit::isconstant` / `isvirtual`
+/// (`oopspec` identity for the codewriter). One graph per
+/// `specialize:call_location` site.
 fn jit_intrinsic_false_funcptr(
     rtyper: &RPythonTyper,
     name: &str,
@@ -9393,14 +9483,14 @@ fn jit_intrinsic_false_funcptr(
             .iter()
             .any(|existing| GraphKey::of(existing).as_usize() == graph_id)
         {
-            graphs.push(graph);
+            graphs.push(graph.clone());
         }
     }
     let ft = FuncType {
         args: vec![arg_lltype],
         result: LowLevelType::Bool,
     };
-    let ptr = functionptr(ft.clone(), name, Some(graph_id), Some(name.to_string()));
+    let ptr = functionptr_for_graph_with_type(&graph, ft.clone());
     Ok(Constant::with_concretetype(
         ConstValue::LLPtr(Box::new(ptr)),
         LowLevelType::Ptr(Box::new(Ptr {
@@ -9411,11 +9501,13 @@ fn jit_intrinsic_false_funcptr(
 
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks
 /// `jit.isconstant`. The body graph is `return False`
-/// (`rlib/jit.py isconstant`).
+/// (`rlib/jit.py isconstant`). `arg_lltype` is the argument's lltype
+/// (any type; the codewriter emits `{kind}_isconstant` from it).
 pub(crate) fn jit_isconstant_intrinsic_funcptr(
     rtyper: &RPythonTyper,
+    arg_lltype: LowLevelType,
 ) -> Result<Constant, TyperError> {
-    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isconstant", LowLevelType::Signed)
+    jit_intrinsic_false_funcptr(rtyper, "majit_rlib::jit::isconstant", arg_lltype)
 }
 
 /// Function pointer whose `_name` is the CallPath `lib.rs` marks
@@ -15672,10 +15764,10 @@ mod tests {
         assert!(body_ops.contains(&"unichar_eq"));
     }
 
-    /// `ll_strhash` synthesised against `Ptr(STR)` produces a
-    /// 2-block-plus-returnblock CFG. start (ptr_nonzero) branches on
-    /// `nz`: True → block_lookup, False → returnblock(0). block_lookup
-    /// emits `getfield + jit_conditional_call_value`.
+    /// `ll_strhash` synthesised against `Ptr(STR)`: start (ptr_nonzero)
+    /// True → block_lookup, False → returnblock(0). block_lookup is
+    /// getfield + SpecTag `we_are_jitted` (true first); the true
+    /// successor holds `jit_conditional_call_value`.
     #[test]
     fn build_ll_strhash_emits_null_guard_then_conditional_call_value_for_str() {
         use crate::annotator::annrpython::RPythonAnnotator;
@@ -15715,7 +15807,7 @@ mod tests {
         assert!(matches!(c_zero.value, ConstValue::Int(0)));
         drop(link_borrow);
 
-        // True branch -> block_lookup with getfield + jit_conditional_call_value.
+        // True branch -> block_lookup: getfield then SpecTag we_are_jitted.
         let true_link = startblock
             .exits
             .iter()
@@ -15729,11 +15821,36 @@ mod tests {
             .iter()
             .map(|op| op.opname.as_str())
             .collect();
-        assert_eq!(lookup_ops, vec!["getfield", "jit_conditional_call_value"]);
+        assert_eq!(lookup_ops, vec!["getfield"]);
+        match &lookup_borrow.exitswitch {
+            Some(Hlvalue::Constant(c)) => {
+                assert_eq!(c.value, ConstValue::SpecTag(WE_ARE_JITTED_TAG_ID))
+            }
+            other => panic!("lookup exitswitch must be the SpecTag constant, got {other:?}"),
+        }
+        assert_eq!(lookup_borrow.exits.len(), 2);
+        let jit_exit = lookup_borrow.exits[0].borrow();
+        assert!(
+            matches!(
+                &jit_exit.exitcase,
+                Some(Hlvalue::Constant(c)) if c.value == ConstValue::Bool(true)
+            ),
+            "true (jitted) link is first"
+        );
+        let jit_block = jit_exit.target.as_ref().unwrap().clone();
+        drop(jit_exit);
+        drop(lookup_borrow);
+        let jit_borrow = jit_block.borrow();
+        let jit_ops: Vec<&str> = jit_borrow
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(jit_ops, vec!["jit_conditional_call_value"]);
 
-        // jit_conditional_call_value has 3 args: cond (Variable h),
+        // jit_conditional_call_value has 3 args: value (Variable h),
         // funcptr Constant, s (Variable).
-        let cond_op = &lookup_borrow.operations[1];
+        let cond_op = &jit_borrow.operations[0];
         assert_eq!(cond_op.args.len(), 3);
         let Hlvalue::Constant(c_func) = &cond_op.args[1] else {
             panic!("jit_conditional_call_value arg[1] must be funcptr Constant");

@@ -2465,7 +2465,9 @@ impl FlowContext {
                                 Hlvalue::Constant(Constant {
                                     value: ConstValue::List(items),
                                     ..
-                                }) => Hlvalue::Constant(Constant::new(ConstValue::Tuple(items))),
+                                }) => Hlvalue::Constant(Constant::new(ConstValue::Tuple(
+                                    items.as_ref().clone(),
+                                ))),
                                 other => self.record_pure_op("list_to_tuple", vec![other])?,
                             }
                         }
@@ -2656,7 +2658,9 @@ impl FlowContext {
                                 Hlvalue::Variable(_) => unreachable!(),
                             })
                             .collect();
-                        Hlvalue::Constant(Constant::new(ConstValue::List(elements)))
+                        Hlvalue::Constant(Constant::new(ConstValue::List(std::sync::Arc::new(
+                            elements,
+                        ))))
                     } else {
                         self.record_pure_op("newlist", items)?
                     };
@@ -3305,11 +3309,11 @@ impl FlowContext {
                                 Hlvalue::Constant(Constant {
                                     value: ConstValue::Tuple(items),
                                     ..
-                                })
-                                | Hlvalue::Constant(Constant {
+                                }) => items.into_iter().map(Constant::new).collect(),
+                                Hlvalue::Constant(Constant {
                                     value: ConstValue::List(items),
                                     ..
-                                }) => items.into_iter().map(Constant::new).collect(),
+                                }) => items.iter().cloned().map(Constant::new).collect(),
                                 other => {
                                     return Err(FlowContextError::Flowing(FlowingError::new(
                                         format!(

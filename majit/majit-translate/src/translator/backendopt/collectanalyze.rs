@@ -240,7 +240,7 @@ mod tests {
             args: vec![],
             result: lltype::LowLevelType::Void,
         };
-        lltype::_func::new(functype, "ext".to_string(), None, None, attrs)
+        lltype::_func::new(functype, "ext".to_string(), None, None::<String>, attrs)
     }
 
     #[test]

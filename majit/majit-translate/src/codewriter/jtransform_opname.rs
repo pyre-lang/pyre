@@ -74,6 +74,7 @@ use crate::model::{
 };
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::lltypesystem::lltype::{Array, GcKind, LowLevelType, PtrTarget};
+use crate::translator::rtyper::lltypesystem::rstr::{STR, UNICODE};
 use majit_jitcode::codewriter::jtransform::{
     LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
 };
@@ -259,9 +260,37 @@ pub fn lower_graph(graph: &FlowGraph) -> crate::model::FunctionGraph {
         if let Some(look) = func._jit_look_inside_ {
             out.func.jit_look_inside = Some(look);
         }
+        out.func.oopspec = func.oopspec.clone();
+        if func.oopspec.is_some() {
+            out.func.oopspec_argnames = startblock_oopspec_argnames(graph);
+        }
     }
 
     out
+}
+
+/// Bare startblock inputarg names for `FuncEffects.oopspec_argnames`.
+/// Same source as `effect_graph_from_rtyped_helper`'s `OpKind::Input { name }`
+/// (`Variable::name_prefix` when renamed); strip the intern trailing `_`
+/// so the names match harvested `#[oopspec]` argnames (no numbering suffix).
+fn startblock_oopspec_argnames(graph: &FlowGraph) -> Vec<String> {
+    graph
+        .startblock
+        .borrow()
+        .inputargs
+        .iter()
+        .filter_map(|hlv| match hlv {
+            Hlvalue::Variable(v) => {
+                let name = if v.renamed() {
+                    v.name_prefix()
+                } else {
+                    "arg".to_string()
+                };
+                Some(name.strip_suffix('_').unwrap_or(&name).to_string())
+            }
+            Hlvalue::Constant(_) => None,
+        })
+        .collect()
 }
 
 /// Transduce a single flowspace `SpaceOperation` into the model graph at
@@ -318,81 +347,76 @@ fn transduce_op(
         }
         // `s.chars[i]` → `strgetitem(s, i)` / `unicodegetitem(s, i)`.  A
         // standalone `GcArray` is `getarrayitem_gc_<kind>`
-        // (`rewrite_op_getarrayitem`).
+        // (`rewrite_op_getarrayitem`).  Prefix: `_array_of_voids` then
+        // `FixedSizeArray` (`rewrite_op_getarrayitem`).
         "getarrayitem" => {
-            if let Some(array) = gc_array_of_operand(&op.args[0]) {
-                let base = expect_var(&op.args[0]);
-                let index = materialize(out, block, &op.args[1]);
-                let result = expect_var(&op.result);
-                out.push_op_with_result_var(
-                    block,
-                    OpKind::ArrayRead {
-                        base,
-                        index,
-                        item_ty: value_type_of(&result),
-                        array_type_id: array_type_id_of(&array),
-                        nolength: array_nolength(&array),
-                        pure: array._immutable_field(),
-                    },
-                    result,
-                );
+            if let Some(array_ty) = array_type_of_operand(&op.args[0]) {
+                if array_of_voids(&array_ty) {
+                    // `_array_of_voids(ARRAY)` returns [].  getsubstruct is
+                    // the other "emit nothing" case, and it still records an
+                    // alias; a Void-item getarrayitem result is unused.
+                    // debug_assert!: the result Variable must stay unconsumed.
+                    debug_assert!(
+                        matches!(
+                            expect_var(&op.result).concretetype().as_ref(),
+                            Some(LowLevelType::Void)
+                        ),
+                        "getarrayitem of a Void-item ARRAY has a Void result that must not be consumed"
+                    );
+                } else if is_fixed_size_array(&array_ty) {
+                    panic_fixed_size_array_unsupported(&out.name, &array_ty);
+                } else {
+                    emit_getarrayitem(out, block, op, chars_alias, family);
+                }
             } else {
-                let string_var = resolve_string(chars_alias, &op.args[0]);
-                let index = materialize(out, block, &op.args[1]);
-                let result = expect_var(&op.result);
-                out.push_op_with_result_var(
-                    block,
-                    OpKind::LoweredBlackholeOp {
-                        opname: family.getitem.to_string(),
-                        args: vec![string_var.into(), index.into()],
-                    },
-                    result,
-                );
+                emit_getarrayitem(out, block, op, chars_alias, family);
             }
         }
         // `s.chars[i] = c` → `strsetitem(s, i, c)` / `unicodesetitem(...)`.
         // Void result.  A standalone `GcArray` is `setarrayitem_gc_<kind>`
-        // (`rewrite_op_setarrayitem`).
+        // (`rewrite_op_setarrayitem`).  Prefix: `_array_of_voids` then
+        // `FixedSizeArray` (`rewrite_op_setarrayitem`).
         "setarrayitem" => {
-            if let Some(array) = gc_array_of_operand(&op.args[0]) {
-                let base = expect_var(&op.args[0]);
-                let index = materialize(out, block, &op.args[1]);
-                let value = linkarg_from_hlvalue(&op.args[2]);
-                out.push_op_var(
-                    block,
-                    OpKind::ArrayWrite {
-                        base,
-                        index,
-                        value,
-                        item_ty: hlvalue_value_type(&op.args[2]),
-                        array_type_id: array_type_id_of(&array),
-                        nolength: array_nolength(&array),
-                    },
-                    false,
-                );
+            if let Some(array_ty) = array_type_of_operand(&op.args[0]) {
+                if array_of_voids(&array_ty) {
+                    // `_array_of_voids(ARRAY)` returns [].  Void result; no
+                    // op is emitted.  debug_assert!: unused afterwards.
+                    debug_assert!(
+                        matches!(
+                            expect_var(&op.result).concretetype().as_ref(),
+                            Some(LowLevelType::Void) | None
+                        ),
+                        "setarrayitem of a Void-item ARRAY has a Void result that must not be consumed"
+                    );
+                } else if is_fixed_size_array(&array_ty) {
+                    panic_fixed_size_array_unsupported(&out.name, &array_ty);
+                } else {
+                    emit_setarrayitem(out, block, op, chars_alias, family);
+                }
             } else {
-                let string_var = resolve_string(chars_alias, &op.args[0]);
-                let index = materialize(out, block, &op.args[1]);
-                let value = materialize(out, block, &op.args[2]);
-                out.push_op_var(
-                    block,
-                    OpKind::LoweredBlackholeOp {
-                        opname: family.setitem.to_string(),
-                        args: vec![string_var.into(), index.into(), value.into()],
-                    },
-                    false,
-                );
+                emit_setarrayitem(out, block, op, chars_alias, family);
             }
         }
-        // `malloc_varsize(STR, gc, n)` → `newstr(n)` / `newunicode(n)`.
-        // `malloc_varsize(GcArray, gc, n)` → `new_array` / `new_array_clear`
-        // (`rewrite_op_malloc_varsize`).  STR vs UNICODE vs GcArray is the
-        // first-arg Constant lltype, not the graph-wide string family.
+        // `rewrite_op_malloc_varsize`: flavor `raw` first (these helpers are
+        // gc), then `op.args[0].value == rstr.STR` → `newstr`,
+        // `== rstr.UNICODE` → `newunicode`, else ARRAY → `new_array` /
+        // `new_array_clear`.
         "malloc_varsize" => {
-            let size = materialize(out, block, &op.args[2]);
-            let result = expect_var(&op.result);
             let malloc_ty = malloc_type_lltype(&op.args[0]);
-            if let Some(array) = gc_array_from_lltype(malloc_ty) {
+            if let Some(alloc_family) = str_family_from_lltype(malloc_ty) {
+                let size = materialize(out, block, &op.args[2]);
+                let result = expect_var(&op.result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::LoweredBlackholeOp {
+                        opname: alloc_family.alloc.to_string(),
+                        args: vec![size.into()],
+                    },
+                    result,
+                );
+            } else if let Some(array) = gc_array_from_lltype(malloc_ty) {
+                let size = materialize(out, block, &op.args[2]);
+                let result = expect_var(&op.result);
                 let item_ty = array_item_value_type(&array.OF);
                 let array_type_id = array_type_id_of(&array);
                 let kind = if array_malloc_clears(&array, &op.args[1]) {
@@ -410,14 +434,8 @@ fn transduce_op(
                 };
                 out.push_op_with_result_var(block, kind, result);
             } else {
-                let alloc_family = str_family_from_lltype(malloc_ty).unwrap_or(*family);
-                out.push_op_with_result_var(
-                    block,
-                    OpKind::LoweredBlackholeOp {
-                        opname: alloc_family.alloc.to_string(),
-                        args: vec![size.into()],
-                    },
-                    result,
+                panic!(
+                    "jtransform_opname::lower_graph: malloc_varsize type is not STR, UNICODE, or GcArray: {malloc_ty:?}"
                 );
             }
         }
@@ -973,7 +991,43 @@ fn transduce_op(
                 .map(|a| materialize(out, block, a))
                 .collect();
             let result = expect_var(&op.result);
-            emit_conditional_call_oopspec(out, block, cond, &callee, extra_args, result);
+            emit_conditional_call_oopspec_named(
+                out,
+                block,
+                cond,
+                &callee,
+                extra_args,
+                result,
+                "conditional_call",
+            );
+        }
+        // `rlib/jit.py conditional_call_elidable` inlines to
+        // `jit_conditional_call_value` on the `we_are_jitted()` true arm.
+        // `jtransform.py Transformer.rewrite_op_jit_conditional_call_value`
+        // / `_rewrite_op_cond_call` rewrites the interpreter-facing
+        // `majit_rlib::jit::conditional_call_elidableN` Call (`oopspec
+        // jit.conditional_call_value`) to `OpKind::ConditionalCallValue`.
+        "jit_conditional_call_value" => {
+            assert!(
+                op.args.len() >= 2,
+                "jtransform_opname::lower_graph: jit_conditional_call_value needs value and fnptr"
+            );
+            let value = materialize(out, block, &op.args[0]);
+            let callee = callee_name_from_funcptr(&op.args[1]);
+            let extra_args: Vec<FVar> = op.args[2..]
+                .iter()
+                .map(|a| materialize(out, block, a))
+                .collect();
+            let result = expect_var(&op.result);
+            emit_conditional_call_oopspec_named(
+                out,
+                block,
+                value,
+                &callee,
+                extra_args,
+                result,
+                "conditional_call_elidable",
+            );
         }
         // `jtransform.py Transformer.rewrite_op_debug_assert` returns [].
         "debug_assert" => {}
@@ -995,7 +1049,41 @@ pub(crate) fn emit_conditional_call_oopspec(
     extra_args: Vec<FVar>,
     result: FVar,
 ) {
+    emit_conditional_call_oopspec_named(
+        out,
+        block,
+        cond,
+        callee_name,
+        extra_args,
+        result,
+        "conditional_call",
+    )
+}
+
+/// Interpreter-facing `oopspec("jit.conditional_call")` /
+/// `oopspec("jit.conditional_call_value")` Call.
+///
+/// `_rewrite_op_cond_call` reads args[0] as the condition/value, args[1] as
+/// the function (`fn_const_target_of` of a 0-arg `__fn_const` Call),
+/// and args[2:] as the callee arguments. The helper leaf is
+/// `{helper_prefix}{n}`: `conditional_callN` (`is_jit_conditional_call_path`)
+/// or `conditional_call_elidableN`. Only `conditional_call_elidable1` exists
+/// in majit-rlib.
+fn emit_conditional_call_oopspec_named(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    cond: FVar,
+    callee_name: &str,
+    extra_args: Vec<FVar>,
+    result: FVar,
+    helper_prefix: &str,
+) {
     let n = extra_args.len();
+    if helper_prefix == "conditional_call_elidable" && n != 1 {
+        panic!(
+            "jtransform_opname::lower_graph: missing majit_rlib::jit::conditional_call_elidable{n} helper"
+        );
+    }
     let fn_target = CallTarget::function_path(
         std::iter::once(FN_CONST_HEAD).chain(callee_name.split("::").filter(|s| !s.is_empty())),
     );
@@ -1011,7 +1099,7 @@ pub(crate) fn emit_conditional_call_oopspec(
         )
         .expect("__fn_const produces a result var");
     fn_var.set_concretetype(Some(LowLevelType::Signed));
-    let helper = format!("conditional_call{n}");
+    let helper = format!("{helper_prefix}{n}");
     let target = CallTarget::function_path(["majit_rlib", "jit", helper.as_str()]);
     let mut args = Vec::with_capacity(2 + extra_args.len());
     args.push(cond);
@@ -1082,27 +1170,145 @@ fn gc_array_from_lltype(ty: &LowLevelType) -> Option<Array> {
     }
 }
 
-/// STR vs UNICODE from the malloc type: a GcStruct whose `chars` field
-/// is `Array(Char)` / `Array(UniChar)` (`rstr.py` `STR` / `UNICODE`).
-fn str_family_from_lltype(ty: &LowLevelType) -> Option<StrFamily> {
+/// `ARRAY = op.args[0].concretetype.TO` (`rewrite_op_getarrayitem` /
+/// `rewrite_op_setarrayitem`).  `malloc_type_lltype` produces the TYPE
+/// constant itself, not a Ptr; this helper is the operand-side Ptr.TO.
+fn array_type_of_operand(hlv: &Hlvalue) -> Option<LowLevelType> {
+    let var = hlvalue_as_var(hlv)?;
+    ptr_to(&var.concretetype()?)
+}
+
+fn ptr_to(ty: &LowLevelType) -> Option<LowLevelType> {
     match ty {
-        LowLevelType::ForwardReference(fwd) => str_family_from_lltype(&fwd.resolved()?),
-        LowLevelType::Struct(s) => match s._flds.get("chars") {
-            Some(LowLevelType::Array(arr)) => match arr.OF {
-                LowLevelType::Char => Some(StrFamily::STR),
-                LowLevelType::UniChar => Some(StrFamily::UNICODE),
-                _ => None,
-            },
-            _ => None,
-        },
-        LowLevelType::Ptr(ptr) => match &ptr.TO {
-            PtrTarget::Struct(s) => {
-                str_family_from_lltype(&LowLevelType::Struct(Box::new(s.clone())))
-            }
-            PtrTarget::ForwardReference(fwd) => str_family_from_lltype(&fwd.resolved()?),
-            _ => None,
-        },
+        LowLevelType::ForwardReference(fwd) => ptr_to(&fwd.resolved()?),
+        LowLevelType::Ptr(ptr) => Some(LowLevelType::from(ptr.TO.clone())),
+        LowLevelType::InteriorPtr(ip) => Some((*ip.TO).clone()),
         _ => None,
+    }
+}
+
+/// `Transformer._array_of_voids(ARRAY)`: `ARRAY.OF == lltype.Void`.
+fn array_of_voids(array: &LowLevelType) -> bool {
+    match array {
+        LowLevelType::ForwardReference(fwd) => fwd.resolved().as_ref().is_some_and(array_of_voids),
+        LowLevelType::Array(arr) => matches!(arr.OF, LowLevelType::Void),
+        LowLevelType::FixedSizeArray(arr) => matches!(arr.OF, LowLevelType::Void),
+        _ => false,
+    }
+}
+
+/// `isinstance(ARRAY, lltype.FixedSizeArray)` (`rewrite_op_getarrayitem`).
+fn is_fixed_size_array(array: &LowLevelType) -> bool {
+    match array {
+        LowLevelType::ForwardReference(fwd) => {
+            fwd.resolved().as_ref().is_some_and(is_fixed_size_array)
+        }
+        LowLevelType::FixedSizeArray(_) => true,
+        _ => false,
+    }
+}
+
+fn panic_fixed_size_array_unsupported(graph: &str, array: &LowLevelType) -> ! {
+    panic!(
+        "NotImplementedError: {graph:?} uses {array:?}, which is not supported by the JIT codewriter"
+    )
+}
+
+/// STR vs UNICODE from the malloc type: lltype equality with
+/// `rstr.STR` / `rstr.UNICODE` (`rewrite_op_malloc_varsize`
+/// `op.args[0].value == rstr.STR`).  The producer (`struct_lltype_from_strptr`)
+/// passes the TYPE constant itself, not a Ptr.
+fn str_family_from_lltype(ty: &LowLevelType) -> Option<StrFamily> {
+    if *ty == *STR {
+        Some(StrFamily::STR)
+    } else if *ty == *UNICODE {
+        Some(StrFamily::UNICODE)
+    } else {
+        None
+    }
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn emit_getarrayitem(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+    chars_alias: &HashMap<FVar, FVar>,
+    family: &StrFamily,
+) {
+    if let Some(array) = gc_array_of_operand(&op.args[0]) {
+        let base = expect_var(&op.args[0]);
+        let index = materialize(out, block, &op.args[1]);
+        let result = expect_var(&op.result);
+        out.push_op_with_result_var(
+            block,
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty: value_type_of(&result),
+                array_type_id: array_type_id_of(&array),
+                nolength: array_nolength(&array),
+                pure: array._immutable_field(),
+            },
+            result,
+        );
+    } else {
+        let string_var = resolve_string(chars_alias, &op.args[0]);
+        let index = materialize(out, block, &op.args[1]);
+        let result = expect_var(&op.result);
+        out.push_op_with_result_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: family.getitem.to_string(),
+                args: vec![string_var.into(), index.into()],
+            },
+            result,
+        );
+    }
+}
+
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn emit_setarrayitem(
+    out: &mut crate::model::FunctionGraph,
+    block: BlockId,
+    op: &crate::flowspace::model::SpaceOperation,
+    chars_alias: &HashMap<FVar, FVar>,
+    family: &StrFamily,
+) {
+    if let Some(array) = gc_array_of_operand(&op.args[0]) {
+        let base = expect_var(&op.args[0]);
+        let index = materialize(out, block, &op.args[1]);
+        let value = linkarg_from_hlvalue(&op.args[2]);
+        out.push_op_var(
+            block,
+            OpKind::ArrayWrite {
+                base,
+                index,
+                value,
+                item_ty: hlvalue_value_type(&op.args[2]),
+                array_type_id: array_type_id_of(&array),
+                nolength: array_nolength(&array),
+            },
+            false,
+        );
+    } else {
+        let string_var = resolve_string(chars_alias, &op.args[0]);
+        let index = materialize(out, block, &op.args[1]);
+        let value = materialize(out, block, &op.args[2]);
+        out.push_op_var(
+            block,
+            OpKind::LoweredBlackholeOp {
+                opname: family.setitem.to_string(),
+                args: vec![string_var.into(), index.into(), value.into()],
+            },
+            false,
+        );
     }
 }
 
@@ -1126,6 +1332,7 @@ fn array_nolength(arr: &Array) -> bool {
 
 fn array_item_value_type(of: &LowLevelType) -> ValueType {
     match of {
+        LowLevelType::Void => ValueType::Void,
         LowLevelType::Struct(_) => ValueType::Ref(None),
         other => value_type_from_lltype(other),
     }
@@ -1428,7 +1635,9 @@ mod tests {
         Link, SpaceOperation, c_last_exception,
     };
     use crate::model::{ExitCase, ExitSwitch, LinkArg, OpKind, ValueType};
-    use crate::translator::rtyper::lltypesystem::lltype::{Array, LowLevelType, Ptr, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        Array, LowLevelType, Ptr, PtrTarget, Struct,
+    };
     use crate::translator::rtyper::lltypesystem::rbuilder::{
         STRINGBUILDERPTR, build_ll_bool_helper_graph, build_ll_getlength_helper_graph,
     };
@@ -2898,6 +3107,160 @@ mod tests {
         }))
     }
 
+    fn gcarray_void() -> LowLevelType {
+        LowLevelType::Array(Box::new(Array::gc(LowLevelType::Void)))
+    }
+
+    fn gcarray_void_ptr() -> LowLevelType {
+        LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Void)),
+        }))
+    }
+
+    /// `rewrite_op_malloc_varsize` compares `op.args[0].value == rstr.STR`.
+    /// A GcStruct that only looks like STR (`chars: Array(Char)` under a
+    /// different name) is not STR.
+    #[test]
+    #[should_panic(expected = "str_lookalike")]
+    fn malloc_varsize_of_str_lookalike_is_not_newstr() {
+        let lookalike = LowLevelType::Struct(Box::new(Struct::gc(
+            "str_lookalike",
+            vec![
+                ("hash".into(), LowLevelType::Signed),
+                (
+                    "chars".into(),
+                    LowLevelType::Array(Box::new(Array::new(LowLevelType::Char))),
+                ),
+            ],
+        )));
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+        let return_var = variable_with_lltype("s", STRPTR.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_malloc_varsize_str_lookalike",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let s = variable_with_lltype("s", STRPTR.clone());
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(lookalike),
+                gc_flavor_const().expect("gc flavor const"),
+                Hlvalue::Variable(n),
+            ],
+            Hlvalue::Variable(s.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(s)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let _model = lower_graph(&graph);
+    }
+
+    /// `rewrite_op_getarrayitem`: `_array_of_voids(ARRAY)` returns [].
+    #[test]
+    fn getarrayitem_of_void_array_emits_nothing() {
+        let array_ptr = gcarray_void_ptr();
+        let arr = variable_with_lltype("arr", array_ptr);
+        let i = variable_with_lltype("i", LowLevelType::Signed);
+        let startblock = Block::shared(vec![
+            Hlvalue::Variable(arr.clone()),
+            Hlvalue::Variable(i.clone()),
+        ]);
+        let return_var = variable_with_lltype("n", LowLevelType::Signed);
+        let graph = FlowGraph::with_return_var(
+            "ll_test_void_getarrayitem",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let x = variable_with_lltype("x", LowLevelType::Void);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getarrayitem",
+            vec![Hlvalue::Variable(arr), Hlvalue::Variable(i.clone())],
+            Hlvalue::Variable(x),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(i)],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        for block in &model.blocks {
+            for op in &block.operations {
+                panic!(
+                    "void-item getarrayitem must emit nothing, got {:?}",
+                    op.kind
+                );
+            }
+        }
+    }
+
+    /// `rewrite_op_malloc_varsize`: a Void-item `GcArray` still allocates
+    /// (`new_array`); `_array_of_voids` is getarrayitem/setarrayitem only.
+    #[test]
+    fn malloc_varsize_of_void_array_is_new_array() {
+        let n = variable_with_lltype("n", LowLevelType::Signed);
+        let startblock = Block::shared(vec![Hlvalue::Variable(n.clone())]);
+        let array_ptr = gcarray_void_ptr();
+        let return_var = variable_with_lltype("a", array_ptr.clone());
+        let graph = FlowGraph::with_return_var(
+            "ll_test_malloc_varsize_gcarray_void",
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let a = variable_with_lltype("a", array_ptr);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "malloc_varsize",
+            vec![
+                lowlevel_type_const(gcarray_void()),
+                gc_flavor_const().expect("gc flavor const"),
+                Hlvalue::Variable(n.clone()),
+            ],
+            Hlvalue::Variable(a.clone()),
+        ));
+        startblock.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Variable(a.clone())],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let model = lower_graph(&graph);
+        let mut news = Vec::new();
+        for block in &model.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::NewArray {
+                        length,
+                        item_ty,
+                        array_type_id,
+                    } => {
+                        assert_eq!(length, &n);
+                        assert_eq!(*item_ty, ValueType::Void);
+                        assert_eq!(array_type_id.as_deref(), Some("GcArray(Void)"));
+                        assert_eq!(op.result.as_ref(), Some(&a));
+                        news.push("new_array");
+                    }
+                    other => {
+                        panic!("void-item malloc_varsize must lower to NewArray, got {other:?}")
+                    }
+                }
+            }
+        }
+        assert_eq!(news, vec!["new_array"]);
+    }
+
     /// `rewrite_op_malloc_varsize`: `malloc_varsize(GcArray(Signed), {flavor: gc}, n)`
     /// is `new_array`, not `newstr`.
     #[test]
@@ -3155,6 +3518,61 @@ mod tests {
             cond_calls,
             vec![5],
             "one conditional_call3 Call (cond, fn, l, newsize, True), got {cond_calls:?}"
+        );
+        let has_fn_const = model.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    target
+                        .path_segments()
+                        .is_some_and(|segs| segs.first() == Some(&crate::model::FN_CONST_HEAD))
+                        && args.is_empty()
+                }
+                _ => false,
+            })
+        });
+        assert!(has_fn_const, "function arg is a 0-arg __fn_const Call");
+    }
+
+    /// `ll_strhash` inlines `rlib/jit.py conditional_call_elidable` to a
+    /// `jit_conditional_call_value` llop. `lower_graph` emits the interpreter-facing
+    /// `majit_rlib::jit::conditional_call_elidable1` Call `_rewrite_op_cond_call` rewrites.
+    #[test]
+    fn lower_graph_lowers_jit_conditional_call_value_in_ll_strhash() {
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rstr::string_repr;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let llfn = string_repr()
+            .get_ll_hash_function(&rtyper)
+            .expect("ll_strhash helper")
+            .expect("Some");
+        let graph = llfn.graph.as_ref().expect("ll_strhash graph");
+        let model = lower_graph(&graph.graph.borrow());
+        let cond_calls: Vec<_> = model
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, args, .. } => {
+                    let segs = target.path_segments()?;
+                    if segs == ["majit_rlib", "jit", "conditional_call_elidable1"] {
+                        assert!(
+                            op.result.is_some(),
+                            "conditional_call_elidable1 result var is the op result"
+                        );
+                        Some(args.len())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cond_calls,
+            vec![3],
+            "one conditional_call_elidable1 Call (value, fn, s), got {cond_calls:?}"
         );
         let has_fn_const = model.blocks.iter().any(|block| {
             block.operations.iter().any(|op| match &op.kind {

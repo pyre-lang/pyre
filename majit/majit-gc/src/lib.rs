@@ -3224,11 +3224,16 @@ pub fn set_active_raise_memory_error(hook: Option<RaiseMemoryErrorFn>) {
 }
 
 /// Store the prebuilt MemoryError singleton as the pending exception.
-/// No-op when no hook is installed, matching `memory_error_singleton_ref`
-/// with no provider.
+///
+/// The hook stores the prebuilt MemoryError
+/// (`jit_exc_raise(memory_error_singleton_ref())`). When no hook is
+/// installed the runtime cannot raise, which is `debug.py fatalerror`.
 pub fn raise_memory_error() {
     if let Some(hook) = ACTIVE_RAISE_MEMORY_ERROR.get() {
         hook();
+    } else {
+        eprintln!("fatal error: MemoryError raised with no runtime installed");
+        std::process::abort();
     }
 }
 

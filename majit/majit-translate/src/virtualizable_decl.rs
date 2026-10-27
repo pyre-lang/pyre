@@ -26,6 +26,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::model::{ConstValue, HostObject};
@@ -101,7 +102,7 @@ pub fn stamp_host_virtualizable(host: &HostObject, class_key: &str) {
         .into_iter()
         .map(ConstValue::byte_str)
         .collect::<Vec<_>>();
-    host.class_set("_virtualizable_", ConstValue::List(items));
+    host.class_set("_virtualizable_", ConstValue::List(Arc::new(items)));
 }
 
 /// Whether `owner` is the class that declared `_virtualizable_`
@@ -230,8 +231,8 @@ mod tests {
             panic!("_virtualizable_ must be a list");
         };
         assert_eq!(
-            items,
-            vec![ConstValue::byte_str("pc"), ConstValue::byte_str("stack[*]")]
+            items.as_slice(),
+            [ConstValue::byte_str("pc"), ConstValue::byte_str("stack[*]")]
         );
         register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
@@ -334,7 +335,7 @@ mod tests {
         else {
             panic!("_virtualizable_ must be a list");
         };
-        assert_eq!(items, vec![ConstValue::byte_str("x")]);
+        assert_eq!(items.as_slice(), [ConstValue::byte_str("x")]);
         register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
 

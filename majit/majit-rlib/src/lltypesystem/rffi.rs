@@ -29,7 +29,7 @@ const CHAR_ARRAY_LENGTH_SIZE: usize = std::mem::size_of::<isize>();
 #[majit_macros::oopspec("raw_malloc_varsize_char(size)")]
 #[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_char(size: usize) -> usize {
-    raw_malloc_varsize_char_impl(size, false, false)
+    raw_malloc_varsize_char_impl(size, size, false, false)
 }
 
 fn raw_malloc_char_memory_error() -> usize {
@@ -45,12 +45,17 @@ fn raw_malloc_char_memory_error() -> usize {
 #[majit_macros::oopspec("raw_malloc_varsize_zero(size)")]
 #[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_zero(size: usize) -> usize {
-    raw_malloc_varsize_char_impl(size, true, false)
+    raw_malloc_varsize_char_impl(size, size, true, false)
 }
 
-fn raw_malloc_varsize_char_impl(size: usize, zero: bool, add_memory_pressure: bool) -> usize {
-    if add_memory_pressure && size > 0 {
-        majit_gc::add_memory_pressure(size as isize, majit_ir::GcRef::NULL);
+fn raw_malloc_varsize_char_impl(
+    size: usize,
+    pressure: usize,
+    zero: bool,
+    add_memory_pressure: bool,
+) -> usize {
+    if add_memory_pressure && pressure > 0 {
+        majit_gc::add_memory_pressure(pressure as isize, majit_ir::GcRef::NULL);
     }
     let ptr = unsafe { crate::rffi::raw_malloc(size) };
     if ptr.is_null() {
@@ -66,14 +71,14 @@ fn raw_malloc_varsize_char_impl(size: usize, zero: bool, add_memory_pressure: bo
 #[majit_macros::oopspec("raw_malloc_varsize_char_add_memory_pressure(size)")]
 #[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_char_add_memory_pressure(size: usize) -> usize {
-    raw_malloc_varsize_char_impl(size, false, true)
+    raw_malloc_varsize_char_impl(size, size, false, true)
 }
 
 /// `_rewrite_raw_malloc` `_zero` + `_add_memory_pressure` on the CHAR path.
 #[majit_macros::oopspec("raw_malloc_varsize_zero_add_memory_pressure(size)")]
 #[majit_macros::dont_look_inside]
 pub fn raw_malloc_varsize_zero_add_memory_pressure(size: usize) -> usize {
-    raw_malloc_varsize_char_impl(size, true, true)
+    raw_malloc_varsize_char_impl(size, size, true, true)
 }
 
 /// `_rewrite_raw_malloc` `name += '_no_track_allocation'` on the CHAR path.
@@ -106,7 +111,8 @@ pub fn raw_malloc_varsize_zero_add_memory_pressure_no_track_allocation(size: usi
 /// `extra_item_after_alloc=1`. `llmemory.sizeof(TYPE, n)` is `n + 1`
 /// items (`llmemory.py extra_item_after_alloc`). The extra item is
 /// closed over; the call is still `(n)` (`support.py
-/// build_raw_malloc_varsize_builder`).
+/// build_raw_malloc_varsize_builder`). Memory pressure is charged for `n`
+/// items only (`gct_fv_raw_malloc_varsize` `raw_malloc_memory_pressure_varsize(length, itemsize)`).
 fn raw_malloc_varsize_char_extra_item_impl(
     n: usize,
     zero: bool,
@@ -115,7 +121,7 @@ fn raw_malloc_varsize_char_extra_item_impl(
     let Some(size) = n.checked_add(1) else {
         return raw_malloc_char_memory_error();
     };
-    raw_malloc_varsize_char_impl(size, zero, add_memory_pressure)
+    raw_malloc_varsize_char_impl(size, n, zero, add_memory_pressure)
 }
 
 #[majit_macros::oopspec("raw_malloc_varsize_char_extra_item(n)")]
@@ -186,8 +192,8 @@ fn raw_malloc_varsize_char_with_length_impl(
     let Some(payload) = n.checked_add(extra) else {
         return raw_malloc_char_memory_error();
     };
-    if add_memory_pressure && payload > 0 {
-        majit_gc::add_memory_pressure(payload as isize, majit_ir::GcRef::NULL);
+    if add_memory_pressure && n > 0 {
+        majit_gc::add_memory_pressure(n as isize, majit_ir::GcRef::NULL);
     }
     let Some(bytes) = CHAR_ARRAY_LENGTH_SIZE.checked_add(payload) else {
         return raw_malloc_char_memory_error();
@@ -390,9 +396,6 @@ impl _StrFinalizerQueue {
     }
 
     fn register_finalizer(gcptr: majit_ir::GcRef) {
-        if !majit_gc::current_thread_gc_available() || !majit_gc::rgil::am_i_holding_the_gil() {
-            return;
-        }
         majit_gc::gc_register_finalizer(Self::fq_index(), gcptr);
     }
 }
@@ -435,25 +438,33 @@ static STR_FQ_FREE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 /// `_get_raw_address_buf_from_string` (`rffi.py`). Cache key is
 /// `objectmodel.compute_unique_id` via `majit_gc::gc_id_or_identityhash`.
-/// Returns `CCHARP` (`*mut u8`). `str2charp` raises `MemoryError`.
+/// Returns `CCHARP` (`*mut u8`); when `str2charp` raises `MemoryError` the exception is pending and the result is NULL.
 ///
 /// Upstream has no JIT hint; the only caller is `get_raw_address_of_string`.
 #[allow(non_snake_case)]
-pub fn _get_raw_address_buf_from_string(string: *mut u8) -> Result<*mut u8, MemoryError> {
+pub fn _get_raw_address_buf_from_string(string: *mut u8) -> *mut u8 {
     let key = majit_gc::gc_id_or_identityhash(string as usize);
     {
         let fq = _fq_addr_from_string.lock();
         if let Some(&ptr) = fq.raw_copies.get(&key) {
-            return Ok(ptr as *mut u8);
+            return ptr as *mut u8;
         }
     }
-    let ptr = unsafe { str2charp(str_as_bytes(string as *const u8), false)? };
+    let ptr = match unsafe { str2charp(str_as_bytes(string as *const u8), false) } {
+        Ok(ptr) => ptr,
+        Err(MemoryError) => {
+            // `str2charp` raises `MemoryError`: pending exception + NULL is the
+            // published `CCHARP` helper's raise shape.
+            majit_gc::raise_memory_error();
+            return core::ptr::null_mut();
+        }
+    };
     {
         let mut fq = _fq_addr_from_string.lock();
         fq.raw_copies.insert(key, ptr as usize);
     }
     _StrFinalizerQueue::register_finalizer(majit_ir::GcRef(string as usize));
-    Ok(ptr)
+    ptr
 }
 
 /// Residual `HELPER_FNADDRS` row (`rffi_expand` `helper_fnaddr_registration`).
@@ -503,16 +514,7 @@ pub fn get_raw_address_of_string(string: *mut u8) -> *mut u8 {
         let moved = majit_gc::gc_move_out_of_nursery(gcref);
         string = moved.0 as *mut u8;
         if majit_gc::can_move(moved) {
-            return match _get_raw_address_buf_from_string(string) {
-                Ok(ptr) => ptr,
-                Err(MemoryError) => {
-                    // Residual `HELPER_FNADDRS` ABI is `CCHARP` with
-                    // `EF_CAN_RAISE`; pending exception + NULL is that
-                    // residual shape (`raw_malloc_memory_error`).
-                    majit_gc::raise_memory_error();
-                    core::ptr::null_mut()
-                }
-            };
+            return _get_raw_address_buf_from_string(string);
         }
     }
     let data_start = unsafe { string.add(STR_CHARS_OFFSET) };
@@ -574,6 +576,26 @@ mod tests {
             assert!(bytes.iter().all(|b| *b == 0));
         }
         crate::rffi::ll_raw_free(zeroed as i64);
+    }
+
+    /// `gct_fv_raw_malloc_varsize` charges `length * itemsize`; for
+    /// `Array(Char)` that is `n`, not the extra allocated item.
+    #[test]
+    fn raw_malloc_varsize_char_extra_item_add_memory_pressure_charges_n() {
+        use std::sync::atomic::{AtomicIsize, Ordering};
+        static CHARGED: AtomicIsize = AtomicIsize::new(0);
+        fn hook(size: isize, _object: majit_ir::GcRef) {
+            CHARGED.fetch_add(size, Ordering::SeqCst);
+        }
+        static PRESSURE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = PRESSURE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        CHARGED.store(0, Ordering::SeqCst);
+        majit_gc::set_active_add_memory_pressure(Some(hook));
+        let ptr = raw_malloc_varsize_char_extra_item_add_memory_pressure(5);
+        majit_gc::set_active_add_memory_pressure(None);
+        assert_ne!(ptr, 0);
+        assert_eq!(CHARGED.load(Ordering::SeqCst), 5);
+        crate::rffi::ll_raw_free(ptr as i64);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -766,17 +788,19 @@ mod tests {
 
     #[test]
     fn get_raw_address_buf_from_string_copies_and_caches() {
-        let text = b"cache-me";
-        let mut storage = alloc_fake_str(text, 0xFF);
-        let ptr = storage.as_mut_ptr() as *mut u8;
-        let first = _get_raw_address_buf_from_string(ptr).unwrap();
-        let second = _get_raw_address_buf_from_string(ptr).unwrap();
-        assert_eq!(first, second);
-        unsafe {
-            assert_ne!(first, ptr.add(STR_CHARS_OFFSET));
-            assert_eq!(std::slice::from_raw_parts(first, text.len()), text);
-            assert_eq!(*first.add(text.len()), 0);
-        }
+        with_host_gc_mutator(|| {
+            let text = b"cache-me";
+            let mut storage = alloc_fake_str(text, 0xFF);
+            let ptr = storage.as_mut_ptr() as *mut u8;
+            let first = _get_raw_address_buf_from_string(ptr);
+            let second = _get_raw_address_buf_from_string(ptr);
+            assert_eq!(first, second);
+            unsafe {
+                assert_ne!(first, ptr.add(STR_CHARS_OFFSET));
+                assert_eq!(std::slice::from_raw_parts(first, text.len()), text);
+                assert_eq!(*first.add(text.len()), 0);
+            }
+        });
     }
 
     fn with_host_gc_mutator<R>(f: impl FnOnce() -> R) -> R {
@@ -819,7 +843,7 @@ mod tests {
             majit_gc::gc_sync::gc_op(|gc| gc.do_collect_nursery());
             write_str_payload(root.0 as *mut u8, text);
 
-            let copy = _get_raw_address_buf_from_string(root.0 as *mut u8).unwrap();
+            let copy = _get_raw_address_buf_from_string(root.0 as *mut u8);
             let key = majit_gc::gc_id_or_identityhash(root.0);
             unsafe {
                 assert_ne!(copy, (root.0 as *mut u8).add(STR_CHARS_OFFSET));

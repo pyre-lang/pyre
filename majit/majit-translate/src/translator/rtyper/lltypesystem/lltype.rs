@@ -1219,7 +1219,11 @@ pub struct _func {
     pub graph: Option<usize>,
     /// Owning graph handle (`lltype.py _func.graph = graph`).
     graph_owned: Option<OwnedGraph>,
-    pub _callable: Option<String>,
+    /// Shared callable object (`lltype.py _func._callable`). `Arc` so a
+    /// `_ptr` clone keeps `id(self._callable)` (`_func._getid` arm 3).
+    pub _callable: Option<std::sync::Arc<str>>,
+    /// `id(self)` of this `_func` container; clones of one `_ptr` share it.
+    _identity: usize,
     pub attrs: HashMap<String, ConstValue>,
 }
 
@@ -1230,30 +1234,37 @@ impl fmt::Debug for _func {
             .field("_name", &self._name)
             .field("graph", &self.graph)
             .field("_callable", &self._callable)
+            .field("_identity", &self._identity)
             .field("attrs", &self.attrs)
             .finish()
     }
 }
 
 impl _func {
-    pub fn new(
+    pub fn new<C>(
         TYPE: FuncType,
         _name: String,
         graph: Option<usize>,
-        _callable: Option<String>,
+        _callable: Option<C>,
         attrs: HashMap<String, ConstValue>,
-    ) -> Self {
+    ) -> Self
+    where
+        C: Into<std::sync::Arc<str>>,
+    {
         Self::new_owning_graph(TYPE, _name, graph, None, _callable, attrs)
     }
 
-    fn new_owning_graph(
+    fn new_owning_graph<C>(
         TYPE: FuncType,
         _name: String,
         graph: Option<usize>,
         graph_owned: Option<GraphRef>,
-        _callable: Option<String>,
+        _callable: Option<C>,
         attrs: HashMap<String, ConstValue>,
-    ) -> Self {
+    ) -> Self
+    where
+        C: Into<std::sync::Arc<str>>,
+    {
         let graph_owned = graph_owned.map(OwnedGraph::new);
         let graph = match &graph_owned {
             Some(g) => Some(GraphKey::of(&g.graph_ref()).as_usize()),
@@ -1264,7 +1275,8 @@ impl _func {
             _name,
             graph,
             graph_owned,
-            _callable,
+            _callable: _callable.map(Into::into),
+            _identity: fresh_low_level_container_identity(),
             attrs,
         }
     }
@@ -1276,7 +1288,8 @@ impl _func {
     }
 
     /// `_func._getid` (`lltype.py`): `id(self.graph)` when a graph is
-    /// present, else `id(self._callable)`, else `id(self)`.
+    /// present, else `id(self._callable)`, else `id(self)`. These ids are
+    /// stable across clones of one `_ptr`.
     fn _getid(&self) -> i64 {
         if let Some(g) = &self.graph_owned {
             return g.as_usize() as i64;
@@ -1285,9 +1298,9 @@ impl _func {
             return id as i64;
         }
         if let Some(name) = &self._callable {
-            return name.as_ptr() as i64;
+            return std::sync::Arc::as_ptr(name) as *const u8 as i64;
         }
-        self as *const _func as i64
+        self._identity as i64
     }
 }
 
@@ -1562,9 +1575,9 @@ impl _func {
     /// (`lltype.py`). Arity mismatch and per-arg type
     /// mismatch raise `TypeError`; a None `_callable` raises
     /// `RuntimeError`. The Rust port models `_callable` as an optional
-    /// name string rather than a real closure, so the return value is
-    /// the result type's default — matching the `_container_example`
-    /// closure `def ex(*args): return self.RESULT._defl()`.
+    /// shared name (`Arc<str>`) rather than a real closure, so the
+    /// return value is the result type's default — matching the
+    /// `_container_example` closure `def ex(*args): return self.RESULT._defl()`.
     pub fn call(&self, args: &[LowLevelValue]) -> LowLevelValue {
         if args.len() != self.TYPE.args.len() {
             panic!(
@@ -3504,7 +3517,7 @@ impl _ptr {
         if let _ptr_obj::IntCast(n) = obj {
             return Ok(n);
         }
-        let result = obj._getid();
+        let result = obj._getid()?;
         if self._TYPE._gckind() == GcKind::Gc {
             assert!(result != 0 && (result & 3) == 0);
         }
@@ -4233,14 +4246,14 @@ impl FuncType {
         // upstream `FuncType._container_example` (lltype.py)
         // constructs `_func(self, _callable=ex)` where `ex` is a fresh
         // closure returning `self.RESULT._defl()`. Rust stores
-        // `_callable` as an Option<String>; the marker `"<example>"`
+        // `_callable` as an `Option<Arc<str>>`; the marker `"<example>"`
         // keeps `_func.call` from tripping the "undefined function"
         // raise while the arg validation still runs.
         _func::new(
             self.clone(),
             "<example>".into(),
             None,
-            Some("<example>".into()),
+            Some("<example>"),
             HashMap::new(),
         )
     }
@@ -5556,17 +5569,18 @@ impl _ptr_obj {
 
     /// `_container._getid` (`lltype.py`): `id(self)` of the container.
     /// `_func._getid` uses `id(self.graph)` when a graph is present.
-    fn _getid(&self) -> i64 {
+    /// `_subarray._getid` / `_arraylenref._getid` raise `NotImplementedError`.
+    fn _getid(&self) -> Result<i64, String> {
         match self {
-            _ptr_obj::Struct(s) => s.identity() as i64,
-            _ptr_obj::Array(a) => a.identity() as i64,
-            _ptr_obj::Opaque(o) => o.identity() as i64,
-            _ptr_obj::Subarray(s) => s._identity as i64,
-            _ptr_obj::ArrayLenRef(a) => a._identity as i64,
-            _ptr_obj::EndMarker(e) => e._identity as i64,
-            _ptr_obj::Wref(w) => w._identity as i64,
-            _ptr_obj::Func(f) => f._getid(),
-            _ptr_obj::IntCast(n) => *n,
+            _ptr_obj::Struct(s) => Ok(s.identity() as i64),
+            _ptr_obj::Array(a) => Ok(a.identity() as i64),
+            _ptr_obj::Opaque(o) => Ok(o.identity() as i64),
+            _ptr_obj::Subarray(_) => Err("NotImplementedError: _subarray._getid()".into()),
+            _ptr_obj::ArrayLenRef(_) => Err("NotImplementedError: _arraylenref._getid()".into()),
+            _ptr_obj::EndMarker(e) => Ok(e._identity as i64),
+            _ptr_obj::Wref(w) => Ok(w._identity as i64),
+            _ptr_obj::Func(f) => Ok(f._getid()),
+            _ptr_obj::IntCast(n) => Ok(*n),
         }
     }
 
@@ -6112,35 +6126,40 @@ impl InteriorPtr {
     }
 }
 
-pub fn functionptr(
+pub fn functionptr<C>(
     TYPE: FuncType,
     name: &str,
     graph: Option<usize>,
-    _callable: Option<String>,
-) -> _ptr {
+    _callable: Option<C>,
+) -> _ptr
+where
+    C: Into<std::sync::Arc<str>>,
+{
     functionptr_with_attrs(TYPE, name, graph, None, _callable, HashMap::new())
 }
 
 /// `rpython/rtyper/extfunc.py:72-74, 87-89`
 /// `functionptr(FT, name, _external_name=name, _callable=...)`.
-pub fn functionptr_with_external_name(
-    TYPE: FuncType,
-    name: &str,
-    _callable: Option<String>,
-) -> _ptr {
+pub fn functionptr_with_external_name<C>(TYPE: FuncType, name: &str, _callable: Option<C>) -> _ptr
+where
+    C: Into<std::sync::Arc<str>>,
+{
     let mut attrs = HashMap::new();
     attrs.insert("_external_name".to_string(), ConstValue::byte_str(name));
     functionptr_with_attrs(TYPE, name, None, None, _callable, attrs)
 }
 
-fn functionptr_with_attrs(
+fn functionptr_with_attrs<C>(
     TYPE: FuncType,
     name: &str,
     graph: Option<usize>,
     graph_owned: Option<GraphRef>,
-    _callable: Option<String>,
+    _callable: Option<C>,
     attrs: HashMap<String, ConstValue>,
-) -> _ptr {
+) -> _ptr
+where
+    C: Into<std::sync::Arc<str>>,
+{
     _ptr::new(
         Ptr {
             TO: PtrTarget::Func(TYPE.clone()),
@@ -6721,7 +6740,7 @@ mod tests {
             },
             "query",
             None,
-            Some("<query>".into()),
+            Some("<query>".to_string()),
         );
         let destr = functionptr(
             FuncType {
@@ -6730,7 +6749,7 @@ mod tests {
             },
             "destr",
             None,
-            Some("<destr>".into()),
+            Some("<destr>".to_string()),
         );
         let attached =
             attachRuntimeTypeInfo_with_ptrs(&mut T, Some(query.clone()), Some(destr.clone()))
@@ -6937,6 +6956,74 @@ mod tests {
         assert_eq!(funcobj._name, "forced_name");
         assert_eq!(funcobj._callable.as_deref(), Some("forced_callable"));
         assert_eq!(funcobj.attrs.get("extra"), Some(&ConstValue::Int(7)));
+    }
+
+    #[test]
+    fn func_getid_is_stable_across_clones() {
+        let with_callable = functionptr(
+            FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+            "f",
+            None,
+            Some("f".to_string()),
+        );
+        let callable_id = with_callable._cast_to_int(false).expect("callable id");
+        assert_eq!(
+            callable_id,
+            with_callable
+                .clone()
+                ._cast_to_int(false)
+                .expect("callable id clone")
+        );
+
+        let no_callable = functionptr(
+            FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+            "g",
+            None,
+            None::<String>,
+        );
+        let none_id = no_callable._cast_to_int(false).expect("no-callable id");
+        assert_eq!(
+            none_id,
+            no_callable
+                .clone()
+                ._cast_to_int(false)
+                .expect("no-callable id clone")
+        );
+
+        let other = functionptr(
+            FuncType {
+                args: vec![],
+                result: LowLevelType::Void,
+            },
+            "h",
+            None,
+            None::<String>,
+        );
+        let other_id = other._cast_to_int(false).expect("other no-callable id");
+        assert_ne!(none_id, other_id);
+    }
+
+    #[test]
+    fn rebuilt_funcptr_shares_callable_id() {
+        let ft = FuncType {
+            args: vec![],
+            result: LowLevelType::Void,
+        };
+        let p1 = functionptr(ft.clone(), "f", None, Some("f".to_string()));
+        let _ptr_obj::Func(func) = p1._obj().unwrap() else {
+            panic!("functionptr must expose a function object");
+        };
+        let p2 = functionptr(ft, "f", None, func._callable.clone());
+        assert_eq!(
+            p1._cast_to_int(false).expect("p1 id"),
+            p2._cast_to_int(false).expect("p2 id"),
+        );
     }
 
     #[test]
@@ -8149,7 +8236,7 @@ mod tests {
             },
             "f".into(),
             None,
-            Some("impl".into()),
+            Some("impl"),
             HashMap::new(),
         );
         let _ = f.call(&[]);
@@ -8166,7 +8253,7 @@ mod tests {
             },
             "f".into(),
             None,
-            Some("impl".into()),
+            Some("impl"),
             HashMap::new(),
         );
         let _ = f.call(&[LowLevelValue::Bool(true)]);
@@ -8183,7 +8270,7 @@ mod tests {
             },
             "f".into(),
             None,
-            None,
+            None::<String>,
             HashMap::new(),
         );
         let _ = f.call(&[]);
@@ -8198,7 +8285,7 @@ mod tests {
             },
             "f".into(),
             None,
-            Some("impl".into()),
+            Some("impl"),
             HashMap::new(),
         );
         let result = f.call(&[LowLevelValue::Signed(42)]);
@@ -8426,6 +8513,41 @@ mod tests {
         assert_eq!(sub.getitem(0), Some(LowLevelValue::Signed(7)));
 
         assert!(direct_fieldptr(&p, "z").is_err());
+    }
+
+    #[test]
+    fn subarray_getid_raises() {
+        // `_subarray._getid` / `_arraylenref._getid` (lltype.py).
+        let s = Struct::gc(
+            "point",
+            vec![
+                ("x".into(), LowLevelType::Signed),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        let p = malloc(
+            LowLevelType::Struct(Box::new(s)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .unwrap();
+        let fieldptr = direct_fieldptr(&p, "x").unwrap();
+        let err = fieldptr
+            ._cast_to_int(true)
+            .expect_err("subarray _getid raises");
+        assert!(err.contains("NotImplementedError"), "{err}");
+
+        let array_ty = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Signed)));
+        let arrayptr = malloc(array_ty, Some(3), MallocFlavor::Gc, true).unwrap();
+        let _ptr_obj::Array(arr) = arrayptr._obj().unwrap() else {
+            panic!("array ptr must hold an Array container");
+        };
+        let lenptr = _arraylenref::_makeptr(Box::new(arr), true);
+        let err = lenptr
+            ._cast_to_int(true)
+            .expect_err("arraylenref _getid raises");
+        assert!(err.contains("NotImplementedError"), "{err}");
     }
 
     #[test]

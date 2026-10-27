@@ -652,8 +652,8 @@ pub struct Transformer<'a> {
     /// every later `LinkArg` operand; Variable-only slots keep the result,
     /// which `materialize_const_result` defines once at the rename.
     /// Exit `LinkArg`s and `follow_constant_exit` read the same map.
-    /// Lives on the Transformer across blocks (SSA names are graph-unique;
-    /// a later block sees a fresh inputarg, the Constant already on the link).
+    /// Cleared at the start of every `optimize_block` (`renamings_constants = {}`):
+    /// a later block sees a fresh inputarg and the Constant already on the link.
     const_aliases: std::collections::HashMap<
         crate::flowspace::model::Variable,
         crate::flowspace::model::Constant,
@@ -2999,11 +2999,12 @@ impl<'a> Transformer<'a> {
             return;
         }
 
-        // `jtransform.py:76-77` — both tables are rebound to empty dicts as
-        // the first statements of every `optimize_block`, so a virtualizable
-        // array read is only visible to the block that performed it.
+        // `optimize_block` rebinds `vable_array_vars`, `vable_flags` and
+        // `renamings_constants` to empty dicts first, so each is visible
+        // only to the block that filled it.
         self.vable_array_vars.clear();
         self.vable_flags.clear();
+        self.const_aliases.clear();
 
         let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
@@ -3075,15 +3076,10 @@ impl<'a> Transformer<'a> {
                 |b| b,
             )
         };
+        // `_do_renaming_on_link`: only `link.args`.
         for exit in &mut exits {
             for arg in &mut exit.args {
                 *arg = rewrite_linkarg_const_alias(arg.clone(), &self.const_aliases);
-            }
-            if let Some(arg) = exit.last_exception.take() {
-                exit.last_exception = Some(rewrite_linkarg_const_alias(arg, &self.const_aliases));
-            }
-            if let Some(arg) = exit.last_exc_value.take() {
-                exit.last_exc_value = Some(rewrite_linkarg_const_alias(arg, &self.const_aliases));
             }
         }
         // `jtransform.py`: `block.exitswitch = renamings.get(block.exitswitch, block.exitswitch)`
@@ -5746,6 +5742,7 @@ impl<'a> Transformer<'a> {
         let (owner, zero, add_memory_pressure, track_allocation, length) = match &op.kind {
             OpKind::RawMalloc {
                 owner,
+                TYPE: _,
                 zero,
                 track_allocation,
                 add_memory_pressure,
@@ -5756,7 +5753,7 @@ impl<'a> Transformer<'a> {
                 // zero / track_allocation, then `if d: raise
                 // UnsupportedMallocFlags(d)`.
                 if !extra_flags.is_empty() {
-                    panic!("unsupported malloc flags {extra_flags:?}");
+                    panic!("UnsupportedMallocFlags({extra_flags:?})");
                 }
                 (
                     owner.as_str(),
@@ -14475,14 +14472,14 @@ fn materialize_const_result(
     c: &crate::flowspace::model::Constant,
 ) -> SpaceOperation {
     use crate::flowspace::model::ConstValue;
-    use crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash;
     if let Some(ty) = c.concretetype.clone() {
         result.set_concretetype(Some(ty));
     }
     // Dedicated Const* ops match `assembler.rs` encode of those kinds.
-    // Remaining constants (non-null non-STR `LLPtr`, `LLAddress`, …)
-    // keep the Constant as a `{kind}_copy` operand so `emit_const`
-    // pools them the same way `LoweredBlackholeOp.args` already does.
+    // Every non-null `LLPtr` (a prebuilt STR included) and every other
+    // constant stays a `{kind}_copy` of the Constant (`flatten.py
+    // insert_renamings`), so `emit_const` pools it by
+    // `value._obj.container` like any `LoweredBlackholeOp` operand.
     let kind = match &c.value {
         ConstValue::Int(n) => OpKind::ConstInt(*n),
         ConstValue::UInt(n) => OpKind::ConstUInt(*n),
@@ -14495,13 +14492,6 @@ fn materialize_const_result(
         ConstValue::UniStr(s) => OpKind::ConstInternedStr(s.as_bytes().to_vec()),
         ConstValue::HostObject(obj) => OpKind::ConstRef(obj.clone()),
         ConstValue::LLPtr(p) if !p.nonzero() => OpKind::ConstRefNull,
-        ConstValue::LLPtr(p) => {
-            if let Some((bytes, _)) = prebuilt_str_bytes_and_hash(p) {
-                OpKind::ConstStr(bytes)
-            } else {
-                return materialize_const_result_copy(result, c);
-            }
-        }
         _ => return materialize_const_result_copy(result, c),
     };
     SpaceOperation {
@@ -14535,6 +14525,7 @@ fn materialize_const_result_copy(
 /// `jtransform.py Transformer.follow_constant_exit`: when `exitswitch` is
 /// a Constant (here: a Variable in `const_aliases`) and the block cannot
 /// raise, keep the matching link as the sole unconditional exit.
+/// `follow_constant_exit` compares `link.llexitcase` only.
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
@@ -14548,7 +14539,6 @@ fn follow_constant_exit(
     >,
     canraise: bool,
 ) -> (Option<crate::model::ExitSwitch>, Vec<crate::model::Link>) {
-    use crate::flowspace::model::ConstValue;
     use crate::model::{ExitCase, ExitSwitch};
     let Some(ExitSwitch::Value(v)) = &exitswitch else {
         return (exitswitch, exits);
@@ -14563,12 +14553,6 @@ fn follow_constant_exit(
     let mut taken_idx = None;
     for (i, link) in exits.iter().enumerate() {
         if link.llexitcase.as_ref() == Some(llvalue) {
-            taken_idx = Some(i);
-            break;
-        }
-        if let (Some(ExitCase::Bool(b)), ConstValue::Bool(cb)) = (&link.exitcase, llvalue)
-            && b == cb
-        {
             taken_idx = Some(i);
             break;
         }
@@ -14655,6 +14639,7 @@ fn remap_op(
         | OpKind::NewWithVtable { .. } => op.kind.clone(),
         OpKind::RawMalloc {
             owner,
+            TYPE: malloc_type,
             zero,
             track_allocation,
             add_memory_pressure,
@@ -14662,6 +14647,7 @@ fn remap_op(
             length,
         } => OpKind::RawMalloc {
             owner: owner.clone(),
+            TYPE: malloc_type.clone(),
             zero: *zero,
             track_allocation: *track_allocation,
             add_memory_pressure: *add_memory_pressure,
@@ -16123,7 +16109,7 @@ fn map_user_oopspec_to_index(spec: &str) -> majit_ir::descr::OopSpecIndex {
             OopSpecIndex::RawMallocVarsizeChar
         }
         "raw_free" => OopSpecIndex::RawFree,
-        // jtransform.py:507-509: oopspec_name.endswith('dict.lookup')
+        // jtransform.py Transformer.handle_builtin_call: oopspec_name.endswith('dict.lookup')
         _ if base.ends_with("dict.lookup") => OopSpecIndex::DictLookup,
         _ => OopSpecIndex::None,
     }
@@ -16322,20 +16308,19 @@ fn raw_malloc_varsize_array(
     }
 }
 
-/// Result TYPE of a raw varsize malloc: an `Array` or a `Struct` with
-/// `_arrayfld` (`transform.py varsize_malloc_helper`).
+/// TYPE of a raw varsize malloc
+/// (`_rewrite_raw_malloc` `TYPE = op.args[0].value`): an `Array`, or a
+/// `Struct` with `_arrayfld`.
 fn raw_malloc_varsize_type(
     op: &SpaceOperation,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
-    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
-    let ll = op.result.as_ref()?.concretetype()?;
-    match ll {
-        LowLevelType::Ptr(ptr) => match ptr.TO {
-            PtrTarget::Array(arr) => Some(LowLevelType::Array(Box::new(arr))),
-            PtrTarget::Struct(st) => Some(LowLevelType::Struct(Box::new(st))),
-            _ => None,
-        },
-        LowLevelType::Array(_) | LowLevelType::Struct(_) => Some(ll),
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match &op.kind {
+        OpKind::RawMalloc { TYPE: Some(t), .. }
+            if matches!(t, LowLevelType::Array(_) | LowLevelType::Struct(_)) =>
+        {
+            Some(t.clone())
+        }
         _ => None,
     }
 }
@@ -24509,19 +24494,77 @@ mod tests {
 
     #[test]
     fn record_exact_value_str_ptr_const_unused_is_defined_by_conststr() {
-        assert_record_exact_value_ref_const_defined(
-            strptr_const(),
-            false,
-            |kind| matches!(kind, OpKind::ConstStr(bytes) if bytes == b"hello"),
-        );
+        let c = strptr_const();
+        assert_record_exact_value_ref_const_defined(c.clone(), false, |kind| match kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                opname == "ref_copy"
+                    && matches!(
+                        args.as_slice(),
+                        [LinkArg::Const(got)] if got.value == c.value
+                    )
+            }
+            _ => false,
+        });
     }
 
     #[test]
     fn record_exact_value_str_ptr_const_used_is_defined_by_conststr() {
-        assert_record_exact_value_ref_const_defined(
-            strptr_const(),
-            true,
-            |kind| matches!(kind, OpKind::ConstStr(bytes) if bytes == b"hello"),
+        let c = strptr_const();
+        assert_record_exact_value_ref_const_defined(c.clone(), true, |kind| match kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                opname == "ref_copy"
+                    && matches!(
+                        args.as_slice(),
+                        [LinkArg::Const(got)] if got.value == c.value
+                    )
+            }
+            _ => false,
+        });
+    }
+
+    #[test]
+    fn renamed_str_constant_keeps_container_identity() {
+        use crate::flowspace::model::{ConstValue, Constant, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, llstr};
+
+        let p1 = llstr(b"hello").expect("llstr");
+        let p2 = llstr(b"hello").expect("llstr");
+        let c1 = Constant::with_concretetype(ConstValue::LLPtr(Box::new(p1)), STRPTR.clone());
+        let c2 = Constant::with_concretetype(ConstValue::LLPtr(Box::new(p2)), STRPTR.clone());
+        let op1 = materialize_const_result(Variable::new(), &c1);
+        let op2 = materialize_const_result(Variable::new(), &c2);
+
+        let ptr_of = |op: &SpaceOperation, expected: &ConstValue| match &op.kind {
+            OpKind::LoweredBlackholeOp { opname, args } => {
+                assert_eq!(opname, "ref_copy");
+                match args.as_slice() {
+                    [LinkArg::Const(got)] => {
+                        assert_eq!(got.value, *expected);
+                        let ConstValue::LLPtr(p) = &got.value else {
+                            panic!("ref_copy Const is LLPtr: {:?}", got.value);
+                        };
+                        p.clone()
+                    }
+                    other => panic!("expected [LinkArg::Const], got {other:?}"),
+                }
+            }
+            other => panic!("expected ref_copy, got {other:?}"),
+        };
+        let got1 = ptr_of(&op1, &c1.value);
+        let got2 = ptr_of(&op2, &c2.value);
+        let container = |p: &crate::translator::rtyper::lltypesystem::lltype::_ptr| match p
+            ._obj0_value()
+            .ok()
+            .flatten()
+        {
+            Some(_ptr_obj::Struct(s)) => s.identity(),
+            other => panic!("STR container: {other:?}"),
+        };
+        assert_ne!(
+            container(&got1),
+            container(&got2),
+            "equal-byte STR constants keep distinct containers"
         );
     }
 
@@ -24609,6 +24652,94 @@ mod tests {
             block.exits[0].target, default,
             "ByteStr default link is kept, exits={:?}",
             block.exits
+        );
+    }
+
+    #[test]
+    fn follow_constant_exit_matches_llexitcase_only() {
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use std::collections::HashMap;
+
+        let mut graph = FunctionGraph::new("const_bool_switch");
+        let sw = graph.alloc_value_var();
+        let if_false = graph.create_block();
+        let if_true = graph.create_block();
+        let default = graph.create_block();
+
+        let false_link = Link::new_mixed(vec![], if_false, Some(ExitCase::Bool(false)));
+        let true_link = Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true)));
+        assert_eq!(false_link.llexitcase, Some(ConstValue::Bool(false)));
+        assert_eq!(true_link.llexitcase, Some(ConstValue::Bool(true)));
+
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            sw.clone(),
+            crate::flowspace::model::Constant::with_concretetype(
+                ConstValue::Bool(true),
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+            ),
+        );
+
+        let (exitswitch, taken) = follow_constant_exit(
+            Some(ExitSwitch::Value(sw.clone())),
+            vec![false_link, true_link],
+            &aliases,
+            false,
+        );
+        assert!(exitswitch.is_none());
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].target, if_true);
+        assert!(taken[0].exitcase.is_none());
+        assert!(taken[0].llexitcase.is_none());
+
+        let mut missing_ll = Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true)));
+        missing_ll.llexitcase = None;
+        let default_link = Link::new_mixed(
+            vec![],
+            default,
+            Some(ExitCase::Const(ConstValue::ByteStr(b"default".to_vec()))),
+        )
+        .with_llexitcase(ConstValue::ByteStr(b"default".to_vec()));
+        let (exitswitch, taken) = follow_constant_exit(
+            Some(ExitSwitch::Value(sw)),
+            vec![missing_ll, default_link],
+            &aliases,
+            false,
+        );
+        assert!(exitswitch.is_none());
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            taken[0].target, default,
+            "Bool exitcase without llexitcase is not taken"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "follow_constant_exit: no matching exit and last is not default")]
+    fn follow_constant_exit_matches_llexitcase_only_missing_ll_panics() {
+        use crate::flowspace::model::ConstValue;
+        use crate::model::{ExitCase, ExitSwitch, Link};
+        use std::collections::HashMap;
+
+        let mut graph = FunctionGraph::new("const_bool_switch_missing_ll");
+        let sw = graph.alloc_value_var();
+        let if_true = graph.create_block();
+        let mut missing_ll = Link::new_mixed(vec![], if_true, Some(ExitCase::Bool(true)));
+        missing_ll.llexitcase = None;
+        let mut aliases = HashMap::new();
+        aliases.insert(
+            sw.clone(),
+            crate::flowspace::model::Constant::with_concretetype(
+                ConstValue::Bool(true),
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Bool,
+            ),
+        );
+        let _ = follow_constant_exit(
+            Some(ExitSwitch::Value(sw)),
+            vec![missing_ll],
+            &aliases,
+            false,
         );
     }
 
@@ -30030,6 +30161,25 @@ mod tests {
         extra_flags: Vec<String>,
     ) -> (FunctionGraph, crate::flowspace::model::Variable) {
         use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::rffi::{CArray, CArrayPtr};
+
+        let fallback_of = if owner.contains("Char") && !owner.contains("UniChar") {
+            LowLevelType::Char
+        } else {
+            LowLevelType::Signed
+        };
+        let malloc_type = match result_ll.as_ref() {
+            Some(LowLevelType::Ptr(ptr)) => match &ptr.TO {
+                PtrTarget::Array(arr) => Some(LowLevelType::Array(Box::new(arr.clone()))),
+                PtrTarget::Struct(st) => Some(LowLevelType::Struct(Box::new(st.clone()))),
+                _ => None,
+            },
+            Some(ll @ (LowLevelType::Array(_) | LowLevelType::Struct(_))) => Some(ll.clone()),
+            Some(_) => None,
+            None if with_length => Some(LowLevelType::Array(Box::new(CArray(fallback_of.clone())))),
+            None => None,
+        };
 
         let mut graph = FunctionGraph::new("raw_malloc");
         let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
@@ -30039,6 +30189,7 @@ mod tests {
                 graph.startblock,
                 OpKind::raw_malloc_with_flags(
                     owner,
+                    malloc_type,
                     zero,
                     track_allocation,
                     add_memory_pressure,
@@ -30052,14 +30203,7 @@ mod tests {
         if let Some(ll) = result_ll {
             p.set_concretetype(Some(ll));
         } else if with_length {
-            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-            use crate::translator::rtyper::lltypesystem::rffi::CArrayPtr;
-            let of = if owner.contains("Char") && !owner.contains("UniChar") {
-                LowLevelType::Char
-            } else {
-                LowLevelType::Signed
-            };
-            p.set_concretetype(Some(CArrayPtr(of)));
+            p.set_concretetype(Some(CArrayPtr(fallback_of)));
         }
         graph.set_return(graph.startblock, Some(p.clone()));
         let mut cc = CallControl::new();
@@ -30133,6 +30277,53 @@ mod tests {
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
         assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+    }
+
+    /// `_rewrite_raw_malloc` `TYPE = op.args[0].value`: CHAR is the malloc
+    /// TYPE, not the result variable's concretetype.
+    #[test]
+    fn raw_malloc_varsize_type_reads_type_not_result() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::CArray;
+
+        let mut graph = FunctionGraph::new("raw_malloc");
+        let n = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let p = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::raw_malloc_with_flags(
+                    "Array(Char)",
+                    Some(LowLevelType::Array(Box::new(CArray(LowLevelType::Char)))),
+                    false,
+                    true,
+                    false,
+                    Vec::new(),
+                    Some(n.clone()),
+                ),
+                true,
+            )
+            .expect("raw malloc result");
+        FunctionGraph::set_concretetype_of_inline(&p, ConcreteType::Signed);
+        p.set_concretetype(Some(LowLevelType::Signed));
+        graph.set_return(graph.startblock, Some(p.clone()));
+        let mut cc = CallControl::new();
+        let transformed = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph)
+            .graph;
+        let ops = &transformed.block(transformed.startblock).operations;
+        let (path, descriptor, args_i) = raw_malloc_residual(ops);
+        assert_eq!(
+            path, "majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char",
+            "TYPE Array(Char) takes the CHAR helper even when the result is Signed, got {path}"
+        );
+        assert_eq!(args_i, std::slice::from_ref(&n));
+        assert_eq!(
+            descriptor.extra_info.oopspecindex,
+            OopSpecIndex::RawMallocVarsizeChar
+        );
+        assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
     }
 
     /// `jtransform.py test_raw_malloc_zero` without zero: a non-Char raw
@@ -30463,7 +30654,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "unsupported malloc flags")]
+    #[should_panic(expected = "UnsupportedMallocFlags")]
     fn raw_malloc_varsize_unknown_flag_panics() {
         let _ = transform_raw_malloc_ex(
             "Array(Signed)",

@@ -61,6 +61,7 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::flowspace::model::{
     self as flowspace_model, Block as FlowspaceBlock, BlockRef, ConstValue, Constant,
@@ -4861,7 +4862,7 @@ fn legacy_const_define_hlvalue(
         // the upstream Constant shape here, the same way the
         // `__str_const` arm below re-folds a string literal.
         kind if is_const_prebuilt_array_define(kind) => Ok(const_prebuilt_array_items(kind)
-            .map(|items| Hlvalue::Constant(Constant::new(ConstValue::List(items))))),
+            .map(|items| Hlvalue::Constant(Constant::new(ConstValue::List(Arc::new(items)))))),
         // String-literal constant.  Upstream flowspace carries a string
         // literal as a bare `Constant('text')` SSA value (annotated
         // `SomeString` by `immutablevalue`); `front::mir` has no
@@ -4941,7 +4942,9 @@ fn legacy_const_define_hlvalue(
             let func_ptr = match entry.declared_funcptr_type() {
                 Some(ft) => match &maybe_graph {
                     Some(graph) => lltype::functionptr_for_graph_with_type(&graph.graph, ft),
-                    None => lltype::functionptr(ft, &key.segments().join("::"), None, None),
+                    None => {
+                        lltype::functionptr(ft, &key.segments().join("::"), None, None::<String>)
+                    }
                 },
                 None => {
                     let precise = match (&maybe_graph, &lift_error) {
@@ -13129,11 +13132,11 @@ mod tests {
         match legacy_const_define_hlvalue(&op, None).expect("const-array define folds") {
             Some(Hlvalue::Constant(c)) => assert_eq!(
                 c.value,
-                ConstValue::List(vec![
+                ConstValue::List(Arc::new(vec![
                     ConstValue::Int(0),
                     ConstValue::Int(2),
                     ConstValue::Int(-3),
-                ])
+                ]))
             ),
             other => panic!("expected Constant(List), got {other:?}"),
         }
@@ -13189,10 +13192,10 @@ mod tests {
         match legacy_const_define_hlvalue(&op, None).expect("const-str-array define folds") {
             Some(Hlvalue::Constant(c)) => assert_eq!(
                 c.value,
-                ConstValue::List(vec![
+                ConstValue::List(Arc::new(vec![
                     ConstValue::ByteStr(b"re.TEMPLATE".to_vec()),
                     ConstValue::ByteStr(b"re.IGNORECASE".to_vec()),
-                ])
+                ]))
             ),
             other => panic!("expected Constant(List), got {other:?}"),
         }

@@ -1351,11 +1351,11 @@ mod tests {
     fn same_constant_uses_id_fallback_for_unhashable_list_values() {
         use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         let a = Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::List(vec![]),
+            ConstValue::List(std::sync::Arc::new(vec![])),
             LowLevelType::Signed,
         ));
         let b = Hlvalue::Constant(Constant::with_concretetype(
-            ConstValue::List(vec![]),
+            ConstValue::List(std::sync::Arc::new(vec![])),
             LowLevelType::Signed,
         ));
         // Distinct Constant instances — different `Constant.id`, both
