@@ -5523,8 +5523,11 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // one must fail loudly rather than reinterpret a headerless map-node
     // allocation as a `W_TypeObject`.  Function `?` fields,
     // `ModuleDictStrategy.version`, `W_TypeObject.version_tag` / `w_name`,
-    // and mapdict `Terminator.allow_unboxing` / `PlainAttribute.ever_mutated`
-    // / `CachedAttributeHolder.attr` / `typ` resolve through
+    // mapdict `Terminator.allow_unboxing` / `PlainAttribute.ever_mutated`
+    // / `CachedAttributeHolder.attr` / `typ`, `CellFamily.ever_mutated`,
+    // `AuditHolder.hooks_armed`, `W_Property.fget` / `fset`,
+    // `StaticMethod` / `ClassMethod.w_function`, and
+    // `ExecutionContext.w_tracefunc` / `profilefunc` resolve through
     // [`quasi_immut_descr_from_mutate`] (mutate descr required). The arms
     // below are the remaining STRUCTs: hand-minted singletons including
     // `GilReadyState.gil_ready` and `PyCode.w_globals`.
@@ -5532,46 +5535,11 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     // `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is the same slot
     // as the reserved `pycode_w_globals_quasi_descr` index.
     let qmut = unsafe {
-        if index == crate::descr::cell_family_ever_mutated_descr().index() {
-            Some(
-                (*(struct_ptr as *const pyre_object::nestedscope::CellFamily))
-                    .current_ever_mutated_qmut(),
-            )
-        } else if index == crate::descr::audit_holder_hooks_descr().index() {
-            pyre_interpreter::module::sys::vm::audit_holder_current_hooks_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::property_fget_descr().index() {
-            pyre_object::descriptor::w_property_current_fget_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::property_fset_descr().index() {
-            pyre_object::descriptor::w_property_current_fset_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::staticmethod_w_function_quasi_descr().index() {
-            pyre_object::function::w_staticmethod_current_w_function_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::classmethod_w_function_quasi_descr().index() {
-            pyre_object::function::w_classmethod_current_w_function_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::pycode_w_globals_quasi_descr().index()
+        if index == crate::descr::pycode_w_globals_quasi_descr().index()
             || is_pycode_w_globals_descr(descr)
         {
             pyre_interpreter::pycode::w_code_current_w_globals_qmut(
                 struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::ec_w_tracefunc_descr().index() {
-            // The reserved index is the owner identity; this order keeps an
-            // ordinal slip from casting an EC as another STRUCT.
-            pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
-                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
-            )
-        } else if index == crate::descr::ec_profilefunc_descr().index() {
-            pyre_interpreter::executioncontext::ec_current_profilefunc_qmut(
-                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
             )
         } else if index == crate::descr::gil_ready_descr().index() {
             // `gil.py` `GILThreadLocals.gil_ready?` — one process-global

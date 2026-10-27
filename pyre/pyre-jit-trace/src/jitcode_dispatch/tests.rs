@@ -5971,6 +5971,250 @@ fn assembled_type_version_tag_quasi_descr_is_the_group_mutate_row() {
     assembled_type_quasi_descr_is_the_group_mutate_row("version_tag", "mutate_version_tag");
 }
 
+fn assembled_struct_quasi_descr_is_the_group_mutate_row(
+    owner_leaf: &str,
+    field_leaf: &str,
+    mutate_leaf: &str,
+    expected_field: DescrRef,
+    expected_mutate: DescrRef,
+) -> usize {
+    let mut seen = 0usize;
+    for jc in crate::jitcode_runtime::all_jitcodes() {
+        for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+            if op.key != "record_quasiimmut_field/rdd" && op.key != "record_quasiimmut_field/idd" {
+                continue;
+            }
+            if op.pc + 6 > jc.code.len() {
+                continue;
+            }
+            let field_idx = u16::from_le_bytes([jc.code[op.pc + 2], jc.code[op.pc + 3]]) as usize;
+            let mutate_idx = u16::from_le_bytes([jc.code[op.pc + 4], jc.code[op.pc + 5]]) as usize;
+            let Some(field_bh) = crate::jitcode_runtime::get_descr_by_index(field_idx) else {
+                continue;
+            };
+            let Some(mutate_bh) = crate::jitcode_runtime::get_descr_by_index(mutate_idx) else {
+                continue;
+            };
+            let (
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: fname,
+                    owner: fowner,
+                    ..
+                },
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: mname,
+                    owner: mowner,
+                    ..
+                },
+            ) = (field_bh, mutate_bh)
+            else {
+                continue;
+            };
+            let owner_ok = fowner.as_str() == owner_leaf
+                || fowner.as_str().ends_with(&format!("::{owner_leaf}"));
+            let mutate_owner_ok = mowner.as_str() == owner_leaf
+                || mowner.as_str().ends_with(&format!("::{owner_leaf}"));
+            let is_field =
+                fname.as_str() == field_leaf || fname.as_str().ends_with(&format!(".{field_leaf}"));
+            let is_mutate = mname.as_str() == mutate_leaf
+                || mname.as_str().ends_with(&format!(".{mutate_leaf}"));
+            if !(owner_ok && mutate_owner_ok && is_field && is_mutate) {
+                continue;
+            }
+            let field_descr = crate::descr::make_descr_from_bh(field_bh);
+            let mutate_descr = crate::descr::make_descr_from_bh(mutate_bh);
+            assert!(
+                std::sync::Arc::ptr_eq(&field_descr, &expected_field),
+                "{} {owner_leaf}.{field_leaf} field descr must be the group row",
+                jc.name
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&mutate_descr, &expected_mutate),
+                "{} {owner_leaf}.{mutate_leaf} must be the group row",
+                jc.name
+            );
+            seen += 1;
+        }
+    }
+    seen
+}
+
+#[test]
+fn assembled_property_fget_quasi_descr_is_the_group_mutate_row() {
+    // `descriptor.py W_Property._immutable_fields_ = ["w_fget?", ...]`.
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_fget` for pyre `fget?`.
+    let expected_field = crate::descr::property_fget_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("W_Property.fget has mutate_fget");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "W_Property",
+        "fget",
+        "mutate_fget",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one W_Property.fget? /rdd with mutate_fget"
+    );
+}
+
+#[test]
+fn assembled_property_fset_quasi_descr_is_the_group_mutate_row() {
+    // `descriptor.py W_Property._immutable_fields_ = [..., "w_fset?", ...]`.
+    let expected_field = crate::descr::property_fset_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("W_Property.fset has mutate_fset");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "W_Property",
+        "fset",
+        "mutate_fset",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one W_Property.fset? /rdd with mutate_fset"
+    );
+}
+
+#[test]
+fn assembled_property_fdel_quasi_descr_is_the_group_mutate_row() {
+    // `descriptor.py W_Property._immutable_fields_ = [..., "w_fdel?"]`.
+    // `w_property_get_fdel` is a translated reader of pyre `fdel?`.
+    let expected_field = crate::descr::property_fdel_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("W_Property.fdel has mutate_fdel");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "W_Property",
+        "fdel",
+        "mutate_fdel",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one W_Property.fdel? /rdd with mutate_fdel"
+    );
+}
+
+#[test]
+fn assembled_cell_family_ever_mutated_quasi_descr_is_the_group_mutate_row() {
+    // `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
+    let expected_field = crate::descr::cell_family_ever_mutated_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("CellFamily.ever_mutated has mutate_ever_mutated");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "CellFamily",
+        "ever_mutated",
+        "mutate_ever_mutated",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one CellFamily.ever_mutated? /rdd with mutate_ever_mutated"
+    );
+}
+
+#[test]
+fn assembled_audit_holder_hooks_armed_quasi_descr_is_the_group_mutate_row() {
+    // `vm.py AuditHolder._immutable_fields_ = ['hooks_w?[:]']` through
+    // the `hooks_armed` projection.
+    let expected_field = crate::descr::audit_holder_hooks_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("AuditHolder.hooks_armed has mutate_hooks_armed");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "AuditHolder",
+        "hooks_armed",
+        "mutate_hooks_armed",
+        expected_field,
+        expected_mutate,
+    );
+    // `audit_hooks_armed` is `(*holder).hooks_armed.get()`, not a
+    // translated getfield, so the assembler does not emit
+    // `record_quasiimmut_field`. The pin is `walker_pin_audit_hooks`.
+    let _ = seen;
+}
+
+#[test]
+fn assembled_staticmethod_w_function_quasi_descr_is_the_group_mutate_row() {
+    // `function.py StaticMethod._immutable_fields_ = ['w_function?']`.
+    let expected_field = crate::descr::staticmethod_w_function_quasi_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("StaticMethod.w_function has mutate_w_function");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "StaticMethod",
+        "w_function",
+        "mutate_w_function",
+        expected_field,
+        expected_mutate,
+    );
+    // `w_staticmethod_get_func` is a raw `(*const StaticMethod).w_function`
+    // deref, not a translated getfield, so the assembler does not emit
+    // `record_quasiimmut_field`. The pin is `walker_pin_descriptor_slot`.
+    let _ = seen;
+}
+
+#[test]
+fn assembled_classmethod_w_function_quasi_descr_is_the_group_mutate_row() {
+    // `function.py ClassMethod._immutable_fields_ = ['w_function?']`.
+    let expected_field = crate::descr::classmethod_w_function_quasi_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("ClassMethod.w_function has mutate_w_function");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "ClassMethod",
+        "w_function",
+        "mutate_w_function",
+        expected_field,
+        expected_mutate,
+    );
+    // `w_classmethod_get_func` is a raw `(*const ClassMethod).w_function`
+    // deref, not a translated getfield, so the assembler does not emit
+    // `record_quasiimmut_field`. The pin is `walker_pin_descriptor_slot`.
+    let _ = seen;
+}
+
+#[test]
+fn assembled_ec_w_tracefunc_quasi_descr_is_the_group_mutate_row() {
+    // `executioncontext.py ExecutionContext._immutable_fields_` `w_tracefunc?`.
+    // The translated `gettrace` read is `jit.promote(self.w_tracefunc)`.
+    let expected_field = crate::descr::ec_w_tracefunc_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("ExecutionContext.w_tracefunc has mutate_w_tracefunc");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "ExecutionContext",
+        "w_tracefunc",
+        "mutate_w_tracefunc",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one ExecutionContext.w_tracefunc? /rdd with mutate_w_tracefunc"
+    );
+}
+
+#[test]
+fn assembled_ec_profilefunc_quasi_descr_is_the_group_mutate_row() {
+    // `executioncontext.py ExecutionContext._immutable_fields_` `profilefunc?`.
+    let expected_field = crate::descr::ec_profilefunc_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("ExecutionContext.profilefunc has mutate_profilefunc");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "ExecutionContext",
+        "profilefunc",
+        "mutate_profilefunc",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one ExecutionContext.profilefunc? /rdd with mutate_profilefunc"
+    );
+}
+
 #[test]
 fn walker_pin_type_version_tag_records_quasiimmut_from_mutate_descr() {
     // `typeobject.py W_TypeObject._immutable_fields_` `_version_tag?`.
@@ -6235,6 +6479,196 @@ fn walker_pin_holder_typ_records_quasiimmut_from_mutate_descr() {
                 .expect("holder typ resolves an instance")
         },
         "CachedAttributeHolder.typ?",
+    );
+}
+
+#[test]
+fn walker_pin_cell_family_ever_mutated_records_quasiimmut_from_mutate_descr() {
+    // `nestedscope.py CellFamily._immutable_fields_ = ['ever_mutated?']`.
+    let family = Box::into_raw(Box::new(pyre_object::nestedscope::CellFamily::new(
+        "x".to_string(),
+    )));
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| walker_pin_cell_family_ever_mutated(wc, 0, family).expect("pin"),
+        crate::descr::cell_family_ever_mutated_descr(),
+        || unsafe { (*family).current_ever_mutated_qmut() },
+        "CellFamily.ever_mutated?",
+    );
+}
+
+#[test]
+fn walker_pin_audit_hooks_records_quasiimmut_from_mutate_descr() {
+    // `vm.py AuditHolder._immutable_fields_ = ['hooks_w?[:]']` through
+    // the `hooks_armed` projection.
+    let holder = Box::into_raw(Box::new(
+        pyre_interpreter::module::sys::vm::AuditHolder::new(),
+    ));
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| walker_pin_audit_hooks(wc, 0, holder).expect("pin"),
+        crate::descr::audit_holder_hooks_descr(),
+        || {
+            unsafe { pyre_interpreter::module::sys::vm::audit_holder_current_hooks_qmut(holder) }
+                .expect("AuditHolder resolves an instance")
+        },
+        "AuditHolder.hooks_armed?",
+    );
+}
+
+#[test]
+fn walker_pin_property_fget_records_quasiimmut_from_mutate_descr() {
+    // `descriptor.py W_Property._immutable_fields_ = ["w_fget?", ...]`.
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let obj = pyre_object::descriptor::w_property_new(
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    );
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            walker_pin_descriptor_slot(wc, 0, obj, crate::descr::property_fget_descr())
+                .expect("pin")
+        },
+        crate::descr::property_fget_descr(),
+        || {
+            unsafe { pyre_object::descriptor::w_property_current_fget_qmut(obj) }
+                .expect("property fget resolves an instance")
+        },
+        "W_Property.fget?",
+    );
+}
+
+#[test]
+fn walker_pin_property_fset_records_quasiimmut_from_mutate_descr() {
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let obj = pyre_object::descriptor::w_property_new(
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    );
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            walker_pin_descriptor_slot(wc, 0, obj, crate::descr::property_fset_descr())
+                .expect("pin")
+        },
+        crate::descr::property_fset_descr(),
+        || {
+            unsafe { pyre_object::descriptor::w_property_current_fset_qmut(obj) }
+                .expect("property fset resolves an instance")
+        },
+        "W_Property.fset?",
+    );
+}
+
+#[test]
+fn walker_pin_property_fdel_records_quasiimmut_from_mutate_descr() {
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let obj = pyre_object::descriptor::w_property_new(
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+        pyre_object::PY_NULL,
+    );
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            walker_pin_descriptor_slot(wc, 0, obj, crate::descr::property_fdel_descr())
+                .expect("pin")
+        },
+        crate::descr::property_fdel_descr(),
+        || {
+            unsafe { pyre_object::descriptor::w_property_current_fdel_qmut(obj) }
+                .expect("property fdel resolves an instance")
+        },
+        "W_Property.fdel?",
+    );
+}
+
+#[test]
+fn walker_pin_staticmethod_w_function_records_quasiimmut_from_mutate_descr() {
+    // `function.py StaticMethod._immutable_fields_ = ['w_function?']`.
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let obj = pyre_object::function::w_staticmethod_new(pyre_object::PY_NULL);
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            walker_pin_descriptor_slot(
+                wc,
+                0,
+                obj,
+                crate::descr::staticmethod_w_function_quasi_descr(),
+            )
+            .expect("pin")
+        },
+        crate::descr::staticmethod_w_function_quasi_descr(),
+        || {
+            unsafe { pyre_object::function::w_staticmethod_current_w_function_qmut(obj) }
+                .expect("staticmethod w_function resolves an instance")
+        },
+        "StaticMethod.w_function?",
+    );
+}
+
+#[test]
+fn walker_pin_classmethod_w_function_records_quasiimmut_from_mutate_descr() {
+    // `function.py ClassMethod._immutable_fields_ = ['w_function?']`.
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let obj = pyre_object::function::w_classmethod_new(pyre_object::PY_NULL);
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            walker_pin_descriptor_slot(
+                wc,
+                0,
+                obj,
+                crate::descr::classmethod_w_function_quasi_descr(),
+            )
+            .expect("pin")
+        },
+        crate::descr::classmethod_w_function_quasi_descr(),
+        || {
+            unsafe { pyre_object::function::w_classmethod_current_w_function_qmut(obj) }
+                .expect("classmethod w_function resolves an instance")
+        },
+        "ClassMethod.w_function?",
+    );
+}
+
+#[test]
+fn walker_pin_ec_w_tracefunc_records_quasiimmut_from_mutate_descr() {
+    // `executioncontext.py _immutable_fields_ = ['w_tracefunc?']`.
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let ec = Box::into_raw(Box::new(pyre_interpreter::ExecutionContext::new()));
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            let ec_box = wc.trace_ctx.const_ref(ec as i64);
+            walker_pin_ec_quasi_field(wc, 0, ec_box, crate::descr::ec_w_tracefunc_descr())
+                .expect("pin")
+        },
+        crate::descr::ec_w_tracefunc_descr(),
+        || {
+            unsafe { pyre_interpreter::ec_current_w_tracefunc_qmut(ec) }
+                .expect("EC w_tracefunc resolves an instance")
+        },
+        "ExecutionContext.w_tracefunc?",
+    );
+}
+
+#[test]
+fn walker_pin_ec_profilefunc_records_quasiimmut_from_mutate_descr() {
+    // `executioncontext.py _immutable_fields_ = ['profilefunc?']`.
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let ec = Box::into_raw(Box::new(pyre_interpreter::ExecutionContext::new()));
+    walker_pin_mapdict_records_quasiimmut_from_mutate(
+        |wc| {
+            let ec_box = wc.trace_ctx.const_ref(ec as i64);
+            walker_pin_ec_quasi_field(wc, 0, ec_box, crate::descr::ec_profilefunc_descr())
+                .expect("pin")
+        },
+        crate::descr::ec_profilefunc_descr(),
+        || {
+            unsafe { pyre_interpreter::ec_current_profilefunc_qmut(ec) }
+                .expect("EC profilefunc resolves an instance")
+        },
+        "ExecutionContext.profilefunc?",
     );
 }
 

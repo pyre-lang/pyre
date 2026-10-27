@@ -8319,14 +8319,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     // `InlineRegisterBankGuard` (`miframe_registers`).  The only other address this fold
     // bakes is the family's, and a family is a `Box::into_raw` leak outside
     // the collector entirely.
-    let owner = ctx.trace_ctx.const_ref(family as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::cell_family_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
     Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
 }
 
@@ -8431,14 +8424,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
         )?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(cell_op);
     }
-    let owner = ctx.trace_ctx.const_ref(family as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::cell_family_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_op,

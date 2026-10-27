@@ -2003,14 +2003,7 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
     walker_guard_stamped_class(ctx, op.pc, class_cell_op, cell_type)?;
-    let owner = ctx.trace_ctx.const_ref(family as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::cell_family_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op.pc)?;
+    walker_pin_cell_family_ever_mutated(ctx, op.pc, family)?;
     let cls_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         class_cell_op,

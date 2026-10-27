@@ -224,6 +224,7 @@ pub unsafe fn w_method_get_class(obj: PyObjectRef) -> PyObjectRef {
     static_name = "STATICMETHOD",
     user_layout
 )]
+#[majit_macros::jit_immutable_fields("w_function?")]
 pub struct StaticMethod {
     pub w_function: PyObjectRef,
     /// function.py:676 `self.w_dict = None` — lazily allocated by
@@ -234,18 +235,16 @@ pub struct StaticMethod {
     /// _immutable_fields_ = ['w_function?']` — see [`crate::quasiimmut`].
     ///
     /// Holds no GC pointers, so the derived `W_STATICMETHOD_GC_PTR_OFFSETS` has
-    /// nothing to walk here, and it is deliberately absent from the descr
-    /// census: it is an `AtomicPtr` plus a lock rather than one pointer-shaped
-    /// word, so a `Type::Ref` row would misdescribe it, and no emit allocates
-    /// either wrapper, so `rewrite.py clear_gc_fields` never runs over this
-    /// layout.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
+    /// nothing to walk here.  `W_STATICMETHOD_DESCR_GROUP` lists `mutate_w_function`
+    /// plus `mutate_w_function_lock` the way `FUNCTION_DESCR_GROUP` lists each
+    /// `mutate_<name>`.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
     /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
     /// stated precondition: the lock cannot be remapped out from under a
     /// holder.  Recording binds the instance onto the marker descr as an
     /// `Arc`, so the compiler never re-resolves this owner and a sweep
     /// mid-compile is safe; the sweep hook is `{static,class}method_destructor`
     /// in `pyre-jit/src/eval.rs`.
-    pub w_function_watchers: crate::quasiimmut::QuasiImmutField,
+    pub mutate_w_function: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Field offsets of the inline `PyObjectRef` slots within `StaticMethod`,
@@ -253,6 +252,8 @@ pub struct StaticMethod {
 /// `METHOD_*` consts above.
 pub const STATICMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(StaticMethod, w_function);
 pub const STATICMETHOD_W_DICT_OFFSET: usize = std::mem::offset_of!(StaticMethod, w_dict);
+pub const STATICMETHOD_MUTATE_W_FUNCTION_OFFSET: usize =
+    std::mem::offset_of!(StaticMethod, mutate_w_function);
 
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
@@ -277,7 +278,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
                     ob: header,
                     w_function: func,
                     w_dict: PY_NULL,
-                    w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
+                    mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
                 },
             );
         }
@@ -288,7 +289,7 @@ pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob: header,
         w_function: func,
         w_dict: PY_NULL,
-        w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
     })
 }
 
@@ -317,11 +318,11 @@ pub unsafe fn w_staticmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
         // pays one load.
         if (*(obj as *const StaticMethod))
-            .w_function_watchers
+            .mutate_w_function
             .is_installed()
         {
             crate::quasiimmut::sweep_quasi_immut_field(
-                &(*(obj as *const StaticMethod)).w_function_watchers,
+                &(*(obj as *const StaticMethod)).mutate_w_function,
             );
         }
         (*(obj as *mut StaticMethod)).w_function = func;
@@ -344,7 +345,7 @@ pub unsafe fn w_staticmethod_current_w_function_qmut(
     }
     Some(
         (*(obj as *const StaticMethod))
-            .w_function_watchers
+            .mutate_w_function
             .get_current_qmut_instance(),
     )
 }
@@ -420,6 +421,7 @@ pub unsafe fn is_exact_staticmethod(obj: PyObjectRef) -> bool {
 
 /// Python classmethod descriptor.
 #[pyre_class("classmethod", type_id = 21, static_name = "CLASSMETHOD", user_layout)]
+#[majit_macros::jit_immutable_fields("w_function?")]
 pub struct ClassMethod {
     pub w_function: PyObjectRef,
     /// function.py:724 `self.w_dict = None` — a real per-wrapper field,
@@ -429,24 +431,24 @@ pub struct ClassMethod {
     /// _immutable_fields_ = ['w_function?']` — see [`crate::quasiimmut`].
     ///
     /// Holds no GC pointers, so the derived `W_CLASSMETHOD_GC_PTR_OFFSETS` has
-    /// nothing to walk here, and it is deliberately absent from the descr
-    /// census: it is an `AtomicPtr` plus a lock rather than one pointer-shaped
-    /// word, so a `Type::Ref` row would misdescribe it, and no emit allocates
-    /// either wrapper, so `rewrite.py clear_gc_fields` never runs over this
-    /// layout.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
+    /// nothing to walk here.  `W_CLASSMETHOD_DESCR_GROUP` lists `mutate_w_function`
+    /// plus `mutate_w_function_lock` the way `FUNCTION_DESCR_GROUP` lists each
+    /// `mutate_<name>`.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
     /// i.e. non-moving, which is [`crate::quasiimmut::QuasiImmutField`]'s
     /// stated precondition: the lock cannot be remapped out from under a
     /// holder.  Recording binds the instance onto the marker descr as an
     /// `Arc`, so the compiler never re-resolves this owner and a sweep
     /// mid-compile is safe; the sweep hook is `{static,class}method_destructor`
     /// in `pyre-jit/src/eval.rs`.
-    pub w_function_watchers: crate::quasiimmut::QuasiImmutField,
+    pub mutate_w_function: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Field offsets of the inline `PyObjectRef` slots within `ClassMethod`, the
 /// `classmethod` twin of the `STATICMETHOD_*` consts above.
 pub const CLASSMETHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(ClassMethod, w_function);
 pub const CLASSMETHOD_W_DICT_OFFSET: usize = std::mem::offset_of!(ClassMethod, w_dict);
+pub const CLASSMETHOD_MUTATE_W_FUNCTION_OFFSET: usize =
+    std::mem::offset_of!(ClassMethod, mutate_w_function);
 
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`): pin the
@@ -471,7 +473,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
                     ob: header,
                     w_function: func,
                     w_dict: PY_NULL,
-                    w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
+                    mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
                 },
             );
         }
@@ -482,7 +484,7 @@ pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
         ob: header,
         w_function: func,
         w_dict: PY_NULL,
-        w_function_watchers: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_w_function: crate::quasiimmut::QuasiImmutField::new(),
     })
 }
 
@@ -511,11 +513,11 @@ pub unsafe fn w_classmethod_set_func(obj: PyObjectRef, func: PyObjectRef) {
         // `pyjitpl.py`'s `mutatebox.nonnull()` — a wrapper no loop watches
         // pays one load.
         if (*(obj as *const ClassMethod))
-            .w_function_watchers
+            .mutate_w_function
             .is_installed()
         {
             crate::quasiimmut::sweep_quasi_immut_field(
-                &(*(obj as *const ClassMethod)).w_function_watchers,
+                &(*(obj as *const ClassMethod)).mutate_w_function,
             );
         }
         (*(obj as *mut ClassMethod)).w_function = func;
@@ -538,7 +540,7 @@ pub unsafe fn w_classmethod_current_w_function_qmut(
     }
     Some(
         (*(obj as *const ClassMethod))
-            .w_function_watchers
+            .mutate_w_function
             .get_current_qmut_instance(),
     )
 }

@@ -12558,7 +12558,9 @@ fn walker_pin_descriptor_slot<Sym: WalkSym>(
     // There is no `can_move` gate on this pin (`rpython/jit` uses
     // `can_move` only in backend `convert_to_imm`).
     let descr_const = ctx.trace_ctx.const_ref(w_descr as i64);
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field, None);
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&field)
+        .expect("descriptor ? field has mutate_<name>");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, descr_const, field, Some(&mutate));
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -12803,6 +12805,39 @@ pub(crate) fn walker_pin_mapdict_quasi_field<Sym: WalkSym>(
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
+pub(crate) fn walker_pin_cell_family_ever_mutated<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    family: *const pyre_object::nestedscope::CellFamily,
+) -> Result<(), DispatchError> {
+    if family.is_null() {
+        return Ok(());
+    }
+    let descr = crate::descr::cell_family_ever_mutated_descr();
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("CellFamily.ever_mutated has mutate_ever_mutated");
+    let owner = ctx.trace_ctx.const_ref(family as i64);
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, descr, Some(&mutate));
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
+/// Pin one `executioncontext.py` `?` field on a boxed EC. Portal guards
+/// (`record_portal_tracefunc_guard` / `record_portal_profilefunc_guard`)
+/// look the mutate descr up the same way; this helper exists so tests can
+/// record without a portal snapshot.
+#[cfg(test)]
+pub(crate) fn walker_pin_ec_quasi_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    ec_box: OpRef,
+    descr: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("ExecutionContext ? field has mutate_<name>");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr, Some(&mutate));
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 fn walker_pin_terminator_allow_unboxing<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -12837,12 +12872,10 @@ fn walker_pin_audit_hooks<Sym: WalkSym>(
         return Ok(());
     }
     let owner = ctx.trace_ctx.const_ref(holder as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::audit_holder_hooks_descr(),
-        None,
-    );
+    let descr = crate::descr::audit_holder_hooks_descr();
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("AuditHolder.hooks_armed has mutate_hooks_armed");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, owner, descr, Some(&mutate));
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -14010,7 +14043,9 @@ fn record_portal_tracefunc_guard<Sym: WalkSym>(
     // `jit.promote(self.w_tracefunc)`.  The `?` is the invalidation
     // half — `settrace` notifies, `GUARD_NOT_INVALIDATED` fails, and
     // the loop is not re-entered with the folded NULL.
-    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), None);
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("ExecutionContext.w_tracefunc has mutate_w_tracefunc");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr.clone(), Some(&mutate));
     if already {
         return Ok(());
     }
@@ -14056,12 +14091,10 @@ fn record_portal_profilefunc_guard<Sym: WalkSym>(
         return Ok(());
     };
     stamp_live_execution_context(ctx.trace_ctx, ec_box);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        ec_box,
-        crate::descr::ec_profilefunc_descr(),
-        None,
-    );
+    let descr = crate::descr::ec_profilefunc_descr();
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("ExecutionContext.profilefunc has mutate_profilefunc");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, ec_box, descr, Some(&mutate));
     walker_flush_guard_not_invalidated(ctx, op_pc)
 }
 
@@ -15128,6 +15161,23 @@ fn handle<Sym: WalkSym>(
         // (`QuasiImmutDescr.__init__` / `get_current_qmut_instance`).
         "record_quasiimmut_field/rdd" => {
             let obj = read_ref_reg(code, op, 0, ctx)?;
+            let descr = read_descr(code, op, 1, ctx)?;
+            let mutate = read_descr(code, op, 3, ctx)?;
+            crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr, Some(&mutate));
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // Headerless owner: assembler `lookup_reg_with_kind_var` puts the
+        // raw pointer in the int bank (`getfield_raw_*` `i` base). Walker
+        // pins of the same STRUCT use `const_ref` so `concrete_gc_ptr`
+        // can read the address.
+        "record_quasiimmut_field/idd" => {
+            let obj = match read_int_reg_concrete(code, op, 0, ctx) {
+                ConcreteValue::Int(ptr) if ptr != 0 => ctx.trace_ctx.const_ref(ptr),
+                _ => {
+                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                }
+            };
             let descr = read_descr(code, op, 1, ctx)?;
             let mutate = read_descr(code, op, 3, ctx)?;
             crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr, Some(&mutate));

@@ -650,9 +650,9 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `W_Property` prefix, so the same cast covers that layout.
 unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
-    unsafe { (*p).fget_watchers.reclaim() };
-    unsafe { (*p).fset_watchers.reclaim() };
-    unsafe { (*p).fdel_watchers.reclaim() };
+    unsafe { (*p).mutate_fget.reclaim() };
+    unsafe { (*p).mutate_fset.reclaim() };
+    unsafe { (*p).mutate_fdel.reclaim() };
 }
 
 /// The `w_function?` counterpart of [`property_destructor`] for `staticmethod`.
@@ -664,7 +664,7 @@ unsafe fn property_destructor(obj_addr: usize) {
 /// that layout.
 unsafe fn staticmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::StaticMethod;
-    unsafe { (*m).w_function_watchers.reclaim() };
+    unsafe { (*m).mutate_w_function.reclaim() };
 }
 
 /// The `classmethod` twin of [`staticmethod_destructor`].
@@ -676,7 +676,7 @@ unsafe fn staticmethod_destructor(obj_addr: usize) {
 /// that layout.
 unsafe fn classmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::ClassMethod;
-    unsafe { (*m).w_function_watchers.reclaim() };
+    unsafe { (*m).mutate_w_function.reclaim() };
 }
 
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).

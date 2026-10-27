@@ -4117,6 +4117,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
 /// a process-global — the shape `_codecs`' `CodecState` already uses for a
 /// registry that belongs to the interpreter rather than to one mutator.  Its
 /// Python objects are handed to the collector by [`walk_audit_hooks_gc`].
+/// `repr(C)` pins field offsets to declaration order so the JIT descr
+/// group's `offset_of!` matches the walker arg0 (the holder itself).
+/// `vm.py AuditHolder._immutable_fields_ = ['hooks_w?[:]']` is carried
+/// through the `hooks_armed` projection the JIT reads.
+#[repr(C)]
+#[majit_macros::jit_immutable_fields("hooks_armed?")]
 pub struct AuditHolder {
     /// `vm.py AuditHolder.__init__ self.hooks_w = None` projected onto a byte at a fixed offset:
     /// false while upstream's list is None, which is exactly the `vm.py`
@@ -4124,15 +4130,27 @@ pub struct AuditHolder {
     /// through a descriptor, and `Box<[T]>` has no target-stable null spelling
     /// — a wasm32 fat pointer is two 4-byte halves, not one 8-byte word.
     pub hooks_armed: std::cell::Cell<bool>,
-    /// The hidden watcher field implementing `vm.py:439 _immutable_fields_ =
-    /// ['hooks_w?[:]']`.  The owner is a `Box::into_raw` leak that is never
-    /// freed, so [`pyre_object::quasiimmut::QuasiImmutField`]'s `Drop` is
+    /// Hidden `mutate_hooks_armed` (`quasiimmut.py get_mutate_field_name` of
+    /// pyre `hooks_armed`). Carries upstream `hooks_w?[:]` through the
+    /// `hooks_armed` projection. The owner is a `Box::into_raw` leak that is
+    /// never freed, so [`pyre_object::quasiimmut::QuasiImmutField`]'s `Drop` is
     /// unreachable and its inner box is reclaimed only through `invalidate`.
-    pub hooks_watchers: pyre_object::quasiimmut::QuasiImmutField,
+    pub mutate_hooks_armed: pyre_object::quasiimmut::QuasiImmutField,
     /// A boxed slice rather than a `Vec` because `vm.py
     /// debug.make_sure_not_resized` is the other half of that declaration:
     /// [`sys_addaudithook`] replaces the list, never grows it in place.
     hooks_w: Box<[pyre_object::PyObjectRef]>,
+}
+
+impl AuditHolder {
+    /// Empty holder (`vm.py AuditHolder.__init__` `hooks_w = None`).
+    pub fn new() -> Self {
+        Self {
+            hooks_armed: std::cell::Cell::new(false),
+            mutate_hooks_armed: pyre_object::quasiimmut::QuasiImmutField::new(),
+            hooks_w: Box::new([]),
+        }
+    }
 }
 
 static AUDIT_HOOKS: std::sync::atomic::AtomicPtr<AuditHolder> =
@@ -4150,11 +4168,7 @@ fn audit_holder() -> *mut AuditHolder {
         if !holder.is_null() {
             return holder;
         }
-        let created = Box::into_raw(Box::new(AuditHolder {
-            hooks_armed: std::cell::Cell::new(false),
-            hooks_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
-            hooks_w: Box::new([]),
-        }));
+        let created = Box::into_raw(Box::new(AuditHolder::new()));
         if AUDIT_HOOKS
             .compare_exchange(
                 std::ptr::null_mut(),
@@ -4189,7 +4203,7 @@ pub unsafe fn audit_holder_current_hooks_qmut(
     if holder.is_null() {
         return None;
     }
-    Some(unsafe { (*holder).hooks_watchers.get_current_qmut_instance() })
+    Some(unsafe { (*holder).mutate_hooks_armed.get_current_qmut_instance() })
 }
 
 /// Forward the installed hooks.  Upstream reaches them through the space's
@@ -4479,8 +4493,8 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         // hook_setfield` emits `jit_force_quasi_immutable` before `setfield`.
         // The `is_installed()` fast path is `quasiimmut.py invalidation`'s
         // null test, so an unwatched install stays lock-free.
-        if (*holder).hooks_watchers.is_installed() {
-            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).hooks_watchers);
+        if (*holder).mutate_hooks_armed.is_installed() {
+            pyre_object::quasiimmut::sweep_quasi_immut_field(&(*holder).mutate_hooks_armed);
         }
         (*holder).hooks_w = next;
         (*holder).hooks_armed.set(true);
