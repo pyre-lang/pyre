@@ -3774,7 +3774,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if r_args[0].is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(callable as i64);
-            let mutate = crate::descr::function_mutate_descr_for_field(&kw_defs_descr)
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&kw_defs_descr)
                 .expect("Function.w_kw_defs has mutate_w_kw_defs");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
@@ -8353,7 +8353,7 @@ fn walker_guard_function_field<Sym: WalkSym>(
     descr: majit_ir::DescrRef,
     expected: i64,
 ) -> Result<(), DispatchError> {
-    let mutate = crate::descr::function_mutate_descr_for_field(&descr)
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
         .expect("walker_guard_function_field is a Function ? slot");
     crate::state::record_quasiimmut_field(ctx.trace_ctx, callable, descr.clone(), Some(&mutate));
     walker_flush_guard_not_invalidated(ctx, op_pc)?;
@@ -9963,10 +9963,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // the guard failed forever while the code object it stands for is
         // loop-invariant.
         //
-        // Keep GETFIELD+GUARD_VALUE even on a ConstPtr callable.
-        // `code?` matches `function.py getcode()` but Linux `test_uuid`
-        // SIGSEGV's with the marker: after `test_UUID` warms the JIT,
-        // `jit_bigint_int_eq` treats a small int as `*const BigInt`.
+        // On a ConstPtr callable the same sequence still runs:
+        // `record_quasiimmut_field` with `mutate_code` /
+        // `mutate_w_func_globals_obj` (`quasiimmut.py get_mutate_field_name`),
+        // then GETFIELD + GUARD_VALUE (`walker_guard_function_field`). The
+        // marker revokes a `__code__` / globals store; the value guards are
+        // the identity check the reads below assume.
         walker_guard_function_field(
             ctx,
             op.pc,
@@ -10008,7 +10010,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 return resolved_inline_decline(op.pc, line!());
             }
             let closure_descr = crate::descr::function_closure_descr();
-            let mutate = crate::descr::function_mutate_descr_for_field(&closure_descr)
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&closure_descr)
                 .expect("Function.closure has mutate_closure");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
@@ -10087,7 +10089,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // above says must not be loaded through.
         if guards_the_callee_function {
             let defs_w = crate::descr::function_defs_w_descr();
-            let mutate = crate::descr::function_mutate_descr_for_field(&defs_w)
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&defs_w)
                 .expect("Function.defs_w has mutate_defs_w");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
@@ -10294,7 +10296,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if callable_guard_op.is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(live_callable() as i64);
-            let mutate = crate::descr::function_mutate_descr_for_field(&kw_defs_descr)
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&kw_defs_descr)
                 .expect("Function.w_kw_defs has mutate_w_kw_defs");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,

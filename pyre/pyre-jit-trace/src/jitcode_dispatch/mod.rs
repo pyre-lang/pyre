@@ -12467,18 +12467,29 @@ fn walker_record_getfield_gc_i_uncached<Sym: WalkSym>(
 /// `w_type_const` must already be pinned to the receiver's type — the caller
 /// guards `w_class` first, so the marker attaches to a constant the optimizer
 /// can hand to `register_quasi_immutable_deps` as the watched object.
+fn walker_pin_type_quasi_field<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    w_type_const: OpRef,
+    descr: majit_ir::DescrRef,
+) -> Result<(), DispatchError> {
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("W_TypeObject ? field has mutate_<name>");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, w_type_const, descr, Some(&mutate));
+    walker_flush_guard_not_invalidated(ctx, op_pc)
+}
+
 fn walker_pin_type_version_tag<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     w_type_const: OpRef,
 ) -> Result<(), DispatchError> {
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
+    walker_pin_type_quasi_field(
+        ctx,
+        op_pc,
         w_type_const,
         crate::descr::type_version_tag_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    )
 }
 
 /// Make a class-namespace `ObjectMutableCell`'s payload green again, so a fold
@@ -12617,11 +12628,14 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
             };
             // The first record can minor-collect; box the type before it.
             let type_const = ctx.trace_ctx.const_ref(value_type.as_ptr() as i64);
+            let version_descr = crate::descr::type_version_tag_descr();
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&version_descr)
+                .expect("W_TypeObject.version_tag has mutate_version_tag");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 type_const,
-                crate::descr::type_version_tag_descr(),
-                None,
+                version_descr,
+                Some(&mutate),
             );
             let w_value = specialize::live_box_ref(ctx, value_const, w_value);
             let mapdict =
@@ -12717,7 +12731,7 @@ fn walker_pin_function_quasi_field<Sym: WalkSym>(
     callable: pyre_object::PyObjectRef,
     descr: majit_ir::DescrRef,
 ) -> Result<(), DispatchError> {
-    let mutate = crate::descr::function_mutate_descr_for_field(&descr)
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
         .expect("Function ? field has mutate_<name> in FUNCTION_DESCR_GROUP");
     let callable_const = ctx.trace_ctx.const_ref(callable as i64);
     crate::state::record_quasiimmut_field(ctx.trace_ctx, callable_const, descr, Some(&mutate));

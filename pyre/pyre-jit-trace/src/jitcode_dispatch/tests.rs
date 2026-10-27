@@ -5890,6 +5890,149 @@ fn assembled_function_code_quasi_descr_is_the_group_mutate_code_row() {
     );
 }
 
+fn assembled_type_quasi_descr_is_the_group_mutate_row(field_leaf: &str, mutate_leaf: &str) {
+    let expected_field = if field_leaf == "version_tag" {
+        crate::descr::type_version_tag_descr()
+    } else {
+        crate::descr::type_name_obj_descr()
+    };
+    let expected_mutate = crate::descr::type_mutate_descr_for_field(&expected_field)
+        .unwrap_or_else(|| panic!("W_TypeObject.{field_leaf} has {mutate_leaf}"));
+    let mut seen = 0usize;
+    for jc in crate::jitcode_runtime::all_jitcodes() {
+        for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+            if op.key != "record_quasiimmut_field/rdd" {
+                continue;
+            }
+            if op.pc + 6 > jc.code.len() {
+                continue;
+            }
+            let field_idx = u16::from_le_bytes([jc.code[op.pc + 2], jc.code[op.pc + 3]]) as usize;
+            let mutate_idx = u16::from_le_bytes([jc.code[op.pc + 4], jc.code[op.pc + 5]]) as usize;
+            let Some(field_bh) = crate::jitcode_runtime::get_descr_by_index(field_idx) else {
+                continue;
+            };
+            let Some(mutate_bh) = crate::jitcode_runtime::get_descr_by_index(mutate_idx) else {
+                continue;
+            };
+            let (
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: fname,
+                    owner: fowner,
+                    ..
+                },
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: mname,
+                    owner: mowner,
+                    ..
+                },
+            ) = (field_bh, mutate_bh)
+            else {
+                continue;
+            };
+            let type_owner =
+                fowner.as_str() == "W_TypeObject" || fowner.as_str().ends_with("::W_TypeObject");
+            let mutate_owner =
+                mowner.as_str() == "W_TypeObject" || mowner.as_str().ends_with("::W_TypeObject");
+            let is_field =
+                fname.as_str() == field_leaf || fname.as_str().ends_with(&format!(".{field_leaf}"));
+            let is_mutate = mname.as_str() == mutate_leaf
+                || mname.as_str().ends_with(&format!(".{mutate_leaf}"));
+            if !(type_owner && mutate_owner && is_field && is_mutate) {
+                continue;
+            }
+            let field_descr = crate::descr::make_descr_from_bh(field_bh);
+            let mutate_descr = crate::descr::make_descr_from_bh(mutate_bh);
+            assert!(
+                std::sync::Arc::ptr_eq(&field_descr, &expected_field),
+                "{} W_TypeObject.{field_leaf} field descr must be the group row",
+                jc.name
+            );
+            assert!(
+                std::sync::Arc::ptr_eq(&mutate_descr, &expected_mutate),
+                "{} W_TypeObject.{mutate_leaf} must be the group row",
+                jc.name
+            );
+            seen += 1;
+        }
+    }
+    assert!(
+        seen > 0,
+        "translation must assemble at least one W_TypeObject.{field_leaf}? /rdd with {mutate_leaf}"
+    );
+}
+
+#[test]
+fn assembled_type_version_tag_quasi_descr_is_the_group_mutate_row() {
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_version_tag` for pyre `version_tag?`
+    // (`typeobject.py _version_tag?`). Assembler `fielddescrof` must
+    // hydrate the group row.
+    assembled_type_quasi_descr_is_the_group_mutate_row("version_tag", "mutate_version_tag");
+}
+
+#[test]
+fn walker_pin_type_version_tag_records_quasiimmut_from_mutate_descr() {
+    // `typeobject.py W_TypeObject._immutable_fields_` `_version_tag?`.
+    // `walker_pin_type_version_tag` must pass `mutate_version_tag` so
+    // `quasiimmut.py QuasiImmutDescr` is built by
+    // `quasi_immut_descr_from_mutate`.
+    use crate::state::ConcreteValue;
+
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let obj = pyre_object::typeobject::w_type_new(
+        "WalkerPinVersion",
+        pyre_object::PY_NULL,
+        std::ptr::null_mut(),
+    );
+
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let type_const = wc.trace_ctx.const_ref(obj as i64);
+            walker_pin_type_version_tag(wc, 0, type_const).expect("pin");
+        },
+    );
+    let recorder = tc.into_recorder();
+    let qmut_ops: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .collect();
+    assert_eq!(qmut_ops.len(), 1, "one QUASIIMMUT_FIELD for version_tag?");
+    let qmut_descr = qmut_ops[0]
+        .getdescr()
+        .expect("QUASIIMMUT_FIELD has a descr");
+    let qd = qmut_descr
+        .as_quasi_immut_descr()
+        .expect("QuasiImmutDescr from quasi_immut_descr_from_mutate");
+    let expected_field = crate::descr::type_version_tag_descr();
+    assert!(
+        std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_field),
+        "recorded field descr must be W_TypeObject.version_tag"
+    );
+    let live = unsafe { pyre_object::typeobject::w_type_current_qmut_instance(obj) }
+        .expect("a type resolves an instance");
+    assert_eq!(
+        qd.qmut().instance_identity(),
+        std::sync::Arc::as_ptr(&live) as usize
+    );
+}
+
 #[test]
 fn walker_pin_namespace_version_records_quasiimmut_from_mutate_descr() {
     // `celldict.py ModuleDictStrategy._immutable_fields_ = ["version?"]`.

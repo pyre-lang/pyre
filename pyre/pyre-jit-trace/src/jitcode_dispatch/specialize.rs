@@ -3394,13 +3394,12 @@ fn walker_fold_type_name<Sym: WalkSym>(
         return Ok(None);
     };
     let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
+    walker_pin_type_quasi_field(
+        ctx,
+        op_pc,
         w_type_const,
         crate::descr::type_name_obj_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    )?;
     // `record_quasiimmut_field` installs the watcher before it captures
     // `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`). The
     // eligibility peek is only the non-null test; baking it would keep a
@@ -14259,6 +14258,7 @@ fn walker_guard_fold_type_version<Sym: WalkSym>(
     version_tag: i64,
 ) -> Result<OpRef, DispatchError> {
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_pin_type_version_tag(ctx, pc, type_const)?;
     let descr = crate::descr::type_version_tag_descr();
     let vt_op = walker_record_getfield_gc_i_uncached(ctx, type_const, descr);
     walker_guard_fold_int(ctx, pc, vt_op, version_tag)?;
@@ -18637,6 +18637,12 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     // `typeobject.py:1046-1058` rewrites `w_name` without mutating the class
     // dictionary or its version tag.  Pin the raw slot, including its initial
     // null state, because it shadows the type name rendered in the message.
+    walker_pin_type_quasi_field(
+        ctx,
+        op.pc,
+        descr_type_const,
+        crate::descr::type_name_obj_descr(),
+    )?;
     let descr_type_name_op = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[descr_type_const],

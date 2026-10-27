@@ -5281,9 +5281,9 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
     unsafe { pyre_object::dictmultiobject::module_dict_cell_at(obj, slot) }
 }
 
-/// `pyjitpl.py opimpl_getfield_gc_*` never installs a watcher. Function `?`
-/// fields and `ModuleDictStrategy.version` carry their mutate descr on
-/// [`record_quasiimmut_field`] (`jtransform.py rewrite_op_getfield` /
+/// `pyjitpl.py opimpl_getfield_gc_*` never installs a watcher. A field whose
+/// STRUCT publishes `mutate_<name>` (`descr.py get_field_descr`) carries that
+/// descr on [`record_quasiimmut_field`] (`jtransform.py rewrite_op_getfield` /
 /// walker pins). Other STRUCTs still go through [`quasi_immut_descr`].
 fn maybe_record_quasiimmut_on_getfield(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
     if !descr.is_quasi_immutable() {
@@ -5297,9 +5297,7 @@ fn maybe_record_quasiimmut_on_getfield(ctx: &mut TraceCtx, obj: OpRef, descr: &D
         );
         return;
     }
-    if crate::descr::function_mutate_descr_for_field(descr).is_some()
-        || crate::descr::is_module_dict_version_field(descr)
-    {
+    if crate::descr::mutate_descr_for_quasi_field(descr).is_some() {
         return;
     }
     let qmutdescr = quasi_immut_descr(ctx, obj, descr);
@@ -5450,23 +5448,6 @@ fn is_pycode_w_globals_descr(descr: &DescrRef) -> bool {
     name == "w_globals" || name.ends_with(".w_globals")
 }
 
-/// Analyzer `fielddescrof` for `typeobject.py` `_version_tag?` mints its own
-/// index. The reserved [`crate::descr::type_version_tag_descr`] is the same
-/// slot: `W_TypeObject.version_tag`.
-fn is_type_version_tag_descr(descr: &DescrRef) -> bool {
-    if !descr.is_quasi_immutable() {
-        return false;
-    }
-    let Some(field) = descr.as_field_descr() else {
-        return false;
-    };
-    if field.offset() != core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag) {
-        return false;
-    }
-    let name = field.field_name();
-    name == "version_tag" || name.ends_with(".version_tag")
-}
-
 /// Watcher from the mutate descr: `QuasiImmutDescr.__init__` /
 /// `get_current_qmut_instance`.
 pub(crate) fn quasi_immut_descr_from_mutate(
@@ -5540,26 +5521,16 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     let index = descr.index();
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
-    // allocation as a `W_TypeObject`.  Function `?` fields and
-    // `ModuleDictStrategy.version` resolve through
-    // [`quasi_immut_descr_from_mutate`] (mutate descr required). The arms
-    // below are the remaining STRUCTs: hand-minted singletons including
-    // `GilReadyState.gil_ready`, `W_TypeObject.name?`, and `PyCode.w_globals`.
+    // allocation as a `W_TypeObject`.  Function `?` fields,
+    // `ModuleDictStrategy.version`, and `W_TypeObject.version_tag` / `w_name`
+    // resolve through [`quasi_immut_descr_from_mutate`] (mutate descr
+    // required). The arms below are the remaining STRUCTs: hand-minted
+    // singletons including `GilReadyState.gil_ready` and `PyCode.w_globals`.
     // Analyzer `fielddescrof` stamps that field from `pycode.py`
     // `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is the same slot
     // as the reserved `pycode_w_globals_quasi_descr` index.
     let qmut = unsafe {
-        if index == crate::descr::type_version_tag_descr().index()
-            || is_type_version_tag_descr(descr)
-        {
-            pyre_object::typeobject::w_type_current_qmut_instance(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::type_name_obj_descr().index() {
-            pyre_object::typeobject::w_type_current_w_name_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::terminator_allow_unboxing_descr().index() {
+        if index == crate::descr::terminator_allow_unboxing_descr().index() {
             pyre_interpreter::objspace::std::mapdict::terminator_current_allow_unboxing_qmut(
                 struct_ptr as *const _,
             )
