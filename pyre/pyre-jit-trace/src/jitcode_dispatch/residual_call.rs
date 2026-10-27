@@ -9250,8 +9250,11 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let effects_before = fbw_executed_effect_count();
     let unjournaled_before = fbw_has_unjournaled_effect();
-    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
-    ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
+    // Pause the caller before installing the callee index:
+    // `run_codewriter_helper_inline_call` computes `helper_subwalk_level`
+    // then overwrites `transparent_helper_jitcode_index`, matching
+    // `walk_translated_builtin_wrapper` / `pyjitpl.py`
+    // `do_residual_or_indirect_call` (`perform_call` / `newframe`).
     let exc_before = ctx.last_exc_value();
     let walk = run_codewriter_helper_inline_call(
         ctx,
@@ -9263,7 +9266,6 @@ fn try_do_residual_or_indirect_call<Sym: WalkSym>(
         &ref_concretes,
         f_args,
     );
-    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
     let walk_outcome = match walk {
         Ok(outcome) => outcome,
         Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
