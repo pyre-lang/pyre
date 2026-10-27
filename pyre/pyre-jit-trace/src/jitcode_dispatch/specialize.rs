@@ -20513,11 +20513,11 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
                 .replace_box(pycode_op, pycode_const);
             pycode_const
         };
-    let globals_op = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        promoted,
-        crate::descr::pycode_w_globals_quasi_descr(),
-    );
+    let descr = crate::descr::pycode_w_globals_descr();
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("PyCode.w_globals has mutate_w_globals");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, promoted, descr.clone(), Some(&mutate));
+    let globals_op = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, promoted, descr);
     if walker_concrete_ref_object(ctx, globals_op).is_none() {
         // Reread through the forwarded constant, not the pre-record word.
         let Some(pycode_obj) = walker_concrete_ref_object(ctx, pycode_const) else {

@@ -5818,6 +5818,72 @@ fn assembled_w_ctype_mutate_size_quasi_descr_is_the_embedded_field() {
     let _ = (seen, expected);
 }
 
+#[cfg(feature = "pyre-module")]
+#[test]
+fn mutate_descr_for_quasi_field_resolves_w_ctype_size_to_mutate_size() {
+    // `ctypeobj.py W_CType.size?` has no DECLARED_GROUPS row; the parent
+    // is the assembler SizeDescr. `mutate_descr_for_quasi_field` must
+    // still find the packed `mutate_size` intern
+    // (`quasiimmut.py get_mutate_field_name`).
+    let mut size_descr = None;
+    let mut mutate_descr = None;
+    for jc in crate::jitcode_runtime::all_jitcodes() {
+        for op in crate::jitcode_runtime::decoded_ops(&jc.code) {
+            if op.key != "record_quasiimmut_field/rdd" {
+                continue;
+            }
+            if op.pc + 6 > jc.code.len() {
+                continue;
+            }
+            let field_idx = u16::from_le_bytes([jc.code[op.pc + 2], jc.code[op.pc + 3]]) as usize;
+            let mutate_idx = u16::from_le_bytes([jc.code[op.pc + 4], jc.code[op.pc + 5]]) as usize;
+            let Some(field_bh) = crate::jitcode_runtime::get_descr_by_index(field_idx) else {
+                continue;
+            };
+            let Some(mutate_bh) = crate::jitcode_runtime::get_descr_by_index(mutate_idx) else {
+                continue;
+            };
+            let (
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: fname,
+                    owner: fowner,
+                    ..
+                },
+                majit_jitcode::jitcode::BhDescr::Field {
+                    name: mname,
+                    owner: mowner,
+                    ..
+                },
+            ) = (field_bh, mutate_bh)
+            else {
+                continue;
+            };
+            let owner_ok =
+                fowner.as_str().contains("W_CType") && mowner.as_str().contains("W_CType");
+            let is_size = fname.as_str() == "size" || fname.as_str().ends_with(".size");
+            let is_mutate =
+                mname.as_str() == "mutate_size" || mname.as_str().ends_with(".mutate_size");
+            if !(owner_ok && is_size && is_mutate) {
+                continue;
+            }
+            size_descr = Some(crate::descr::make_descr_from_bh(field_bh));
+            mutate_descr = Some(crate::descr::make_descr_from_bh(mutate_bh));
+            break;
+        }
+        if size_descr.is_some() {
+            break;
+        }
+    }
+    let size = size_descr.expect("assembled W_CType.size field descr");
+    let mutate = mutate_descr.expect("assembled W_CType.mutate_size field descr");
+    let resolved =
+        crate::descr::mutate_descr_for_quasi_field(&size).expect("W_CType.size has mutate_size");
+    assert!(
+        std::sync::Arc::ptr_eq(&resolved, &mutate),
+        "mutate_descr_for_quasi_field must return the interned mutate_size row"
+    );
+}
+
 #[test]
 fn assembled_function_code_quasi_descr_is_the_group_mutate_code_row() {
     // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
@@ -6216,6 +6282,50 @@ fn assembled_ec_profilefunc_quasi_descr_is_the_group_mutate_row() {
 }
 
 #[test]
+fn assembled_gil_ready_quasi_descr_is_the_group_mutate_row() {
+    // `gil.py GILThreadLocals._immutable_fields_ = ['gil_ready?']`.
+    // The static is headerless, so a translated `gil_ready_word` field
+    // read assembles `record_quasiimmut_field` as `/idd` (int-banked
+    // raw place). `/rdd` would mean the assembler banked the static as
+    // a GC ref.
+    let expected_field = crate::descr::gil_ready_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("GilReadyState.gil_ready has mutate_gil_ready");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "GilReadyState",
+        "gil_ready",
+        "mutate_gil_ready",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one GilReadyState.gil_ready? /idd with mutate_gil_ready"
+    );
+}
+
+#[test]
+fn assembled_pycode_w_globals_quasi_descr_is_the_group_mutate_row() {
+    // `pycode.py PyCode._immutable_fields_` `w_globals?`.
+    // `jtransform.py rewrite_op_getfield` emits `record_quasiimmut_field`
+    // with mutate_field `mutate_w_globals`.
+    let expected_field = crate::descr::pycode_w_globals_descr();
+    let expected_mutate = crate::descr::mutate_descr_for_quasi_field(&expected_field)
+        .expect("PyCode.w_globals has mutate_w_globals");
+    let seen = assembled_struct_quasi_descr_is_the_group_mutate_row(
+        "PyCode",
+        "w_globals",
+        "mutate_w_globals",
+        expected_field,
+        expected_mutate,
+    );
+    assert!(
+        seen > 0,
+        "translation must assemble at least one PyCode.w_globals? /rdd with mutate_w_globals"
+    );
+}
+
+#[test]
 fn walker_pin_type_version_tag_records_quasiimmut_from_mutate_descr() {
     // `typeobject.py W_TypeObject._immutable_fields_` `_version_tag?`.
     // `walker_pin_type_version_tag` must pass `mutate_version_tag` so
@@ -6329,6 +6439,192 @@ fn walker_pin_namespace_version_records_quasiimmut_from_mutate_descr() {
         std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_field),
         "recorded field descr must be ModuleDictStrategy.version"
     );
+    assert_ne!(qd.qmut().instance_identity(), 0);
+}
+
+#[test]
+fn walker_pin_pycode_w_globals_records_quasiimmut_from_mutate_descr() {
+    // `pycode.py PyCode._immutable_fields_` `w_globals?`.
+    // `inlined_callee_frame_w_globals` must pass `mutate_w_globals` so
+    // `quasiimmut.py QuasiImmutDescr` is built by
+    // `quasi_immut_descr_from_mutate`.
+    use crate::state::ConcreteValue;
+
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ());
+
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let code_const = wc.trace_ctx.const_ref(w_code as i64);
+            let descr = crate::descr::pycode_w_globals_descr();
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+                .expect("PyCode.w_globals has mutate_w_globals");
+            crate::state::record_quasiimmut_field(wc.trace_ctx, code_const, descr, Some(&mutate));
+        },
+    );
+    let recorder = tc.into_recorder();
+    let qmut_ops: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .collect();
+    assert_eq!(qmut_ops.len(), 1, "one QUASIIMMUT_FIELD for w_globals?");
+    let qmut_descr = qmut_ops[0]
+        .getdescr()
+        .expect("QUASIIMMUT_FIELD has a descr");
+    let qd = qmut_descr
+        .as_quasi_immut_descr()
+        .expect("QuasiImmutDescr from quasi_immut_descr_from_mutate");
+    let expected_field = crate::descr::pycode_w_globals_descr();
+    assert!(
+        std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_field),
+        "recorded field descr must be the PYCODE_DESCR_GROUP w_globals row"
+    );
+    let expected_mutate = crate::descr::pycode_mutate_w_globals_descr();
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &crate::descr::mutate_descr_for_quasi_field(&expected_field).expect("mutate_w_globals"),
+            &expected_mutate
+        ),
+        "mutate descr must be the PYCODE_DESCR_GROUP mutate_w_globals row"
+    );
+    assert_ne!(qd.qmut().instance_identity(), 0);
+}
+
+#[test]
+fn pycode_w_globals_pin_on_stamped_getfield_gcr_is_quasi_immut_descr() {
+    // `frame_get_globals_obj` records GetfieldGcR of PyFrame.pycode then
+    // pins `w_globals?`. `pyjitpl.py opimpl_record_quasiimmut_field`
+    // reads `box.getref_base()`; after execute (or the pin's stamp)
+    // writes `_resref`, `quasiimmut.py QuasiImmutDescr` must be the
+    // recorded descr so `heap.py OptHeap.optimize_QUASIIMMUT_FIELD`
+    // does not refuse the loop.
+    use crate::state::ConcreteValue;
+
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let w_code = pyre_interpreter::w_code_new(0xDEAD_BEEF as *const ());
+
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let frame = OpRef::input_arg_ref(0);
+            let pycode_op = wc.trace_ctx.record_op_with_descr(
+                majit_ir::OpCode::GetfieldGcR,
+                &[frame],
+                crate::descr::pyframe_code_descr(),
+            );
+            wc.trace_ctx.set_opref_concrete(
+                pycode_op,
+                majit_ir::Value::Ref(majit_ir::GcRef(w_code as usize)),
+            );
+            let descr = crate::descr::pycode_w_globals_descr();
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+                .expect("PyCode.w_globals has mutate_w_globals");
+            crate::state::record_quasiimmut_field(wc.trace_ctx, pycode_op, descr, Some(&mutate));
+        },
+    );
+    let recorder = tc.into_recorder();
+    let qmut_ops: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .collect();
+    assert_eq!(qmut_ops.len(), 1, "one QUASIIMMUT_FIELD for w_globals?");
+    let qmut_descr = qmut_ops[0]
+        .getdescr()
+        .expect("QUASIIMMUT_FIELD has a descr");
+    let qd = qmut_descr
+        .as_quasi_immut_descr()
+        .expect("stamped GetfieldGcR of pycode must mint QuasiImmutDescr");
+    assert!(std::sync::Arc::ptr_eq(
+        qd.fielddescr(),
+        &crate::descr::pycode_w_globals_descr()
+    ));
+    assert_ne!(qd.qmut().instance_identity(), 0);
+}
+
+#[test]
+fn gil_ready_quasiimmut_from_mutate_descr_on_const_int() {
+    // `gil.py GILThreadLocals.gil_ready?` is a headerless static.
+    // Assembler `/idd` banks the address as Int; `const_ref` of that
+    // place would enter the GC const_ptr table
+    // (`trace_ctx.rs const_ref` / `hold_live_const_ptr`).
+    use crate::state::ConcreteValue;
+
+    pyre_interpreter::test_hooks::install_hash_hook();
+    let _hook_guard = WalkerQmutHookGuard::install();
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    let addr = &raw const pyre_object::gil_ready::GIL_READY_STATE as i64;
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            let obj = wc.trace_ctx.const_int(addr);
+            let descr = crate::descr::gil_ready_descr();
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+                .expect("GilReadyState.gil_ready has mutate_gil_ready");
+            crate::state::record_quasiimmut_field(wc.trace_ctx, obj, descr, Some(&mutate));
+        },
+    );
+    let recorder = tc.into_recorder();
+    let qmut_ops: Vec<_> = recorder
+        .ops()
+        .iter()
+        .filter(|op| op.opcode == majit_ir::OpCode::QuasiimmutField)
+        .collect();
+    assert_eq!(qmut_ops.len(), 1, "one QUASIIMMUT_FIELD for gil_ready?");
+    let qmut_descr = qmut_ops[0]
+        .getdescr()
+        .expect("QUASIIMMUT_FIELD has a descr");
+    let qd = qmut_descr
+        .as_quasi_immut_descr()
+        .expect("QuasiImmutDescr from quasi_immut_descr_from_mutate");
+    let expected_field = crate::descr::gil_ready_descr();
+    assert!(
+        std::sync::Arc::ptr_eq(qd.fielddescr(), &expected_field),
+        "recorded field descr must be the GIL_READY_DESCR_GROUP gil_ready row"
+    );
+    assert_eq!(qd.struct_ptr(), addr as u64);
     assert_ne!(qd.qmut().instance_identity(), 0);
 }
 

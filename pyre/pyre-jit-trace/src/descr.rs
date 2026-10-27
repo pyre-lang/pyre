@@ -73,24 +73,6 @@ const INT_MUTABLE_CELL_VALUE_INDEX: u32 = CELL_DESCR_TAG;
 const OBJECT_W_CLASS_DESCR_TAG: u32 = 0x5500_0000;
 const OBJECT_W_CLASS_INDEX: u32 = OBJECT_W_CLASS_DESCR_TAG;
 
-// `GilReadyState.gil_ready` is a process-global `i64`, not a `PyObject`
-// field. `quasi_immut_descr` selects the watcher from `descr.index()`
-// alone, so the index has to be an owner identity. Next free tag after
-// `PyObject.w_class` (`0x5500_0000`); `0x6100_0000` is native mapdict.
-const GIL_READY_DESCR_TAG: u32 = 0x5600_0000;
-const GIL_READY_INDEX: u32 = GIL_READY_DESCR_TAG;
-
-// `PyCode.w_globals` is `pycode.py` `"w_globals?"`. The index selects the
-// pointer cast in `quasi_immut_descr`, and the PyCode descr group's row
-// derives its index from the layout (`stable_field_index`) and its parent
-// ordinal, so that number is not an owner identity. Reserved in a tag of
-// its own. Disjoint from FIELD (0x10xx_xxxx), ARRAY, SIZE, CELL, MAPDICT,
-// PROPERTY, WRAPPER, CELL_FAMILY, EC, OBJECT_W_CLASS (`0x5500_0000`),
-// GIL_READY (`0x5600_0000`), `object.typeptr` (0x6000_0000), the native
-// mapdict block, and the GC tid.
-const PYCODE_DESCR_TAG: u32 = 0x5700_0000;
-const PYCODE_W_GLOBALS_INDEX: u32 = PYCODE_DESCR_TAG;
-
 // The generated native user layouts append mapdict fields at different base
 // sizes. HeapCache keys by descriptor index; give each translated STRUCT field
 // the distinct identity provided by descr.py's per-STRUCT cache.
@@ -4830,10 +4812,10 @@ pub fn type_mutate_descr_for_field(field: &DescrRef) -> Option<DescrRef> {
 /// `quasiimmut.py get_mutate_field_name(fieldname)` = `'mutate_' + fieldname`
 /// through the field's parent SizeDescr (`descr.py get_field_descr(STRUCT,
 /// fieldname)`). Lookup is `(STRUCT, "mutate_" + fieldname)` on
-/// `all_fielddescrs`, never an index or offset. `None` when the descr is not
-/// quasi, has no parent, or the STRUCT has no `mutate_<field>` row (PyCode
-/// `w_globals` keeps `mutate_w_globals.ptr` / `.lock`; headerless reserved
-/// descrs have no parent).
+/// `all_fielddescrs`, then `_cache_field[STRUCT][mutate_<name>]` for a packed
+/// intern `fielddescrof` made when the layout flattened the hidden field to
+/// `mutate_<name>.ptr` / `.lock` (`W_CType.size`). `None` when the descr is
+/// not quasi, has no parent, or the STRUCT has no `mutate_<field>` row.
 pub fn mutate_descr_for_quasi_field(field: &DescrRef) -> Option<DescrRef> {
     let fd = field.as_field_descr()?;
     if !field.is_quasi_immutable() {
@@ -4846,9 +4828,28 @@ pub fn mutate_descr_for_quasi_field(field: &DescrRef) -> Option<DescrRef> {
     let parent = fd.get_parent_descr()?;
     let sd = parent.as_size_descr()?;
     let mutate_key = format!("mutate_{key}");
-    sd.all_fielddescrs()
+    if let Some(child) = sd
+        .all_fielddescrs()
         .iter()
         .find(|child| child.field_key() == mutate_key)
+    {
+        return Some(child.clone() as DescrRef);
+    }
+    let cache_key = sd.cache_key();
+    if cache_key != 0 {
+        let gc = majit_ir::descr::gc_cache().lock();
+        if let Some(cached) = gc
+            ._cache_field
+            .get(&majit_ir::descr::LLType::Struct(cache_key))
+            .and_then(|fields| fields.get(&mutate_key))
+        {
+            return Some(cached.clone() as DescrRef);
+        }
+    }
+    let mutate_ptr_key = format!("{mutate_key}.ptr");
+    sd.all_fielddescrs()
+        .iter()
+        .find(|child| child.field_key() == mutate_ptr_key)
         .map(|child| child.clone() as DescrRef)
 }
 
@@ -7905,17 +7906,19 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(PyCode, loop_header_info),
                 false,
             ),
-            // Inlined `QuasiImmutField` for `rclass.py InstanceRepr._setup_repr`
-            // `mutate_w_globals` (`pycode.py` `"w_globals?"`): two raw host
-            // pointers (`get_type_flag` FLAG_UNSIGNED).
-            word_int(
-                "mutate_w_globals.ptr",
+            // Hidden `mutate_w_globals` (`rclass.py InstanceRepr._setup_repr` /
+            // `quasiimmut.py get_mutate_field_name` of `pycode.py` `"w_globals?"`).
+            // `Type::Ref` + `mutate_<name>_lock` match `FUNCTION_DESCR_GROUP`.
+            word_ref(
+                "mutate_w_globals",
                 mutate_w_globals + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
                 false,
+                false,
             ),
-            word_int(
-                "mutate_w_globals.lock",
+            word_ref(
+                "mutate_w_globals_lock",
                 mutate_w_globals + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET,
+                false,
                 false,
             ),
             int_field(
@@ -7961,32 +7964,8 @@ pub fn pycode_w_globals_descr() -> DescrRef {
     pycode_field_descr_at(pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET)
 }
 
-/// `pycode.py` `"w_globals?"` — the globals `pyframe.py PyFrame.get_w_globals`
-/// reads off `jit.promote(self.pycode)`.
-///
-/// Minted standalone rather than read out of [`PYCODE_DESCR_GROUP`], the way
-/// [`STATICMETHOD_W_FUNCTION_QUASI_DESCR`] is: the group's row derives its
-/// index from the layout, and this owner needs an index of its own for the
-/// reason [`PYCODE_DESCR_TAG`] records. The group keeps its census row for
-/// the field's ordinary reads.
-static PYCODE_W_GLOBALS_QUASI_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
-    Arc::new(
-        majit_ir::descr::SimpleFieldDescr::new_with_name(
-            PYCODE_W_GLOBALS_INDEX,
-            pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET,
-            std::mem::size_of::<usize>(),
-            Type::Ref,
-            false,
-            majit_ir::descr::ArrayFlag::Pointer,
-            "PyCode.w_globals".to_string(),
-            "w_globals".to_string(),
-        )
-        .with_quasi_immutable(true),
-    )
-});
-
-pub fn pycode_w_globals_quasi_descr() -> DescrRef {
-    PYCODE_W_GLOBALS_QUASI_DESCR.clone()
+pub fn pycode_mutate_w_globals_descr() -> DescrRef {
+    field_descr_from_group_named(&*PYCODE_DESCR_GROUP, "mutate_w_globals")
 }
 
 /// `PyCode.w_name` — the realized `co_name` string.  `w_code_name_obj` builds
@@ -9369,29 +9348,78 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
 
 /// `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ = ['gil_ready?']`).
 ///
-/// One process-wide `i64` at offset 0 of a non-GC `static mut`. Both
-/// `is_immutable` and `is_quasi_immutable` are set so `SimpleFieldDescr::is_always_pure`
-/// stays false: an always-pure read of a constant receiver folds the zero
-/// with no `QuasiimmutField` and no invalidation. `is_gc_managed` is false
-/// so the read does not emit `GUARD_GC_TYPE` against the bytes before the
-/// static.
+/// One process-wide `i64` at offset 0 of a non-GC `static mut`, plus the
+/// hidden `mutate_gil_ready` / `mutate_gil_ready_lock` words
+/// (`rclass.py InstanceRepr._setup_repr` / `quasiimmut.py
+/// get_mutate_field_name`). Both `is_immutable` and `is_quasi_immutable`
+/// are set so `SimpleFieldDescr::is_always_pure` stays false: an
+/// always-pure read of a constant receiver folds the zero with no
+/// `QuasiimmutField` and no invalidation. `is_gc_managed` is false so the
+/// read does not emit `GUARD_GC_TYPE` against the bytes before the static.
+/// HeapCache `index` is the interned `(STRUCT, fieldname)` identity.
 static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
-    let spec = SimpleFieldDescrSpec {
-        index: GIL_READY_INDEX,
-        field_key: "gil_ready".to_string(),
-        name: "GilReadyState.gil_ready".to_string(),
-        offset: 0,
-        field_size: 8,
-        field_type: Type::Int,
-        is_immutable: true,
-        is_quasi_immutable: true,
-        flag: ArrayFlag::Signed,
-        virtualizable: false,
-        index_in_parent: 0,
-        is_class_word: Some(false),
-        load_is_acquire: false,
+    use pyre_object::gil_ready::GilReadyState;
+    let mutate_offset = std::mem::offset_of!(GilReadyState, mutate_gil_ready)
+        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET;
+    let mutate_lock_offset = std::mem::offset_of!(GilReadyState, mutate_gil_ready)
+        + pyre_object::quasiimmut::QUASIIMMUT_FIELD_LOCK_OFFSET;
+    let field = |field_key: &str,
+                 offset,
+                 field_size,
+                 field_type,
+                 is_immutable,
+                 is_quasi_immutable,
+                 flag,
+                 index_in_parent| {
+        SimpleFieldDescrSpec {
+            index: u32::MAX,
+            field_key: field_key.to_string(),
+            name: format!("GilReadyState.{field_key}"),
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            is_quasi_immutable,
+            flag,
+            virtualizable: false,
+            index_in_parent,
+            is_class_word: Some(false),
+            load_is_acquire: false,
+        }
     };
+    let specs = [
+        field(
+            "gil_ready",
+            std::mem::offset_of!(GilReadyState, gil_ready),
+            8,
+            Type::Int,
+            true,
+            true,
+            ArrayFlag::Signed,
+            0,
+        ),
+        field(
+            "mutate_gil_ready",
+            mutate_offset,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            1,
+        ),
+        field(
+            "mutate_gil_ready_lock",
+            mutate_lock_offset,
+            WORD,
+            Type::Ref,
+            false,
+            false,
+            ArrayFlag::Pointer,
+            2,
+        ),
+    ];
     // `descr.py get_field_descr` caches `(STRUCT, fieldname)`. The opcode
     // EffectInfo member names this STRUCT by `path_hash("gil_ready::GilReadyState")`.
     // A cache_key of 0 never occupies that slot, so `stamp_effect_info_descr`
@@ -9399,19 +9427,23 @@ static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = Lazy
     let cache_key = majit_ir::descr::path_hash("gil_ready::GilReadyState");
     majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
         u32::MAX,
-        8,
+        std::mem::size_of::<GilReadyState>(),
         0,
         cache_key,
         0,
         false,
         true,
-        &[spec],
+        &specs,
         &[],
     )
 });
 
 pub fn gil_ready_descr() -> DescrRef {
-    GIL_READY_DESCR_GROUP.field_descrs[0].clone() as DescrRef
+    field_descr_from_group_named(&*GIL_READY_DESCR_GROUP, "gil_ready")
+}
+
+pub fn gil_ready_mutate_descr() -> DescrRef {
+    field_descr_from_group_named(&*GIL_READY_DESCR_GROUP, "mutate_gil_ready")
 }
 
 /// Size descriptor for W_SliceObject allocation via NewWithVtable.
@@ -10286,8 +10318,9 @@ mod tests {
             &pyre_interpreter::pycode::CODE_TYPE as *const _ as usize
         );
         // Inherited `PyObject.w_class` occupies `all_fielddescrs[0]`, then
-        // every `PyCode` payload field in declaration order, the inlined
-        // `QuasiImmutField` as its leaves (`heaptracker.all_fielddescrs`).
+        // every `PyCode` payload field in declaration order, the hidden
+        // `mutate_w_globals` / `mutate_w_globals_lock` words
+        // (`quasiimmut.py get_mutate_field_name`).
         let names: Vec<&str> = size
             .all_fielddescrs()
             .iter()
@@ -10317,8 +10350,8 @@ mod tests {
                 "PyCode.w_filename",
                 "PyCode.addr2line_memo",
                 "PyCode.loop_header_info",
-                "PyCode.mutate_w_globals.ptr",
-                "PyCode.mutate_w_globals.lock",
+                "PyCode.mutate_w_globals",
+                "PyCode.mutate_w_globals_lock",
                 "PyCode.jit_shape",
             ]
         );
@@ -11447,6 +11480,16 @@ mod tests {
                 Type::Ref,
                 &*W_PROPERTY_DESCR_GROUP,
                 false,
+            ),
+            (
+                gil_ready_descr(),
+                gil_ready_mutate_descr(),
+                "gil_ready",
+                core::mem::offset_of!(pyre_object::gil_ready::GilReadyState, gil_ready),
+                8,
+                Type::Int,
+                &*GIL_READY_DESCR_GROUP,
+                true,
             ),
         ];
         for (field, expected_mutate, key, offset, field_size, field_type, group, headerless) in
@@ -13233,11 +13276,39 @@ mod tests {
         let descr = gil_ready_descr();
         assert!(descr.is_quasi_immutable());
         assert!(!descr.is_always_pure());
-        assert_eq!(descr.index(), GIL_READY_INDEX);
+        assert!(
+            std::sync::Arc::ptr_eq(
+                &descr,
+                &field_descr_from_group_named(&*GIL_READY_DESCR_GROUP, "gil_ready")
+            ),
+            "gil_ready must be the interned group row"
+        );
         let field = descr.as_field_descr().expect("field descr");
         assert_eq!(field.offset(), 0);
         assert_eq!(field.field_size(), 8);
         assert_eq!(field.field_type(), Type::Int);
+        assert_eq!(field.field_key(), "gil_ready");
+        let mutate = mutate_descr_for_quasi_field(&descr).expect("gil_ready has mutate_gil_ready");
+        assert!(std::sync::Arc::ptr_eq(&mutate, &gil_ready_mutate_descr()));
+        assert_eq!(
+            GIL_READY_DESCR_GROUP.size_descr.size(),
+            std::mem::size_of::<pyre_object::gil_ready::GilReadyState>()
+        );
+        assert!(GIL_READY_DESCR_GROUP.size_descr.headerless());
+        for (i, row) in GIL_READY_DESCR_GROUP.field_descrs.iter().enumerate() {
+            assert_eq!(row.index_in_parent(), i, "{}", row.field_key());
+        }
+    }
+
+    #[test]
+    fn gil_ready_mutate_descr_offset_lands_on_the_static_field() {
+        let mutate = gil_ready_mutate_descr();
+        let off = mutate.as_field_descr().expect("mutate descr").offset();
+        let state = &raw const pyre_object::gil_ready::GIL_READY_STATE;
+        let via = (state as *const u8).wrapping_add(off);
+        // Field projection of `static mut` is a mutable-static place.
+        let direct = unsafe { &raw const pyre_object::gil_ready::GIL_READY_STATE.mutate_gil_ready };
+        assert_eq!(via, direct as *const u8);
     }
 
     #[test]
@@ -13304,6 +13375,17 @@ mod tests {
         assert!(
             std::sync::Arc::ptr_eq(&descr, &canonical),
             "gil_ready Field member must bridge to the quasi descr",
+        );
+        let mutate_lookup = descr_from_set_member(&majit_ir::effectinfo::DescrSetMember::Field {
+            struct_id: majit_ir::descr::path_hash("pyre_object::gil_ready::GilReadyState"),
+            field_name: "mutate_gil_ready".into(),
+        });
+        let SetMemberLookup::Resolved(mutate) = mutate_lookup else {
+            panic!("mutate_gil_ready Field member must resolve");
+        };
+        assert!(
+            std::sync::Arc::ptr_eq(&mutate, &gil_ready_mutate_descr()),
+            "mutate_gil_ready Field member must bridge to the group row",
         );
     }
 
@@ -13927,6 +14009,33 @@ mod tests {
                 Type::Ref,
                 false,
                 audit_holder_mutate_hooks_armed_descr(),
+            ),
+            (
+                &[
+                    "GilReadyState",
+                    "gil_ready::GilReadyState",
+                    "pyre_object::gil_ready::GilReadyState",
+                ],
+                "gil_ready",
+                0,
+                8,
+                Type::Int,
+                true,
+                gil_ready_descr(),
+            ),
+            (
+                &[
+                    "GilReadyState",
+                    "gil_ready::GilReadyState",
+                    "pyre_object::gil_ready::GilReadyState",
+                ],
+                "mutate_gil_ready",
+                std::mem::offset_of!(pyre_object::gil_ready::GilReadyState, mutate_gil_ready)
+                    + pyre_object::quasiimmut::QUASIIMMUT_FIELD_PTR_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                gil_ready_mutate_descr(),
             ),
             (
                 &[
@@ -16148,11 +16257,12 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                 return canonical;
             }
             // `GilReadyState.gil_ready` is the process-wide `gil_ready?`
-            // word. The codewriter has no `?` attribute on it (that would
-            // emit `record_quasiimmut_field`, which the production
-            // blackhole builder does not implement) and names the owner by
-            // leaf or by module path. Bridge to the one quasi descr before
-            // the generic parent lookup mints a mutable twin.
+            // word (`gil.py GILThreadLocals._immutable_fields_`).
+            // `#[jit_immutable_fields("gil_ready?")]` is on the STRUCT, so
+            // `jtransform.py rewrite_op_getfield` emits
+            // `record_quasiimmut_field`. The owner is named by leaf or by
+            // module path. Bridge to the interned group row before the
+            // generic parent lookup mints a mutable twin.
             if (owner.as_str() == "GilReadyState" || owner.as_str().ends_with("::GilReadyState"))
                 && name.as_str() == "gil_ready"
             {
@@ -16208,6 +16318,25 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
             // Flatten may store the display name (`Function.code`) with a
             // crate-qualified owner; `descr.py get_field_descr` keys the
             // STRUCT-local fieldname, so look up the leaf.
+            if owner.as_str() == "PyCode" || owner.as_str().ends_with("::PyCode") {
+                let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
+                if let Some(canonical) = PYCODE_DESCR_GROUP
+                    .field_descrs
+                    .iter()
+                    .find(|descr| descr.field_key() == leaf)
+                {
+                    let canonical = canonical.clone() as DescrRef;
+                    if let Some(field) = canonical.as_field_descr() {
+                        let nested_mutate = leaf.starts_with("mutate_") && *field_size == 2 * WORD;
+                        if nested_mutate
+                            || (field.field_size() == *field_size
+                                && field.field_type() == *field_type)
+                        {
+                            return canonical;
+                        }
+                    }
+                }
+            }
             if owner.as_str() == "Function" || owner.as_str().ends_with("::Function") {
                 let leaf = field_key.rsplit('.').next().unwrap_or(field_key);
                 if let Some(canonical) = FUNCTION_DESCR_GROUP
@@ -17177,14 +17306,15 @@ fn mint_field(
         && let majit_ir::descr::LLType::Struct(struct_id) = &struct_key
         && is_gil_ready_struct(*struct_id)
     {
-        let canonical = gil_ready_descr();
-        if let Some(field) = canonical.as_field_descr()
-            && field.offset() == *offset
-            && field.field_size() == *field_size
-            && field.field_type() == *field_type
+        if let Some(canonical) = GIL_READY_DESCR_GROUP
+            .field_descrs
+            .iter()
+            .find(|descr| descr.field_key() == "gil_ready")
+            && canonical.offset() == *offset
+            && canonical.field_size() == *field_size
+            && canonical.field_type() == *field_type
         {
-            return Some(GIL_READY_DESCR_GROUP.field_descrs[0].clone()
-                as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
+            return Some(canonical.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>);
         }
     }
     if field_name == "version"
@@ -17720,6 +17850,8 @@ fn d24_headerless_group_for_owner(
         || owner.ends_with("::AuditHolder")
     {
         Some(&*AUDIT_HOLDER_DESCR_GROUP)
+    } else if owner == "GilReadyState" || owner.ends_with("::GilReadyState") {
+        Some(&*GIL_READY_DESCR_GROUP)
     } else {
         None
     }
@@ -17732,6 +17864,8 @@ fn d24_headerless_group_for_struct_id(
         Some(&*CELL_FAMILY_DESCR_GROUP)
     } else if is_audit_holder_struct(struct_id) {
         Some(&*AUDIT_HOLDER_DESCR_GROUP)
+    } else if is_gil_ready_struct(struct_id) {
+        Some(&*GIL_READY_DESCR_GROUP)
     } else {
         None
     }

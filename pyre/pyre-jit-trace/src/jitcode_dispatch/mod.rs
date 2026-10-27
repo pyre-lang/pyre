@@ -15163,17 +15163,41 @@ fn handle<Sym: WalkSym>(
             let obj = read_ref_reg(code, op, 0, ctx)?;
             let descr = read_descr(code, op, 1, ctx)?;
             let mutate = read_descr(code, op, 3, ctx)?;
+            // `pyjitpl.py opimpl_record_quasiimmut_field` reads
+            // `box.getref_base()`. MIFrame `read_ref_reg` answers that
+            // word from the register; the walker keeps the same pointer
+            // in the typed shadow when the OpRef itself was not stamped.
+            if ctx.trace_ctx.box_value(obj).is_none() {
+                if let ConcreteValue::Ref(ptr) = read_ref_reg_concrete(code, op, 0, ctx) {
+                    if !ptr.is_null() {
+                        ctx.trace_ctx
+                            .try_set_opref_concrete(obj, Value::Ref(majit_ir::GcRef(ptr as usize)));
+                    }
+                }
+            }
             crate::state::record_quasiimmut_field(ctx.trace_ctx, obj, descr, Some(&mutate));
             walker_flush_guard_not_invalidated(ctx, op.pc)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // Headerless owner: assembler `lookup_reg_with_kind_var` puts the
-        // raw pointer in the int bank (`getfield_raw_*` `i` base). Walker
-        // pins of the same STRUCT use `const_ref` so `concrete_gc_ptr`
-        // can read the address.
+        // raw pointer in the int bank (`getfield_raw_*` `i` base), so
+        // `rewrite_op_getfield` keys `record_quasiimmut_field/idd`.
+        // Keep that Int box. `const_ref` of a data-segment static
+        // (`gil.py GILThreadLocals.gil_ready` as `GIL_READY_STATE`) or a
+        // raw `CellFamily` would enter the GC const_ptr table
+        // (`trace_ctx.rs const_ref` / `hold_live_const_ptr`).
+        // `concrete_gc_ptr` reads the Int address for
+        // `quasiimmut.py get_current_qmut_instance`.
         "record_quasiimmut_field/idd" => {
-            let obj = match read_int_reg_concrete(code, op, 0, ctx) {
-                ConcreteValue::Int(ptr) if ptr != 0 => ctx.trace_ctx.const_ref(ptr),
+            let obj = read_int_reg(code, op, 0, ctx)?;
+            match read_int_reg_concrete(code, op, 0, ctx) {
+                ConcreteValue::Int(n) if n != 0 => {
+                    // Same `box.getref_base()` stamp as `/rdd`: keep the
+                    // Int-bank address on the box so
+                    // `quasiimmut.py get_current_qmut_instance` can add
+                    // the mutate offset (`history.py ConstInt`).
+                    ctx.trace_ctx.try_set_opref_concrete(obj, Value::Int(n));
+                }
                 _ => {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
