@@ -14164,9 +14164,7 @@ pub fn builtin_int(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         // intobject.py:1047 — unicode is normalized through
         // `unicode_to_decimal_w` so non-ASCII decimal digits parse.
         if unsafe { is_str(obj) } {
-            let normalized = pyre_object::with_roots!(obj => unicode_to_decimal_w(obj))
-                .map_err(|_| invalid_int_literal(obj, 10))?;
-            return parse_int_from_str(obj, &normalized, 10);
+            return _string_to_int_or_long_unicode(obj);
         }
         // intobject.py:1056-1070 — bytes / bytearray, then any object
         // exposing a readable buffer (`space.charbuf_w`).
@@ -14352,13 +14350,74 @@ fn unicode_to_decimal_w(w_unistr: PyObjectRef) -> Result<String, crate::PyError>
     Ok(out)
 }
 
+/// `intobject.py _string_to_int_or_long` for the unicode arm of `_new_baseint`.
+///
+/// Normalize with `unicode_to_decimal_w`, map that failure to
+/// `invalid_int_literal`, then parse. Owns a Rust `String`; upstream
+/// `string_to_int` is a residual call in the trace.
+#[majit_macros::dont_look_inside]
+pub(crate) fn _string_to_int_or_long_unicode(
+    mut w_value: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    let normalized = pyre_object::with_roots!(w_value => unicode_to_decimal_w(w_value))
+        .map_err(|_| invalid_int_literal(w_value, 10))?;
+    parse_int_from_str(w_value, &normalized, 10)
+}
+
 /// `wrap_parsestringerror(space, e, w_source)` — report the original Python
 /// source object, not the whitespace-trimmed or Unicode-normalized buffer the
 /// number parser consumes internally.
+///
+/// `intobject.py wrap_parsestringerror` is `oefmt(..., '%s: %R', e.msg, w_source)`:
+/// `e.msg` names the base, and `%R` runs on first message read.
 fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
     // `%.200R` clips the rendering at 200 code points, closing quote included
-    // — a long literal is reported unterminated.
+    // — a long literal is reported unterminated. The clip of a bytes-like
+    // source is the object stored as `x0`; the repr clip lives in
+    // `PyError::ensure_deferred_computed`.
     const MAX_REPR_CODE_POINTS: usize = 200;
+    // `oefmt_one` stores the format pointer, so each entry is a `'static`
+    // literal. Indexed by `base` for 0..=36; `wrap_parsestringerror` names
+    // the base in `e.msg`.
+    const INVALID_INT_LITERAL_FMT: [&str; 37] = [
+        "invalid literal for int() with base 0: %R",
+        "invalid literal for int() with base 1: %R",
+        "invalid literal for int() with base 2: %R",
+        "invalid literal for int() with base 3: %R",
+        "invalid literal for int() with base 4: %R",
+        "invalid literal for int() with base 5: %R",
+        "invalid literal for int() with base 6: %R",
+        "invalid literal for int() with base 7: %R",
+        "invalid literal for int() with base 8: %R",
+        "invalid literal for int() with base 9: %R",
+        "invalid literal for int() with base 10: %R",
+        "invalid literal for int() with base 11: %R",
+        "invalid literal for int() with base 12: %R",
+        "invalid literal for int() with base 13: %R",
+        "invalid literal for int() with base 14: %R",
+        "invalid literal for int() with base 15: %R",
+        "invalid literal for int() with base 16: %R",
+        "invalid literal for int() with base 17: %R",
+        "invalid literal for int() with base 18: %R",
+        "invalid literal for int() with base 19: %R",
+        "invalid literal for int() with base 20: %R",
+        "invalid literal for int() with base 21: %R",
+        "invalid literal for int() with base 22: %R",
+        "invalid literal for int() with base 23: %R",
+        "invalid literal for int() with base 24: %R",
+        "invalid literal for int() with base 25: %R",
+        "invalid literal for int() with base 26: %R",
+        "invalid literal for int() with base 27: %R",
+        "invalid literal for int() with base 28: %R",
+        "invalid literal for int() with base 29: %R",
+        "invalid literal for int() with base 30: %R",
+        "invalid literal for int() with base 31: %R",
+        "invalid literal for int() with base 32: %R",
+        "invalid literal for int() with base 33: %R",
+        "invalid literal for int() with base 34: %R",
+        "invalid literal for int() with base 35: %R",
+        "invalid literal for int() with base 36: %R",
+    ];
     // `_PyLong_FromBytes` renders the buffer it was handed through a fresh
     // `PyBytes_FromStringAndSize`, so a `bytearray` — or a subclass of either
     // — reports its contents as `b'-'` rather than its own repr.
@@ -14373,16 +14432,17 @@ fn invalid_int_literal(w_source: PyObjectRef, base: u32) -> crate::PyError {
     } else {
         w_source
     };
-    let source_repr = unsafe { crate::display::py_repr_wtf8(rendered) }
-        .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<unprintable>".to_string()));
-    let mut clipped = rustpython_wtf8::Wtf8Buf::new();
-    for point in source_repr.code_points().take(MAX_REPR_CODE_POINTS) {
-        clipped.push(point);
-    }
-    crate::PyError::value_error(crate::display::wtf8_format!(
-        format!("invalid literal for int() with base {base}: "),
-        clipped
-    ))
+    // `lookup_exc_class_for_kind` is an atomic load of `EXC_CLASS_BY_KIND`;
+    // it does not allocate, so `rendered` does not need a pin across it.
+    let w_type = pyre_object::interp_exceptions::lookup_exc_class_for_kind(
+        pyre_object::interp_exceptions::ExcKind::ValueError,
+    );
+    crate::error::oefmt_one(
+        crate::PyErrorKind::ValueError,
+        w_type,
+        rendered as pyre_object::gc_hook::GCREF,
+        INVALID_INT_LITERAL_FMT[base as usize],
+    )
 }
 
 /// Parse an integer from a string with the given base.

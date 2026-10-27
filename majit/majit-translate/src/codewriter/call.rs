@@ -10926,18 +10926,23 @@ impl CallControl {
         seen: &mut CallTracker,
         analyzed: &mut AnalyzedCalls,
     ) -> bool {
-        // `graphanalyze.py GraphAnalyzer.analyze` walks `funcobj.graph`
-        // (`callable_graph_path`); a harvested crate-prefixed spelling is
-        // that graph.
+        // Hints are read from the function object under either spelling
+        // (`collectanalyze.py CollectAnalyzer.analyze_direct_call` reads
+        // `graph.func`); the body is walked from the registered graph
+        // (`callable_graph_path`).
+        let spelled = path;
         let resolved = self.callable_graph_path(path);
         let path = resolved.as_ref().unwrap_or(path);
-        // collectanalyze.py:15: _gctransformer_hint_cannot_collect_ → False
-        if self.func_effects(path).is_some_and(|f| f.cannot_collect) {
+        let hinted = |pred: fn(&FuncRef<'_>) -> bool| {
+            [spelled, path]
+                .into_iter()
+                .any(|p| self.func_effects(p).is_some_and(|f| pred(&f)))
+        };
+        if hinted(|f| f.cannot_collect) {
             return false;
         }
-        // collectanalyze.py:15: _gctransformer_hint_close_stack_ → True.
         // close_stack functions always can collect.
-        if self.func_effects(path).is_some_and(|f| f.close_stack) {
+        if hinted(|f| f.close_stack) {
             return true;
         }
         let graph = match self.function_graphs.get(path) {
@@ -24836,6 +24841,56 @@ mod tests {
                 .split("calling a function with signature")
                 .nth(1),
             "crate-prefixed mismatch must be the same signature Exception as the registered spelling"
+        );
+
+        assert!(
+            !cc.analyze_can_collect(
+                &spelled_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+            ),
+            "crate-prefixed collectanalyze of a non-allocating body is false before _gctransformer_hint_close_stack_"
+        );
+        cc.mark_close_stack(spelled_path.clone());
+        assert!(
+            cc.analyze_can_collect(
+                &spelled_path,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+            ),
+            "crate-prefixed _gctransformer_hint_close_stack_ must answer true"
+        );
+
+        cc.struct_fields
+            .note_foreign_body_callable("alloc", "vec::<Impl>::push");
+        let alloc_registered = CallPath::from_segments(["vec", "<Impl>", "push"]);
+        let alloc_spelled = CallPath::from_segments(["alloc", "vec", "<Impl>", "push"]);
+        let mut alloc_graph = FunctionGraph::new("push");
+        let start = alloc_graph.startblock;
+        alloc_graph.blocks[start.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::New {
+                owner: "Vec".to_string(),
+            },
+        });
+        alloc_graph.set_return(start, None);
+        cc.register_function_graph(alloc_registered, alloc_graph);
+        assert!(
+            cc.analyze_can_collect(
+                &alloc_spelled,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+            ),
+            "crate-prefixed collectanalyze of a New body is true before _gctransformer_hint_cannot_collect_"
+        );
+        cc.mark_cannot_collect(alloc_spelled.clone());
+        assert!(
+            !cc.analyze_can_collect(
+                &alloc_spelled,
+                &mut CallTracker::new(),
+                &mut new_analyzed_calls(),
+            ),
+            "crate-prefixed _gctransformer_hint_cannot_collect_ must answer false"
         );
     }
 

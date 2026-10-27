@@ -30211,7 +30211,7 @@ impl<'a> Lowering<'a> {
                 // graph-less std helper.  A string-byte-view (`as_bytes()`)
                 // is `ll_strlen == 0`, not a GcArray header read.
                 if args.len() == 1 && self.is_slice_is_empty(&reg) {
-                    let fat_len = if first_arg_is_string_byte_view || first_arg_is_list_view {
+                    let fat_len = if first_arg_is_string_byte_view {
                         None
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
@@ -30290,9 +30290,9 @@ impl<'a> Lowering<'a> {
                 // `Rvalue::Len` rewrites to `__strlen`: the view is the
                 // `W_UnicodeObject`, not a GcArray header.
                 if args.len() == 1 && self.is_slice_len(&reg) {
-                    // `Box<[T]>::len` is the fat pointer's metadata word.
-                    // `arraylen_gc` would dereference the data word.
-                    let fat_len = if first_arg_is_string_byte_view || first_arg_is_list_view {
+                    // A `Box<[T]>` field read — list views included — reads the fat pointer's length word (`rlist.py` `ll_length` reads the list's own length);
+                    // a list view with no fat word in the graph (a parameter, a `Vec`) keeps `__len`.
+                    let fat_len = if first_arg_is_string_byte_view {
                         None
                     } else {
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
@@ -100704,7 +100704,7 @@ mod tests {
     /// index are `__len` / `ArrayRead`, never the resizable-list raw ptr.
     #[test]
     fn list_view_box_u8_slice_len_index_stays_the_list() {
-        use crate::model::OpKind;
+        use crate::model::{OpKind, VecFieldPart};
 
         let u8_ty = window_u8();
         let n = window_usize();
@@ -100852,6 +100852,115 @@ mod tests {
             getitem,
             "Box<[u8]> list view index is list getitem; leafs={leafs:?} graph={}",
             graph.dump()
+        );
+
+        // `fn f(s: &S) -> usize { s.kinds.len() }` with `S { kinds: Box<[u8]> }`.
+        // The Box is a struct field read in `fat_box_vars`, so `<[T]>::len` is
+        // FatLen of `kinds`, not a residual `__len`.
+        let holder_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+        });
+        let holder_ref = serde_json::json!({"Ref": ["Erased", holder_adt, "Shared"]});
+        let field_box_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "builtin": "Box",
+                "generics": {
+                    "regions": [],
+                    "types": [window_slice()],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let usize_ty = window_usize();
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "S"], true),
+            "kind": {"Struct": [{
+                "name": "kinds",
+                "ty": field_box_ty,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            }]}
+        });
+        let kinds_place = window_place(
+            serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Projection": [
+                    window_place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &field_box_ty,
+        );
+        let field_len = window_opaque_fun(
+            1,
+            &["core", "slice", "<Impl>", "len"],
+            vec![field_box_ty.clone()],
+            usize_ty.clone(),
+        );
+        let (field_unwind, field_ret) = window_unwind_and_return_blocks();
+        let field_caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": window_meta(&["fixture", "kinds_len"], true),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": usize_ty},
+            "body": {"Unstructured": {
+                "span": window_span(),
+                "locals": {"arg_count": 1, "locals": [
+                    window_local(0, &usize_ty),
+                    window_local(1, &holder_ref),
+                    window_local(2, &field_box_ty)
+                ]},
+                "body": [
+                    {
+                        "statements": [{
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 2}), &field_box_ty),
+                                {"Use": [{"Copy": kinds_place}, "No"]}
+                            ]}
+                        }],
+                        "kind": "Regular",
+                        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": window_empty_generics()
+                            }},
+                            "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &field_box_ty)}],
+                            "dest": window_place(serde_json::json!({"Local": 0}), &usize_ty)
+                        }, "target": 2, "on_unwind": 1}}}
+                    },
+                    field_unwind,
+                    {
+                        "statements": [],
+                        "kind": "Regular",
+                        "terminator": {"span": window_span(), "kind": "Return"}
+                    },
+                    field_ret
+                ]
+            }}
+        });
+        let field_llbc = window_llbc(vec![holder], vec![field_caller, field_len]);
+        let field_graph =
+            super::lower_function(&field_llbc, "kinds_len").expect("lower S.kinds.len()");
+        let field_ops = window_graph_ops(&field_graph);
+        let field_leafs = window_call_leafs(&field_graph);
+        let kinds_fat_len = field_ops.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.name == "kinds" && field.vec_part == Some(VecFieldPart::FatLen)
+            )
+        });
+        assert!(
+            kinds_fat_len,
+            "Box<[u8]> field len is FatLen of kinds; leafs={field_leafs:?} graph={}",
+            field_graph.dump()
+        );
+        assert!(
+            !field_leafs.iter().any(|leaf| leaf == "__len"),
+            "Box<[u8]> field len must not residualize __len; leafs={field_leafs:?} graph={}",
+            field_graph.dump()
         );
     }
 

@@ -4507,15 +4507,19 @@ fn call_with_kwargs_in_ctx_impl(
         let type_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(current_callable());
         let current_type = || pyre_object::gc_roots::shadow_stack_get(type_slot);
-        let pos = rooted_pos();
-        if let Some(result) = type_call_special_case(current_type(), &pos, nkw > 0) {
-            return result;
+        if std::ptr::eq(current_type(), crate::typedef::w_type()) {
+            let pos = rooted_pos();
+            if let Some(result) = type_call_special_case(current_type(), &pos, nkw > 0) {
+                return result;
+            }
         }
-        let pos = rooted_pos();
-        let names = rooted_names();
-        let values = rooted_values();
-        if let Some(result) = type_call_vectorcall(current_type(), &pos, &names, &values) {
-            return result;
+        if type_declares_vectorcall(current_type()) {
+            let pos = rooted_pos();
+            let names = rooted_names();
+            let values = rooted_values();
+            if let Some(result) = type_call_vectorcall(current_type(), &pos, &names, &values) {
+                return result;
+            }
         }
         // Types with acceptable_as_base_class=false (bool, NoneType) reject kwargs.
         // PyPy: boolobject.py descr_new uses @unwrap_spec (positional only).
@@ -5073,6 +5077,16 @@ fn type_call_vectorcall(
     ))
 }
 
+/// Whether `w_type` declares a vectorcall (`w_type_has_vectorcall`).
+#[cfg(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+))]
+fn type_declares_vectorcall(w_type: PyObjectRef) -> bool {
+    unsafe { pyre_object::typeobject::w_type_has_vectorcall(w_type) }
+}
+
 /// A build without the C layer has nothing that arms the flag.
 #[cfg(not(all(
     feature = "cpyext",
@@ -5086,6 +5100,16 @@ fn type_call_vectorcall(
     _keywords_w: &[PyObjectRef],
 ) -> Option<PyResult> {
     None
+}
+
+/// Whether `w_type` declares a vectorcall (`w_type_has_vectorcall`).
+#[cfg(not(all(
+    feature = "cpyext",
+    not(feature = "sandbox"),
+    any(target_os = "macos", target_os = "linux")
+)))]
+fn type_declares_vectorcall(_w_type: PyObjectRef) -> bool {
+    false
 }
 
 /// `gateway.py Signature` on a type slot — keyword-capable when it has
@@ -5194,18 +5218,23 @@ fn type_descr_call_impl(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRe
         }
         pinned_args
     };
-    if let Some(result) = type_call_special_case(
+    if std::ptr::eq(
         pyre_object::gc_roots::shadow_stack_get(root_base),
-        &current_args(),
-        false,
+        crate::typedef::w_type(),
     ) {
-        return match result {
-            Ok(value) => value,
-            Err(error) => {
-                set_call_error(error);
-                PY_NULL
-            }
-        };
+        if let Some(result) = type_call_special_case(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            &current_args(),
+            false,
+        ) {
+            return match result {
+                Ok(value) => value,
+                Err(error) => {
+                    set_call_error(error);
+                    PY_NULL
+                }
+            };
+        }
     }
     type_descr_call_instantiate(
         pyre_object::gc_roots::shadow_stack_get(root_base),
@@ -5263,31 +5292,37 @@ fn type_descr_call_instantiate(w_type: PyObjectRef, args: &[PyObjectRef]) -> PyO
         }
     };
 
-    if let Some(result) = {
-        let mut pinned_args = Vec::with_capacity(args_len);
-        extend_current_args(&mut pinned_args);
-        type_call_special_case(current_type(), &pinned_args, false)
-    } {
-        return match result {
-            Ok(value) => value,
-            Err(error) => {
-                set_call_error(error);
-                PY_NULL
-            }
-        };
+    // typeobject.py W_TypeObject.descr_call dispatches on `__args__` in place,
+    // so the argument list is copied only for the form that consumes it.
+    if std::ptr::eq(current_type(), crate::typedef::w_type()) {
+        if let Some(result) = {
+            let mut pinned_args = Vec::with_capacity(args_len);
+            extend_current_args(&mut pinned_args);
+            type_call_special_case(current_type(), &pinned_args, false)
+        } {
+            return match result {
+                Ok(value) => value,
+                Err(error) => {
+                    set_call_error(error);
+                    PY_NULL
+                }
+            };
+        }
     }
-    if let Some(result) = {
-        let mut pinned_args = Vec::with_capacity(args_len);
-        extend_current_args(&mut pinned_args);
-        type_call_vectorcall(current_type(), &pinned_args, &[], &[])
-    } {
-        return match result {
-            Ok(value) => value,
-            Err(error) => {
-                set_call_error(error);
-                PY_NULL
-            }
-        };
+    if type_declares_vectorcall(current_type()) {
+        if let Some(result) = {
+            let mut pinned_args = Vec::with_capacity(args_len);
+            extend_current_args(&mut pinned_args);
+            type_call_vectorcall(current_type(), &pinned_args, &[], &[])
+        } {
+            return match result {
+                Ok(value) => value,
+                Err(error) => {
+                    set_call_error(error);
+                    PY_NULL
+                }
+            };
+        }
     }
 
     if let Err(e) = check_type_instantiable(current_type()) {
@@ -7496,16 +7531,18 @@ fn type_descr_call_with_mode(
         let _ = pyre_object::gc_roots::pin_root(arg);
     }
     let current_type = || pyre_object::gc_roots::shadow_stack_get(root_base);
-    if let Some(result) = {
-        let mut pinned_args = Vec::with_capacity(args_len);
-        for index in 0..args_len {
-            pinned_args.push(pyre_object::gc_roots::shadow_stack_get(
-                root_base + 1 + index,
-            ));
+    if std::ptr::eq(current_type(), crate::typedef::w_type()) {
+        if let Some(result) = {
+            let mut pinned_args = Vec::with_capacity(args_len);
+            for index in 0..args_len {
+                pinned_args.push(pyre_object::gc_roots::shadow_stack_get(
+                    root_base + 1 + index,
+                ));
+            }
+            type_call_special_case(current_type(), &pinned_args, false)
+        } {
+            return result;
         }
-        type_call_special_case(current_type(), &pinned_args, false)
-    } {
-        return result;
     }
     let extend_current_args = |dst: &mut Vec<PyObjectRef>| {
         for index in 0..args_len {
@@ -7515,12 +7552,14 @@ fn type_descr_call_with_mode(
         }
     };
 
-    if let Some(result) = {
-        let mut pinned_args = Vec::with_capacity(args_len);
-        extend_current_args(&mut pinned_args);
-        type_call_vectorcall(current_type(), &pinned_args, &[], &[])
-    } {
-        return result;
+    if type_declares_vectorcall(current_type()) {
+        if let Some(result) = {
+            let mut pinned_args = Vec::with_capacity(args_len);
+            extend_current_args(&mut pinned_args);
+            type_call_vectorcall(current_type(), &pinned_args, &[], &[])
+        } {
+            return result;
+        }
     }
     check_type_instantiable(current_type())?;
     // Step 1: Look up __new__ via type MRO → allocate instance.

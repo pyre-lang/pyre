@@ -3944,10 +3944,11 @@ pub fn make_builtin_type_with_metatype(
 /// [`__majit_wrap_bool_descr_new`] does.  `_new_baseint`'s first arm returns
 /// an exact `int` argument itself; an exact `float` whose truncation fits a
 /// machine Signed takes `float.__int__` (`floatobject.py descr_trunc`,
-/// `newint_from_float`).  No argument, a base, a subclass `cls`, and every
-/// other argument stay on [`int_descr_new`], which is `dont_look_inside` so
-/// the `__int__` / `__index__` / literal-parse arms are not graphs inside
-/// this one.
+/// `newint_from_float`).  An exact `str` takes the unicode arm
+/// (`unicode_to_decimal_w` then `_string_to_int_or_long`).  No argument, a
+/// base, a subclass `cls`, and every other argument stay on [`int_descr_new`],
+/// which is `dont_look_inside` so the `__int__` / `__index__` / `__repr__`
+/// arms are not graphs inside this one.
 pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 2 && !args[1].is_null() {
         let int_type = gettypeobject(&pyre_object::INT_TYPE);
@@ -3969,6 +3970,13 @@ pub fn __majit_wrap_int_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, c
                 if x >= -9223372036854775808.0 && x < 9223372036854775808.0 {
                     return crate::objspace::descroperation::_int_from_trunc(x);
                 }
+            }
+            // intobject.py `_new_baseint`:
+            // `space.isinstance_w(w_value, space.w_unicode)`, restricted
+            // here to the exact `str` type so a subclass `__int__` /
+            // `__index__` / `__repr__` is not skipped.
+            if w_type.is_some() && w_type == gettypefor(&pyre_object::STR_TYPE) {
+                return crate::builtins::_string_to_int_or_long_unicode(w_value);
             }
         }
     }

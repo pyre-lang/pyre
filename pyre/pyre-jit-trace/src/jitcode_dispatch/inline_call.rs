@@ -7540,8 +7540,14 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
             }
             None => Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc }),
         },
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+        DispatchOutcome::SubRaise {
+            exc,
+            mut exc_concrete,
+        } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                // The helper body's own `walk()` catch already emitted the
+                // context call (`resolve_exception_context`); a second call would duplicate it.
+                record_caller_frame_traceback(ctx, exc, &mut exc_concrete, op.pc)?;
                 ctx.set_last_exc_value(exc, exc_concrete);
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
@@ -7917,8 +7923,14 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
             write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
             Ok(Some((DispatchOutcome::Continue, op.next_pc)))
         }
-        DispatchOutcome::SubRaise { exc, exc_concrete } => {
+        DispatchOutcome::SubRaise {
+            exc,
+            mut exc_concrete,
+        } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                // The helper body's own `walk()` catch already emitted the
+                // context call (`resolve_exception_context`); a second call would duplicate it.
+                record_caller_frame_traceback(ctx, exc, &mut exc_concrete, op.pc)?;
                 ctx.set_last_exc_value(exc, exc_concrete);
                 Ok(Some((DispatchOutcome::Continue, target)))
             } else {
@@ -20399,6 +20411,22 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
             Err(error)
         }
     }
+}
+
+/// The caller Python frame's `pyopcode.py handle_operation_error` →
+/// `pytraceback.record_application_traceback` node, emitted at runtime as well
+/// as applied for the recording pass because the handler is inside the trace.
+fn record_caller_frame_traceback<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    exc: OpRef,
+    exc_concrete: &mut ConcreteValue,
+    pc: usize,
+) -> Result<(), DispatchError> {
+    let node = record_prepend_application_traceback(ctx, exc, *exc_concrete, pc)?;
+    let emit_runtime = node.is_none();
+    record_inline_application_traceback(ctx, exc, exc_concrete, pc, true, emit_runtime, node);
+    record_top_level_application_traceback(ctx, exc, exc_concrete, pc, true, emit_runtime, node);
+    Ok(())
 }
 
 /// Operand layout `dR>X`:

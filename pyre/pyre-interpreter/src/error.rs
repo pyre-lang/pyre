@@ -788,11 +788,13 @@ impl PyError {
     /// need the enum keep this residual.
     #[majit_macros::dont_look_inside]
     pub fn display_message(&self) -> DisplayMessage {
-        self.ensure_deferred_computed();
-        if self.message.is_null() {
+        // The deferred `%R` can collect, so the reads go through the reloaded handle; the caller's own handle is the caller's root to restore, as for any other collecting call such as `py_str_display`.
+        let mut this = PyError(self.0);
+        this.ensure_deferred_computed();
+        if this.message.is_null() {
             DisplayMessage::FromExcObject
         } else {
-            DisplayMessage::Text(wtf8_from_message_str(self.message))
+            DisplayMessage::Text(wtf8_from_message_str(this.message))
         }
     }
 
@@ -1286,7 +1288,7 @@ impl PyError {
     }
 
     /// Bool view of [`Self::display_message`]. The `Wtf8Buf` match stays
-    /// inside the residual helper. A pending deferred `%T` / `%s` formats
+    /// inside the residual helper. A pending deferred `%T` / `%s` / `%R` formats
     /// first, so a non-empty computed message reads as true
     /// (`OpErrFmt._compute_value`).
     #[majit_macros::dont_look_inside]
@@ -1307,49 +1309,92 @@ impl PyError {
         std::str::from_utf8(bytes).expect("oefmt valuefmt is UTF-8")
     }
 
-    /// `error.py OpErrFmt._compute_value` for a single `%T` or `%s`:
-    /// `space.type(value).name` or the stored text, interpolated into the
-    /// format pieces. First read fills `message` and clears the pending latch;
-    /// later readers use the rstr.
+    /// `error.py OpErrFmt._compute_value` for a single `%T`, `%s`, or `%R`:
+    /// `space.type(value).name`, the stored text, or `space.repr(value)`,
+    /// interpolated into the format pieces. First read fills `message` and
+    /// clears the pending latch; later readers use the rstr. The `%R` arm
+    /// can collect, so `self` is reloaded from its pinned slot before it
+    /// returns (`shadowstack.py gc_restore_root`).
     #[majit_macros::dont_look_inside]
-    fn ensure_deferred_computed(&self) {
+    fn ensure_deferred_computed(&mut self) {
         if !self.has_deferred_fmt() {
             return;
         }
-        let mut err = PyError(self.0);
         let _roots = pyre_object::gc_roots::push_roots();
-        let handle_slot = err.pin(&_roots);
+        let handle_slot = self.pin(&_roots);
+        let x0_pinned = !self.fmt_x0.is_null();
         let x0_slot = pyre_object::gc_roots::shadow_stack_len();
-        if !err.fmt_x0.is_null() {
-            let _ = pyre_object::gc_roots::pin_root(err.fmt_x0 as pyre_object::PyObjectRef);
+        if x0_pinned {
+            let _ = pyre_object::gc_roots::pin_root(self.fmt_x0 as pyre_object::PyObjectRef);
         }
-        let fmt = err.deferred_valuefmt();
-        let (strings, formats) = decompose_valuefmt(fmt);
-        let x0 = if err.fmt_x0.is_null() {
-            err.fmt_x0
+        let fmt = self.deferred_valuefmt();
+        let x0 = if !x0_pinned {
+            std::ptr::null_mut()
         } else {
             pyre_object::gc_roots::shadow_stack_get(x0_slot) as pyre_object::gc_hook::GCREF
         };
         let mut message = Wtf8Buf::new();
-        for (i, part) in strings[..formats.len()].iter().enumerate() {
-            message.push_str(part);
-            match formats[i].as_str() {
-                "T" => message.push_str(&type_name_of(x0 as PyObjectRef)),
-                "s" => {
-                    message.push_wtf8(unsafe {
-                        pyre_object::unicodeobject::utf8_payload_wtf8(
-                            x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
-                        )
-                    });
+        // Walk the parts in place, as `_compute_value` walks the `strings` / `formats` that `get_operrcls2` precomputed.
+        let bytes = fmt.as_bytes();
+        let mut start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'%' {
+                    message.push_str(&fmt[start..i + 1]);
+                    i += 2;
+                    start = i;
+                    continue;
                 }
-                _ => {}
+                if i + 1 < bytes.len() {
+                    let c = bytes[i + 1];
+                    message.push_str(&fmt[start..i]);
+                    match c {
+                        b'T' => message.push_str(&type_name_of(x0 as PyObjectRef)),
+                        b's' => {
+                            message.push_wtf8(unsafe {
+                                pyre_object::unicodeobject::utf8_payload_wtf8(
+                                    x0 as *const pyre_object::unicodeobject::UnicodeValueStorage,
+                                )
+                            });
+                        }
+                        b'R' => {
+                            // `py_repr_wtf8` allocates and may run Python: take `x0`
+                            // from its pinned slot immediately before the call.
+                            let x0 = if x0_pinned {
+                                pyre_object::gc_roots::shadow_stack_get(x0_slot)
+                                    as pyre_object::gc_hook::GCREF
+                            } else {
+                                std::ptr::null_mut()
+                            };
+                            let source_repr =
+                                unsafe { crate::display::py_repr_wtf8(x0 as PyObjectRef) }
+                                    .unwrap_or_else(|_| {
+                                        Wtf8Buf::from_string("<unprintable>".to_string())
+                                    });
+                            // [3.15-spec] `%.200R` precision the int-literal message
+                            // uses: upstream `OpErrFmt` renders the full repr;
+                            // CPython 3.15 `PyLong_FromUnicodeObject` /
+                            // `_PyLong_FromBytes` format `%.200R`; the only deferred
+                            // `%R` user is the int-literal message.
+                            for point in source_repr.code_points().take(200) {
+                                message.push(point);
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 2;
+                    start = i;
+                    continue;
+                }
             }
+            i += 1;
         }
-        message.push_str(&strings[formats.len()]);
-        err.reload(&_roots, handle_slot);
-        err.set_display_message(DisplayMessage::Text(message));
+        message.push_str(&fmt[start..]);
+        self.reload(&_roots, handle_slot);
+        self.set_display_message(DisplayMessage::Text(message));
         unsafe {
-            (*err.raw()).fmt_valuefmt_len = 0;
+            (*self.raw()).fmt_valuefmt_len = 0;
         }
     }
 
@@ -3569,21 +3614,22 @@ impl PyError {
     /// `W_BaseException.descr_str` formats `args_w`, so the args'
     /// `__str__` runs at display time, not at raise time.
     pub fn message_text(&self) -> String {
-        self.ensure_deferred_computed();
-        if self.has_display_message() || self.exc_object.is_null() {
+        let mut this = PyError(self.0);
+        this.ensure_deferred_computed();
+        if this.has_display_message() || this.exc_object.is_null() {
             // Display-side only: `message` is WTF-8 and may hold a lone
             // surrogate, so spend the escape the stream would spend rather
             // than folding it to U+FFFD.  A caller that needs the value
             // itself wants [`message_wtf8`].
             return crate::display::wtf8_display_string(
-                self.display_message_buf(),
+                this.display_message_buf(),
                 "<unprintable>",
             );
         }
         // Infallible Display-side context: a raising `__str__` degrades to
         // the placeholder rather than propagating, and a lone surrogate is
         // backslash-escaped rather than panicking.
-        unsafe { crate::display::py_str_display(self.exc_object) }
+        unsafe { crate::display::py_str_display(this.exc_object) }
     }
 
     /// [`message_text`] without the display encode — the text as a value.
@@ -3592,11 +3638,12 @@ impl PyError {
     /// surrogate in a message that names a user string has to survive here;
     /// `message_text` is for the diagnostic streams only.
     pub fn message_wtf8(&self) -> Wtf8Buf {
-        self.ensure_deferred_computed();
-        if self.has_display_message() || self.exc_object.is_null() {
-            return self.display_message_buf();
+        let mut this = PyError(self.0);
+        this.ensure_deferred_computed();
+        if this.has_display_message() || this.exc_object.is_null() {
+            return this.display_message_buf();
         }
-        unsafe { crate::display::py_str_wtf8(self.exc_object) }
+        unsafe { crate::display::py_str_wtf8(this.exc_object) }
             .unwrap_or_else(|_| Wtf8Buf::from_string("<unprintable>".to_string()))
     }
 
@@ -6689,6 +6736,46 @@ mod tests {
         );
         assert_eq!(err.message_text(), "expected a nonnegative input, got -1.1");
         assert!(!err.has_deferred_fmt());
+    }
+
+    #[test]
+    fn oefmt_one_percent_r_defers_until_message_read() {
+        // `error.py get_operrcls2.OpErrFmt.__init__`: store w_type, x0, and
+        // the format constant. `_compute_value` runs `space.repr` on first read.
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let w_src = pyre_object::w_str_new_managed("x");
+        let err = super::oefmt_one(
+            super::PyErrorKind::ValueError,
+            std::ptr::null_mut(),
+            w_src as pyre_object::gc_hook::GCREF,
+            "invalid literal for int() with base 10: %R",
+        );
+        assert!(
+            err.has_deferred_fmt(),
+            "OpErrFmt stores the %R operand until _compute_value"
+        );
+        assert_eq!(
+            err.message_text(),
+            "invalid literal for int() with base 10: 'x'"
+        );
+        assert!(!err.has_deferred_fmt());
+    }
+
+    #[test]
+    fn oefmt_one_percent_t_folds_literal_percents_around_the_code() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let w_src = pyre_object::w_str_new_managed("x");
+        let err = super::oefmt_one(
+            super::PyErrorKind::ValueError,
+            std::ptr::null_mut(),
+            w_src as pyre_object::gc_hook::GCREF,
+            "100%% of %T is 50%%",
+        );
+        assert_eq!(err.message_text(), "100% of str is 50%");
     }
 
     #[test]
