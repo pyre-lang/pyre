@@ -166,6 +166,15 @@ pub struct ItemsBlock {
     items: [PyObjectRef; 0],
 }
 
+/// MiniMark-allocated by `alloc_list_items_block_gc` with the tid from
+/// `PY_OBJECT_ARRAY_GC_TYPE_ID`; this impl declares the gckind only (allocation keeps that tid).
+impl crate::lltype::GcType for ItemsBlock {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 pub const ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(ItemsBlock, items);
 
 /// Offset of the `capacity` header the collector reads as the GcArray length.
@@ -1499,6 +1508,15 @@ pub struct FloatItemsBlock {
     items: [f64; 0],
 }
 
+/// MiniMark-allocated by `ll_new_float_items` with the tid from `gc_float_array_gc_type_id`; this
+/// impl declares the gckind only (allocation keeps that tid).
+impl crate::lltype::GcType for FloatItemsBlock {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 const _: () = assert!(
     std::mem::size_of::<FloatItemsBlock>() == std::mem::size_of::<TypedItemsBlock>()
         && std::mem::offset_of!(FloatItemsBlock, items) == TYPED_ITEMS_BLOCK_ITEMS_OFFSET,
@@ -1758,6 +1776,15 @@ pub struct FixedObjectArray {
     /// Flexible-array tail marker. Actual items follow immediately in
     /// memory (sized to `len` at allocation time); this field has size 0.
     _items: [PyObjectRef; 0],
+}
+
+/// MiniMark-allocated by `alloc_mro_block_gc` with the tid from `PY_OBJECT_ARRAY_GC_TYPE_ID`; this
+/// impl declares the gckind only (allocation keeps that tid).
+impl crate::lltype::GcType for FixedObjectArray {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
 }
 
 impl FixedObjectArray {
@@ -2091,6 +2118,15 @@ pub struct GcTypedArray {
     /// Flexible-array tail marker. Actual items follow immediately in
     /// memory and are sized by the allocation descriptor.
     items: [u8; 0],
+}
+
+/// MiniMark-allocated by `allocate_array_struct_at_typed` with the tid from that caller; this
+/// impl declares the gckind only (allocation keeps that tid).
+impl crate::lltype::GcType for GcTypedArray {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
 }
 
 /// Array element kind — resume.py:656 arraydescr.is_array_of_* / FLAG_STRUCT parity.

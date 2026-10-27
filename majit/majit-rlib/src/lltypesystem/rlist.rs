@@ -172,6 +172,16 @@ pub struct TypedItemsBlock {
     items: [u64; 0],
 }
 
+/// MiniMark-allocated by `try_alloc_typed_items_block_nursery` with the tid from
+/// `gc_int_array_gc_type_id` / `gc_float_array_gc_type_id`; this impl declares the gckind
+/// only (allocation keeps that tid).
+impl majit_gc::GcType for TypedItemsBlock {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 pub const TYPED_ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(TypedItemsBlock, items);
 
 /// Offset of the `capacity` header the collector reads as the GcArray length.

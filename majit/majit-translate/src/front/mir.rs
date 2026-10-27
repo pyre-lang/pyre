@@ -4480,6 +4480,23 @@ impl DeclaredGcFacts {
     }
 }
 
+/// Whether `sid` is a declared GC struct: the exact identity, or the generic
+/// template `name` instantiates.
+///
+/// Harvest seeds the template `StructId` of a generic `GcType` impl.
+/// `struct_id_for_name` instantiates names that carry `<...>`, so a layout
+/// key misses the seed unless this fallback runs. `history.py` `getkind` of
+/// `Ptr(TO)` follows `TO._gckind`.
+pub(crate) fn struct_id_is_declared_gc(
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+    sid: majit_ir::descr::StructId,
+    name: &str,
+) -> bool {
+    gc_struct_ids.contains(&sid)
+        || majit_ir::descr::struct_template_id_for_name(name)
+            .is_some_and(|template| gc_struct_ids.contains(&template))
+}
+
 fn struct_id_for_type_decl(td: &TypeDecl) -> majit_ir::descr::StructId {
     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&td.item_meta.name_path()))
 }
@@ -4591,7 +4608,7 @@ pub(crate) fn declared_gckind_by_name(
                 continue;
             }
             let canon = strip_crate_prefix(&td.item_meta.name_path());
-            let kind = if gc.contains(&struct_id_for_type_decl(td)) {
+            let kind = if struct_id_is_declared_gc(&gc, struct_id_for_type_decl(td), &canon) {
                 GcKind::Gc
             } else {
                 GcKind::Raw
@@ -61127,7 +61144,17 @@ fn pointer_elem_pointee_is_gc(
     {
         return true;
     }
-    declared_adt_struct_id(pointee, llbc).is_some_and(|sid| gc_struct_ids.contains(&sid))
+    let Some(td) = adt_node_def_id(pointee).and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    let Some(sid) = declared_adt_struct_id(pointee, llbc) else {
+        return false;
+    };
+    struct_id_is_declared_gc(
+        gc_struct_ids,
+        sid,
+        &strip_crate_prefix(&td.item_meta.name_path()),
+    )
 }
 
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
@@ -66106,7 +66133,11 @@ fn overlay_field_lltype(
         && let Some(id) = adt_node_def_id(pointee)
         && let Some(td) = llbc.type_by_id(id)
     {
-        if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+        if struct_id_is_declared_gc(
+            gc_struct_ids,
+            struct_id_for_type_decl(td),
+            &strip_crate_prefix(&td.item_meta.name_path()),
+        ) {
             return (*GCREF).clone();
         }
         return LowLevelType::Ptr(Box::new(NONGCREF.clone()));
@@ -66836,7 +66867,11 @@ fn declared_raw_adt_node<'a>(
     if exception_carrier_node(node, llbc) {
         return None;
     }
-    if gc_struct_ids.contains(&sid) {
+    let name = adt_node_def_id(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .map(|td| strip_crate_prefix(&td.item_meta.name_path()))
+        .unwrap_or_default();
+    if struct_id_is_declared_gc(gc_struct_ids, sid, &name) {
         return None;
     }
     if tyref_is_zero_sized(&TyRef::Other(node.clone()), llbc) {
@@ -66872,7 +66907,11 @@ fn adt_def_is_raw_storage(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+    if struct_id_is_declared_gc(
+        gc_struct_ids,
+        struct_id_for_type_decl(td),
+        &strip_crate_prefix(&td.item_meta.name_path()),
+    ) {
         return false;
     }
     let carrier = llbc.exception_carrier();
@@ -67010,7 +67049,11 @@ fn pointee_is_raw_word(
         let Some(td) = llbc.type_by_id(def_id) else {
             return false;
         };
-        if gc_struct_ids.contains(&struct_id_for_type_decl(td)) {
+        if struct_id_is_declared_gc(
+            gc_struct_ids,
+            struct_id_for_type_decl(td),
+            &strip_crate_prefix(&td.item_meta.name_path()),
+        ) {
             return false;
         }
         return match &td.kind {
@@ -135242,6 +135285,86 @@ mod tests {
         assert_eq!(kinds.get("HeadedByImpl"), Some(&GcKind::Gc));
         assert_eq!(kinds.get("HeadedByInner"), Some(&GcKind::Gc));
         assert_eq!(kinds.get("HeadedByRaw"), Some(&GcKind::Raw));
+    }
+
+    /// Layout gckind follows a `GcType` impl, including a generic template
+    /// seed for an instantiation. `struct_id_is_declared_gc` is the one
+    /// membership test (`history.py` `getkind` of `Ptr(TO)` follows
+    /// `TO._gckind`).
+    #[test]
+    fn declared_gc_layout_gckind_follows_gctype_or_template() {
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+        let span = serde_json::json!({"data": {
+            "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+        }});
+        let meta = |segs: &[&str]| {
+            serde_json::json!({
+                "name": segs.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span.clone(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let adt = |id: u64| {
+            serde_json::json!({
+                "Adt": {"id": id, "generics": {
+                    "regions": [], "types": [], "const_generics": [], "trait_refs": []
+                }}
+            })
+        };
+        let g_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "G"]),
+            "kind": {"Struct": []}
+        });
+        let gg_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "GG"]),
+            "kind": {"Struct": [{"name": "head", "ty": {"TypeVar": {"Bound": [0, 0]}}}]}
+        });
+        let n_decl = serde_json::json!({
+            "def_id": 2,
+            "item_meta": meta(&["fixture", "N"]),
+            "kind": {"Struct": []}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [g_decl, gg_decl, n_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["majit_gc", "header", "GcType"])
+                }],
+                "trait_impls": [
+                    {"impl_trait": {"id": 0, "generics": {"types": [{"Value": [0, adt(0)]}]}}},
+                    {"impl_trait": {"id": 0, "generics": {"types": [{"Value": [1, adt(1)]}]}}}
+                ]
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("fixture Llbc parses");
+        let kinds = super::declared_gckind_by_name(std::slice::from_ref(&llbc));
+        assert_eq!(kinds.get("G"), Some(&GcKind::Gc));
+        assert_eq!(kinds.get("N"), Some(&GcKind::Raw));
+        assert_eq!(kinds.get("GG"), Some(&GcKind::Gc));
+        let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        let gg_sid = super::struct_id_for_type_decl(llbc.type_by_id(1).expect("GG decl"));
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("GG".to_string(), Some(gg_sid)),
+                ("fixture::GG".to_string(), Some(gg_sid)),
+            ]));
+        let inst = majit_ir::descr::struct_id_for_name("GG<i64>").expect("instantiated GG<i64>");
+        assert_ne!(inst, gg_sid, "struct_id_for_name instantiates <i64>");
+        assert!(
+            super::struct_id_is_declared_gc(&gc, inst, "GG<i64>"),
+            "GG<i64> is declared gc via the template seed"
+        );
     }
 
     /// A transparent handle wrapping an alias of `*mut Header` is a GC

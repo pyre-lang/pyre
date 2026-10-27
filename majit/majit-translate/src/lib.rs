@@ -2066,11 +2066,12 @@ fn analyze_pipeline_from_module_paths(
             if let Some(host) = exact.and_then(|item| item.host.clone()) {
                 layout.host = Some(host);
             }
-            layout.gckind = if declared_gc.contains(&sid) {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
-            } else {
-                crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
-            };
+            layout.gckind =
+                if crate::front::mir::struct_id_is_declared_gc(&declared_gc, sid, struct_name) {
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Gc
+                } else {
+                    crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+                };
             if census_struct_layouts {
                 let variants = struct_layout_variants.entry(sid).or_default();
                 if let Some((_, spellings)) = variants.iter_mut().find(|(observed, _)| {

@@ -49,6 +49,15 @@ pub struct GcEntries<K, V> {
     pub items: [Entry<K, V>; 0],
 }
 
+/// MiniMark-allocated by `alloc_entries` with the tid from `GcEntriesType::entries_gc_type_id`;
+/// this impl declares the gckind only (allocation keeps that tid).
+impl<K, V> crate::lltype::GcType for GcEntries<K, V> {
+    fn type_id() -> u32 {
+        u32::MAX
+    }
+    const SIZE: usize = 0;
+}
+
 /// Byte offsets of the GC references inside one value of `Self`
 /// (`gctypelayout` `varofstoptrs` contribution).
 pub trait GcRefOffsets {
