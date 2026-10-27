@@ -376,7 +376,7 @@ fn rewire_one_option_try_site(
             graph.push_niche_null(none_bb, return_niche_null_cast)
         };
         let narrow_root = return_narrow_root.map(str::to_owned);
-        crate::front::option_map_or::emit_narrow(graph, none_bb, null, &narrow_root)
+        crate::front::option_variant::emit_narrow(graph, none_bb, null, &narrow_root)
     } else {
         emit_option_variant(graph, none_bb, return_option_owner, 0, None)
     };

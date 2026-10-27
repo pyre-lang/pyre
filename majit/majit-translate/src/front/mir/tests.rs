@@ -12607,6 +12607,22 @@ pub(in crate::front::mir) fn llbc_with_types(
     Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
 }
 
+pub(in crate::front::mir) fn unit_fn_ptr() -> serde_json::Value {
+    serde_json::json!({
+        "FnPtr": {
+            "skip_binder": {
+                "inputs": [],
+                "output": {"Tuple": []},
+                "is_unsafe": false
+            }
+        }
+    })
+}
+
+pub(in crate::front::mir) fn option_shared_ref(def: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"Ref": ["Erased", def, "Shared"]})
+}
+
 pub(in crate::front::mir) fn adt_node(def_id: u64) -> serde_json::Value {
     serde_json::json!({
         "Adt": {
@@ -12734,16 +12750,33 @@ fn option_i64_ty() -> serde_json::Value {
     option_adt_node(0, option_int_arg(true))
 }
 
-fn option_impl_seg() -> serde_json::Value {
+fn option_impl_seg_for(opt_ty: &serde_json::Value) -> serde_json::Value {
     serde_json::json!({"Impl": {"Ty": {
-        "skip_binder": {"Value": [0, option_i64_ty()]},
+        "skip_binder": {"Value": [0, opt_ty]},
         "kind": "InherentImplBlock"
     }}})
 }
 
 fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
+    option_map_or_typed_fn_item_llbc(
+        option_i64_ty(),
+        interior_i64(),
+        vec![option_enum(0)],
+        fn_item,
+    )
+}
+
+/// `core::option::<Impl>::map_or` FunDecl plus a caller, with a chosen
+/// `Option<P>` payload. Some's payload is `Field[1, 0]` on `self`, matching
+/// the extracted Charon body.
+fn option_map_or_typed_fn_item_llbc(
+    opt_ty: serde_json::Value,
+    payload_ty: serde_json::Value,
+    type_decls: Vec<serde_json::Value>,
+    fn_item: serde_json::Value,
+) -> Llbc {
     let i64_ty = interior_i64();
-    let opt_ty = option_i64_ty();
+    let disc_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
     let fn_id = fn_item
         .get("def_id")
         .and_then(serde_json::Value::as_u64)
@@ -12754,13 +12787,28 @@ fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
             "generics": empty_generics()
         }
     });
+    let self_place = interior_place(1, &opt_ty);
+    let disc_place = interior_place(4, &disc_ty);
+    let ret_place = interior_place(0, &i64_ty);
+    let default_place = interior_place(2, &i64_ty);
+    // Extracted `core::option::<Impl>::map_or` spells Some's payload as
+    // `Field[1, 0]` on `self` (variant Some, field 0). A `Downcast` then
+    // `Field[null, 0]` collapses: the variant-less Field is not an enum
+    // payload, so the Copy is the Option word and From-identity never
+    // reads `__pos_0`.
+    let payload_place = serde_json::json!({
+        "kind": {
+            "Projection": [self_place.clone(), {"Field": [1, 0]}]
+        },
+        "ty": payload_ty
+    });
     let map_or = serde_json::json!({
         "def_id": 1,
         "item_meta": {
             "name": [
                 {"Ident": ["core", 0]},
                 {"Ident": ["option", 0]},
-                option_impl_seg(),
+                option_impl_seg_for(&opt_ty),
                 {"Ident": ["map_or", 0]}
             ],
             "span": interior_span(),
@@ -12778,7 +12826,62 @@ fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
             "inputs": [opt_ty.clone(), i64_ty.clone(), fn_ty.clone()],
             "output": i64_ty.clone()
         },
-        "body": "Opaque"
+        "body": {
+            "Unstructured": {
+                "span": interior_span(),
+                "locals": {
+                    "arg_count": 3,
+                    "locals": [
+                        interior_local(0, None, &i64_ty),
+                        interior_local(1, Some("self"), &opt_ty),
+                        interior_local(2, Some("default"), &i64_ty),
+                        interior_local(3, Some("f"), &fn_ty),
+                        interior_local(4, Some("disc"), &disc_ty)
+                    ]
+                },
+                "body": [
+                    interior_bb(
+                        vec![interior_assign(
+                            disc_place.clone(),
+                            serde_json::json!({"Discriminant": self_place.clone()})
+                        )],
+                        serde_json::json!({
+                            "span": interior_span(),
+                            "kind": {"Switch": {
+                                "discr": {"Copy": disc_place.clone()},
+                                "targets": {"SwitchInt": [
+                                    null,
+                                    [
+                                        [{"Scalar": {"Signed": ["Isize", "1"]}}, 1],
+                                        [{"Scalar": {"Signed": ["Isize", "0"]}}, 2]
+                                    ],
+                                    2
+                                ]}
+                            }}
+                        }),
+                    ),
+                    interior_bb(
+                        vec![],
+                        interior_call(
+                            fn_id,
+                            vec![interior_copy(payload_place)],
+                            ret_place.clone(),
+                            4,
+                            3,
+                        ),
+                    ),
+                    interior_bb(
+                        vec![interior_assign(
+                            ret_place.clone(),
+                            interior_use(default_place),
+                        )],
+                        interior_return(),
+                    ),
+                    interior_bb(vec![], interior_unwind()),
+                    interior_bb(vec![], interior_return()),
+                ]
+            }
+        }
     });
     let caller = interior_caller(
         "map_or_fn_item",
@@ -12813,45 +12916,53 @@ fn option_map_or_fn_item_llbc(fn_item: serde_json::Value) -> Llbc {
             interior_bb(vec![], interior_return()),
         ],
     );
-    llbc_with_types(
-        "fixture",
-        vec![option_enum(0)],
-        vec![caller, map_or, fn_item],
-    )
+    llbc_with_types("fixture", type_decls, vec![caller, map_or, fn_item])
 }
 
-fn graph_has_map_or(graph: &FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::Method { name, .. },
-                ..
-            } if name == "map_or"
-        ) || matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.last().map(String::as_str) == Some("map_or")
-        )
-    })
+fn map_or_call_count(graph: &FunctionGraph) -> usize {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "map_or"
+            ) || matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("map_or")
+            )
+        })
+        .count()
 }
 
-fn graph_has_fn_const(graph: &FunctionGraph) -> bool {
-    graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call { target, .. } if crate::model::fn_const_segments(target).is_some()
-        )
-    })
+fn lower_map_or_core_body(llbc: &Llbc) -> FunctionGraph {
+    let ctx = super::LowerContext::new(llbc);
+    for fd in llbc.iter_fun_decls() {
+        if fd
+            .item_meta
+            .name_path()
+            .ends_with("::option::<Impl>::map_or")
+        {
+            return super::lower_fun_decl(&ctx, fd)
+                .unwrap_or_else(|e| panic!("lower map_or body: {e}"));
+        }
+    }
+    panic!("fixture has no map_or FunDecl");
 }
 
-/// `opt.map_or(-1, i64::from)` with reflexive `From<i64> for i64`: residual
-/// `map_or` and the 0-arg `__fn_const` define are gone; the Some arm is
-/// identity on the payload (ordinary `is_reflexive_from`).
+/// `opt.map_or(-1, i64::from)` with reflexive `From<i64> for i64`: the
+/// caller keeps a regular call to the core `map_or` body; inside that
+/// body `f(t)` with `f = From::from` is identity (`is_reflexive_from`).
 #[test]
 fn map_or_i64_from_fn_item_is_identity_select() {
+    use crate::model::ExitSwitch;
     let from = interior_opaque(
         2,
         &["core", "convert", "<Impl>", "from"],
@@ -12859,54 +12970,69 @@ fn map_or_i64_from_fn_item_is_identity_select() {
         interior_i64(),
     );
     let llbc = option_map_or_fn_item_llbc(from);
-    let graph = lower_interior(&llbc, "map_or_fn_item");
-    assert!(
-        !graph_has_map_or(&graph),
-        "residual map_or must be rewritten; ops={:?}",
-        graph_ops(&graph)
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    assert_eq!(
+        caller.blocks[caller.startblock.0].exits.len(),
+        1,
+        "the Some/None diamond lives in the core body, not at the caller"
+    );
+
+    let body = lower_map_or_core_body(&llbc);
+    assert_eq!(
+        map_or_call_count(&body),
+        0,
+        "the core body is the match, not a recursive map_or; ops={:?}",
+        graph_ops(&body)
     );
     assert!(
-        !graph_has_fn_const(&graph),
-        "function-item define must not survive; ops={:?}",
-        graph_ops(&graph)
-    );
-    assert!(
-        !graph
-            .blocks
-            .iter()
-            .flat_map(|b| &b.operations)
-            .any(|op| matches!(
+        !body.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+            matches!(
                 &op.kind,
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("from")
-            )),
-        "reflexive From is identity, not a residual from call; ops={:?}",
-        graph_ops(&graph)
+            )
+        }),
+        "reflexive From is identity inside the body, not a residual from call; ops={:?}",
+        graph_ops(&body)
     );
     assert!(
-        graph
-            .blocks
+        body.blocks
             .iter()
             .flat_map(|b| &b.operations)
             .any(|op| matches!(
                 &op.kind,
                 OpKind::FieldRead { field, .. } if field.name == "__pos_0"
             )),
-        "the Some arm still reads the payload"
+        "the Some arm still reads the payload; ops={:?}",
+        graph_ops(&body)
     );
+    let branches = body
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.exits.len() == 2 || matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+        })
+        .count();
     assert_eq!(
-        graph.blocks[graph.startblock.0].exits.len(),
-        2,
-        "A branches to Some/None arms"
+        branches, 1,
+        "the core body branches to Some/None arms, got {branches}"
     );
 }
 
-/// `opt.map_or(-1, plus_one)` with a local function item: residual `map_or`
-/// and `__fn_const` are gone; the Some arm calls `plus_one` directly.
+/// `opt.map_or(-1, plus_one)` with a local function item: the caller
+/// keeps a regular `map_or` call; the core body calls `plus_one`
+/// directly as `f(t)`.
 #[test]
 fn map_or_plus_one_fn_item_calls_the_function() {
+    use crate::model::ExitSwitch;
     let plus_one = interior_opaque(
         2,
         &["fixture", "plus_one"],
@@ -12914,18 +13040,21 @@ fn map_or_plus_one_fn_item_calls_the_function() {
         interior_i64(),
     );
     let llbc = option_map_or_fn_item_llbc(plus_one);
-    let graph = lower_interior(&llbc, "map_or_fn_item");
-    assert!(
-        !graph_has_map_or(&graph),
-        "residual map_or must be rewritten; ops={:?}",
-        graph_ops(&graph)
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
     );
-    assert!(
-        !graph_has_fn_const(&graph),
-        "function-item define must not survive; ops={:?}",
-        graph_ops(&graph)
+    assert_eq!(
+        caller.blocks[caller.startblock.0].exits.len(),
+        1,
+        "the Some/None diamond lives in the core body, not at the caller"
     );
-    let named: Vec<_> = graph
+
+    let body = lower_map_or_core_body(&llbc);
+    let named: Vec<_> = body
         .blocks
         .iter()
         .flat_map(|b| &b.operations)
@@ -12943,16 +13072,440 @@ fn map_or_plus_one_fn_item_calls_the_function() {
         named.len(),
         1,
         "the Some arm calls plus_one; ops={:?}",
-        graph_ops(&graph)
+        graph_ops(&body)
     );
     let OpKind::Call { args, .. } = &named[0].kind else {
         panic!("plus_one call");
     };
     assert_eq!(args.len(), 1, "the Some arm calls plus_one(payload)");
+    let branches = body
+        .blocks
+        .iter()
+        .filter(|block| {
+            block.exits.len() == 2 || matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+        })
+        .count();
     assert_eq!(
-        graph.blocks[graph.startblock.0].exits.len(),
+        branches, 1,
+        "the core body branches to Some/None arms, got {branches}"
+    );
+}
+
+fn map_or_null_targets(graph: &FunctionGraph) -> Vec<String> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call { target, .. } if target.to_string().starts_with("core::ptr::null") => {
+                Some(target.to_string())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn map_or_producer_ty(graph: &FunctionGraph, var: &Variable) -> ValueType {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => ValueType::Int,
+                OpKind::Input { ty, .. } => ty.clone(),
+                OpKind::Call { result_ty, .. } => result_ty.clone(),
+                OpKind::BinOp { result_ty, .. } => result_ty.clone(),
+                OpKind::FieldRead { ty, .. } => ty.clone(),
+                other => panic!("unexpected is_ operand producer: {other:?}"),
+            };
+        }
+    }
+    panic!("no producer for is_ operand");
+}
+
+fn map_or_value_bank(ty: &ValueType) -> char {
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => 'i',
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => 'r',
+        ValueType::Float => 'f',
+        _ => 'v',
+    }
+}
+
+/// Payload enum used as a raw-address niche (`Option<&RawEnum>`): not
+/// fieldless, no GcType, one word of layout so the shared-ref Option is
+/// the null-pointer niche.
+fn raw_address_payload_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["fixture", 0]},
+                {"Ident": ["RawEnum", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Empty",
+                "fields": [],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Word",
+                "fields": [{"name": null, "ty": interior_i64(), "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]},
+        "layout": interior_layout(8, &[0], false)
+    })
+}
+
+/// `opt.map_or(default, f)` on `Option<fn()>`: the core body tests the
+/// niche word against `null_fn` (`rnone.py` `rtype_is_None`).
+#[test]
+fn map_or_niche_fn_option_body_tests_against_null_fn() {
+    let fn_ty = unit_fn_ptr();
+    let opt_ty = option_adt_node(0, fn_ty.clone());
+    let take = interior_opaque(2, &["fixture", "take"], vec![fn_ty.clone()], interior_i64());
+    let llbc = option_map_or_typed_fn_item_llbc(opt_ty, fn_ty, vec![option_enum(0)], take);
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    let body = lower_map_or_core_body(&llbc);
+    assert_eq!(
+        map_or_null_targets(&body),
+        vec!["core::ptr::null_fn".to_string()],
+        "Option<fn> discriminant uses null_fn; ops={:?}",
+        graph_ops(&body)
+    );
+}
+
+/// `opt.map_or(default, f)` on `Option<&RawEnum>`: a raw-enum borrow is
+/// an int-bank Address, so the niche null shares that bank and `is_`
+/// operands agree (`rnone.py` `rtype_is_None`).
+#[test]
+fn map_or_niche_raw_address_body_is_operands_agree() {
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
         2,
-        "A branches to Some/None arms"
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), raw_address_payload_enum(1)],
+        take,
+    );
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let mut saw_is = 0usize;
+    for block in &body.blocks {
+        for op in &block.operations {
+            let OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "is_" {
+                continue;
+            }
+            saw_is += 1;
+            let lhs_ty = map_or_producer_ty(&body, lhs);
+            let rhs_ty = map_or_producer_ty(&body, rhs);
+            assert_eq!(
+                map_or_value_bank(&lhs_ty),
+                map_or_value_bank(&rhs_ty),
+                "is_ mixed kinds {lhs_ty:?} vs {rhs_ty:?}; ops={:?}",
+                graph_ops(&body)
+            );
+            assert_eq!(
+                map_or_value_bank(&lhs_ty),
+                'i',
+                "raw-address niche opt is int-banked; ops={:?}",
+                graph_ops(&body)
+            );
+        }
+    }
+    assert_eq!(
+        saw_is,
+        1,
+        "niche map_or body emits one is_ null test; ops={:?}",
+        graph_ops(&body)
+    );
+    assert_eq!(
+        map_or_null_targets(&body),
+        vec!["core::ptr::null_raw".to_string()],
+        "Option<&RawEnum> discriminant uses null_raw; ops={:?}",
+        graph_ops(&body)
+    );
+}
+
+/// `Some.__pos_0` of `Option<&RawEnum>` retypes the Address word as
+/// `Ptr(RawEnum)` via 2-arg `lltype.cast_int_to_ptr` (`ann_cast_int_to_ptr`).
+#[test]
+fn map_or_niche_raw_address_some_payload_is_cast_int_to_ptr() {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), raw_address_payload_enum(1)],
+        take,
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let casts: Vec<&SpaceOperation> = graph_ops(&body)
+        .into_iter()
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_int_to_ptr"),
+            _ => false,
+        })
+        .collect();
+    assert_eq!(
+        casts.len(),
+        2,
+        "Discriminant is_ and Some.__pos_0 each retype Address as Ptr(RawEnum); ops={:?}",
+        graph_ops(&body)
+    );
+    for (i, cast) in casts.iter().enumerate() {
+        let OpKind::Call {
+            args, result_ty, ..
+        } = &cast.kind
+        else {
+            panic!("cast_int_to_ptr is a Call");
+        };
+        assert_eq!(
+            args.len(),
+            2,
+            "cast[{i}] cast_int_to_ptr(PTRTYPE, int); args={args:?}"
+        );
+        assert!(
+            matches!(
+                &args[0],
+                crate::model::LinkArg::Const(c)
+                    if matches!(c.value, crate::flowspace::model::ConstValue::LowLevelType(_))
+            ),
+            "cast[{i}] PtrT is the raw Ptr constant, got {:?}",
+            args[0]
+        );
+        assert_eq!(
+            result_ty,
+            &ValueType::Int,
+            "cast[{i}] raw Ptr getkind is int; ops={:?}",
+            graph_ops(&body)
+        );
+        let result = cast
+            .result
+            .as_ref()
+            .expect("cast_int_to_ptr writes a result");
+        let ct = result.concretetype.borrow();
+        let Some(LowLevelType::Ptr(ptr)) = ct.as_ref() else {
+            panic!("cast[{i}] concretetype is Ptr(T), got {ct:?}");
+        };
+        let PtrTarget::Struct(st) = &ptr.TO else {
+            panic!("cast[{i}] Ptr of the raw enum, got {:?}", ptr.TO);
+        };
+        assert_eq!(st._name, "RawEnum");
+        assert_eq!(st._gckind, GcKind::Raw);
+    }
+}
+
+/// `Some.__pos_0` of `Option<&*mut WordHasher>` is a slot address, so it
+/// does not emit `__cast_instance_intrinsic` to the GC class.
+/// `Option<&WordHasher>` still emits exactly one.
+#[test]
+fn map_or_slot_ref_payload_is_not_the_pointee_class() {
+    let hasher = code_struct(1, &["hash", "WordHasher"]);
+    let take_i64 = interior_i64();
+    let gc_payload = option_shared_ref(adt_node(1));
+    let gc_opt = option_adt_node(0, gc_payload.clone());
+    let gc_take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![gc_payload.clone()],
+        take_i64.clone(),
+    );
+    let gc_llbc = option_map_or_typed_fn_item_llbc(
+        gc_opt,
+        gc_payload,
+        vec![option_enum(0), hasher.clone()],
+        gc_take,
+    );
+    let gc_body = lower_map_or_core_body(&gc_llbc);
+    let gc_roots: Vec<&str> = gc_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        gc_roots,
+        vec!["WordHasher"],
+        "Option<&WordHasher> still casts Some.__pos_0 to the pointee class; ops={:?}",
+        graph_ops(&gc_body)
+    );
+
+    let slot_payload = option_shared_ref(interior_raw_mut(adt_node(1)));
+    let slot_opt = option_adt_node(0, slot_payload.clone());
+    let slot_take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![slot_payload.clone()],
+        take_i64,
+    );
+    let slot_llbc = option_map_or_typed_fn_item_llbc(
+        slot_opt,
+        slot_payload,
+        vec![option_enum(0), hasher],
+        slot_take,
+    );
+    let slot_body = lower_map_or_core_body(&slot_llbc);
+    let slot_roots: Vec<&str> = slot_body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        slot_roots.len(),
+        0,
+        "Option<&*mut WordHasher> must not cast the slot address to WordHasher; ops={:?} roots={slot_roots:?}",
+        graph_ops(&slot_body)
+    );
+}
+
+/// Residual call whose dest is `Option<P>`: the caller is a one-block
+/// Call of an Opaque FunDecl (`items_base_operand_llbc` residual shape).
+fn lower_residual_option_dest(payload: serde_json::Value) -> FunctionGraph {
+    let opt_ty = option_adt_node(0, payload);
+    let callee = interior_opaque(1, &["fixture", "residual_get"], vec![], opt_ty.clone());
+    let caller = interior_caller(
+        "call_residual",
+        0,
+        vec![],
+        opt_ty.clone(),
+        vec![interior_local(0, None, &opt_ty)],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(0, &opt_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![option_enum(0), code_struct(1, &["fixture", "GcStruct"])],
+        vec![caller, callee],
+    );
+    lower_interior(&llbc, "call_residual")
+}
+
+fn residual_option_dest_cast_roots(graph: &FunctionGraph) -> Vec<&str> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect()
+}
+
+/// Residual dest `Option<&*mut GcStruct>` is a slot address (`rdict.py`
+/// `ll_get`): `option_residual_narrow_root` must not extra-peel it into
+/// class `GcStruct`. `Option<*mut GcStruct>` keeps today's payload-class
+/// trailing `__cast_instance_intrinsic`.
+#[test]
+fn residual_slot_ref_option_dest_is_not_the_pointee_class() {
+    let slot = lower_residual_option_dest(option_shared_ref(interior_raw_mut(adt_node(1))));
+    let slot_roots = residual_option_dest_cast_roots(&slot);
+    assert_eq!(
+        slot_roots.len(),
+        0,
+        "Option<&*mut GcStruct> residual dest must not recast the slot address; ops={:?} roots={slot_roots:?}",
+        graph_ops(&slot)
+    );
+
+    let raw = lower_residual_option_dest(interior_raw_mut(adt_node(1)));
+    let raw_roots = residual_option_dest_cast_roots(&raw);
+    assert_eq!(
+        raw_roots,
+        vec!["GcStruct"],
+        "Option<*mut GcStruct> residual dest keeps today's payload-class cast; ops={:?} roots={raw_roots:?}",
+        graph_ops(&raw)
+    );
+}
+
+/// `opt.map_or(default, f)` on `Option<&WordHasher>`: the Some payload
+/// is the niche pointer, narrowed to the pointee class so `f(t)` sees
+/// `SomeInstance(WordHasher)` (`rclass.py` `InstanceRepr._setup_repr`).
+#[test]
+fn map_or_reference_payload_class_is_narrowed() {
+    let payload_ty = option_shared_ref(adt_node(1));
+    let opt_ty = option_adt_node(0, payload_ty.clone());
+    let take = interior_opaque(
+        2,
+        &["fixture", "take"],
+        vec![payload_ty.clone()],
+        interior_i64(),
+    );
+    let llbc = option_map_or_typed_fn_item_llbc(
+        opt_ty,
+        payload_ty,
+        vec![option_enum(0), code_struct(1, &["hash", "WordHasher"])],
+        take,
+    );
+    let caller = lower_interior(&llbc, "map_or_fn_item");
+    assert_eq!(
+        map_or_call_count(&caller),
+        1,
+        "caller keeps one regular call to the core map_or body; ops={:?}",
+        graph_ops(&caller)
+    );
+    let body = lower_map_or_core_body(&llbc);
+    let roots: Vec<&str> = body
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .collect();
+    assert_eq!(
+        roots,
+        vec!["WordHasher"],
+        "Some.__pos_0 of a GC-instance niche Option is cast to the pointee class; ops={:?}",
+        graph_ops(&body)
     );
 }
 
@@ -15217,17 +15770,16 @@ fn niche_option_ext_eq_stays_a_call() {
     );
 }
 
-/// `gettypeobject` (`gettypefor(..).map_or(PY_NULL, |p| p.as_ptr())`)
-/// must fold its `gettypefor` match through the niche
-/// `Option<NonNull<PyObject>>` path now that `gettypefor` returns a
-/// one-word niche Option: the map_or rewrite uses a `ptr_ne` null-test
-/// (`base != null_mut()`), NOT an aggregate `__discriminant` FieldRead,
-/// and the null is a `null_mut()` call (repr-adaptive) rather than a
-/// fixed-GCREF `ConstRefNull`.  Guards against a regression where the
-/// niche detector stops recognising the `NonNull` payload (which would
-/// re-introduce the classdef-less `__discriminant` base) or where the
-/// null reverts to `ConstRefNull` (which cannot rtype against the
-/// pointer's `InstanceRepr`).  Ignored by default (loads the real LLBC).
+/// `gettypeobject` matches `gettypefor(..)` over a one-word niche
+/// `Option<NonNull<PyObject>>`. The Discriminant fold uses a `ptr_ne`
+/// null-test (`base != null_mut()`), NOT an aggregate `__discriminant`
+/// FieldRead, and the null is a `null_mut()` call (repr-adaptive)
+/// rather than a fixed-GCREF `ConstRefNull`.  Guards against a
+/// regression where the niche detector stops recognising the `NonNull`
+/// payload (which would re-introduce the classdef-less `__discriminant`
+/// base) or where the null reverts to `ConstRefNull` (which cannot
+/// rtype against the pointer's `InstanceRepr`).  Ignored by default
+/// (loads the real LLBC).
 #[test]
 #[ignore]
 fn niche_option_gettypeobject_folds_to_ptr_null_test() {
@@ -15261,7 +15813,7 @@ fn niche_option_gettypeobject_folds_to_ptr_null_test() {
         null_muts >= 1,
         "gettypeobject: expected a null_mut() feeding the niche ptr null-test"
     );
-    // The map_or niche discriminant contains a `ne` pointer null-test, and no
+    // The niche discriminant contains a `ne` pointer null-test, and no
     // `__discriminant` FieldRead survives on the niche `gettypefor` result.
     let has_ne = graph
         .blocks
@@ -15776,8 +16328,8 @@ fn utf8_string_builder_methods_lower_to_string_builder_markers() {
     }
 }
 
-/// `get_w_locals` is `getdebug_data().map_or(PY_NULL, |data| data.w_locals)`
-/// over `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
+/// `get_w_locals` matches `getdebug_data()` over
+/// `Option<&FrameDebugData>` — a SHARED-reference niche Option. Its
 /// `Some` payload must alias the base pointer (no aggregate `__pos_0`
 /// FieldRead), the same fold the `&mut`/`NonNull` niche arms already apply.
 /// Ignored by default (loads the real LLBC).

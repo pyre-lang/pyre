@@ -1896,6 +1896,34 @@ pub(in crate::front::mir) fn one_level_pointer_pointee<'a>(
     None
 }
 
+/// After exactly one `Ref` ([`strip_ty_indirections`], not
+/// [`strip_ty_wrappers`]) plus alias peel, the Option payload is still a
+/// pointer (`Option<&*mut T>` / `Option<&&T>`): the address of a slot, not
+/// class `T`. [`option_payload_instance_class_root`] and
+/// [`Lowering::option_residual_narrow_root`] share this test so a remaining
+/// pointer is not extra-peeled into the pointee class (`rdict.py` `ll_get`).
+pub(in crate::front::mir) fn option_payload_remaining_pointer(
+    payload: &serde_json::Value,
+    llbc: &Llbc,
+) -> bool {
+    let Some(payload) = strip_ty_indirections(payload, llbc) else {
+        return false;
+    };
+    let Some(pointee) = payload
+        .as_object()
+        .and_then(|o| o.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(1))
+    else {
+        return false;
+    };
+    let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
+        return false;
+    };
+    let pointee = type_node_peel_aliases(pointee, llbc).unwrap_or(pointee);
+    one_level_pointer_pointee(pointee, llbc).is_some()
+}
+
 /// Whether `node` names a harvested `_alloc_flavor_ = raw` ADT
 /// (`rclass.py getgcflavor`).
 pub(in crate::front::mir) fn flavor_raw_adt_node(
@@ -10713,7 +10741,7 @@ pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &
 }
 
 /// The `<X>` suffix for the single-element closure-`Args` tuple `(payload,)` a
-/// unary `map_or`/`and_then`/`map` closure receives, where `payload` is the
+/// unary `and_then`/`map` closure receives, where `payload` is the
 /// receiver `Option<X>`'s Some payload.  The extracted `call_once` body reads
 /// this tuple's `.0` via a real Charon `Tuple<X>` container (owner derived at
 /// [`Lowering::resolve_place`] through [`tyref_tuple_suffix`]); the

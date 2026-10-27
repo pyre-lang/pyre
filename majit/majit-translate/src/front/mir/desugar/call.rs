@@ -400,20 +400,14 @@ impl<'a> Lowering<'a> {
         // closure ADT, so `second_arg_ty` alone cannot name the callee.
         let second_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(1));
         let second_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(1));
-        // Third argument's MIR-declared type — `Option::map_or`'s closure env
-        // operand.  Captured before the operands are consumed so the
-        // `front::option_map_or` recording can resolve the closure ADT's
-        // `call_once` inherent-method owner.
+        // Third argument's MIR-declared type. Captured before the operands
+        // are consumed so a 3-arg Regular call (`items_block_set_ref`,
+        // `copy_nonoverlapping`) can classify that operand after `call.args`
+        // is moved.
         let third_arg_ty: Option<TyRef> = call.args.get(2).and_then(|op| match op {
             Operand::Copy(p) | Operand::Move(p) => Some(clone_tyref(&p.ty)),
             Operand::Const(_) => None,
         });
-        // Function-item identity of arg #2, captured before `call.args` is
-        // consumed.  `Option::map_or(opt, default, named_fn)` passes a `FnDef`
-        // constant (or a Copy/Move of a `FnDef`-typed local); that shape has
-        // no closure ADT, so `third_arg_ty` alone cannot name the callee.
-        let third_arg_fn_item = operand_fn_item_segments(self.llbc, call.args.get(2));
-        let third_arg_fn_decl = operand_fn_item_decl(self.llbc, call.args.get(2));
         // A literal scalar index (`slice.get(1)`) has no Place type to retain
         // in `second_arg_ty`.  Charon still records the method's `I` type in
         // the regular-call generics, so classify the `get` before consuming
@@ -8335,61 +8329,6 @@ impl<'a> Lowering<'a> {
             ) {
                 self.expect_sites.push(site);
             }
-        }
-        // Capture `Option::map_or(opt, default, callable)` sites for the
-        // discriminant closure-select `front::option_map_or` synthesizes.
-        // Like `unwrap_or`, `map_or`'s body is Opaque (foreign `core`) and its
-        // receiver is the `Option` ADT, so `first_is_self` routes it to a
-        // `CallTarget::Method` (receiver `args[0]`, default `args[1]`, callable
-        // `args[2]`).  The callable is a closure ADT (`third_arg_ty` →
-        // `call_once`) or a function item (`third_arg_fn_item` → a direct
-        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
-        // the callable needs the receiver type, the env type or `FnDef`
-        // path, and the result type (`call.dest.ty`), all in hand here;
-        // `recognize_map_or_site` also confirms the receiver is an `Option`.
-        // A resolution miss leaves the residual call — an unregistered callee
-        // the rtyper census Skips, so no graph regresses.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 3
-            && name == "map_or"
-            && let Some(mut site) = self.recognize_map_or_site(
-                first_arg_ty.as_ref(),
-                third_arg_ty.as_ref(),
-                third_arg_fn_item.clone(),
-                third_arg_fn_decl,
-                &call.dest.ty,
-                &result_var,
-            )
-        {
-            // Reflexive `From` / same-width integer `From` is identity on the
-            // payload (`is_reflexive_from` / `is_widening_int_from`).  Applied
-            // here with a RegularCall of the FunDecl the FnDef names — the
-            // same predicates the ordinary call-lowering arm uses — so
-            // `recognize_map_or_site` itself does not special-case `From`.
-            if site.fn_item_segments.is_some()
-                && let Some(fd) = third_arg_fn_decl
-            {
-                let reg = RegularCall {
-                    kind: CallKind::Fun(FunId::Regular { id: fd.def_id }),
-                    generics: serde_json::json!({
-                        "regions": [],
-                        "types": [],
-                        "const_generics": [],
-                        "trait_refs": []
-                    }),
-                };
-                if self.is_reflexive_from(&reg) || self.is_widening_int_from(&reg) {
-                    site.fn_item_ctor = Some(AggregateShape::Operand {
-                        index: 0,
-                        transparent: true,
-                    });
-                }
-            }
-            self.map_or_sites.push(site);
         }
         // `Result::map_err(result, closure)` is a foreign core combinator.
         // Record the concrete receiver/result instantiations while their MIR

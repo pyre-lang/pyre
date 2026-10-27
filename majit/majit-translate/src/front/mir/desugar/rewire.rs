@@ -882,7 +882,7 @@ pub(in crate::front::mir) fn rewire_option_filter_diamond(
     flow_result: Variable,
     name: &str,
 ) -> Result<(), String> {
-    use crate::front::option_map_or::emit_narrow;
+    use crate::front::option_variant::emit_narrow;
     use crate::front::option_variant::{
         close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
     };
@@ -1088,7 +1088,7 @@ pub(in crate::front::mir) fn build_disc_arm(
     is_then: bool,
     name: &str,
 ) -> Result<Variable, String> {
-    use crate::front::option_map_or::emit_narrow;
+    use crate::front::option_variant::emit_narrow;
     use crate::front::option_variant::{emit_option_variant, emit_sum_variant, map_source};
 
     match (site.kind, is_then) {
@@ -1534,7 +1534,7 @@ impl CombinatorArmExits<'_> {
         let value = if self.raising_callable {
             value
         } else {
-            crate::front::option_map_or::emit_narrow(graph, block, value, &site.call_result_class)
+            crate::front::option_variant::emit_narrow(graph, block, value, &site.call_result_class)
         };
         let remap_arg = |arg: &LinkArg, fresh: &[(&Option<LinkArg>, &Variable)]| match arg {
             LinkArg::Value(v) if v == self.flow_result => Some(LinkArg::Value(value.clone())),
@@ -2450,7 +2450,7 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
     return_owners: Option<&ResultTryReturnOwners>,
 ) -> Result<(), String> {
     use crate::flowspace::model::Constant;
-    use crate::front::option_map_or::emit_narrow;
+    use crate::front::option_variant::emit_narrow;
     use crate::front::option_variant::{emit_sum_variant, map_source};
     use crate::front::result_exc::{
         assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,

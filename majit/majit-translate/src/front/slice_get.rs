@@ -61,11 +61,15 @@
 //!
 //! ## The rewrite (`rewire_one_slice_get_site`)
 //!
-//! Block A holds the residual `get` call producing `opt`.  Because
-//! `Option<&PyObjectRef>` triggers `option_residual_narrow_root`, `lower_call`
-//! appends a trailing `__cast_instance_intrinsic` after the call, so the call is NOT
-//! A's last op — the block-A skeleton absorbs that optional cast, exactly as
-//! [`crate::front::option_map_or`] does.  The rewrite:
+//! Block A holds the residual `get` call producing `opt`.  A residual dest
+//! whose payload still keys a class (`Option<&RegisteredStruct>`,
+//! `Option<*mut T>`) may append a trailing `__cast_instance_intrinsic` after
+//! the call, so the call is NOT A's last op.  A remaining-pointer dest
+//! (`Option<&PyObjectRef>` = `Option<&*mut T>`) does not: after one `Ref` the
+//! payload is still a pointer, so `option_residual_narrow_root` returns
+//! `None` (`rdict.py` `ll_get`) and the dest stays classdef-less GCREF.  The
+//! block-A skeleton absorbs that optional cast, exactly as
+//! [`crate::front::option_variant::emit_narrow`] does.  The rewrite:
 //! 1. drops the `get` call (+ absorbed cast) and closes A with a
 //!    `bool(i < len(slice))` branch to two fresh arms;
 //! 2. the `then_bb` arm reads `slice[i]` and wraps it in `Some`; a one-word
@@ -82,9 +86,8 @@
 //! the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::option_map_or::emit_narrow;
 use crate::front::option_variant::{
-    close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+    close_goto_mixed, emit_narrow, emit_option_variant, map_source, reproduce_exit_args,
 };
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
@@ -303,11 +306,13 @@ fn rewire_one_slice_get_site(graph: &mut FunctionGraph, site: &SliceGetSite) -> 
         .ok_or_else(|| format!("{name}: slice::get call op not found in block {a}"))?;
     let ops_len = graph.blocks[a].operations.len();
 
-    // `Option<&PyObjectRef>` gains a trailing `__cast_instance_intrinsic` narrowing
-    // op (`result_narrow_root`) whose output is what the block forwards on.
-    // Absorb that optional cast: `flow_result` is the value B consumes,
-    // `narrow_root` re-applies the narrowing per arm, `remove_upto` bounds the
-    // ops to drop.  Any other trailing shape declines (fail-safe).
+    // A dest whose payload still keys a class may gain a trailing
+    // `__cast_instance_intrinsic` (`result_narrow_root`) whose output is
+    // what the block forwards on. A remaining-pointer dest
+    // (`Option<&PyObjectRef>`) does not recast. Absorb that optional
+    // cast: `flow_result` is the value B consumes, `narrow_root`
+    // re-applies the narrowing per arm, `remove_upto` bounds the ops to
+    // drop.  Any other trailing shape declines (fail-safe).
     let (flow_result, narrow_root, remove_upto) = if ci + 1 == ops_len {
         (site.result_var.clone(), None, ci)
     } else if ci + 2 == ops_len {

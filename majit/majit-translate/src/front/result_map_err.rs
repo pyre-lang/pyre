@@ -11,9 +11,8 @@
 
 use crate::flowspace::model::Variable;
 use crate::front::option_closure_select::emit_callable;
-use crate::front::option_map_or::emit_narrow;
 use crate::front::option_variant::{
-    close_goto_mixed, emit_sum_variant, map_source, reproduce_exit_args,
+    close_goto_mixed, emit_narrow, emit_sum_variant, map_source, reproduce_exit_args,
 };
 use crate::model::{
     CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,

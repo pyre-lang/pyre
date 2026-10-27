@@ -49,7 +49,7 @@
 //! `__cast_instance_intrinsic` after the call, so the call is not A's last op; a
 //! scalar-payload `Option<u8>` has no such cast.  The block-A skeleton accepts
 //! both shapes and absorbs the optional cast, exactly as
-//! [`crate::front::option_map_or`] does.  The rewrite:
+//! [`crate::front::option_variant::emit_narrow`] does.  The rewrite:
 //! 1. drops the `first` call (+ absorbed cast) and closes A with a
 //!    `bool(len(slice) > 0)` branch to two fresh arms;
 //! 2. the `then_bb` arm reads `slice[0]` and wraps it in `Some`; a one-word
@@ -66,9 +66,8 @@
 //! keeps the rtyper census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::option_map_or::emit_narrow;
 use crate::front::option_variant::{
-    close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+    close_goto_mixed, emit_narrow, emit_option_variant, map_source, reproduce_exit_args,
 };
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 

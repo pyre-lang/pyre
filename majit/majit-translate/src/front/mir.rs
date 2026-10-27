@@ -6237,21 +6237,11 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             &mut lo.graph,
             &lo.result_expect_sites,
         );
-        // The `Option::map_or` closure-select rewrite (`front::option_map_or`)
-        // splits the residual `map_or` call block into a `__discriminant`
-        // diamond whose `Some` arm calls the closure, same post-lowering shape
-        // and fail-safe contract as `unwrap_or`; gate the reachability sweep on
-        // an actual rewrite.
-        let map_or_rewritten = if lo.map_or_sites.is_empty() {
-            0
-        } else {
-            crate::front::option_map_or::rewire_map_or_call_sites(&mut lo.graph, &lo.map_or_sites)
-        };
         // The `Option::map`/`and_then`/`unwrap_or_else` closure-select rewrite
         // (`front::option_closure_select`) splits the residual call block into a
         // `__discriminant` diamond, same post-lowering shape and fail-safe
-        // contract as `map_or`; gate the reachability sweep on an actual
-        // rewrite.
+        // contract as the remaining Option combinators; gate the reachability
+        // sweep on an actual rewrite.
         let closure_select_outcome = if lo.closure_select_sites.is_empty() {
             crate::front::option_closure_select::ClosureSelectRewriteOutcome::default()
         } else {
@@ -6352,7 +6342,6 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             || unwrap_rewritten > 0
             || expect_rewritten > 0
             || result_expect_rewritten > 0
-            || map_or_rewritten > 0
             || closure_select_rewritten > 0
             || !lo.disc_combinator_sites.is_empty()
         {

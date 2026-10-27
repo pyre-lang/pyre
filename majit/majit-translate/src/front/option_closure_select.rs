@@ -8,10 +8,9 @@
 //! a two-arg `CallTarget::Method` (receiver in `args[0]`, callable in
 //! `args[1]`).  The callable is either a closure ADT (its `call_once` runs on
 //! the selected arm) or a function item (`FnDef`: a zero-sized value naming
-//! one function, called directly as `f(x)` / `f()`).  Like
-//! [`crate::front::option_map_or`] they imply a two-way select on the
-//! receiver's tag, which this pass *creates*.  They differ only in how each
-//! arm produces its result:
+//! one function, called directly as `f(x)` / `f()`).  They imply a two-way
+//! select on the receiver's tag, which this pass *creates*.  They differ
+//! only in how each arm produces its result:
 //!
 //! ```text
 //!     map(opt, f):            Some(x) => Some(f(x))   None => None
@@ -31,17 +30,16 @@
 //! `bool` whose `None` arm is the constant `false` (no callable, no `Option`).
 //! Everything else — locating the residual call, absorbing the trailing
 //! `*mut <registered ADT>` narrowing cast, threading the live values through
-//! the arms, and closing the `bool(disc)` branch — is the
-//! [`crate::front::option_map_or`] skeleton.
+//! the arms, and closing the `bool(disc)` branch — uses the
+//! [`crate::front::option_variant`] diamond helpers.
 //!
 //! It is **fail-safe**: any structural mismatch returns `Err`, the caller leaves
 //! the residual call untouched, and the unregistered callee keeps the rtyper
 //! census Skip (no regression vs the legacy walker).
 
 use crate::flowspace::model::Variable;
-use crate::front::option_map_or::emit_narrow;
 use crate::front::option_variant::{
-    close_goto_mixed, emit_option_variant, map_source, reproduce_exit_args,
+    close_goto_mixed, emit_narrow, emit_option_variant, map_source, reproduce_exit_args,
 };
 use crate::model::{
     BlockId, CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -208,7 +206,7 @@ fn rewire_one_closure_select_site(
     let ops_len = graph.blocks[a].operations.len();
 
     // Absorb the optional trailing `__cast_instance_intrinsic` narrowing cast a
-    // `*mut <registered ADT>` result gains (see `option_map_or`).
+    // `*mut <registered ADT>` result gains (`option_variant::emit_narrow`).
     let (flow_result, narrow_root, remove_upto) = if ci + 1 == ops_len {
         (site.result_var.clone(), None, ci)
     } else if ci + 2 == ops_len {

@@ -727,6 +727,41 @@ pub(crate) fn raw_struct_ptr_from_layout(
     Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
 }
 
+/// Interned `Ptr(Struct raw)` of a harvested storage-raw enum base.
+///
+/// `derive_subject_inputcells` seeds `&MappedObj` (`as_ptr` / `len` `self`)
+/// through [`raw_struct_ptr_from_layout`] → [`owner_ll_container`] once
+/// CallControl layouts exist. An enum base's only harvest row is
+/// `__discriminant` (`derive_program_metadata`; `rclass.py`
+/// `getinstancerepr`). Lowering holds that registry and not the layout
+/// table, so the intern is the tag row and `GcKind::Raw`.
+pub(crate) fn raw_enum_base_ptr_lltype(
+    registry: &crate::front::StructFieldRegistry,
+    class_root: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, Ptr, Struct};
+
+    let lookup = generic_owner_lookup(class_root);
+    if !registry.is_enum_base(lookup) || !registry.enum_base_has_payload(lookup) {
+        return None;
+    }
+    let rows = registry.field_rows(lookup)?;
+    let [row] = rows else {
+        return None;
+    };
+    if row.name != "__discriminant" {
+        return None;
+    }
+    let tag = scalar_lltype(&row.ty)?;
+    let body = Struct::registry_fields(
+        class_root,
+        vec![("__discriminant".to_string(), tag)],
+        GcKind::Raw,
+    );
+    let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
+    Some(LowLevelType::Ptr(Box::new(ptr)))
+}
+
 fn layout_for_owner(
     layouts: &crate::codewriter::call::StructLayoutTable,
     name: &str,
@@ -1042,7 +1077,7 @@ fn niche_word_lltype(
     scalar_lltype(word)
 }
 
-fn scalar_lltype(
+pub(crate) fn scalar_lltype(
     spelling: &str,
 ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;

@@ -3306,23 +3306,33 @@ impl<'a> Lowering<'a> {
                 // = null, `Some(p)` = the non-null pointer.  Its
                 // discriminant is the pointer-null test `base != null`
                 // (`None` = 0, `Some` = 1), not a `__discriminant` field off
-                // a two-word aggregate base (there is none).  Emit the null
-                // pointer, then compare — a `ne` on two `Ref` operands
-                // lowers to `ptr_ne` (`jtransform`), and its `Int` result
-                // feeds the match switch exactly as a `__discriminant` read
-                // would.  The null is a `null_mut()` call, not a
-                // `ConstRefNull`: `null_mut()` rtypes to `convert_const(None)`
-                // on the result repr (`rbuiltin::rtype_ptr_null`), so it
-                // adapts to the `base` pointer's own `InstanceRepr` and the
-                // `ptr_ne` sees two same-repr operands.  A `ConstRefNull` is a
-                // fixed GCREF `_ptr`, which cannot rtype against an
-                // `InstanceRepr(PyObject)` base at the `ne`.  Modelling the
-                // maybe-null pointer this way is the orthodox representation
-                // (RPython has no `Option`; a maybe-null `Ptr` tests
-                // `ptr_nonzero`).
+                // a two-word aggregate base (there is none).  An instance
+                // `Ref` is-None is `Constant(None)` compared with `is_`
+                // (`rnone.py` `rtype_is_None`;
+                // `pairtype(NoneRepr, Repr).convert_from_to` is
+                // `inputconst(r_to, None)`), via
+                // [`FunctionGraph::push_niche_is_some`]. Int-bank
+                // (`null_raw` / `null_fn`) and string / list windows emit
+                // a typed null through `push_niche_null_ptr`, then `is_` /
+                // `eq(..., False)`.
                 if self.tyref_is_niche_option_ptr(&place.ty) {
                     let option_ty = clone_tyref(&place.ty);
-                    let base = self.resolve_place(mir_bb, place)?;
+                    let mut base = self.resolve_place(mir_bb, place)?;
+                    let null_cast = self.option_niche_null_cast(&option_ty);
+                    if self.option_niche_int_null(&option_ty).is_none()
+                        && crate::model::niche_is_none_uses_const_none(null_cast.as_ref())
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        self.graph.push_niche_is_some(
+                            bb_id,
+                            base,
+                            None,
+                            null_cast.as_ref(),
+                            res.clone(),
+                        );
+                        self.niche_disc_vars.insert(res.id());
+                        return Ok((None, res));
+                    }
                     let nullc = self.push_niche_null_ptr(mir_bb, &option_ty);
                     // Preserve PyPy's identity test: first compute
                     // `base is None`, then negate that bool for the Rust
@@ -3338,6 +3348,17 @@ impl<'a> Lowering<'a> {
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     let bb_id = self.emit_bb(mir_bb);
+                    // `null_raw(T)` is `lltype.nullptr(T)` (`SomePtr`).
+                    // `is_` of that null against the Address word is
+                    // IntegerRepr vs PtrRepr (`pairtype.py` `rtype_is_`).
+                    // Retype the Address word as `Ptr(T)` the same way
+                    // `Some.__pos_0` does (`lltype.py` `cast_int_to_ptr`).
+                    // The Option local stays int-bank (`null_raw`, not
+                    // `null_mut`); `option_niche_is_int_bank` is unchanged.
+                    if let Some(ptr_ty) = self.payload_storage_raw_ptr_lltype(&option_ty) {
+                        base =
+                            emit_dest_typed_cast_int_to_ptr(&mut self.graph, bb_id, base, ptr_ty);
+                    }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(is_none.clone()),
                         kind: OpKind::BinOp {
@@ -4023,6 +4044,58 @@ impl<'a> Lowering<'a> {
         }
         let ptr = Ptr::from_container_type(LowLevelType::Struct(Box::new(body))).ok()?;
         Some(LowLevelType::Ptr(Box::new(ptr)))
+    }
+
+    /// PTRTYPE of a niche-Option payload that is a pointer to a storage-raw
+    /// ADT (`Option<&MappedObj>`). `lltype.cast_int_to_ptr(PTRTYPE, addr)`
+    /// returns `SomePtr(PTRTYPE)` (`lltype.py` `ann_cast_int_to_ptr`). The
+    /// Option word itself stays the Address `rnone.py` `rtype_is_None`
+    /// compares. A fn-ptr niche has no ADT pointee and yields `None`.
+    /// PTRTYPE is `raw_enum_base_ptr_lltype` of the harvest enum-base
+    /// row, the same `Ptr(Struct)` `derive_subject_inputcells` seeds for
+    /// the `&RawEnum` Input.
+    pub(in crate::front::mir) fn payload_storage_raw_ptr_lltype(
+        &self,
+        option_ty: &TyRef,
+    ) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+        if tyref_option_payload_is_fn_ptr(option_ty, self.llbc) {
+            return None;
+        }
+        let payload = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)?;
+        if !ty_is_raw_address(
+            &payload,
+            self.llbc,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        ) {
+            return None;
+        }
+        let payload_node =
+            tyref_node(&payload, self.llbc).and_then(|n| type_node_peel_aliases(n, self.llbc))?;
+        let pointee = one_level_pointer_pointee(payload_node, self.llbc)?;
+        let pointee = strip_ty_indirections(pointee, self.llbc).unwrap_or(pointee);
+        let adt = declared_raw_adt_node(
+            pointee,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        )?;
+        let id = adt_node_def_id(adt)?;
+        let decl = self.llbc.type_by_id(id)?;
+        if type_decl_is_fieldless_enum(decl, self.llbc) {
+            return None;
+        }
+        let TypeDeclKind::Enum(_) = &decl.kind else {
+            return None;
+        };
+        let name = raw_address_owner_root(
+            &payload,
+            self.llbc,
+            self.tombstoned_leaves,
+            self.gc_struct_ids,
+            &self.raw_alloc_flavor_structs,
+        )?;
+        crate::annotator::bookkeeper::raw_enum_base_ptr_lltype(self.struct_fields?, &name)
     }
 
     /// 2-arg `cast_int_to_ptr(PTRTYPE, addr)` when dest is a raw overlay.
@@ -5564,8 +5637,39 @@ impl<'a> Lowering<'a> {
                     // rtype clsfield).  Alias the base value with no field read,
                     // mirroring the fieldless-enum discriminant collapse and the
                     // `Discriminant` niche fold above.
+                    //
+                    // A GC-instance payload still needs the ordinary
+                    // `__cast_instance_intrinsic` so `f(t)` / a closure
+                    // `call_once` Args tuple sees `SomeInstance(T)` rather
+                    // than a classdef-less word (`rclass.py`
+                    // `InstanceRepr._setup_repr`). An int-bank raw-address
+                    // niche (`Option<&MappedObj>`, `Option<fn>`) keeps the
+                    // Address word for Discriminant / `is_` / `null_raw`
+                    // (`rnone.py` `rtype_is_None`). The Some payload of a
+                    // storage-raw ADT pointer is that same word retyped as
+                    // `Ptr(T)` (`lltype.py` `cast_int_to_ptr` /
+                    // `ann_cast_int_to_ptr`); a fn-ptr niche stays identity.
+                    // Promoting the Address to Instance is the
+                    // `Ptr ∪ Instance` union `project_struct_rows` refuses.
                     if field_name == "__pos_0" && self.tyref_is_niche_option_ptr(&inner.ty) {
-                        return self.resolve_place(mir_bb, *inner);
+                        let option_ty = clone_tyref(&inner.ty);
+                        let base = self.resolve_place(mir_bb, *inner)?;
+                        if self.option_niche_is_int_bank(&option_ty) {
+                            if let Some(ptr_ty) = self.payload_storage_raw_ptr_lltype(&option_ty) {
+                                let bb_id = self.emit_bb(mir_bb);
+                                return Ok(emit_dest_typed_cast_int_to_ptr(
+                                    &mut self.graph,
+                                    bb_id,
+                                    base,
+                                    ptr_ty,
+                                ));
+                            }
+                            return Ok(base);
+                        }
+                        if let Some(root) = self.option_niche_payload_class_root(&option_ty) {
+                            return Ok(self.cast_ref_word(mir_bb, base, &root));
+                        }
+                        return Ok(base);
                     }
                     // A niche u8-window `Option` (`Option<&[u8]>` / Charon
                     // `Option<[u8]>`) is the window itself: `None` is a null

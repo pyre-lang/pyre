@@ -88,7 +88,6 @@ pub mod mir;
 pub(crate) mod option_closure_select;
 pub(crate) mod option_ctor;
 pub(crate) mod option_expect;
-pub(crate) mod option_map_or;
 pub(crate) mod option_try;
 pub(crate) mod option_unwrap;
 pub(crate) mod option_variant;

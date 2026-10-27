@@ -182,11 +182,17 @@ impl<'a> Lowering<'a> {
 
     /// The RPython instance class carried by an `Option<T>` payload when `T`
     /// is a raw/reference pointer to a registered GC object.  `ValueType`
-    /// records only the register bank, so a `Ref(None)` payload needs its
-    /// source class recorded on the closure-rewrite site until the synthesized
-    /// writer can emit the ordinary instance-narrowing cast.  This preserves
+    /// records only the register bank, so a `Ref(None)` payload needs that
+    /// class on the Some-arm identity (`Some.__pos_0` of a niche Option)
+    /// and on remaining closure-rewrite tuple writes.  This preserves
     /// the concrete field annotation that RPython's `InstanceRepr._setup_repr`
     /// consumes (`rpython/rtyper/rclass.py`).
+    ///
+    /// One pointer word is the class of its pointee (`Option<*mut T>`,
+    /// `Option<&T>`). A remaining pointer after that one word
+    /// (`Option<&*mut T>`, `Option<&&T>`) is the address of a slot, not
+    /// class `T`: [`strip_ty_wrappers`] would peel the extra `Ref`, and
+    /// [`raw_ptr_pointee_class_root_with`] would peel the extra `RawPtr`.
     pub(in crate::front::mir) fn option_payload_instance_class_root(
         &self,
         option_ty: &TyRef,
@@ -208,10 +214,13 @@ impl<'a> Lowering<'a> {
         {
             return Some(root);
         }
+        if option_payload_remaining_pointer(payload, self.llbc) {
+            return None;
+        }
         let pointee = payload.as_object()?.get("Ref")?.as_array()?.get(1)?;
-        let pointee = strip_ty_wrappers(pointee, self.llbc)?;
-        raw_ptr_pointee_class_root_with(pointee, self.llbc, self.tombstoned_leaves)
-            .or_else(|| adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves))
+        let pointee = strip_ty_indirections(pointee, self.llbc)?;
+        let pointee = type_node_peel_aliases(pointee, self.llbc).unwrap_or(pointee);
+        adt_node_class_root_with(pointee, self.llbc, self.tombstoned_leaves)
     }
 
     /// Class root of an `RBigInt` / `&RBigInt` call result, the instance
@@ -251,7 +260,11 @@ impl<'a> Lowering<'a> {
     /// inlined constructor mints a suffixed `Some`/`None` classdef for).
     /// `None` for `Option<u64>` (no raw pointer, not an enum), `Option<*mut
     /// u8>` (primitive pointee, no registered root) and a non-split enum arg
-    /// — all stay classdef-less GCREF, unchanged.
+    /// — all stay classdef-less GCREF, unchanged. A remaining pointer after
+    /// one `Ref` (`Option<&*mut T>` / `Option<&&T>`) is the address of a
+    /// slot, not class `T` (`rdict.py` `ll_get`): [`strip_ty_wrappers`]
+    /// would extra-peel it, so [`option_payload_remaining_pointer`] bails
+    /// first and the dest stays classdef-less GCREF.
     pub(in crate::front::mir) fn option_residual_narrow_root(
         &self,
         dest_ty: &TyRef,
@@ -266,6 +279,7 @@ impl<'a> Lowering<'a> {
         // receiver must key the same suffixed root instead of a bare GCREF.
         // Foreign value payloads (`BigInt` / `Wtf8Buf`, no registered root;
         // a non-split enum arg) still bail, keeping them classdef-less.
+        // A remaining pointer after one Ref is a slot address, not class T.
         let adt = tyref_node(dest_ty, self.llbc)?
             .as_object()?
             .get("Adt")?
@@ -273,6 +287,9 @@ impl<'a> Lowering<'a> {
         let payload = type_decl_ref_generics(adt, self.llbc)?
             .get("types")?
             .get(0)?;
+        if option_payload_remaining_pointer(payload, self.llbc) {
+            return None;
+        }
         let payload_node = strip_ty_wrappers(payload, self.llbc)?;
         let payload_ok =
             raw_ptr_pointee_class_root_with(payload_node, self.llbc, self.tombstoned_leaves)
@@ -447,8 +464,8 @@ impl<'a> Lowering<'a> {
     /// `__discriminant` / `__pos_0` reads key the SAME classdef the value's
     /// *producer* wrote.
     ///
-    /// Agreement is by construction: the suffixed producers (`map_or`,
-    /// `slice_first`, `from_size_align`) mint a
+    /// Agreement is by construction: the suffixed producers (`slice_first`,
+    /// `from_size_align`) mint a
     /// per-instantiation `Option<X>` root through
     /// [`Self::resolve_bool_then_option_dest`], so the consumer reuses that
     /// exact derivation, including checked unsigned arithmetic. Its generated
@@ -1840,98 +1857,6 @@ impl<'a> Lowering<'a> {
             site.fn_item_ctor = Some(self.constructor_fn_item_shape(fd, &built)?);
         }
         Some(site)
-    }
-
-    /// Resolve a recognized `Option::map_or(opt, default, callable)` call into a
-    /// [`crate::front::option_map_or::MapOrSite`] — the `Option` enum root +
-    /// `Some` variant owners, the closure env's `call_once` owner or the
-    /// function-item path, the payload type `T` (the `Some::__pos_0` read the
-    /// callable consumes), and the result type `U` (the `call_once` / select
-    /// result).  `None` (leaving the residual call) when the receiver is not a
-    /// resolvable `Option` — guarding on `Option` since `Result::map_or` shares
-    /// the name but has different tags — or the callable is neither a closure
-    /// ADT nor a named function item.
-    pub(in crate::front::mir) fn recognize_map_or_site(
-        &self,
-        recv_ty: Option<&TyRef>,
-        env_ty: Option<&TyRef>,
-        fn_item_segments: Option<Vec<String>>,
-        fn_item_decl: Option<&FunDecl>,
-        dest_ty: &TyRef,
-        result_var: &Variable,
-    ) -> Option<crate::front::option_map_or::MapOrSite> {
-        let recv_ty = recv_ty?;
-        if !crate::front::result_exc::tyref_is_option(recv_ty, self.llbc) {
-            return None;
-        }
-        let def_id = self.tyref_adt_def_id(recv_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        // Suffix the enum root with the receiver `Option<X>`'s `<X>` so the
-        // per-instantiation root a static `Some(..)` mints is reused here;
-        // `some_owner` then derives `Option<X>::Some`.
-        let option_owner = format!(
-            "{}{}",
-            td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(recv_ty, self.llbc)
-        );
-        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
-        let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        let payload_class_root = self.option_payload_instance_class_root(recv_ty);
-        // Prefer a closure ADT (`call_once(env, (x,))`).  A function item has
-        // no ADT def id — `tyref_ref_adt_def_id` misses — so fall through to
-        // the `FnDef` path captured from the operand (or from `env_ty` when
-        // the item was spilled to a local).
-        let fn_item_segments = fn_item_segments
-            .or_else(|| env_ty.and_then(|ty| tyref_fn_def_call_segments(ty, self.llbc)));
-        let (call_once_owner, args_tuple_suffix, fn_item_segments) =
-            if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
-                let env_td = self.llbc.type_by_id(env_def_id)?;
-                (
-                    closure_env_call_once_owner(env_td),
-                    option_payload_tuple_suffix(recv_ty, self.llbc),
-                    None,
-                )
-            } else {
-                let segments = fn_item_segments.filter(|s| !s.is_empty())?;
-                (String::new(), String::new(), Some(segments))
-            };
-        let fn_item_ctor = match fn_item_decl {
-            Some(fd) if fn_item_segments.is_some() && fd.is_adt_constructor() => {
-                Some(self.constructor_fn_item_shape(fd, dest_ty)?)
-            }
-            _ => None,
-        };
-        let result_ty = tyref_to_value_type_with(
-            dest_ty,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
-        let niche = self.tyref_is_niche_option_ptr(recv_ty);
-        let scalar_kind = if niche {
-            None
-        } else {
-            option_nonzero_word_kind(recv_ty, self.llbc)
-        };
-        let scalar_niche = scalar_kind.is_some();
-        let payload_ty = scalar_kind.unwrap_or(payload_ty);
-        Some(crate::front::option_map_or::MapOrSite {
-            result_var: result_var.clone(),
-            option_owner,
-            some_owner,
-            call_once_owner,
-            fn_item_segments,
-            fn_item_ctor,
-            payload_ty,
-            payload_class_root,
-            result_ty,
-            args_tuple_suffix,
-            niche,
-            int_null: self.option_niche_int_null(recv_ty),
-            scalar_niche,
-            niche_null_cast: self.option_niche_null_cast(recv_ty),
-        })
     }
 
     /// Resolve `Option::ok_or_else(opt, closure) -> Result<T, E>` for the

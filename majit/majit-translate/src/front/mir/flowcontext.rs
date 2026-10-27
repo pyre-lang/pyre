@@ -571,10 +571,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// sibling of `unwrap` (the panic message is dropped; see
     /// [`crate::front::option_expect::ExpectSite`]).
     pub(in crate::front::mir) expect_sites: Vec<crate::front::option_expect::ExpectSite>,
-    /// `Option::map_or(opt, default, closure)` call sites recorded for the
-    /// discriminant closure-select the `front::option_map_or` post-pass
-    /// synthesizes (see [`crate::front::option_map_or::MapOrSite`]).
-    pub(in crate::front::mir) map_or_sites: Vec<crate::front::option_map_or::MapOrSite>,
     /// `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` call sites
     /// recorded for the discriminant closure-select the
     /// `front::option_closure_select` post-pass synthesizes (see
@@ -1581,7 +1577,6 @@ impl<'a> Lowering<'a> {
             slice_index_range_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             expect_sites: Vec::new(),
-            map_or_sites: Vec::new(),
             closure_select_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),

@@ -22,11 +22,12 @@ use crate::front::mir::tests::{
     i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
     kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
     mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
-    option_int_arg, range_contains_fixture, result_adt_node, result_enum, span_json, struct_decl,
-    trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout, type_decl_meta,
-    type_decl_struct, tyref_to_attr_value_type, usize_ty, vec_decl_json, vec_of, vec_type_decls,
-    vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_local,
-    window_meta, window_mut_slice, window_place, window_shared_slice, window_slice, window_span,
+    option_int_arg, option_shared_ref, range_contains_fixture, result_adt_node, result_enum,
+    span_json, struct_decl, trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout,
+    type_decl_meta, type_decl_struct, tyref_to_attr_value_type, unit_fn_ptr, usize_ty,
+    vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json, window_const_slice_ptr,
+    window_empty_generics, window_llbc, window_local, window_meta, window_mut_slice, window_place,
+    window_shared_slice, window_slice, window_span,
 };
 
 #[test]
@@ -6347,6 +6348,99 @@ fn result_integer_instantiations_paint_distinct_class_roots() {
     );
 }
 
+/// `Option::map_or` stays a regular call to the extracted core body
+/// `match self { Some(t) => f(t), None => default }`. The Option repr
+/// is unchanged; only the caller rewrite is gone (`guess_call_kind`
+/// regular).
+#[test]
+fn option_map_or_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let caller = super::lower_function(&llbc, "get_or_create_extra_locals")
+        .expect("lower get_or_create_extra_locals");
+    let map_or_calls = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "map_or",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("map_or")
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        map_or_calls, 1,
+        "caller keeps one regular call to the core map_or body, got {map_or_calls}"
+    );
+
+    let ctx = super::LowerContext::new(&llbc);
+    let mut lowered_core_bodies = 0usize;
+    for fd in llbc.iter_fun_decls() {
+        if !fd.has_unstructured_body() {
+            continue;
+        }
+        let name_path = fd.item_meta.name_path();
+        if !name_path.ends_with("::option::<Impl>::map_or") {
+            continue;
+        }
+        let graph =
+            super::lower_fun_decl(&ctx, fd).unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+        let has_disc = graph.blocks.iter().any(|block| {
+            matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                || block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                    )
+                })
+                || block.operations.iter().any(
+                    |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"),
+                )
+        });
+        assert!(has_disc, "{name_path}: core body matches on the Option tag");
+        let has_ft = graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => name == "call_once" || name == "call" || name == "call_mut",
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => {
+                    let leaf = segments.last().map(String::as_str);
+                    leaf == Some("call_once") || leaf == Some("call") || leaf == Some("call_mut")
+                }
+                _ => false,
+            })
+        });
+        assert!(
+            has_ft,
+            "{name_path}: core body calls f(t); ops={:?}",
+            graph_ops(&graph)
+        );
+        lowered_core_bodies += 1;
+    }
+    assert_eq!(
+        lowered_core_bodies, 1,
+        "extracted map_or FunDecl bodies must lower, got {lowered_core_bodies}"
+    );
+}
+
 #[test]
 fn result_with_pointer_like_err_still_paints_class_root() {
     // Result keeps its tag even when `E` is pointer-like
@@ -6387,18 +6481,6 @@ fn option_of_raw_pointer_stays_classdef_less() {
         super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None),
         None
     );
-}
-
-fn unit_fn_ptr() -> serde_json::Value {
-    serde_json::json!({
-        "FnPtr": {
-            "skip_binder": {
-                "inputs": [],
-                "output": {"Tuple": []},
-                "is_unsafe": false
-            }
-        }
-    })
 }
 
 /// A named word-sized tuple struct is a tagged Option payload, not a
@@ -7001,10 +7083,6 @@ fn with_fixture_lowering(llbc: &Llbc, f: impl FnOnce(&super::Lowering<'_>)) {
     )
     .unwrap();
     f(&lowering);
-}
-
-fn option_shared_ref(def: serde_json::Value) -> serde_json::Value {
-    serde_json::json!({"Ref": ["Erased", def, "Shared"]})
 }
 
 #[test]

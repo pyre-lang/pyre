@@ -5,8 +5,9 @@
 //! [`emit_option_variant_dynamic`] / [`emit_sum_variant_dynamic`] branch on a
 //! live discriminant and join at the existing continuation.
 //! [`map_source`] / [`reproduce_exit_args`] / [`close_goto_mixed`] thread live
-//! values through those arms. [`slice_len_op`] is the length read a slice
-//! bounds guard branches on.
+//! values through those arms. [`emit_narrow`] re-applies a pointee-class
+//! narrowing a residual call carried into a diamond arm. [`slice_len_op`]
+//! is the length read a slice bounds guard branches on.
 
 use crate::flowspace::model::Variable;
 use crate::model::{
@@ -371,6 +372,27 @@ pub(crate) fn slice_len_op(
         args: crate::model::call_args(vec![base]),
         result_ty: ValueType::Int,
     }
+}
+
+/// Re-emit the `__cast_instance_intrinsic` pointee-class narrowing in `block` on
+/// `value`, returning the narrowed value — the same cast `result_narrow_root`
+/// appends after a `*mut <registered ADT>` call result.  `value` unchanged when
+/// no narrowing was absorbed.
+pub(crate) fn emit_narrow(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    value: Variable,
+    narrow_root: &Option<String>,
+) -> Variable {
+    let Some(root) = narrow_root else {
+        return value;
+    };
+    let narrowed = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(narrowed.clone()),
+        kind: crate::model::cast_instance_call(root.clone(), value),
+    });
+    narrowed
 }
 
 #[cfg(test)]

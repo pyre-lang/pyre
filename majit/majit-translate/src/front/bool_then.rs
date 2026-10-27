@@ -155,7 +155,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
             result_ty: site.payload_ty.clone(),
         },
     });
-    let payload = crate::front::option_map_or::emit_narrow(
+    let payload = crate::front::option_variant::emit_narrow(
         graph,
         then_bb,
         payload,
@@ -184,7 +184,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
 
     let none_var = if site.niche {
         let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
-        crate::front::option_map_or::emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
+        crate::front::option_variant::emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
     } else if site.scalar_niche {
         graph
             .push_op_var(
