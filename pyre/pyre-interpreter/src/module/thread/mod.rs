@@ -349,9 +349,8 @@ pub(crate) fn walk_thread_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
                 forward(&mut frame);
                 ec.topframeref = frame as *mut crate::PyFrame;
             }
-            // `builtins_module` / `builtin_dict_cache` / `thread_local_refs`.
-            // `clone_for_thread` copies the builtins reference into the child
-            // EC, so each copy is its own slot: forwarding only the parent's
+            // `thread_local_refs` and remaining EC GC slots. Each registered
+            // thread's copy is its own slot: forwarding only the parent's
             // leaves the child pointing at the pre-move address once a thread
             // is registered but has not yet armed its own root area.
             ec.walk_builtin_roots(visitor);

@@ -1152,6 +1152,9 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
 /// Flatten's shared `get_is_being_profiled` + `promote_greens` block:
 /// `-live-`, `getfield debugdata`, `goto_if_not_ptr_iszero`, then the
 /// profiled diamond and `{int,ref}_guard_value` before `switch next_instr`.
+/// The prefix alone also matches a look-inside graph's own `debugdata`
+/// diamond, so the copy is identified by the greens and `switch` that
+/// follow it ([`merge_greens_reach_switch`]).
 pub(crate) fn is_shared_pmg_block(code: &[u8], target: usize) -> bool {
     let Some(live) = crate::jitcode_runtime::decode_op_at(code, target) else {
         return false;
@@ -1171,8 +1174,40 @@ pub(crate) fn is_shared_pmg_block(code: &[u8], target: usize) -> bool {
             pc = op.next_pc;
         }
     }
-    crate::jitcode_runtime::decode_op_at(code, pc)
-        .is_some_and(|op| op.opname == "goto_if_not_ptr_iszero")
+    let Some(branch) = crate::jitcode_runtime::decode_op_at(code, pc) else {
+        return false;
+    };
+    if branch.opname != "goto_if_not_ptr_iszero" {
+        return false;
+    }
+    merge_greens_reach_switch(code, branch.next_pc)
+}
+
+/// The rest of the `pmg_shared` shape: the promoted greens
+/// (`int_guard_value` and `ref_guard_value`, `interp_jit.py
+/// PyFrame.dispatch` `promote_greens`) and then the `switch` on
+/// `next_instr`, before any exit of the jitcode.  A look-inside graph whose
+/// own `debugdata` test has the same prefix (`pyframe.py get_w_globals`)
+/// returns or raises instead and is not the copy.
+fn merge_greens_reach_switch(code: &[u8], mut pc: usize) -> bool {
+    let mut int_green = false;
+    let mut ref_green = false;
+    while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
+        match op.opname {
+            "int_guard_value" => int_green = true,
+            "ref_guard_value" => ref_green = true,
+            "switch" => return int_green && ref_green,
+            name if name.ends_with("_return") || name == "raise" || name == "reraise" => {
+                return false;
+            }
+            _ => {}
+        }
+        if op.next_pc <= pc {
+            return false;
+        }
+        pc = op.next_pc;
+    }
+    false
 }
 
 /// Freeze the entering opcode's banks when `pc` is flatten's shared
@@ -2839,5 +2874,49 @@ mod callee_ref_owner_tests {
             },
         );
         assert_eq!(tc.concrete_of_opref(value), Some(to_v));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_shared_pmg_block;
+    use crate::jitcode_runtime::insns_opname_to_byte;
+
+    fn insn(key: &str) -> u8 {
+        *insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("`{key}` must be in insns table"))
+    }
+
+    fn encode(ops: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut code = Vec::new();
+        for (key, operands) in ops {
+            code.push(insn(key));
+            code.extend_from_slice(operands);
+        }
+        code
+    }
+
+    #[test]
+    fn shared_pmg_block_requires_promoted_greens_and_switch() {
+        let pmg_shape = encode(&[
+            ("live/", &[0, 0]),
+            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
+            ("live/", &[0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("int_guard_value/i", &[0]),
+            ("ref_guard_value/r", &[0]),
+            ("switch/id", &[0, 0, 0]),
+        ]);
+        assert!(is_shared_pmg_block(&pmg_shape, 0));
+
+        let helper_debugdata_diamond = encode(&[
+            ("live/", &[0, 0]),
+            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
+            ("live/", &[0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("ref_return/r", &[0]),
+        ]);
+        assert!(!is_shared_pmg_block(&helper_debugdata_diamond, 0));
     }
 }

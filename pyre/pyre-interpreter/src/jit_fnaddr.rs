@@ -2331,6 +2331,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::opcode_ops::compare_value_from_tag",
         crate::opcode_ops::jit_compare_value_from_tag,
     );
+    cp2!(
+        &mut entries,
+        "pyre_interpreter::eval::_load_global_fallback",
+        crate::opcode_ops::jit_load_global_fallback,
+    );
     cp3!(
         &mut entries,
         "pyre_interpreter::runtime_ops::is_op",
@@ -3037,6 +3042,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::_pure_issubtype",
         "pyre_interpreter::_pure_issubtype",
         crate::baseobjspace::__majit_call_target__orig__pure_issubtype_unlikely_name,
+    );
+    // `celldict.py _getdictvalue_no_unwrapping_pure` (`@elidable_promote`):
+    // the residual `call_pure` names the renamed original.  One word per
+    // slot: `&self`, the `VersionTag` counter, `w_dict`, the `key` STR.
+    cpa4!(
+        &mut entries,
+        "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+        "pyre_object::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+        pyre_object::celldict::ModuleDictStrategy::__majit_call_target__orig__getdictvalue_no_unwrapping_pure_unlikely_name,
     );
     cpa3!(
         &mut entries,
@@ -5304,12 +5318,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::eval::frame_anchor_release",
         crate::eval::frame_anchor_release_jit_abi,
     );
-    pa1!(
-        &mut entries,
-        "pyre_interpreter::executioncontext::execution_context_builtin_cache_get",
-        "pyre_interpreter::execution_context_builtin_cache_get",
-        crate::executioncontext::execution_context_builtin_cache_get,
-    );
+
     cpa0!(
         &mut entries,
         "pyre_object::dict_eq_hook::has_compares_by_identity_hook",
@@ -7691,6 +7700,10 @@ mod tests {
                 crate::opcode_ops::jit_compare_value_from_tag as *const () as usize as i64,
             ),
             (
+                "pyre_interpreter::eval::_load_global_fallback",
+                crate::opcode_ops::jit_load_global_fallback as *const () as usize as i64,
+            ),
+            (
                 "pyre_interpreter::runtime_ops::is_op",
                 crate::opcode_ops::jit_runtime_ops_is_op as *const () as usize as i64,
             ),
@@ -8013,6 +8026,10 @@ mod tests {
         assert!(are_alias_spellings(
             "pyre_interpreter::_pure_issubtype",
             "pyre_interpreter::baseobjspace::_orig__pure_issubtype_unlikely_name",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_object::celldict::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
+            "pyre_object::ModuleDictStrategy::_orig__getdictvalue_no_unwrapping_pure_unlikely_name",
         ));
         assert!(!are_alias_spellings(
             "pyre_interpreter::baseobjspace::_orig_should_not_inline_unlikely_name",

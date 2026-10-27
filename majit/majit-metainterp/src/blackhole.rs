@@ -4023,6 +4023,72 @@ mod tests {
         assert!(bh.registers_i.is_empty() || bh.registers_i.iter().all(|&v| v == 0));
     }
 
+    /// Process-global `HOST_HOOKS` is one slot; save and restore it under a
+    /// lock so these tests cannot overwrite each other or a sibling.
+    static FORCE_HOOK_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+    fn with_force_hook<T>(
+        hook: crate::quasiimmut::ForceQuasiImmutable,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = FORCE_HOOK_TEST_LOCK.lock();
+        let saved = crate::host_hooks();
+        crate::publish_host_hooks(crate::HostHooks {
+            force_quasi_immutable: Some(hook),
+            ..crate::HostHooks::default()
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        crate::publish_host_hooks(saved);
+        match result {
+            Ok(v) => v,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
+    fn mutate_field_descr(offset: usize) -> BhDescr {
+        BhDescr::Field {
+            offset,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: true,
+            index_in_parent: Some(1),
+            parent: None,
+            name: "mutate_value".into(),
+            owner: "RawOwner".into(),
+            load_is_acquire: false,
+        }
+    }
+
+    /// `/id` reads the owner from `registers_i` and forces through
+    /// `quasiimmut.py do_force_quasi_immutable` at `struct + offset`.
+    #[test]
+    fn handler_jit_force_quasi_immutable_id_forces_raw_owner() {
+        static FORCE_ADDR: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+        FORCE_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+        extern "C" fn force_hook(field_addr: i64) {
+            FORCE_ADDR.store(field_addr, std::sync::atomic::Ordering::SeqCst);
+        }
+
+        let descrs: &'static [BhDescr; 1] = Box::leak(Box::new([mutate_field_descr(8)]));
+        let mut bh = BlackholeInterpreter::default();
+        bh.descrs = descrs;
+        let struct_ptr = 0x1000i64;
+        bh.registers_i = vec![struct_ptr];
+        // Operand layout `id`: 1B int-reg + 2B descr-index 0.
+        let code = [0u8, 0, 0];
+        let next = with_force_hook(force_hook, || {
+            handler_jit_force_quasi_immutable_i(&mut bh, &code, 0).unwrap()
+        });
+        assert_eq!(next, 3);
+        assert_eq!(
+            FORCE_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            struct_ptr.wrapping_add(8),
+        );
+    }
+
     // ── Executor opcode tests (bhimpl_* runtime coverage) ──
     //
     // Systematic correctness tests for each opcode category, driven directly
@@ -11867,11 +11933,18 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             majit_jitcode::insns::BC_RECORD_QUASIIMMUT_FIELD,
         ),
         // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
-        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`;
-        // `bhimpl_jit_force_quasi_immutable` is already wired below.
+        // `jit_force_quasi_immutable(v_inst, descr1)`. Argcodes `rd`
+        // for a GC owner and `id` for a raw address (`getkind` of
+        // Signed / a non-GC ptr). `bhimpl_jit_force_quasi_immutable`
+        // is already wired below; the `/id` handler reads the owner
+        // from `registers_i`.
         (
             "jit_force_quasi_immutable/rd",
             majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE,
+        ),
+        (
+            "jit_force_quasi_immutable/id",
+            majit_jitcode::insns::BC_JIT_FORCE_QUASI_IMMUTABLE_I,
         ),
     ] {
         insns.insert(key.to_string(), byte);
@@ -12361,6 +12434,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         handler_jit_force_quasi_immutable,
     );
     builder.wire_handler(
+        "jit_force_quasi_immutable/id",
+        handler_jit_force_quasi_immutable_i,
+    );
+    builder.wire_handler(
         "record_known_result_i_ir_v/iiIRd",
         handler_record_known_result_i_ir_v,
     );
@@ -12696,13 +12773,35 @@ fn handler_record_quasiimmut_field(
 /// ```
 /// Skipping past the operands without running the force left every loop that
 /// folded a read of the field valid across the write that invalidates it.
+///
+/// `/rd` reads the owner from `registers_r`; `/id` from `registers_i`
+/// (a raw address). `quasiimmut.py do_force_quasi_immutable` then
+/// takes that address plus the mutate field descr — pyre's port adds
+/// the descr offset and calls the host hook, which is valid for a raw
+/// struct as well as a GC one.
 fn handler_jit_force_quasi_immutable(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
     let struct_ptr = bh.registers_r[code[p] as usize];
-    let (mutatefielddescr, p) = read_descr(bh, code, p + 1);
+    force_quasi_immutable_at(bh, code, p + 1, struct_ptr)
+}
+fn handler_jit_force_quasi_immutable_i(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, DispatchError> {
+    let struct_ptr = bh.registers_i[code[p] as usize];
+    force_quasi_immutable_at(bh, code, p + 1, struct_ptr)
+}
+fn force_quasi_immutable_at(
+    bh: &mut BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+    struct_ptr: i64,
+) -> Result<usize, DispatchError> {
+    let (mutatefielddescr, p) = read_descr(bh, code, p);
     crate::quasiimmut::do_force_quasi_immutable(struct_ptr, mutatefielddescr);
     Ok(p)
 }

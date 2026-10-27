@@ -408,8 +408,20 @@ pub unsafe fn store_would_bump_version(w_cell: Option<PyObjectRef>, w_value: PyO
 /// increasing counter — pointer-identity matches PyPy's `is` test
 /// because each `Box<VersionTag>` allocates a fresh address but a
 /// counter is JIT-friendlier and trivially `Copy`.
+///
+/// `repr(transparent)`: the JIT holds the tag as its counter word in every
+/// position (field load, argument, residual `call_pure` slot), the same bank
+/// the quasi-immutable `version?` load produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(transparent)]
 pub struct VersionTag(pub u64);
+
+// The residual `call_pure` passes the tag as its counter word.
+unsafe impl majit_ir::helper_fnaddr::WordNewtypeArg for VersionTag {
+    fn from_word(word: i64) -> Self {
+        VersionTag(word as u64)
+    }
+}
 
 /// The serial [`VersionTag::fresh`] hands out — a process-global counter
 /// bumped once per tag.
@@ -1090,7 +1102,7 @@ impl ModuleDictStrategy {
     /// object as the storage owner and unerase its `dstorage` here.  This is
     /// the load-bearing PyPy shape: callers never pass the concrete erased
     /// storage as a substitute for `w_dict`.
-    #[majit_macros::elidable_promote(promote_args = "0,1,2")]
+    #[majit_macros::elidable_promote(promote_args = "0,1,2", word_newtypes(VersionTag))]
     #[expect(
         clippy::not_unsafe_ptr_arg_deref,
         reason = "PyObjectRef is a GC-managed VM handle whose validity is established at the object-space boundary"

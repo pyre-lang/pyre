@@ -2112,6 +2112,7 @@ mod foriter_delivery_tests {
     }
 
     fn loop_frame() -> LoopFrame {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code =
             function_code("def f(xs):\n    for x in xs:\n        for y in x:\n            pass\n");
         let units = foriter_units(&code);

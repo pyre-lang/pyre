@@ -18,6 +18,7 @@ use crate::pyobject::*;
 /// case `w_dict` is the caller's object directly, preserving subclass
 /// identity for `space.finditem_str` dispatch.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("w_dict")]
 pub struct Module {
     pub ob_header: PyObject,
     /// `module.py:22 self.w_name = w_name`. `PY_NULL` is the anonymous
@@ -25,6 +26,7 @@ pub struct Module {
     pub w_name: PyObjectRef,
     /// Authoritative dict object (`PyPy module.w_dict`).  Always non-null
     /// after construction.
+    /// Immutable after construction (`module.py _immutable_fields_`).
     pub w_dict: PyObjectRef,
     /// `mixedmodule.py MixedModule.w_initialdict`: `PY_NULL` as long as the
     /// builtin module has not been imported yet, and when it has been, its

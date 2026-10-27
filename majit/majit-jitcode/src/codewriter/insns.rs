@@ -230,10 +230,10 @@ pub const BC_MOVE_I_D: u8 = 38;
 // release/may-force policy rides on `EffectInfo.extraeffect`.
 pub const BC_RECORD_EXACT_VALUE_I: u8 = 41;
 pub const BC_RECORD_EXACT_VALUE_R: u8 = 40;
-// slot 42 (formerly BC_CALL_RELEASE_GIL_INT) freed
-// — release-GIL policy rides on
-// `EffectInfo.call_release_gil_target` (`effectinfo.py
-// is_call_release_gil`).
+// Slot 42 was formerly `BC_CALL_RELEASE_GIL_INT`; release-GIL policy
+// rides on `EffectInfo.call_release_gil_target` (`effectinfo.py
+// is_call_release_gil`). Reused below as
+// [`BC_JIT_FORCE_QUASI_IMMUTABLE_I`].
 // BC_CALL_RELEASE_GIL_REF (slot 43) intentionally absent:
 // resoperation.py (`# no such thing`) excludes
 // CALL_RELEASE_GIL_R from the upstream opcode table.
@@ -692,6 +692,14 @@ pub const BC_RECORD_QUASIIMMUT_FIELD: u8 = 199;
 // mutate fielddescr.  Byte 39 is the first unused opcode number
 // (`wellknown_bh_insns` ∪ `extension_insns` fill 199-254).
 pub const BC_JIT_FORCE_QUASI_IMMUTABLE: u8 = 39;
+// `jit_force_quasi_immutable/id` — the same op when the owner is a raw
+// address in the int bank (`assembler.py` argcodes `id`; `getkind` of
+// `lltype.Signed` / a non-GC ptr). Slot 42 is the lowest unused byte
+// (formerly `BC_CALL_RELEASE_GIL_INT`; that policy now rides on
+// `EffectInfo.call_release_gil_target`). Slot 196 stays unused: the
+// file holds that freed byte until a new opcode is assigned there on
+// purpose.
+pub const BC_JIT_FORCE_QUASI_IMMUTABLE_I: u8 = 42;
 
 // `assert_not_none/r` — RPython `pyjitpl.py opimpl_assert_not_none`
 // + `blackhole.py bhimpl_assert_not_none`.  Records that `box` is
@@ -1209,6 +1217,10 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // field descr + mutate descr (no result).
     m.insert("record_quasiimmut_field/rdd", BC_RECORD_QUASIIMMUT_FIELD);
     m.insert("jit_force_quasi_immutable/rd", BC_JIT_FORCE_QUASI_IMMUTABLE);
+    m.insert(
+        "jit_force_quasi_immutable/id",
+        BC_JIT_FORCE_QUASI_IMMUTABLE_I,
+    );
 
     // Heapcache hint markers — `pyjitpl.py:385-410`.
     // `assert_not_none/r` records that `box` is non-null;

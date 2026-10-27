@@ -3168,6 +3168,7 @@ pub fn graph_op_can_raise(op: &super::flow::SpaceOperation) -> bool {
             | "newtuple_from_array"
             | "build_map_from_array"
             | "build_map_from_empty_array"
+            | "load_global_fallback"
             | "dict_display_new"
             | "dict_display_setitem"
             | "set_display_new"
@@ -5585,6 +5586,35 @@ where
     }
 }
 
+/// Lower the LOAD_GLOBAL HLOp `load_global_fallback(frame: Ref, varname: Ref)
+/// → Ref` to `inline_call_r_r(JitCode, ListR([frame, varname]))`
+/// (`jtransform.py handle_regular_call`).  The codewriter records the HLOp
+/// only when [`fully_bound_callee_body`] binds the body, so a decline here
+/// is a malformed op and returns `None`.
+pub fn lower_load_global_hlop_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    _ctx: &LoweringContext,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
+where
+    F: FnMut(super::flow::Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
+{
+    if op.opname != "load_global_fallback" || op.args.len() != 2 {
+        return None;
+    }
+    let dst_reg = match &op.result {
+        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        _ => return None,
+    };
+    let refs = vec![
+        flatten_arg_with_lowering(&op.args[0], get_register, lower_constant),
+        flatten_arg_with_lowering(&op.args[1], get_register, lower_constant),
+    ];
+    build_orthodox_inline_call_r_r_n(inline_call_targets::LOAD_GLOBAL_FALLBACK, refs, dst_reg)
+}
+
 /// Shared shape constructor for `(Ref, Ref, ..., Ref) → Ref` HLOp
 /// / helper families that lower to a uniform `residual_call_r_r`
 /// Insn shape.  Today: CALL (`call_fn_N` for nargs ∈ 0..=8,
@@ -6173,6 +6203,9 @@ where
         return Some(insn);
     }
     if let Some(insn) = lower_tuple_build_hlop_to_insn(op, ctx, get_register, lower_constant) {
+        return Some(insn);
+    }
+    if let Some(insn) = lower_load_global_hlop_to_insn(op, ctx, get_register, lower_constant) {
         return Some(insn);
     }
     if let Some(insn) = lower_simple_call_hlop_to_insn(op, ctx, get_register, lower_constant) {
@@ -7020,6 +7053,8 @@ where
 pub(crate) mod inline_call_targets {
     /// BINARY_OP family — `lower_binary_op_hlop_to_insn`.
     pub const BINARY_VALUE_FROM_TAG: &str = "pyre_interpreter::opcode_ops::binary_value_from_tag";
+    /// LOAD_GLOBAL — `lower_load_global_hlop_to_insn`.
+    pub const LOAD_GLOBAL_FALLBACK: &str = "pyre_interpreter::eval::_load_global_fallback";
     /// BINARY_SLICE — `lower_binary_slice_hlop_to_insn`.
     pub const BINARY_SLICE_VALUES: &str =
         "pyre_interpreter::runtime_ops::binary_slice_values_inner";

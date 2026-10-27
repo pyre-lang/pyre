@@ -250,18 +250,11 @@ impl CachedField {
     /// longer need to gate manually.
     fn invalidate(&mut self, descr: &DescrRef, field_idx: u32, ctx: &mut OptContext) {
         // `CachedField.invalidate`: `if descr.is_always_pure(): return`.
-        // Upstream's word covers a quasi-immutable field too — `is_pure` is
-        // `_immutable_field(name) != False` and `IR_QUASIIMMUTABLE` is an
-        // instance, not `False` — so a `?` field's cache survives a call and
-        // the loop keeps one read, with `guard_not_invalidated` carrying the
-        // per-window check. pyre's `is_always_pure` answers false for a `?`
-        // field to withhold the const-fold that same word licenses, so the
-        // surviving-a-call half is spelled here instead. Without it every
-        // residual call forces a re-read; over the scored bench dir that is 2
-        // of the 5 `ExecutionContext.w_tracefunc` getfield+guard pairs left in
-        // a peeled body. The other three read a different struct box each
-        // time, so no cache can reach them: upstream gets one box per loop from
-        // `ThreadLocalReference(ExecutionContext, loop_invariant=True)`.
+        // Upstream's word covers a quasi-immutable field too (`descr.py
+        // get_field_descr is_pure = _immutable_field != False`). The
+        // `is_quasi_immutable()` half covers only the hand `?` rows stamped
+        // not-pure (`FUNCTION_DESCR_GROUP` `quasi` rows and
+        // `GIL_READY_DESCR_GROUP` in `pyre-jit-trace/src/descr.rs`).
         //
         // Instance `w_class` is an ordinary mutable field, the analog of
         // mapdict `inst_map` (`BaseUserClassMapdict.setclass`). Type objects

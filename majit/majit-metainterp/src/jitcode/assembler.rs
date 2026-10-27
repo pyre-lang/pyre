@@ -973,7 +973,8 @@ impl JitCodeBuilder {
     }
 
     /// Raise already-recorded fields to a declaration that arrived with a
-    /// later emit site.
+    /// later emit site. Declared (any rank) ⇒ immutable,
+    /// `descr.py get_field_descr`.
     ///
     /// It only raises.  A field the declaration omits keeps what it has: an
     /// omission means this site named no declaration, not that the field is
@@ -983,11 +984,12 @@ impl JitCodeBuilder {
             let Some(rank) = Self::rank_of(ranks, &field.name) else {
                 continue;
             };
-            field.is_immutable |= rank.is_immutable();
+            field.is_immutable = true;
             field.is_quasi_immutable |= rank.is_quasi_immutable();
         }
     }
 
+    /// Declared (any rank) ⇒ immutable, `descr.py get_field_descr`.
     fn field_specs_from_layout(
         type_id: u64,
         fields: &[(usize, bool, &str, usize, bool, bool)],
@@ -1035,8 +1037,7 @@ impl JitCodeBuilder {
                         field_type,
                         field_flag,
                         is_field_signed,
-                        is_immutable: Self::rank_of(ranks, name)
-                            .is_some_and(ImmutableRank::is_immutable),
+                        is_immutable: Self::rank_of(ranks, name).is_some(),
                         is_quasi_immutable: Self::rank_of(ranks, name)
                             .is_some_and(ImmutableRank::is_quasi_immutable),
                         index_in_parent: 0,
@@ -1526,6 +1527,38 @@ impl JitCodeBuilder {
     /// `type_id`.
     pub fn jit_force_quasi_immutable(&mut self, struct_reg: u16, type_id: u64, mutate_name: &str) {
         self.touch_ref_reg(struct_reg);
+        self.emit_jit_force_quasi_immutable(
+            "jit_force_quasi_immutable/rd",
+            struct_reg,
+            type_id,
+            mutate_name,
+        );
+    }
+
+    /// Emit `jit_force_quasi_immutable/id`: the owner is a raw address
+    /// in the int bank.
+    pub fn jit_force_quasi_immutable_i(
+        &mut self,
+        struct_reg: u16,
+        type_id: u64,
+        mutate_name: &str,
+    ) {
+        self.touch_reg(struct_reg);
+        self.emit_jit_force_quasi_immutable(
+            "jit_force_quasi_immutable/id",
+            struct_reg,
+            type_id,
+            mutate_name,
+        );
+    }
+
+    fn emit_jit_force_quasi_immutable(
+        &mut self,
+        key: &'static str,
+        struct_reg: u16,
+        type_id: u64,
+        mutate_name: &str,
+    ) {
         let (mutate_offset, _) = self.field_offset_and_type(type_id, mutate_name);
         let mutate_descr = self.add_struct_field_descr(
             mutate_offset,
@@ -1533,7 +1566,7 @@ impl JitCodeBuilder {
             type_id,
             mutate_name,
         );
-        self.write_insn("jit_force_quasi_immutable/rd");
+        self.write_insn(key);
         self.push_reg_u8(struct_reg, "jit_force_quasi_immutable struct");
         self.push_u16(mutate_descr);
     }

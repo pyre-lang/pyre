@@ -70,6 +70,12 @@ pub fn get_current_qmut_instance(
 /// The `if qmut_ref` test is the host's: it owns the representation that
 /// answers whether any loop ever folded a read of this field, and the whole
 /// point of the test is that an object no loop watches pays nothing.
+///
+/// `p` is an address: a GC ref payload for `/rd`, a raw struct pointer
+/// for `/id`. The mutate field is reached by adding the descr offset
+/// (`quasiimmut.py do_force_quasi_immutable` `cpu.bh_getfield_gc_r(p,
+/// mutatefielddescr)`), which is valid for a raw struct as well as a
+/// GC one — the host hook then unlinks at that field address.
 pub fn do_force_quasi_immutable(
     struct_ptr: i64,
     mutatefielddescr: &majit_jitcode::jitcode::BhDescr,

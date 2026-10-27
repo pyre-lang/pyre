@@ -20769,8 +20769,10 @@ pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
     let frame = unsafe { &*(frame_ptr as *const pyre_interpreter::pyframe::PyFrame) };
 
     if helper == majit_ir::RuntimeHelperKind::LoadImport {
-        // `PyFrame.get_builtin` returns this field directly on every normal
-        // frame.  The null/EC fallback is uncommon and remains residual.
+        // `PyFrame.get_builtin` returns this field when an exec/eval
+        // frame honors `__builtins__`. A NULL field is the default
+        // (`honor__builtins__=False`): `get_builtin` answers `space.builtin`
+        // as a ConstPtr, so this fold declines and look-inside succeeds.
         let w_builtin = frame.w_builtin;
         if w_builtin.is_null() || !unsafe { pyre_object::is_module(w_builtin) } {
             return Ok(false);

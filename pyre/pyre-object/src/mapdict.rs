@@ -69,15 +69,32 @@ pub struct Terminator {
 }
 
 impl Terminator {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_allow_unboxing" => {
+                if !self.mutate_allow_unboxing.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_allow_unboxing) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+
     /// Change mapdict.py:308 `allow_unboxing`, invalidating any constant-folded
     /// reads first.
     ///
     /// The value-change return is a required pyre addition: the unguarded
     /// writes in mapdict.py `PlainAttribute._direct_write` and
     /// `CachedAttributeHolder.pick_attr` can repeatedly write `False`, and a
-    /// re-armed watcher must not retrace without bound. The `is_installed()`
-    /// fast path is quasiimmut.py `invalidation`'s null test and remains
-    /// outside the sweep so the common case is lock-free. Notification must
+    /// re-armed watcher must not retrace without bound. Notification must
     /// precede the store: rclass.py `hook_setfield` emits
     /// `jit_force_quasi_immutable` before `setfield`, as do celldict.rs
     /// `mutated` and typeobject.rs `w_type_set_version_tag`.
@@ -85,9 +102,7 @@ impl Terminator {
         if self.allow_unboxing.get() == v {
             return;
         }
-        if self.mutate_allow_unboxing.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_allow_unboxing) };
-        }
+        self.jit_force_quasi_immutable("mutate_allow_unboxing");
         self.allow_unboxing.set(v);
     }
 
@@ -216,15 +231,32 @@ pub struct PlainAttribute {
 }
 
 impl PlainAttribute {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_ever_mutated" => {
+                if !self.mutate_ever_mutated.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+
     /// Change mapdict.py:430 `ever_mutated` using the ordering, fast path, and
     /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
     pub fn set_ever_mutated(&self, v: bool) {
         if self.ever_mutated.get() == v {
             return;
         }
-        if self.mutate_ever_mutated.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
-        }
+        self.jit_force_quasi_immutable("mutate_ever_mutated");
         self.ever_mutated.set(v);
     }
 
@@ -389,15 +421,38 @@ pub struct CachedAttributeHolder {
 }
 
 impl CachedAttributeHolder {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_' + name)`, spelled
+    /// the way `warmspot.py rewrite_force_quasi_immutable` leaves it for the native build:
+    /// `make_invalidation_function` — `if getattr(p, mutatefieldname): _invalidate_now(p)`. The translator
+    /// keys on the `#[jit_llop]` marker to rewrite this call into the llop
+    /// (`jtransform.py rewrite_op_jit_force_quasi_immutable`), so a trace never looks inside it.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_attr" => {
+                if !self.mutate_attr.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_attr) };
+            }
+            "mutate_typ" => {
+                if !self.mutate_typ.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_typ) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+
     /// Change mapdict.py:675 `attr` using the ordering, fast path, and
     /// repeated-value guard documented on [`Terminator::set_allow_unboxing`].
     pub fn set_attr(&self, a: MapRef) {
         if self.attr.get() == a {
             return;
         }
-        if self.mutate_attr.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_attr) };
-        }
+        self.jit_force_quasi_immutable("mutate_attr");
         self.attr.set(a);
     }
 
@@ -407,9 +462,7 @@ impl CachedAttributeHolder {
         if self.typ.get() == t {
             return;
         }
-        if self.mutate_typ.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_typ) };
-        }
+        self.jit_force_quasi_immutable("mutate_typ");
         self.typ.set(t);
     }
 

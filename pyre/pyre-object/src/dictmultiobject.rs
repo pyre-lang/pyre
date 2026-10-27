@@ -1453,8 +1453,9 @@ pub unsafe fn w_dict_get_strategy(
 #[inline]
 pub unsafe fn w_dict_set_strategy(obj: PyObjectRef, strategy: &'static DictStrategyRef) {
     if is_module_dict(obj) {
-        (*(obj as *mut W_ModuleDictObject)).mstrategy =
-            strategy as *const DictStrategyRef as *mut DictStrategyRef;
+        let md = &mut *(obj as *mut W_ModuleDictObject);
+        md.jit_force_quasi_immutable("mutate_mstrategy");
+        md.mstrategy = strategy as *const DictStrategyRef as *mut DictStrategyRef;
         dict_write_barrier(obj);
         return;
     }
@@ -1953,6 +1954,7 @@ pub fn alloc_dict_object(value: W_DictObject, stable: bool) -> PyObjectRef {
 pub static MODULE_DICT_TYPE: PyType = new_pytype("dict");
 
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("mstrategy?")]
 pub struct W_ModuleDictObject {
     pub ob_header: PyObject,
     /// `dstorage` from `W_DictMultiObject.__slots__` (`dictmultiobject.py`).
@@ -1962,6 +1964,8 @@ pub struct W_ModuleDictObject {
     pub dstorage: GCREF,
     /// `mstrategy` from `W_ModuleDictObject.__slots__` (`:331`).
     /// A GC-managed non-moving storage box (off-GC storage).
+    /// Quasi-immutable (`mstrategy?`): every store goes through
+    /// [`W_ModuleDictObject::jit_force_quasi_immutable`] first.
     pub mstrategy: *mut DictStrategyRef,
     /// Key-set mutation state corresponding to the live iterator held by
     /// PyPy's ModuleDictStrategy iterator implementation.
@@ -1971,6 +1975,10 @@ pub struct W_ModuleDictObject {
     /// ObjectDictStrategy operate on a module dict after PyPy's literal
     /// `mstrategy`/`dstorage` swap.
     pub clear_gen: usize,
+    /// Hidden `mutate_mstrategy` field `quasiimmut.py get_mutate_field_name`
+    /// names and `rclass.py InstanceRepr._setup_repr` adds for
+    /// `dictmultiobject.py W_ModuleDictObject._immutable_fields_ = ['mstrategy?']`.
+    pub mutate_mstrategy: crate::quasiimmut::QuasiImmutField,
 }
 
 /// GC type id assigned to `W_ModuleDictObject`.  Lands at slot 48,
@@ -1990,6 +1998,24 @@ impl crate::lltype::GcType for W_ModuleDictObject {
     const SIZE: usize = W_MODULE_DICT_OBJECT_SIZE;
 }
 
+impl W_ModuleDictObject {
+    /// `rclass.py InstanceRepr.hook_setfield` `jit_force_quasi_immutable(vinst, 'mutate_mstrategy')`,
+    /// the native shape `warmspot.py rewrite_force_quasi_immutable` leaves.
+    #[majit_macros::jit_llop("jit_force_quasi_immutable")]
+    #[inline(never)]
+    pub fn jit_force_quasi_immutable(&self, mutatefieldname: &'static str) {
+        match mutatefieldname {
+            "mutate_mstrategy" => {
+                if !self.mutate_mstrategy.is_installed() {
+                    return;
+                }
+                unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_mstrategy) };
+            }
+            _ => panic!("unknown mutate field name {mutatefieldname:?}"),
+        }
+    }
+}
+
 /// `pypy/objspace/std/dictmultiobject.py W_ModuleDictObject(W_DictMultiObject)`
 /// inheritance — `get_strategy`/`set_strategy` overrides read/write
 /// the `mstrategy` slot (a per-allocation `ModuleDictStrategy`).
@@ -2007,6 +2033,7 @@ impl W_DictMultiObject for W_ModuleDictObject {
     /// the bare slot write.  `celldict.py switch_to_object_strategy`
     /// (`:173-186`) is what composes it with the matching `dstorage` swap.
     fn set_strategy(&mut self, strategy: &'static DictStrategyRef) {
+        self.jit_force_quasi_immutable("mutate_mstrategy");
         self.mstrategy = strategy as *const DictStrategyRef as *mut DictStrategyRef;
     }
 }
@@ -2077,6 +2104,7 @@ pub fn w_module_dict_new() -> PyObjectRef {
         mstrategy: roots.get(strategy_ref_slot) as *mut DictStrategyRef,
         keys_version: 0,
         clear_gen: 0,
+        mutate_mstrategy: crate::quasiimmut::QuasiImmutField::new(),
     }) as PyObjectRef
 }
 
@@ -2340,6 +2368,7 @@ pub unsafe fn w_module_dict_switch_to_object_strategy(obj: PyObjectRef) {
     // recompile any trace keyed on the prior version.
     strategy.invalidate_caches();
     strategy.mutated();
+    raw.jit_force_quasi_immutable("mutate_mstrategy");
     raw.mstrategy = &OBJECT_DICT_STRATEGY_REF as *const DictStrategyRef as *mut DictStrategyRef;
     raw.dstorage = new_storage as GCREF;
     dict_write_barrier(obj);
@@ -9175,6 +9204,24 @@ mod tests {
                 w_int_get_value(w_dict_lookup(md, w_int_new(7)).unwrap()),
                 22,
             );
+        }
+    }
+
+    #[test]
+    fn mstrategy_store_invalidates_quasi_immutable_watchers() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let md = w_module_dict_new();
+        unsafe {
+            let flag = Arc::new(AtomicBool::new(false));
+            let token = crate::quasiimmut::test_loop_token(&flag);
+            (*(md as *const W_ModuleDictObject))
+                .mutate_mstrategy
+                .get_current_qmut_instance()
+                .register_loop_token(&token);
+            assert!(!flag.load(Ordering::Acquire));
+            w_module_dict_switch_to_object_strategy(md);
+            assert!(flag.load(Ordering::Acquire));
         }
     }
 

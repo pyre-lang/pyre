@@ -2313,15 +2313,9 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// 'w_kw_defs?']`.
 ///
 /// The `?` makes each field quasi-immutable and `[*]` makes the selected
-/// elements immutable after the field has been promoted.  All nine are marked
-/// here through the `quasi` row: `descr.py:229 is_pure =
-/// STRUCT._immutable_field(fieldname) != False` answers true for a
-/// quasi-immutable field — `IR_QUASIIMMUTABLE` is an object, so `!= False`
-/// holds — which is what the `is_immutable` column carries.  The rank is what
-/// keeps the read from folding on that column alone:
-/// `SimpleFieldDescr::is_always_pure` is `is_immutable && !is_quasi_immutable`,
-/// so the fold stays behind `record_quasiimmut_field` + `GUARD_NOT_INVALIDATED`
-/// exactly as `jtransform.py:895-903` sequences it.
+/// elements immutable after the field has been promoted. All nine go through
+/// the `quasi` row, which stamps `is_immutable = false` because those readers
+/// are not all paired with `record_quasiimmut_field` (see the `quasi` closure).
 ///
 /// The write half these descriptors depend on is
 /// `Function::jit_force_quasi_immutable("mutate_<name>")`, called immediately
@@ -2345,6 +2339,7 @@ static RANGE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// pins of the same slots pass that same mutate descr. The dispatch arm is
 /// `jitcode_dispatch/mod.rs` `"record_quasiimmut_field/rdd"`.
 ///
+
 /// The entries are in byte-offset order and each key is the struct's own field
 /// name, which is what makes the group's numbering agree with the analyzer's.
 /// `index_in_parent` is a field's slot number in the virtual
@@ -2381,7 +2376,14 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             false,
         )
     };
-    // A `function.py:34-42` entry: pure by `descr.py:229`, quasi by its `?`.
+    // Hand-written inline-call paths read `code?`/`w_func_globals?`/`defs_w?`
+    // off a baked ConstPtr callable through GETFIELD+GUARD_VALUE without a
+    // `record_quasiimmut_field` marker: the marker's QuasiImmutDescr keeps the
+    // owner by raw address and the callee may be relocated by the collector
+    // (`jitcode_dispatch/inline_call.rs walker_guard_function_field` and the
+    // `defs_w` read in `try_walker_inline_resolved_user_call`). Stamp
+    // `is_immutable = false` so `is_always_pure` stays false until those
+    // readers are paired.
     let quasi = |key, offset| {
         (
             key,
@@ -2389,7 +2391,7 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             std::mem::size_of::<usize>(),
             Type::Ref,
             false,
-            true,
+            false,
             true,
         )
     };
@@ -4951,9 +4953,10 @@ fn mutate_descr_for_quasi_field_of_parent(field: &DescrRef, parent: &DescrRef) -
 /// `LOAD_GLOBAL` / `STORE_GLOBAL` cell folds bake the stored cell under a
 /// `QUASIIMMUT_FIELD` on this field. `_setitem_str_cell_known` (`celldict.py`)
 /// calls `mutated()` before every write that replaces the stored pointer.
-/// `is_immutable` / `is_quasi_immutable` match
-/// [`make_quasi_immutable_field_descr`]. Its HeapCache `index` is the
+/// Declared rank ⇒ `is_immutable` (`descr.py get_field_descr`
+/// `_immutable_field != False`). Its HeapCache `index` is the
 /// interned `(STRUCT, fieldname)` identity.
+
 ///
 /// `caches` is `celldict.py ModuleDictStrategy.caches`. `heaptracker.py
 /// all_fielddescrs` walks every field of the STRUCT; the JIT never loads
@@ -5008,7 +5011,7 @@ static MODULE_DICT_STRATEGY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGr
             version_offset,
             8,
             Type::Int,
-            false,
+            true,
             true,
             ArrayFlag::Unsigned,
             0,
@@ -7903,7 +7906,8 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     // plus `code_ptr` (`jit_immutable_fields`). `co_name` / `co_qualname` are
     // listed upstream but these slots are realized lazily, so they stay
     // mutable. `w_filename` is realized in `PyCode.__init__` and listed
-    // immutable. `w_globals?` is filled on first execution and then promoted.
+    // immutable. `w_globals?` is filled on first execution and then promoted;
+    // a declared `?` rank stamps `is_immutable` (`descr.py get_field_descr`).
     let word_int = |key, offset, immutable| (key, offset, WORD, Type::Int, false, immutable, false);
     let word_ref =
         |key, offset, immutable, quasi| (key, offset, WORD, Type::Ref, false, immutable, quasi);
@@ -7953,7 +7957,7 @@ static PYCODE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             word_ref(
                 "w_globals",
                 std::mem::offset_of!(PyCode, w_globals),
-                false,
+                true,
                 true,
             ),
             word_ref(
@@ -9500,12 +9504,14 @@ static EC_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::n
 /// One process-wide `i64` at offset 0 of a non-GC `static mut`, plus the
 /// hidden `mutate_gil_ready` / `mutate_gil_ready_lock` words
 /// (`rclass.py InstanceRepr._setup_repr` / `quasiimmut.py
-/// get_mutate_field_name`). Both `is_immutable` and `is_quasi_immutable`
-/// are set so `SimpleFieldDescr::is_always_pure` stays false: an
-/// always-pure read of a constant receiver folds the zero with no
-/// `QuasiimmutField` and no invalidation. `is_gc_managed` is false so the
+/// get_mutate_field_name`). `gil_ready?` is declared (`#[jit_immutable_fields]`),
+/// so the row sets `is_immutable` and `is_quasi_immutable`
+/// (`descr.py get_field_descr`) and the read records `record_quasiimmut_field/idd`
+/// with `mutate_gil_ready` first (`jtransform.py rewrite_op_getfield`).
+/// `is_gc_managed` is false so the
 /// read does not emit `GUARD_GC_TYPE` against the bytes before the static.
 /// HeapCache `index` is the interned `(STRUCT, fieldname)` identity.
+
 static GIL_READY_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
     use pyre_object::gil_ready::GilReadyState;
@@ -10394,7 +10400,7 @@ mod tests {
                 Type::Ref,
                 false,
                 6,
-                false,
+                true,
             ),
             (
                 pycode_hidden_applevel_descr(),
@@ -13429,10 +13435,10 @@ mod tests {
     }
 
     #[test]
-    fn gil_ready_descr_is_quasi_immutable_not_always_pure() {
+    fn gil_ready_descr_is_quasi_immutable_and_always_pure() {
         let descr = gil_ready_descr();
         assert!(descr.is_quasi_immutable());
-        assert!(!descr.is_always_pure());
+        assert!(descr.is_always_pure());
         assert!(
             std::sync::Arc::ptr_eq(
                 &descr,
@@ -13612,7 +13618,7 @@ mod tests {
             version.index()
         );
         assert!(version.is_quasi_immutable());
-        assert!(!version.is_always_pure());
+        assert!(version.is_always_pure());
         assert_eq!(
             version_field.offset(),
             core::mem::offset_of!(pyre_object::celldict::ModuleDictStrategy, version),

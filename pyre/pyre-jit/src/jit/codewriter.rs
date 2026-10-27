@@ -11564,8 +11564,42 @@ impl CodeWriter {
                             // five `ForceToken` / `GuardNotForced` /
                             // `GuardNoException` calls (`guard_failures`
                             // 1803 → 63769). The walker must seed this
-                            // frame's namespace so the fold fires.
-                            let result_value: super::flow::FlowValue = {
+                            // frame's namespace so the fold fires. When the
+                            // `_load_global_fallback` body is fully bound the
+                            // opcode is an `inline_call_ir_r` of it instead,
+                            // and the residual below is the unbound fallback.
+                            let result_value: super::flow::FlowValue = if fully_bound_callee_body(
+                                inline_call_targets::LOAD_GLOBAL_FALLBACK,
+                            )
+                            .is_some()
+                            {
+                                // `varname = self.getname_u(nameindex)` is an RPython
+                                // str constant of this code object: the prebuilt rstr
+                                // `STR` (`StringRepr.convert_const`), not the interned
+                                // `W_UnicodeObject` `Constant::string` lowers to. The
+                                // helper reads this jitcode's own frame red
+                                // (`get_w_globals`, `get_builtin`).
+                                emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "load_global_fallback",
+                                    vec![
+                                        frame_var.into(),
+                                        super::flow::FlowValue::Constant(super::flow::Constant::new(
+                                            super::flow::ConstantValue::Signed(
+                                                pyre_object::unicodeobject::prebuilt_str_storage(
+                                                    code.names[(raw_namei as usize) >> 1].as_str(),
+                                                ) as i64,
+                                            ),
+                                            Some(Kind::Ref),
+                                        ))
+                                        .into(),
+                                    ],
+                                    Kind::Ref,
+                                    py_pc as i64,
+                                )
+                                .into()
+                            } else {
                                 // `bh_load_global_fn` derives globals from the
                                 // live frame; the namespace operand is only a
                                 // trace-time cell-fold hint. The walker replaces

@@ -18151,8 +18151,9 @@ pub fn index_c_int_w(obj: PyObjectRef) -> Result<i32, PyError> {
 pub const HONOR_BUILTINS: bool = false;
 
 /// Resolve the frame builtin for an object globals.  Default
-/// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
-/// delegates to [`pick_builtin_obj`].
+/// (`HONOR_BUILTINS=false`) returns `PY_NULL`: `pyframe.py __init__`
+/// assigns `self.builtin` only when honoring; `get_builtin` answers
+/// `space.builtin`. The `true` path delegates to [`pick_builtin_obj`].
 pub fn frame_builtin_obj(
     w_globals: PyObjectRef,
     exec_ctx: *const crate::PyExecutionContext,
@@ -18160,18 +18161,13 @@ pub fn frame_builtin_obj(
     if HONOR_BUILTINS {
         return pick_builtin_obj(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return b;
-        }
-    }
-    build_default_pick_builtin_module()
+    pyre_object::PY_NULL
 }
 
 /// Fallible variant of [`frame_builtin_obj`].  Default
-/// (`HONOR_BUILTINS=false`) returns `space.builtin`; the `true` path
-/// delegates to [`pick_builtin_obj_checked`].
+/// (`HONOR_BUILTINS=false`) returns `PY_NULL`: `pyframe.py __init__`
+/// assigns `self.builtin` only when honoring; `get_builtin` answers
+/// `space.builtin`. The `true` path delegates to [`pick_builtin_obj_checked`].
 pub fn frame_builtin_obj_checked(
     w_globals: PyObjectRef,
     exec_ctx: *const crate::PyExecutionContext,
@@ -18179,13 +18175,7 @@ pub fn frame_builtin_obj_checked(
     if HONOR_BUILTINS {
         return pick_builtin_obj_checked(w_globals, exec_ctx);
     }
-    if !exec_ctx.is_null() {
-        let b = unsafe { (*exec_ctx).get_builtin() };
-        if !b.is_null() {
-            return Ok(b);
-        }
-    }
-    Ok(build_default_pick_builtin_module())
+    Ok(pyre_object::PY_NULL)
 }
 
 /// `pyframe.py:115-116 self.builtin = space.builtin.pick_builtin(

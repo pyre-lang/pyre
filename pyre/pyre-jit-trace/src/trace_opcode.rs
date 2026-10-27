@@ -3722,6 +3722,7 @@ mod tests {
 
     #[test]
     fn normalize_raise_varargs_jit_null_frame_still_publishes_pending_exception() {
+        pyre_interpreter::test_hooks::install_hash_hook();
         clear_pending_jit_exception();
         let execution_context = pyre_interpreter::PyExecutionContext::default();
         let exc_class = unsafe {

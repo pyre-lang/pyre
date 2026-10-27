@@ -228,6 +228,7 @@ mod tests {
     #[test]
     fn blackhole_leave_rejects_a_red_outside_the_open_frame_scope() {
         std::thread::spawn(|| {
+            pyre_interpreter::test_hooks::install_hash_hook();
             let mut ec = pyre_interpreter::PyExecutionContext::default();
             pyre_interpreter::call::set_last_exec_ctx(&mut ec);
             let mut bh = majit_metainterp::blackhole::BlackholeInterpreter::default();
@@ -251,6 +252,7 @@ mod tests {
     #[test]
     fn blackhole_leave_marks_an_on_chain_parent_without_rewriting_top() {
         std::thread::spawn(|| {
+            pyre_interpreter::test_hooks::install_hash_hook();
             let mut ec = pyre_interpreter::PyExecutionContext::default();
             pyre_interpreter::call::set_last_exec_ctx(&mut ec);
             let mut parent = stack_pyframe();
@@ -272,6 +274,7 @@ mod tests {
     #[test]
     fn blackhole_leave_marks_a_parent_beyond_1024_frames() {
         std::thread::spawn(|| {
+            pyre_interpreter::test_hooks::install_hash_hook();
             let mut ec = pyre_interpreter::PyExecutionContext::default();
             // Allocate the complete chain before publishing any pointers.
             let mut frames: Vec<PyFrame> = (0..1026).map(|_| stack_pyframe()).collect();
@@ -304,6 +307,7 @@ mod tests {
     #[test]
     fn blackhole_leave_closes_the_open_scope() {
         std::thread::spawn(|| {
+            pyre_interpreter::test_hooks::install_hash_hook();
             let mut ec = pyre_interpreter::PyExecutionContext::default();
             pyre_interpreter::call::set_last_exec_ctx(&mut ec);
             let mut parent = stack_pyframe();
@@ -9295,6 +9299,7 @@ mod tests_bh_normalize_raise {
 
     #[test]
     fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let callable = pyre_interpreter::make_builtin_function(
             "len",
             pyre_interpreter::builtins::__majit_wrap_builtin_len,

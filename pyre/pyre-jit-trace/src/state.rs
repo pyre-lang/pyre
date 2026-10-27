@@ -4874,6 +4874,39 @@ pub(crate) fn execute_getfield_gc_uncached(
     mutatebox
 }
 
+/// `pyjitpl.py` `MIFrame.execute_with_descr(rop.GETFIELD_RAW_{R,I}, descr, box)`
+/// for a raw owner of `jit_force_quasi_immutable`.
+///
+/// Same heapcache-free record-and-execute as
+/// [`execute_getfield_gc_uncached`]; the load goes through
+/// `raw_field_sanity_load` (`executor.py do_getfield_raw_*`), which is
+/// the executor the walker uses for `getfield_raw_*`.
+pub(crate) fn execute_getfield_raw_uncached(
+    ctx: &mut TraceCtx,
+    obj: OpRef,
+    descr: DescrRef,
+    tp: Type,
+) -> OpRef {
+    let opcode = match tp {
+        Type::Int => OpCode::GetfieldRawI,
+        Type::Ref => OpCode::GetfieldRawR,
+        Type::Float | Type::Void => {
+            panic!("execute_getfield_raw_uncached: expected Type::Int or Type::Ref, got {tp:?}")
+        }
+    };
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::OPS);
+    ctx.profiler()
+        .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+    let mutatebox = ctx.record_op_with_descr(opcode, &[obj], descr.clone());
+    let live_value = concrete_raw_ptr(ctx, obj)
+        .and_then(|struct_ptr| ctx.raw_field_sanity_load(struct_ptr, &descr, tp));
+    if let Some(live_value) = live_value {
+        ctx.set_opref_concrete(mutatebox, live_value);
+    }
+    mutatebox
+}
+
 fn descr_field_name(descr: &DescrRef) -> &str {
     descr
         .as_field_descr()
@@ -4913,6 +4946,13 @@ fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
         return live_struct_ptr(value);
     }
     ctx.recover_ref_value(obj, 8).and_then(live_struct_ptr)
+}
+
+fn concrete_raw_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
+    match ctx.box_value(obj) {
+        Some(majit_ir::Value::Int(ptr)) if ptr != 0 => Some(ptr),
+        _ => None,
+    }
 }
 
 // Note: pyre does not currently route GetfieldGcF through
@@ -14003,6 +14043,9 @@ mod tests {
 
     #[test]
     fn materialized_inline_frame_slots_are_symbolic_heap_reads() {
+        // libtest runs each test on a fresh thread; `HASH_W_HOOK` is TLS
+        // and `space.builtin` is built once per process.
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let values = [w_int_new(11), pyre_object::w_none(), w_int_new(33)];
@@ -14058,6 +14101,7 @@ mod tests {
 
     #[test]
     fn materialized_inline_frame_consumes_pending_ref_array_write() {
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(a, b):\n    return a\n");
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let values = [w_int_new(11), w_int_new(22)];
@@ -14105,6 +14149,7 @@ mod tests {
         // (resume.py consume_boxes), so the image must not be read
         // for it: the caller's `overlay_stream_ref_slots` owns that slot and
         // would otherwise be overwriting a stale array entry.
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(a, b, c):\n    return a if b is None else c\n");
         let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
         let values = [w_int_new(11), w_int_new(22), w_int_new(33)];
@@ -15024,6 +15069,7 @@ mod tests {
     fn trace_too_long_publishes_forwarded_for_iter_stack_and_coordinate() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_function_body("def f(xs):\n    for x in xs:\n        pass\n");
         let mut live = PyFrame::new(code);
         let mut snapshot = live.snapshot_for_tracing();
@@ -15373,6 +15419,7 @@ mod tests {
     fn test_pypyjit_live_values_with_ec_insert_execution_context_after_frame() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
@@ -15573,6 +15620,7 @@ mod tests {
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_interpreter::{ConstantData, compile_exec};
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
             .expect("test code should compile");
         let code = module
@@ -15784,6 +15832,7 @@ mod tests {
     fn test_init_symbolic_skips_heap_array_read_for_standard_virtualizable() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_exec("1 + 2").expect("test code should compile");
         let mut frame = PyFrame::new(code.clone());
         frame.fix_array_ptrs();
@@ -15813,6 +15862,7 @@ mod tests {
     fn test_virtualizable_array_lengths_uses_full_array() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         let code = compile_exec("x = 1").expect("test code should compile");
         let mut frame = PyFrame::new(code);
         frame.fix_array_ptrs();
@@ -16002,6 +16052,7 @@ mod tests {
         use majit_metainterp::jitcode::JitCodeBuilder;
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
 
         let raw_code = compile_exec("len(x)").expect("test code should compile");
@@ -16256,6 +16307,7 @@ mod tests {
         use majit_ir::resumedata::RebuiltValue;
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
         let raw_code = compile_exec("None").expect("test code should compile");
         let mut frame = PyFrame::new(raw_code);
@@ -16750,6 +16802,7 @@ mod tests {
     fn bridge_semantic_maps_keep_width_but_drop_pcdep_at_non_live_jitcode_offset() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
 
         let raw_code = compile_exec("x = 1").expect("test code should compile");
@@ -16874,6 +16927,7 @@ mod tests {
     fn test_close_loop_args_uses_full_root_virtualizable_array_capacity() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
         let code = compile_exec("len(x)").expect("test code should compile");
         let mut frame = PyFrame::new(code);
@@ -17047,6 +17101,7 @@ mod tests {
     fn merge_point_stack_depth_recovers_the_header_depth() {
         use pyre_interpreter::pyframe::PyFrame;
 
+        pyre_interpreter::test_hooks::install_hash_hook();
         ensure_test_callbacks();
         let code = compile_exec("for i in x:\n    pass\n").expect("test code should compile");
         let mut frame = PyFrame::new(code);

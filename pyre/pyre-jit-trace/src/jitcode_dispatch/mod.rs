@@ -15075,6 +15075,73 @@ fn trace_record_exact_value<Sym: WalkSym>(
     }
 }
 
+/// `pyjitpl.py opimpl_jit_force_quasi_immutable`, parameterized by the
+/// owner's register kind the way `rewrite_op_getfield` picks
+/// `getfield_gc_*` vs `getfield_raw_*` from the owner's lltype.
+///
+/// `owner_is_raw` reads the owner from the int bank and executes the
+/// mutate-field load with [`crate::state::execute_getfield_raw_uncached`]
+/// (the `getfield_raw_*` executor). The installed test, the force+abort,
+/// and `GuardIsnull` are the same for both kinds.
+fn walk_jit_force_quasi_immutable<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    owner_is_raw: bool,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let obj = if owner_is_raw {
+        read_int_reg(code, op, 0, ctx)?
+    } else {
+        read_ref_reg(code, op, 0, ctx)?
+    };
+    let descr = read_descr(code, op, 1, ctx)?;
+    let tp = {
+        let Some(fd) = descr.as_field_descr() else {
+            panic!("jit_force_quasi_immutable: descr.as_field_descr() is None");
+        };
+        if fd.is_pointer_field() || fd.is_float_field() {
+            majit_ir::Type::Ref
+        } else {
+            majit_ir::Type::Int
+        }
+    };
+    let mutatebox = if owner_is_raw {
+        crate::state::execute_getfield_raw_uncached(ctx.trace_ctx, obj, descr.clone(), tp)
+    } else {
+        crate::state::execute_getfield_gc_uncached(ctx.trace_ctx, obj, descr.clone(), tp)
+    };
+    let installed = match ctx.trace_ctx.box_value(mutatebox) {
+        Some(majit_ir::Value::Ref(r)) => r.0 != 0,
+        Some(majit_ir::Value::Int(i)) => i != 0,
+        _ => {
+            return Err(DispatchError::ForceQuasiImmutableValueNotConcrete {
+                pc: op.pc,
+                value: mutatebox,
+            });
+        }
+    };
+    if installed {
+        let struct_ptr = match ctx.trace_ctx.box_value(obj) {
+            Some(majit_ir::Value::Ref(struct_ref)) if !owner_is_raw => struct_ref.0 as i64,
+            Some(majit_ir::Value::Int(ptr)) if owner_is_raw => ptr,
+            _ => panic!(
+                "jit_force_quasi_immutable: owner box_value does not match register kind \
+                 (raw={owner_is_raw})"
+            ),
+        };
+        let Some(fd) = descr.as_field_descr() else {
+            panic!("jit_force_quasi_immutable: descr.as_field_descr() is None");
+        };
+        let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(fd);
+        majit_metainterp::quasiimmut::do_force_quasi_immutable(struct_ptr, &bh);
+        crate::state::note_force_quasi_immut_abort();
+        prepare_force_quasi_immutable_abort(ctx, op.next_pc);
+        return Err(DispatchError::ForceQuasiImmutable { pc: op.next_pc });
+    }
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[mutatebox])?;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
 /// branching handlers (`goto/L`) override the linear `op.next_pc`
 /// advance; non-branching handlers return `op.next_pc` unchanged.
@@ -15953,52 +16020,8 @@ fn handle<Sym: WalkSym>(
         // `_opimpl_getfield_gc_any_pureornot`).
         // An unobserved mutate value declines (upstream `execute_with_descr`
         // always executes the load).
-        "jit_force_quasi_immutable/rd" => {
-            let obj = read_ref_reg(code, op, 0, ctx)?;
-            let descr = read_descr(code, op, 1, ctx)?;
-            let tp = {
-                let Some(fd) = descr.as_field_descr() else {
-                    panic!("jit_force_quasi_immutable/rd: descr.as_field_descr() is None");
-                };
-                #[allow(clippy::if_same_then_else)]
-                if fd.is_pointer_field() {
-                    majit_ir::Type::Ref
-                } else if fd.is_float_field() {
-                    majit_ir::Type::Ref
-                } else {
-                    majit_ir::Type::Int
-                }
-            };
-            let mutatebox =
-                crate::state::execute_getfield_gc_uncached(ctx.trace_ctx, obj, descr.clone(), tp);
-            let installed = match ctx.trace_ctx.box_value(mutatebox) {
-                Some(majit_ir::Value::Ref(r)) => r.0 != 0,
-                Some(majit_ir::Value::Int(i)) => i != 0,
-                _ => {
-                    return Err(DispatchError::ForceQuasiImmutableValueNotConcrete {
-                        pc: op.pc,
-                        value: mutatebox,
-                    });
-                }
-            };
-            if installed {
-                let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj) else {
-                    panic!(
-                        "jit_force_quasi_immutable/rd: box_value(obj) is not Some(Value::Ref(..))"
-                    );
-                };
-                let Some(fd) = descr.as_field_descr() else {
-                    panic!("jit_force_quasi_immutable/rd: descr.as_field_descr() is None");
-                };
-                let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(fd);
-                majit_metainterp::quasiimmut::do_force_quasi_immutable(struct_ref.0 as i64, &bh);
-                crate::state::note_force_quasi_immut_abort();
-                prepare_force_quasi_immutable_abort(ctx, op.next_pc);
-                return Err(DispatchError::ForceQuasiImmutable { pc: op.next_pc });
-            }
-            walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[mutatebox])?;
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
+        "jit_force_quasi_immutable/rd" => walk_jit_force_quasi_immutable(code, op, ctx, false),
+        "jit_force_quasi_immutable/id" => walk_jit_force_quasi_immutable(code, op, ctx, true),
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow kind-flow territory and stay
         // unsupported.

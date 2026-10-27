@@ -2327,9 +2327,9 @@ impl AssemblerEncode for Assembler {
             }
             // `jtransform.py rewrite_op_jit_force_quasi_immutable` emits
             // `jit_force_quasi_immutable(v_inst, descr1)` — a register or
-            // pooled `r` constant followed by one fielddescr. The blackhole
+            // pooled constant followed by one fielddescr. The blackhole
             // counterpart `bhimpl_jit_force_quasi_immutable` expects
-            // argcodes `rd`.
+            // argcodes `rd` (GC owner) or `id` (raw address).
             OpKind::JitForceQuasiImmutable { base, mutate_field } => {
                 match base {
                     crate::model::LinkArg::Value(var) => {
@@ -2340,13 +2340,13 @@ impl AssemblerEncode for Assembler {
                     crate::model::LinkArg::Const(c) => {
                         let kind = crate::flatten::constant_kind(c);
                         assert!(
-                            kind == 'r',
-                            "jit_force_quasi_immutable const base must be Ref, got {kind:?} — graph {:?}",
+                            kind == 'r' || kind == 'i',
+                            "jit_force_quasi_immutable const base must be Ref or Int, got {kind:?} — graph {:?}",
                             self.current_graph_name,
                         );
                         let byte = self.emit_const(&c.value, kind, state, callcontrol);
                         state.code.push(byte);
-                        argcodes.push('r');
+                        argcodes.push(kind);
                     }
                 }
                 // `jtransform.py rewrite_op_jit_force_quasi_immutable`
@@ -6051,7 +6051,8 @@ fn fielddescrof(
             FieldLayoutResolution::Unresolved => {}
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
-            is_immutable = rank.is_immutable();
+            // Declared (any rank) ⇒ immutable, `descr.py get_field_descr`.
+            is_immutable = true;
             is_quasi_immutable = rank.is_quasi_immutable();
         }
         // Both fallbacks above take `offset` from a second source — the
@@ -10820,6 +10821,50 @@ mod tests {
             field_descr_names.contains(&"mutate_code"),
             "expected Field descr for `mutate_code`, got {:?}",
             field_descr_names
+        );
+    }
+
+    /// A `Signed` owner (raw address) keys `jit_force_quasi_immutable/id`.
+    /// `lookup_reg_with_kind_var` maps `ConcreteType::Signed` to `'i'`.
+    #[test]
+    fn assembles_jit_force_quasi_immutable_id() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("force_qmut_raw");
+        let base_var = push_input_var(&mut graph, "owner", ValueType::Int);
+        graph.push_op_var(
+            graph.startblock,
+            OpKind::JitForceQuasiImmutable {
+                base: LinkArg::Value(base_var.clone()),
+                mutate_field: FieldDescriptor::new("mutate_code", Some("Function".to_string())),
+            },
+            false,
+        );
+        graph.set_return(graph.startblock, None);
+
+        FunctionGraph::set_concretetype_of_inline(&base_var, crate::model::ConcreteType::Signed);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+
+        let key_count = asm
+            .insns
+            .keys()
+            .filter(|k| k.starts_with("jit_force_quasi_immutable/"))
+            .count();
+        assert_eq!(
+            key_count,
+            1,
+            "expected exactly one jit_force_quasi_immutable/* key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("jit_force_quasi_immutable/id"),
+            "expected key jit_force_quasi_immutable/id, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
         );
     }
 
