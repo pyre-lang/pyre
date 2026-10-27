@@ -4217,35 +4217,56 @@ pub(crate) fn select_residual_call_opcode(
 /// back as a constant; any other argument list populates `call_pure_results`
 /// so a later call with the same arguments reuses the value.  Returns the
 /// OpRef that carries the result afterwards.
-#[allow(clippy::too_many_arguments)]
-fn record_executed_pure_call_result<Sym: WalkSym>(
+pub(crate) fn record_executed_pure_call_result<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     call_opcode: OpCode,
     allboxes: &[OpRef],
-    arg_values: &[majit_ir::Value],
     descr: majit_ir::DescrRef,
     patch_pos: majit_metainterp::recorder::TracePosition,
     recorded: OpRef,
-    result_value: majit_ir::Value,
 ) -> OpRef {
-    let folded = ctx.trace_ctx.record_result_of_call_pure(
-        recorded,
-        allboxes,
-        arg_values,
-        descr,
-        patch_pos,
-        call_opcode,
-        result_value,
-    );
+    // Read inside this block so the copies die with the call into
+    // `record_result_of_call_pure`. That call cuts, interns, and inserts
+    // `call_pure_results`; none of those may be followed by the pre-call bits.
+    let folded = {
+        let arg_values = allboxes
+            .iter()
+            .map(|arg| {
+                ctx.trace_ctx.box_value(*arg).unwrap_or_else(|| {
+                    panic!(
+                        "record_result_of_call_pure: argument box {arg:?} lost its value across the record"
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        let result_value = ctx.trace_ctx.box_value(recorded).unwrap_or_else(|| {
+            panic!(
+                "record_result_of_call_pure: result box {recorded:?} lost its value across the record"
+            )
+        });
+        ctx.trace_ctx.record_result_of_call_pure(
+            recorded,
+            allboxes,
+            &arg_values,
+            descr,
+            patch_pos,
+            call_opcode,
+            result_value,
+        )
+    };
     // Stamp only when the recorded result has a live slot in the active
     // recorder.  A deeper inlined / recursive frame's residual result may be
     // recorded in a context whose position is not allocated in the active
     // recorder; stamping it would violate the `*FrontendOp(pos, value)`
     // invariant.  Skipping leaves the result symbolic so the downstream branch
     // aborts the trace into the trait fallback instead of crashing.  A folded
-    // constant carries its value inline and has nothing to stamp.
-    if folded.inline_const_to_value().is_none() {
-        ctx.trace_ctx.try_set_opref_concrete(folded, result_value);
+    // constant carries its value inline and has nothing to stamp.  Re-read
+    // the folded box: the value passed into the fold is not a root across
+    // the cut and the re-record.
+    if folded.inline_const_to_value().is_none()
+        && let Some(live) = ctx.trace_ctx.box_value(folded)
+    {
+        ctx.trace_ctx.try_set_opref_concrete(folded, live);
     }
     folded
 }
@@ -9093,51 +9114,42 @@ pub(crate) fn record_ordinary_residual_after_execute<Sym: WalkSym>(
     list_write_barrier: bool,
     profiled_call: bool,
 ) -> (OpRef, bool) {
+    let mut value = value;
     let rewrite_first = list_write_barrier && list_wb_records_before_invalidate(ctx, funcptr);
-    let pure_value = if call_opcode.is_call_pure() {
-        value
-    } else {
-        None
-    };
-    if let Some(result_value) = pure_value {
-        let arg_values = allboxes
+    // `box_value` temporaries end with the predicate. A `Value::Ref` copied
+    // here would not be a root across the record below.
+    let pure = call_opcode.is_call_pure() && value.is_some();
+    let args_known = pure
+        && allboxes
             .iter()
-            .map(|arg| ctx.trace_ctx.box_value(*arg))
-            .collect::<Option<Vec<Value>>>();
-        if let Some(arg_values) = arg_values {
-            let (rec, wb) = record_residual_with_invalidate(
-                ctx,
-                call_opcode,
-                funcptr,
-                allboxes,
-                descr.clone(),
-                ei,
-                Some(result_value),
-                list_write_barrier,
-                rewrite_first,
-            );
-            let can_raise = ei.check_can_raise(false);
-            if can_raise {
-                count_recorded_residual(ctx, call_opcode, profiled_call, rec);
-            }
-            let folded = record_executed_pure_call_result(
-                ctx,
-                call_opcode,
-                allboxes,
-                &arg_values,
-                descr,
-                patch_pos,
-                rec,
-                result_value,
-            );
-            if !can_raise {
-                count_recorded_residual(ctx, call_opcode, profiled_call, folded);
-            }
-            // `wb` still skips a second invalidate and `GUARD_NO_EXCEPTION`.
-            // The pure cut does not read the heapcache, so invalidating again
-            // after it would not change the op stream and must not happen.
-            return (folded, wb);
+            .all(|arg| ctx.trace_ctx.box_value(*arg).is_some());
+    if args_known {
+        // `record_result_of_call_pure` reads constants from the live result op
+        // and argument boxes after the call is recorded; a pre-record `Value` is not a root.
+        let (rec, wb) = record_residual_with_invalidate(
+            ctx,
+            call_opcode,
+            funcptr,
+            allboxes,
+            descr.clone(),
+            ei,
+            value.take(),
+            list_write_barrier,
+            rewrite_first,
+        );
+        let can_raise = ei.check_can_raise(false);
+        if can_raise {
+            count_recorded_residual(ctx, call_opcode, profiled_call, rec);
         }
+        let folded =
+            record_executed_pure_call_result(ctx, call_opcode, allboxes, descr, patch_pos, rec);
+        if !can_raise {
+            count_recorded_residual(ctx, call_opcode, profiled_call, folded);
+        }
+        // `wb` still skips a second invalidate and `GUARD_NO_EXCEPTION`.
+        // The pure cut does not read the heapcache, so invalidating again
+        // after it would not change the op stream and must not happen.
+        return (folded, wb);
     }
     let (rec, wb) = record_residual_with_invalidate(
         ctx,

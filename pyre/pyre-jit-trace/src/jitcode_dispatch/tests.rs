@@ -13951,6 +13951,179 @@ fn call_pure_i_nonconst_records_one_call_with_the_result() {
     assert_eq!(born, Some(majit_ir::Value::Int(42)));
 }
 
+fn with_call_pure_walk<R>(
+    tc: &mut TraceCtx,
+    body: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>) -> R,
+) -> R {
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    body(&mut wc)
+}
+
+/// All-const `CALL_PURE_R`. The folded const is the result box's address
+/// after the record, including when that box and the argument `ConstPtr`
+/// were forwarded the way `finish_payload_root_walker_writes_back_forwarded_const_ptr`
+/// writes a slot back.
+///
+/// A minor collection cannot be forced inside `record_bytes` from this
+/// harness. `TraceCtx::for_test_types` records into a host buffer
+/// (`TraceOpsBuf::double` → `alloc_host`), `MAJIT_GC_STRESS_TRACE_ALLOC` is a
+/// process-lifetime `LazyLock`, and `attach_live_byte_recorder` is a no-op
+/// under `cfg(test)`. The walk below is the crate's forced-collection
+/// writeback, applied to the live boxes the fold reads.
+#[test]
+fn call_pure_r_all_const_folded_const_is_the_forwarded_box() {
+    const ARG: usize = 0x9B_0000_1000;
+    const ARG_TO: usize = ARG + 0x80;
+    const RES: usize = 0x9B_0000_2000;
+    const RES_TO: usize = RES + 0x80;
+    let _restore = [
+        RestoreConstPtr::intern(ARG),
+        RestoreConstPtr::intern(RES),
+        RestoreConstPtr::intern(RES_TO),
+    ];
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+
+    {
+        let mut tc = fresh_trace_ctx();
+        let funcbox = tc.const_int(0x11);
+        let arg = tc.const_ref(ARG as i64);
+        let allboxes = [funcbox, arg];
+        let descr = make_call_descr(
+            91,
+            vec![Type::Ref],
+            Type::Ref,
+            majit_ir::ExtraEffect::ElidableCannotRaise,
+        );
+        let ops_before = tc.num_ops();
+        let folded = with_call_pure_walk(&mut tc, |wc| {
+            let patch_pos = wc.trace_ctx.get_trace_position();
+            let ei = descr
+                .as_call_descr()
+                .expect("CallPureR descr")
+                .get_extra_info()
+                .clone();
+            let (folded, _wb) = record_ordinary_residual_after_execute(
+                wc,
+                majit_ir::OpCode::CallPureR,
+                funcbox,
+                &allboxes,
+                descr.clone(),
+                &ei,
+                patch_pos,
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(RES))),
+                false,
+                true,
+            );
+            folded
+        });
+        assert_eq!(tc.num_ops(), ops_before, "all-const CALL_PURE_R is cut");
+        assert_eq!(folded.as_const_ptr(), Some(majit_ir::GcRef(RES)));
+        assert_eq!(
+            tc.box_value(arg),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(ARG))),
+        );
+    }
+
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(0x11);
+    let arg = tc.const_ref(ARG as i64);
+    let allboxes = [funcbox, arg];
+    let descr = make_call_descr(
+        92,
+        vec![Type::Ref],
+        Type::Ref,
+        majit_ir::ExtraEffect::ElidableCannotRaise,
+    );
+    let patch_pos = tc.get_trace_position();
+    let ops_before = tc.num_ops();
+    let rec = tc.record_op_with_descr_value(
+        majit_ir::OpCode::CallPureR,
+        &allboxes,
+        descr.clone(),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(RES))),
+    );
+    assert_eq!(
+        tc.box_value(rec),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(RES))),
+        "the record stores the pre-move result on the live box",
+    );
+    {
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_ir::const_ptr_table::walk(&mut |slot| {
+            if slot.0 == ARG {
+                slot.0 = ARG_TO;
+            }
+        });
+    }
+    tc.set_opref_concrete(rec, majit_ir::Value::Ref(majit_ir::GcRef(RES_TO)));
+    assert_eq!(
+        tc.box_value(arg),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ARG_TO))),
+    );
+    assert_eq!(
+        tc.box_value(rec),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(RES_TO))),
+    );
+    let folded = with_call_pure_walk(&mut tc, |wc| {
+        record_executed_pure_call_result(
+            wc,
+            majit_ir::OpCode::CallPureR,
+            &allboxes,
+            descr,
+            patch_pos,
+            rec,
+        )
+    });
+    assert_eq!(tc.num_ops(), ops_before, "all-const CALL_PURE_R is cut");
+    assert_eq!(
+        folded.as_const_ptr(),
+        Some(majit_ir::GcRef(RES_TO)),
+        "the folded const is the forwarded result, not the pre-move address",
+    );
+    assert_eq!(
+        tc.box_value(arg),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ARG_TO))),
+        "the argument ConstPtr keeps the forwarded address",
+    );
+}
+
 /// A `jit.not_in_trace` callee that returns normally.
 ///
 /// `execute_residual_call` reads the raise out of `BH_LAST_EXC_VALUE`, so
