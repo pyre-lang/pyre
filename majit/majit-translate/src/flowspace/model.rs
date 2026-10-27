@@ -3638,10 +3638,15 @@ impl Default for Variable {
 /// `__slots__ = ["concretetype"]`.
 #[derive(Clone, Debug)]
 pub struct Constant {
-    /// Stable identity for this `Constant` instance. Upstream caches
-    /// mutable constants by the `Constant(x)` object itself; Rust keeps
-    /// value-based `PartialEq` / `Hash` for legacy comparisons and
-    /// exposes this separate id for identity-keyed caches.
+    /// Wrapper identity assigned at `Constant::new`.
+    ///
+    /// `flowspace/model.py Hashable.__init__` sets `key = id(self.value)`
+    /// when `hash((type(value), value))` raises `TypeError`. For `List` /
+    /// `Dict` that identity is the inner `Arc` (`Arc::ptr_eq`), the same
+    /// convention `annotator/bookkeeper.rs` `ArcIdentity` / `ListArcIdentity`
+    /// use. `Graphs` and a `Tuple` containing an unhashable item still
+    /// hash and compare with this field: pyre's `Vec`-backed tuple and
+    /// `Graphs(Vec<usize>)` carry no shared object identity.
     pub id: u64,
     /// RPython `Hashable.value`.
     pub value: ConstValue,
@@ -3727,15 +3732,16 @@ impl Constant {
         Hlvalue::Constant(self.clone())
     }
 
-    /// RPython `rpython/tool/uid.py` — `Hashable.__init__` tries
+    /// `flowspace/model.py Hashable.__init__` tries
     /// `hash((type(value), value))` and falls back to `id(self.value)`
-    /// when that raises `TypeError`. Rust's derived `Hash` cannot throw,
-    /// so this predicate pre-classifies the `ConstValue` variants whose
-    /// contents are unhashable under Python's own rules
-    /// (`list.__hash__ = None`, `dict.__hash__ = None`) or whose Rust
-    /// container (`Graphs` is a `Vec<GraphId>`) has no meaningful
-    /// value-identity, routing them through the `self.id` (object
-    /// identity) branch of `PartialEq` / `Hash` for `Constant`.
+    /// when that raises `TypeError`. Rust's `Hash` cannot throw, so this
+    /// predicate pre-classifies the `ConstValue` variants whose contents
+    /// are unhashable under Python's own rules (`list.__hash__ = None`,
+    /// `dict.__hash__ = None`) or whose Rust container (`Graphs` is a
+    /// `Vec<GraphId>`) has no meaningful value-identity. `PartialEq` /
+    /// `Hash` for `Constant` then use `Arc::ptr_eq` for `List`/`Dict`
+    /// (the Arc is `id(self.value)`) and `self.id` for `Graphs` / an
+    /// unhashable `Tuple`.
     fn uses_hashable_identity_fallback(value: &ConstValue) -> bool {
         match value {
             ConstValue::List(_) | ConstValue::Dict(_) | ConstValue::Graphs(_) => true,
@@ -3862,11 +3868,21 @@ pub fn next_constant_id() -> u64 {
 }
 
 impl PartialEq for Constant {
+    /// `flowspace/model.py Hashable.__init__` / `Hashable.__eq__` compare
+    /// `self.key`. Unhashable `List`/`Dict` keys are `id(self.value)` —
+    /// the inner `Arc` — so two wrappers of the same object are equal.
     fn eq(&self, other: &Self) -> bool {
         if Self::uses_hashable_identity_fallback(&self.value)
             || Self::uses_hashable_identity_fallback(&other.value)
         {
-            self.id == other.id
+            match (&self.value, &other.value) {
+                (ConstValue::List(a), ConstValue::List(b)) => Arc::ptr_eq(a, b),
+                (ConstValue::Dict(a), ConstValue::Dict(b)) => Arc::ptr_eq(a, b),
+                // Vec-backed `Tuple` / `Graphs(Vec<usize>)` carry no shared object identity.
+                (ConstValue::Graphs(_), ConstValue::Graphs(_))
+                | (ConstValue::Tuple(_), ConstValue::Tuple(_)) => self.id == other.id,
+                _ => false,
+            }
         } else {
             self.value == other.value
         }
@@ -3876,9 +3892,16 @@ impl PartialEq for Constant {
 impl Eq for Constant {}
 
 impl Hash for Constant {
+    /// `flowspace/model.py Hashable.__hash__` hashes `self.key`. `List` /
+    /// `Dict` hash the value (one Arc has one content; the pointer address
+    /// is not hashed so prepass output stays deterministic). `Graphs` and
+    /// an unhashable `Tuple` still hash `self.id`.
     fn hash<H: Hasher>(&self, state: &mut H) {
         if Self::uses_hashable_identity_fallback(&self.value) {
-            self.id.hash(state);
+            match &self.value {
+                ConstValue::List(_) | ConstValue::Dict(_) => self.value.hash(state),
+                _ => self.id.hash(state),
+            }
         } else {
             self.value.hash(state);
         }
@@ -5962,6 +5985,7 @@ mod tests {
 
     use super::*;
     use crate::translator::rtyper::lltypesystem::lltype;
+    use std::collections::HashSet;
     use std::collections::hash_map::DefaultHasher;
 
     #[test]
@@ -6224,9 +6248,81 @@ mod tests {
         };
 
         assert_ne!(a, b);
-        assert_ne!(hash_of(&a), hash_of(&b));
+        // Distinct Arcs with equal contents share the deterministic
+        // `ConstValue` content hash (`Hashable.__hash__` of `id(value)`
+        // cannot be a pointer address: prepass output must stay stable).
+        assert_eq!(hash_of(&a), hash_of(&b));
         assert_eq!(a, c);
         assert_eq!(hash_of(&a), hash_of(&c));
+    }
+
+    #[test]
+    fn constant_wrapping_the_same_list_object_is_equal() {
+        let l = Arc::new(vec![ConstValue::Int(1)]);
+        let a = Constant::new(ConstValue::List(l.clone()));
+        let b = Constant::new(ConstValue::List(l.clone()));
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn constant_wrapping_distinct_equal_lists_is_unequal() {
+        let a = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
+        let b = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_wrapping_the_same_dict_object_is_equal() {
+        let mut items = IndexMap::new();
+        items.insert(ConstValue::Int(1), ConstValue::Int(10));
+        let d = Arc::new(items);
+        let a = Constant::new(ConstValue::Dict(d.clone()));
+        let b = Constant::new(ConstValue::Dict(d.clone()));
+        let hash_of = |v: &Constant| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        assert_eq!(a, b);
+        assert_eq!(hash_of(&a), hash_of(&b));
+    }
+
+    #[test]
+    fn constant_wrapping_distinct_equal_dicts_is_unequal() {
+        let mut a_items = IndexMap::new();
+        a_items.insert(ConstValue::Int(1), ConstValue::Int(10));
+        let mut b_items = IndexMap::new();
+        b_items.insert(ConstValue::Int(1), ConstValue::Int(10));
+        let a = Constant::new(ConstValue::Dict(Arc::new(a_items)));
+        let b = Constant::new(ConstValue::Dict(Arc::new(b_items)));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_same_arc_hashset_len_is_one() {
+        let l = Arc::new(vec![ConstValue::Int(1)]);
+        let a = Constant::new(ConstValue::List(l.clone()));
+        let b = Constant::new(ConstValue::List(l.clone()));
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
+
+        let mut items = IndexMap::new();
+        items.insert(ConstValue::Int(1), ConstValue::Int(10));
+        let d = Arc::new(items);
+        let a = Constant::new(ConstValue::Dict(d.clone()));
+        let b = Constant::new(ConstValue::Dict(d.clone()));
+        let mut set = HashSet::new();
+        set.insert(a);
+        set.insert(b);
+        assert_eq!(set.len(), 1);
     }
 
     #[test]
