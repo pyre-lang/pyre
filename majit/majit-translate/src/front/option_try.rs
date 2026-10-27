@@ -36,7 +36,8 @@ use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::option_variant::{emit_option_variant, map_source};
 use crate::front::result_exc::{
     assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-    follow_single_exit, op_operand_vars, split_diamond_exits,
+    diamond_forward_chain, locate_control_flow_question, op_operand_vars,
+    unreachable_continue_target,
 };
 use crate::model::{
     CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind,
@@ -228,70 +229,57 @@ fn rewire_one_option_try_site(
         ));
     };
 
-    let (c, cf_c) = follow_single_exit(graph, b, &cf_forwarded)
-        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
-    assert_single_pred(graph, c, &name)?;
-
-    // Block C: `d = cf.__discriminant`; switch d {0 -> Continue, 1 -> Break}.
-    let (disc_idx, cf_disc_var) = graph.blocks[c]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == cf_c && field.name == "__discriminant" =>
-            {
-                op.result.clone().map(|r| (i, r))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
-    match &graph.blocks[c].exitswitch {
-        Some(ExitSwitch::Value(v)) if *v == cf_disc_var => {}
-        other => {
-            return Err(format!(
-                "{name}: block {c} exitswitch {other:?} is not the ControlFlow discriminant switch"
-            ));
+    let question = locate_control_flow_question(graph, b, &cf_forwarded, &name)?;
+    let c = question.disc_block;
+    let cf_c = question.cf_at_disc.clone();
+    if c != b {
+        assert_single_pred(graph, c, &name)?;
+        if let Some(disc_idx) = question.disc_idx {
+            assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
         }
     }
-    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+    let continue_link = question.continue_link.clone();
+    let break_link = question.break_link.clone();
+    let cf_disc_var = question.disc_var.clone();
     verify_break_arm_is_return_none(graph, &break_link, &cf_c, &name)?;
 
     // Map the continue edge's arguments back to A scope.  `cf_c` positions are
     // replaced by the Some-arm payload; the synthetic ControlFlow discriminant
     // is the constant Continue tag (`0`).
-    let mut continue_specs = Vec::with_capacity(continue_link.args.len());
+    let mut continue_specs = Vec::new();
     let mut payload_positions = Vec::new();
     let mut some_sources = Vec::new();
     if !some_sources.contains(&opt_a) {
         some_sources.push(opt_a.clone());
     }
-    for (i, arg) in continue_link.args.iter().enumerate() {
-        match arg {
-            LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
-            LinkArg::Value(v) if *v == cf_c => {
-                continue_specs.push(ContinueArg::Payload);
-                payload_positions.push(i);
-            }
-            LinkArg::Value(v) if *v == cf_disc_var => {
-                continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
-            }
-            LinkArg::Value(v) => {
-                let chain: &[(usize, usize)] = if a == b { &[(b, c)] } else { &[(a, b), (b, c)] };
-                let v_a = back_substitute(graph, chain, v, &name)?;
-                if !some_sources.contains(&v_a) {
-                    some_sources.push(v_a.clone());
+    if let Some(continue_link) = &continue_link {
+        continue_specs.reserve(continue_link.args.len());
+        for (i, arg) in continue_link.args.iter().enumerate() {
+            match arg {
+                LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
+                LinkArg::Value(v) if *v == cf_c => {
+                    continue_specs.push(ContinueArg::Payload);
+                    payload_positions.push(i);
                 }
-                continue_specs.push(ContinueArg::Mapped(v_a));
+                LinkArg::Value(v) if cf_disc_var.as_ref() == Some(v) => {
+                    continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
+                }
+                LinkArg::Value(v) => {
+                    let chain = diamond_forward_chain(a, &question.path);
+                    let v_a = back_substitute(graph, &chain, v, &name)?;
+                    if !some_sources.contains(&v_a) {
+                        some_sources.push(v_a.clone());
+                    }
+                    continue_specs.push(ContinueArg::Mapped(v_a));
+                }
             }
         }
-    }
-    if payload_positions.len() > 1 {
-        return Err(format!(
-            "{name}: ControlFlow value threaded into {} continue-arm slots — multi-slot payload collapse is not fail-safe",
-            payload_positions.len()
-        ));
+        if payload_positions.len() > 1 {
+            return Err(format!(
+                "{name}: ControlFlow value threaded into {} continue-arm slots — multi-slot payload collapse is not fail-safe",
+                payload_positions.len()
+            ));
+        }
     }
 
     // All structural validation passed; mutate the graph.
@@ -309,56 +297,62 @@ fn rewire_one_option_try_site(
         }
     }
 
-    let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
+    let (some_bb, some_inputs) = if continue_link.is_some() {
+        graph.create_block_with_arg_vars(some_sources.len())
+    } else {
+        (unreachable_continue_target(graph), Vec::new())
+    };
     let (none_bb, _none_inputs) = graph.create_block_with_arg_vars(0);
 
-    let opt_in_some = map_source(&some_sources, &some_inputs, &opt_a)
-        .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
-    // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
-    // base pointer (identity).
-    let payload = if site.niche || site.scalar_niche {
-        opt_in_some
-    } else {
-        let payload = graph.alloc_value_var();
-        graph.block_mut(some_bb).operations.push(SpaceOperation {
-            result: Some(payload.clone()),
-            kind: OpKind::FieldRead {
-                base: opt_in_some,
-                field: FieldDescriptor {
-                    name: "__pos_0".to_string(),
-                    owner_root: Some(site.some_owner.clone()),
-                    owner_id: None,
-                    base_is_deref: None,
-                    taken_by_address: false,
-                    inline_vec: false,
-                    vec_part: None,
-                    owner_declared_gc: None,
-                    host_index: None,
-                    scalar_word: None,
+    if let Some(continue_link) = &continue_link {
+        let opt_in_some = map_source(&some_sources, &some_inputs, &opt_a)
+            .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
+        // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
+        // base pointer (identity).
+        let payload = if site.niche || site.scalar_niche {
+            opt_in_some
+        } else {
+            let payload = graph.alloc_value_var();
+            graph.block_mut(some_bb).operations.push(SpaceOperation {
+                result: Some(payload.clone()),
+                kind: OpKind::FieldRead {
+                    base: opt_in_some,
+                    field: FieldDescriptor {
+                        name: "__pos_0".to_string(),
+                        owner_root: Some(site.some_owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
+                        scalar_word: None,
+                    },
+                    ty: site.payload_ty.clone(),
+                    pure: true,
                 },
-                ty: site.payload_ty.clone(),
-                pure: true,
-            },
-        });
-        payload
-    };
-    let some_link_args = continue_specs
-        .iter()
-        .map(|spec| match spec {
-            ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
-            ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
-            ContinueArg::Mapped(v_a) => map_source(&some_sources, &some_inputs, v_a)
-                .map(LinkArg::Value)
-                .ok_or_else(|| format!("{name}: continue arg not threaded into Some arm")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    graph.set_control_flow_metadata(
-        some_bb,
-        None,
-        vec![Link::new_mixed(some_link_args, continue_link.target, None)],
-    );
-    for pos in payload_positions {
-        collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+            });
+            payload
+        };
+        let some_link_args = continue_specs
+            .iter()
+            .map(|spec| match spec {
+                ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+                ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
+                ContinueArg::Mapped(v_a) => map_source(&some_sources, &some_inputs, v_a)
+                    .map(LinkArg::Value)
+                    .ok_or_else(|| format!("{name}: continue arg not threaded into Some arm")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        graph.set_control_flow_metadata(
+            some_bb,
+            None,
+            vec![Link::new_mixed(some_link_args, continue_link.target, None)],
+        );
+        for pos in payload_positions {
+            collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+        }
     }
 
     // The break arm returns the enclosing function's `None`, whose physical
@@ -467,7 +461,11 @@ fn rewire_one_option_try_site(
         Some(ExitSwitch::Value(opt_disc)),
         vec![
             Link::new_mixed(
-                some_sources.iter().cloned().map(LinkArg::Value).collect(),
+                if continue_link.is_some() {
+                    some_sources.iter().cloned().map(LinkArg::Value).collect()
+                } else {
+                    Vec::new()
+                },
                 some_bb,
                 Some(some_case),
             ),

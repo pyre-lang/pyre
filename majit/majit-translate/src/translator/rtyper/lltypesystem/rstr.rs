@@ -468,9 +468,137 @@ pub fn ll_join() -> Result<(), TyperError> {
     Err(rstr_deferred("ll_join"))
 }
 
-/// RPython `do_stringformat = LLHelpers.do_stringformat`.
-pub fn do_stringformat() -> Result<(), TyperError> {
-    Err(rstr_deferred("do_stringformat"))
+/// RPython `parse_fmt_string` (`rstr.py` `AbstractLLHelpers.parse_fmt_string`).
+/// Supports `x`, `d`, `o`, `s`, `r`, `f`; `%%` is a literal `%`.
+enum FmtChunk {
+    Literal(String),
+    Spec(char),
+}
+
+fn parse_fmt_string(fmt: &str) -> Result<Vec<FmtChunk>, TyperError> {
+    let mut chars = fmt.chars();
+    let mut r = Vec::new();
+    let mut curstr = String::new();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let Some(f) = chars.next() else {
+                return Err(TyperError::message(format!(
+                    "Unsupported formatting specifier: end of string in {fmt:?}"
+                )));
+            };
+            if f == '%' {
+                curstr.push('%');
+                continue;
+            }
+            if !curstr.is_empty() {
+                r.push(FmtChunk::Literal(std::mem::take(&mut curstr)));
+            }
+            if !"xdosrf".contains(f) {
+                return Err(TyperError::message(format!(
+                    "Unsupported formatting specifier: {f:?} in {fmt:?}"
+                )));
+            }
+            r.push(FmtChunk::Spec(f));
+        } else {
+            curstr.push(c);
+        }
+    }
+    if !curstr.is_empty() {
+        r.push(FmtChunk::Literal(curstr));
+    }
+    Ok(r)
+}
+
+/// RPython `LLHelpers.do_stringformat` (`lltypesystem/rstr.py`).
+///
+/// `'x'` → `hop.gendirectcall(ll_int2hex, vitem, False)` specialised
+/// on the interpolant's lowleveltype (`ll_str.py` `ll_int2hex`): Signed
+/// (`-1` → `"-1"`) or Unsigned (`r_uint` digits). A single-placeholder
+/// `"%x"` returns that call; a multi-chunk join needs `ll_join_strs`
+/// over `TEMP` and is deferred. A unicode format (`TEMP_UNICODE` +
+/// `ll_str2unicode`) is not yet ported.
+pub fn do_stringformat(hop: &HighLevelOp) -> RTypeResult {
+    let fmt = {
+        let args_s = hop.args_s.borrow();
+        let s_str = args_s
+            .first()
+            .ok_or_else(|| TyperError::message("do_stringformat: missing format string"))?;
+        match s_str.const_() {
+            Some(ConstValue::ByteStr(bytes)) => String::from_utf8_lossy(bytes).into_owned(),
+            Some(ConstValue::UniStr(_)) => {
+                return Err(TyperError::message(
+                    "do_stringformat: unicode format (TEMP_UNICODE + ll_str2unicode) is not yet ported",
+                ));
+            }
+            _ => {
+                return Err(TyperError::message(
+                    "do_stringformat: format string is not constant",
+                ));
+            }
+        }
+    };
+    let things = parse_fmt_string(&fmt)?;
+    if things.len() != 1 {
+        return Err(TyperError::message(
+            "do_stringformat: multi-chunk join (ll_join_strs over TEMP) is not yet ported",
+        ));
+    }
+    let code = match &things[0] {
+        FmtChunk::Spec(code) => *code,
+        FmtChunk::Literal(text) => {
+            return Err(TyperError::message(format!(
+                "do_stringformat: literal-only format is not emitted by the front ({text:?})"
+            )));
+        }
+    };
+    let (vitem, is_integer, lltype) = {
+        let args_v = hop.args_v.borrow();
+        let args_r = hop.args_r.borrow();
+        let vitem = args_v
+            .get(1)
+            .cloned()
+            .ok_or_else(|| TyperError::message("do_stringformat: missing interpolant"))?;
+        let r_arg = args_r
+            .get(1)
+            .and_then(|r| r.as_ref())
+            .ok_or_else(|| TyperError::message("do_stringformat: missing interpolant repr"))?;
+        let is_integer = r_arg
+            .repr_class_id()
+            .mro()
+            .contains(&ReprClassId::IntegerRepr);
+        (vitem, is_integer, r_arg.lowleveltype().clone())
+    };
+    let vchunk = match code {
+        'x' => {
+            if !is_integer {
+                return Err(TyperError::message(
+                    "do_stringformat: %x requires IntegerRepr",
+                ));
+            }
+            let (args, signed_input) = match lltype {
+                LowLevelType::Unsigned => (vec![LowLevelType::Unsigned, LowLevelType::Bool], false),
+                LowLevelType::Signed => (vec![LowLevelType::Signed, LowLevelType::Bool], true),
+                other => {
+                    return Err(TyperError::message(format!(
+                        "do_stringformat: %x over {other:?} is not yet ported"
+                    )));
+                }
+            };
+            let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+                "ll_int2hex".to_string(),
+                args,
+                STRPTR.clone(),
+                |_rtyper, _args, _result| build_ll_int2hex_helper_graph("ll_int2hex", signed_input),
+            )?;
+            let c_false = constant_with_lltype(ConstValue::Bool(false), LowLevelType::Bool);
+            hop.gendirectcall(&helper, vec![vitem, c_false])?
+        }
+        other => {
+            return Err(TyperError::message(format!("%{other} is not RPython")));
+        }
+    };
+    hop.exception_cannot_occur()?;
+    Ok(vchunk)
 }
 
 /// RPython `class BaseLLStringRepr(Repr)` (`lltypesystem/rstr.py`).
@@ -16716,6 +16844,227 @@ mod tests {
         assert_eq!(items[0], LowLevelValue::Char('0'));
         assert_eq!(items[10], LowLevelValue::Char('a'));
         assert_eq!(items[15], LowLevelValue::Char('f'));
+    }
+
+    /// `'%x' % r_uint` rtypes to `direct_call(ll_int2hex, vitem, False)`
+    /// (`rstr.py do_stringformat` `'x'`).
+    #[test]
+    fn do_stringformat_pct_x_r_uint_emits_ll_int2hex_addprefix_false() {
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::translator::rtyper::pairtype::pair_rtype_mod;
+        use crate::translator::rtyper::rint::unsigned_repr;
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let v_fmt = Variable::new();
+        v_fmt.set_concretetype(Some(STRPTR.clone()));
+        let v_n = Variable::new();
+        v_n.set_concretetype(Some(LowLevelType::Unsigned));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(STRPTR.clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "mod".to_string(),
+                vec![
+                    Hlvalue::Variable(v_fmt.clone()),
+                    Hlvalue::Variable(v_n.clone()),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        let mut s_fmt = SomeString::new(false, false);
+        s_fmt.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(b"%x".to_vec())));
+        hop.args_s.borrow_mut().extend([
+            SomeValue::String(s_fmt),
+            SomeValue::Integer(SomeInteger::new(false, true)),
+        ]);
+        let r_str = string_repr() as Arc<dyn Repr>;
+        let r_uint = unsigned_repr() as Arc<dyn Repr>;
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_str.clone()), Some(r_uint.clone())]);
+
+        let result = pair_rtype_mod(r_str.as_ref(), r_uint.as_ref(), &hop)
+            .unwrap_or_else(|err| panic!("pair rtype_mod %x: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1, "single-chunk %x: one direct_call");
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops.ops.iter().all(|op| op.opname != "int_mod"),
+            "string-format mod must not rtype to int_mod: {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "do_stringformat calls hop.exception_cannot_occur()"
+        );
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_int2hex"), "expected 'll_int2hex' in {dbg}");
+        assert_eq!(ops.ops[0].args.len(), 3, "funcptr, vitem, addPrefix");
+        match &ops.ops[0].args[2] {
+            Hlvalue::Constant(flag) => {
+                assert_eq!(flag.value, ConstValue::Bool(false), "addPrefix False");
+            }
+            other => panic!("expected False const addPrefix, got {other:?}"),
+        }
+        assert_eq!(
+            ll_int2hex_direct_call_first_arg_lltype(&ops.ops[0].args[0]),
+            LowLevelType::Unsigned
+        );
+    }
+
+    fn ll_int2hex_direct_call_first_arg_lltype(funcptr: &Hlvalue) -> LowLevelType {
+        let Hlvalue::Constant(c) = funcptr else {
+            panic!("expected Constant funcptr");
+        };
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("expected LLPtr funcptr, got {:?}", c.value);
+        };
+        match &ptr._TYPE.TO {
+            PtrTarget::Func(func_type) => func_type.args[0].clone(),
+            other => panic!("expected FuncType, got {other:?}"),
+        }
+    }
+
+    /// `'%x' % signed` rtypes to `direct_call(ll_int2hex, vitem, False)`
+    /// with the Signed-input helper (`rstr.py do_stringformat` `'x'`).
+    #[test]
+    fn do_stringformat_pct_x_signed_emits_ll_int2hex_signed_helper() {
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::translator::rtyper::pairtype::pair_rtype_mod;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let v_fmt = Variable::new();
+        v_fmt.set_concretetype(Some(STRPTR.clone()));
+        let v_n = Variable::new();
+        v_n.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(STRPTR.clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "mod".to_string(),
+                vec![
+                    Hlvalue::Variable(v_fmt.clone()),
+                    Hlvalue::Variable(v_n.clone()),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        let mut s_fmt = SomeString::new(false, false);
+        s_fmt.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(b"%x".to_vec())));
+        hop.args_s.borrow_mut().extend([
+            SomeValue::String(s_fmt),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        let r_str = string_repr() as Arc<dyn Repr>;
+        let r_int = signed_repr() as Arc<dyn Repr>;
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_str.clone()), Some(r_int.clone())]);
+
+        let result = pair_rtype_mod(r_str.as_ref(), r_int.as_ref(), &hop)
+            .unwrap_or_else(|err| panic!("pair rtype_mod %x signed: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1, "single-chunk %x: one direct_call");
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert!(
+            ops.ops.iter().all(|op| op.opname != "int_mod"),
+            "string-format mod must not rtype to int_mod: {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            ll_int2hex_direct_call_first_arg_lltype(&ops.ops[0].args[0]),
+            LowLevelType::Signed
+        );
+    }
+
+    #[test]
+    fn do_stringformat_unicode_format_is_not_yet_ported() {
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::translator::rtyper::rint::unsigned_repr;
+        use crate::translator::rtyper::rstr::string_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let v_fmt = Variable::new();
+        v_fmt.set_concretetype(Some(STRPTR.clone()));
+        let v_n = Variable::new();
+        v_n.set_concretetype(Some(LowLevelType::Unsigned));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(STRPTR.clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "mod".to_string(),
+                vec![
+                    Hlvalue::Variable(v_fmt.clone()),
+                    Hlvalue::Variable(v_n.clone()),
+                ],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        let mut s_fmt = SomeString::new(false, false);
+        s_fmt.inner.base.const_box = Some(Constant::new(ConstValue::UniStr("%x".to_string())));
+        hop.args_s.borrow_mut().extend([
+            SomeValue::String(s_fmt),
+            SomeValue::Integer(SomeInteger::new(false, true)),
+        ]);
+        let r_str = string_repr() as Arc<dyn Repr>;
+        let r_uint = unsigned_repr() as Arc<dyn Repr>;
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_str.clone()), Some(r_uint.clone())]);
+
+        let err = do_stringformat(&hop).expect_err("unicode format must decline");
+        assert!(
+            err.to_string()
+                .contains("unicode format (TEMP_UNICODE + ll_str2unicode) is not yet ported"),
+            "got {err}"
+        );
     }
 
     #[test]

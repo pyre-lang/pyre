@@ -4357,6 +4357,15 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::jit_ll_int2dec",
         pyre_object::lowlevel_string::jit_ll_int2dec,
     );
+    // `jtransform` `int_hex_helper` residual of `BinOp { op: "mod" }` of
+    // `__str_const("%x")` over a uint (`rstr.py do_stringformat` `'x'` →
+    // `ll_str.py ll_int2hex(i, False)`).
+    cpa1!(
+        &mut entries,
+        "pyre_object::lowlevel_string::jit_ll_int2hex",
+        "pyre_object::jit_ll_int2hex",
+        pyre_object::lowlevel_string::jit_ll_int2hex,
+    );
     cpa1!(
         &mut entries,
         "pyre_object::lowlevel_string::jit_ll_str_from_rust_string",

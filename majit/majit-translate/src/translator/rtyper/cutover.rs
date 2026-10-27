@@ -2365,7 +2365,13 @@ fn install_source_graph(
             .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
             .unwrap_or_else(|| key.clone());
         let result_shell = raw_ptr_token_annotation(registry, graph.return_type.as_deref())
-            .or_else(|| residual_stub_result_shell(&semantic_key, graph.return_type.as_deref()))
+            .or_else(|| {
+                residual_stub_result_shell(
+                    &semantic_key,
+                    graph.return_type.as_deref(),
+                    Some(registry.bookkeeper()),
+                )
+            })
             .map(|shell| declared_return_annotation(registry, graph).unwrap_or(shell));
         if let Some(result_shell) = result_shell {
             let stub = build_stub_pygraph_with_result_shell(
@@ -3214,16 +3220,31 @@ pub(crate) fn default_someshell_for_lltype(
 /// Projected through `ref`, it met the `SomeString` of a `StringBuilder.build()`
 /// at the same `space.newutf8` argument as a `String ∪ Instance` UnionError.
 ///
-/// The object-pointer marker (`OBJECTPTR_RETURN_TYPE`, stamped by
-/// `SemanticFunctionHeader::new` for a `*mut PyObject`-returning opaque callee the
-/// front-end left untokened) keeps the typed `OBJECTPTR` lltype so a caller
-/// reading the returned object's fields rtypes against the real struct.
+/// The object-pointer marker (`OBJECTPTR_RETURN_TYPE`) is a `*mut PyObject` /
+/// `PyObjectRef` result. Annotation-stage that is `SomeInstance` of the
+/// PyObject classdef (`signature.py` `annotationoftype` of a user class,
+/// `bookkeeper.py` `getuniqueclassdef`; `extfunc.py` `register_external`
+/// takes a declared `SomeInstance` result). `llannotation.py`
+/// `lltype_to_annotation(OBJECTPTR)` is the rtyper-stage `SomePtr`; using it
+/// here made `mergeinputargs` raise `Instance(PyObject) ∪ Ptr(object)`
+/// against a tuple-field `PyObjectRef`. [`return_token_to_lltype`] still
+/// maps the token to `OBJECTPTR` for `FuncType.RESULT`.
 ///
 /// `i128` / `u128` are deliberately declined: they have no `getkind` at the
 /// codewriter boundary (`history.getkind` rejects `SignedLongLongLong`, 16
 /// bytes), so a caller annotating one would only reach a deeper wall.
 pub(crate) fn residual_return_shell(
     token: Option<&str>,
+) -> Option<crate::annotator::model::SomeValue> {
+    residual_return_annotation(token, None)
+}
+
+/// [`residual_return_shell`] with a bookkeeper so a `*mut PyObject` token
+/// interns the same PyObject classdef an Input `class_root` seeds
+/// (`derive_subject_inputcells`).
+fn residual_return_annotation(
+    token: Option<&str>,
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Option<crate::annotator::model::SomeValue> {
     if token == Some(GCREF_RETURN_TYPE) {
         return Some(
@@ -3245,6 +3266,9 @@ pub(crate) fn residual_return_shell(
             &crate::model::ValueType::Str,
         );
     }
+    if token == Some(OBJECTPTR_RETURN_TYPE) {
+        return Some(object_pointer_annotation(bookkeeper));
+    }
     // A function-return tuple is `model.py SomeTuple` (`rtuple.py`).
     // Each item is the residual token `dont_look_inside_return_token`
     // stamps for that element (`Tuple<*mut PyObject,*mut PyObject>`).
@@ -3258,7 +3282,7 @@ pub(crate) fn residual_return_shell(
         }
         let items: Option<Vec<_>> = args
             .into_iter()
-            .map(|arg| residual_return_shell(Some(arg)))
+            .map(|arg| residual_return_annotation(Some(arg), bookkeeper))
             .collect();
         return items.map(|items| {
             crate::annotator::model::SomeValue::Tuple(crate::annotator::model::SomeTuple::new(
@@ -3267,6 +3291,43 @@ pub(crate) fn residual_return_shell(
         });
     }
     return_token_to_lltype(token).and_then(|ll| default_someshell_for_lltype(&ll))
+}
+
+/// Annotation-stage cell of a `*mut PyObject` / `PyObjectRef` residual.
+///
+/// `signature.py` `annotationoftype` of a user class is
+/// `SomeInstance(bookkeeper.getuniqueclassdef(t))`. The Input seed for the
+/// same pointee uses `getuniqueclassdef_for_struct_root` of that class
+/// root, so the residual intern must be that ClassDef — a classdef-less
+/// instance would widen it away, and `lltype_to_annotation(OBJECTPTR)` is
+/// `SomePtr` (`llannotation.py`), which has no union arm with
+/// `SomeInstance`.
+fn object_pointer_annotation(
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
+) -> crate::annotator::model::SomeValue {
+    if let Some(bk) = bookkeeper {
+        let root = OBJECTPTR_RETURN_TYPE
+            .strip_prefix("*mut ")
+            .unwrap_or("PyObject");
+        if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(root) {
+            return crate::annotator::model::SomeValue::Instance(
+                crate::annotator::model::SomeInstance::new(
+                    Some(classdef),
+                    false,
+                    std::collections::BTreeMap::new(),
+                ),
+            );
+        }
+        let projected = bk.project_struct_field_type("PyObjectRef");
+        if matches!(
+            &projected,
+            crate::annotator::model::SomeValue::Instance(inst) if inst.classdef.is_some()
+        ) {
+            return projected;
+        }
+    }
+    crate::codewriter::annotation_state::valuetype_to_someshell(&crate::model::ValueType::Ref(None))
+        .expect("Ref(None) shells to a definite SomeInstance")
 }
 
 /// Choose the annotation carried by a `dont_look_inside` stub's return link.
@@ -3280,11 +3341,12 @@ pub(crate) fn residual_return_shell(
 fn residual_stub_result_shell(
     function_key: &FunctionPathKey,
     token: Option<&str>,
+    bookkeeper: Option<&Rc<crate::annotator::bookkeeper::Bookkeeper>>,
 ) -> Option<crate::annotator::model::SomeValue> {
     if is_exception_object_materializer(function_key) {
         Some(exception_object_result_annotation())
     } else {
-        residual_return_shell(token)
+        residual_return_annotation(token, bookkeeper)
     }
 }
 
@@ -3614,7 +3676,9 @@ pub(crate) fn register_unsafe_fn_stubs(
             continue;
         }
         let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
-            .or_else(|| residual_return_shell(return_token.as_deref()))
+            .or_else(|| {
+                residual_return_annotation(return_token.as_deref(), Some(registry.bookkeeper()))
+            })
         else {
             continue;
         };
@@ -11697,8 +11761,8 @@ mod tests {
         let annotation = ret.annotation.borrow();
         let annotation = annotation.as_ref().expect("stub return is pre-annotated");
         assert!(
-            matches!(&**annotation, SomeValue::Ptr(_)),
-            "the object-pointer token must annotate as the declared pointer, got {annotation:?}"
+            matches!(&**annotation, SomeValue::Instance(_)),
+            "the object-pointer token must annotate as SomeInstance, got {annotation:?}"
         );
     }
 
@@ -12179,10 +12243,51 @@ mod tests {
             tuple
                 .items
                 .iter()
-                .all(|item| matches!(item, SomeValue::Ptr(_))),
-            "each item is the typed object-pointer shell, got {:?}",
+                .all(|item| matches!(item, SomeValue::Instance(_))),
+            "each item is the PyObject instance shell, got {:?}",
             tuple.items
         );
+    }
+
+    #[test]
+    fn objectptr_residual_shares_input_classdef() {
+        use crate::annotator::model::{SomeInstance, SomeValue, union};
+
+        let bk = Rc::new(crate::annotator::bookkeeper::Bookkeeper::new());
+        let residual = residual_return_annotation(Some(OBJECTPTR_RETURN_TYPE), Some(&bk))
+            .expect("*mut PyObject residual is annotatable");
+        let SomeValue::Instance(residual_inst) = &residual else {
+            panic!("elidable *mut PyObject residual is SomeInstance, got {residual:?}");
+        };
+        let residual_cd = residual_inst
+            .classdef
+            .as_ref()
+            .expect("SomeInstance(classdef PyObject)");
+        let input_cd = bk
+            .getuniqueclassdef_for_struct_root("PyObject")
+            .expect("PyObject Input class_root");
+        assert!(
+            Rc::ptr_eq(residual_cd, &input_cd),
+            "residual shares the Input PyObject ClassDef"
+        );
+        let s_input = SomeValue::Instance(SomeInstance::new(
+            Some(input_cd),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        union(&residual, &s_input)
+            .expect("elidable *mut PyObject residual unions with a PyObject Input");
+
+        let token = format!("Tuple<{OBJECTPTR_RETURN_TYPE},{OBJECTPTR_RETURN_TYPE}>");
+        let tuple = residual_return_annotation(Some(&token), Some(&bk))
+            .expect("(PyObjectRef, PyObjectRef) residual is annotatable");
+        let SomeValue::Tuple(tuple) = tuple else {
+            panic!("expected SomeTuple, got {tuple:?}");
+        };
+        assert_eq!(tuple.items.len(), 2);
+        for item in &tuple.items {
+            union(item, &s_input).expect("tuple item must union with a PyObject Input");
+        }
     }
 
     #[test]
@@ -12236,7 +12341,7 @@ mod tests {
             "pyerror_index_error_to_exc_object",
         ] {
             let key = FunctionPathKey::from_segments(["pyre_interpreter", "error", name]);
-            let shell = residual_stub_result_shell(&key, Some(OBJECTPTR_RETURN_TYPE))
+            let shell = residual_stub_result_shell(&key, Some(OBJECTPTR_RETURN_TYPE), None)
                 .expect("exception materializer must have a result shell");
             let SomeValue::Instance(instance) = shell else {
                 panic!("{name}: raw pointer ABI must not leak into annotation")
@@ -12246,11 +12351,11 @@ mod tests {
         }
 
         let ordinary_key = FunctionPathKey::from_segments(["other", "pyerror_to_exc_object"]);
-        let ordinary = residual_stub_result_shell(&ordinary_key, Some(OBJECTPTR_RETURN_TYPE))
+        let ordinary = residual_stub_result_shell(&ordinary_key, Some(OBJECTPTR_RETURN_TYPE), None)
             .expect("ordinary object-pointer residual must have a result shell");
         assert!(
-            matches!(ordinary, SomeValue::Ptr(_)),
-            "ordinary object-pointer residuals keep their typed Ptr shell"
+            matches!(ordinary, SomeValue::Instance(_)),
+            "ordinary object-pointer residuals are SomeInstance, got {ordinary:?}"
         );
     }
 

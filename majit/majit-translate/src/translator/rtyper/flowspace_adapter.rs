@@ -1064,6 +1064,188 @@ fn tuple_aggregate_items(
     Some(TupleAggregate { items, at })
 }
 
+/// FatData+FatLen FieldWrite pairs formed in order between adjacent
+/// halves on one `(base, field.name)`. Rebuilt as `newtuple(data, len)`
+/// then `setattr` (`rtuple.py` `TupleRepr.newtuple`, `rclass.py`
+/// `InstanceRepr.setfield`).
+struct WindowFieldWritePair {
+    at: usize,
+    data_at: usize,
+    len_at: usize,
+    base: Variable,
+    field: crate::model::FieldDescriptor,
+    data: crate::model::LinkArg,
+    data_ty: crate::model::ValueType,
+    len: crate::model::LinkArg,
+    len_ty: crate::model::ValueType,
+}
+
+fn window_field_write_pairs(operations: &[SpaceOperation]) -> Vec<WindowFieldWritePair> {
+    type StoredHalf = (
+        usize,
+        Variable,
+        crate::model::FieldDescriptor,
+        crate::model::LinkArg,
+        crate::model::ValueType,
+    );
+    struct Partial {
+        base_id: u64,
+        name: String,
+        data: Option<StoredHalf>,
+        len: Option<StoredHalf>,
+    }
+    fn start_partial(base_id: u64, name: String, is_data: bool, stored: StoredHalf) -> Partial {
+        let mut entry = Partial {
+            base_id,
+            name,
+            data: None,
+            len: None,
+        };
+        if is_data {
+            entry.data = Some(stored);
+        } else {
+            entry.len = Some(stored);
+        }
+        entry
+    }
+    fn complete_pair(partial: Partial) -> WindowFieldWritePair {
+        let (data_at, data_base, data_field, data, data_ty) =
+            partial.data.expect("complete_pair requires both halves");
+        let (len_at, _, _, len, len_ty) = partial.len.expect("complete_pair requires both halves");
+        WindowFieldWritePair {
+            at: data_at.max(len_at),
+            data_at,
+            len_at,
+            base: data_base,
+            field: data_field,
+            data,
+            data_ty,
+            len,
+            len_ty,
+        }
+    }
+    let mut open: Vec<Partial> = Vec::new();
+    let mut completed: Vec<WindowFieldWritePair> = Vec::new();
+    for (op_index, op) in operations.iter().enumerate() {
+        match &op.kind {
+            OpKind::FieldWrite {
+                base,
+                field,
+                value,
+                ty,
+            } => {
+                let same_key = |p: &Partial| p.base_id == base.id() && p.name == field.name;
+                match field.vec_part {
+                    Some(crate::model::VecFieldPart::FatData)
+                    | Some(crate::model::VecFieldPart::FatLen) => {
+                        let is_data =
+                            matches!(field.vec_part, Some(crate::model::VecFieldPart::FatData));
+                        let stored = (
+                            op_index,
+                            base.clone(),
+                            field.clone(),
+                            value.clone(),
+                            ty.clone(),
+                        );
+                        if let Some(idx) = open.iter().position(same_key) {
+                            let half_filled = if is_data {
+                                open[idx].data.is_some()
+                            } else {
+                                open[idx].len.is_some()
+                            };
+                            if half_filled {
+                                open.remove(idx);
+                                open.push(start_partial(
+                                    base.id(),
+                                    field.name.clone(),
+                                    is_data,
+                                    stored,
+                                ));
+                            } else if is_data {
+                                open[idx].data = Some(stored);
+                                if open[idx].len.is_some() {
+                                    completed.push(complete_pair(open.remove(idx)));
+                                }
+                            } else {
+                                open[idx].len = Some(stored);
+                                if open[idx].data.is_some() {
+                                    completed.push(complete_pair(open.remove(idx)));
+                                }
+                            }
+                        } else {
+                            open.push(start_partial(
+                                base.id(),
+                                field.name.clone(),
+                                is_data,
+                                stored,
+                            ));
+                        }
+                    }
+                    _ => {
+                        open.retain(|p| !same_key(p));
+                    }
+                }
+            }
+            OpKind::FieldRead { base, field, .. } => {
+                open.retain(|p| !(p.base_id == base.id() && p.name == field.name));
+            }
+            _ => {}
+        }
+    }
+    completed
+}
+
+/// `rclass.py` `InstanceRepr.setfield`: setattr of `field` on `base`,
+/// narrowing to the variant class when `owner_root`'s parent is an enum
+/// base.
+fn setattr_instance_field(
+    base_hl: Hlvalue,
+    field: &crate::model::FieldDescriptor,
+    value_hl: Hlvalue,
+    result: Hlvalue,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    let name = Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name)));
+    let variant_owner = field.owner_root.as_deref().filter(|root| {
+        let Some((parent, _)) = root.rsplit_once("::") else {
+            return false;
+        };
+        call_registry
+            .bookkeeper()
+            .struct_fields
+            .borrow()
+            .as_ref()
+            .is_some_and(|reg| reg.is_enum_base(parent))
+    });
+    if let Some(owner) = variant_owner {
+        let callable_host = HOST_ENV
+            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+            .ok_or_else(|| {
+                TyperError::message(
+                    "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                )
+            })?;
+        let narrowed = Hlvalue::Variable(Variable::new());
+        return Ok(vec![
+            FlowspaceOp::new(
+                "simple_call",
+                vec![
+                    Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                    base_hl,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
+                ],
+                narrowed.clone(),
+            ),
+            FlowspaceOp::new("setattr", vec![narrowed, name, value_hl], result),
+        ]);
+    }
+    Ok(vec![FlowspaceOp::new(
+        "setattr",
+        vec![base_hl, name, value_hl],
+        result,
+    )])
+}
+
 /// `true` iff `kind` is `front::mir`'s synthetic function-item constant
 /// define-op (`Call(["__fn_const", <real path>...])`).  Like
 /// [`crate::model::is_str_const_define`], this is a constant carrier rather than a
@@ -2505,6 +2687,29 @@ pub fn translate_op(
                     result,
                 ));
             }
+            if field.owner_root.is_none()
+                && matches!(
+                    field.vec_part,
+                    Some(crate::model::VecFieldPart::FatData)
+                        | Some(crate::model::VecFieldPart::FatLen)
+                )
+            {
+                // Owner-less window word: the base is already the
+                // `SomeTuple` (`rtuple.py` `TupleRepr.getitem`).
+                // `CodeObject.varnames` FatLen has an owner_root and
+                // stays `len(getattr)` below.
+                let metadata = field.vec_part == Some(crate::model::VecFieldPart::FatLen);
+                return Ok(vec![FlowspaceOp::new(
+                    "getitem",
+                    vec![
+                        base_hl,
+                        Hlvalue::Constant(Constant::new(ConstValue::Int(fat_dyn_word_index(
+                            metadata,
+                        )))),
+                    ],
+                    result,
+                )]);
+            }
             if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
                 // Slice / `Box<[T]>` FatLen is `len(getattr(owner, field))`
                 // (`ListRepr.rtype_len`).
@@ -2736,45 +2941,7 @@ pub fn translate_op(
             };
             let value_hl = intmask_unsigned_store(ty, &field.name, value_hl);
             let result = resolve_result_hlvalue(op, value_map)?;
-            let name = Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name)));
-            let variant_owner = field.owner_root.as_deref().filter(|root| {
-                let Some((parent, _)) = root.rsplit_once("::") else {
-                    return false;
-                };
-                call_registry
-                    .bookkeeper()
-                    .struct_fields
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|reg| reg.is_enum_base(parent))
-            });
-            if let Some(owner) = variant_owner {
-                let callable_host = HOST_ENV
-                    .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
-                    .ok_or_else(|| {
-                        TyperError::message(
-                            "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
-                        )
-                    })?;
-                let narrowed = Hlvalue::Variable(Variable::new());
-                return Ok(vec![
-                    FlowspaceOp::new(
-                        "simple_call",
-                        vec![
-                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
-                            base_hl,
-                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
-                        ],
-                        narrowed.clone(),
-                    ),
-                    FlowspaceOp::new("setattr", vec![narrowed, name, value_hl], result),
-                ]);
-            }
-            Ok(vec![FlowspaceOp::new(
-                "setattr",
-                vec![base_hl, name, value_hl],
-                result,
-            )])
+            setattr_instance_field(base_hl, field, value_hl, result, call_registry)
         }
 
         // ─── ArrayRead / ArrayLen / ArrayWrite ports ───
@@ -6348,6 +6515,7 @@ fn function_graph_to_flowspace_inner(
                 Some((result, elements))
             })
             .collect();
+        let window_pairs = window_field_write_pairs(&legacy_block.operations);
         for (op_index, legacy_op) in legacy_block.operations.iter().enumerate() {
             if let Some(hlvalue) =
                 legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
@@ -6524,6 +6692,37 @@ fn function_graph_to_flowspace_inner(
                     }
                     let result = lookup_operand(&value_map, tuple_var, legacy_op, "tuple")?;
                     translated_ops.push(FlowspaceOp::new("newtuple", args, result));
+                }
+                continue;
+            }
+            if let OpKind::FieldWrite { .. } = &legacy_op.kind
+                && let Some(pair) = window_pairs
+                    .iter()
+                    .find(|p| p.data_at == op_index || p.len_at == op_index)
+            {
+                if op_index == pair.at {
+                    let base_hl = lookup_operand(&value_map, &pair.base, legacy_op, "base")?;
+                    let data_hl =
+                        lookup_link_arg(&value_map, &pair.data, legacy_op, "window_data")?;
+                    let data_hl = intmask_unsigned_store(&pair.data_ty, &pair.field.name, data_hl);
+                    let len_hl = lookup_link_arg(&value_map, &pair.len, legacy_op, "window_len")?;
+                    let len_hl = intmask_unsigned_store(&pair.len_ty, &pair.field.name, len_hl);
+                    let layout = crate::fat_ptr_layout::probe();
+                    let tuple_args = if layout.len_offset < layout.data_offset {
+                        vec![len_hl, data_hl]
+                    } else {
+                        vec![data_hl, len_hl]
+                    };
+                    let tuple = Hlvalue::Variable(Variable::new());
+                    translated_ops.push(FlowspaceOp::new("newtuple", tuple_args, tuple.clone()));
+                    let result = resolve_result_hlvalue(legacy_op, &value_map)?;
+                    translated_ops.extend(setattr_instance_field(
+                        base_hl,
+                        &pair.field,
+                        tuple,
+                        result,
+                        call_registry,
+                    )?);
                 }
                 continue;
             }
@@ -11672,6 +11871,68 @@ mod tests {
     }
 
     #[test]
+    fn translate_op_ownerless_fat_window_lowers_to_getitem() {
+        // A split window value is already the `SomeTuple`; FatData / FatLen
+        // are `getitem` (`rtuple.py` `TupleRepr.getitem`). `CodeObject.varnames`
+        // keeps an owner_root and stays `len(getattr)` above.
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 5);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let data_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", None)
+                    .with_vec_part(crate::model::VecFieldPart::FatData),
+                ty: ValueType::Unsigned,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&data_op, &value_map, &empty_call_registry()).expect("ownerless fat data");
+        assert_eq!(
+            translated
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getitem"]
+        );
+        let Hlvalue::Constant(ref idx) = translated[0].args[1] else {
+            panic!("getitem index");
+        };
+        let expected_data = fat_dyn_word_index(false);
+        assert!(matches!(idx.value, ConstValue::Int(n) if n == expected_data));
+
+        let len_op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("__pos_0", None)
+                    .with_vec_part(crate::model::VecFieldPart::FatLen),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&len_op, &value_map, &empty_call_registry()).expect("ownerless fat len");
+        assert_eq!(
+            translated
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>(),
+            vec!["getitem"]
+        );
+        let Hlvalue::Constant(ref idx) = translated[0].args[1] else {
+            panic!("getitem index");
+        };
+        let expected_len = fat_dyn_word_index(true);
+        assert!(matches!(idx.value, ConstValue::Int(n) if n == expected_len));
+    }
+
+    #[test]
     fn translate_op_fat_len_dyn_fat_lowers_to_getattr_getitem() {
         // DictStrategyRef.imp is `&'static dyn DictStrategy` (`two_word_fat_struct`).
         // FatLen is getitem of that pair, not len() → getattr("__len__").
@@ -12673,6 +12934,421 @@ mod tests {
             &startblock.operations[1].args[1],
             Hlvalue::Constant(c) if c.value == ConstValue::Int(1)
         ));
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_rebuilds_window_field_writes_as_tuple_setattr() {
+        // FatData+FatLen writes of one attribute become `newtuple` then
+        // `setattr` (`rtuple.py` `TupleRepr.newtuple`, `rclass.py`
+        // `InstanceRepr.setfield`).
+        let mut graph = LegacyGraph::new("window_to_tuple_setattr");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new("__pos_0", Some("FmtArg::Bytes".into()));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
+                        class_root: Some("FmtArg::Bytes".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("window pair must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["newtuple", "setattr"], "got {opnames:?}");
+        assert_eq!(startblock.operations[0].args.len(), 2);
+        let layout = crate::fat_ptr_layout::probe();
+        let data_idx = layout.word_index(false) as usize;
+        let len_idx = layout.word_index(true) as usize;
+        assert!(matches!(
+            &startblock.operations[0].args[data_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(10)
+        ));
+        assert!(matches!(
+            &startblock.operations[0].args[len_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(20)
+        ));
+        let Hlvalue::Constant(ref name) = startblock.operations[1].args[1] else {
+            panic!("setattr name");
+        };
+        assert!(matches!(
+            &name.value,
+            ConstValue::ByteStr(bytes) if bytes == b"__pos_0"
+        ));
+    }
+
+    #[test]
+    fn window_field_writes_pair_in_order_around_a_read() {
+        // Adjacent halves pair in order: a FieldRead of the same field
+        // between two complete windows yields two `newtuple`/`setattr`
+        // pairs with the read in between (`rclass.py`
+        // `InstanceRepr.setfield`).
+        let mut graph = LegacyGraph::new("window_pairs_around_read");
+        let vars = mint_vars(&mut graph, 8);
+        let field = crate::model::FieldDescriptor::new("__pos_0", Some("FmtArg::Bytes".into()));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
+                        class_root: Some("FmtArg::Bytes".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[4].clone()),
+                    kind: OpKind::FieldRead {
+                        base: vars[1].clone(),
+                        field: field.clone(),
+                        ty: ValueType::Ref(None),
+                        pure: false,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[5].clone()),
+                    kind: OpKind::ConstInt(30),
+                },
+                SpaceOperation {
+                    result: Some(vars[6].clone()),
+                    kind: OpKind::ConstInt(40),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[5].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[6].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[7]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("two window pairs around a read must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            opnames,
+            vec!["newtuple", "setattr", "getattr", "newtuple", "setattr"],
+            "got {opnames:?}"
+        );
+        let layout = crate::fat_ptr_layout::probe();
+        let data_idx = layout.word_index(false) as usize;
+        let len_idx = layout.word_index(true) as usize;
+        assert!(matches!(
+            &startblock.operations[0].args[data_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(10)
+        ));
+        assert!(matches!(
+            &startblock.operations[0].args[len_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(20)
+        ));
+        assert!(matches!(
+            &startblock.operations[3].args[data_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(30)
+        ));
+        assert!(matches!(
+            &startblock.operations[3].args[len_idx],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(40)
+        ));
+    }
+
+    #[test]
+    fn ordinary_field_write_after_window_pair_is_kept() {
+        // An ordinary whole-field write (`vec_part` None) after a
+        // completed window pair is not coalesced away.
+        let mut graph = LegacyGraph::new("ordinary_write_after_window");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new("__pos_0", Some("FmtArg::Bytes".into()));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
+                        class_root: Some("FmtArg::Bytes".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[4].clone()),
+                    kind: OpKind::ConstInt(30),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field.clone(),
+                        value: LinkArg::Value(vars[4].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[5]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("ordinary write after window pair must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            opnames,
+            vec!["newtuple", "setattr", "setattr"],
+            "ordinary write must stay after the pair, got {opnames:?}"
+        );
+        assert!(matches!(
+            &startblock.operations[2].args[2],
+            Hlvalue::Constant(c) if c.value == ConstValue::Int(30)
+        ));
+    }
+
+    #[test]
+    fn function_graph_to_flowspace_unmatched_fat_data_write_stays_setattr() {
+        // A FatData write with no FatLen in the same block is not dropped.
+        let mut graph = LegacyGraph::new("unmatched_fat_data");
+        let vars = mint_vars(&mut graph, 5);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: crate::model::FieldDescriptor::new("__pos_0", None)
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[3]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
+            .expect("unmatched FatData must adapt");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            opnames,
+            vec!["setattr"],
+            "unmatched FatData must setattr, got {opnames:?}"
+        );
     }
 
     #[test]

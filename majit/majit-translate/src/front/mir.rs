@@ -100,7 +100,11 @@
 //!   - `Scalar(Signed|Isize)` → `ConstInt`; `Scalar(Unsigned|Usize)` →
 //!     `ConstUInt`.
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
-//!   - `Str` / `Char` / `ByteStr` → synthetic `Call(__str_const)`.
+//!   - `Str` / `ByteStr` → synthetic `Call(__str_const)`.
+//!   - `Char` → `ConstInt` of the code point then `builtin_unichr`
+//!     (`__majit_unichr`), so a Rust `char` annotates as
+//!     `SomeUnicodeCodePoint` while staying in the Int bank
+//!     (`getkind` of UniChar).
 //!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
 //!   - `Opaque(reason)` / `VTableRef` — synthetic opaque-string Call.
 //!   - `TraitConst` on a selected impl folds to that impl's `NamedConst`
@@ -384,7 +388,9 @@ pub(crate) fn trait_impl_identity_path(module: &str, identity: &str, leaf: &str)
 }
 
 /// Whether `segment` is the trait-impl identity segment
-/// [`trait_impl_identity_path`] writes.
+/// [`trait_impl_identity_path`] writes between the impl owner and the
+/// method leaf (`"<impl {identity}>"`). Charon's FunDecl placeholder
+/// `"<Impl>"` is a different spelling and does not match.
 pub(crate) fn is_trait_impl_identity_segment(segment: &str) -> bool {
     segment.starts_with("<impl ") && segment.ends_with('>')
 }
@@ -15263,17 +15269,7 @@ impl<'a> Lowering<'a> {
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                        return Ok((
-                            Some(OpKind::Call {
-                                target: CallTarget::FunctionPath {
-                                    segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
-                                    fun_decl_id: None,
-                                },
-                                args: crate::model::call_args(vec![arg]),
-                                result_ty: ValueType::Int,
-                            }),
-                            res,
-                        ));
+                        return Ok((Some(unichr_call(arg)), res));
                     }
                     if matches!(src_attr, Some(ValueType::Unsigned))
                         && matches!(
@@ -20654,14 +20650,7 @@ impl<'a> Lowering<'a> {
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(var.clone()),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
-                        fun_decl_id: None,
-                    },
-                    args: crate::model::call_args(vec![code_v]),
-                    result_ty: ValueType::Int,
-                },
+                kind: unichr_call(code_v),
             });
             return var;
         }
@@ -26591,6 +26580,21 @@ impl<'a> Lowering<'a> {
                     && !from_bytes_identity
                     && !regular_call_is_slice_to_vec(&reg, self.llbc) =>
             {
+                // Checked `Wtf8::from_bytes(&[u8])` is the window pair
+                // (`rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8`).
+                if self.is_wtf8_from_bytes_checked(&reg, &call.dest.ty) {
+                    let spliced = splice_pair_lens(args.clone(), pair_lens.clone());
+                    if self.try_lower_wtf8_from_bytes_checked(
+                        mir_bb,
+                        &reg,
+                        &spliced,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )? {
+                        return Ok(());
+                    }
+                }
                 let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
                 self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
                 // The `?`-site capture below keys the callee's scope on it.
@@ -29235,6 +29239,19 @@ impl<'a> Lowering<'a> {
                             &call.dest.ty,
                         );
                         self.local_var[dest_local] = Some(LocalValue::One(res));
+                    } else if self
+                        .identity_cast_int_raw_ptr_to_ccharp(&call.dest.ty, first_arg_ty.as_ref())
+                    {
+                        // `libc::malloc` is `*mut c_void` (`lltype.py`
+                        // `ann_malloc` flavor raw, kind Int/Unsigned).
+                        // `ptr.cast::<u8>()` / `cast::<CHAR>()` is
+                        // `lltype.py` `ann_cast_int_to_ptr` / `rffi.cast`
+                        // onto `CCHARP`, the same wrap
+                        // `ensure_window_ccharp` /
+                        // `emit_window_from_raw_parts_ptr` emit. Other
+                        // identity casts stay aliases.
+                        let res = emit_cast_int_to_ccharp(&mut self.graph, bb_id, args[0].clone());
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
@@ -31057,6 +31074,38 @@ impl<'a> Lowering<'a> {
                             Some("as_ptr" | "as_mut_ptr")
                         ) =>
                     {
+                        // `ll_vec_as_ptr(header: usize)` reads `VEC_PTR_WORD`
+                        // (`rvec.rs`). One-word `as_ptr` is `ll_vec_items_*`
+                        // and takes the Vec; this arm is the kind-independent
+                        // helper. Convert the Vec to that header the same way
+                        // `pair_rustvec_integer_convert_from_to` /
+                        // `gen_cast` do: `cast_ptr_to_int` then `r_uint`.
+                        // Passing the Vec unique-graphs `vec_header_word`
+                        // as `r_uint ∪ list` (`mergeinputargs`).
+                        //
+                        // Byte items (`Vec<u8>` / `CHAR`) are `rlist.py`
+                        // `ll_items` / `rgc.py`
+                        // `ll_nonmovable_raw_ptr_for_resizable_list`: the
+                        // helper returns an integer word and the destination
+                        // `*mut u8` / `*const u8` is `CCHARP`, so wrap with
+                        // `cast_int_to_ptr(CCHARP, items)`. Other item kinds
+                        // keep the integer result.
+                        let signed = push_cast_ptr_to_int(&mut self.graph, bb_id, args[0].clone());
+                        args[0] = push_r_uint(&mut self.graph, bb_id, signed);
+                        if tyref_is_raw_byte_ptr(&call.dest.ty, self.llbc) {
+                            let items = self.emit_path_call(
+                                mir_bb,
+                                &rust_vec_as_ptr_helper_segments().join("::"),
+                                vec![args[0].clone()],
+                                ValueType::Unsigned,
+                            );
+                            let ccharp = emit_cast_int_to_ccharp(&mut self.graph, bb_id, items);
+                            self.local_var[dest_local] = Some(LocalValue::One(ccharp));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
                         (rust_vec_as_ptr_helper_segments(), None)
                     }
                     None => (segments, method_hint),
@@ -35841,6 +35890,31 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// Destination is `*mut u8` / `*const u8` / `*mut CHAR` and the source
+    /// is an integer-kinded raw pointer (`*mut c_void` from `malloc`).
+    /// `lltype.py` `ann_cast_int_to_ptr` / `rffi.cast` onto `CCHARP`.
+    fn identity_cast_int_raw_ptr_to_ccharp(&self, dest_ty: &TyRef, src_ty: Option<&TyRef>) -> bool {
+        if !tyref_is_raw_byte_ptr(dest_ty, self.llbc) {
+            return false;
+        }
+        let Some(src_ty) = src_ty else {
+            return false;
+        };
+        if !tyref_is_raw_pointer(src_ty, self.llbc) || tyref_is_raw_byte_ptr(src_ty, self.llbc) {
+            return false;
+        }
+        matches!(
+            tyref_to_value_type_with(
+                src_ty,
+                self.llbc,
+                self.tombstoned_leaves,
+                self.gc_struct_ids,
+                &self.raw_alloc_flavor_structs,
+            ),
+            ValueType::Int | ValueType::Unsigned
+        )
+    }
+
     /// Recognize `<core::sync::atomic::Atomic*>::load(&self, ordering)`.
     /// This is only method recognition; `lower_call` must check ordering
     /// separately before applying the existing Relaxed fold.
@@ -38006,6 +38080,10 @@ impl<'a> Lowering<'a> {
     /// `majit_rlib::rffi::buffer::charpsize2str`).
     fn emit_charpsize2str(&mut self, mir_bb: usize, ptr: Variable, len: Variable) -> Variable {
         let bb_id = self.emit_bb(mir_bb);
+        self.push_charpsize2str(bb_id, ptr, len)
+    }
+
+    fn push_charpsize2str(&mut self, bb_id: BlockId, ptr: Variable, len: Variable) -> Variable {
         let header = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
@@ -38359,9 +38437,13 @@ impl<'a> Lowering<'a> {
                     })?;
                 return Ok((data, len));
             }
-            return Err(LowerError::Unsupported(format!(
-                "bb{mir_bb}: owner_to_window: unclassified owner"
-            )));
+            // A window is SomeTuple([SomePtr(CCHARP), SomeInteger])
+            // (`model.py SomeTuple`, `rffi.py CCHARP`), so an already-split
+            // buffer is read as its two fields (`rtuple.py TupleRepr.getitem`).
+            // `var` addresses the `{data, len}` slot; the FieldRead
+            // {FatData, FatLen} fallback `pair_place_parts` uses for a
+            // non-Local window loads those two words.
+            return self.split_window_value(mir_bb, var);
         }
         Err(LowerError::Unsupported(format!(
             "bb{mir_bb}: owner_to_window: unclassified owner"
@@ -39156,6 +39238,12 @@ impl<'a> Lowering<'a> {
     /// Checked `Wtf8::from_bytes` → `rutf8.check_utf8(bytes, true)` then
     /// Ok → `Option::Some` of the unchecked byte identity, Err → `None`.
     /// `rutf8.py check_utf8` / `unicodehelper.py str_decode_utf8` fast arm.
+    ///
+    /// `check_utf8`'s `&[u8]` formal is a window (`pair_or_window_fun_inputs` /
+    /// `pair_len_shadows_of`), so the emitted call is `{data: CCHARP, len}`
+    /// plus `allow_surrogates`. A one-word STR owner is split the same way
+    /// other `&[u8]` callees are. Dest `&Wtf8` is `rstr.STR`; the Ok arm
+    /// is that header (`charpsize2str` of the window, or the STR itself).
     #[expect(
         clippy::too_many_arguments,
         reason = "Mirrors the other try_lower_* call intercepts"
@@ -39169,9 +39257,27 @@ impl<'a> Lowering<'a> {
         dest_ty: &TyRef,
         target: usize,
     ) -> Result<bool, LowerError> {
-        if args.len() != 1 || !self.is_wtf8_from_bytes_checked(reg, dest_ty) {
+        if !self.is_wtf8_from_bytes_checked(reg, dest_ty) {
             return Ok(false);
         }
+        let (data, len, ok_str) = match args {
+            [bytes] => {
+                if let Some(len) = self.window_len_companion(bytes) {
+                    (self.ensure_window_ccharp(mir_bb, bytes.clone()), len, None)
+                } else if self.var_is_str_repr(bytes) || self.var_has_str_value_type(bytes) {
+                    let (data, len) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    (data, len, Some(bytes.clone()))
+                } else {
+                    return Ok(false);
+                }
+            }
+            [data, len] => (
+                self.ensure_window_ccharp(mir_bb, data.clone()),
+                len.clone(),
+                None,
+            ),
+            _ => return Ok(false),
+        };
         let Some(check_id) = self.rutf8_check_utf8_fun_decl_id() else {
             return Ok(false);
         };
@@ -39192,7 +39298,6 @@ impl<'a> Lowering<'a> {
                 None => return Ok(false),
             }
         };
-        let bytes = args[0].clone();
         let bb_id = self.emit_bb(mir_bb);
         let allow = self
             .graph
@@ -39201,11 +39306,12 @@ impl<'a> Lowering<'a> {
             result: Some(allow.clone()),
             kind: OpKind::ConstBool(true),
         });
+        // Window pair + `allow_surrogates=True`: `rutf8.py check_utf8`.
         let result_var = self.emit_fun_decl_call(
             bb_id,
             check_id,
             segments,
-            vec![bytes.clone(), allow],
+            vec![data.clone(), len.clone(), allow],
             ValueType::Ref(Some(result_owner.clone())),
         );
         let disc = emit_enum_disc_read(&mut self.graph, bb_id, result_var, &result_owner);
@@ -39215,6 +39321,11 @@ impl<'a> Lowering<'a> {
             .as_ref()
             .map(|(_, _, t)| t.clone())
             .unwrap_or(ValueType::Str);
+        let ok_from_window = ok_str.is_none();
+        let ok_extras: Vec<Variable> = match ok_str {
+            Some(header) => vec![header],
+            None => vec![data, len],
+        };
         // Result Ok=0 is the false arm of `bool(disc)`.
         self.close_call_diamond(
             mir_bb,
@@ -39224,7 +39335,7 @@ impl<'a> Lowering<'a> {
             niche,
             false,
             &[],
-            std::slice::from_ref(&bytes),
+            &ok_extras,
             |this, err_bb, _| {
                 if niche {
                     let cast = this.option_niche_null_cast(dest_ty);
@@ -39240,10 +39351,15 @@ impl<'a> Lowering<'a> {
                 }
             },
             |this, ok_bb, mapped| {
-                let ok_bytes = mapped[0].clone();
+                let header = if ok_from_window {
+                    this.push_charpsize2str(ok_bb, mapped[0].clone(), mapped[1].clone())
+                } else {
+                    let header = mapped[0].clone();
+                    stamp_as_rstr_str(&header);
+                    header
+                };
                 if niche {
-                    stamp_as_rstr_str(&ok_bytes);
-                    ok_bytes
+                    header
                 } else {
                     crate::front::option_variant::emit_option_variant(
                         &mut this.graph,
@@ -39252,7 +39368,7 @@ impl<'a> Lowering<'a> {
                         1,
                         Some((
                             some_owner.as_ref().expect("tagged Some owner").as_str(),
-                            ok_bytes,
+                            header,
                             payload_ty.clone(),
                         )),
                     )
@@ -43249,12 +43365,14 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
+        let payload_is_char = tyref_enum_payload_is_by_value_char(recv_ty, self.llbc);
         let scalar_niche = is_option && !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
         Some(crate::front::option_unwrap::UnwrapSite {
             result_var: result_var.clone(),
             enum_owner,
             payload_owner,
             payload_ty,
+            payload_is_char,
             payload_on_disc_true,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
@@ -43293,11 +43411,14 @@ impl<'a> Lowering<'a> {
             &mut niche,
         );
         let scalar_niche = !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
+        let payload_is_char = crate::front::result_exc::tyref_option_payload(recv_ty, self.llbc)
+            .is_some_and(|payload| tyref_is_by_value_char(&payload, self.llbc));
         Some(crate::front::option_expect::ExpectSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,
+            payload_is_char,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,
@@ -47521,15 +47642,10 @@ impl<'a> Lowering<'a> {
         first_arg_ty: Option<&TyRef>,
         dest_ty: &TyRef,
     ) -> Option<Variable> {
-        let [.., iter_seg, traits_seg, collect_seg, impl_seg, leaf] = segments else {
-            return None;
-        };
-        if iter_seg.as_str() != "iter"
-            || traits_seg.as_str() != "traits"
-            || collect_seg.as_str() != "collect"
-            || impl_seg.as_str() != "<Impl>"
-            || leaf.as_str() != "into_iter"
-        {
+        if !fmt_path_ends_with(
+            segments,
+            &["iter", "traits", "collect", "<Impl>", "into_iter"],
+        ) {
             return None;
         }
         self.identity_self_call_alias(args, first_arg_ty, dest_ty)
@@ -68232,6 +68348,27 @@ pub(crate) fn nonzero_option_zero(owner: &str) -> OpKind {
     }
 }
 
+/// `builtin_unichr` (`IntegerRepr.rtype_unichr`): INT code point → UniChar.
+/// A Rust `char` stays in the Int register bank (`getkind` of UniChar)
+/// while the annotator cell is `SomeUnicodeCodePoint`.
+pub(crate) fn unichr_call(arg: Variable) -> OpKind {
+    OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
+            fun_decl_id: None,
+        },
+        args: crate::model::call_args(vec![arg]),
+        result_ty: ValueType::Int,
+    }
+}
+
+/// Emit [`unichr_call`] on `bb` and return the UniChar result.
+pub(crate) fn push_unichr(graph: &mut FunctionGraph, bb: BlockId, arg: Variable) -> Variable {
+    graph
+        .push_op_var(bb, unichr_call(arg), true)
+        .expect("unichr produces a value")
+}
+
 fn option_owner_is_unsigned_nonzero(owner: &str) -> bool {
     if owner.contains("NonZeroU128")
         || owner.contains("NonZero<u128")
@@ -72906,6 +73043,26 @@ fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
             };
             lit.as_str() == Some("Char") || lit.as_object().is_some_and(|o| o.contains_key("Char"))
         })
+}
+
+/// By-value `char`, not `&char`. `Option<char>::unwrap` extracts a UniChar;
+/// `Option<&char>` extracts a pointer.
+fn tyref_is_by_value_char(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_char(ty, llbc) && tyref_peel_one_ref_node(ty, llbc).is_none()
+}
+
+/// `Option<char>` / `Result<char, E>` payload is a by-value Rust `char`.
+/// `Utf8StringIterator.next` (`rutf8.py`) yields an INT code point;
+/// extracting it as `char` is `unichr(codepoint)` (`builtin_unichr`).
+fn tyref_enum_payload_is_by_value_char(ty: &TyRef, llbc: &Llbc) -> bool {
+    let payload = if crate::front::result_exc::tyref_is_option(ty, llbc) {
+        crate::front::result_exc::tyref_option_payload(ty, llbc)
+    } else if crate::front::result_exc::tyref_is_result(ty, llbc) {
+        crate::front::result_exc::tyref_result_ok(ty, llbc)
+    } else {
+        None
+    };
+    payload.is_some_and(|payload| tyref_is_by_value_char(&payload, llbc))
 }
 
 /// Needle of `str::contains<P>` after Pattern monomorphisation.
@@ -79314,20 +79471,34 @@ struct FmtChain {
 /// crate-qualified spelling (`core::fmt::Arguments::new`) and the
 /// crate-stripped front-end spelling (`fmt::Arguments::new`) both
 /// resolve.  The leaf is compared through its `__spec_` marker: a
-/// specialized copy is the same function.
+/// specialized copy is the same function.  A trait-impl identity
+/// segment ([`is_trait_impl_identity_segment`]) is skipped, so
+/// `["vec","Vec","<impl Index<…>>","index"]` still matches
+/// `["vec","Vec","index"]` (`Bookkeeper.getdesc`).
 fn fmt_path_ends_with(segments: &[String], tail: &[&str]) -> bool {
-    segments.len() >= tail.len()
-        && segments[segments.len() - tail.len()..]
-            .iter()
-            .zip(tail)
-            .enumerate()
-            .all(|(i, (s, t))| {
-                if i + 1 == tail.len() {
-                    crate::front::clause_spec::unspecialized_leaf(s) == *t
-                } else {
-                    s.as_str() == *t
-                }
-            })
+    let mut si = segments.len();
+    let mut ti = tail.len();
+    while ti > 0 {
+        if si == 0 {
+            return false;
+        }
+        si -= 1;
+        if is_trait_impl_identity_segment(&segments[si]) {
+            continue;
+        }
+        let s = segments[si].as_str();
+        let t = tail[ti - 1];
+        let matched = if ti == tail.len() {
+            crate::front::clause_spec::unspecialized_leaf(s) == t
+        } else {
+            s == t
+        };
+        if !matched {
+            return false;
+        }
+        ti -= 1;
+    }
+    true
 }
 
 fn is_trait_impl_path_segment(segment: &str) -> bool {
@@ -79892,10 +80063,12 @@ fn rewire_disc_combinator_sites(
     sites: &[DiscCombinatorSite],
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> usize {
-    sites
+    let rewritten = sites
         .iter()
         .filter(|site| rewire_one_disc_combinator(graph, site, spec).is_ok())
-        .count()
+        .count();
+    crate::front::result_exc::split_trailing_ops_off_canraise_blocks(graph);
+    rewritten
 }
 
 fn rewire_one_disc_combinator(
@@ -81730,7 +81903,7 @@ fn rewire_one_result_try_site(
     use crate::front::option_variant::{emit_sum_variant, map_source};
     use crate::front::result_exc::{
         assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-        follow_single_exit, split_diamond_exits,
+        diamond_forward_chain, locate_control_flow_question, unreachable_continue_target,
     };
 
     let name = graph.name.clone();
@@ -81790,33 +81963,18 @@ fn rewire_one_result_try_site(
     assert_block_pure_besides(graph, b, &recognized_b, "branch", &name)?;
 
     let (a, res_a) = result_try_predecessor_carrying(graph, b, &res_b, &name)?;
-    let (c, cf_c) = follow_single_exit(graph, b, &cf_forwarded)
-        .map_err(|e| format!("{name}: branch block exit: {e}"))?;
-    assert_single_pred(graph, c, &name)?;
-
-    let (disc_idx, cf_disc_var) = graph.blocks[c]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::FieldRead { base, field, .. }
-                if *base == cf_c && field.name == "__discriminant" =>
-            {
-                op.result.clone().map(|r| (i, r))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| format!("{name}: block {c} lacks the ControlFlow __discriminant read"))?;
-    match &graph.blocks[c].exitswitch {
-        Some(ExitSwitch::Value(v)) if *v == cf_disc_var => {}
-        other => {
-            return Err(format!(
-                "{name}: block {c} exitswitch {other:?} is not the ControlFlow discriminant switch"
-            ));
+    let question = locate_control_flow_question(graph, b, &cf_forwarded, &name)?;
+    let c = question.disc_block;
+    let cf_c = question.cf_at_disc.clone();
+    if c != b {
+        assert_single_pred(graph, c, &name)?;
+        if let Some(disc_idx) = question.disc_idx {
+            assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
         }
     }
-    assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[c].exits, &name)?;
+    let continue_link = question.continue_link.clone();
+    let break_link = question.break_link.clone();
+    let cf_disc_var = question.disc_var.clone();
     let (e_block, residual_var) = result_try_verify_break_arm(graph, &break_link, &cf_c, &name)?;
     // The from_residual block still owns the original successor — the
     // RootScope close lives there, not in the residual call itself.
@@ -81826,8 +81984,7 @@ fn rewire_one_result_try_site(
     let (err_sources, err_specs, err_target) = result_try_err_successor(
         graph,
         a,
-        b,
-        c,
+        &question.path,
         &break_link,
         e_block,
         &residual_var,
@@ -81840,61 +81997,76 @@ fn rewire_one_result_try_site(
         Payload,
         Mapped(Variable),
     }
-    let mut continue_specs = Vec::with_capacity(continue_link.args.len());
+    let mut continue_specs = Vec::new();
     let mut payload_positions = Vec::new();
     let mut ok_sources = Vec::new();
     if !ok_sources.contains(&res_a) {
         ok_sources.push(res_a.clone());
     }
-    for (i, arg) in continue_link.args.iter().enumerate() {
-        match arg {
-            LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
-            LinkArg::Value(v) if *v == cf_c => {
-                continue_specs.push(ContinueArg::Payload);
-                payload_positions.push(i);
-            }
-            LinkArg::Value(v) if *v == cf_disc_var => {
-                continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
-            }
-            LinkArg::Value(v) => {
-                let v_a = back_substitute(graph, &[(a, b), (b, c)], v, &name)?;
-                if !ok_sources.contains(&v_a) {
-                    ok_sources.push(v_a.clone());
+    if let Some(continue_link) = &continue_link {
+        continue_specs.reserve(continue_link.args.len());
+        for (i, arg) in continue_link.args.iter().enumerate() {
+            match arg {
+                LinkArg::Const(cst) => continue_specs.push(ContinueArg::Const(cst.clone())),
+                LinkArg::Value(v) if *v == cf_c => {
+                    continue_specs.push(ContinueArg::Payload);
+                    payload_positions.push(i);
                 }
-                continue_specs.push(ContinueArg::Mapped(v_a));
+                LinkArg::Value(v) if cf_disc_var.as_ref() == Some(v) => {
+                    continue_specs.push(ContinueArg::Const(Constant::new(ConstValue::Int(0))));
+                }
+                LinkArg::Value(v) => {
+                    let v_a = back_substitute(
+                        graph,
+                        &diamond_forward_chain(a, &question.path),
+                        v,
+                        &name,
+                    )?;
+                    if !ok_sources.contains(&v_a) {
+                        ok_sources.push(v_a.clone());
+                    }
+                    continue_specs.push(ContinueArg::Mapped(v_a));
+                }
             }
         }
-    }
-    if payload_positions.len() > 1 {
-        return Err(format!(
-            "{name}: ControlFlow value threaded into {} continue-arm slots",
-            payload_positions.len()
-        ));
+        if payload_positions.len() > 1 {
+            return Err(format!(
+                "{name}: ControlFlow value threaded into {} continue-arm slots",
+                payload_positions.len()
+            ));
+        }
     }
 
-    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(ok_sources.len());
+    let (ok_bb, ok_inputs) = if continue_link.is_some() {
+        graph.create_block_with_arg_vars(ok_sources.len())
+    } else {
+        (unreachable_continue_target(graph), Vec::new())
+    };
     let (err_bb, err_inputs) = graph.create_block_with_arg_vars(err_sources.len());
 
-    let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
-        .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
-    let payload = emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
-    let ok_link_args = continue_specs
-        .iter()
-        .map(|spec| match spec {
-            ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
-            ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
-            ContinueArg::Mapped(v_a) => map_source(&ok_sources, &ok_inputs, v_a)
-                .map(LinkArg::Value)
-                .ok_or_else(|| format!("{name}: continue arg not threaded into Ok arm")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    graph.set_control_flow_metadata(
-        ok_bb,
-        None,
-        vec![Link::new_mixed(ok_link_args, continue_link.target, None)],
-    );
-    for pos in payload_positions {
-        collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+    if let Some(continue_link) = &continue_link {
+        let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
+            .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
+        let payload =
+            emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
+        let ok_link_args = continue_specs
+            .iter()
+            .map(|spec| match spec {
+                ContinueArg::Const(cst) => Ok(LinkArg::Const(cst.clone())),
+                ContinueArg::Payload => Ok(LinkArg::Value(payload.clone())),
+                ContinueArg::Mapped(v_a) => map_source(&ok_sources, &ok_inputs, v_a)
+                    .map(LinkArg::Value)
+                    .ok_or_else(|| format!("{name}: continue arg not threaded into Ok arm")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        graph.set_control_flow_metadata(
+            ok_bb,
+            None,
+            vec![Link::new_mixed(ok_link_args, continue_link.target, None)],
+        );
+        for pos in payload_positions {
+            collapse_pos0_read(graph, continue_link.target, pos, &name)?;
+        }
     }
 
     let res_in_err = map_source(&err_sources, &err_inputs, &res_a)
@@ -81942,7 +82114,11 @@ fn rewire_one_result_try_site(
         Some(ExitSwitch::Value(disc)),
         vec![
             Link::new_mixed(
-                ok_sources.iter().cloned().map(LinkArg::Value).collect(),
+                if continue_link.is_some() {
+                    ok_sources.iter().cloned().map(LinkArg::Value).collect()
+                } else {
+                    Vec::new()
+                },
                 ok_bb,
                 Some(ExitCase::Const(ConstValue::Int(0))),
             ),
@@ -82068,15 +82244,14 @@ enum ResultTryErrArg {
 fn result_try_err_successor(
     graph: &FunctionGraph,
     a: usize,
-    b: usize,
-    c: usize,
+    path: &[usize],
     break_link: &Link,
     e_block: usize,
     residual_var: &Variable,
     res_a: &Variable,
     name: &str,
 ) -> Result<(Vec<Variable>, Vec<ResultTryErrArg>, BlockId), String> {
-    use crate::front::result_exc::back_substitute;
+    use crate::front::result_exc::{back_substitute, diamond_forward_chain};
     let [e_exit] = graph.blocks[e_block].exits.as_slice() else {
         return Err(format!(
             "{name}: break arm block {e_block} does not have a single exit"
@@ -82114,7 +82289,8 @@ fn result_try_err_successor(
                         err_specs.push(ResultTryErrArg::Const(cst.clone()));
                     }
                     Some(LinkArg::Value(cv)) => {
-                        let v_a = back_substitute(graph, &[(a, b), (b, c)], cv, name)?;
+                        let v_a =
+                            back_substitute(graph, &diamond_forward_chain(a, path), cv, name)?;
                         if !err_sources.contains(&v_a) {
                             err_sources.push(v_a.clone());
                         }
@@ -84263,7 +84439,11 @@ fn rust_vec_helper_segments(
 }
 
 /// Kind-independent `ll_items`: the header's buffer pointer word, for a
-/// `Vec<T>` whose item is not one word (`ll_vec_as_ptr`).
+/// `Vec<T>` whose item is not one word (`ll_vec_as_ptr`). The call site
+/// converts the Vec with `cast_ptr_to_int` then `r_uint` before this
+/// helper (`pair_rustvec_integer_convert_from_to`). Byte items wrap the
+/// integer result with `cast_int_to_ptr(CCHARP)` (`rlist.py` `ll_items`,
+/// `rgc.py` `ll_nonmovable_raw_ptr_for_resizable_list`).
 fn rust_vec_as_ptr_helper_segments() -> Vec<String> {
     majit_ir::rvec::RVEC_MODULE
         .split("::")
@@ -84656,18 +84836,21 @@ fn str_render_op(
 /// pieces become `__str_const`s, the `{}` placeholder renders its value
 /// with `str(value)` (`OpKind::UnaryOp { op: "str" }` → the rtyper's
 /// `ll_str`), and the parts fold left through `BinOp("add")` (→
-/// `ll_strconcat`).  Empty literal pieces are skipped.  The final op
-/// reuses `result` (the displaced `alloc::fmt::format` result var) so the
-/// downstream consumer is untouched.  Mirrors how RPython lowers a
-/// constant-template `%`/`+` string build into native rstr operations,
-/// rather than leaving the graph-less `fmt::rt` externs residual.
+/// `ll_strconcat`).  A default-spec `{:x}` interpolant (`hex`) is
+/// `rstr.py do_stringformat` over `'%x' % r_uint(n)`: `BinOp mod` of
+/// `__str_const("%x")` and `r_uint(n)`, skipping the cast when the
+/// value is already Unsigned.  Empty literal pieces are skipped.  The
+/// final op reuses `result` (the displaced `alloc::fmt::format` result
+/// var) so the downstream consumer is untouched.
 fn emit_fmt_expansion_ops(
     graph: &mut FunctionGraph,
     pieces: &[String],
     value: &Variable,
     result: Variable,
+    hex: bool,
 ) -> Vec<SpaceOperation> {
     use crate::model::{CallTarget, OpKind, ValueType};
+    let already_unsigned = hex && fmt_value_is_unsigned(graph, value);
     let str_const = |graph: &mut FunctionGraph, ops: &mut Vec<SpaceOperation>, text: &str| {
         let v = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
         stamp_as_rstr_str(&v);
@@ -84689,12 +84872,37 @@ fn emit_fmt_expansion_ops(
     if !pieces[0].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[0]));
     }
-    // `str(value)` — render the single Display placeholder as `UnaryOp
-    // str` (`Repr.rtype_str`: `ll_str` / `ll_int2dec` / rust-heap
-    // `String` copy). jtransform residualizes the rust-heap case.
     let rendered = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
     stamp_as_rstr_str(&rendered);
-    ops.push(str_render_op(value, rendered.clone()));
+    if hex {
+        // `rstr.py do_stringformat` `'x'` → `ll_str.py ll_int2hex(i, False)`
+        // over `'%x' % r_uint(n)`.
+        let fmt = str_const(graph, &mut ops, "%x");
+        let rhs = if already_unsigned {
+            value.clone()
+        } else {
+            let masked = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+            ops.push(SpaceOperation {
+                result: Some(masked.clone()),
+                kind: rarithmetic_mask("r_uint", value.clone(), ValueType::Unsigned),
+            });
+            masked
+        };
+        ops.push(SpaceOperation {
+            result: Some(rendered.clone()),
+            kind: OpKind::BinOp {
+                op: "mod".to_string(),
+                lhs: fmt,
+                rhs,
+                result_ty: ValueType::Str,
+            },
+        });
+    } else {
+        // `str(value)` — render the single Display placeholder as `UnaryOp
+        // str` (`Repr.rtype_str`: `ll_str` / `ll_int2dec` / rust-heap
+        // `String` copy). jtransform residualizes the rust-heap case.
+        ops.push(str_render_op(value, rendered.clone()));
+    }
     parts.push(rendered);
     if pieces.len() > 1 && !pieces[1].is_empty() {
         parts.push(str_const(graph, &mut ops, &pieces[1]));
@@ -84954,6 +85162,9 @@ struct FmtCollapse {
     format_block: BlockId,
     format_result: u64,
     pieces: Vec<String>,
+    /// Default-spec `FmtArgKind::LowerHex` over an integer interpolant:
+    /// the placeholder is `'%x' % r_uint(n)` (`rstr.py do_stringformat`).
+    hex: bool,
     /// `(block, exit_index, arg_pos, replacement)` — replace the chain
     /// value the link forwarded with the threaded rendered value.
     link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
@@ -85201,6 +85412,65 @@ fn fmt_value_is_rstr_string(
         || matches!(ty, ValueType::Ref(Some(root)) if root.as_str() == "String")
 }
 
+/// Default-spec `{:x}` interpolant: a word-sized integer (Signed /
+/// Unsigned / Bool). Int128 / UInt128 / string stay residual. A missing
+/// producer (loop phi / function input) keeps the collapse, matching
+/// [`fmt_value_renders_via_rstr`] — `sre_pattern_flag_tail`'s `flags`
+/// is an i64 phi after the FLAG_NAMES loop.
+///
+/// `jtransform` skip-path uses the same predicate for leftover
+/// `'%x' % n` when dual-gate has not yet stamped Unsigned → Signed.
+pub(crate) fn fmt_value_is_integer_hex(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    use crate::model::{OpKind, ValueType};
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return true;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstBool(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => {
+            matches!(ty, ValueType::Int | ValueType::Unsigned | ValueType::Bool)
+        }
+        _ => false,
+    }
+}
+
+/// Skip `r_uint` when the interpolant is already Unsigned (`ConstUInt` /
+/// `ValueType::Unsigned` / `Input` ty Unsigned).
+fn fmt_value_is_unsigned(graph: &FunctionGraph, var: &crate::flowspace::model::Variable) -> bool {
+    use crate::model::{OpKind, ValueType};
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstUInt(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => matches!(ty, ValueType::Unsigned),
+        _ => false,
+    }
+}
+
 fn quote_debug_string_pieces(pieces: &mut Vec<String>) {
     if pieces.is_empty() {
         pieces.push(String::new());
@@ -85224,6 +85494,7 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
         return None;
     }
     let mut pieces = nav.pieces;
+    let mut hex = false;
     match nav.kind {
         FmtArgKind::Display => {
             // `str` + `ll_strconcat` consume rstr `STR` (or an int `ll_int2dec`).
@@ -85239,12 +85510,20 @@ fn collect_fmt_collapse(graph: &FunctionGraph, bf: BlockId, fi: usize) -> Option
             }
             quote_debug_string_pieces(&mut pieces);
         }
-        FmtArgKind::LowerHex => return None,
+        FmtArgKind::LowerHex => {
+            // Default-spec `{:x}` only (`is_default` already excluded
+            // `{:02x}` / `{:0width$x}`). Integer interpolant → `'%x' % r_uint`.
+            if !fmt_value_is_integer_hex(graph, &nav.context) {
+                return None;
+            }
+            hex = true;
+        }
     }
     Some(FmtCollapse {
         format_block: bf,
         format_result: nav.format_result.id(),
         pieces,
+        hex,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -85340,7 +85619,7 @@ fn collapse_fmt_chains(graph: &mut FunctionGraph) -> usize {
         else {
             continue;
         };
-        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result);
+        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result, site.hex);
         graph
             .block_mut(site.format_block)
             .operations
@@ -85373,7 +85652,6 @@ fn collect_lower_hex_byte_fmt_collapse(
     if nav.kind != FmtArgKind::LowerHex
         || !nav.placeholder.is_lower_hex_byte_02()
         || !nav.context_is_u8
-        || nav.pieces != ["\\x".to_string(), String::new()]
     {
         return None;
     }
@@ -87653,6 +87931,25 @@ mod tests {
         assert!(!fmt_path_ends_with(&spec, &["lltype", "malloc"]));
         let inner = segs(&["malloc_typed__spec_X_0123456789abcdef", "new"]);
         assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
+        let identity = segs(&[
+            "vec",
+            "Vec",
+            "<impl core::ops::index::Index<alloc::vec::Vec<v0,v2>,v1>>",
+            "index",
+        ]);
+        assert!(fmt_path_ends_with(&identity, &["vec", "Vec", "index"]));
+        let collect = segs(&[
+            "iter",
+            "traits",
+            "collect",
+            "<Impl>",
+            "<impl core::iter::traits::collect::IntoIterator<core::ops::range::Range<v0>>>",
+            "into_iter",
+        ]);
+        assert!(fmt_path_ends_with(
+            &collect,
+            &["iter", "traits", "collect", "<Impl>", "into_iter"]
+        ));
     }
 
     #[test]
@@ -94049,6 +94346,246 @@ mod tests {
         assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
         let bp_exit = &bp_block.exits[0];
         assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
+    }
+
+    #[test]
+    fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
+        use super::{collapse_fmt_chains, fmt_path_ends_with};
+        use crate::flowspace::model::Variable;
+        use crate::model::{
+            CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
+            ValueType,
+        };
+
+        // `format!("0x{:x}", n)` — default-spec LowerHex over an Int.
+        let mut graph = FunctionGraph::new("fmt_hex_collapse");
+        let b0 = graph.create_block();
+        let bp = graph.create_block();
+        let bf = graph.create_block();
+        let bret = graph.create_block();
+
+        let ctx = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(ctx.clone()),
+            kind: OpKind::Input {
+                name: "n".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+        });
+        let tuple = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Tuple"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Tuple".to_string())),
+            },
+        });
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: tuple.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                value: LinkArg::Value(ctx.clone()),
+                ty: ValueType::Int,
+            },
+        });
+        let arg_ref = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(arg_ref.clone()),
+            kind: OpKind::FieldRead {
+                base: tuple,
+                field: FieldDescriptor::new("__pos_0", Some("Tuple".to_string())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        });
+        let new_lower_hex = Variable::new();
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(new_lower_hex.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["fmt", "rt", "Argument", "new_lower_hex"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![arg_ref]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let arg_in = Variable::new();
+        graph.block_mut(bp).inputargs = vec![arg_in.clone()];
+        graph.block_mut(b0).exits =
+            vec![Link::from_variables(&graph, vec![new_lower_hex], bp, None).with_prevblock(b0)];
+
+        let args_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(args_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Array"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_arr.clone(),
+                field: FieldDescriptor::new("__pos_0", Some("Array".to_string())),
+                value: LinkArg::Value(arg_in.clone()),
+                ty: ValueType::Ref(None),
+            },
+        });
+        let pieces_arr = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(pieces_arr.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor("Array"),
+                args: crate::model::call_args(vec![]),
+                result_ty: ValueType::Ref(Some("Array".to_string())),
+            },
+        });
+        for (i, byte) in [2i64, b'0' as i64, b'x' as i64, 0xC0, 0].iter().enumerate() {
+            let v = Variable::new();
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: Some(v.clone()),
+                kind: OpKind::ConstInt(*byte),
+            });
+            graph.block_mut(bp).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: pieces_arr.clone(),
+                    field: FieldDescriptor::new(format!("__pos_{i}"), Some("Array".to_string())),
+                    value: LinkArg::Value(v),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        let fmt_args = Variable::new();
+        graph.block_mut(bp).operations.push(SpaceOperation {
+            result: Some(fmt_args.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["fmt", "Arguments", "new"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![pieces_arr, args_arr]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let fmt_args_in = Variable::new();
+        graph.block_mut(bf).inputargs = vec![fmt_args_in.clone()];
+        graph.block_mut(bp).exits =
+            vec![Link::from_variables(&graph, vec![fmt_args], bf, None).with_prevblock(bp)];
+
+        let formatted = Variable::new();
+        graph.block_mut(bf).operations.push(SpaceOperation {
+            result: Some(formatted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: ["alloc", "fmt", "format"]
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![fmt_args_in.clone()]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let ret = Variable::new();
+        graph.block_mut(bret).inputargs = vec![ret];
+        graph.block_mut(bf).exits = vec![
+            Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf),
+        ];
+
+        collapse_fmt_chains(&mut graph);
+
+        let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+        let kinds: Vec<&OpKind> = bf_block.operations.iter().map(|op| &op.kind).collect();
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &vec!["__str_const".to_string(), "0x".to_string()]
+            )),
+            "leading literal 0x: {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments == &vec!["__str_const".to_string(), "%x".to_string()]
+            )),
+            "hex placeholder is __str_const(\"%x\"): {kinds:?}"
+        );
+        assert!(
+            kinds.iter().any(|kind| matches!(
+                kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("r_uint")
+            )),
+            "signed interpolant is r_uint-cast: {kinds:?}"
+        );
+        let mod_op = kinds
+            .iter()
+            .find(|kind| matches!(kind, OpKind::BinOp { op, .. } if op == "mod"));
+        let Some(OpKind::BinOp { lhs, .. }) = mod_op else {
+            panic!("hex placeholder is BinOp mod: {kinds:?}");
+        };
+        let lhs_op = bf_block
+            .operations
+            .iter()
+            .find(|op| op.result.as_ref().map(|r| r.id()) == Some(lhs.id()));
+        assert!(
+            matches!(
+                lhs_op.map(|op| &op.kind),
+                Some(OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                }) if segments == &vec!["__str_const".to_string(), "%x".to_string()]
+            ),
+            "mod lhs is __str_const(\"%x\"): {lhs_op:?}"
+        );
+        assert!(
+            !bf_block.operations.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if fmt_path_ends_with(segments, &["fmt", "format"])
+            )),
+            "alloc::fmt::format must be consumed"
+        );
+        let getslice = bf_block
+            .operations
+            .iter()
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some("__getslice_rangeto")
+                )
+            })
+            .count();
+        assert!(
+            getslice <= 2,
+            "hex collapse must not unroll digits: {getslice} __getslice_rangeto"
+        );
     }
 
     #[test]
@@ -106772,6 +107309,139 @@ mod tests {
                     } if segments.last().map(String::as_str) == Some(leaf)
                 )),
                 "Vec::{leaf} on Vec<u8> must not stay residual; ops={ops:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn signed_byte_vec_as_ptr_converts_the_header_and_wraps_ccharp() {
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let i8_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I8"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![i8_ty.clone()])}
+        });
+        let i8_ptr = serde_json::json!({"RawPtr": [i8_ty.clone(), "Const"]});
+        let i8_mut_ptr = serde_json::json!({"RawPtr": [i8_ty, "Mut"]});
+        let vec_decl = {
+            let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let expected = super::rust_vec_as_ptr_helper_segments();
+        for (caller, leaf, dest_ty) in [
+            ("vec_i8_as_ptr", "as_ptr", i8_ptr),
+            ("vec_i8_as_mut_ptr", "as_mut_ptr", i8_mut_ptr),
+        ] {
+            let llbc = std_extern_call_fixture_with_types(
+                caller,
+                &["alloc", "vec", "<Impl>", leaf],
+                &[vec_ty.clone()],
+                dest_ty,
+                vec![vec_decl.clone()],
+            );
+            let graph = super::lower_function(&llbc, caller).expect("lower Vec<i8> as_ptr");
+            let ops = graph_ops(&graph);
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if *segments == expected
+                )),
+                "Vec::{leaf} on Vec<i8> must call {expected:?}; ops={ops:?}"
+            );
+            assert!(
+                !ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.last().map(String::as_str) == Some(leaf)
+                )),
+                "Vec::{leaf} on Vec<i8> must not stay residual; ops={ops:?}"
+            );
+            let as_ptr_arg = ops.iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if *segments == expected => args.first().and_then(LinkArg::as_variable).cloned(),
+                _ => None,
+            });
+            let as_ptr_arg = as_ptr_arg.expect("ll_vec_as_ptr argument");
+            let r_uint_src = ops.iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if op.result.as_ref() == Some(&as_ptr_arg)
+                    && segments.last().map(String::as_str) == Some("r_uint") =>
+                {
+                    args.first().and_then(LinkArg::as_variable).cloned()
+                }
+                _ => None,
+            });
+            let r_uint_src = r_uint_src.expect("ll_vec_as_ptr argument is r_uint of the header");
+            assert!(
+                ops.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if op.result.as_ref() == Some(&r_uint_src)
+                        && segments.last().map(String::as_str) == Some("cast_ptr_to_int") =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }),
+                "Vec::{leaf} header is cast_ptr_to_int then r_uint; ops={ops:?}"
+            );
+            let items = ops.iter().find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if *segments == expected => op.result.clone(),
+                _ => None,
+            });
+            let items = items.expect("ll_vec_as_ptr result");
+            assert!(
+                ops.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        args,
+                        ..
+                    } if segments.last().map(String::as_str) == Some("cast_int_to_ptr")
+                        && args.len() == 2
+                        && args.get(1).and_then(LinkArg::as_variable) == Some(&items) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                }),
+                "Vec::{leaf} items word is cast_int_to_ptr(CCHARP); ops={ops:?}"
             );
         }
     }
@@ -130298,17 +130968,44 @@ mod tests {
     /// Checked `Wtf8::from_bytes` is `rutf8.py check_utf8` plus the
     /// Option Some/None wrap (`unicodehelper.py str_decode_utf8` fast arm).
     #[test]
-    #[ignore]
     fn oefmt_wtf8_from_bytes_lowers_to_check_utf8_option() {
         use crate::model::{CallTarget, OpKind};
-        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
-        let llbc = Llbc::load(path).expect("load real LLBC");
-        let graph = super::lower_function(&llbc, "oefmt").expect("lower oefmt");
-        let paths = oefmt_call_paths(&graph);
+        let interpreter = Llbc::load(crate::runtime_names::artifacts::INTERPRETER_ULLBC)
+            .expect("load interpreter LLBC");
+        let object =
+            Llbc::load(crate::runtime_names::artifacts::OBJECT_ULLBC).expect("load object LLBC");
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                &[interpreter, object],
+                crate::HostStaticAddrs {
+                    error_carrier: crate::ErrorCarrierSpec {
+                        carrier_path: "pyre_interpreter::error::PyError",
+                        carrier_class: "",
+                        carrier_wrappers: &[],
+                        to_exc_object: Some(&[
+                            "pyre_interpreter",
+                            "error",
+                            "pyerror_to_exc_object",
+                        ]),
+                        from_exc_object: Some(("PyError", "from_exc_object")),
+                    },
+                    ..Default::default()
+                },
+                &["error"],
+                &["oefmt"],
+            )
+            .expect("lower oefmt");
+        let graph = program
+            .functions
+            .iter()
+            .find(|f| f.name == "oefmt")
+            .expect("oefmt graph")
+            .graph();
+        let paths = oefmt_call_paths(graph);
         assert!(
-            !paths
-                .iter()
-                .any(|segments| segments == &["Wtf8".to_string(), "from_bytes".to_string()]),
+            !paths.iter().any(|segments| {
+                segments.ends_with(&["Wtf8".to_string(), "from_bytes".to_string()])
+            }),
             "checked Wtf8::from_bytes must not remain a residual: {paths:#?}"
         );
         assert!(
@@ -130322,6 +131019,21 @@ mod tests {
             .iter()
             .flat_map(|block| &block.operations)
             .collect();
+        let check_utf8_argc = ops.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.ends_with(&["rutf8".to_string(), "check_utf8".to_string()]) => {
+                Some(args.len())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            check_utf8_argc,
+            Some(3),
+            "check_utf8 takes the window pair plus allow_surrogates: {graph:#?}"
+        );
         assert!(
             ops.iter()
                 .any(|op| matches!(&op.kind, OpKind::ConstBool(true))),

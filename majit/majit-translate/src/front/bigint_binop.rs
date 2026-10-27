@@ -167,7 +167,7 @@ fn residual_path(leaf: &str) -> Vec<String> {
 /// helper only recognizes those path spellings.
 fn is_rbigint_operator_owner(segments: &[String], owner: &str) -> bool {
     owner == "<Impl>"
-        || owner.starts_with("<impl ")
+        || crate::front::mir::is_trait_impl_identity_segment(owner)
         || matches!(
             segments,
             [.., module, ty, _] if module == "rbigint" && ty == "RBigInt"

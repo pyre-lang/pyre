@@ -711,6 +711,13 @@ fn dispatch_rtype_op(
         | (AbstractStringRepr, AbstractStringRepr, "inplace_add") => {
             committed(super::rstr::pair_abstract_string_rtype_add(r1, r2, hop))
         }
+        // rstr.py — `pairtype(AbstractStringRepr, Repr).rtype_mod` and
+        // `pairtype(AbstractStringRepr, FloatRepr).rtype_mod` both
+        // dispatch to `LLHelpers.do_stringformat`. IntegerRepr MRO
+        // (`IntegerRepr → FloatRepr → Repr`) hits the FloatRepr arm first.
+        (AbstractStringRepr, FloatRepr, "mod") | (AbstractStringRepr, Repr, "mod") => {
+            committed(super::lltypesystem::rstr::do_stringformat(hop))
+        }
         // `rtype_add` is defined at exactly one place, `pairtype(
         // AbstractStringRepr, AbstractStringRepr)` (rstr.py); no
         // char pairtype defines one. A char operand reaches that body

@@ -11,8 +11,13 @@ use crate::{
     builtin_code_name, function_get_name, function_get_qualname,
 };
 
-/// Address half of `W_Root.getaddrstring`: `2 * HUGEVAL_BYTES` lower-case
-/// hex digits, zero-padded to the pointer width, after a literal `0x`.
+/// Address half of `baseobjspace.py W_Root.getaddrstring`: `2 * HUGEVAL_BYTES`
+/// lowercase hex digits, zero-padded to the pointer width, after a literal `0x`.
+///
+/// `getaddrstring` fills a fixed `2 * HUGEVAL_BYTES` run from the low nibble
+/// up (`n = id & 0x0F; n += ord('0'); if n > ord('9'): n += ord('a') - ord('9') - 1`).
+/// The `0x` prefix is `repr_addr`'s existing contract: callers append this
+/// result, while `W_Root.getrepr` interpolates `"<%s at 0x%s%s>"`.
 ///
 /// `PyUnicode_FromFormat`'s `%p` hands the pointer to the platform `printf`
 /// instead, which pads and uppercases on MSVC and does neither on glibc; no
@@ -26,7 +31,29 @@ use crate::{
 /// [`repr_gc_addr`] instead, so the text is `getaddrstring`'s id rather than
 /// the nursery address it currently occupies.
 pub fn repr_addr(addr: usize) -> String {
-    format!("0x{addr:0width$x}", width = size_of::<usize>() * 2)
+    const HEX_WIDTH: usize = size_of::<usize>() * 2;
+    let mut digits = [b' '; HEX_WIDTH];
+    let mut w_id = addr;
+    let mut i = HEX_WIDTH;
+    loop {
+        let mut n = (w_id & 0x0F) as u8;
+        n += b'0';
+        if n > b'9' {
+            n += b'a' - b'9' - 1;
+        }
+        i -= 1;
+        digits[i] = n;
+        if i == 0 {
+            break;
+        }
+        w_id >>= 4;
+    }
+    let mut out = String::with_capacity(2 + HEX_WIDTH);
+    out.push_str("0x");
+    for &digit in &digits {
+        out.push(digit as char);
+    }
+    out
 }
 
 /// Address half of `W_Root.getaddrstring` for a GC object.
@@ -2466,9 +2493,28 @@ impl fmt::Display for PyDisplay {
 mod tests {
     use super::{
         bytes_repr_string, format_float_repr, format_wtf8_repr, jit_format_float_repr_rstr,
-        syntax_error_basename_start,
+        repr_addr, syntax_error_basename_start,
     };
     use rustpython_wtf8::{CodePoint, Wtf8Buf};
+
+    #[test]
+    fn repr_addr_matches_zero_padded_lowercase_hex() {
+        let width = size_of::<usize>() * 2;
+        for x in [
+            0usize,
+            1,
+            0xdead_beef,
+            usize::MAX,
+            0x10,
+            0xa,
+            0xf,
+            0xff,
+            0x1234_5678,
+            0x0fed_cba9,
+        ] {
+            assert_eq!(repr_addr(x), format!("0x{x:0width$x}"));
+        }
+    }
 
     #[test]
     fn bytes_repr_matches_pypy_quote_and_escape_edges() {

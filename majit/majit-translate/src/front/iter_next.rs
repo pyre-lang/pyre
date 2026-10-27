@@ -1173,6 +1173,12 @@ fn rewire_one_next_site(
              not a list-iterator for-loop"
         ));
     }
+    // `Utf8StringIterator.next` (`rutf8.py`) yields an INT code point.
+    // Rust `Chars::next` yields `char`, so the Some-arm element is
+    // `unichr(codepoint)` (`builtin_unichr`). The raising `__iter_next`
+    // stays last on A (`LastException`); the wrap sits on a forwarding
+    // successor.
+    let from_utf8 = walk_back_with(graph, edges, &next_iter, utf8_iter_probe).is_some();
 
     // A's single exit → C (the Option discriminant switch).  Unlike the
     // Result `?` diamond there is no intervening `branch()` block.
@@ -1371,7 +1377,7 @@ fn rewire_one_next_site(
         branch_value_vars.push(bool_var.clone());
         (none_link, some_link, false, branch_value_vars)
     };
-    let some_target = some_link.target;
+    let mut some_target = some_link.target;
     let none_target = none_link.target;
 
     // Some arm (normal exit): the `next` op result IS the element.  Map
@@ -1715,6 +1721,28 @@ fn rewire_one_next_site(
         .with_llexitcase_from_exitcase();
     stopiter_link.last_exception = Some(LinkArg::Value(stop_etype));
     stopiter_link.last_exc_value = Some(LinkArg::Value(stop_evalue));
+
+    if from_utf8 && enumerate_site.is_none() && aggregate_payload && payload_positions.len() == 1 {
+        let pos = payload_positions[0];
+        let n = graph.blocks[some_target.0].inputargs.len();
+        if pos < n {
+            let (wrap_bb, wrap_inputs) = graph.create_block_with_arg_vars(n);
+            let ch = crate::front::mir::push_unichr(graph, wrap_bb, wrap_inputs[pos].clone());
+            let wrap_args: Vec<LinkArg> = wrap_inputs
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    if i == pos {
+                        LinkArg::Value(ch.clone())
+                    } else {
+                        LinkArg::Value(v.clone())
+                    }
+                })
+                .collect();
+            graph.set_goto_mixed(wrap_bb, some_target, wrap_args);
+            some_target = wrap_bb;
+        }
+    }
 
     let block_a = &mut graph.blocks[a];
     block_a.exitswitch = Some(ExitSwitch::LastException);

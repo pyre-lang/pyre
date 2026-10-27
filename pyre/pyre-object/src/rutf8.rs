@@ -271,36 +271,12 @@ pub fn check_utf8(s: &[u8], allow_surrogates: bool) -> Result<i64, CheckError> {
 /// the two disagree first inside `create_utf8_index_storage`, which reads past
 /// the buffer.
 ///
-/// Its *loop* is kept, because `str::from_utf8` scans a word at a time and
-/// `check_utf8` a byte at a time — 0.08 against 0.35 ns per byte, over every
-/// name in every code object a marshal load carries.  Only the two bounds
-/// `_invalid_byte_2_of_3` and `_invalid_byte_3_of_3` impose are restored;
+/// The scan is [`check_utf8`] (`rutf8.py` `_check_utf8`, `@jit.elidable`);
 /// `check_utf8_and_wtf8_from_bytes_agree` holds the two to one answer.
 pub fn wtf8_from_bytes(s: &[u8], allow_surrogates: bool) -> Result<&Wtf8, CheckError> {
-    if !allow_surrogates {
-        // `check_utf8` with the flag off admits exactly well-formed UTF-8, and
-        // `Utf8Error::valid_up_to` is the same offset it would report: both
-        // name the start of the sequence the scan stopped on.
-        return match std::str::from_utf8(s) {
-            Ok(valid) => Ok(Wtf8::new(valid)),
-            Err(error) => Err(CheckError {
-                pos: error.valid_up_to() as i64,
-            }),
-        };
-    }
-    let mut pos = 0;
-    while let Err(error) = std::str::from_utf8(&s[pos..]) {
-        pos += error.valid_up_to();
-        // A strict decode stops at a surrogate's leading byte and nowhere
-        // else that WTF-8 goes on from, so exactly one three-byte sequence
-        // may follow before the scan resumes.
-        match s[pos..] {
-            [0xED, 0xA0..=0xBF, 0x80..=0xBF, ..] => pos += 3,
-            _ => return Err(CheckError { pos: pos as i64 }),
-        }
-    }
-    // SAFETY: every sequence in `s` is well formed, and admitting the
-    // surrogates is what separates WTF-8 from UTF-8.
+    check_utf8(s, allow_surrogates)?;
+    // SAFETY: `check_utf8` admitted every sequence in `s`; with
+    // `allow_surrogates` that is WTF-8, otherwise UTF-8, a subset of it.
     Ok(unsafe { Wtf8::from_bytes_unchecked(s) })
 }
 

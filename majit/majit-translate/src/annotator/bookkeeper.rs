@@ -1165,7 +1165,7 @@ pub(crate) fn two_word_fat_struct(
 /// `{data: CCHARP, len: Signed}` (`rffi.get_nonmovingbuffer`). Upstream
 /// `SomePtr` is nullable, so `Option<&[u8]>` is the same pair (`None` is a
 /// null data word).
-fn dyn_fat_window_annotation() -> SomeValue {
+pub(crate) fn dyn_fat_window_annotation() -> SomeValue {
     let data = crate::translator::rtyper::llannotation::lltype_to_annotation(
         crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
     );
@@ -3629,9 +3629,23 @@ impl Bookkeeper {
                             &crate::model::ValueType::Int,
                         )
                         .is_some_and(|shell| shell == attr.s_value);
+                // `tyref_to_attr_value_type` banks `&[u8]` as Int, so FORCE
+                // shells a window field as the Int-bank shell. The layout
+                // spelling is still `{data: CCHARP, len: Signed}`
+                // (`rffi.get_nonmovingbuffer`), and `project_struct_field_type`
+                // answers `dyn_fat_window_annotation`. Replace ONLY that
+                // exact FORCE shell on a window spelling.
+                let is_window_integer_force_shell =
+                    (majit_ir::descr::is_shared_u8_slice_spelling(&row.ty)
+                        || majit_ir::descr::is_option_of_u8_window_spelling(&row.ty))
+                        && crate::codewriter::annotation_state::valuetype_to_someshell(
+                            &crate::model::ValueType::Int,
+                        )
+                        .is_some_and(|shell| shell == attr.s_value);
                 if matches!(attr.s_value, SomeValue::Impossible)
                     || (is_untyped_force_shell && !matches!(s_value, SomeValue::Impossible))
                     || is_fn_integer_force_shell
+                    || is_window_integer_force_shell
                 {
                     attr.s_value = s_value;
                 }
@@ -12375,6 +12389,36 @@ mod tests {
             force.as_ref(),
             "non-fn Int field must keep the Int FORCE shell, got {:?}",
             len.s_value
+        );
+    }
+
+    #[test]
+    fn struct_root_pass2_replaces_integer_force_shell_of_window_field() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        // `tyref_to_attr_value_type` banks `&[u8]` as Int, so FORCE shells
+        // the field `SomeInteger`. Pass-2 must replace that with
+        // `dyn_fat_window_annotation` (`rffi.get_nonmovingbuffer`).
+        crate::annotator::classdesc::register_struct_fields(
+            "WindowHolder",
+            &[("buf".to_string(), crate::model::ValueType::Int)],
+        );
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "WindowHolder".to_string(),
+            vec![("buf".to_string(), "&[u8]".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let cd = bk
+            .getuniqueclassdef_for_struct_root("WindowHolder")
+            .expect("WindowHolder registers");
+        let g = cd.borrow();
+        let buf = g.attrs.get("buf").expect("buf attr present");
+        assert_eq!(
+            buf.s_value,
+            dyn_fat_window_annotation(),
+            "window field must project to dyn_fat_window_annotation, got {:?}",
+            buf.s_value
         );
     }
 

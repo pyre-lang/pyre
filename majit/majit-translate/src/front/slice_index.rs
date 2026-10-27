@@ -667,37 +667,53 @@ fn slice_index_segments_match(segments: &[String]) -> bool {
     // spelling carries no module segment and the anchored form IS two
     // segments; the crate-qualified spelling is accepted alongside it so the
     // arm is anchored wherever the crate name survives.
-    if segments == ["Wtf8", "index"] || segments == ["rustpython_wtf8", "Wtf8", "index"] {
+    let segs: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .filter(|seg| !crate::front::mir::is_trait_impl_identity_segment(seg))
+        .collect();
+    if segs == ["Wtf8", "index"] || segs == ["rustpython_wtf8", "Wtf8", "index"] {
         return true;
     }
     // Scalar `Vec::index` is intercepted in `lower_call` (`is_vec_index_call`)
     // before a residual is planted, so this arm only sees `Range*`.
     // Residual spelling after `impl_method_owner_for_fundecl`:
     // `["vec","Vec","index"]`. FunDecl `name_path`: `alloc::vec::<Impl>::index`.
-    if vec_inherent_index_segments(segments) {
+    // A trait-impl identity segment is stripped so
+    // `["vec","Vec","<impl Index<…>>","index"]` is the same owner/leaf
+    // (`rlist.py` `AbstractBaseListRepr.rtype_getslice`).
+    if vec_inherent_index_from_leafs(&segs) {
         return true;
     }
-    let n = segments.len();
-    if n < 4 || segments.first().map(String::as_str) != Some("core") {
+    let n = segs.len();
+    if n < 4 || segs.first() != Some(&"core") {
         return false;
     }
-    let slice_impl = n >= 5
-        && segments[n - 4] == "slice"
-        && segments[n - 3] == "index"
-        && segments[n - 2] == "<Impl>";
-    let array_impl = segments[n - 3] == "array" && segments[n - 2] == "<Impl>";
-    segments[n - 1] == "index" && (slice_impl || array_impl)
+    let slice_impl =
+        n >= 5 && segs[n - 4] == "slice" && segs[n - 3] == "index" && segs[n - 2] == "<Impl>";
+    let array_impl = segs[n - 3] == "array" && segs[n - 2] == "<Impl>";
+    segs[n - 1] == "index" && (slice_impl || array_impl)
 }
 
 /// Inherent `Vec::index` (not `index_mut`). Accepts the impl-owner residual
 /// `["vec","Vec","index"]` and crate-qualified / FunDecl forms that end in
-/// `"vec","Vec","index"` or `"vec","<Impl>","index"`.
+/// `"vec","Vec","index"` or `"vec","<Impl>","index"`. A trait-impl identity
+/// segment is ignored, matching [`crate::front::mir::trait_impl_identity_path`].
 pub(crate) fn vec_inherent_index_segments(segments: &[String]) -> bool {
-    let n = segments.len();
+    let segs: Vec<&str> = segments
+        .iter()
+        .map(String::as_str)
+        .filter(|seg| !crate::front::mir::is_trait_impl_identity_segment(seg))
+        .collect();
+    vec_inherent_index_from_leafs(&segs)
+}
+
+fn vec_inherent_index_from_leafs(segs: &[&str]) -> bool {
+    let n = segs.len();
     n >= 3
-        && segments[n - 1] == "index"
-        && segments[n - 3] == "vec"
-        && (segments[n - 2] == "Vec" || segments[n - 2] == "<Impl>")
+        && segs[n - 1] == "index"
+        && segs[n - 3] == "vec"
+        && (segs[n - 2] == "Vec" || segs[n - 2] == "<Impl>")
 }
 
 /// `true` when the `RangeFrom` value is consumed by EXACTLY its own
@@ -2621,6 +2637,18 @@ mod tests {
             "alloc".into(),
             "vec".into(),
             "<Impl>".into(),
+            "index".into(),
+        ]));
+        assert!(slice_index_segments_match(&[
+            "vec".into(),
+            "Vec".into(),
+            "<impl core::ops::index::Index<alloc::vec::Vec<v0,v2>,v1>>".into(),
+            "index".into(),
+        ]));
+        assert!(slice_index_segments_match(&[
+            "Wtf8".into(),
+            "<impl core::ops::index::Index<rustpython_wtf8::Wtf8,core::ops::range::RangeFrom<usize>>>"
+                .into(),
             "index".into(),
         ]));
         assert!(!slice_index_segments_match(&[

@@ -597,9 +597,14 @@ jobs:
     if: ${{ !cancelled() && needs.prepare-charon-llbc-linux.result == 'success' }}
     # Two cargo passes used to measure ~27 min together; PR 1832 run
     # 34968256365 spent ~55 min on dynasm alone (29 compile + 21 test +
-    # 3 serial) and the 60 min cap cancelled cranelift mid-link. 90 min
-    # bounds a hang without cutting the sequential dynasm+cranelift work.
-    timeout-minutes: 90
+    # 3 serial) and the 60 min cap cancelled cranelift mid-link, so the cap
+    # went to 90. On 2026-10-27 main's run 40452016158 (d83d4978a46) was
+    # cancelled by the 90 min cap still inside the dynasm test step (43
+    # compile, >45 test), and a run of the same tree plus one PR spent 36
+    # compile + 49 test + 1 serial and was cancelled in the cranelift build
+    # (4 min when it completes). 120 min bounds a hang without cutting the
+    # sequential dynasm+cranelift work.
+    timeout-minutes: 120
     steps: &cargo-test-steps
     - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       with:

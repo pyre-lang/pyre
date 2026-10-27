@@ -250,6 +250,9 @@ enum ForceAnnotation {
     /// Two-word fat-dyn (`two_word_fat_struct`): data then metadata, or
     /// the reverse when the host lays the vtable word first.
     Tuple(Vec<ForceAnnotation>),
+    /// `SomePtr(CCHARP)` (`rffi.CCHARP` / `rffi.get_nonmovingbuffer`).
+    /// Reconstruct-on-read: `SomePtr` is not stored in the Send FORCE table.
+    PtrCCharp,
 }
 
 impl ForceAnnotation {
@@ -288,6 +291,14 @@ impl ForceAnnotation {
                     .map(ForceAnnotation::from_somevalue)
                     .collect();
                 items.map(ForceAnnotation::Tuple)
+            }
+            SomeValue::Ptr(_) => {
+                match crate::translator::rtyper::llannotation::annotation_to_lltype(s, None) {
+                    Ok(ll) if ll == *crate::translator::rtyper::lltypesystem::rffi::CCHARP => {
+                        Some(ForceAnnotation::PtrCCharp)
+                    }
+                    _ => None,
+                }
             }
             _ => None,
         }
@@ -328,6 +339,11 @@ impl ForceAnnotation {
             ForceAnnotation::Tuple(items) => SomeValue::Tuple(SomeTuple::new(
                 items.iter().map(ForceAnnotation::to_somevalue).collect(),
             )),
+            ForceAnnotation::PtrCCharp => {
+                crate::translator::rtyper::llannotation::lltype_to_annotation(
+                    crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+                )
+            }
         }
     }
 }
@@ -547,6 +563,18 @@ pub fn register_struct_fields_with_layout(
                 entry.insert(
                     name.clone(),
                     force_annotation_from_shell(&dyn_fat_field_annotation()),
+                );
+                continue;
+            }
+            if majit_ir::descr::is_shared_u8_slice_spelling(ty)
+                || majit_ir::descr::is_option_of_u8_window_spelling(ty)
+            {
+                // `{data: CCHARP, len: Signed}` (`rffi.get_nonmovingbuffer`).
+                entry.insert(
+                    name.clone(),
+                    force_annotation_from_shell(
+                        &crate::annotator::bookkeeper::dyn_fat_window_annotation(),
+                    ),
                 );
                 continue;
             }
@@ -3765,6 +3793,40 @@ mod tests {
             }
             other => panic!("expected Tuple FORCE for &dyn imp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn shared_u8_slice_layout_seeds_window_tuple_force() {
+        // `FmtArg::Bytes.__pos_0` is `&[u8]`. FORCE seeds
+        // `dyn_fat_window_annotation` (`rffi.get_nonmovingbuffer`) so
+        // getattr is SomeTuple, not the Int-bank Integer shell.
+        let window = crate::annotator::bookkeeper::dyn_fat_window_annotation();
+        register_struct_fields_with_layout(
+            "force_test_window::FmtArgBytes",
+            &[("__pos_0".into(), crate::model::ValueType::Int)],
+            Some(&[("__pos_0".into(), "&[u8]".into())]),
+        );
+        let entry = forced_attributes_for("force_test_window::FmtArgBytes")
+            .expect("FORCE row for shared u8 window");
+        assert_eq!(
+            entry.get("__pos_0"),
+            Some(&window),
+            "shared &[u8] FORCE must be dyn_fat_window_annotation, got {:?}",
+            entry.get("__pos_0")
+        );
+        register_struct_fields_with_layout(
+            "force_test_window::OptionSlice",
+            &[("buf".into(), crate::model::ValueType::Int)],
+            Some(&[("buf".into(), "Option<&[u8]>".into())]),
+        );
+        let entry = forced_attributes_for("force_test_window::OptionSlice")
+            .expect("FORCE row for Option<&[u8]>");
+        assert_eq!(
+            entry.get("buf"),
+            Some(&window),
+            "Option<&[u8]> FORCE must be dyn_fat_window_annotation, got {:?}",
+            entry.get("buf")
+        );
     }
 
     #[test]

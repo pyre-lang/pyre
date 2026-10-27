@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=44
+# pyre-check: max-pypy-ratio=14
 # Two function-entry comprehension loops (`single_comp`, `pair_comp`); each
 # virtualizes an inner list whose backing is NewArray/NewArrayClear. wasm
 # compiles each as its own module.

@@ -171,6 +171,13 @@ pub struct GraphTransformConfig {
     /// `rstr.py ll_int2dec` via `rint.py rtype_str`.
     #[serde(default = "default_int_str_helper")]
     pub int_str_helper: String,
+    /// The host's own `'%x' % r_uint(n)` helper, called for a `mod` of
+    /// `__str_const("%x")` over an integer.
+    ///
+    /// Same contract as [`Self::int_str_helper`]; `rstr.py do_stringformat`
+    /// `'x'` → `ll_str.py ll_int2hex(i, False)`.
+    #[serde(default = "default_int_hex_helper")]
+    pub int_hex_helper: String,
     /// The host's own `str(f)` helper, called for a `str` over a Float operand.
     ///
     /// Same contract as [`Self::int_str_helper`]; `rfloat.py FloatRepr.ll_str`
@@ -221,6 +228,14 @@ fn default_int_str_helper() -> String {
     "jit_ll_int2dec".to_string()
 }
 
+/// The [`GraphTransformConfig::int_hex_helper`] default: pyre's own, in
+/// `pyre_object::lowlevel_string`, whose address `jit_fnaddr.rs` binds.
+/// It is `ll_str.py ll_int2hex` over a `r_uint` with `addPrefix=False`,
+/// returning `Ptr(STR)`.
+fn default_int_hex_helper() -> String {
+    "jit_ll_int2hex".to_string()
+}
+
 /// The [`GraphTransformConfig::float_str_helper`] default: pyre's own, in
 /// `pyre_interpreter::display`, whose address `jit_fnaddr.rs` binds.  It
 /// is `rfloat.py FloatRepr.ll_str` → `formatd` over a Float, returning
@@ -255,6 +270,7 @@ impl Default for GraphTransformConfig {
             jitdriver_receiver_roots: default_jitdriver_receiver_roots(),
             str_concat_helper: default_str_concat_helper(),
             int_str_helper: default_int_str_helper(),
+            int_hex_helper: default_int_hex_helper(),
             float_str_helper: default_float_str_helper(),
             str_eq_helper: default_str_eq_helper(),
             rust_string_str_helper: default_rust_string_str_helper(),
@@ -676,6 +692,11 @@ pub struct Transformer<'a> {
     /// pre-rename operand (`jtransform.py` `rewrite_op_direct_ptradd`
     /// reads `op.args[0].concretetype`).
     direct_ptradd_type_arg: Option<crate::flowspace::model::Variable>,
+    /// Right operand of the `mod` currently being rewritten, before
+    /// `r_uint` / `intmask` identity aliasing. Aliasing drops the marker's
+    /// Unsigned annotation; the `'%x'` skip-path reads signedness from this
+    /// operand, as `prefix_unsigned_binop` does for ordered compares.
+    pct_x_rhs_before_alias: Option<crate::flowspace::model::Variable>,
     /// Results of `FieldRead`s whose `(owner, field)` is an immutable
     /// array rank (`name[*]`, `rclass.py _parse_field_list`).  An
     /// `ArrayRead` whose base (after `canonical_gc_base` and pointer
@@ -2825,6 +2846,7 @@ impl<'a> Transformer<'a> {
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             fn_const_results: std::collections::HashMap::new(),
             direct_ptradd_type_arg: None,
+            pct_x_rhs_before_alias: None,
             immutable_array_vars: None,
             notes: Vec::new(),
             vable_rewrites: 0,
@@ -3021,6 +3043,10 @@ impl<'a> Transformer<'a> {
             // been aliased onto the original pointer, whose concretetype
             // is not the array item type the `same_as` result carried.
             self.direct_ptradd_type_arg = direct_ptradd_type_arg(original_op);
+            self.pct_x_rhs_before_alias = match &original_op.kind {
+                OpKind::BinOp { op, rhs, .. } if op == "mod" => Some(rhs.clone()),
+                _ => None,
+            };
             let op = remap_op(original_op, &self.aliases);
             // `jtransform.py`: `if renamings_constants: op = self._do_renaming(renamings_constants, op)`
             // before `rewrite_operation`.
@@ -3048,6 +3074,7 @@ impl<'a> Transformer<'a> {
                 }
             }
             self.direct_ptradd_type_arg = None;
+            self.pct_x_rhs_before_alias = None;
         }
 
         // `jtransform.py:116-118`: the block's exception exits belong to its
@@ -3814,6 +3841,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
+        let pct_x_rhs_before_alias = self.pct_x_rhs_before_alias.clone();
         let configured_helper = match &op.kind {
             OpKind::UnaryOp {
                 op: unop_name,
@@ -3838,6 +3866,23 @@ impl<'a> Transformer<'a> {
                 && crate::front::mir::interpolant_is_rust_heap_string(graph, operand) =>
             {
                 Some(self.config.rust_string_str_helper.as_str())
+            }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "mod"
+                && operand_is_str_const_pct_x(graph, lhs)
+                && operand_is_pct_x_mod_integer_rhs(
+                    graph,
+                    rhs,
+                    self.get_value_kind_var(rhs),
+                    &self.unsigned_vars,
+                    pct_x_rhs_before_alias.as_ref(),
+                ) =>
+            {
+                Some(self.config.int_hex_helper.as_str())
             }
             OpKind::BinOp {
                 op: binop_name,
@@ -5295,6 +5340,58 @@ impl<'a> Transformer<'a> {
             // `_ll_2_int_floordiv` / `_ll_2_int_mod`: their `x // y` /
             // `x % y` are `ll_int_py_div` / `ll_int_py_mod`.
             //
+            // `'%x' % r_uint(n)` leftover as `BinOp mod` of
+            // `__str_const("%x")` over an integer: `rstr.py
+            // do_stringformat` `'x'` → `ll_str.py ll_int2hex(i, False)`.
+            // The Skip-path residual is the host `jit_ll_int2hex`
+            // extern. Result is rstr `STR` (`GcRef`). Must precede the
+            // integer-mod arm (`binop_result_is_int`).
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "mod"
+                && operand_is_str_const_pct_x(graph, lhs)
+                && operand_is_pct_x_mod_integer_rhs(
+                    graph,
+                    rhs,
+                    self.get_value_kind_var(rhs),
+                    &self.unsigned_vars,
+                    pct_x_rhs_before_alias.as_ref(),
+                )
+                && !self.config.int_hex_helper.is_empty() =>
+            {
+                self.stamp_value_kind(
+                    graph,
+                    op.result.clone(),
+                    crate::codewriter::type_state::ConcreteType::GcRef,
+                );
+                let target = CallTarget::function_path([self.config.int_hex_helper.as_str()]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
+                let mut ops = vec![funcptr_op];
+                ops.push(SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Int],
+                            majit_ir::value::Type::Ref,
+                            EffectInfo::new(ExtraEffect::ElidableOrMemoryError, OopSpecIndex::None),
+                        ),
+                        args_i: vec![rhs.clone()],
+                        args_r: vec![],
+                        args_f: vec![],
+                        result_kind: 'r',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
+            }
             // Without this rewrite the assembler encoder
             // (`codewriter/assembler.rs`'s `op_kind_to_opname_with_kinds`
             // `format!("int_{op}")`) would emit the bare opname,
@@ -8178,6 +8275,28 @@ impl<'a> Transformer<'a> {
                     },
                 },
             ]);
+        }
+        // `jtransform.py rewrite_op_getinteriorfield`: a `chars` item read of a
+        // `Ptr(rstr.STR)` / `Ptr(rstr.UNICODE)` is `strgetitem` / `unicodegetitem`.
+        // The front flattens `ll_stritem_nonneg`'s `s.chars[i]` into an
+        // `ArrayRead` on the string pointer itself.
+        let string_getitem = match base.concretetype() {
+            Some(t) if t == *crate::translator::rtyper::lltypesystem::rstr::STRPTR => {
+                Some("strgetitem")
+            }
+            Some(t) if t == *crate::translator::rtyper::lltypesystem::rstr::UNICODEPTR => {
+                Some("unicodegetitem")
+            }
+            _ => None,
+        };
+        if let Some(opname) = string_getitem {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: opname.into(),
+                    args: vec![base.clone().into(), index.clone().into()],
+                },
+            }]);
         }
         let (array_type_id, nolength, source_pure) = match &op.kind {
             OpKind::ArrayRead {
@@ -15831,6 +15950,76 @@ fn stroruni_first_arg_kind(var: &crate::flowspace::model::Variable) -> StrOrUniK
     }
 }
 
+/// `'%x'` producer — the lhs of `'%x' % r_uint(n)` (`rstr.py
+/// do_stringformat`).
+///
+/// The front emits `Call(["__str_const", "%x"])`. `fold_str_consts`
+/// (`str_const_fold.rs`) rewrites that call to `ConstStr(b"%x")`
+/// before `Transformer::transform`, so both spellings are the same
+/// constant (`box_str_const_fold::str_literal_bytes`).
+fn operand_is_str_const_pct_x(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    let Some((bid, idx)) = crate::front::mir::resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    crate::translator::rtyper::box_str_const_fold::str_literal_bytes(&op.kind).as_deref()
+        == Some(b"%x")
+}
+
+/// Integer rhs of `'%x' % n` (`rstr.py` IntegerRepr). Dual-gate Skip
+/// stamps Unsigned → Signed so `get_value_kind_var` is `'i'`. An
+/// already-unsigned interpolant (`fmt_value_is_unsigned`) keeps
+/// Unknown concretetype until that stamp; `fmt_value_is_integer_hex`
+/// is the same predicate the front used to emit the `mod`. Signedness
+/// is read from the pre-alias operand (`r_uint` marker → unsigned;
+/// `jtransform.py _noop_rewrite`, `IntegerRepr`). A signed operand is
+/// rejected: `jit_ll_int2hex` is the `r_uint` specialisation.
+fn operand_is_pct_x_mod_integer_rhs(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+    kind: char,
+    unsigned_vars: &std::collections::HashSet<u64>,
+    before_alias: Option<&crate::flowspace::model::Variable>,
+) -> bool {
+    let pre = before_alias.unwrap_or(var);
+    let signed = !unsigned_vars.contains(&pre.id()) && operand_is_signed_integer(graph, pre);
+    !signed && (kind == 'i' || crate::front::mir::fmt_value_is_integer_hex(graph, var))
+}
+
+/// `jit_ll_int2hex` is the `r_uint` specialisation of `ll_int2hex`.
+/// A signed operand needs the signed `ll_int2hex` (`-1` → `"-1"`).
+fn operand_is_signed_integer(
+    graph: &crate::model::FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> bool {
+    let Some((bid, idx)) = crate::front::mir::resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstInt(n) => *n < 0,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => matches!(ty, ValueType::Int),
+        _ => false,
+    }
+}
+
 /// Whether `var` is rstr `STR` (`Ptr(STR)` / `rpy_string` / `Utf8Str`).
 ///
 /// `stroruni_first_arg_kind` reads the lltype. Collapse-emitted
@@ -19873,6 +20062,350 @@ mod tests {
             other => panic!("expected CallResidual, got {other:?}"),
         }
         assert!(matches!(ops[3].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn transform_graph_lowers_pct_x_mod_to_ll_int2hex_residual_call() {
+        let mut graph = FunctionGraph::new("int_hex");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "%x"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 5, "Input + __str_const + fnptr + call + Live");
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2hex"]));
+        assert!(
+            matches!(&ops[2].kind, OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr)
+        );
+        match &ops[3].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(
+                    descriptor.extra_info.extraeffect,
+                    ExtraEffect::ElidableOrMemoryError
+                );
+                assert_eq!(args_i, &vec![n_var.clone()]);
+                assert!(args_r.is_empty());
+                assert!(args_f.is_empty());
+                assert_eq!(*result_kind, 'r');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[4].kind, OpKind::Live));
+        assert_no_int_mod_with_ref_operand(&transformed.graph);
+    }
+
+    fn pct_x_mod_graph(fmt_kind: OpKind) -> FunctionGraph {
+        let mut graph = FunctionGraph::new("int_hex");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph.push_op_var(graph.startblock, fmt_kind, true).unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        graph
+    }
+
+    fn assert_pct_x_mod_rewritten_to_ll_int2hex(graph: &FunctionGraph) {
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(graph);
+        assert_no_int_mod_with_ref_operand(&transformed.graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2hex"]));
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr
+            )),
+            "expected jit_ll_int2hex funcptr, ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::CallResidual { result_kind: 'r', args_r, .. } if args_r.is_empty()
+            )),
+            "expected residual call with ref result, ops={ops:?}"
+        );
+    }
+
+    fn assert_no_int_mod_with_ref_operand(graph: &FunctionGraph) {
+        for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+            let OpKind::BinOp {
+                op: name, lhs, rhs, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if name != "mod" && name != "int_mod" {
+                continue;
+            }
+            let lhs_ct = FunctionGraph::concretetype_of(lhs);
+            let rhs_ct = FunctionGraph::concretetype_of(rhs);
+            assert!(
+                lhs_ct != ConcreteType::GcRef && rhs_ct != ConcreteType::GcRef,
+                "string-format mod must not survive as int_mod with a Ptr/ref operand: \
+                 {name} lhs={lhs_ct:?} rhs={rhs_ct:?}"
+            );
+        }
+    }
+
+    /// `fold_str_consts` runs before jtransform in `transform_graph_to_jitcode`.
+    /// The leftover `'%x' % n` must still lower to `jit_ll_int2hex` after
+    /// the `__str_const` producer becomes `ConstStr`.
+    #[test]
+    fn transform_graph_lowers_pct_x_mod_after_fold_str_consts_to_ll_int2hex() {
+        let mut graph = pct_x_mod_graph(OpKind::Call {
+            target: CallTarget::function_path(["__str_const", "%x"]),
+            args: crate::model::call_args(vec![]),
+            result_ty: ValueType::Str,
+        });
+        crate::translator::rtyper::str_const_fold::fold_str_consts(&mut graph);
+        let fmt = &graph.block(graph.startblock).operations[1];
+        assert!(
+            matches!(&fmt.kind, OpKind::ConstStr(bytes) if bytes == b"%x"),
+            "fold_str_consts must rewrite __str_const(\"%x\") to ConstStr: {:?}",
+            fmt.kind
+        );
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
+    }
+
+    #[test]
+    fn transform_graph_lowers_conststr_pct_x_mod_to_ll_int2hex() {
+        let graph = pct_x_mod_graph(OpKind::ConstStr(b"%x".to_vec()));
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
+    }
+
+    /// `unknown_code_point_display` reuses `cp.to_u32()` as the `mod`
+    /// rhs (`already_unsigned`). Without dual-gate the cell stays
+    /// Unknown (`get_value_kind_var` `'r'`); the skip-path must still
+    /// residualize `jit_ll_int2hex` from the Unsigned ValueType.
+    #[test]
+    fn transform_graph_lowers_conststr_pct_x_mod_unsigned_unknown_to_ll_int2hex() {
+        let mut graph = FunctionGraph::new("int_hex_u");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(graph.startblock, OpKind::ConstStr(b"%x".to_vec()), true)
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&n_var),
+            ConcreteType::Unknown
+        );
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
+    }
+
+    #[test]
+    fn transform_graph_keeps_signed_pct_x_mod_off_the_unsigned_hex_helper() {
+        let mut graph = FunctionGraph::new("int_hex_signed");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "%x"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: n_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config).transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let expected_fnaddr =
+            crate::call::symbolic_fnaddr_for_target(&CallTarget::function_path(["jit_ll_int2hex"]));
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::ConstFnAddr { value, .. } if *value == expected_fnaddr
+            )),
+            "signed '%x' must not residualize jit_ll_int2hex, ops={ops:?}"
+        );
+    }
+
+    /// `'%x' % r_uint(n)`: the `r_uint` marker is identity-folded
+    /// (`jtransform.py _noop_rewrite`) and the remapped `mod` rhs is the
+    /// signed `Input`. Signedness is read from the pre-alias operand so
+    /// the skip-path still residualizes `jit_ll_int2hex` (`IntegerRepr`).
+    #[test]
+    fn transform_graph_sends_r_uint_of_signed_pct_x_mod_to_the_hex_helper() {
+        let mut graph = FunctionGraph::new("int_hex_r_uint");
+        let n_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "n".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let m_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["rpython", "rlib", "rarithmetic", "r_uint"]),
+                    args: crate::model::call_args(vec![n_var.clone()]),
+                    result_ty: ValueType::Unsigned,
+                },
+                true,
+            )
+            .unwrap();
+        let fmt_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "%x"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs: fmt_var.clone(),
+                    rhs: m_var.clone(),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+
+        FunctionGraph::set_concretetype_of_inline(&n_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&m_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&fmt_var, ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+
+        assert_pct_x_mod_rewritten_to_ll_int2hex(&graph);
     }
 
     #[test]
@@ -26127,6 +26660,73 @@ mod tests {
                 .iter()
                 .any(|o| matches!(&o.kind, OpKind::ArrayRead { pure: true, .. })),
             "no ArrayRead should have been rewritten pure"
+        );
+    }
+
+    /// `jtransform.py rewrite_op_getinteriorfield`: an `ArrayRead` of a
+    /// `Ptr(rstr.STR)` is `strgetitem`.
+    #[test]
+    fn getarrayitem_on_a_str_pointer_is_strgetitem() {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let mut cc = CallControl::new();
+        let mut graph = FunctionGraph::new("hex_digit");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Call {
+                    target: CallTarget::function_path(["__str_const", "0123456789abcdef"]),
+                    args: crate::model::call_args(vec![]),
+                    result_ty: ValueType::Str,
+                },
+                true,
+            )
+            .unwrap();
+        s.set_concretetype(Some(STRPTR.clone()));
+        let index = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "i".to_string(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::ArrayRead {
+                    base: s,
+                    index,
+                    item_ty: ValueType::Int,
+                    array_type_id: None,
+                    nolength: false,
+                    pure: true,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, None);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let transformed = transformer.transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|o| matches!(
+                &o.kind,
+                OpKind::LoweredBlackholeOp { opname, .. }
+                    if opname == "strgetitem" && o.result.as_ref() == Some(&result)
+            )),
+            "ArrayRead of a STR pointer must become strgetitem: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o.kind, OpKind::ArrayRead { .. })),
+            "no ArrayRead should remain: {ops:?}"
         );
     }
 

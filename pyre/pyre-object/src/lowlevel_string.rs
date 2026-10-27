@@ -802,6 +802,46 @@ pub extern "C" fn jit_ll_int2dec(val: i64) -> *mut crate::unicodeobject::Utf8Str
     out as *mut crate::unicodeobject::Utf8Str
 }
 
+/// `ll_str.py hex_chars` — immortal `'0123456789abcdef'` nibble table.
+const HEX_CHARS: &[u8; 16] = b"0123456789abcdef";
+
+/// `ll_str.py ll_int2hex(i, addPrefix=False)` — `@jit.elidable` lowercase
+/// hex render of the unsigned bits into a fresh rstr `STR`. No `0x`
+/// prefix; `0` → `"0"`. `mallocstr` failure raises MemoryError and
+/// returns null.
+#[majit_macros::elidable]
+pub extern "C" fn jit_ll_int2hex(val: u64) -> *mut crate::unicodeobject::Utf8Str {
+    // `malloc(CHAR_ARRAY, 20)` — digits least-significant first.
+    let mut temp = [0u8; 20];
+    let mut len = 0usize;
+    // `ll_unsigned(i)`: unsigned input, so upstream's sign branch is constant 0.
+    let mut i = val;
+    if i == 0 {
+        len = 1;
+        temp[0] = b'0';
+    } else {
+        while i != 0 {
+            temp[len] = HEX_CHARS[(i & 0xf) as usize];
+            i >>= 4;
+            len += 1;
+        }
+    }
+    let result = mallocstr(len);
+    if result == 0 {
+        return raise_ll_memory_error();
+    }
+    // `result.hash = 0` is already stored by `mallocstr`.
+    unsafe {
+        let dst = (result as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
+        let mut j = 0usize;
+        while j < len {
+            *dst.add(j) = temp[len - j - 1];
+            j += 1;
+        }
+    }
+    result as *mut crate::unicodeobject::Utf8Str
+}
+
 /// `rgc.ll_shrink_array(buf, new_len)` — the non-virtual residual target of the
 /// StringBuilder / UnicodeBuilder `build` tree's `ll_shrink_final`.
 ///
@@ -954,6 +994,22 @@ mod tests {
         // Source layout is untouched; the payload is a distinct STR.
         assert_ne!(buf as *const u8, src.as_ptr());
         bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
+
+    #[test]
+    fn jit_ll_int2hex_renders_unsigned_lowercase() {
+        for (val, expected) in [(0u64, "0"), (0x1a, "1a"), (u64::MAX, "ffffffffffffffff")] {
+            let buf = jit_ll_int2hex(val);
+            assert!(!buf.is_null());
+            let buf = buf as i64;
+            assert_eq!(bh_lowlevel_string_len(buf), expected.len());
+            let chars: String = bh_read_lowlevel_string(buf, 1)
+                .into_iter()
+                .map(|c| c as u8 as char)
+                .collect();
+            assert_eq!(chars, expected);
+            bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
+        }
     }
 
     #[test]

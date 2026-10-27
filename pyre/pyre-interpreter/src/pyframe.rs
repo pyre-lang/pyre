@@ -6707,9 +6707,10 @@ impl PyFrame {
     /// [`Self::getcode`] is the `hint(self.pycode, promote=True)` path.
     #[inline]
     pub fn code(&self) -> &CodeObject {
-        unsafe {
-            &*(crate::w_code_get_ptr(self.pycode as pyre_object::PyObjectRef) as *const CodeObject)
-        }
+        // Read `code_ptr` at its own raw-flavored type: a `*const ()` hop
+        // types the value as a GC object, and the cast back to the raw
+        // `CodeObject` pointer fails `rtype_cast_instance_intrinsic`.
+        unsafe { &*(*(self.pycode as *const crate::pycode::PyCode)).code_ptr }
     }
 
     /// `pycode.py` `PyCode.co_flags` — the compiler flag word

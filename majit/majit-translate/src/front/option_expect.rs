@@ -63,6 +63,9 @@ pub(crate) struct ExpectSite {
     /// The `Option`'s payload `T` projected to a [`ValueType`] — the
     /// `Some::__pos_0` field kind and the extracted result kind.
     pub payload_ty: ValueType,
+    /// `Option<char>`: `__pos_0` is the INT code point
+    /// `Utf8StringIterator.next` (`rutf8.py`) yields; wrap `builtin_unichr`.
+    pub payload_is_char: bool,
     /// True when the receiver is a niche `Option<NonNull<_>>` — a one-word
     /// pointer with no aggregate `__discriminant` / `__pos_0`.  The `Some`-arm
     /// discriminant is then `opt != null` and the payload is the base pointer
@@ -225,6 +228,11 @@ fn rewire_one_expect_site(graph: &mut FunctionGraph, site: &ExpectSite) -> Resul
         payload
     };
     let payload_value = crate::front::option_unwrap::emit_narrow(graph, then_bb, &cast, payload);
+    let payload_value = if site.payload_is_char {
+        crate::front::mir::push_unichr(graph, then_bb, payload_value)
+    } else {
+        payload_value
+    };
     let then_link_args = reproduce_exit_args(
         &saved_exit,
         &out_var,
@@ -343,6 +351,7 @@ mod tests {
                 option_owner: "core::option::Option".to_string(),
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
+                payload_is_char: false,
                 niche: false,
                 int_null: None,
                 scalar_niche: false,
@@ -427,6 +436,7 @@ mod tests {
                 option_owner: "core::option::Option".to_string(),
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Ref(None),
+                payload_is_char: false,
                 niche: true,
                 int_null: None,
                 scalar_niche: false,
@@ -478,6 +488,7 @@ mod tests {
                 option_owner: "core::option::Option".to_string(),
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
+                payload_is_char: false,
                 niche: false,
                 int_null: None,
                 scalar_niche: false,
@@ -517,6 +528,7 @@ mod tests {
                 option_owner: "core::option::Option".to_string(),
                 some_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
+                payload_is_char: false,
                 niche: true,
                 int_null: Some(crate::model::NicheIntNull::FnPtr(None)),
                 scalar_niche: false,
