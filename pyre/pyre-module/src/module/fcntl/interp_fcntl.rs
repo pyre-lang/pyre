@@ -341,7 +341,7 @@ fn fcntl(
         // falling back to `space.int_w`; a TypeError from the buffer
         // arm is the signal to take the integer one.
         if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
-            let data = match arg_readbuf(w_arg, "fcntl") {
+            let data = match pyre_object::with_roots!(w_cmd, w_arg => arg_readbuf(w_arg, "fcntl")) {
                 Ok(data) => data,
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
                     let arg = pyre_object::with_roots!(w_cmd, w_arg => {
@@ -483,7 +483,7 @@ fn ioctl(
                     return ioctl_mutable(fd, request, slice);
                 }
             }
-            match arg_readbuf(arg, "ioctl") {
+            match pyre_object::with_roots!(w_request, w_arg, w_mutate, arg => arg_readbuf(arg, "ioctl")) {
                 Ok(buf) => return ioctl_readonly(fd, request, buf),
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {}
                 Err(e) => return Err(e),

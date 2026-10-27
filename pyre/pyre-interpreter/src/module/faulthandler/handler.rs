@@ -781,32 +781,36 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                             "register() missing signal",
                         ));
                     }
+                    // Bind every later slot before the first coercion: `args`
+                    // is a native `&[PyObjectRef]` copy the collector does not
+                    // rewrite, and `gateway_int_w` can collect.
+                    let mut w_file_arg = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_all_threads = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_chain = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_max_threads = args.get(4).copied().unwrap_or(pyre_object::PY_NULL);
                     // `handler.py register` `@unwrap_spec(signum=int)`.
-                    let signum =
-                        pyre_interpreter::baseobjspace::gateway_int_w(w_signum)? as libc::c_int;
+                    let signum = pyre_object::with_roots!(w_file_arg, w_all_threads, w_chain, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_signum))? as libc::c_int;
                     // `handler.py register` `@unwrap_spec(all_threads=int, chain=int)`
                     // with defaults `all_threads=1, chain=0`: the arguments are
                     // coerced as integers (`gateway_int_w`, raising on a non-int),
                     // not by truthiness; `register` then tests `if all_threads:`.  An
                     // omitted keyword leaves a null slot from the signature binding, so
                     // treat null as the default.
-                    let all_threads = args
-                        .get(2)
-                        .copied()
-                        .filter(|a| !a.is_null())
-                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                        .transpose()?
-                        .unwrap_or(1)
-                        != 0;
-                    let chain = args
-                        .get(3)
-                        .copied()
-                        .filter(|a| !a.is_null())
-                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                        .transpose()?
-                        .unwrap_or(0)
-                        != 0;
-                    let max_threads = int_arg(args, 4, 100)? as libc::c_int;
+                    let all_threads = if w_all_threads.is_null() {
+                        1
+                    } else {
+                        pyre_object::with_roots!(w_file_arg, w_chain, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_all_threads))?
+                    } != 0;
+                    let chain = if w_chain.is_null() {
+                        0
+                    } else {
+                        pyre_object::with_roots!(w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_chain))?
+                    } != 0;
+                    let max_threads = if w_max_threads.is_null() {
+                        100
+                    } else {
+                        pyre_object::with_roots!(w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
+                    } as libc::c_int;
                     #[cfg(all(unix, feature = "host_env"))]
                     {
                         // Resolving the file runs a user `fileno()` and `flush()`.
@@ -816,9 +820,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         // must not run those side effects at all — so this sits
                         // after the coercions above and inside the support gate.
                         check_signum(signum)?;
-                        let (fd, w_file) = faulthandler_get_fileno_and_file(
-                            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
-                        )?;
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(w_file_arg)?;
                         // Nothing else names the resolved file between here and the
                         // owner store below, so keep it rooted across the install.
                         let _roots = pyre_object::gc_roots::push_roots();
