@@ -9043,7 +9043,7 @@ fn recast_images_of(ops: &[crate::model::SpaceOperation], start: &Variable) -> V
 /// object being reloaded: `reload_top_root[_at]` and
 /// `try_gc_current_object_address`. `get` / `shadow_stack_get` stay out —
 /// their first argument is the scope, not the root.
-fn is_gc_erasure_root_identity(kind: &OpKind) -> bool {
+pub(crate) fn is_gc_erasure_root_identity(kind: &OpKind) -> bool {
     let OpKind::Call {
         target: CallTarget::FunctionPath { segments, .. },
         ..

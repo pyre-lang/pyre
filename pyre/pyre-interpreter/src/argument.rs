@@ -2004,21 +2004,24 @@ impl ArgErr {
                 num_defaults,
                 given,
                 kwonly_given,
-            } => format_too_many(signature, *num_defaults, *given, *kwonly_given),
+            } => format_too_many(
+                signature.num_argnames(),
+                *num_defaults,
+                *given,
+                *kwonly_given,
+            ),
             ArgErr::TooManyMethod {
                 signature,
                 num_defaults,
                 given,
                 kwonly_given,
-            } => {
-                let mut msg = format_too_many(signature, *num_defaults, *given, *kwonly_given);
-                let n = signature.num_argnames();
-                // argument.py:592-594 — "did you forget self?" hint.
-                if *given == n + 1 && (n == 0 || signature.argnames[0] != "self") {
-                    msg.push_str(". Did you forget 'self' in the function definition?");
-                }
-                msg
-            }
+            } => format_too_many_method(
+                signature.num_argnames(),
+                signature.argnames.first().copied(),
+                *num_defaults,
+                *given,
+                *kwonly_given,
+            ),
             ArgErr::MultipleValues { argname } => {
                 format!("got multiple values for argument '{argname}'")
             }
@@ -2042,15 +2045,13 @@ impl ArgErr {
     }
 }
 
-/// pypy/interpreter/argument.py `ArgErrTooMany.getmsg` body.
-/// Extracted because both `TooMany` and `TooManyMethod` arms share it.
-fn format_too_many(
-    signature: &crate::gateway::Signature,
+/// pypy/interpreter/argument.py `ArgErrTooMany.getmsg`.
+pub(crate) fn format_too_many(
+    num_args: usize,
     num_defaults: usize,
     given: usize,
     kwonly_given: usize,
 ) -> String {
-    let num_args = signature.num_argnames();
     let takes_str = if num_defaults > 0 {
         format!(
             "from {} to {} positional arguments",
@@ -2072,6 +2073,22 @@ fn format_too_many(
         format!("{given} {verb}")
     };
     format!("takes {takes_str} but {given_str} given")
+}
+
+/// pypy/interpreter/argument.py `ArgErrTooManyMethod.getmsg`: `ArgErrTooMany.getmsg` plus the
+/// forgotten-self hint when exactly one positional too many was given and the first parameter is not `self`.
+pub(crate) fn format_too_many_method(
+    num_args: usize,
+    first_argname: Option<&str>,
+    num_defaults: usize,
+    given: usize,
+    kwonly_given: usize,
+) -> String {
+    let mut msg = format_too_many(num_args, num_defaults, given, kwonly_given);
+    if given == num_args + 1 && (num_args == 0 || first_argname != Some("self")) {
+        msg.push_str(". Did you forget 'self' in the function definition?");
+    }
+    msg
 }
 
 #[cfg(test)]

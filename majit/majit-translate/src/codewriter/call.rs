@@ -110,8 +110,11 @@ pub(crate) fn access_directly_identity_origin(origin: &CallPath, aliases: &[Call
 }
 
 /// True when `kind` is an identity whose result is the value it reloads or
-/// casts: the predicates `jtransform` folds to `same_as`, plus a GC-root
-/// reload (`is_gc_root_reload`). The reloaded value is the call's first
+/// casts: the predicates `jtransform` folds to `same_as`, plus a GC-erasure
+/// reload whose first argument is the reloaded object
+/// (`is_gc_erasure_root_identity`); a root-slot read (`gc_roots::get`,
+/// `shadow_stack_get`) takes a scope or an index and is not an identity
+/// (`shadowcolor.py _gc_restore_root`). The reloaded value is the call's first
 /// argument, the way `peel_recast_to_source` identifies it. An AccessDirect
 /// retarget of that callee is still identity: `jtransform.py
 /// rewrite_op_same_as` folds the origin call, and `annrpython.py
@@ -145,7 +148,7 @@ fn call_is_access_directly_identity(kind: &OpKind) -> bool {
 
 fn call_kind_is_access_directly_identity(kind: &OpKind) -> bool {
     if crate::front::result_exc::is_recast_narrow(kind)
-        || crate::front::result_exc::is_gc_root_reload(kind)
+        || crate::front::result_exc::is_gc_erasure_root_identity(kind)
     {
         return true;
     }
@@ -7060,14 +7063,16 @@ impl CallControl {
     ///
     /// Identity ops the codewriter already folds to `same_as`
     /// (`jtransform.py rewrite_op_same_as` / `rewrite_op_cast_pointer` /
-    /// the `deref` reborrow) forward the flag. A GC-root reload
-    /// (`is_gc_root_reload`) forwards it from the value it reloads — the
-    /// call's first argument, the way `peel_recast_to_source` identifies
-    /// it. An identity callee's `recursivecall` return does not bind
-    /// the caller's result; `identity_forward` carries the flag so
-    /// `annrpython.py setbinding` still sees one Variable. Stored
-    /// `call_result_flags` are the `annrpython.py recursivecall`
-    /// return binding of a non-identity call.
+    /// the `deref` reborrow) forward the flag. A GC-erasure reload whose
+    /// first argument is the reloaded object (`is_gc_erasure_root_identity`)
+    /// forwards it from the value it reloads — the call's first argument,
+    /// the way `peel_recast_to_source` identifies it. A root-slot read
+    /// (`gc_roots::get`, `shadow_stack_get`) takes a scope or an index and
+    /// is not an identity (`shadowcolor.py _gc_restore_root`). An identity
+    /// callee's `recursivecall` return does not bind the caller's result;
+    /// `identity_forward` carries the flag so `annrpython.py setbinding`
+    /// still sees one Variable. Stored `call_result_flags` are the
+    /// `annrpython.py recursivecall` return binding of a non-identity call.
     pub(crate) fn access_directly_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
         let unknown = HashSet::new();
         let hinted = Self::access_directly_hinted_ids(graph, &unknown);
@@ -17287,6 +17292,95 @@ mod tests {
             other => panic!("expected Call to q, got {other:?}"),
         }
         assert_access_directly_copy(&cc, &q_path, &[0]);
+    }
+
+    /// A root-slot read (`gc_roots::get`, `shadow_stack_get`) takes a
+    /// scope or an index, not the restored object (`shadowcolor.py
+    /// _gc_restore_root`). An AccessDirect flag on that first argument
+    /// does not follow the result, so the subsequent call to `q` stays
+    /// on the regular graph.
+    fn drive_root_slot_read_then_call_q(
+        leaf: &str,
+        n_formals: usize,
+    ) -> (CallControl, CallPath, CallPath) {
+        let mut cc = CallControl::new();
+        let getter_path = CallPath::from_segments(["gc_roots", leaf]);
+        let mut getter = graph_with_formals(leaf, n_formals);
+        let other = getter.alloc_value_var();
+        getter.set_return(getter.startblock, Some(other));
+        getter.return_flags = FlagReturn::UNFLAGGED;
+        cc.register_function_graph(getter_path, getter);
+
+        let q_path = CallPath::from_segments(["q"]);
+        cc.register_function_graph(q_path.clone(), graph_with_formals("q", 1));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        let loaded = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: frame,
+                kind: crate::hints::HintKind::AccessDirectly,
+            },
+        });
+        let mut args = vec![hinted];
+        if n_formals > 1 {
+            args.push(caller.alloc_value_var());
+        }
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["gc_roots", leaf]),
+                args: crate::model::call_args(args),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(q_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([loaded]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        cc.annotate_access_directly(&[caller_path.clone()]);
+        (cc, caller_path, q_path)
+    }
+
+    fn assert_q_not_retargeted(cc: &CallControl, caller_path: &CallPath, q_path: &CallPath) {
+        let caller = cc.function_graphs().get(caller_path).expect("caller");
+        match &caller.block(caller.startblock).operations[2].kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let target = CallPath::from_segments(segments.iter().map(String::as_str));
+                assert_eq!(
+                    target, *q_path,
+                    "call to q must keep the regular path; a root-slot read is not an identity"
+                );
+            }
+            other => panic!("expected Call to q, got {other:?}"),
+        }
+        assert_no_access_directly_copy(cc, q_path);
+    }
+
+    #[test]
+    fn shadow_stack_get_does_not_keep_access_directly_for_the_next_call() {
+        let (cc, caller_path, q_path) = drive_root_slot_read_then_call_q("shadow_stack_get", 1);
+        assert_q_not_retargeted(&cc, &caller_path, &q_path);
+    }
+
+    #[test]
+    fn gc_roots_get_does_not_keep_access_directly_for_the_next_call() {
+        let (cc, caller_path, q_path) = drive_root_slot_read_then_call_q("get", 2);
+        assert_q_not_retargeted(&cc, &caller_path, &q_path);
     }
 
     /// A self-loop whose only binding is itself has no seed, so the flag

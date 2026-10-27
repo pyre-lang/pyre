@@ -2153,7 +2153,7 @@ fn call_thread_target(
         roots.normalize(head, 2 + n_mixed);
         let mixed_now: Vec<PyObjectRef> = (0..n_mixed).map(|i| roots.get(mixed_base + i)).collect();
         let resolved =
-            crate::call::resolve_kwargs(roots.get(head), &mixed_now, roots.get(head + 1))?;
+            crate::call::resolve_kwargs(roots.get(head), &mixed_now, roots.get(head + 1), false)?;
         let target = roots.get(head);
         crate::call::call_user_function_plain_with_ctx(ec, target, &resolved)
     } else {

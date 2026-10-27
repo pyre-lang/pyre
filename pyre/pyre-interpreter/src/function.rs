@@ -4996,6 +4996,63 @@ except TypeError as e:
         assert_eq!(r_g0, "g0() takes 0 positional arguments but 1 was given");
     }
 
+    /// `callmethod.py CALL_METHOD_KW` stores `Arguments.methodcall`;
+    /// `argument.py ArgErrTooManyMethod.getmsg` appends the forgotten-self
+    /// hint on that keyword path. A bound-method object plus keywords, and a
+    /// first parameter already named `self`, do not.
+    #[test]
+    fn call_kw_methodcall_arity_error_carries_self_hint() {
+        crate::test_hooks::install_hash_hook();
+        let source = "\
+class A:
+    def g(a, *, k):
+        pass
+    def gself(self, *, k):
+        pass
+m = A().g
+try:
+    A().g(1, k=2)
+except TypeError as e:
+    r_call_kw_self = str(e)
+try:
+    m(1, k=2)
+except TypeError as e:
+    r_bound_kw = str(e)
+try:
+    A().gself(1, k=2)
+except TypeError as e:
+    r_self_named = str(e)
+";
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("CALL_KW methodcall arity snippet");
+        let w_globals = frame.get_w_globals();
+        let get = |name: &str| {
+            let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+            unsafe { pyre_object::w_str_get_wtf8(value) }
+                .as_str()
+                .expect(name)
+                .to_string()
+        };
+        let r_call_kw_self = get("r_call_kw_self");
+        let r_bound_kw = get("r_bound_kw");
+        let r_self_named = get("r_self_named");
+        assert_eq!(
+            r_call_kw_self,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given. Did you forget 'self' in the function definition?"
+        );
+        assert_eq!(
+            r_bound_kw,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
+        assert!(
+            !r_self_named.contains("Did you forget 'self'"),
+            "gself: {r_self_named}"
+        );
+    }
+
     /// `FUNCTION_GC_PTR_OFFSETS` must list every inline
     /// `PyObjectRef`-shaped field the GC traces (`code` is `*const ()`
     /// but points at a `[ob: PyObject, ...]`-prefixed Code object so

@@ -864,7 +864,8 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 }
 
 /// `argument.py ArgErrTooMany.getmsg` / `ArgErrTooManyMethod.getmsg`
-/// for a user-function positional overflow.
+/// for a user-function positional overflow. Message body is
+/// `argument.rs` `format_too_many` / `format_too_many_method`.
 ///
 /// `fill_user_function_args` is `_match_signature`'s positional analog;
 /// `methodcall` is the `Arguments.methodcall` field that site reads.
@@ -888,34 +889,26 @@ fn user_function_too_many_error(
     } else {
         0
     };
-    let takes_str = if ndefaults > 0 {
-        format!(
-            "from {} to {} positional arguments",
-            nparams as isize - ndefaults as isize,
-            nparams
+    // Positional path: no keywords, so no keyword-only slots are filled.
+    let kwonly_given = 0;
+    // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
+    let body = if methodcall {
+        crate::argument::format_too_many_method(
+            nparams,
+            code_ref.varnames.first().map(|n| n.as_str()),
+            ndefaults,
+            nargs,
+            kwonly_given,
         )
     } else {
-        format!(
-            "{} positional argument{}",
-            nparams,
-            if nparams != 1 { "s" } else { "" }
-        )
+        crate::argument::format_too_many(nparams, ndefaults, nargs, kwonly_given)
     };
-    let given_str = format!("{} {}", nargs, if nargs != 1 { "were" } else { "was" });
     // `fname` is WTF-8: `format!` would render it through `Display`, which
     // substitutes U+FFFD for a lone surrogate.
     let mut msg = Wtf8Buf::new();
     msg.push_wtf8(&fname);
-    msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
-    // argument.py `ArgErrTooManyMethod.getmsg`: append the forgotten-self
-    // hint when the extra argument is exactly one past `num_argnames`
-    // and the first parameter is not already named `self`.
-    if methodcall {
-        let first = code_ref.varnames.first().map(|name| name.as_str());
-        if nargs == nparams + 1 && (nparams == 0 || first != Some("self")) {
-            msg.push_str(". Did you forget 'self' in the function definition?");
-        }
-    }
+    msg.push_str("() ");
+    msg.push_str(&body);
     crate::builtins::applevel_binding_error(callable, args, &[], crate::PyError::type_error(msg))
 }
 
@@ -1388,6 +1381,7 @@ pub fn function_call_args(func: PyObjectRef, args: &crate::argument::Arguments) 
             values,
             true,
             std::ptr::null_mut(),
+            args.methodcall,
         );
     }
     let code = unsafe { crate::getcode(func) };
@@ -1900,6 +1894,7 @@ fn call_function_ex_impl(
                 &keywords_w,
                 true,
                 profile_anchor.live(),
+                false,
             );
         }
     }
@@ -1974,6 +1969,11 @@ fn call_kw_in_ctx_impl(
     kwarg_names: PyObjectRef,
     profile_frame: *mut PyFrame,
 ) -> PyResult {
+    // callmethod.py CALL_METHOD_KW: `Arguments(..., methodcall=w_self is not None)`.
+    // A later bound-method unwrap does not set this: `function.py Method.call_args`
+    // prepends through `argument.py Arguments.replace_arguments`, which leaves
+    // methodcall false.
+    let methodcall = self_or_null != pyre_object::PY_NULL;
     let mut args: Vec<PyObjectRef> = positional.to_vec();
 
     if self_or_null != pyre_object::PY_NULL {
@@ -2152,6 +2152,7 @@ fn call_kw_in_ctx_impl(
                 &keywords_w,
                 true,
                 profile_anchor.live(),
+                methodcall,
             );
         }
         return call_callable_with_mode(
@@ -2242,6 +2243,7 @@ fn call_kw_in_ctx_impl(
         roots.get(func_slot),
         &args_for_resolve,
         roots.get(func_slot + 1),
+        methodcall,
     ) {
         Ok(resolved) => resolved,
         Err(err) => {
@@ -2754,10 +2756,14 @@ pub fn call_callable_inline_residual(
 /// method surface is a separate, much larger refactor that would also
 /// re-thread `call_with_kwargs` / `parse_builtin_signature`; it is out of
 /// scope here and tracked as a follow-up.
+///
+/// `methodcall` is `Arguments.methodcall`. `Arguments._match_signature`
+/// raises `ArgErrTooManyMethod` when it is set.
 pub(crate) fn resolve_kwargs(
     callable: PyObjectRef,
     args: &[PyObjectRef],
     kwarg_names: PyObjectRef,
+    methodcall: bool,
 ) -> Result<Vec<PyObjectRef>, crate::PyError> {
     if kwarg_names.is_null() {
         return Ok(args.to_vec());
@@ -2937,58 +2943,30 @@ pub(crate) fn resolve_kwargs(
                 0
             }
         };
-        let takes_str = if ndefaults > 0 {
-            format!(
-                "from {} to {} positional arguments",
-                n_pos_params as isize - ndefaults as isize,
-                n_pos_params
-            )
-        } else {
-            format!(
-                "{} positional argument{}",
+        // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
+        // Keyword-only slots are `result[n_pos_params .. n_pos_params + kwonlyarg_count]`
+        // after `skip_cls` (`nparams = total_params - skip_cls`).
+        let mut kwonly_given: usize = 0;
+        for i in n_pos_params..(n_pos_params + code.kwonlyarg_count as usize) {
+            if !result[i].is_null() {
+                kwonly_given += 1;
+            }
+        }
+        let body = if methodcall {
+            crate::argument::format_too_many_method(
                 n_pos_params,
-                if n_pos_params != 1 { "s" } else { "" }
-            )
-        };
-        // argument.py:571 ArgErrTooMany.getmsg
-        let nkwonly_given = if nkw > 0 {
-            let nkwonly = code.kwonlyarg_count as usize;
-            (0..nkw)
-                .filter(|&ki| {
-                    let kw_name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                    if let Some(kw_obj) = kw_name {
-                        if !unsafe { pyre_object::is_str(kw_obj) } {
-                            return false;
-                        }
-                        let kw_s = unsafe { pyre_object::w_str_get_value_opt(kw_obj) };
-                        (0..nkwonly)
-                            .any(|j| Some(&*code.varnames[skip_cls + n_pos_params + j]) == kw_s)
-                    } else {
-                        false
-                    }
-                })
-                .count()
-        } else {
-            0
-        };
-        let given_str = if nkwonly_given > 0 {
-            format!(
-                "{} positional argument{} (and {} keyword-only argument{}) were given",
+                code.varnames.first().map(|n| n.as_str()),
+                ndefaults,
                 n_pos,
-                if n_pos != 1 { "s" } else { "" },
-                nkwonly_given,
-                if nkwonly_given != 1 { "s" } else { "" },
+                kwonly_given,
             )
         } else {
-            format!(
-                "{} {} given",
-                n_pos,
-                if n_pos != 1 { "were" } else { "was" }
-            )
+            crate::argument::format_too_many(n_pos_params, ndefaults, n_pos, kwonly_given)
         };
         let mut msg = Wtf8Buf::new();
         msg.push_wtf8(&fname);
-        msg.push_str(&format!("() takes {takes_str} but {given_str}"));
+        msg.push_str("() ");
+        msg.push_str(&body);
         return Err(crate::PyError::type_error(msg));
     }
 
@@ -3686,6 +3664,7 @@ pub fn call_args(callable: PyObjectRef, args: &crate::argument::Arguments) -> Py
         values,
         true,
         std::ptr::null_mut(),
+        args.methodcall,
     )
 }
 
@@ -3752,6 +3731,7 @@ fn call_with_minted_keyword_names(
         &keywords_w,
         dispatch_metaclass_call,
         std::ptr::null_mut(),
+        false,
     )
 }
 
@@ -3760,6 +3740,10 @@ fn call_with_minted_keyword_names(
 /// `__new__`/`__init__` directly after a custom metaclass delegates through
 /// `super().__call__`, so redispatching that same metaclass override here
 /// would recurse instead of reaching the default constructor path.
+///
+/// `methodcall` is `Arguments.methodcall`; `_match_signature` raises
+/// `ArgErrTooManyMethod` when it is set. Callers that hold an `Arguments`
+/// pass `args.methodcall`; star-arg and minted-name paths pass `false`.
 fn call_with_kwargs_in_ctx_impl(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -3768,6 +3752,7 @@ fn call_with_kwargs_in_ctx_impl(
     keywords_w: &[PyObjectRef],
     dispatch_metaclass_call: bool,
     profile_frame: *mut crate::pyframe::PyFrame,
+    methodcall: bool,
 ) -> PyResult {
     // `call_args_and_c_profile` / `CALL_FUNCTION_KW` keep `frame` across
     // override binding and argument marshalling.  Reload it after each
@@ -3824,6 +3809,7 @@ fn call_with_kwargs_in_ctx_impl(
             &values,
             dispatch_metaclass_call,
             profile_frame,
+            methodcall,
         )
     };
 
@@ -4278,23 +4264,30 @@ fn call_with_kwargs_in_ctx_impl(
                         0
                     }
                 };
-                let takes_str = if ndefaults > 0 {
-                    format!(
-                        "from {} to {} positional arguments",
-                        n_pos_params as isize - ndefaults as isize,
-                        n_pos_params
+                // argument.py Arguments._match_signature — `self.methodcall` selects `ArgErrTooManyMethod`.
+                // Keyword-only slots are `result[n_pos_params .. n_pos_params + kwonlyarg_count]`;
+                // the keyword loop above stored matches with `result[pi] = current_kwarg(kw_index)`.
+                let mut kwonly_given: usize = 0;
+                for i in n_pos_params..(n_pos_params + code.kwonlyarg_count as usize) {
+                    if !result[i].is_null() {
+                        kwonly_given += 1;
+                    }
+                }
+                let body = if methodcall {
+                    crate::argument::format_too_many_method(
+                        n_pos_params,
+                        code.varnames.first().map(|n| n.as_str()),
+                        ndefaults,
+                        npos,
+                        kwonly_given,
                     )
                 } else {
-                    format!(
-                        "{} positional argument{}",
-                        n_pos_params,
-                        if n_pos_params != 1 { "s" } else { "" }
-                    )
+                    crate::argument::format_too_many(n_pos_params, ndefaults, npos, kwonly_given)
                 };
-                let given_str = format!("{} {}", npos, if npos != 1 { "were" } else { "was" });
                 let mut msg = Wtf8Buf::new();
                 msg.push_wtf8(&fname);
-                msg.push_str(&format!("() takes {takes_str} but {given_str} given"));
+                msg.push_str("() ");
+                msg.push_str(&body);
                 return Err(binding_error(crate::PyError::type_error(msg)));
             }
 
@@ -5175,6 +5168,7 @@ pub fn type_call_instantiate_with_kwargs(
         keywords_w,
         false,
         std::ptr::null_mut(),
+        false,
     )
 }
 
@@ -5676,6 +5670,7 @@ fn call_metaclass_with_kwargs(
                 pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
                 &call_args,
                 kwarg_names,
+                false,
             ) {
                 Ok(resolved) => call_user_function_resolved_frameless(
                     pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
@@ -5707,6 +5702,7 @@ fn call_metaclass_with_kwargs(
                     &values,
                     true,
                     std::ptr::null_mut(),
+                    false,
                 )
             };
             match result {
@@ -5762,6 +5758,7 @@ fn call_metaclass_with_kwargs(
                 pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
                 &call_args,
                 kwarg_names,
+                false,
             ) {
                 Ok(resolved) => {
                     let res = call_user_function_resolved_frameless(
@@ -6084,7 +6081,7 @@ mod pack_varargs_tests {
         pyre_object::gc_hook::register_gc_alloc_hook(collecting_alloc_hook);
         pyre_object::gc_hook::register_gc_alloc_stable_hook(collecting_stable_hook);
         let _clear = ClearHook;
-        let resolved = super::resolve_kwargs(func, &[before, default_value], names)
+        let resolved = super::resolve_kwargs(func, &[before, default_value], names, false)
             .expect("keyword binding should succeed");
         drop(_clear);
         let after = roots.get(slot);
@@ -6197,7 +6194,7 @@ mod pack_varargs_tests {
         pyre_object::gc_hook::register_gc_alloc_hook(collecting_alloc_hook);
         pyre_object::gc_hook::register_gc_alloc_stable_hook(collecting_stable_hook);
         let _clear = ClearHook;
-        let resolved = super::resolve_kwargs(func, &[value_a, value_b], names)
+        let resolved = super::resolve_kwargs(func, &[value_a, value_b], names, false)
             .expect("keyword binding should succeed");
         drop(_clear);
         let after = roots.get(slot);
@@ -6266,6 +6263,204 @@ mod function_call_args_tests {
                 30
             );
         }
+    }
+}
+
+/// `argument.py ArgErrTooManyMethod.getmsg` on the keyword path.
+/// `callmethod.py CALL_METHOD_KW` stores `methodcall` from the LOAD_METHOD
+/// self slot; a bound-method object unwrapped from a plain CALL_KW does not.
+#[cfg(test)]
+mod forgotten_self_hint_tests {
+    fn run_snippet(source: &str) -> pyre_object::PyObjectRef {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile_exec(source).expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame
+            .execute_frame(None, None)
+            .expect("forgotten-self snippet");
+        frame.get_w_globals()
+    }
+
+    fn get_str(w_globals: pyre_object::PyObjectRef, name: &str) -> String {
+        let value = unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+        unsafe { pyre_object::w_str_get_wtf8(value) }
+            .as_str()
+            .expect(name)
+            .to_string()
+    }
+
+    /// CALL_KW with self appends the hint; a bound-method callable with
+    /// keywords does not; a first parameter already named `self` does not.
+    #[test]
+    fn call_kw_methodcall_arity_error_carries_self_hint() {
+        let source = "\
+class A:
+    def g(a, *, k):
+        pass
+    def f(a):
+        pass
+    def gself(self, *, k):
+        pass
+    def h(a, *, k, j):
+        pass
+m = A().g
+n = A().f
+try:
+    A().g(1, k=2)
+except TypeError as e:
+    r_call_kw_self = str(e)
+try:
+    m(1, k=2)
+except TypeError as e:
+    r_bound_kw = str(e)
+try:
+    n(1)
+except TypeError as e:
+    r_bound_pos = str(e)
+try:
+    A().g(*[1], k=2)
+except TypeError as e:
+    r_star_kw = str(e)
+try:
+    A().g(*[1], **{'k': 2})
+except TypeError as e:
+    r_star_starstar = str(e)
+try:
+    A().h(*[1], k=2, j=3)
+except TypeError as e:
+    r_star_two_kwonly = str(e)
+try:
+    A().f(*[1])
+except TypeError as e:
+    r_star_pos = str(e)
+try:
+    A().gself(1, k=2)
+except TypeError as e:
+    r_self_named = str(e)
+";
+        let w_globals = run_snippet(source);
+        let r_call_kw_self = get_str(w_globals, "r_call_kw_self");
+        let r_bound_kw = get_str(w_globals, "r_bound_kw");
+        let r_bound_pos = get_str(w_globals, "r_bound_pos");
+        let r_star_kw = get_str(w_globals, "r_star_kw");
+        let r_star_starstar = get_str(w_globals, "r_star_starstar");
+        let r_star_two_kwonly = get_str(w_globals, "r_star_two_kwonly");
+        let r_star_pos = get_str(w_globals, "r_star_pos");
+        let r_self_named = get_str(w_globals, "r_self_named");
+        assert_eq!(
+            r_call_kw_self,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given. Did you forget 'self' in the function definition?"
+        );
+        assert_eq!(
+            r_bound_kw,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
+        assert_eq!(
+            r_bound_pos,
+            "A.f() takes 1 positional argument but 2 were given. Did you forget 'self' in the function definition?"
+        );
+        assert_eq!(
+            r_star_kw,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
+        assert_eq!(
+            r_star_starstar,
+            "A.g() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
+        assert_eq!(
+            r_star_two_kwonly,
+            "A.h() takes 1 positional argument but 2 positional arguments (and 2 keyword-only arguments) were given"
+        );
+        assert!(
+            !r_star_pos.contains("Did you forget 'self'"),
+            "star pos: {r_star_pos}"
+        );
+        assert!(
+            !r_self_named.contains("Did you forget 'self'"),
+            "gself: {r_self_named}"
+        );
+    }
+
+    /// `resolve_kwargs` itself appends the hint from `methodcall`, matching
+    /// `argument.py ArgErrTooManyMethod.getmsg`.
+    #[test]
+    fn resolve_kwargs_methodcall_appends_forgotten_self_hint() {
+        crate::test_hooks::install_hash_hook();
+        let module =
+            crate::compile_exec("def g(a, *, k):\n    pass\ndef gself(self, *, k):\n    pass\n")
+                .expect("compile");
+        let nested = |want: &str| {
+            module
+                .constants
+                .iter()
+                .find_map(|constant| match constant {
+                    rustpython_compiler_core::bytecode::ConstantData::Code { code }
+                        if code.obj_name == want =>
+                    {
+                        Some((**code).clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("nested {want}"))
+        };
+        let code_g = nested("g");
+        let code_gself = nested("gself");
+        let w_globals = pyre_object::w_dict_new();
+        let func_g = crate::function::function_new_from_code(
+            crate::pycode::box_code_object(code_g),
+            w_globals,
+        );
+        let func_gself = crate::function::function_new_from_code(
+            crate::pycode::box_code_object(code_gself),
+            w_globals,
+        );
+        let dummy = pyre_object::w_int_new(0);
+        let extra = pyre_object::w_int_new(1);
+        let k_val = pyre_object::w_int_new(2);
+        let names = pyre_object::w_tuple_new(vec![pyre_object::w_str_new("k")]);
+        let with_hint = super::resolve_kwargs(func_g, &[dummy, extra, k_val], names, true)
+            .expect_err("too many");
+        let no_hint = super::resolve_kwargs(func_g, &[dummy, extra, k_val], names, false)
+            .expect_err("too many");
+        let self_named = super::resolve_kwargs(func_gself, &[dummy, extra, k_val], names, true)
+            .expect_err("too many");
+        assert!(
+            with_hint
+                .message_text()
+                .contains("Did you forget 'self' in the function definition?"),
+            "methodcall: {}",
+            with_hint.message_text()
+        );
+        assert!(
+            !no_hint.message_text().contains("Did you forget 'self'"),
+            "plain: {}",
+            no_hint.message_text()
+        );
+        assert!(
+            !self_named.message_text().contains("Did you forget 'self'"),
+            "gself: {}",
+            self_named.message_text()
+        );
+    }
+
+    /// `argument.py Arguments._match_signature` counts filled keyword-only
+    /// slots, so a `**kwargs` extra is not a keyword-only argument.
+    #[test]
+    fn kwonly_given_ignores_varkw_extras() {
+        let source = "\
+def f(a, *, k, **kw):
+    pass
+try:
+    f(1, 2, **{'k': 1, 'z': 2})
+except TypeError as e:
+    r_starstar_extra = str(e)
+";
+        let w_globals = run_snippet(source);
+        let r_starstar_extra = get_str(w_globals, "r_starstar_extra");
+        assert_eq!(
+            r_starstar_extra,
+            "f() takes 1 positional argument but 2 positional arguments (and 1 keyword-only argument) were given"
+        );
     }
 }
 

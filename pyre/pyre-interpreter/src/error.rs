@@ -6079,9 +6079,11 @@ pub fn oefmt_noargs(kind: PyErrorKind, valuefmt: &'static str) -> OperationError
 /// `w_list_new`. `%T` / `%s` text have no user-visible side effect, so a
 /// swallowed TypeError never loads the type name.
 ///
-/// `%R` / `%S` / `%N` / `%d` / `%s` bytes / `%8` still convert here. 3.14's
-/// `_PyErr_FormatV` renders the whole string before it ever names the
-/// exception —
+/// [3.15-spec] eager %R/%S/%N/%d/%s-bytes/%8 conversion <-> PyPy deferred
+/// (`OpErrFmt._compute_value`) — observable: a user `__repr__`/`__str__`
+/// runs at the raise even when the error is swallowed; evidence:
+/// `Python/errors.c _PyErr_FormatV` at v3.15.2 clears the exception and
+/// calls `PyUnicode_FromFormatV` before the exception is named:
 ///
 /// ```c
 /// /* Issue #23571: PyUnicode_FromFormatV() must not be called with an
@@ -6090,11 +6092,11 @@ pub fn oefmt_noargs(kind: PyErrorKind, valuefmt: &'static str) -> OperationError
 /// string = PyUnicode_FromFormatV(format, vargs);
 /// ```
 ///
-/// — so `%R`'s `PyObject_Repr` runs at the raise, not at the read. Measured
-/// on 3.14.6 and 3.14.6t, with `hasattr` / `getattr(obj, name, default)` over
-/// a `property` whose `w_name` has a logging `__repr__`: the repr runs once
-/// per raise even when the error is swallowed. PyPy's
-/// `OpErrFmt._compute_value` defers it.
+/// The same holds on the free-threaded build: the conversion runs under
+/// the raising thread with no lock involved. `hasattr` /
+/// `getattr(obj, name, default)` over a `property` whose `w_name` has a
+/// logging `__repr__`: the repr runs once per raise even when the error is
+/// swallowed.
 pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -> OperationError {
     // `OpErrFmtNoArgs(w_type, valuefmt)` — no argument, so the format string is
     // the message verbatim, `%` sequences and all.  The message is the
@@ -6207,7 +6209,12 @@ pub fn oefmt(w_type: PyObjectRef, valuefmt: &'static str, args: &[FmtArg<'_>]) -
             // Bytes that are not WTF-8 at all are where the two part company
             // upstream: `%8` replaces them, which this matches, while `%s`
             // keeps them and subtracts the bad run from the reported length
-            // instead.  No `Wtf8Buf` can hold them, so `%s` replaces them too.
+            // instead.  `[3.15-spec]` `%s` replaces them too <-> PyPy keeps
+            // them — observable: U+FFFD in the message; evidence:
+            // `Objects/unicodeobject.c unicode_fromformat_write_utf8` at
+            // v3.15.2 decodes `%s` with `"replace"`
+            // (`_PyUnicode_DecodeUTF8Writer(..., _Py_ERROR_REPLACE,
+            // "replace", ...)`), and no `Wtf8Buf` can hold them.
             ('s', FmtArg::Bytes(value)) | ('8', FmtArg::Bytes(value)) => {
                 match rustpython_wtf8::Wtf8::from_bytes(value) {
                     Some(value) => message.push_wtf8(value),
