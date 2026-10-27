@@ -819,8 +819,14 @@ impl LiveFrameRegs {
 
     fn replace_active_box(&self, oldbox: OpRef, newbox: OpRef) {
         let bank = match oldbox.ty() {
-            Some(majit_ir::Type::Int) => &self.registers_i,
-            Some(majit_ir::Type::Ref) => &self.registers_r,
+            Some(majit_ir::Type::Int) => {
+                assert_int_bank_box(newbox, "replace_active_box");
+                &self.registers_i
+            }
+            Some(majit_ir::Type::Ref) => {
+                assert_ref_bank_box(newbox, "replace_active_box");
+                &self.registers_r
+            }
             Some(majit_ir::Type::Float) => &self.registers_f,
             _ => return,
         };
@@ -6801,10 +6807,11 @@ fn put_back_list_of_boxes3<Sym: WalkSym>(
     let redboxes = &live_args[..n_reds];
     let mut i = 0;
     for &reg in red_i_regs {
-        ctx.registers_i.set(reg, redboxes[i]);
+        store_int_bank(ctx.registers_i, reg, redboxes[i], "put_back_list_of_boxes3");
         i += 1;
     }
     for &reg in red_r_regs {
+        assert_ref_bank_box(redboxes[i], "put_back_list_of_boxes3");
         ctx.registers_r.set(reg, redboxes[i]);
         i += 1;
     }
@@ -6966,6 +6973,7 @@ fn write_ref_reg<Sym: WalkSym>(
             len,
             bank: "r",
         })?;
+    assert_ref_bank_box(value, "write_ref_reg");
     ctx.registers_r.set(dst, value);
     // Snapshot is sized to `registers_r.len()` at dispatch entry, so
     // a dst-in-bounds OpRef write implies in-bounds for the shadow.
@@ -7110,6 +7118,71 @@ unsafe fn raw_load_float(addr: *const u8, itemsize: usize) -> f64 {
     }
 }
 
+/// pyjitpl.py `make_result_of_lastop`: the bank follows resultbox.type.
+/// A known-typed OpRef whose type is not the dest bank is never written;
+/// `OpRef::NONE` / unknown is left to the existing unbound-register paths.
+pub(crate) fn ensure_resultbox_type_for_bank<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    pc: usize,
+    dst_bank: char,
+    value: OpRef,
+) -> Result<(), DispatchError> {
+    let Some(got) = ctx.trace_ctx.get_opref_type(value) else {
+        return Ok(());
+    };
+    let expected = match dst_bank {
+        'i' => majit_ir::Type::Int,
+        'r' => majit_ir::Type::Ref,
+        'f' => majit_ir::Type::Float,
+        _ => return Ok(()),
+    };
+    if got == expected {
+        Ok(())
+    } else {
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, symbolic: 0 })
+    }
+}
+
+/// pyjitpl.py `setup_call` / `make_result_of_lastop`: the bank follows
+/// `box.type`. Type lookup is `get_opref_type` (`opref.ty()` excluding Void).
+/// `OpRef::NONE` and an unknown type are left to the unbound-register paths.
+pub(crate) fn assert_int_bank_box(opref: OpRef, site: &'static str) {
+    if opref.is_none() {
+        return;
+    }
+    let Some(ty) = opref.ty().filter(|tp| *tp != Type::Void) else {
+        return;
+    };
+    if ty != Type::Int {
+        panic!(
+            "registers_i holds {opref:?} of type {ty:?} at {site} (pyjitpl.py setup_call partitions by box.type)"
+        );
+    }
+}
+
+/// Mirror of [`assert_int_bank_box`] for `registers_r`.
+pub(crate) fn assert_ref_bank_box(opref: OpRef, site: &'static str) {
+    if opref.is_none() {
+        return;
+    }
+    let Some(ty) = opref.ty().filter(|tp| *tp != Type::Void) else {
+        return;
+    };
+    if ty != Type::Ref {
+        panic!(
+            "registers_r holds {opref:?} of type {ty:?} at {site} (pyjitpl.py setup_call partitions by box.type)"
+        );
+    }
+}
+
+/// Underlying Int-bank store. [`write_int_reg`] runs
+/// [`ensure_resultbox_type_for_bank`] first (walk abort); this panics if a
+/// caller bypasses that check with a known non-Int box.
+pub(crate) fn store_int_bank(bank: &RegisterBank, index: usize, value: OpRef, site: &'static str) {
+    assert_int_bank_box(value, site);
+    bank.set(index, value);
+}
+
 /// Int-bank twin of [`write_ref_reg`] (Int-bank concrete shadow).  Writes an Int
 /// register and its concrete shadow in lock-step.  Mirrors the
 /// Ref-bank contract: every walker handler that writes
@@ -7140,7 +7213,9 @@ fn write_int_reg<Sym: WalkSym>(
             len,
             bank: "i",
         })?;
-    ctx.registers_i.set(dst, value);
+    // pyjitpl.py make_result_of_lastop: the bank follows resultbox.type.
+    ensure_resultbox_type_for_bank(ctx, pc, 'i', value)?;
+    store_int_bank(ctx.registers_i, dst, value, "write_int_reg");
     // Mirror `write_ref_reg`'s defensive get_mut.  Test fixtures pass
     // an empty `concrete_registers_i` slice; production callers
     // (Concrete shadow seeding) size it to `registers_i.len()` at dispatch entry.
@@ -12691,6 +12766,7 @@ fn walker_box_int<Sym: WalkSym>(
     value: i64,
 ) -> Result<OpRef, DispatchError> {
     let _ = (op_pc, value);
+    assert_int_bank_box(raw, "walker_box_int");
     // intobject.py `wrapint` (withprebuiltint=False): every boxing
     // allocates a fresh `W_IntObject`. Interning a constant raw here
     // is WITHPREBUILTINT for the residual `box_int_fn` path. Only
