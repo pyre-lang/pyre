@@ -587,16 +587,18 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
     let single_def = |dest: usize| def_counts.get(dest).copied() == Some(1);
     let mut const_locals: HashMap<usize, usize> = HashMap::new();
     let mut array_lens: HashMap<usize, usize> = HashMap::new();
-    let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
-    let mut queue: VecDeque<usize> = VecDeque::new();
     if n_blocks == 0 {
         return Ok(None);
     }
+    let slice_facts = slice_len_entry_facts(body, llbc);
+    let mut depth_in: Vec<Option<usize>> = vec![None; n_blocks];
+    let mut queue: VecDeque<usize> = VecDeque::new();
     depth_in[0] = Some(0);
     queue.push_back(0);
     let mut visited = vec![false; n_blocks];
     let reach = |depth_in: &mut Vec<Option<usize>>,
                  queue: &mut VecDeque<usize>,
+                 specials: &HashMap<usize, Special>,
                  target: u64,
                  depth: usize|
      -> Result<(), Refusal> {
@@ -605,7 +607,15 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             return Ok(());
         }
         match depth_in[target] {
-            Some(d) if d != depth => Err("depth-disagrees-at-merge"),
+            Some(d) if d != depth => {
+                // RootScope drop rewinds every pin since Open; keep the first
+                // incoming, Drop overwrites from Guard (successor sees that).
+                if close_merge_accepts_unequal_depth(body, llbc, specials, target, d, depth) {
+                    Ok(())
+                } else {
+                    Err("depth-disagrees-at-merge")
+                }
+            }
             Some(_) => Ok(()),
             None => {
                 depth_in[target] = Some(depth);
@@ -621,6 +631,9 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         }
         visited[bb] = true;
         let mut depth = depth_in[bb].expect("queued blocks have a depth");
+        let mut slice_state = slice_facts[bb]
+            .clone()
+            .expect("a block the walk reaches is reachable in the slice dataflow");
         let block = &body.body[bb];
         // Statements: the index, pair and alias definitions.
         for (si, stmt) in block.statements.iter().enumerate() {
@@ -630,6 +643,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
             let Some(dest) = place_local(place) else {
                 continue;
             };
+            apply_slice_assign(&mut slice_state, dest, rvalue);
             match rvalue {
                 Rvalue::Aggregate(kind, operands) if kind.get("Array").is_some() => {
                     if single_def(dest) {
@@ -757,6 +771,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
         let term_json = block.terminator.kind_value();
         match block.term_ref(llbc) {
             Ok(TermKind::Call { call, target, .. }) => {
+                note_slice_len_call(call, llbc, &mut slice_state);
                 let Some(&(leaf, method)) = classified.get(&bb) else {
                     // Observes at Known(0) reads the caller's slots.
                     // Inside our Open the callee reads our pins, which
@@ -768,7 +783,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     {
                         return Err("calls-stack-sensitive-fn");
                     }
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
+                    reach(&mut depth_in, &mut queue, &plan.specials, *target, depth)?;
                     continue;
                 };
                 let args_json = &term_json["Call"]["call"]["args"];
@@ -850,31 +865,61 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     }
                     Leaf::Publish => {
                         let slice = call.args.get(arg0).and_then(operand_local);
-                        let (agg_si, operands) = resolve_published_array(block, slice)
-                            .ok_or("publish-array-unresolved")?;
-                        let mut inserted = Vec::new();
-                        for (i, element) in operands.iter().enumerate() {
-                            let ty = element
-                                .as_object()
-                                .and_then(|m| m.values().next())
-                                .and_then(|p| p.get("ty"))
-                                .cloned()
-                                .ok_or("publish-element-untyped")?;
-                            plan.slot_ty.get_or_insert(ty.clone());
-                            inserted.push(assign_json(
-                                local_place_json(slot_local(depth + i), &ty),
-                                json!({ "Use": [copy_operand_json(element), "Yes"] }),
-                            ));
+                        if let Some((agg_si, operands)) = resolve_published_array(block, slice) {
+                            let mut inserted = Vec::new();
+                            for (i, element) in operands.iter().enumerate() {
+                                let ty = element
+                                    .as_object()
+                                    .and_then(|m| m.values().next())
+                                    .and_then(|p| p.get("ty"))
+                                    .cloned()
+                                    .ok_or("publish-element-untyped")?;
+                                plan.slot_ty.get_or_insert(ty.clone());
+                                inserted.push(assign_json(
+                                    local_place_json(slot_local(depth + i), &ty),
+                                    json!({ "Use": [copy_operand_json(element), "Yes"] }),
+                                ));
+                            }
+                            plan.inserted_after
+                                .entry((bb, agg_si))
+                                .or_default()
+                                .extend(inserted);
+                            if let Some(dest) = dest {
+                                bind(&mut plan.specials, dest, Special::Index(depth))?;
+                            }
+                            depth += operands.len();
+                            plan.slot_count = plan.slot_count.max(depth);
+                        } else if let Some((param, k)) =
+                            resolve_published_param_len(block, slice, &slice_state)
+                        {
+                            let param_ty = body
+                                .locals
+                                .locals
+                                .get(param)
+                                .map(|l| ty_ref_json(&l.ty))
+                                .ok_or("publish-param-untyped")?;
+                            let elem_ty = slice_elem_ty_json(body, llbc, param)
+                                .unwrap_or_else(|| param_ty.clone());
+                            plan.slot_ty.get_or_insert(elem_ty.clone());
+                            for i in 0..k {
+                                stmts.push(assign_json(
+                                    local_place_json(slot_local(depth + i), &elem_ty),
+                                    json!({
+                                        "Use": [
+                                            param_index_operand_json(param, i, &param_ty, &elem_ty),
+                                            "Yes"
+                                        ]
+                                    }),
+                                ));
+                            }
+                            if let Some(dest) = dest {
+                                bind(&mut plan.specials, dest, Special::Index(depth))?;
+                            }
+                            depth += k;
+                            plan.slot_count = plan.slot_count.max(depth);
+                        } else {
+                            return Err("publish-array-unresolved");
                         }
-                        plan.inserted_after
-                            .entry((bb, agg_si))
-                            .or_default()
-                            .extend(inserted);
-                        if let Some(dest) = dest {
-                            bind(&mut plan.specials, dest, Special::Index(depth))?;
-                        }
-                        depth += operands.len();
-                        plan.slot_count = plan.slot_count.max(depth);
                     }
                     Leaf::Normalize => {}
                     Leaf::NormalizeMoved => {
@@ -931,7 +976,7 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         stmts,
                     },
                 );
-                reach(&mut depth_in, &mut queue, *target, depth)?;
+                reach(&mut depth_in, &mut queue, &plan.specials, *target, depth)?;
             }
             Ok(TermKind::Drop { place, target, .. }) => {
                 let dropped = place_local(place);
@@ -941,6 +986,8 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     if *d > depth {
                         return Err("close-above-depth");
                     }
+                    // Native RootScope drop rewinds to the Open guard; rewrite
+                    // replaces this Drop with Goto, so path-only pins are unread.
                     depth = *d;
                     plan.terms.insert(
                         bb,
@@ -949,11 +996,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                             stmts: Vec::new(),
                         },
                     );
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
+                    reach(&mut depth_in, &mut queue, &plan.specials, *target, depth)?;
                 } else if dropped.is_some_and(|l| is_root_scope_local(body, llbc, l)) {
                     return Err("drop-of-unopened-guard");
                 } else {
-                    reach(&mut depth_in, &mut queue, *target, depth)?;
+                    reach(&mut depth_in, &mut queue, &plan.specials, *target, depth)?;
                 }
             }
             Ok(TermKind::Assert { assert, target, .. }) => {
@@ -966,21 +1013,16 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                         },
                     );
                 }
-                reach(&mut depth_in, &mut queue, *target, depth)?;
+                reach(&mut depth_in, &mut queue, &plan.specials, *target, depth)?;
             }
-            Ok(TermKind::Goto { target }) => reach(&mut depth_in, &mut queue, *target, depth)?,
-            Ok(TermKind::Switch { targets, .. }) => match targets {
-                majit_charon_reader::ullbc::SwitchTargets::If(a, b) => {
-                    reach(&mut depth_in, &mut queue, *a, depth)?;
-                    reach(&mut depth_in, &mut queue, *b, depth)?;
-                }
-                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
-                    for (_, t) in arms {
-                        reach(&mut depth_in, &mut queue, *t, depth)?;
-                    }
-                    reach(&mut depth_in, &mut queue, *default, depth)?;
-                }
-            },
+            Ok(TermKind::Goto { target }) => {
+                reach(&mut depth_in, &mut queue, &plan.specials, *target, depth)?
+            }
+            Ok(TermKind::Switch { discr, targets }) => {
+                for_each_switch_succ(block, discr, targets, &slice_state, llbc, |t, _| {
+                    reach(&mut depth_in, &mut queue, &plan.specials, t, depth)
+                })?;
+            }
             Ok(TermKind::Return) => {
                 if depth != 0 {
                     // 10.04 `Drop` of the guard lives in an `is_cleanup`
@@ -988,13 +1030,11 @@ fn analyze(body: &Unstructured, llbc: &Llbc) -> Result<Option<Plan>, Refusal> {
                     // `UnwindResume` is among them and a later
                     // `UnwindTerminate` can be last. Return is then the
                     // normal closer.
-                    if body
+                    if !body
                         .body
                         .iter()
                         .any(|bb| matches!(bb.term_ref(llbc), Ok(TermKind::UnwindResume)))
                     {
-                        depth = 0;
-                    } else {
                         return Err("returns-with-published-slots");
                     }
                 }
@@ -1122,6 +1162,57 @@ pub(super) fn is_root_scope_local(body: &Unstructured, llbc: &Llbc, local: usize
     super::output_adt_def_id_free(&decl.ty, llbc)
         .and_then(|id| llbc.type_by_id(id))
         .is_some_and(|t| super::gc_root_scope_type_path(&t.item_meta.name_path()))
+}
+
+/// `RootScope` drop pops every pin published since Open, so unequal incoming
+/// depths at that `Drop` still Close to the Open guard (`gctransform` has no bracket).
+fn close_merge_accepts_unequal_depth(
+    body: &Unstructured,
+    llbc: &Llbc,
+    specials: &HashMap<usize, Special>,
+    target: usize,
+    stored: usize,
+    incoming: usize,
+) -> bool {
+    let Some(block) = body.body.get(target) else {
+        return false;
+    };
+    let Ok(TermKind::Drop { place, .. }) = block.term_ref(llbc) else {
+        return false;
+    };
+    let Some(local) = place_local(place) else {
+        return false;
+    };
+    // Typed RootScope (production) or the local Open bound as Guard (fixtures).
+    if !is_root_scope_local(body, llbc, local)
+        && !matches!(specials.get(&local), Some(Special::Guard(_)))
+    {
+        return false;
+    }
+    let Some(Special::Guard(guard)) = specials.get(&local) else {
+        return false;
+    };
+    // `analyze` depths are exact `usize` (`Depth::Known`); both sides ≥ the Open guard.
+    if stored < *guard || incoming < *guard {
+        return false;
+    }
+    // Leaves are Call terminators, so a Drop block's statements cannot be
+    // Get/Set/Pin/Publish/Len/Base. Still refuse a tracked slot-index read.
+    for stmt in &block.statements {
+        if matches!(
+            stmt.stmt_kind_ref(),
+            Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_))
+        ) {
+            continue;
+        }
+        if specials_in_json(stmt.kind_value(), specials)
+            .iter()
+            .any(|s| matches!(s, Special::Index(_) | Special::IndexPair(_)))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Follow a published slice back to the array literal it borrows, in the same
@@ -1739,6 +1830,7 @@ fn stack_walk(
     }
     let mut why = String::new();
     let mut saw_open = false;
+    let slice_facts = slice_len_entry_facts(body, llbc);
     let mut depth_in: Vec<Option<Depth>> = vec![None; n_blocks];
     let mut guards: HashMap<usize, Depth> = HashMap::new();
     let mut aliases: HashMap<usize, usize> = HashMap::new();
@@ -1781,6 +1873,9 @@ fn stack_walk(
             };
         }
         let mut depth = depth_in[bb].expect("queued blocks have a depth");
+        let mut slice_state = slice_facts[bb]
+            .clone()
+            .expect("a block the walk reaches is reachable in the slice dataflow");
         let block = &body.body[bb];
         for stmt in &block.statements {
             let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
@@ -1789,6 +1884,7 @@ fn stack_walk(
             let Some(dest) = place_local(place) else {
                 continue;
             };
+            apply_slice_assign(&mut slice_state, dest, rvalue);
             match rvalue {
                 Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
                     clear_tracked(
@@ -1993,6 +2089,7 @@ fn stack_walk(
                         &mut field_params,
                     );
                 }
+                note_slice_len_call(call, llbc, &mut slice_state);
                 let path = callee_path(call, llbc);
                 match classify_call(call, llbc) {
                     Some((leaf, method)) => {
@@ -2045,7 +2142,10 @@ fn stack_walk(
                                 if let Some(dest) = place_local(&call.dest) {
                                     indices.insert(dest, depth);
                                 }
-                                match resolve_published_array_len(block, slice) {
+                                match resolve_published_array_len(block, slice).or_else(|| {
+                                    resolve_published_param_len(block, slice, &slice_state)
+                                        .map(|(_, k)| k)
+                                }) {
                                     Some(n) => depth = depth.add(n),
                                     None => depth = depth.after_unknown_push(),
                                 }
@@ -2158,15 +2258,12 @@ fn stack_walk(
             }
             Ok(TermKind::Assert { target, .. }) => successors.push(*target),
             Ok(TermKind::Goto { target }) => successors.push(*target),
-            Ok(TermKind::Switch { targets, .. }) => match targets {
-                majit_charon_reader::ullbc::SwitchTargets::If(a, b) => {
-                    successors.extend([*a, *b]);
-                }
-                majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => {
-                    successors.extend(arms.iter().map(|(_, t)| *t));
-                    successors.push(*default);
-                }
-            },
+            Ok(TermKind::Switch { discr, targets }) => {
+                let _ = for_each_switch_succ(block, discr, targets, &slice_state, llbc, |t, _| {
+                    successors.push(t);
+                    Ok(())
+                });
+            }
             Ok(TermKind::Return) => {
                 let this_returns_index = indices.get(&0).is_some_and(|d| d.lower_bound().is_some())
                     || field_indices
@@ -2194,17 +2291,19 @@ fn stack_walk(
             read_why = Some(why.clone());
         }
         for target in successors {
-            let target = target as usize;
-            if target >= n_blocks {
+            let target_u = target as usize;
+            if target_u >= n_blocks {
                 continue;
             }
-            let next = match depth_in[target] {
+            // Unequal Known depths join to AtLeast; Drop of the opener then
+            // overwrites with the Open guard, so a Close-block join still exits there.
+            let next_depth = match depth_in[target_u] {
                 None => depth,
                 Some(old) => old.join(depth),
             };
-            if depth_in[target] != Some(next) {
-                depth_in[target] = Some(next);
-                queue.push_back(target);
+            if depth_in[target_u] != Some(next_depth) {
+                depth_in[target_u] = Some(next_depth);
+                queue.push_back(target_u);
             }
         }
     }
@@ -2312,6 +2411,487 @@ fn resolve_published_array_len(
         }
     }
     None
+}
+
+/// Known `args.len() == K` is only modeled up to this many published slots.
+/// A larger constant falls back to [`Depth::after_unknown_push`].
+const MAX_KNOWN_SLICE_LEN: usize = 8;
+
+/// Per-block slice-parameter facts. Block-entry values are the
+/// [`slice_len_entry_facts`] fixpoint; the depth walks then evolve a copy
+/// through the block.
+///
+/// `lens` is the path fact (`len(param) == K`). `aliases` / `lens_of` are
+/// the SSA-like identities that let a later block's `Eq`/`Ne` see a
+/// `Len` / `PtrMetadata` / `<[T]>::len` assigned on a predecessor. Joins
+/// intersect every map: a key whose value disagrees (or is missing on one
+/// edge) is dropped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SliceLenState {
+    lens: HashMap<usize, usize>,
+    aliases: HashMap<usize, usize>,
+    lens_of: HashMap<usize, usize>,
+}
+
+impl SliceLenState {
+    fn at_entry(arg_count: usize) -> Self {
+        let mut aliases = HashMap::new();
+        for i in 1..=arg_count {
+            aliases.insert(i, i);
+        }
+        Self {
+            lens: HashMap::new(),
+            aliases,
+            lens_of: HashMap::new(),
+        }
+    }
+
+    fn intersect(&self, other: &Self) -> Self {
+        Self {
+            lens: intersect_usize_map(&self.lens, &other.lens),
+            aliases: intersect_usize_map(&self.aliases, &other.aliases),
+            lens_of: intersect_usize_map(&self.lens_of, &other.lens_of),
+        }
+    }
+
+    fn with_len(&self, param: usize, k: usize) -> Self {
+        let mut out = self.clone();
+        if k <= MAX_KNOWN_SLICE_LEN {
+            out.lens.insert(param, k);
+        }
+        out
+    }
+
+    fn clear_local(&mut self, dest: usize) {
+        self.aliases.remove(&dest);
+        self.lens_of.remove(&dest);
+    }
+}
+
+fn intersect_usize_map(
+    a: &HashMap<usize, usize>,
+    b: &HashMap<usize, usize>,
+) -> HashMap<usize, usize> {
+    a.iter()
+        .filter_map(|(&k, &v)| (b.get(&k) == Some(&v)).then_some((k, v)))
+        .collect()
+}
+
+/// Block-entry slice-length facts: forward must-dataflow, meet =
+/// [`SliceLenState::intersect`], run to a fixpoint before the depth walks
+/// read them. `None` = block unreachable from entry.
+fn slice_len_entry_facts(body: &Unstructured, llbc: &Llbc) -> Vec<Option<SliceLenState>> {
+    let n_blocks = body.body.len();
+    let mut facts: Vec<Option<SliceLenState>> = vec![None; n_blocks];
+    if n_blocks == 0 {
+        return facts;
+    }
+    facts[0] = Some(SliceLenState::at_entry(body.locals.arg_count as usize));
+    let mut worklist = VecDeque::from([0usize]);
+    let meet = |facts: &mut Vec<Option<SliceLenState>>,
+                worklist: &mut VecDeque<usize>,
+                target: u64,
+                sl: &SliceLenState| {
+        let t = target as usize;
+        if t >= n_blocks {
+            return;
+        }
+        match &facts[t] {
+            None => {
+                facts[t] = Some(sl.clone());
+                worklist.push_back(t);
+            }
+            Some(old) => {
+                let next = old.intersect(sl);
+                if next != *old {
+                    facts[t] = Some(next);
+                    worklist.push_back(t);
+                }
+            }
+        }
+    };
+    while let Some(bb) = worklist.pop_front() {
+        let mut s = facts[bb].clone().expect("worklisted blocks have facts");
+        let block = &body.body[bb];
+        for stmt in &block.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let Some(dest) = place_local(place) else {
+                continue;
+            };
+            apply_slice_assign(&mut s, dest, rvalue);
+        }
+        match block.term_ref(llbc) {
+            Ok(TermKind::Call { call, target, .. }) => {
+                note_slice_len_call(call, llbc, &mut s);
+                meet(&mut facts, &mut worklist, *target, &s);
+            }
+            Ok(TermKind::Switch { discr, targets }) => {
+                let _ = for_each_switch_succ(block, discr, targets, &s, llbc, |t, sl| {
+                    meet(&mut facts, &mut worklist, t, sl);
+                    Ok(())
+                });
+            }
+            Ok(TermKind::Goto { target })
+            | Ok(TermKind::Drop { target, .. })
+            | Ok(TermKind::Assert { target, .. }) => {
+                meet(&mut facts, &mut worklist, *target, &s);
+            }
+            _ => {}
+        }
+    }
+    facts
+}
+
+fn ptr_metadata_of_local(place: &Place) -> Option<usize> {
+    let PlaceKind::Projection(inner, ProjectionElem::Atom(elem)) = &place.kind else {
+        return None;
+    };
+    (elem == "PtrMetadata")
+        .then(|| place_local(inner).or_else(|| deref_of_local(inner)))
+        .flatten()
+}
+
+fn place_slice_param(state: &SliceLenState, place: &Place) -> Option<usize> {
+    place_local(place)
+        .or_else(|| deref_of_local(place))
+        .or_else(|| ptr_metadata_of_local(place))
+        .and_then(|l| state.aliases.get(&l).copied())
+}
+
+fn operand_slice_param(state: &SliceLenState, op: &Operand) -> Option<usize> {
+    match op {
+        Operand::Copy(p) | Operand::Move(p) => place_slice_param(state, p),
+        Operand::Const(_) => None,
+    }
+}
+
+fn binop_eq_ne(op: &Value) -> Option<bool> {
+    match op {
+        Value::String(s) if s == "Eq" => Some(true),
+        Value::String(s) if s == "Ne" => Some(false),
+        _ => None,
+    }
+}
+
+/// `core::slice::<Impl>::len` / `alloc::slice::<Impl>::len`.
+/// `slice::index::<Impl>::len` is a different item.
+fn is_slice_len_path(path: &str) -> bool {
+    let parts: Vec<&str> = path.split("::").collect();
+    let n = parts.len();
+    n >= 3
+        && parts[n - 3] == "slice"
+        && parts[n - 2] == "<Impl>"
+        && parts[n - 1] == "len"
+        && !(n >= 4 && parts[n - 4] == "index")
+}
+
+fn apply_slice_assign(state: &mut SliceLenState, dest: usize, rvalue: &Rvalue) {
+    let param = match rvalue {
+        Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => match op {
+            Operand::Copy(src) | Operand::Move(src) => {
+                if let Some(p) =
+                    ptr_metadata_of_local(src).and_then(|l| state.aliases.get(&l).copied())
+                {
+                    state.clear_local(dest);
+                    state.lens_of.insert(dest, p);
+                    return;
+                }
+                if let Some(p) = place_local(src).and_then(|l| state.lens_of.get(&l).copied()) {
+                    state.clear_local(dest);
+                    state.lens_of.insert(dest, p);
+                    return;
+                }
+                operand_slice_param(state, op)
+            }
+            Operand::Const(_) => None,
+        },
+        Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+            place_slice_param(state, src)
+        }
+        Rvalue::Len(src) => {
+            if let Some(p) = place_slice_param(state, src) {
+                state.clear_local(dest);
+                state.lens_of.insert(dest, p);
+                return;
+            }
+            None
+        }
+        _ => None,
+    };
+    state.clear_local(dest);
+    if let Some(p) = param {
+        state.aliases.insert(dest, p);
+    }
+}
+
+fn note_slice_len_call(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    llbc: &Llbc,
+    state: &mut SliceLenState,
+) {
+    let Some(dest) = place_local(&call.dest) else {
+        return;
+    };
+    state.clear_local(dest);
+    let Some(path) = callee_path(call, llbc) else {
+        return;
+    };
+    if !is_slice_len_path(&path) {
+        return;
+    }
+    if let Some(p) = call
+        .args
+        .first()
+        .and_then(|op| operand_slice_param(state, op))
+    {
+        state.lens_of.insert(dest, p);
+    }
+}
+
+/// Follow `local` through `Use`/`Copy`/`Move`/`Ref`/`Cast` in `block` to a
+/// function-parameter alias recorded in `state`.
+fn follow_to_param(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    slice: Option<usize>,
+    state: &SliceLenState,
+) -> Option<usize> {
+    let mut want = slice?;
+    if let Some(&p) = state.aliases.get(&want) {
+        return Some(p);
+    }
+    for stmt in block.statements.iter().rev() {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        if place_local(place) != Some(want) {
+            continue;
+        }
+        match rvalue {
+            Rvalue::UnaryOp(_, op) | Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                want = operand_local(op)?;
+            }
+            Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. } => {
+                want = place_local(src).or_else(|| deref_of_local(src))?;
+            }
+            _ => return None,
+        }
+        if let Some(&p) = state.aliases.get(&want) {
+            return Some(p);
+        }
+    }
+    state.aliases.get(&want).copied()
+}
+
+fn len_param_of_operand(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    state: &SliceLenState,
+    op: &Operand,
+) -> Option<usize> {
+    let mut want = operand_local(op)?;
+    if let Some(&p) = state.lens_of.get(&want) {
+        return Some(p);
+    }
+    for stmt in block.statements.iter().rev() {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        if place_local(place) != Some(want) {
+            continue;
+        }
+        match rvalue {
+            Rvalue::UnaryOp(_, next) | Rvalue::Use(next, _) | Rvalue::Cast(_, next, _) => {
+                if let Operand::Copy(src) | Operand::Move(src) = next
+                    && let Some(p) =
+                        ptr_metadata_of_local(src).and_then(|l| state.aliases.get(&l).copied())
+                {
+                    return Some(p);
+                }
+                want = operand_local(next)?;
+            }
+            Rvalue::Len(src) => return place_slice_param(state, src),
+            _ => return None,
+        }
+        if let Some(&p) = state.lens_of.get(&want) {
+            return Some(p);
+        }
+    }
+    state.lens_of.get(&want).copied()
+}
+
+/// Discriminant of a switch, followed through `Use`/`Copy`/`Move` in this
+/// block, is `Eq`/`Ne` of a slice-parameter length and a constant `K`.
+/// Returns `(param_local, K, is_eq)`.
+fn resolve_discr_eq_ne(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    discr: &Operand,
+    state: &SliceLenState,
+    llbc: &Llbc,
+) -> Option<(usize, usize, bool)> {
+    let mut want = operand_local(discr)?;
+    for stmt in block.statements.iter().rev() {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        if place_local(place) != Some(want) {
+            continue;
+        }
+        match rvalue {
+            Rvalue::UnaryOp(_, op) | Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                want = operand_local(op)?;
+            }
+            Rvalue::BinaryOp(op, lhs, rhs) => {
+                let is_eq = binop_eq_ne(op)?;
+                let (len_op, k) = if let Some(k) = const_usize(rhs, llbc) {
+                    (lhs, k)
+                } else if let Some(k) = const_usize(lhs, llbc) {
+                    (rhs, k)
+                } else {
+                    return None;
+                };
+                if k > MAX_KNOWN_SLICE_LEN {
+                    return None;
+                }
+                let param = len_param_of_operand(block, state, len_op)?;
+                return Some((param, k, is_eq));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn scalar_as_bool(v: &Value, llbc: &Llbc) -> Option<bool> {
+    if let Some(b) = v.get("Bool").and_then(Value::as_bool) {
+        return Some(b);
+    }
+    json_const_usize(v, llbc).map(|n| n != 0)
+}
+
+fn resolve_published_param_len(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    slice: Option<usize>,
+    state: &SliceLenState,
+) -> Option<(usize, usize)> {
+    let param = follow_to_param(block, slice, state)?;
+    let k = *state.lens.get(&param)?;
+    (k <= MAX_KNOWN_SLICE_LEN).then_some((param, k))
+}
+
+fn peel_ty_owned(v: &Value, llbc: &Llbc) -> Value {
+    let mut cur = v.clone();
+    for _ in 0..8 {
+        if let Some(id) = cur.get("Deduplicated").and_then(Value::as_u64)
+            && let Some(body) = llbc.dedup_body(id)
+        {
+            cur = body.clone();
+            continue;
+        }
+        if let Some(arr) = cur.get("Value").and_then(Value::as_array)
+            && arr.len() == 2
+        {
+            cur = arr[1].clone();
+            continue;
+        }
+        break;
+    }
+    cur
+}
+
+fn slice_elem_ty_json(body: &Unstructured, llbc: &Llbc, param: usize) -> Option<Value> {
+    let ty = &body.locals.locals.get(param)?.ty;
+    let mut cur = peel_ty_owned(&ty_ref_json(ty), llbc);
+    if let Some(p) = cur
+        .get("Ref")
+        .and_then(Value::as_array)
+        .and_then(|a| a.get(1))
+        .cloned()
+        .or_else(|| {
+            cur.get("RawPtr")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .cloned()
+        })
+    {
+        cur = peel_ty_owned(&p, llbc);
+    }
+    cur.get("Slice")?.as_array()?.first().cloned()
+}
+
+/// `param[i]` at the pin site: `(*param)[i]` with a const `Index` offset.
+fn param_index_operand_json(
+    param: usize,
+    index: usize,
+    param_ty: &Value,
+    elem_ty: &Value,
+) -> Value {
+    let param_place = local_place_json(param, param_ty);
+    let deref = json!({
+        "kind": { "Projection": [param_place, "Deref"] },
+        "ty": param_ty,
+    });
+    let offset = json!({
+        "Const": [{ "Integer": { "Unsigned": ["Usize", index.to_string()] } }, param_ty]
+    });
+    json!({
+        "Copy": {
+            "kind": {
+                "Projection": [
+                    deref,
+                    { "Index": { "offset": offset, "from_end": false } }
+                ]
+            },
+            "ty": elem_ty,
+        }
+    })
+}
+
+fn for_each_switch_succ(
+    block: &majit_charon_reader::ullbc::BasicBlock,
+    discr: &Operand,
+    targets: &majit_charon_reader::ullbc::SwitchTargets,
+    state: &SliceLenState,
+    llbc: &Llbc,
+    mut emit: impl FnMut(u64, &SliceLenState) -> Result<(), Refusal>,
+) -> Result<(), Refusal> {
+    let fact = resolve_discr_eq_ne(block, discr, state, llbc);
+    match targets {
+        majit_charon_reader::ullbc::SwitchTargets::If(then_bb, else_bb) => {
+            let (then_s, else_s) = match fact {
+                Some((param, k, true)) => (state.with_len(param, k), state.clone()),
+                Some((param, k, false)) => (state.clone(), state.with_len(param, k)),
+                None => (state.clone(), state.clone()),
+            };
+            emit(*then_bb, &then_s)?;
+            emit(*else_bb, &else_s)?;
+        }
+        majit_charon_reader::ullbc::SwitchTargets::SwitchInt(_, arms, default) => match fact {
+            Some((param, k, is_eq)) => {
+                for (scalar, t) in arms {
+                    let outgoing = match scalar_as_bool(scalar, llbc) {
+                        Some(true) if is_eq => state.with_len(param, k),
+                        Some(false) if !is_eq => state.with_len(param, k),
+                        _ => state.clone(),
+                    };
+                    emit(*t, &outgoing)?;
+                }
+                let default_s = if is_eq {
+                    state.clone()
+                } else {
+                    state.with_len(param, k)
+                };
+                emit(*default, &default_s)?;
+            }
+            None => {
+                for (_, t) in arms {
+                    emit(*t, state)?;
+                }
+                emit(*default, state)?;
+            }
+        },
+    }
+    Ok(())
 }
 
 /// The functions of `llbc` whose shadow-stack effect a caller cannot see
@@ -3818,5 +4398,408 @@ mod tests {
             assert_is_slot_index_bounds_check(&assert, &specials, &HashMap::new(), &fixture_llbc()),
             "index 0 of a 3-slot erased array is true by construction"
         );
+    }
+
+    fn pin_roots_llbc_with_subject(body: &Unstructured) -> Llbc {
+        let unstructured = super::unstructured_json_from_body(body);
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["other", "unused"], json!("Opaque")),
+                    opaque_fun(6, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(7, &["c", "subject"], json!({ "Unstructured": unstructured }))
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        llbc
+    }
+
+    fn json_contains_local(v: &Value, local: u64) -> bool {
+        match v {
+            Value::Object(m) => {
+                m.get("Local").and_then(Value::as_u64) == Some(local)
+                    || m.values().any(|c| json_contains_local(c, local))
+            }
+            Value::Array(items) => items.iter().any(|c| json_contains_local(c, local)),
+            _ => false,
+        }
+    }
+
+    fn json_has_index_of_local(v: &Value, local: u64) -> bool {
+        match v {
+            Value::Object(m) => {
+                if let Some(proj) = m.get("Projection").and_then(Value::as_array)
+                    && proj.get(1).is_some_and(|elem| {
+                        elem.get("Index").is_some() || elem.get("ConstantIndex").is_some()
+                    })
+                    && json_contains_local(&proj[0], local)
+                {
+                    return true;
+                }
+                m.values().any(|c| json_has_index_of_local(c, local))
+            }
+            Value::Array(items) => items.iter().any(|c| json_has_index_of_local(c, local)),
+            _ => false,
+        }
+    }
+
+    /// `if args.len() == K { push_roots; b = pin_roots(args); x = get(b [+ add]); drop; return } else { return }`
+    fn param_slice_pin_body(k: Option<u64>, get_add: Option<u64>) -> Unstructured {
+        let copy = |i| json!({"Copy": place(i)});
+        let get_term = |target: u64| {
+            if let Some(add) = get_add {
+                bb_stmts(
+                    vec![assign_local(
+                        7,
+                        json!({"BinaryOp": ["Add", copy(5), usize_lit(add)]}),
+                    )],
+                    call_fun(2, vec![copy(7)], 6, target),
+                )
+            } else {
+                bb(call_fun(2, vec![copy(5)], 6, target))
+            }
+        };
+        match k {
+            Some(k) => body_of_args(
+                1,
+                8,
+                vec![
+                    bb_stmts(
+                        vec![
+                            assign_local(2, json!({"Len": place(1)})),
+                            assign_local(3, json!({"BinaryOp": ["Eq", copy(2), usize_lit(k)]})),
+                        ],
+                        json!({"Switch": {
+                            "discr": {"Move": place(3)},
+                            "targets": {"If": [1, 6]}
+                        }}),
+                    ),
+                    bb(call_fun(1, vec![], 4, 2)),
+                    bb(call_fun(6, vec![copy(1)], 5, 3)),
+                    get_term(4),
+                    bb(drop_local(4, 5)),
+                    bb(json!("Return")),
+                    bb(json!("Return")),
+                ],
+            ),
+            None => body_of_args(
+                1,
+                8,
+                vec![
+                    bb(call_fun(1, vec![], 4, 1)),
+                    bb(call_fun(6, vec![copy(1)], 5, 2)),
+                    get_term(3),
+                    bb(drop_local(4, 4)),
+                    bb(json!("Return")),
+                ],
+            ),
+        }
+    }
+
+    #[test]
+    fn param_slice_pin_after_len_eq_one_is_erased() {
+        let body = param_slice_pin_body(Some(1), None);
+        let llbc = pin_roots_llbc_with_subject(&body);
+        let fd = llbc.fn_by_id(7).expect("subject");
+        let body = fd.unstructured().expect("body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        for (i, bb) in erased.body.iter().enumerate() {
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(&llbc) {
+                assert!(
+                    classify_call(call, &llbc).is_none(),
+                    "root leaf remains in bb{i}"
+                );
+            }
+        }
+        let reads_args0 = erased.body.iter().any(|bb| {
+            bb.statements
+                .iter()
+                .any(|st| json_has_index_of_local(st.kind_value(), 1))
+        });
+        assert!(reads_args0, "erased pin must read args[0] at the pin site");
+    }
+
+    #[test]
+    fn param_slice_pin_without_len_check_refuses() {
+        let body = param_slice_pin_body(None, None);
+        let llbc = stack_ops_llbc_with_callee();
+        match analyze(&body, &llbc) {
+            Err("publish-array-unresolved") => {}
+            Ok(Some(_)) => panic!("expected ParamSlots refusal, got accepted"),
+            Ok(None) => panic!("expected ParamSlots refusal, got no bracket"),
+            Err(reason) => panic!("expected publish-array-unresolved (ParamSlots), got {reason}"),
+        }
+    }
+
+    #[test]
+    fn param_slice_get_past_known_len_is_refused() {
+        let body = param_slice_pin_body(Some(1), Some(1));
+        let llbc = stack_ops_llbc_with_callee();
+        match analyze(&body, &llbc) {
+            Err("get-above-depth") => {}
+            Ok(Some(_)) => panic!("expected get-above-depth, got accepted"),
+            Ok(None) => panic!("expected get-above-depth, got no bracket"),
+            Err(reason) => panic!("expected get-above-depth, got {reason}"),
+        }
+    }
+
+    #[test]
+    fn param_slice_len_via_slice_len_call_is_erased() {
+        let copy = |i| json!({"Copy": place(i)});
+        let slice_len = json!({
+            "def_id": 12,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["core", 0]},
+                    {"Ident": ["slice", 0]},
+                    {"Impl": {"Ty": null}},
+                    {"Ident": ["len", 0]}
+                ],
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": true
+            },
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [],
+                "output": {"Deduplicated": 0}
+            },
+            "body": "Opaque"
+        });
+        let reborrow = json!({"Ref": {
+            "kind": "Shared",
+            "place": {
+                "kind": {"Projection": [place(1), "Deref"]},
+                "ty": ty()
+            },
+            "ptr_metadata": {"Copy": {
+                "kind": {"Projection": [place(1), "PtrMetadata"]},
+                "ty": ty()
+            }}
+        }});
+        let body = body_of_args(
+            1,
+            8,
+            vec![
+                bb_stmts(
+                    vec![assign_local(4, reborrow)],
+                    call_fun(12, vec![copy(4)], 2, 1),
+                ),
+                bb_stmts(
+                    vec![assign_local(
+                        3,
+                        json!({"BinaryOp": ["Eq", copy(2), usize_lit(1)]}),
+                    )],
+                    json!({"Switch": {
+                        "discr": {"Move": place(3)},
+                        "targets": {"If": [2, 7]}
+                    }}),
+                ),
+                bb(call_fun(1, vec![], 5, 3)),
+                bb(call_fun(6, vec![copy(1)], 6, 4)),
+                bb(call_fun(2, vec![copy(6)], 7, 5)),
+                bb(drop_local(5, 6)),
+                bb(json!("Return")),
+                bb(json!("Return")),
+            ],
+        );
+        let unstructured = super::unstructured_json_from_body(&body);
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [
+                    null,
+                    opaque_fun(1, &["pyre_object", "gc_roots", "push_roots"], json!("Opaque")),
+                    opaque_fun(2, &["pyre_object", "gc_roots", "shadow_stack_get"], json!("Opaque")),
+                    opaque_fun(3, &["pyre_object", "gc_roots", "shadow_stack_len"], json!("Opaque")),
+                    opaque_fun(4, &["pyre_object", "gc_roots", "pin_root"], json!("Opaque")),
+                    opaque_fun(5, &["other", "unused"], json!("Opaque")),
+                    opaque_fun(6, &["pyre_object", "gc_roots", "pin_roots"], json!("Opaque")),
+                    opaque_fun(7, &["c", "subject"], json!({ "Unstructured": unstructured })),
+                    null, null, null, null,
+                    slice_len
+                ]
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc");
+        llbc.mark_stack_sensitive_fns_complete();
+        let fd = llbc.fn_by_id(7).expect("subject");
+        let body = fd.unstructured().expect("body");
+        match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+    }
+
+    /// `__majit_wrap_dict_descr_keys`: `len==1` Open/Publish, then an `is_null`
+    /// diamond that pins one extra root on the live arm; both arms join at
+    /// `Drop` of the opener.
+    #[test]
+    fn param_slice_null_diamond_joins_at_opener_drop_is_erased() {
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of_args(
+            1,
+            11,
+            vec![
+                bb_stmts(
+                    vec![
+                        assign_local(2, json!({"Len": place(1)})),
+                        assign_local(3, json!({"BinaryOp": ["Eq", copy(2), usize_lit(1)]})),
+                    ],
+                    json!({"Switch": {
+                        "discr": {"Move": place(3)},
+                        "targets": {"If": [1, 11]}
+                    }}),
+                ),
+                bb(call_fun(1, vec![], 4, 2)),
+                bb(call_fun(6, vec![copy(1)], 5, 3)),
+                bb(call_fun(2, vec![copy(5)], 6, 4)),
+                bb(json!({"Switch": {
+                    "discr": {"Copy": place(6)},
+                    "targets": {"If": [5, 6]}
+                }})),
+                bb(call_fun(2, vec![copy(5)], 7, 8)),
+                bb(call_fun(3, vec![], 8, 7)),
+                bb(call_fun(4, vec![copy(6)], 9, 9)),
+                bb(drop_local(4, 10)),
+                bb(call_fun(2, vec![copy(8)], 10, 8)),
+                bb(json!("Return")),
+                bb(json!("Return")),
+            ],
+        );
+        let llbc = pin_roots_llbc_with_subject(&body);
+        let fd = llbc.fn_by_id(7).expect("subject");
+        let body = fd.unstructured().expect("body");
+        let erased = match erase_shadow_stack(fd, &body, &llbc) {
+            Ok(Some(erased)) => erased,
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        };
+        for (i, bb) in erased.body.iter().enumerate() {
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(&llbc) {
+                assert!(
+                    classify_call(call, &llbc).is_none(),
+                    "root leaf remains in bb{i}"
+                );
+            }
+        }
+    }
+
+    /// Same published-slot disagreement at a join that later reads a slot
+    /// (not `Drop` of the opener) still refuses.
+    #[test]
+    fn depth_disagrees_at_non_close_join_that_reads_a_slot_is_refused() {
+        let copy = |i| json!({"Copy": place(i)});
+        let body = body_of(
+            6,
+            vec![
+                bb(call_fun(1, vec![], 1, 1)),
+                bb(call_fun(3, vec![], 2, 2)),
+                bb(call_fun(4, vec![copy(0)], 3, 3)),
+                bb(json!({"Switch": {
+                    "discr": {"Copy": place(0)},
+                    "targets": {"If": [4, 5]}
+                }})),
+                bb(json!({"Goto": {"target": 6}})),
+                bb(call_fun(4, vec![copy(0)], 4, 6)),
+                bb(call_fun(2, vec![copy(2)], 5, 7)),
+                bb(drop_local(1, 8)),
+                bb(json!("Return")),
+            ],
+        );
+        let llbc = stack_ops_llbc();
+        match analyze(&body, &llbc) {
+            Err("depth-disagrees-at-merge") => {}
+            Ok(Some(_)) => panic!("expected depth-disagrees-at-merge, got accepted"),
+            Ok(None) => panic!("expected depth-disagrees-at-merge, got no bracket"),
+            Err(reason) => panic!("expected depth-disagrees-at-merge, got {reason}"),
+        }
+    }
+
+    /// A later predecessor can shrink the slice-length facts at a block that
+    /// the depth walk already visited. That is a dataflow meet, not a refusal:
+    /// when nothing after the join publishes the param, the body still erases.
+    #[test]
+    fn slice_len_fact_shrinking_at_a_visited_merge_is_not_refused() {
+        let copy = |i| json!({"Copy": place(i)});
+        let len_eq_diamond = |then_bb: u64, else_bb: u64| {
+            bb_stmts(
+                vec![
+                    assign_local(2, json!({"Len": place(1)})),
+                    assign_local(3, json!({"BinaryOp": ["Eq", copy(2), usize_lit(1)]})),
+                ],
+                json!({"Switch": {
+                    "discr": {"Move": place(3)},
+                    "targets": {"If": [then_bb, else_bb]}
+                }}),
+            )
+        };
+        // B is first reached from `len(param)==1` and visited, then from the
+        // no-fact edge. Nothing in or after B publishes the param slice.
+        let body = body_of_args(
+            1,
+            6,
+            vec![
+                len_eq_diamond(1, 2),
+                bb(json!({"Goto": {"target": 3}})),
+                bb(json!({"Goto": {"target": 3}})),
+                bb(call_fun(1, vec![], 4, 4)),
+                bb(call_fun(4, vec![copy(0)], 5, 5)),
+                bb(drop_local(4, 6)),
+                bb(json!("Return")),
+            ],
+        );
+        let llbc = stack_ops_llbc();
+        match analyze(&body, &llbc) {
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("expected accepted erase, got no bracket"),
+            Err(reason) => panic!("expected accepted erase, got {reason}"),
+        }
+
+        // The only `len==1` fact is lost at the join before a Publish of that
+        // param: unknown-K, same refusal as `param_slice_pin_without_len_check`.
+        let body = body_of_args(
+            1,
+            6,
+            vec![
+                len_eq_diamond(1, 2),
+                bb(json!({"Goto": {"target": 3}})),
+                bb(json!({"Goto": {"target": 3}})),
+                bb(call_fun(1, vec![], 4, 4)),
+                bb(call_fun(6, vec![copy(1)], 5, 5)),
+                bb(drop_local(4, 6)),
+                bb(json!("Return")),
+            ],
+        );
+        let llbc = stack_ops_llbc_with_callee();
+        match analyze(&body, &llbc) {
+            Err("publish-array-unresolved") => {}
+            Ok(Some(_)) => panic!("expected ParamSlots refusal, got accepted"),
+            Ok(None) => panic!("expected ParamSlots refusal, got no bracket"),
+            Err(reason) => panic!("expected publish-array-unresolved (ParamSlots), got {reason}"),
+        }
     }
 }
