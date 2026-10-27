@@ -1345,51 +1345,48 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         pyre_interpreter::make_builtin_function_with_arity("set_name", mmap_set_name, 2)
     );
 
-    unsafe {
-        pyre_interpreter::__pyre_put_new!(
-            ns_slot,
-            "seek",
-            pyre_interpreter::make_builtin_function("seek", |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "seek() missing argument",
-                    ));
+    pyre_interpreter::__pyre_put_new!(
+        ns_slot,
+        "seek",
+        pyre_interpreter::make_builtin_function("seek", |args| {
+            // `interp_mmap.py seek` `@unwrap_spec(pos=OFF_T, whence=int)`.
+            if args.len() < 2 {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "seek() missing argument",
+                ));
+            }
+            if args.len() > 3 {
+                return Err(pyre_interpreter::PyError::type_error(format!(
+                    "seek() takes from 2 to 3 positional arguments but {} were given",
+                    args.len()
+                )));
+            }
+            let mut obj = args[0];
+            let mut w_pos = args[1];
+            let off = pyre_object::with_roots!(obj, w_pos => mmap_index_w(obj, w_pos))?;
+            let whence = if args.len() >= 3 {
+                let mut w_whence = args[2];
+                pyre_object::with_roots!(obj, w_pos, w_whence => mmap_index_w(obj, w_whence))?
+            } else {
+                0
+            };
+            let (_, len) = mmap_ptr(obj)?;
+            let cur = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_pos"));
+            let new_pos = match whence {
+                0 => off,
+                1 => cur + off,
+                2 => len as i64 + off,
+                _ => {
+                    return Err(pyre_interpreter::PyError::value_error("invalid whence"));
                 }
-                let mut obj = args[0];
-                let (_, len) = mmap_ptr(obj)?;
-                if !{ pyre_object::is_int(args[1]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "seek: offset must be an integer",
-                    ));
-                }
-                let off = { pyre_object::w_int_get_value(args[1]) };
-                let whence = if args.len() >= 3 {
-                    if !{ pyre_object::is_int(args[2]) } {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "seek: whence must be an integer",
-                        ));
-                    }
-                    pyre_object::w_int_get_value(args[2])
-                } else {
-                    0
-                };
-                let cur = pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_pos"));
-                let new_pos = match whence {
-                    0 => off,
-                    1 => cur + off,
-                    2 => len as i64 + off,
-                    _ => {
-                        return Err(pyre_interpreter::PyError::value_error("invalid whence"));
-                    }
-                };
-                if new_pos < 0 || (new_pos as usize) > len {
-                    return Err(pyre_interpreter::PyError::value_error("seek out of range"));
-                }
-                mmap_set_attr(obj, "_pos", pyre_object::w_int_new(new_pos));
-                Ok(pyre_object::w_int_new(new_pos))
-            })
-        )
-    };
+            };
+            if new_pos < 0 || (new_pos as usize) > len {
+                return Err(pyre_interpreter::PyError::value_error("seek out of range"));
+            }
+            mmap_set_attr(obj, "_pos", pyre_object::w_int_new(new_pos));
+            Ok(pyre_object::w_int_new(new_pos))
+        })
+    );
 
     unsafe {
         pyre_interpreter::__pyre_put_new!(

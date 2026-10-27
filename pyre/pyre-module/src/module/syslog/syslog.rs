@@ -132,20 +132,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 } else {
                     openlog_ident_from_argv()
                 };
-                for index in 1..args.len() {
-                    if !unsafe { pyre_object::is_int(_roots.get(args_base + index)) } {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "openlog(): logoption and facility must be integers",
-                        ));
-                    }
-                }
                 let logoption = if args.len() > 1 {
-                    unsafe { pyre_object::w_int_get_value(_roots.get(args_base + 1)) as i32 }
+                    pyre_interpreter::baseobjspace::gateway_int_w(_roots.get(args_base + 1))?
+                        as i32
                 } else {
                     0
                 };
                 let facility = if args.len() > 2 {
-                    unsafe { pyre_object::w_int_get_value(_roots.get(args_base + 2)) as i32 }
+                    pyre_interpreter::baseobjspace::gateway_int_w(_roots.get(args_base + 2))?
+                        as i32
                 } else {
                     libc::LOG_USER
                 };
@@ -183,13 +178,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
                 let _roots = pyre_object::gc_roots::push_roots();
                 let args_base = _roots.pin_roots(args);
                 let (priority, mut w_msg) = if args.len() >= 2 {
-                    if !unsafe { pyre_object::is_int(_roots.get(args_base)) } {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "syslog(): priority must be an integer",
-                        ));
-                    }
                     (
-                        unsafe { pyre_object::w_int_get_value(_roots.get(args_base)) as i32 },
+                        pyre_interpreter::baseobjspace::gateway_int_w(_roots.get(args_base))?
+                            as i32,
                         _roots.get(args_base + 1),
                     )
                 } else if args.len() == 1 {
@@ -257,18 +248,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_inte
             |args| {
                 #[cfg(feature = "host_env")]
                 {
-                    let mask = if let Some(&a) = args.first() {
-                        if !unsafe { pyre_object::is_int(a) } {
-                            return Err(pyre_interpreter::PyError::type_error(
-                                "setlogmask(): argument must be an integer",
-                            ));
-                        }
-                        unsafe { pyre_object::w_int_get_value(a) as i32 }
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "setlogmask() missing argument",
-                        ));
-                    };
+                    let mut w_mask = args.first().copied().ok_or_else(|| {
+                        pyre_interpreter::PyError::type_error("setlogmask() missing argument")
+                    })?;
+                    let mask = pyre_object::with_roots!(
+                        w_mask => pyre_interpreter::baseobjspace::gateway_int_w(w_mask)
+                    )? as i32;
                     Ok(pyre_object::w_int_new(
                         unsafe { ll::c_setlogmask(mask) } as i64
                     ))
