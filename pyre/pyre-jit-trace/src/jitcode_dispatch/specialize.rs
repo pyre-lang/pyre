@@ -16873,7 +16873,16 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         };
         nested_entry.level = Some(append_helper_parent(level, parent));
     }
-    run_orthodox_helper_subwalk(
+    // `do_residual_or_indirect_call` keeps the caller `MIFrame` current
+    // while `perform_call` / `newframe` pushes the callee (`pyjitpl.py`).
+    // `helper_subwalk_level` therefore numbers the caller at the CALL;
+    // install the callee index only after that pause, matching
+    // `walk_translated_builtin_wrapper`.
+    let saved_th_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+    if let Some(index) = residual_call::helper_index_for_sub_body(sub_body) {
+        ctx.fbw_mode.transparent_helper_jitcode_index = Some(index);
+    }
+    let result = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
@@ -16887,7 +16896,9 @@ fn run_codewriter_helper_inline_call_body<Sym: WalkSym>(
         ref_arg_concretes,
         float_args,
     )
-    .map(|(outcome, _)| outcome)
+    .map(|(outcome, _)| outcome);
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_th_index;
+    result
 }
 
 /// Re-read a ref the collector may have moved.

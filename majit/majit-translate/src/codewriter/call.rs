@@ -9296,6 +9296,22 @@ impl CallControl {
             |path| self.function_graphs.get(path),
         )
     }
+
+    /// `FUNC.RESULT` of an indirect-call family attached as `c_graphs`.
+    ///
+    /// Same projection as [`Self::declared_result_type_for_indirect`];
+    /// `lower_indirect_calls` clears `family_key` after filling `graphs`,
+    /// so jtransform reads the witness graphs the same way
+    /// `getcalldescr`'s indirect arm does.
+    pub(crate) fn declared_result_type_for_graphs(
+        &self,
+        graphs: Option<&[CallPath]>,
+    ) -> Option<Type> {
+        let graphs = graphs.filter(|g| !g.is_empty())?;
+        declared_result_type("<indirect>", "<family>", graphs.to_vec(), |path| {
+            self.function_graphs.get(path)
+        })
+    }
 }
 
 /// `CallPath`s of the impls `trait_method_impls` records for
@@ -12146,11 +12162,12 @@ impl CallControl {
                         );
                     }
                     // call.py `getcalldescr`: RESULT != FUNC.RESULT raises.
-                    // `return_type` stays `None` for ordinary fns (`front::mir`
-                    // leaves the Charon `TyRef::Deduplicated` unresolved).
-                    // That absence is not `lltype.Void`; treating it as Void
-                    // panics `compare_slot_rest` (call result `Ref`, stamp
-                    // missing). The stamp, when present, is checked.
+                    // `return_type` stays `None` for ordinary aggregate fns
+                    // (`front::mir` leaves the Charon `TyRef::Deduplicated`
+                    // unresolved). That absence is not `lltype.Void`; treating
+                    // it as Void panics `compare_slot_rest` (call result `Ref`,
+                    // stamp missing). Unit and scalar stamps, when present,
+                    // are checked.
                     // `Result<T, E>` is the success type `T` (`FUNC.RESULT`).
                     if let Some(expected_result) = self.declared_graph_result_type(&graph)
                         && result_type != expected_result
@@ -12182,10 +12199,10 @@ impl CallControl {
                         );
                     }
                     // Same conditional as the Direct arm: an unstamped
-                    // `return_type` is not `FUNC.RESULT`. The prebuilt eval
-                    // hook (`register_eval_override`, `plain_eval_fn_addr`)
-                    // returns `PyResult`, which stays unstamped, and mapping
-                    // that absence to `Void` disagrees with the call's `Ref`.
+                    // `return_type` is not `FUNC.RESULT`. Ordinary aggregate
+                    // graphs and the prebuilt eval hook (`register_eval_override`,
+                    // `plain_eval_fn_addr`) stay unstamped; mapping that
+                    // absence to `Void` disagrees with the call's `Ref`.
                     if let Some(expected_result) = self.declared_graph_result_type(&witness_graph)
                         && result_type != expected_result
                     {
