@@ -3892,14 +3892,15 @@ impl PartialEq for Constant {
 impl Eq for Constant {}
 
 impl Hash for Constant {
-    /// `flowspace/model.py Hashable.__hash__` hashes `self.key`. `List` /
-    /// `Dict` hash the value (one Arc has one content; the pointer address
-    /// is not hashed so prepass output stays deterministic). `Graphs` and
-    /// an unhashable `Tuple` still hash `self.id`.
+    /// `flowspace/model.py Hashable.__init__` / `Hashable.__hash__` hashes
+    /// `Hashable.key`. For `List`/`Dict` the key is `id(self.value)`, i.e.
+    /// the inner `Arc`'s address, consistent with the `Arc::ptr_eq` equality.
+    /// `Graphs` and an unhashable `Tuple` still hash `self.id`.
     fn hash<H: Hasher>(&self, state: &mut H) {
         if Self::uses_hashable_identity_fallback(&self.value) {
             match &self.value {
-                ConstValue::List(_) | ConstValue::Dict(_) => self.value.hash(state),
+                ConstValue::List(a) => (Arc::as_ptr(a) as *const () as usize).hash(state),
+                ConstValue::Dict(d) => (Arc::as_ptr(d) as *const () as usize).hash(state),
                 _ => self.id.hash(state),
             }
         } else {
@@ -6248,10 +6249,6 @@ mod tests {
         };
 
         assert_ne!(a, b);
-        // Distinct Arcs with equal contents share the deterministic
-        // `ConstValue` content hash (`Hashable.__hash__` of `id(value)`
-        // cannot be a pointer address: prepass output must stay stable).
-        assert_eq!(hash_of(&a), hash_of(&b));
         assert_eq!(a, c);
         assert_eq!(hash_of(&a), hash_of(&c));
     }
@@ -6275,6 +6272,17 @@ mod tests {
         let a = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
         let b = Constant::new(ConstValue::List(Arc::new(vec![ConstValue::Int(1)])));
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn constant_list_hash_does_not_read_elements() {
+        let list = ConstValue::List(Arc::new(vec![ConstValue::LowLevelType(Box::new(
+            lltype::LowLevelType::ForwardReference(Box::new(lltype::ForwardReference::new())),
+        ))]));
+        let c = Constant::new(list);
+        let mut hasher = DefaultHasher::new();
+        c.hash(&mut hasher);
+        let _ = hasher.finish();
     }
 
     #[test]
