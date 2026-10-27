@@ -869,7 +869,12 @@ enum TracebackWalkField {
     /// `tb.tb_frame` — the node's frame.  Unlike its two siblings the getter
     /// ALSO runs `mark_as_escaped()`; see the escape emit.
     TbFrame,
-    /// `frame.f_code` — `fget_f_code` is `self.pycode as PyObjectRef`.
+    /// `frame.f_code` — `pyframe.py fget_code` → `getcode()`. The hop pins
+    /// the slot with GuardNonnull rather than GuardValue: a traceback walk
+    /// sees a different pycode per catching frame, and `compile.py
+    /// make_a_counter_per_value` would compile a bridge per value.
+    /// Interpreter `fget_f_code` still promotes
+    /// (`hint(self.pycode, promote=True)`).
     /// `tb_lasti` / `tb_lineno` are absent: `tb_lasti` is unused on the walk,
     /// and `tb_lineno` is recorded by descending `descr_get_tb_lineno`.
     FCode,
@@ -1058,9 +1063,9 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
             (unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(concrete_obj) })
                 as pyre_object::PyObjectRef
         }
-        // `w_name` is realized on first demand, so an unread code object
-        // carries a null here; that declines below and the residual realizes
-        // it for the next attempt.
+        // `w_name` is stored at construction (`PyCode.__init__ self.co_name`);
+        // a null here is a wrapper that skipped `w_code_new_owned` and
+        // declines so the residual can realize it.
         TracebackWalkField::CoName => unsafe {
             (*(concrete_obj as *const pyre_interpreter::pycode::PyCode)).w_name
         },

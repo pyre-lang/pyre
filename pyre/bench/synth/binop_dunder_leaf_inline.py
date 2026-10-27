@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=4.5
+# pyre-check: max-pypy-ratio=2.2
 # A `BINARY_OP` / `COMPARE_OP` whose dunder is a call-free Python body.
 #
 # The walker used to refuse every one of these.  The refusal was not about the
@@ -22,8 +22,9 @@
 # residual and is here so the two sit side by side, not because it gates.
 # `synth/binop_dunder_commit_then_notimplemented` is what gates the refusal.
 #
-# The ceiling gates admission of `fast`. On this run dynasm reads 1.2x and
-# cranelift 2.2x; the ceiling is twice the slower. Losing admission puts
+# The ceiling gates admission of `fast`.
+# main CI 10-24..10-26 (6 runs, all native legs): 1.1x-1.6x; ceiling = max x 1.35.
+# Losing admission puts
 # `fast`'s `+`, `*` and `<` back on a residual frame apiece, and that reading
 # stays above the ceiling.
 #

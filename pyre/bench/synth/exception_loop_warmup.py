@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=4
-# The measured reading stays under 4, so the ceiling is 4.
+# pyre-check: max-pypy-ratio=2.6
+# main CI 10-24..10-26 (6 runs, all native legs): 1.2x-1.9x; ceiling = max x 1.35.
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,

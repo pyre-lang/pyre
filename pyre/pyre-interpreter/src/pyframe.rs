@@ -5540,12 +5540,12 @@ impl PyFrame {
         crate::executioncontext::ExecutionContext::getnextframe_nohidden(this)
     }
 
-    /// pyframe.py fget_code → self.getcode().  Returns the `PyCode`
-    /// wrapper object (`self.pycode`) itself, which is what `frame.f_code`
-    /// yields to Python — not the inner `CodeObject`.
+    /// pyframe.py fget_code → self.getcode() → hint(self.pycode, promote=True).
+    /// Returns the `PyCode` wrapper (`self.pycode`) itself, which is what
+    /// `frame.f_code` yields to Python — not the inner `CodeObject`.
     #[inline]
     pub fn fget_f_code(&self) -> PyObjectRef {
-        self.pycode as PyObjectRef
+        majit_metainterp::jit::promote(self.pycode) as PyObjectRef
     }
 
     /// pyframe.py descr_repr — `<frame at 0x…, file '…', line …,

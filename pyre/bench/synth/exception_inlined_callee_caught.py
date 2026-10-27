@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=2.9
-# Readings 0.6x-1.2x. A ceiling under 3 derives no floor.
+# pyre-check: max-pypy-ratio=2.1
+# main CI 10-24..10-26 (6 runs, all native legs): 0.7x-1.5x; ceiling = max x 1.35.
+# A ceiling under 3 derives no floor.
 N = 131327700
 
 

@@ -2714,7 +2714,10 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     };
     match item {
         Some(val) => Ok(val),
-        None => Err(PyError::index_error("list index out of range")),
+        None => Err(crate::error::oefmt_noargs(
+            PyErrorKind::IndexError,
+            "list index out of range",
+        )),
     }
 }
 

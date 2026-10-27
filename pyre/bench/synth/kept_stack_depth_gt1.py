@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=6.4
-# Widest reading 5.7x with 28% cranelift spread; the ceiling covers 2.32s/0.33s.
+# pyre-check: max-pypy-ratio=4.9
+# main CI 10-24..10-26 (6 runs, all native legs): 1.7x-3.6x; ceiling = max x 1.35. Derived floor 1.225x.
 # Depth > 1 kept-stack branch guards: chained comparisons, nested
 # short-circuits and conditional expressions keep two or more operand-stack
 # temps live across a `goto_if_not`.  The not-taken arm resumes at a merge

@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=2.9
+# pyre-check: max-pypy-ratio=1.1
+# main CI 10-24..10-26 (6 runs, all native legs): 0.4x-0.8x; ceiling = max x 1.35.
 # After the descr_reduce fold the loop DCEs to incrementing integers.
 # A ceiling under 3 derives no floor.
 N = 39024391

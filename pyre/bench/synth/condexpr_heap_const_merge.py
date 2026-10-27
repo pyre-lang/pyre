@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=3.6
+# pyre-check: max-pypy-ratio=2.7
+# main CI 10-24..10-26 (6 runs, all native legs): 1.0x-2.0x; ceiling = max x 1.35.
 # The trip count answers two ends at once.  The loop has to run long enough to
 # reach the JIT, or the merge this fixture exists for never happens; and pypy's
 # own execution has to clear FLOOR_GATE_MIN_BASELINE_S, or the ratio divides

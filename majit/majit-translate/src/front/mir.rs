@@ -21651,12 +21651,14 @@ impl<'a> Lowering<'a> {
             _ => self.resolve_place(mir_bb, inner)?,
         };
         let bb_id = self.emit_bb(mir_bb);
-        Ok(push_direct_ptradd(
+        let entry_ty = ptr.concretetype();
+        let result =
+            push_direct_ptradd(&mut self.graph, bb_id, ptr, bytes, &item_lltype_for_size(1));
+        Ok(restore_offset_pointer_type(
             &mut self.graph,
             bb_id,
-            ptr,
-            bytes,
-            &item_lltype_for_size(1),
+            entry_ty,
+            result,
         ))
     }
 
@@ -63368,9 +63370,8 @@ fn cast_pair_dest(kind: &serde_json::Value) -> Option<&serde_json::Value> {
         .or_else(|| obj.get("PtrWithExposedProvenance"))
 }
 
-/// Word-sized integer `ScalarTy` (`Isize`/`Usize`, or `I64`/`U64` on 64-bit).
+/// Integer `ScalarTy` at least as wide as the target word.
 fn scalar_ty_holds_full_address(ty: &serde_json::Value) -> bool {
-    let word = crate::layout::target_word_size();
     let Some(int) = ty.get("Integer") else {
         return false;
     };
@@ -63381,10 +63382,22 @@ fn scalar_ty_holds_full_address(ty: &serde_json::Value) -> bool {
     else {
         return false;
     };
-    matches!(
-        (name, word),
-        ("Isize" | "Usize", _) | ("I64" | "U64", 8) | ("I32" | "U32", 4)
-    )
+    int_scalar_width_covers_word(name, crate::layout::target_word_size())
+}
+
+/// Integer storage at least as wide as the pointer (`rbuiltin.py` `gen_cast`
+/// preserves the value through primitive widening).
+fn int_scalar_width_covers_word(name: &str, word: usize) -> bool {
+    let width = match name {
+        "I8" | "U8" => 1,
+        "I16" | "U16" => 2,
+        "I32" | "U32" => 4,
+        "I64" | "U64" => 8,
+        "I128" | "U128" => 16,
+        "Isize" | "Usize" => word,
+        _ => return false,
+    };
+    width >= word
 }
 
 fn cast_kind_is_address_cast(kind: &serde_json::Value) -> bool {
@@ -66305,15 +66318,14 @@ fn emit_rffi_cast_to_carray_ptr(
 }
 
 /// 2-arg `lltype.cast_int_to_ptr(PtrT, int)` (`lltype.py`
-/// `ann_cast_int_to_ptr`). The result is a raw `CArrayPtr` / `CCHARP`.
-fn emit_cast_int_to_carray_ptr(
+/// `ann_cast_int_to_ptr`). `ptr_ty` is the result concretetype.
+fn emit_cast_int_to_ptr_type(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     addr: Variable,
-    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ptr_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
 ) -> Variable {
     use crate::flowspace::model::ConstValue;
-    let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
     let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
     raw.set_concretetype(Some(ptr_ty.clone()));
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -66334,6 +66346,17 @@ fn emit_cast_int_to_carray_ptr(
         },
     });
     raw
+}
+
+/// 2-arg `lltype.cast_int_to_ptr` onto `CArrayPtr` / `CCHARP`.
+fn emit_cast_int_to_carray_ptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+    item: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+) -> Variable {
+    let ptr_ty = lltype_for_direct_ptradd_pointer(None, item);
+    emit_cast_int_to_ptr_type(graph, bb_id, addr, ptr_ty)
 }
 
 /// `cast_int_to_ptr(CCHARP, int)` so a window data word is `CCHARP` rather
@@ -66432,6 +66455,28 @@ fn push_direct_ptradd(
             result_ty: ValueType::Int,
         },
     });
+    result
+}
+
+/// Restore the raw entry pointer type after a byte `direct_ptradd`.
+/// `ann_direct_ptradd` returns `s_p`; `rffi.py` `ptradd` is
+/// `rffi.cast(CCHARP, p)` → `rffi.ptradd` → `rffi.cast(PTRTYPE, q)`.
+fn restore_offset_pointer_type(
+    graph: &mut FunctionGraph,
+    bb: BlockId,
+    entry_ty: Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType>,
+    result: Variable,
+) -> Variable {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    if let Some(t) = entry_ty
+        && matches!(&t, LowLevelType::Ptr(p) if !p._needsgc())
+        && result.concretetype().as_ref() != Some(&t)
+    {
+        let addr = push_cast_ptr_to_int(graph, bb, result);
+        return emit_cast_int_to_ptr_type(graph, bb, addr, t);
+    }
+    // Int-kind (`getkind` Signed) or None: no pointer annotation to restore.
+    // A GC pointer plus a byte offset is an interior address, which stays CCHARP.
     result
 }
 
@@ -77480,6 +77525,12 @@ fn const_eval_unop(kind: &serde_json::Value, v: ConstLit) -> Option<ConstLit> {
 }
 
 fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
+    const_cast_int_with_word(n, target, crate::layout::target_word_size())
+}
+
+/// Truncate / re-extend to `target` (`lltype.py` `cast_primitive`).
+/// `Isize`/`Usize` width is the target word, not a hard-coded 64.
+fn const_cast_int_with_word(n: i64, target: &serde_json::Value, word: usize) -> Option<i64> {
     let int = target
         .get("Integer")
         .and_then(serde_json::Value::as_object)?;
@@ -77493,7 +77544,8 @@ fn const_cast_int(n: i64, target: &serde_json::Value) -> Option<i64> {
         "I8" | "U8" => 8,
         "I16" | "U16" => 16,
         "I32" | "U32" => 32,
-        "I64" | "U64" | "Isize" | "Usize" => 64,
+        "I64" | "U64" => 64,
+        "Isize" | "Usize" => (word * 8) as u32,
         // 128-bit targets exceed the i64 carrier.
         _ => return None,
     };
@@ -86566,6 +86618,41 @@ mod tests {
             Some(super::IntCastAction::RUint)
         );
         assert_eq!(super::int_cast_action(128, false, 64, false), None);
+    }
+
+    /// Widening integer storage keeps every address bit (`rbuiltin.py` `gen_cast`).
+    #[test]
+    fn int_scalar_width_covers_word_accepts_widening_integer() {
+        assert!(super::int_scalar_width_covers_word("U64", 8));
+        assert!(super::int_scalar_width_covers_word("I64", 8));
+        assert!(super::int_scalar_width_covers_word("U128", 8));
+        assert!(!super::int_scalar_width_covers_word("U32", 8));
+        assert!(super::int_scalar_width_covers_word("U64", 4));
+        assert!(super::int_scalar_width_covers_word("U32", 4));
+        assert!(!super::int_scalar_width_covers_word("U16", 4));
+    }
+
+    /// `Isize`/`Usize` truncate to the target word (`lltype.py` `cast_primitive`).
+    #[test]
+    fn const_cast_int_with_word_truncates_isize_usize_to_target_width() {
+        let usize_ty = serde_json::json!({"Integer": {"Unsigned": "Usize"}});
+        let isize_ty = serde_json::json!({"Integer": {"Signed": "Isize"}});
+        assert_eq!(
+            super::const_cast_int_with_word(0x1_0000_0001, &usize_ty, 8),
+            Some(0x1_0000_0001)
+        );
+        assert_eq!(
+            super::const_cast_int_with_word(0xffff_ffff, &isize_ty, 8),
+            Some(0xffff_ffff)
+        );
+        assert_eq!(
+            super::const_cast_int_with_word(0x1_0000_0001, &usize_ty, 4),
+            Some(1)
+        );
+        assert_eq!(
+            super::const_cast_int_with_word(0xffff_ffff, &isize_ty, 4),
+            Some(-1)
+        );
     }
 
     /// A missing Charon layout on `GcEntries { length: usize, items: [T; 0] }`
@@ -112163,6 +112250,125 @@ mod tests {
             }
             other => panic!("expected pointer direct_ptradd, got {other:?}"),
         }
+    }
+
+    /// Byte `direct_ptradd` stamps `CCHARP`; `ann_direct_ptradd` then
+    /// restores `s_p` (`rffi.py` `ptradd`).
+    #[test]
+    fn restore_offset_pointer_type_recasts_ccharp_to_entry_ptr() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut graph = FunctionGraph::new("test");
+        let bb = graph.startblock;
+        let ptr = graph
+            .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+        let entry_ty = super::lltype_for_direct_ptradd_pointer(None, &LowLevelType::Signed);
+        ptr.set_concretetype(Some(entry_ty.clone()));
+        let count = graph
+            .push_op_var(bb, OpKind::ConstInt(8), true)
+            .expect("count");
+        let ptradd =
+            super::push_direct_ptradd(&mut graph, bb, ptr, count, &super::item_lltype_for_size(1));
+        let restored = super::restore_offset_pointer_type(
+            &mut graph,
+            bb,
+            Some(entry_ty.clone()),
+            ptradd.clone(),
+        );
+        let ccharp = super::lltype_for_direct_ptradd_pointer(None, &LowLevelType::Char);
+        let ptradd_op = graph
+            .block(bb)
+            .operations
+            .iter()
+            .find(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().map(String::as_str) == Some("direct_ptradd"),
+                _ => false,
+            })
+            .expect("direct_ptradd");
+        match &ptradd_op.kind {
+            OpKind::Call { args, .. } => {
+                let crate::model::LinkArg::Value(operand) = &args[0] else {
+                    panic!("pointer operand must be a variable, got {:?}", args[0]);
+                };
+                assert_eq!(
+                    operand.concretetype().as_ref(),
+                    Some(&ccharp),
+                    "direct_ptradd operand is CCHARP"
+                );
+            }
+            other => panic!("expected direct_ptradd call, got {other:?}"),
+        }
+        assert_eq!(
+            ptradd_op.result.as_ref(),
+            Some(&ptradd),
+            "direct_ptradd result variable"
+        );
+        assert_eq!(
+            ptradd.concretetype().as_ref(),
+            Some(&ccharp),
+            "direct_ptradd result is CCHARP"
+        );
+        assert_eq!(
+            restored.concretetype().as_ref(),
+            Some(&entry_ty),
+            "restored result is the entry CArrayPtr(Signed)"
+        );
+    }
+
+    #[test]
+    fn restore_offset_pointer_type_keeps_ptradd_when_entry_is_signed() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut graph = FunctionGraph::new("test");
+        let bb = graph.startblock;
+        let ptr = graph
+            .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+        ptr.set_concretetype(Some(LowLevelType::Signed));
+        let count = graph
+            .push_op_var(bb, OpKind::ConstInt(8), true)
+            .expect("count");
+        let ptradd =
+            super::push_direct_ptradd(&mut graph, bb, ptr, count, &super::item_lltype_for_size(1));
+        let restored = super::restore_offset_pointer_type(
+            &mut graph,
+            bb,
+            Some(LowLevelType::Signed),
+            ptradd.clone(),
+        );
+        assert_eq!(restored, ptradd, "no pointer annotation to restore");
+    }
+
+    #[test]
+    fn restore_offset_pointer_type_keeps_ccharp_for_gc_entry() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        let mut graph = FunctionGraph::new("test");
+        let bb = graph.startblock;
+        let ptr = graph
+            .push_op_var(bb, OpKind::ConstRefAddr(0x1000), true)
+            .expect("pointer value");
+        let entry_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::gc("S", vec![("x".into(), LowLevelType::Signed)])),
+        }));
+        ptr.set_concretetype(Some(entry_ty.clone()));
+        let count = graph
+            .push_op_var(bb, OpKind::ConstInt(8), true)
+            .expect("count");
+        let ptradd =
+            super::push_direct_ptradd(&mut graph, bb, ptr, count, &super::item_lltype_for_size(1));
+        let restored =
+            super::restore_offset_pointer_type(&mut graph, bb, Some(entry_ty), ptradd.clone());
+        let ccharp = super::lltype_for_direct_ptradd_pointer(None, &LowLevelType::Char);
+        assert_eq!(restored, ptradd, "GC entry plus byte offset stays CCHARP");
+        assert_eq!(
+            restored.concretetype().as_ref(),
+            Some(&ccharp),
+            "result remains CCHARP"
+        );
     }
 
     #[test]

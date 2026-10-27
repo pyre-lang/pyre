@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=4
+# pyre-check: max-pypy-ratio=2.7
+# main CI 10-24..10-26 (6 runs, all native legs): 1.2x-2.0x; ceiling = max x 1.35.
 # CALL_KW and CALL_FUNCTION_EX inside a callee that is inlined into the hot
 # loop.  The residual port compiles both opcodes rather than emitting
 # abort_permanent and declining the callee's jitcode.  Guards output

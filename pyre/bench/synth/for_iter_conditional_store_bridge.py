@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=4
-# The measured reading stays under 4, so the ceiling is 4.
+# pyre-check: max-pypy-ratio=2.7
+# main CI 10-24..10-26 (6 runs, all native legs): 1.1x-2.0x; ceiling = max x 1.35.
 def loop_with_two_backedges(n):
     high = 0
     for i in range(n):

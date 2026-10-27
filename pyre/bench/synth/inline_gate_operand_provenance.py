@@ -1,11 +1,9 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=4.1
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 50000
 # iterations pypy exec is under `EXEC_TIME_FLOOR_S`, the ratio prints with
 # a `~`, and this ceiling is not applied.  5000000 iterations land pypy's
-# startup-subtracted time near 0.07s.  Local dynasm reads 2.1x–2.4x (exec
-# near 0.15s against pypy near 0.07s) once `__sub__` and `__mul__` descend
-# `_int_sub` / `_int_mul`.  6 keeps that reading and leaves room for
-# cranelift and a slower host.  A ceiling of 6 floors at parity.
+# startup-subtracted time near 0.07s.
+# main CI 10-24..10-26 (6 runs, all native legs): 1.4x-3.0x; ceiling = max x 1.35. Derived floor 1.025x.
 # The FOR_ITER inline gate admits a callee whose only unproven residual is a
 # `BINARY_OP` it expects the walker to specialize away.  That expectation rests
 # on `args_all_exact_*`, which describes the callee's INCOMING ARGUMENTS — so it

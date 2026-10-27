@@ -1317,27 +1317,36 @@ fn allocate_exception(
         _ if extended => exc_kind_to_pytype(kind),
         _ => &EXCEPTION_TYPE,
     };
-    // `user_setup` → `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`):
-    // the USER map is the owning type's terminator from construction. Reading
-    // it before allocation is what makes `_get_mapdict_map`'s
-    // `jit.promote(self.map)` promotable. Heap types can sit in the nursery,
-    // so `w_class` is pinned around the terminator load and the malloc.
-    let _roots = crate::gc_roots::push_roots();
-    let class_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(w_class);
-    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
-    let map = if user && unsafe { crate::typeobject::is_type(w_class) } {
-        unsafe { crate::typeobject::w_type_get_terminator(w_class) as usize }
+    // `user_setup` → `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`)
+    // only applies to a USER layout. Builtin KeyError/IndexError/ValueError
+    // have `user == false`, so `map == 0` and `layout_header_class` returns
+    // `python_class` unchanged — the shadow-stack pins around that identity
+    // load are a no-op vs `objspace.py allocate_instance` for an interp-level
+    // class, and they sat on every residual raise.
+    let _user_roots = if user {
+        Some(crate::gc_roots::push_roots())
     } else {
-        0
+        None
     };
-    let w_class = crate::gc_roots::shadow_stack_get(class_slot);
-    // A live USER map already holds the Python class on
-    // `terminator.w_cls`. The header is `gettypefor(typeptr)`.
-    let header_class = unsafe { layout_header_class(ob_type, w_class, map) };
-    let header_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(header_class);
-    let header_class = crate::gc_roots::shadow_stack_get(header_slot);
+    let (header_class, map) = if user {
+        let class_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_class);
+        let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+        let map = if unsafe { crate::typeobject::is_type(w_class) } {
+            unsafe { crate::typeobject::w_type_get_terminator(w_class) as usize }
+        } else {
+            0
+        };
+        let w_class = crate::gc_roots::shadow_stack_get(class_slot);
+        // A live USER map already holds the Python class on
+        // `terminator.w_cls`. The header is `gettypefor(typeptr)`.
+        let header_class = unsafe { layout_header_class(ob_type, w_class, map) };
+        let header_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(header_class);
+        (crate::gc_roots::shadow_stack_get(header_slot), map)
+    } else {
+        (w_class, 0)
+    };
     let base = w_exception_base_defaults(kind, ob_type, header_class);
     let obj = if !extended && !user {
         alloc_typed(base, immortal)

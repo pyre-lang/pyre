@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=3.5
-# CI measures dynasm at 1.0x-1.3x pypy and cranelift at 1.7x-2.9x. A ceiling of
-# 3.5 keeps the derived floor (0.875x) under the dynasm readings, which a ceiling
-# of 4 put at exactly parity. With the arity-2 reader off, the loop pays the
+# pyre-check: max-pypy-ratio=2.6
+# main CI 10-24..10-26 (6 runs, all native legs): 1.1x-1.9x; ceiling = max x 1.35.
+# With the arity-2 reader off, the loop pays the
 # opaque residual (about 198x when the retired `subscr_specialised_pair` fold
 # was the only reader).
 # #171/#11 Approach C, SUBSCRIPT slice: canonical-tuple `t[i]` emits a PURE
