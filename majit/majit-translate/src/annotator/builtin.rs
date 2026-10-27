@@ -2627,13 +2627,59 @@ fn nonconst_non_constant(
     Ok(super::model::not_const(s_arg))
 }
 
-/// `rlib/jit.py ConditionalCallEntry.compute_result_annotation` for
-/// `_jit_conditional_call`: the call is void.
+/// `ConditionalCallEntry.compute_result_annotation` `emulate_pbc_call(position_key, args_s[1], args_s[2:])`.
+fn conditional_call_emulate(
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
+    what: &str,
+) -> Result<SomeValue, AnnotatorError> {
+    use super::bookkeeper::EmulatedPbcCallKey;
+    use crate::translator::rtyper::llannotation::lltype_to_annotation;
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+
+    let s_fn = arg_at(args_s, 1, what);
+    match s_fn {
+        SomeValue::PBC(_) => {
+            let unique_key = match bk.current_position_key() {
+                Some(pk) => EmulatedPbcCallKey::Position(pk),
+                None => EmulatedPbcCallKey::Text(what.to_string()),
+            };
+            let call_args: Vec<SomeValue> = (2..args_s.len())
+                .map(|i| arg_at(args_s, i, what).clone())
+                .collect();
+            bk.emulate_pbc_call(unique_key, s_fn, &call_args, &[], None)
+        }
+        SomeValue::Ptr(sp) => match &sp.ll_ptrtype.TO {
+            PtrTarget::Func(ft) => Ok(lltype_to_annotation(ft.result.clone())),
+            other => Err(AnnotatorError::new(format!(
+                "{what}: function arg is SomePtr but not a FuncType, got {other:?}"
+            ))),
+        },
+        other => Err(AnnotatorError::new(format!(
+            "{what}: function arg should be SomePBC or SomePtr(FuncType), got {other:?}"
+        ))),
+    }
+}
+
+/// `rlib/jit.py ConditionalCallEntry.compute_result_annotation`:
+///
+/// ```python
+/// def compute_result_annotation(self, *args_s):
+///     s_res = self.bookkeeper.emulate_pbc_call(self.bookkeeper.position_key,
+///                                              args_s[1], args_s[2:])
+///     if self.instance == _jit_conditional_call_value:
+///         from rpython.annotator import model as annmodel
+///         return annmodel.unionof(s_res, args_s[0].nonnoneify())
+/// ```
+///
+/// Both forms run `emulate_pbc_call`. The void form
+/// (`_jit_conditional_call`) discards `s_res` and returns `s_None`.
 fn jit_conditional_call(
-    _bk: &Rc<Bookkeeper>,
-    _args_s: &[Option<SomeValue>],
+    bk: &Rc<Bookkeeper>,
+    args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
+    let _s_res = conditional_call_emulate(bk, args_s, "jit.conditional_call")?;
     Ok(super::model::s_none())
 }
 
@@ -2653,37 +2699,8 @@ fn jit_conditional_call_elidable(
     args_s: &[Option<SomeValue>],
     _kwds: &HashMap<String, Option<SomeValue>>,
 ) -> Result<SomeValue, AnnotatorError> {
-    use super::bookkeeper::EmulatedPbcCallKey;
-    use crate::translator::rtyper::llannotation::lltype_to_annotation;
-    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
-
     let s_value = arg_at(args_s, 0, "jit.conditional_call_elidable").clone();
-    let s_fn = arg_at(args_s, 1, "jit.conditional_call_elidable");
-    let s_res = match s_fn {
-        SomeValue::PBC(_) => {
-            let unique_key = match bk.current_position_key() {
-                Some(pk) => EmulatedPbcCallKey::Position(pk),
-                None => EmulatedPbcCallKey::Text("jit.conditional_call_elidable".to_string()),
-            };
-            let call_args: Vec<SomeValue> = (2..args_s.len())
-                .map(|i| arg_at(args_s, i, "jit.conditional_call_elidable").clone())
-                .collect();
-            bk.emulate_pbc_call(unique_key, s_fn, &call_args, &[], None)?
-        }
-        SomeValue::Ptr(sp) => match &sp.ll_ptrtype.TO {
-            PtrTarget::Func(ft) => lltype_to_annotation(ft.result.clone()),
-            other => {
-                return Err(AnnotatorError::new(format!(
-                    "conditional_call_elidable: function arg is SomePtr but not a FuncType, got {other:?}"
-                )));
-            }
-        },
-        other => {
-            return Err(AnnotatorError::new(format!(
-                "conditional_call_elidable: function arg should be SomePBC or SomePtr(FuncType), got {other:?}"
-            )));
-        }
-    };
+    let s_res = conditional_call_emulate(bk, args_s, "jit.conditional_call_elidable")?;
     unionof([&s_res, &s_value.nonnoneify()]).map_err(|e| AnnotatorError::new(e.to_string()))
 }
 
@@ -4125,7 +4142,20 @@ mod tests {
     /// `_jit_conditional_call` is void.
     #[test]
     fn jit_conditional_call_annotates_s_none() {
-        let out = jit_conditional_call(&bk(), &[], &no_kwds()).unwrap();
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            FuncType, LowLevelType, Ptr, PtrTarget, SomePtr,
+        };
+
+        let s_cond = SomeValue::Bool(SomeBool::new());
+        let s_fn = SomeValue::Ptr(SomePtr::new(Ptr {
+            TO: PtrTarget::Func(FuncType {
+                args: vec![LowLevelType::Signed],
+                result: LowLevelType::Signed,
+            }),
+        }));
+        let s_arg = SomeValue::Integer(SomeInteger::new(false, false));
+        let out = jit_conditional_call(&bk(), &[Some(s_cond), Some(s_fn), Some(s_arg)], &no_kwds())
+            .unwrap();
         assert!(
             matches!(out, SomeValue::None_(_)),
             "void conditional_call must be s_None, got {out:?}"
@@ -4161,6 +4191,82 @@ mod tests {
                 "union of nonneg value and maybe-neg callee result drops nonneg"
             ),
             other => panic!("expected SomeInteger union, got {other:?}"),
+        }
+    }
+
+    /// Direct analyzer call: `args_s` is `[SomeBool, SomePBC(f), SomeInteger]`.
+    /// `builtin.rs` tests drive analysers by calling them; a compiled
+    /// `f(x)` HostObject becomes the PBC the same way
+    /// `classdesc_init_classdef_emulates_del_call` feeds `emulate_pbc_call`.
+    #[test]
+    fn jit_conditional_call_emulates_its_callee() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::EmulatedPbcCallKey;
+        use crate::flowspace::model::{ConstValue, HostObject};
+        use rustpython_compiler::{Mode, compile as rp_compile};
+        use rustpython_compiler_core::bytecode::ConstantData;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let bk = ann.bookkeeper.clone();
+        let code = rp_compile(
+            "def f(x):\n    return x\n",
+            Mode::Exec,
+            "<test>",
+            Default::default(),
+        )
+        .expect("compile should succeed");
+        let inner = code
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                ConstantData::Code { code } => Some(&**code),
+                _ => None,
+            })
+            .expect("function body should be a code constant");
+        let host =
+            HostObject::new_user_function(crate::flowspace::model::GraphFunc::from_host_code(
+                crate::flowspace::bytecode::HostCode::from_code(inner),
+                crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
+                Vec::new(),
+            ));
+        let s_fn = bk
+            .immutablevalue(&ConstValue::HostObject(host.clone()))
+            .expect("f annotates as SomePBC");
+        assert!(
+            matches!(s_fn, SomeValue::PBC(_)),
+            "callee must be a Python-level PBC, got {s_fn:?}"
+        );
+        let s_cond = SomeValue::Bool(SomeBool::new());
+        let s_arg = SomeValue::Integer(SomeInteger::default());
+        let out = jit_conditional_call(&bk, &[Some(s_cond), Some(s_fn), Some(s_arg)], &no_kwds())
+            .expect("void conditional_call emulates its callee");
+        assert!(
+            matches!(out, SomeValue::None_(_)),
+            "void conditional_call must be s_None, got {out:?}"
+        );
+        assert!(
+            bk.emulated_pbc_calls
+                .borrow()
+                .contains_key(&EmulatedPbcCallKey::Text(
+                    "jit.conditional_call".to_string()
+                )),
+            "void form must record emulate_pbc_call on f"
+        );
+        let fd = bk
+            .getdesc(&host)
+            .expect("f FunctionDesc")
+            .as_function()
+            .expect("f is a FunctionDesc");
+        let graphs = fd.borrow().getgraphs();
+        assert!(
+            !graphs.is_empty(),
+            "emulate_pbc_call must build a graph for f"
+        );
+        let args = graphs[0].graph.borrow().getargs();
+        assert_eq!(args.len(), 1, "f(x) has one input");
+        match ann.annotation(&args[0]) {
+            Some(SomeValue::Integer(_)) => {}
+            other => panic!("f's input arg annotation is an integer, got {other:?}"),
         }
     }
 
