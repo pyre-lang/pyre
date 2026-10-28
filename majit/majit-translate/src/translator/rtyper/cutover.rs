@@ -2615,7 +2615,8 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // non-overwriting, between-passes seeding contract as the unsafe-fn
     // stubs above.
     register_foreign_stdlib_externals(registry);
-    // Zero-arg Void no-effect externals (`icf_identity_token`). Same
+    // Zero-arg Void no-effect externals (`icf_identity_token` /
+    // `icf_identity_token_of`). Same
     // between-passes seeding as the stdlib table; jtransform drops the
     // residual (`is_no_effect_external`) instead of emitting empty asm.
     register_no_effect_externals(registry);
@@ -3964,17 +3965,25 @@ const FOREIGN_STDLIB_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
 ///
 /// Analog of `extfunc.py register_external(function, [], None,
 /// sandboxsafe=True)` whose body is a no-op. Charon leaves
-/// `majit_ir::icf::icf_identity_token` Foreign: the `#[oopspec]` /
-/// `#[dont_look_inside]` macros insert it as empty `nomem` asm so LLVM
-/// MergeFunctions cannot fold helper bodies. Upstream `isconstant` has
-/// no such call (`rlib/jit.py` returns `NonConstant(False)`); the
-/// annotator must see that body, and jtransform must drop the token
-/// the way `rewrite_op_getfield` returns on `RESULT is lltype.Void`.
-const NO_EFFECT_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[(
-    &["majit_ir", "icf", "icf_identity_token"],
-    &[],
-    LowLevelType::Void,
-)];
+/// `majit_ir::icf::icf_identity_token` / `icf_identity_token_of` Foreign:
+/// the `#[oopspec]` / `#[dont_look_inside]` macros insert them as empty
+/// `nomem` asm so LLVM MergeFunctions cannot fold helper bodies. Upstream
+/// `isconstant` has no such call (`rlib/jit.py` returns
+/// `NonConstant(False)`); the annotator must see that body, and
+/// jtransform must drop the token the way `rewrite_op_getfield` returns
+/// on `RESULT is lltype.Void`.
+const NO_EFFECT_EXTERNALS: &[(&[&str], &[&str], LowLevelType)] = &[
+    (
+        &["majit_ir", "icf", "icf_identity_token"],
+        &[],
+        LowLevelType::Void,
+    ),
+    (
+        &["majit_ir", "icf", "icf_identity_token_of"],
+        &[],
+        LowLevelType::Void,
+    ),
+];
 
 /// Residual runtime helpers the interpreter spells in source. Analog of
 /// `extfunc.py register_external` / `@jit.dont_look_inside`: the annotator
@@ -13122,12 +13131,12 @@ mod tests {
 
     /// `rlib/jit.py isconstant`: `@oopspec` + `@specialize.call_location()`
     /// with body `return NonConstant(False)`. The Rust macro inserts
-    /// `icf_identity_token` (empty `nomem` asm); Charon leaves that
-    /// Foreign. Registering it as a zero-arg Void external
-    /// (`register_external(..., [], None)`) lets the annotator see the
-    /// same SomeBool-not-constant body upstream annotates, and
-    /// jtransform drops the token the way `rewrite_op_getfield`
-    /// returns on `RESULT is lltype.Void`.
+    /// `icf_identity_token` / `icf_identity_token_of` (empty `nomem` asm);
+    /// Charon leaves that Foreign. Registering it as a zero-arg Void
+    /// external (`register_external(..., [], None)`) lets the annotator
+    /// see the same SomeBool-not-constant body upstream annotates, and
+    /// jtransform drops the token the way `rewrite_op_getfield` returns
+    /// on `RESULT is lltype.Void`.
     fn isconstant_oopspec_body_graph() -> LegacyGraph {
         let mut graph = LegacyGraph::new("isconstant");
         let value = graph.alloc_value_var();
@@ -13183,6 +13192,7 @@ mod tests {
         use crate::parse::CallPath;
 
         let token = ["majit_ir", "icf", "icf_identity_token"];
+        let token_of = ["majit_ir", "icf", "icf_identity_token_of"];
         let isconstant = ["majit_rlib", "jit", "isconstant"];
         let translator = crate::translator::translator::TranslationContext::new();
         let ann = RPythonAnnotator::new(Some(translator), None, None, false);
@@ -13195,6 +13205,9 @@ mod tests {
         let token_entry = registry
             .lookup(&FunctionPathKey::from_segments(token))
             .expect("icf_identity_token must be a registered no-effect external");
+        registry
+            .lookup(&FunctionPathKey::from_segments(token_of))
+            .expect("icf_identity_token_of must be a registered no-effect external");
         assert!(
             token_entry
                 .function_desc

@@ -1448,13 +1448,22 @@ fn report_helper_fnaddr_skip(name: &Ident, reason: HelperFnAddrSkip) {
 /// Expands to [`majit_ir::icf_identity`]: empty `nomem` asm whose comment
 /// carries a unique const immediate (native) or a volatile read of that
 /// immediate (wasm32), never `black_box` of a pointer.
-fn icf_identity_tokens(name: &Ident) -> proc_macro2::TokenStream {
+fn icf_identity_tokens(name: &Ident, generics: &syn::Generics) -> proc_macro2::TokenStream {
+    let type_params: Vec<&Ident> = generics.type_params().map(|tp| &tp.ident).collect();
+    let of_token = if type_params.is_empty() {
+        quote! {}
+    } else {
+        quote! {
+            ::majit_ir::icf::icf_identity_token_of::<( #(#type_params,)* )>();
+        }
+    };
     quote! {
         ::majit_ir::icf_identity!(::core::concat!(
             ::core::module_path!(),
             "::",
             stringify!(#name),
         ));
+        #of_token
     }
 }
 
@@ -1809,8 +1818,9 @@ fn emit_helper_call_target_fn(
         ReturnType::Type(_, ty) => Some(ty.as_ref()),
         ReturnType::Default => None,
     });
-    let trace_identity = icf_identity_tokens(&trace_target_name);
-    let concrete_identity = icf_identity_tokens(&concrete_target_name);
+    let empty_generics = syn::Generics::default();
+    let trace_identity = icf_identity_tokens(&trace_target_name, &empty_generics);
+    let concrete_identity = icf_identity_tokens(&concrete_target_name, &empty_generics);
     let wrapper = match return_kind {
         HelperCallKind::Void => quote! {
             #[doc(hidden)]
@@ -1880,7 +1890,7 @@ fn emit_helper_call_target_fn(
         let registration =
             emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_name, arity);
         let ctor = emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_name, arity);
-        let fnaddr_identity = icf_identity_tokens(&fnaddr_name);
+        let fnaddr_identity = icf_identity_tokens(&fnaddr_name, &empty_generics);
         let float_abi = match return_kind {
             HelperCallKind::Void => quote! {
                 #[doc(hidden)]
@@ -2522,7 +2532,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
     let body_markers = rpython_attribute_body_markers(attr_name, sig);
-    let identity = icf_identity_tokens(&sig.ident);
+    let identity = icf_identity_tokens(&sig.ident, &sig.generics);
 
     let expanded = quote! {
         #(#attrs)*
@@ -2708,7 +2718,7 @@ fn expand_dont_look_inside_attribute(
     };
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
     let body_markers = rpython_attribute_body_markers(attr_name, sig);
-    let identity = icf_identity_tokens(&sig.ident);
+    let identity = icf_identity_tokens(&sig.ident, &sig.generics);
 
     // No-op inline-prebuild fn.  A residual (opaque) helper has no inline
     // body, hence no per-marker `-live-` triples to pre-register.  But a
@@ -2819,7 +2829,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
 
     let rpython_attribute_const = rpython_attribute_const_for(attr_name, sig, vis);
     let body_markers = rpython_attribute_body_markers(attr_name, sig);
-    let identity = icf_identity_tokens(&sig.ident);
+    let identity = icf_identity_tokens(&sig.ident, &sig.generics);
 
     // `jit_may_force` and `loop_invariant` keep `#[inline(never)]` for the
     // reason recorded on [`elidable`]: their bodies are past the inlining
@@ -3625,9 +3635,13 @@ fn attr_ends_with(attr: &syn::Attribute, name: &str) -> bool {
 /// rlib/jit.py `func.oopspec = spec`. Body-local `oopspec_<NAME>` is what
 /// `harvest_hints_from_llbcs` keys (`oopspec_` prefix); Charon promotes it
 /// under the function path, and `marker_path_to_fn_path` binds that parent.
-fn oopspec_body_markers(fn_ident: &Ident, spec: &str) -> proc_macro2::TokenStream {
+fn oopspec_body_markers(
+    fn_ident: &Ident,
+    spec: &str,
+    generics: &syn::Generics,
+) -> proc_macro2::TokenStream {
     let body_name = format_ident!("oopspec_{}", fn_ident);
-    let identity = icf_identity_tokens(fn_ident);
+    let identity = icf_identity_tokens(fn_ident, generics);
     quote! {
         #[doc(hidden)]
         #[allow(dead_code)]
@@ -3747,7 +3761,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     // binds that parent when it is the function path. Emit the body-local
     // const for every item, and keep the module-level const for free
     // functions so the existing external name stays visible.
-    let body_markers = oopspec_body_markers(&sig.ident, &spec_value);
+    let body_markers = oopspec_body_markers(&sig.ident, &spec_value, &sig.generics);
     // The function stays an ordinary callable one: a call jtransform does not
     // rewrite from its oopspec is a residual call to its address
     // (`getfunctionptr`).
@@ -3967,7 +3981,7 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
     let trampoline_opaque_marker = format_ident!("_jit_look_inside_{}", trampoline_name);
     let trampoline_oopspec_markers = moved_oopspec
         .as_deref()
-        .map(|spec| oopspec_body_markers(&trampoline_name, spec));
+        .map(|spec| oopspec_body_markers(&trampoline_name, spec, &syn::Generics::default()));
     let trampoline_oopspec_sibling = moved_oopspec.as_deref().and_then(|spec| {
         if has_receiver {
             None

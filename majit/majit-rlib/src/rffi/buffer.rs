@@ -1076,12 +1076,14 @@ pub extern "C" fn ll_raw_malloc_varsize_no_length_zero(
 /// header. Kept as the 3-arg ABI `blackhole.rs` / `jit_fnaddr.rs` bind.
 #[inline(never)]
 pub extern "C" fn ll_raw_malloc_varsize(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    majit_ir::icf_identity!(concat!(module_path!(), "::", "ll_raw_malloc_varsize"));
     ll_raw_malloc_varsize_no_length(n, basesize, itemsize)
 }
 
 /// `zero=True` form of [`ll_raw_malloc_varsize`].
 #[inline(never)]
 pub extern "C" fn ll_raw_malloc_varsize_zero(n: i64, basesize: i64, itemsize: i64) -> i64 {
+    majit_ir::icf_identity!(concat!(module_path!(), "::", "ll_raw_malloc_varsize_zero"));
     ll_raw_malloc_varsize_no_length_zero(n, basesize, itemsize)
 }
 
@@ -1120,6 +1122,11 @@ macro_rules! raw_varsize_flag_wrappers {
             basesize: i64,
             itemsize: i64,
         ) -> i64 {
+            majit_ir::icf_identity!(concat!(
+                module_path!(),
+                "::",
+                "ll_raw_malloc_varsize_no_length_no_track_allocation"
+            ));
             ll_raw_malloc_varsize_no_length(n, basesize, itemsize)
         }
         #[inline(never)]
@@ -1128,6 +1135,11 @@ macro_rules! raw_varsize_flag_wrappers {
             basesize: i64,
             itemsize: i64,
         ) -> i64 {
+            majit_ir::icf_identity!(concat!(
+                module_path!(),
+                "::",
+                "ll_raw_malloc_varsize_no_length_zero_no_track_allocation"
+            ));
             ll_raw_malloc_varsize_no_length_zero(n, basesize, itemsize)
         }
         #[inline(never)]
@@ -1136,6 +1148,11 @@ macro_rules! raw_varsize_flag_wrappers {
             basesize: i64,
             itemsize: i64,
         ) -> i64 {
+            majit_ir::icf_identity!(concat!(
+                module_path!(),
+                "::",
+                "ll_raw_malloc_varsize_no_length_add_memory_pressure_no_track_allocation"
+            ));
             ll_raw_malloc_varsize_no_length_add_memory_pressure(n, basesize, itemsize)
         }
         #[inline(never)]
@@ -1144,6 +1161,11 @@ macro_rules! raw_varsize_flag_wrappers {
             basesize: i64,
             itemsize: i64,
         ) -> i64 {
+            majit_ir::icf_identity!(concat!(
+                module_path!(),
+                "::",
+                "ll_raw_malloc_varsize_no_length_zero_add_memory_pressure_no_track_allocation"
+            ));
             ll_raw_malloc_varsize_no_length_zero_add_memory_pressure(n, basesize, itemsize)
         }
         #[inline(never)]
@@ -1162,6 +1184,11 @@ macro_rules! raw_varsize_flag_wrappers {
             itemsize: i64,
             lengthoffset: i64,
         ) -> i64 {
+            majit_ir::icf_identity!(concat!(
+                module_path!(),
+                "::",
+                "ll_raw_malloc_varsize_with_length_no_track_allocation"
+            ));
             ll_raw_malloc_varsize_with_length(n, basesize, itemsize, lengthoffset)
         }
         #[inline(never)]
@@ -1171,6 +1198,11 @@ macro_rules! raw_varsize_flag_wrappers {
             itemsize: i64,
             lengthoffset: i64,
         ) -> i64 {
+            majit_ir::icf_identity!(concat!(
+                module_path!(),
+                "::",
+                "ll_raw_malloc_varsize_with_length_add_memory_pressure_no_track_allocation"
+            ));
             ll_raw_malloc_varsize_with_length_add_memory_pressure(
                 n,
                 basesize,

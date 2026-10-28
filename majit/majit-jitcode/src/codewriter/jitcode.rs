@@ -3936,7 +3936,10 @@ mod tests {
         jc.get_live_vars_info(0, 42);
     }
 
-    /// `jitcode.py` `JitCode.follow_jump`: `assert position in self._alllabels`.
+    /// `jitcode.py` `JitCode.follow_jump`: `if not we_are_translated():
+    /// assert position in self._alllabels`. The check runs only
+    /// untranslated; a release build is the translated image.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "not in _alllabels")]
     fn follow_jump_rejects_a_position_outside_alllabels() {

@@ -1160,8 +1160,9 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `majit_ir::icf::icf_identity_token::<ID>()` is a machine-code
-                // distinguisher with no semantic effect. genc
+                // `majit_ir::icf::icf_identity_token::<ID>()` /
+                // `majit_ir::icf::icf_identity_token_of::<T>()` is a
+                // machine-code distinguisher with no semantic effect. genc
                 // `FunctionCodeGenerator` emits one C function per graph and
                 // never merges two graphs, so the helper's flow graph has no
                 // operation for it. Bind the unit destination to `emit_unit`

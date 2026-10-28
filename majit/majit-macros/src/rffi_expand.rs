@@ -525,7 +525,7 @@ impl LlexternalInput {
             // `jit_trace_fnaddrs` must carry that path or the funcbox stays a
             // symbolic hash and the tracer cannot run the wrapper.
             let ccall_fnaddr = self.ccall_fnaddr_registration();
-            let identity = crate::icf_identity_tokens(&call_name);
+            let identity = crate::icf_identity_tokens(&call_name, &syn::Generics::default());
             Ok(quote! {
                 #save_err_assert
                 #funcptr
