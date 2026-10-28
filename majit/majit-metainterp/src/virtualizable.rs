@@ -180,28 +180,14 @@ pub struct VirtualizableInfo {
     /// Built by set_parent_descr(); None until then.
     pub vable_token_descr: Option<DescrRef>,
     /// virtualizable.py:71-72: self.static_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
-    /// Built by set_parent_descr(); empty until then.
+    /// Each entry is the parent SizeDescr's listed row (`descr.py
+    /// get_field_descr`), the same Arc `heaptracker.all_fielddescrs`
+    /// publishes. A synthetic VTYPE whose parent has no row of that
+    /// name at that offset keeps a minted fallback.
     _static_field_descrs: Vec<DescrRef>,
     /// virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
-    /// Built by set_parent_descr(); empty until then.
+    /// Same listed-row identity as `_static_field_descrs`.
     _array_field_descrs: Vec<DescrRef>,
-    /// Parent-struct-layout counterparts of `_static_field_descrs`, keyed by
-    /// the same field index. Each carries the `index_in_parent` (and canonical
-    /// identity) the parent `SizeDescr` assigns by struct declaration order,
-    /// looked up by byte offset, rather than the vinfo's own sequential
-    /// `[token, statics, arrays]` ordering. These two numberings diverge for a
-    /// struct whose declaration order differs from `[token, statics, arrays]`
-    /// (PyFrame). A vable field op against a force-materialized inline-callee
-    /// VIRTUAL frame must record the struct-layout descr so the optimizer pairs
-    /// the read/write with the frame's `NewWithVtable` construction (which uses
-    /// the parent struct descrs) by matching `index_in_parent`. Falls back to
-    /// the vinfo descr when the parent has no field at that offset.
-    _static_field_struct_descrs: Vec<DescrRef>,
-    /// Parent-struct-layout counterparts of `_array_field_descrs` (the
-    /// array-pointer fields). Like `_static_field_struct_descrs`, these carry
-    /// the parent `SizeDescr`'s `index_in_parent` so a vable op against a
-    /// force-materialized VIRTUAL frame pairs with its `NewWithVtable`.
-    _array_field_struct_descrs: Vec<DescrRef>,
     /// virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
     /// Map from descriptor identity (Arc pointer address) to field index.
     pub static_field_by_descrs: indexmap::IndexMap<usize, usize>,
@@ -271,8 +257,6 @@ impl Clone for VirtualizableInfo {
             vable_token_descr: self.vable_token_descr.clone(),
             _static_field_descrs: self._static_field_descrs.clone(),
             _array_field_descrs: self._array_field_descrs.clone(),
-            _static_field_struct_descrs: self._static_field_struct_descrs.clone(),
-            _array_field_struct_descrs: self._array_field_struct_descrs.clone(),
             static_field_by_descrs: self.static_field_by_descrs.clone(),
             array_field_by_descrs: self.array_field_by_descrs.clone(),
             clear_vable_ptr: self.clear_vable_ptr,
@@ -343,6 +327,43 @@ fn listed_struct_field(descr: &DescrRef, field_name: &str, offset: usize) -> Opt
     })
 }
 
+/// `virtualizable.py` `descr.vinfo = self` on the cached `cpu.fielddescrof`
+/// object (`SimpleFieldDescr::set_vinfo`).
+fn stamp_vinfo_on_listed(
+    listed: &DescrRef,
+    vinfo: &Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
+) {
+    if let Some(w) = vinfo.clone()
+        && let Some(simple) = listed
+            .as_any()
+            .and_then(|any| any.downcast_ref::<majit_ir::SimpleFieldDescr>())
+    {
+        simple.set_vinfo(w);
+    }
+}
+
+/// Listed SizeDescr row when the parent publishes `(name, offset)`; otherwise
+/// the no-listed-row fallback mint (synthetic test VTYPE, layout without
+/// `all_fielddescrs`).
+fn listed_or_fallback<F>(
+    parent: &DescrRef,
+    name: &str,
+    offset: usize,
+    vinfo: &Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
+    mint: F,
+) -> DescrRef
+where
+    F: FnOnce() -> DescrRef,
+{
+    match listed_struct_field(parent, name, offset) {
+        Some(listed) => {
+            stamp_vinfo_on_listed(&listed, vinfo);
+            listed
+        }
+        None => mint(),
+    }
+}
+
 impl VirtualizableInfo {
     /// `virtualizable.py VirtualizableInfo.unwrap_virtualizable_box`.
     ///
@@ -381,8 +402,6 @@ impl VirtualizableInfo {
             vable_token_descr: None,
             _static_field_descrs: Vec::new(),
             _array_field_descrs: Vec::new(),
-            _static_field_struct_descrs: Vec::new(),
-            _array_field_struct_descrs: Vec::new(),
             static_field_by_descrs: indexmap::IndexMap::new(),
             array_field_by_descrs: indexmap::IndexMap::new(),
             clear_vable_ptr: None,
@@ -439,17 +458,24 @@ impl VirtualizableInfo {
         vinfo: Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
     ) {
         // virtualizable.py:28: self.vable_token_descr = cpu.fielddescrof(VTYPE, 'vable_token')
-        // descr.py get_index + heaptracker.py get_fielddescr_index_in: index_in_parent counts
-        // non-void, non-typeptr fields in struct declaration order.
-        // Layout: [typeptr, vable_token(0), static_0(1), ..., array_ptr_0(n+1), ...]
-        self.vable_token_descr = Some(Self::build_field_descr(
+        // descr.py get_field_descr is the listed SizeDescr row; the mint is
+        // the no-listed-row fallback (synthetic test VTYPE).
+        self.vable_token_descr = Some(listed_or_fallback(
             descr,
+            "vable_token",
             self.token_offset,
-            item_size_for_type(Type::Ref),
-            Type::Ref,
-            majit_ir::ArrayFlag::Pointer,
-            0,
-            vinfo.clone(),
+            &vinfo,
+            || {
+                Self::build_field_descr(
+                    descr,
+                    self.token_offset,
+                    item_size_for_type(Type::Ref),
+                    Type::Ref,
+                    majit_ir::ArrayFlag::Pointer,
+                    0,
+                    vinfo.clone(),
+                )
+            },
         ));
         // virtualizable.py:71-72: self.static_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
         let num_static = self.static_fields.len();
@@ -463,15 +489,17 @@ impl VirtualizableInfo {
                 } else {
                     majit_ir::ArrayFlag::from_field_type(f.field_type)
                 };
-                Self::build_field_descr(
-                    descr,
-                    f.offset,
-                    f.field_size,
-                    f.field_type,
-                    flag,
-                    1 + i,
-                    vinfo.clone(),
-                )
+                listed_or_fallback(descr, &f.name, f.offset, &vinfo, || {
+                    Self::build_field_descr(
+                        descr,
+                        f.offset,
+                        f.field_size,
+                        f.field_type,
+                        flag,
+                        1 + i,
+                        vinfo.clone(),
+                    )
+                })
             })
             .collect();
         // virtualizable.py:73-74: self.array_field_descrs = [cpu.fielddescrof(VTYPE, name) ...]
@@ -482,85 +510,40 @@ impl VirtualizableInfo {
             .iter()
             .enumerate()
             .map(|(j, a)| {
-                let offset = a.field_offset;
-                Self::build_field_descr(
-                    descr,
-                    offset,
-                    std::mem::size_of::<usize>(),
-                    Type::Ref,
-                    majit_ir::ArrayFlag::Pointer,
-                    1 + num_static + j,
-                    vinfo.clone(),
-                )
+                listed_or_fallback(descr, &a.name, a.field_offset, &vinfo, || {
+                    Self::build_field_descr(
+                        descr,
+                        a.field_offset,
+                        std::mem::size_of::<usize>(),
+                        Type::Ref,
+                        majit_ir::ArrayFlag::Pointer,
+                        1 + num_static + j,
+                        vinfo.clone(),
+                    )
+                })
             })
             .collect();
-        // Parent-struct-layout descrs, looked up by (fieldname, offset) from
-        // the parent SizeDescr's canonical `all_fielddescrs()`. Used only when
-        // a vable field op targets a force-materialized inline-callee VIRTUAL
-        // frame: its construction (`NewWithVtable` + `SetfieldGc`) uses the
-        // parent struct descrs, and the optimizer pairs reads/writes on a
-        // virtual by `index_in_parent`, so the vable op must record the struct
-        // descr (whose `index_in_parent` follows struct declaration order)
-        // rather than the vinfo descr (whose `index_in_parent` follows
-        // `[token, statics, arrays]`). When the parent exposes no field of
-        // that name at a vinfo field's offset (e.g. the synthetic test VTYPE,
-        // or a layout without `all_fielddescrs`), fall back to the vinfo
-        // descr — for those the two orderings coincide.
-        //
-        // Offset-only matching is not `cpu.fielddescrof(VTYPE, name)`: the
-        // first listed row at that byte wins, so a Windows PyFrame whose
-        // `pycode` sits at 16 while `token_offset` is 64 still stores the
-        // token, but a same-offset decoy (or an LLBC row that reused the
-        // token's offset for another name) would steal the slot.
-        let struct_descr_at = |name: &str, offset: usize, fallback: &DescrRef| -> DescrRef {
-            listed_struct_field(descr, name, offset).unwrap_or_else(|| fallback.clone())
-        };
-        self._static_field_struct_descrs = self
-            .static_fields
-            .iter()
-            .enumerate()
-            .map(|(i, f)| struct_descr_at(&f.name, f.offset, &self._static_field_descrs[i]))
-            .collect();
-        self._array_field_struct_descrs = self
-            .array_fields
-            .iter()
-            .enumerate()
-            .map(|(j, a)| struct_descr_at(&a.name, a.field_offset, &self._array_field_descrs[j]))
-            .collect();
-        // virtualizable.py `self.vable_token_descr = cpu.fielddescrof(VTYPE,
-        // 'vable_token')` is `descr.py get_field_descr`'s cached object,
-        // the same row `heaptracker.all_fielddescrs` lists.
-        // `virtualizable.py` then stamps `descr.vinfo = self` on that
-        // object. Name and offset must both match: an LLBC row named
-        // `vable_token` at a different byte is not the host slot, and a
-        // different name at `token_offset` is not `fielddescrof(...,
-        // 'vable_token')`. Either mismatch keeps the minted descr.
-        if let Some(listed) = listed_struct_field(descr, "vable_token", self.token_offset) {
-            if let Some(w) = vinfo.clone()
-                && let Some(simple) = listed
-                    .as_any()
-                    .and_then(|any| any.downcast_ref::<majit_ir::SimpleFieldDescr>())
-            {
-                simple.set_vinfo(w);
-            }
-            self.vable_token_descr = Some(listed);
-        }
-        // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
-        // Identity-keyed on the FieldDescr this vinfo owns, the same
-        // object the codewriter emits.
+        // VirtualizableInfo.__init__: descr.vinfo = self on each listed
+        // cpu.fielddescrof object, then static_field_by_descrs /
+        // array_field_by_descrs keyed by those objects.
         self.static_field_by_descrs = indexmap::IndexMap::new();
         for (i, d) in self._static_field_descrs.iter().enumerate() {
             self.static_field_by_descrs.insert(descr_identity(d), i);
         }
-        // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
         self.array_field_by_descrs = indexmap::IndexMap::new();
         for (i, d) in self._array_field_descrs.iter().enumerate() {
             self.array_field_by_descrs.insert(descr_identity(d), i);
         }
     }
 
-    /// Build a FieldDescr carrying parent_descr (+ optional vinfo backref).
-    /// Helper for `set_parent_descr` / `finalize_arc` descriptor caching.
+    /// No-listed-row fallback mint (`cpu.fielddescrof` when the parent
+    /// SizeDescr has no `(name, offset)` row).
+    ///
+    /// `heapcache_index_value`: `u32::MAX` allocates
+    /// `next_call_descr_heapcache_index` (unique). Passing `0` would keep
+    /// index 0, so every fallback mint would share HeapCache key 0
+    /// (`heapcache.py` keys `CacheEntry` on the descr object, flattened
+    /// to `Descr::index()`).
     fn build_field_descr(
         parent: &DescrRef,
         offset: usize,
@@ -570,9 +553,10 @@ impl VirtualizableInfo {
         index_in_parent: usize,
         vinfo: Option<Weak<dyn majit_ir::descr::VinfoMarker>>,
     ) -> DescrRef {
-        let mut descr = majit_ir::SimpleFieldDescr::new(0, offset, field_size, field_type, false)
-            .with_flag(flag)
-            .with_parent_descr(parent.clone(), index_in_parent);
+        let mut descr =
+            majit_ir::SimpleFieldDescr::new(u32::MAX, offset, field_size, field_type, false)
+                .with_flag(flag)
+                .with_parent_descr(parent.clone(), index_in_parent);
         if let Some(w) = vinfo {
             descr = descr.with_vinfo(w);
         }
@@ -1112,12 +1096,14 @@ impl VirtualizableInfo {
         self._static_field_descrs[field_index].clone()
     }
 
-    /// Parent-struct-layout counterpart of `static_field_descr`. Returns the
-    /// descr carrying the struct-declaration-order `index_in_parent`, for
-    /// recording a vable field op against a force-materialized inline-callee
-    /// virtual frame (see `_static_field_struct_descrs`).
+    /// Same Arc as [`Self::static_field_descr`].
+    ///
+    /// `virtualizable.py` `cpu.fielddescrof(VTYPE, name)` is the listed
+    /// SizeDescr row (`descr.py get_field_descr`), so the vinfo descr and
+    /// the parent-struct descr are one object. A no-listed-row fallback
+    /// mint (synthetic test VTYPE) is that object too.
     pub fn static_field_struct_descr(&self, field_index: usize) -> DescrRef {
-        self._static_field_struct_descrs[field_index].clone()
+        self.static_field_descr(field_index)
     }
 
     /// virtualizable.py:28: self.vable_token_descr
@@ -1134,12 +1120,10 @@ impl VirtualizableInfo {
         self._array_field_descrs[array_index].clone()
     }
 
-    /// Parent-struct-layout counterpart of `array_pointer_field_descr`. Returns
-    /// the array-pointer descr carrying the struct-declaration-order
-    /// `index_in_parent`, for reading the array base off a force-materialized
-    /// inline-callee virtual frame (see `_array_field_struct_descrs`).
+    /// Same Arc as [`Self::array_pointer_field_descr`]. See
+    /// [`Self::static_field_struct_descr`].
     pub fn array_pointer_struct_descr(&self, array_index: usize) -> DescrRef {
-        self._array_field_struct_descrs[array_index].clone()
+        self.array_pointer_field_descr(array_index)
     }
 
     /// virtualizable.py:58: `self.array_descrs[array_index]`
@@ -1853,6 +1837,7 @@ unsafe fn write_virtualizable_array(array_info: &VableArrayInfo, obj_ptr: *mut u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_ir::Descr;
 
     /// Test helper: add an array field with a fresh descriptor.
     /// Production code should use GcCache-sourced descriptors.
@@ -2005,6 +1990,46 @@ mod tests {
             "offset-first remap would have kept the pycode decoy"
         );
         assert_eq!(fd.offset(), token_offset);
+    }
+
+    /// A parent SizeDescr without `all_fielddescrs` takes the no-listed-row
+    /// fallback mint. `heapcache_index_value(0)` would leave every mint at
+    /// HeapCache key 0; the fallback routes through `u32::MAX` so each
+    /// descr gets a distinct `next_call_descr_heapcache_index`.
+    #[test]
+    fn fallback_mints_get_distinct_heapcache_indices() {
+        let mut info = VirtualizableInfo::new(0);
+        info.add_field("x", Type::Int, 8);
+        info.add_field("y", Type::Int, 16);
+        test_add_array_field(&mut info, "stack", Type::Ref, 24, 0, 0);
+        let descr: DescrRef = majit_ir::descr::make_size_descr(64);
+        let info = info.finalize_arc(descr);
+
+        let d0 = info.static_field_descr(0);
+        let d1 = info.static_field_descr(1);
+        let a0 = info.array_pointer_field_descr(0);
+        let token = info.token_field_descr();
+        assert_ne!(d0.index(), 0, "fallback must not keep heapcache index 0");
+        assert_ne!(d1.index(), 0, "fallback must not keep heapcache index 0");
+        assert_ne!(a0.index(), 0, "fallback must not keep heapcache index 0");
+        assert_ne!(token.index(), 0, "fallback must not keep heapcache index 0");
+        let idxs = [d0.index(), d1.index(), a0.index(), token.index()];
+        for i in 0..idxs.len() {
+            for j in (i + 1)..idxs.len() {
+                assert_ne!(
+                    idxs[i], idxs[j],
+                    "fallback descrs {i} and {j} must not share a HeapCache key"
+                );
+            }
+        }
+        assert!(std::sync::Arc::ptr_eq(
+            &info.static_field_struct_descr(0),
+            &d0
+        ));
+        assert!(std::sync::Arc::ptr_eq(
+            &info.array_pointer_struct_descr(0),
+            &a0
+        ));
     }
 
     #[test]

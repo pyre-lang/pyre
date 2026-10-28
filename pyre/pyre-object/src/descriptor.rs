@@ -179,8 +179,9 @@ mod super_tests {
 /// Python property descriptor object.
 ///
 /// Layout: `[ob_type | fget | fset | fdel | w_doc | w_name | getter_doc |
-/// fget_watchers | fset_watchers | fdel_watchers]`
+/// mutate_fget | mutate_fset | mutate_fdel]`
 #[pyre_class("property", type_id = 19, static_name = "PROPERTY", user_layout)]
+#[majit_macros::jit_immutable_fields("fget?", "fset?", "fdel?")]
 pub struct W_Property {
     /// `descriptor.py:175 _immutable_fields_ = ["w_fget?", "w_fset?",
     /// "w_fdel?"]` declares all three quasi-immutable; the hidden watcher
@@ -201,8 +202,9 @@ pub struct W_Property {
     /// was copied from `fget.__doc__` (descriptor.py); `_copy`
     /// uses it to drop the inherited doc when the getter is replaced.
     pub getter_doc: bool,
-    /// The hidden `mutate_w_fget` field for `descriptor.py:175
-    /// _immutable_fields_ = ["w_fget?", ...]` — see [`crate::quasiimmut`].
+    /// Hidden `mutate_fget` (`quasiimmut.py get_mutate_field_name` of pyre
+    /// `fget`; `descriptor.py W_Property._immutable_fields_ = ["w_fget?",
+    /// "w_fset?", "w_fdel?"]`).
     ///
     /// Holds no GC pointers, so the derived `PTR_OFFSETS` has nothing to walk
     /// here.  The allocation is [`crate::gc_hook::try_gc_alloc_stable_raw`],
@@ -212,11 +214,13 @@ pub struct W_Property {
     /// its own instance; `property_destructor` in `pyre-jit/src/eval.rs` takes
     /// it back on sweep instead.  `W_TypeObject` and `Function`'s inline
     /// `mutate_<name>` fields carry the same pattern.
-    pub fget_watchers: crate::quasiimmut::QuasiImmutField,
-    /// The `w_fset?` twin of [`Self::fget_watchers`].
-    pub fset_watchers: crate::quasiimmut::QuasiImmutField,
-    /// The `w_fdel?` twin of [`Self::fget_watchers`].
-    pub fdel_watchers: crate::quasiimmut::QuasiImmutField,
+    pub mutate_fget: crate::quasiimmut::QuasiImmutField,
+    /// Hidden `mutate_fset` (`quasiimmut.py get_mutate_field_name` of pyre
+    /// `fset`; upstream `w_fset?`).
+    pub mutate_fset: crate::quasiimmut::QuasiImmutField,
+    /// Hidden `mutate_fdel` (`quasiimmut.py get_mutate_field_name` of pyre
+    /// `fdel`; upstream `w_fdel?`).
+    pub mutate_fdel: crate::quasiimmut::QuasiImmutField,
 }
 
 /// Allocate a new property object.
@@ -246,9 +250,9 @@ pub fn w_property_new(
             w_doc: PY_NULL,
             w_name: PY_NULL,
             getter_doc: false,
-            fget_watchers: crate::quasiimmut::QuasiImmutField::new(),
-            fset_watchers: crate::quasiimmut::QuasiImmutField::new(),
-            fdel_watchers: crate::quasiimmut::QuasiImmutField::new(),
+            mutate_fget: crate::quasiimmut::QuasiImmutField::new(),
+            mutate_fset: crate::quasiimmut::QuasiImmutField::new(),
+            mutate_fdel: crate::quasiimmut::QuasiImmutField::new(),
         },
         crate::gc_roots::shadow_stack_get(base + 3),
     )
@@ -301,14 +305,14 @@ pub unsafe fn w_property_reinit(
     // version tag, which is the only other pin a fold over `obj.name` holds.
     // The `is_installed` test is `pyjitpl.py`'s `mutatebox.nonnull()` — a
     // property no loop watches pays one load.
-    if (*prop).fget_watchers.is_installed() {
-        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fget_watchers);
+    if (*prop).mutate_fget.is_installed() {
+        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fget);
     }
-    if (*prop).fset_watchers.is_installed() {
-        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fset_watchers);
+    if (*prop).mutate_fset.is_installed() {
+        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fset);
     }
-    if (*prop).fdel_watchers.is_installed() {
-        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).fdel_watchers);
+    if (*prop).mutate_fdel.is_installed() {
+        crate::quasiimmut::sweep_quasi_immut_field(&(*prop).mutate_fdel);
     }
     (*prop).fget = fget;
     (*prop).fset = fset;
@@ -337,7 +341,7 @@ pub unsafe fn w_property_current_fget_qmut(
     }
     Some(
         (*(obj as *const W_Property))
-            .fget_watchers
+            .mutate_fget
             .get_current_qmut_instance(),
     )
 }
@@ -354,7 +358,24 @@ pub unsafe fn w_property_current_fset_qmut(
     }
     Some(
         (*(obj as *const W_Property))
-            .fset_watchers
+            .mutate_fset
+            .get_current_qmut_instance(),
+    )
+}
+
+/// The `w_fdel?` twin of [`w_property_current_fget_qmut`].
+///
+/// # Safety
+/// `obj` must point to a live [`W_Property`].
+pub unsafe fn w_property_current_fdel_qmut(
+    obj: PyObjectRef,
+) -> Option<std::sync::Arc<crate::quasiimmut::QuasiImmut>> {
+    if obj.is_null() {
+        return None;
+    }
+    Some(
+        (*(obj as *const W_Property))
+            .mutate_fdel
             .get_current_qmut_instance(),
     )
 }

@@ -2041,6 +2041,26 @@ fn publish_kind0_field(struct_id: u64, field_name: &str) {
         }
         let _ = crate::descr::make_descr_from_bh(&bh);
     }
+    intern_leftover_packed_field(struct_id, field_name);
+}
+
+/// Packed parent `all_fielddescrs` is `heaptracker.all_fielddescrs`. A
+/// leftover field named only by EffectInfo still lives there when no
+/// opcode Field slot carries it.
+fn intern_leftover_packed_field(struct_id: u64, _field_name: &str) {
+    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+    let mut rest: &[u8] = BYTES;
+    while !rest.is_empty() {
+        let (type_id, _) = majit_jitcode::jitcode::BhSizeSpec::peek_header(rest);
+        if type_id != struct_id {
+            let consumed = majit_jitcode::jitcode::BhSizeSpec::skip_record(rest);
+            rest = &rest[consumed..];
+            continue;
+        }
+        let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(rest);
+        rest = &rest[consumed..];
+        crate::descr::intern_packed_fields_into_gccache(&spec);
+    }
 }
 
 pub fn rehydrate_build_descr_raw_sets() {
@@ -2913,6 +2933,8 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
     // `getfield_raw_r/id>r` has no `BC_*` (`assembler.py setdefault`);
     // `wire_bhimpl_handlers` binds `handler_getfield_raw_r`
     // (`blackhole.py bhimpl_getfield_raw_r`).
+    // `record_quasiimmut_field/idd` is the headerless twin of `/rdd`
+    // (int-bank base, same no-op skip).
     const DYNAMIC_INSN_KEYS: &[&str] = &[
         "recursive_call_i/iIRFIRF>i",
         "recursive_call_r/iIRFIRF>r",
@@ -2920,6 +2942,7 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         "recursive_call_v/iIRFIRF",
         "int_isvirtual/i>i",
         "getfield_raw_r/id>r",
+        "record_quasiimmut_field/idd",
     ];
     let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
         .iter()
@@ -5073,10 +5096,10 @@ mod tests {
     /// set, so absence from it is not by itself proof that no jitcode carries
     /// the byte.
     ///
-    /// `record_quasiimmut_field/rdd` is registered.
-    /// `jtransform.py rewrite_op_getfield` emits it ahead of a
-    /// quasi-immutable getfield, and `handler_record_quasiimmut_field` is
-    /// the no-op step.
+    /// `record_quasiimmut_field/rdd` and `/idd` are registered.
+    /// `jtransform.py rewrite_op_getfield` emits `/rdd` for a GC owner
+    /// and `/idd` for a headerless raw owner (`getfield_raw_*` int-bank
+    /// base). `handler_record_quasiimmut_field` is the no-op step.
     #[test]
     fn production_bh_builder_overlay_only_gap_snapshot() {
         let builder = build_pyre_production_bh_builder();

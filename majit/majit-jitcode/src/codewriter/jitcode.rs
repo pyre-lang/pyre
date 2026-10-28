@@ -2114,8 +2114,10 @@ impl BhFieldSpec {
     /// through different import paths, so that printable prefix must not turn
     /// one STRUCT's translated constant into several layouts.
     pub fn same_descr_layout(&self, other: &Self) -> bool {
-        self.index == other.index
-            && self.field_key() == other.field_key()
+        // Identity is `(STRUCT, fieldname)` plus geometry. `index` is the
+        // analyzer serialization handle, not HeapCache identity, and must
+        // not collapse or split layouts across processes.
+        self.field_key() == other.field_key()
             && self.offset == other.offset
             && self.field_size == other.field_size
             && self.field_type == other.field_type

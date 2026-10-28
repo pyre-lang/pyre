@@ -413,14 +413,23 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                                 });
                                 specs.len() - 1
                             });
-                        let group = majit_ir::descr::make_simple_descr_group_with_flags(
+                        let owner_spelling = if !p.owner.is_empty() {
+                            p.owner.as_str()
+                        } else {
+                            owner
+                        };
+                        let (_, cache_key) =
+                            majit_ir::descr::struct_key_from_owner_or_name(owner_spelling, name);
+                        let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
                             u32::MAX,
                             p.size,
                             0,
+                            cache_key,
                             p.vtable as usize,
                             p.is_gc_managed,
                             p.headerless,
                             &specs,
+                            &[],
                         );
                         let fd = group.field_descrs[selected].clone();
                         return (*offset, fd as majit_ir::DescrRef);
@@ -553,14 +562,23 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                             index_in_parent: index_in_parent.unwrap_or(0),
                             load_is_acquire: *load_is_acquire,
                         };
-                        let group = majit_ir::descr::make_simple_descr_group_with_flags(
+                        let owner_spelling = if !p.owner.is_empty() {
+                            p.owner.as_str()
+                        } else {
+                            owner
+                        };
+                        let (_, cache_key) =
+                            majit_ir::descr::struct_key_from_owner_or_name(owner_spelling, name);
+                        let group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
                             u32::MAX,
                             p.size,
                             0,
+                            cache_key,
                             p.vtable as usize,
                             p.is_gc_managed,
                             p.headerless,
                             std::slice::from_ref(&spec),
+                            &[],
                         );
                         let fd = group.field_descrs[0].clone();
                         return (*offset, fd as majit_ir::DescrRef);
@@ -641,20 +659,25 @@ pub fn field_descr_ref_from_bh(descr: &crate::blackhole::BhDescr) -> (usize, maj
                     parent.is_some()
                 );
             }
-            (
-                *offset,
-                Arc::new(
-                    majit_ir::descr::SimpleFieldDescr::new(
-                        0,
-                        *offset,
-                        *field_size,
-                        *field_type,
-                        *is_immutable,
-                    )
-                    .with_flag(*field_flag)
-                    .with_load_is_acquire(*load_is_acquire),
-                ) as majit_ir::DescrRef,
-            )
+            {
+                let (struct_key, _) = majit_ir::descr::struct_key_from_owner_or_name(owner, name);
+                let fd = majit_ir::descr::gc_cache().lock().get_field_descr(
+                    struct_key,
+                    field_key,
+                    Some(name.as_str()),
+                    *offset,
+                    *field_size,
+                    *field_type,
+                    *is_immutable,
+                    *is_quasi_immutable,
+                    *field_flag,
+                    u32::MAX,
+                    false,
+                    *index_in_parent,
+                    *load_is_acquire,
+                );
+                (*offset, fd as majit_ir::DescrRef)
+            }
         }
         other => panic!("getfield_gc/setfield_gc: descr is not a Field: {other:?}"),
     }
@@ -758,16 +781,25 @@ pub fn residual_write_effect_info(
                 },
             )
             .collect();
+        let cache_key = if type_id == 0 {
+            let display = ordered
+                .first()
+                .map(|&(_, _, name, _, _, _)| name)
+                .unwrap_or("");
+            majit_ir::descr::struct_key_from_owner_or_name("", display).1
+        } else {
+            type_id
+        };
         majit_ir::descr::make_simple_descr_group_keyed(
             u32::MAX,
             struct_size,
             type_id as u32,
-            type_id,
+            cache_key,
             0,
             is_gc_managed,
             &specs,
         );
-        let struct_key = majit_ir::descr::LLType::Struct(type_id);
+        let struct_key = majit_ir::descr::LLType::Struct(cache_key);
         fds.extend(fields.iter().map(|(_, _, write_field, _, _, _)| {
             majit_ir::descr::gc_cache()
                 .lock()

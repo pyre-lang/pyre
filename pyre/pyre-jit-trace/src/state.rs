@@ -4282,29 +4282,7 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // PyreSym.generate_guard for proper snapshot/fail_args (pyjitpl.py
     // generate_guard parity). Instead, set a flag on ctx so the caller
     // (PyreSym with_ctx block) can emit it with full resume data.
-    if descr.is_quasi_immutable() {
-        if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
-            // pyjitpl.py:1077-1080 cache hit:
-            //   if heapcache.is_quasi_immut_known(fielddescr, box):
-            //       profiler.count_ops(rop.QUASIIMMUT_FIELD, HEAPCACHED_OPS)
-            //       return
-            ctx.profiler().count_ops(
-                OpCode::QuasiimmutField,
-                majit_metainterp::counters::HEAPCACHED_OPS,
-            );
-        } else {
-            let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
-            ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-            ctx.record_op_with_descr(
-                OpCode::QuasiimmutField,
-                &[obj],
-                qmutdescr.unwrap_or_else(|| descr.clone()),
-            );
-            if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-                ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
-            }
-        }
-    }
+    maybe_record_quasiimmut_on_getfield(ctx, obj, &descr);
     // `opimpl_getfield_gc_i` records the plain GETFIELD_GC_I opnum
     // regardless of `descr.is_always_pure()`; purity is re-derived from
     // the descr by OptHeap (const fold + invalidation-exempt field
@@ -4401,26 +4379,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         );
         return cached;
     }
-    if descr.is_quasi_immutable() {
-        if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
-            // pyjitpl.py cache hit (see opimpl_getfield_gc_i above).
-            ctx.profiler().count_ops(
-                OpCode::QuasiimmutField,
-                majit_metainterp::counters::HEAPCACHED_OPS,
-            );
-        } else {
-            let qmutdescr = quasi_immut_descr(ctx, obj, &descr);
-            ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
-            ctx.record_op_with_descr(
-                OpCode::QuasiimmutField,
-                &[obj],
-                qmutdescr.unwrap_or_else(|| descr.clone()),
-            );
-            if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-                ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
-            }
-        }
-    }
+    maybe_record_quasiimmut_on_getfield(ctx, obj, &descr);
     // `opimpl_getfield_gc_r` records the plain GETFIELD_GC_R opnum
     // regardless of `descr.is_always_pure()`; purity is re-derived from
     // the descr by OptHeap. There is no pure getfield opnum.
@@ -4498,17 +4457,37 @@ fn descr_field_name(descr: &DescrRef) -> &str {
         .unwrap_or("<unnamed>")
 }
 
-fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
-    let Some(majit_ir::Value::Ref(struct_ref)) = ctx.box_value(obj) else {
-        return None;
-    };
-    if struct_ref == majit_ir::GcRef::NO_CONCRETE
-        || struct_ref.as_usize() == 0
-        || struct_ref.as_usize() == usize::MAX
-    {
-        return None;
+fn live_struct_ptr(value: majit_ir::Value) -> Option<i64> {
+    match value {
+        majit_ir::Value::Ref(struct_ref) => {
+            if struct_ref == majit_ir::GcRef::NO_CONCRETE
+                || struct_ref.as_usize() == 0
+                || struct_ref.as_usize() == usize::MAX
+            {
+                return None;
+            }
+            Some(struct_ref.0 as i64)
+        }
+        // Headerless /idd: the assembler banks a raw address as Int
+        // (`lookup_reg_with_kind_var`). `quasiimmut.py
+        // get_current_qmut_instance` adds the mutate offset to that
+        // address; it is not a GCREF (`history.py ConstInt`).
+        majit_ir::Value::Int(ptr) if ptr != 0 => Some(ptr),
+        _ => None,
     }
-    Some(struct_ref.0 as i64)
+}
+
+fn concrete_gc_ptr(ctx: &TraceCtx, obj: OpRef) -> Option<i64> {
+    // `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
+    // Constants and stamped FrontendOps carry that word on the box
+    // (`TraceCtx::box_value`). A walker pin that records `GetfieldGcR`
+    // without `execute_with_descr` leaves `_resref` empty; recover the
+    // live field the executor would have written
+    // (`TraceCtx::recover_ref_value`).
+    if let Some(value) = ctx.box_value(obj) {
+        return live_struct_ptr(value);
+    }
+    ctx.recover_ref_value(obj, 8).and_then(live_struct_ptr)
 }
 
 // Note: pyre does not currently route GetfieldGcF through
@@ -5045,17 +5024,25 @@ pub(crate) fn trace_float_block_setitem_value(
 /// first-seen globals. Inline callers only use this after proving that the
 /// callee function globals is that code-global identity; the uncommon
 /// debugdata override stays on the residual path.
+///
+/// `jtransform.py rewrite_op_getfield` records `record_quasiimmut_field`
+/// with `mutate_w_globals` before the load (`pycode.py` `"w_globals?"`).
 pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
-    let pycode = ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[frame],
-        crate::descr::pyframe_code_descr(),
-    );
-    ctx.record_op_with_descr(
-        OpCode::GetfieldGcR,
-        &[pycode],
-        crate::descr::pycode_w_globals_descr(),
-    )
+    let code_descr = crate::descr::pyframe_code_descr();
+    let pycode = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame], code_descr.clone());
+    // `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
+    // This GetfieldGcR is a walker pin, not `execute_with_descr`, so stamp
+    // the live pycode the executor would have left on the box.
+    if let Some(struct_ptr) = concrete_gc_ptr(ctx, frame) {
+        if let Some(live) = ctx.field_sanity_load(struct_ptr, &code_descr, Type::Ref) {
+            ctx.set_opref_concrete(pycode, live);
+        }
+    }
+    let descr = crate::descr::pycode_w_globals_descr();
+    if let Some(mutate) = crate::descr::mutate_descr_for_quasi_field(&descr) {
+        record_quasiimmut_field(ctx, pycode, descr.clone(), Some(&mutate));
+    }
+    ctx.record_op_with_descr(OpCode::GetfieldGcR, &[pycode], descr)
 }
 
 /// `FixedObjectArray.len` sits at payload offset 0. `set_forwarding_address`
@@ -5322,6 +5309,37 @@ pub(crate) fn module_dict_cell_value_direct(obj: PyObjectRef, slot: usize) -> Op
     unsafe { pyre_object::dictmultiobject::module_dict_cell_at(obj, slot) }
 }
 
+/// `pyjitpl.py opimpl_getfield_gc_*` never installs a watcher. A field whose
+/// STRUCT publishes `mutate_<name>` (`descr.py get_field_descr`) carries that
+/// descr on [`record_quasiimmut_field`] (`jtransform.py rewrite_op_getfield` /
+/// walker pins). Other STRUCTs still go through [`quasi_immut_descr`].
+fn maybe_record_quasiimmut_on_getfield(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) {
+    if !descr.is_quasi_immutable() {
+        return;
+    }
+    let field_index = descr.index();
+    if ctx.heap_cache().is_quasi_immut_known(field_index, obj) {
+        ctx.profiler().count_ops(
+            OpCode::QuasiimmutField,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+        return;
+    }
+    if crate::descr::mutate_descr_for_quasi_field(descr).is_some() {
+        return;
+    }
+    let qmutdescr = quasi_immut_descr(ctx, obj, descr);
+    ctx.heap_cache_mut().quasi_immut_now_known(field_index, obj);
+    ctx.record_op_with_descr(
+        OpCode::QuasiimmutField,
+        &[obj],
+        qmutdescr.unwrap_or_else(|| descr.clone()),
+    );
+    if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+        ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    }
+}
+
 /// pyjitpl.py `opimpl_record_quasiimmut_field`: record the
 /// dependency marker and arm the pending GUARD_NOT_INVALIDATED once per
 /// heapcache epoch.
@@ -5427,8 +5445,8 @@ impl majit_ir::QuasiImmutHandle for RecordedQuasiImmut {
 }
 
 /// `pycode.py` `"w_globals?"`. Analyzer `fielddescrof` stamps
-/// `PyCode.w_globals`; the reserved quasi descr uses the same offset and a
-/// `Struct.w_globals` name.
+/// `PyCode.w_globals`; that is the [`crate::descr::pycode_w_globals_descr`]
+/// group row (`descr.py get_field_descr(STRUCT, fieldname)`).
 /// A constant globals operand is its own namespace. A non-constant one is
 /// the recorded `PyCode.w_globals` read only when that field's
 /// quasi-immutable dependency is already known: the marker keeps the dict
@@ -5445,39 +5463,12 @@ pub(crate) fn globals_read_keeps_recorded_namespace(ctx: &TraceCtx, globals: OpR
 }
 
 fn is_pycode_w_globals_descr(descr: &DescrRef) -> bool {
-    if !descr.is_quasi_immutable() {
-        return false;
-    }
-    let Some(field) = descr.as_field_descr() else {
-        return false;
-    };
-    if field.offset() != pyre_interpreter::pycode::CODE_W_GLOBALS_OFFSET {
-        return false;
-    }
-    let name = field.field_name();
-    name == "w_globals" || name.ends_with(".w_globals")
-}
-
-/// Analyzer `fielddescrof` for `typeobject.py` `_version_tag?` mints its own
-/// index. The reserved [`crate::descr::type_version_tag_descr`] is the same
-/// slot: `W_TypeObject.version_tag`.
-fn is_type_version_tag_descr(descr: &DescrRef) -> bool {
-    if !descr.is_quasi_immutable() {
-        return false;
-    }
-    let Some(field) = descr.as_field_descr() else {
-        return false;
-    };
-    if field.offset() != core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag) {
-        return false;
-    }
-    let name = field.field_name();
-    name == "version_tag" || name.ends_with(".version_tag")
+    std::sync::Arc::ptr_eq(descr, &crate::descr::pycode_w_globals_descr())
 }
 
 /// Watcher from the mutate descr: `QuasiImmutDescr.__init__` /
 /// `get_current_qmut_instance`.
-fn quasi_immut_descr_from_mutate(
+pub(crate) fn quasi_immut_descr_from_mutate(
     ctx: &mut TraceCtx,
     obj: OpRef,
     field_descr: &DescrRef,
@@ -5548,109 +5539,21 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
     let index = descr.index();
     // The index decides which type `struct_ptr` is cast to, so an unrecognised
     // one must fail loudly rather than reinterpret a headerless map-node
-    // allocation as a `W_TypeObject`.  The arms below are every quasi-immutable
-    // descr this binary mints: the hand-minted singletons, including
-    // `GilReadyState.gil_ready`, `W_TypeObject.name?`, the nine `Function`
-    // fields `function.py` declares (`function_quasi_immut_slot`), and
-    // `PyCode.w_globals`. Analyzer `fielddescrof` stamps that field from
-    // `pycode.py` `"w_globals?"`; the name plus `CODE_W_GLOBALS_OFFSET` is
-    // the same slot as the reserved `pycode_w_globals_quasi_descr` index.
+    // allocation as a `W_TypeObject`.  Function `?` fields,
+    // `ModuleDictStrategy.version`, `W_TypeObject.version_tag` / `w_name`,
+    // mapdict `Terminator.allow_unboxing` / `PlainAttribute.ever_mutated`
+    // / `CachedAttributeHolder.attr` / `typ`, `CellFamily.ever_mutated`,
+    // `AuditHolder.hooks_armed`, `W_Property.fget` / `fset`,
+    // `StaticMethod` / `ClassMethod.w_function`,
+    // `ExecutionContext.w_tracefunc` / `profilefunc`,
+    // `GilReadyState.gil_ready`, `PyCode.w_globals`, and `W_CType.size`
+    // resolve through [`quasi_immut_descr_from_mutate`] (mutate descr
+    // required). The arm below is the remaining STRUCT: `PyObject.w_class`.
     let qmut = unsafe {
-        if index == crate::descr::module_dict_version_descr().index() {
-            pyre_object::dictmultiobject::module_dict_strategy_current_version_qmut(
-                struct_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
-            )
-        } else if index == crate::descr::type_version_tag_descr().index()
-            || is_type_version_tag_descr(descr)
-        {
-            pyre_object::typeobject::w_type_current_qmut_instance(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::type_name_obj_descr().index() {
-            pyre_object::typeobject::w_type_current_w_name_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::terminator_allow_unboxing_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::terminator_current_allow_unboxing_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::plain_attribute_ever_mutated_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::plain_attribute_current_ever_mutated_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::cell_family_ever_mutated_descr().index() {
-            Some(
-                (*(struct_ptr as *const pyre_object::nestedscope::CellFamily))
-                    .current_ever_mutated_qmut(),
-            )
-        } else if index == crate::descr::holder_attr_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::holder_current_attr_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::holder_typ_descr().index() {
-            pyre_interpreter::objspace::std::mapdict::holder_current_typ_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::audit_holder_hooks_descr().index() {
-            pyre_interpreter::module::sys::vm::audit_holder_current_hooks_qmut(
-                struct_ptr as *const _,
-            )
-        } else if index == crate::descr::property_fget_descr().index() {
-            pyre_object::descriptor::w_property_current_fget_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::property_fset_descr().index() {
-            pyre_object::descriptor::w_property_current_fset_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::staticmethod_w_function_quasi_descr().index() {
-            pyre_object::function::w_staticmethod_current_w_function_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::classmethod_w_function_quasi_descr().index() {
-            pyre_object::function::w_classmethod_current_w_function_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::pycode_w_globals_quasi_descr().index()
-            || is_pycode_w_globals_descr(descr)
-        {
-            pyre_interpreter::pycode::w_code_current_w_globals_qmut(
-                struct_ptr as pyre_object::PyObjectRef,
-            )
-        } else if index == crate::descr::ec_w_tracefunc_descr().index() {
-            // Ahead of `function_quasi_immut_slot`.  The reserved index is
-            // the owner identity; this order keeps an ordinal slip from
-            // casting an EC as a Function.
-            pyre_interpreter::executioncontext::ec_current_w_tracefunc_qmut(
-                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
-            )
-        } else if index == crate::descr::ec_profilefunc_descr().index() {
-            pyre_interpreter::executioncontext::ec_current_profilefunc_qmut(
-                struct_ptr as *const pyre_interpreter::executioncontext::ExecutionContext,
-            )
-        } else if index == crate::descr::gil_ready_descr().index() {
-            // `gil.py` `GILThreadLocals.gil_ready?` — one process-global
-            // watcher. `struct_ptr` is the static's address; every reader
-            // shares this invalidation.
-            Some(pyre_object::gil_ready::gil_ready_current_qmut())
-        } else if index == crate::descr::w_class_descr().index() {
+        if index == crate::descr::w_class_descr().index() {
             // `PyObject.w_class?` — one process-global watcher; the
             // struct_ptr is unused (every instance shares the invalidation).
             Some(pyre_object::w_class_current_qmut())
-        } else if descr.is_quasi_immutable()
-            && descr.as_field_descr().is_some_and(|field| {
-                let name = field.field_name();
-                name == "size" || name.ends_with(".size")
-            })
-        {
-            // `W_CType.size?` is the only quasi-immutable `size`. The watcher
-            // lives on the ctype; the module hook reads it.
-            pyre_interpreter::importing::ctype_size_qmut(struct_ptr as pyre_object::gc_hook::GCREF)
-        } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {
-            pyre_interpreter::function::function_current_qmut_instance(
-                struct_ptr as pyre_object::PyObjectRef,
-                slot,
-            )
         } else {
             debug_assert!(
                 false,
@@ -13126,7 +13029,7 @@ mod tests {
     }
 
     #[test]
-    fn function_code_quasiimmut_instance_identity_agrees_between_ladder_and_mutate_descr() {
+    fn function_code_quasiimmut_instance_identity_via_mutate_descr() {
         pyre_interpreter::test_hooks::install_hash_hook();
         let _hook_guard = QmutHookGuard::install();
 
@@ -13139,10 +13042,8 @@ mod tests {
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let obj = ctx.const_ref(func as i64);
         let field = crate::descr::function_code_descr();
-        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
-            &crate::descr::w_function_size_descr(),
-            pyre_interpreter::function::FUNCTION_MUTATE_CODE_OFFSET,
-        );
+        let mutate = crate::descr::function_mutate_descr_for_field(&field)
+            .expect("Function.code has mutate_code");
         let mutate_fd = mutate
             .as_field_descr()
             .expect("mutate_code is a field descr");
@@ -13151,36 +13052,25 @@ mod tests {
             "Function.mutate_code must carry a parent slot"
         );
 
-        let ladder =
-            quasi_immut_descr(&mut ctx, obj, &field).expect("ladder resolves Function.code");
         let generic = quasi_immut_descr_from_mutate(&mut ctx, obj, &field, mutate_fd)
             .expect("generic route resolves Function.mutate_code");
-
-        let ladder_id = ladder
-            .as_quasi_immut_descr()
-            .expect("ladder QuasiImmutDescr")
-            .qmut()
-            .instance_identity();
         let generic_id = generic
             .as_quasi_immut_descr()
             .expect("generic QuasiImmutDescr")
             .qmut()
             .instance_identity();
-        assert_eq!(ladder_id, generic_id);
-        assert_ne!(ladder_id, 0);
+        assert_ne!(generic_id, 0);
     }
 
     #[test]
-    fn record_quasiimmut_field_declines_no_concrete_receiver_on_ladder_and_mutate_descr() {
+    fn record_quasiimmut_field_declines_no_concrete_receiver_on_mutate_descr() {
         pyre_interpreter::test_hooks::install_hash_hook();
         let _hook_guard =
             QmutHookGuard::install_with(test_get_current_qmut_instance_forbids_no_concrete);
 
         let field = crate::descr::function_code_descr();
-        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
-            &crate::descr::w_function_size_descr(),
-            pyre_interpreter::function::FUNCTION_MUTATE_CODE_OFFSET,
-        );
+        let mutate = crate::descr::function_mutate_descr_for_field(&field)
+            .expect("Function.code has mutate_code");
         let mutate_fd = mutate
             .as_field_descr()
             .expect("mutate_code is a field descr");
@@ -13189,42 +13079,32 @@ mod tests {
             "Function.mutate_code must carry a parent slot"
         );
 
-        {
-            let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-            let obj = OpRef::input_arg_ref(0);
-            ctx.set_opref_concrete(obj, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
-            assert!(
-                quasi_immut_descr(&mut ctx, obj, &field).is_none(),
-                "ladder must decline a NO_CONCRETE receiver"
-            );
-            record_quasiimmut_field(&mut ctx, obj, field.clone(), None);
-            assert_recorded_quasiimmut_field_has_no_qmut_descr(ctx);
-        }
-
-        {
-            let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
-            let obj = OpRef::input_arg_ref(0);
-            ctx.set_opref_concrete(obj, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
-            assert!(
-                quasi_immut_descr_from_mutate(&mut ctx, obj, &field, mutate_fd).is_none(),
-                "generic mutate descr must decline a NO_CONCRETE receiver"
-            );
-            record_quasiimmut_field(&mut ctx, obj, field.clone(), Some(&mutate));
-            assert_recorded_quasiimmut_field_has_no_qmut_descr(ctx);
-        }
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let obj = OpRef::input_arg_ref(0);
+        ctx.set_opref_concrete(obj, Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+        assert!(
+            quasi_immut_descr_from_mutate(&mut ctx, obj, &field, mutate_fd).is_none(),
+            "generic mutate descr must decline a NO_CONCRETE receiver"
+        );
+        record_quasiimmut_field(&mut ctx, obj, field.clone(), Some(&mutate));
+        assert_recorded_quasiimmut_field_has_no_qmut_descr(ctx);
     }
 
     #[test]
     fn pycode_mutate_w_globals_descr_resolves_to_embedded_quasi_immut_field() {
         let offset = std::mem::offset_of!(pyre_interpreter::pycode::PyCode, mutate_w_globals);
-        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
-            &crate::descr::pycode_size_descr(),
-            offset,
-        );
+        let field = crate::descr::pycode_w_globals_descr();
+        let mutate = crate::descr::mutate_descr_for_quasi_field(&field)
+            .expect("PyCode.w_globals has mutate_w_globals");
+        assert!(std::sync::Arc::ptr_eq(
+            &mutate,
+            &crate::descr::pycode_mutate_w_globals_descr()
+        ));
         let fd = mutate
             .as_field_descr()
             .expect("PyCode.mutate_w_globals is a field descr");
         assert_eq!(fd.offset(), offset);
+        assert_eq!(fd.field_key(), "mutate_w_globals");
         assert!(
             fd.get_parent_descr().is_some(),
             "PyCode.mutate_w_globals must carry a parent slot"
@@ -13232,7 +13112,7 @@ mod tests {
     }
 
     #[test]
-    fn pycode_w_globals_quasiimmut_instance_identity_agrees_between_ladder_and_mutate_descr() {
+    fn pycode_w_globals_quasiimmut_from_mutate_descr() {
         pyre_interpreter::test_hooks::install_hash_hook();
         let _hook_guard = QmutHookGuard::install();
 
@@ -13241,11 +13121,9 @@ mod tests {
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let obj = ctx.const_ref(w_code as i64);
-        let field = crate::descr::pycode_w_globals_quasi_descr();
-        let mutate = majit_ir::descr::field_descr_from_parent_by_offset(
-            &crate::descr::pycode_size_descr(),
-            std::mem::offset_of!(pyre_interpreter::pycode::PyCode, mutate_w_globals),
-        );
+        let field = crate::descr::pycode_w_globals_descr();
+        let mutate = crate::descr::mutate_descr_for_quasi_field(&field)
+            .expect("PyCode.w_globals has mutate_w_globals");
         let mutate_fd = mutate
             .as_field_descr()
             .expect("mutate_w_globals is a field descr");
@@ -13254,23 +13132,13 @@ mod tests {
             "PyCode.mutate_w_globals must carry a parent slot"
         );
 
-        let ladder =
-            quasi_immut_descr(&mut ctx, obj, &field).expect("ladder resolves PyCode.w_globals");
         let generic = quasi_immut_descr_from_mutate(&mut ctx, obj, &field, mutate_fd)
             .expect("generic route resolves PyCode.mutate_w_globals");
-
-        let ladder_id = ladder
+        let qd = generic
             .as_quasi_immut_descr()
-            .expect("ladder QuasiImmutDescr")
-            .qmut()
-            .instance_identity();
-        let generic_id = generic
-            .as_quasi_immut_descr()
-            .expect("generic QuasiImmutDescr")
-            .qmut()
-            .instance_identity();
-        assert_eq!(ladder_id, generic_id);
-        assert_ne!(ladder_id, 0);
+            .expect("generic QuasiImmutDescr");
+        assert!(std::sync::Arc::ptr_eq(qd.fielddescr(), &field));
+        assert_ne!(qd.qmut().instance_identity(), 0);
     }
 
     #[test]

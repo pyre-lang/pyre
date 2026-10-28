@@ -262,7 +262,7 @@ pub fn new_terminator(w_cls: PyObjectRef, kind: TerminatorKind) -> MapRef {
     let raw = pyre_object::lltype::malloc_raw(MapNode::Terminator(Terminator {
         w_cls,
         allow_unboxing: Cell::new(true),
-        allow_unboxing_watchers: QuasiImmutField::new(),
+        mutate_allow_unboxing: QuasiImmutField::new(),
         kind,
         devolved_dict_terminator: Cell::new(std::ptr::null()),
         cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
@@ -1044,7 +1044,7 @@ pub unsafe fn new_plain_attribute(
         num_attributes: back_node.num_attributes() + 1,
         back,
         ever_mutated: Cell::new(false),
-        ever_mutated_watchers: QuasiImmutField::new(),
+        mutate_ever_mutated: QuasiImmutField::new(),
         order,
         cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: back_node.terminator(),
@@ -1097,7 +1097,7 @@ pub unsafe fn new_unboxed_plain_attribute(
         num_attributes: back_node.num_attributes() + 1,
         back,
         ever_mutated: Cell::new(false),
-        ever_mutated_watchers: QuasiImmutField::new(),
+        mutate_ever_mutated: QuasiImmutField::new(),
         order,
         cache_attrs: AtomicPtr::new(std::ptr::null_mut()),
         terminator: back_node.terminator(),
@@ -5050,9 +5050,9 @@ unsafe fn new_cached_attribute_holder(
     Box::into_raw(Box::new(CachedAttributeHolder {
         order,
         attr: Cell::new(attr),
-        attr_watchers: QuasiImmutField::new(),
+        mutate_attr: QuasiImmutField::new(),
         typ: Cell::new(unbox_type),
-        typ_watchers: QuasiImmutField::new(),
+        mutate_typ: QuasiImmutField::new(),
     }))
 }
 

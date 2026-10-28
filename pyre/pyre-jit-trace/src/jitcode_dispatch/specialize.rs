@@ -2003,14 +2003,7 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
     walker_guard_stamped_class(ctx, op.pc, class_cell_op, cell_type)?;
-    let owner = ctx.trace_ctx.const_ref(family as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::cell_family_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op.pc)?;
+    walker_pin_cell_family_ever_mutated(ctx, op.pc, family)?;
     let cls_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         class_cell_op,
@@ -3394,13 +3387,12 @@ fn walker_fold_type_name<Sym: WalkSym>(
         return Ok(None);
     };
     let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
+    walker_pin_type_quasi_field(
+        ctx,
+        op_pc,
         w_type_const,
         crate::descr::type_name_obj_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    )?;
     // `record_quasiimmut_field` installs the watcher before it captures
     // `constantfieldbox` (`quasiimmut.py QuasiImmutDescr.__init__`). The
     // eligibility peek is only the non-null test; baking it would keep a
@@ -14259,6 +14251,7 @@ fn walker_guard_fold_type_version<Sym: WalkSym>(
     version_tag: i64,
 ) -> Result<OpRef, DispatchError> {
     let type_const = ctx.trace_ctx.const_ref(w_type as i64);
+    walker_pin_type_version_tag(ctx, pc, type_const)?;
     let descr = crate::descr::type_version_tag_descr();
     let vt_op = walker_record_getfield_gc_i_uncached(ctx, type_const, descr);
     walker_guard_fold_int(ctx, pc, vt_op, version_tag)?;
@@ -18637,6 +18630,12 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     // `typeobject.py:1046-1058` rewrites `w_name` without mutating the class
     // dictionary or its version tag.  Pin the raw slot, including its initial
     // null state, because it shadows the type name rendered in the message.
+    walker_pin_type_quasi_field(
+        ctx,
+        op.pc,
+        descr_type_const,
+        crate::descr::type_name_obj_descr(),
+    )?;
     let descr_type_name_op = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[descr_type_const],
@@ -20514,11 +20513,11 @@ fn inlined_callee_frame_w_globals<Sym: WalkSym>(
                 .replace_box(pycode_op, pycode_const);
             pycode_const
         };
-    let globals_op = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        promoted,
-        crate::descr::pycode_w_globals_quasi_descr(),
-    );
+    let descr = crate::descr::pycode_w_globals_descr();
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("PyCode.w_globals has mutate_w_globals");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, promoted, descr.clone(), Some(&mutate));
+    let globals_op = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, promoted, descr);
     if walker_concrete_ref_object(ctx, globals_op).is_none() {
         // Reread through the forwarded constant, not the pre-record word.
         let Some(pycode_obj) = walker_concrete_ref_object(ctx, pycode_const) else {

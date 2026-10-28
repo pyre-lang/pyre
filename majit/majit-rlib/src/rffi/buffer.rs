@@ -1313,7 +1313,6 @@ mod tests {
     };
 
     static RAISE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    static PRESSURE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn fixedsize_roundtrip_zero_clears_and_free() {
@@ -1359,7 +1358,9 @@ mod tests {
         fn hook(size: isize, _object: majit_ir::GcRef) {
             CHARGED.fetch_add(size, Ordering::SeqCst);
         }
-        let _guard = PRESSURE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::MEMORY_PRESSURE_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         CHARGED.store(0, Ordering::SeqCst);
         majit_gc::set_active_add_memory_pressure(Some(hook));
         let ptr = ll_raw_malloc_fixedsize_add_memory_pressure(8);

@@ -16,6 +16,13 @@ use std::sync::Arc;
 /// `ever_mutated` accumulates across frame instantiations: a binding that is
 /// only ever filled once leaves it false, and that is what lets a cell the
 /// trace has as a constant fold its contents.
+///
+/// `repr(C)` pins field offsets to declaration order so the JIT descr
+/// group's `offset_of!` matches the walker arg0 (the family itself).
+/// `name: String` stays first. `nestedscope.py CellFamily._immutable_fields_
+/// = ['ever_mutated?']`.
+#[repr(C)]
+#[majit_macros::jit_immutable_fields("ever_mutated?")]
 pub struct CellFamily {
     /// nestedscope.py `CellFamily.__init__` `name` — the cellvar this family belongs to.
     pub name: String,
@@ -25,13 +32,12 @@ pub struct CellFamily {
     /// [`w_cell_delete`]; [`Self::set_ever_mutated`] invalidates watchers
     /// before changing it.
     pub ever_mutated: std::cell::Cell<bool>,
-    /// The hidden watcher field for that `?` declaration, written out because
-    /// pyre has no rtyper to synthesise it.  Mirrors
-    /// `PlainAttribute::ever_mutated_watchers`: the owner is a
-    /// `Box::into_raw` leak that is never freed, so [`QuasiImmutField`]'s
-    /// `Drop` is unreachable and its inner box is reclaimed only through
-    /// [`QuasiImmutField::invalidate`].
-    pub ever_mutated_watchers: QuasiImmutField,
+    /// Hidden `mutate_ever_mutated` field (`quasiimmut.py get_mutate_field_name`
+    /// of pyre `ever_mutated`; `nestedscope.py CellFamily._immutable_fields_ =
+    /// ['ever_mutated?']`). The owner is a `Box::into_raw` leak that is
+    /// never freed, so [`QuasiImmutField`]'s `Drop` is unreachable and its
+    /// inner box is reclaimed only through [`QuasiImmutField::invalidate`].
+    pub mutate_ever_mutated: QuasiImmutField,
 }
 
 /// Host `CellFamily` is a `Box::into_raw`'d host allocation, never a GC object.
@@ -45,7 +51,7 @@ impl CellFamily {
         Self {
             name,
             ever_mutated: std::cell::Cell::new(false),
-            ever_mutated_watchers: QuasiImmutField::new(),
+            mutate_ever_mutated: QuasiImmutField::new(),
         }
     }
 
@@ -56,22 +62,22 @@ impl CellFamily {
         if self.ever_mutated.get() == v {
             return;
         }
-        if self.ever_mutated_watchers.is_installed() {
-            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.ever_mutated_watchers) };
+        if self.mutate_ever_mutated.is_installed() {
+            unsafe { crate::quasiimmut::sweep_quasi_immut_field(&self.mutate_ever_mutated) };
         }
         self.ever_mutated.set(v);
     }
 
     pub fn current_ever_mutated_qmut(&self) -> Arc<crate::quasiimmut::QuasiImmut> {
-        self.ever_mutated_watchers.get_current_qmut_instance()
+        self.mutate_ever_mutated.get_current_qmut_instance()
     }
 
     pub fn ever_mutated_qmut_installed(&self) -> bool {
-        self.ever_mutated_watchers.is_installed()
+        self.mutate_ever_mutated.is_installed()
     }
 
     pub fn force_ever_mutated_qmut(&self) {
-        self.ever_mutated_watchers.invalidate();
+        self.mutate_ever_mutated.invalidate();
     }
 }
 

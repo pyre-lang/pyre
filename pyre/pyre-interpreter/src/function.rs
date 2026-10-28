@@ -69,7 +69,23 @@ pub static CLASSMETHOD_DESCRIPTOR_TYPE: PyType =
 /// - `name_ptr`: rstr `STR` (`function.py self.name = forcename or code.co_name`)
 /// - `closure`:  tuple of cell objects, or PY_NULL if no closure
 /// - `w_func_globals_obj`: the module namespace dict object (`__globals__`)
+///
+/// `function.py Function._immutable_fields_` is declared here. Two pyre
+/// field names differ from upstream because the struct already spelled
+/// them that way: `w_func_globals` → `w_func_globals_obj`, `qualname` →
+/// `w_qualname`. Suffixes (`?`, `?[*]`) match upstream.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields(
+    "code?",
+    "w_func_globals_obj?",
+    "closure?[*]",
+    "defs_w?[*]",
+    "name?",
+    "w_qualname?",
+    "w_objclass?",
+    "w_text_signature?",
+    "w_kw_defs?"
+)]
 pub struct Function {
     pub ob: PyObject,
     /// Pointer to a Code object (PyCode or BuiltinCode).
@@ -219,9 +235,9 @@ pub const QUASI_IMMUT_SLOT_COUNT: usize = (QuasiImmutSlot::WKwDefs as usize) + 1
 
 /// Which `_immutable_fields_` `?` entry a quasi-immutable operation names.
 ///
-/// `quasiimmut.py` keys everything off the mutate-field *name*; pyre needs a
-/// value it can pass through the descr-index dispatch in
-/// `pyre-jit-trace state.rs` / `pyre-jit eval.rs`, so the name becomes a tag.
+/// `quasiimmut.py` keys everything off the mutate-field *name*. The tag
+/// names which embedded `mutate_<name>` a setter forces
+/// (`Function::jit_force_quasi_immutable`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum QuasiImmutSlot {
     Code,

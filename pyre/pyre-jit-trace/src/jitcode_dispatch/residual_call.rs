@@ -6035,20 +6035,12 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 if let Some(vable_ref) = ctx.trace_ctx.standard_virtualizable_box()
                     && let Some(idx) = info.static_field_index_by_name("last_instr")
                 {
-                    // Record under the PARENT-STRUCT field descr, the resolution
-                    // `vable_setfield` applies through `vable_static_record_descr`;
-                    // `vable_setfield_descr` is a raw pass-through and does not.
-                    // The vinfo's own `static_field_descrs[i]` numbers the field by
-                    // the vinfo `[token, statics, arrays]` order, which diverges
-                    // from PyFrame's struct declaration order, so the store pairs
-                    // against the wrong slot.  `virtualizable.py:71` builds the
-                    // vinfo descrs with `cpu.fielddescrof(VTYPE, name)`, so
-                    // upstream's vinfo descr and the descr an ordinary
-                    // `setfield_gc` carries are one object and the question cannot
-                    // arise there.  Here it decides whether this publish and
+                    // Record under `cpu.fielddescrof(VTYPE, name)`, the listed
+                    // SizeDescr row `VirtualizableInfo.__init__` stores in
+                    // `static_field_descrs`. That is the same Arc an ordinary
+                    // `setfield_gc` carries, so this publish and
                     // `emit_traceback_node`'s store — same frame, same offset —
-                    // supersede each other or survive as two independent
-                    // locations flushed in an arbitrary order.
+                    // supersede each other.
                     let descr = info.static_field_struct_descr(idx);
                     ctx.trace_ctx
                         .vable_setfield_descr(vable_ref, last_instr, descr);
@@ -7840,9 +7832,8 @@ pub(crate) fn publish_portal_executing_last_instr<Sym: WalkSym>(
     );
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
     let idx = info.static_field_index_by_name("last_instr")?;
-    // Parent-struct descr, matching the publish in
-    // `try_execute_residual_call_via_executor_inner`: the vinfo's own static
-    // descr numbers fields in vinfo order, which is not PyFrame's.
+    // Listed `cpu.fielddescrof` row, matching the publish in
+    // `try_execute_residual_call_via_executor_inner`.
     let descr = info.static_field_struct_descr(idx);
     ctx.trace_ctx
         .vable_setfield_descr(vable_ref, last_instr, descr);
@@ -8319,14 +8310,7 @@ fn try_walker_specialize_load_deref<Sym: WalkSym>(
     // `InlineRegisterBankGuard` (`miframe_registers`).  The only other address this fold
     // bakes is the family's, and a family is a `Box::into_raw` leak outside
     // the collector entirely.
-    let owner = ctx.trace_ctx.const_ref(family as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::cell_family_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
     Ok(Some(ctx.trace_ctx.const_ref(contents as i64)))
 }
 
@@ -8431,14 +8415,7 @@ pub(crate) fn try_walker_read_deref_cell<Sym: WalkSym>(
         )?;
         ctx.trace_ctx.heap_cache_mut().class_now_known(cell_op);
     }
-    let owner = ctx.trace_ctx.const_ref(family as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
-        crate::descr::cell_family_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    super::walker_pin_cell_family_ever_mutated(ctx, op_pc, family)?;
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_op,
@@ -8467,17 +8444,12 @@ pub(crate) fn walker_pin_plain_ever_mutated<Sym: WalkSym>(
     op_pc: usize,
     plain: *const pyre_interpreter::objspace::std::mapdict::PlainAttribute,
 ) -> Result<(), DispatchError> {
-    if plain.is_null() {
-        return Ok(());
-    }
-    let owner = ctx.trace_ctx.const_ref(plain as i64);
-    crate::state::record_quasiimmut_field(
-        ctx.trace_ctx,
-        owner,
+    super::walker_pin_mapdict_quasi_field(
+        ctx,
+        op_pc,
+        plain as i64,
         crate::descr::plain_attribute_ever_mutated_descr(),
-        None,
-    );
-    walker_flush_guard_not_invalidated(ctx, op_pc)
+    )
 }
 
 /// Mirror `opimpl_jit_force_quasi_immutable` for mapdict writes hidden inside

@@ -1129,9 +1129,12 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
 /// { .. })`, and yields the `index`. `vable_array_descrs`
 /// (`pyjitpl/dispatch.rs`) then maps that index through the
 /// jitdriver's `VirtualizableInfo` to the canonical `array_field_descrs`
-/// /`array_descrs` pair.  The walker must use the *vinfo* descrs (not the
-/// raw jitcode-pool descrs) because `TraceCtx::vable_array_flat_index`
-/// keys on `array_field_by_descr` (descr identity, `virtualizable.rs`).
+/// /`array_descrs` pair.  The pool entry is `VableArray { index }`, not a
+/// Field descr; hydrating that variant (`BhDescr::VableArray` in
+/// `make_descr_from_bh`) already returns `pyframe_array_field_descr(index)`,
+/// which is the vinfo listed row. The lookup still maps the index onto
+/// those descrs because `TraceCtx::vable_array_flat_index` keys on
+/// `array_field_by_descr` (descr identity, `virtualizable.rs`).
 ///
 /// `field_offset` / `array_offset` are byte offsets (from `op.pc + 1`) of
 /// the two descr operands, matching the per-op argcode layout.

@@ -12248,6 +12248,14 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
         "record_quasiimmut_field/rdd",
         handler_record_quasiimmut_field,
     );
+    // Headerless owner (`CellFamily`, `AuditHolder`): the assembler
+    // puts the raw pointer in the int bank (`getfield_raw_*` `i` base),
+    // so `rewrite_op_getfield` keys `record_quasiimmut_field/idd`. The
+    // blackhole body is the same no-op skip (1 + 2 + 2 bytes).
+    builder.wire_handler(
+        "record_quasiimmut_field/idd",
+        handler_record_quasiimmut_field,
+    );
     // Compatibility fallback for the obsolete name-based vtable opcode.
     builder.wire_handler("vtable_method_ptr/rd>i", handler_vtable_method_ptr_bail);
     builder.wire_handler(
@@ -12591,9 +12599,10 @@ fn handler_record_quasiimmut_field(
 ) -> Result<usize, DispatchError> {
     // RPython `bhimpl_record_quasiimmut_field` is a no-op during blackhole
     // execution (`blackhole.py pass`); the metainterp consumes the two
-    // descriptors during tracing instead.  Skip past `r` (1 byte) +
-    // `d` (2 bytes) + `d` (2 bytes) to reach the next opcode.
-    let p = p + 1; // r
+    // descriptors during tracing instead.  Skip past the struct register
+    // (`r` or `i`, 1 byte) + `d` (2 bytes) + `d` (2 bytes). `/idd` is the
+    // headerless twin (`getfield_raw_*` int-bank base).
+    let p = p + 1; // r or i
     let (_, p) = read_descr(bh, code, p);
     let (_, p) = read_descr(bh, code, p);
     Ok(p)

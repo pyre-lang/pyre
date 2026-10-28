@@ -3774,11 +3774,13 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if r_args[0].is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(callable as i64);
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&kw_defs_descr)
+                .expect("Function.w_kw_defs has mutate_w_kw_defs");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 callable_const,
                 kw_defs_descr,
-                None,
+                Some(&mutate),
             );
         } else {
             walker_guard_function_field(
@@ -3790,11 +3792,12 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             )?;
         }
         let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
+        let version_mutate = crate::descr::module_dict_mutate_version_descr();
         crate::state::record_quasiimmut_field(
             ctx.trace_ctx,
             strategy_const,
             crate::descr::module_dict_version_descr(),
-            None,
+            Some(&version_mutate),
         );
         walker_flush_guard_not_invalidated(ctx, op.pc)?;
         for kwonly in &resolved.values {
@@ -8340,8 +8343,9 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
 /// the value this inline baked, replacing the box so later reads fold.
 ///
 /// `function.py` declares `code?` / `w_func_globals?` / `closure?[*]` /
-/// `defs_w?[*]`; pyre's setters do not yet force the quasi-immutable
-/// invalidation, so a `GuardValue` stands in for it.
+/// `defs_w?[*]`. The pin is `record_quasiimmut_field` with the group's
+/// `mutate_<name>` (`quasiimmut.py get_mutate_field_name`); `GuardValue`
+/// stays as the identity check the later reads assume.
 fn walker_guard_function_field<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -8349,6 +8353,10 @@ fn walker_guard_function_field<Sym: WalkSym>(
     descr: majit_ir::DescrRef,
     expected: i64,
 ) -> Result<(), DispatchError> {
+    let mutate = crate::descr::mutate_descr_for_quasi_field(&descr)
+        .expect("walker_guard_function_field is a Function ? slot");
+    crate::state::record_quasiimmut_field(ctx.trace_ctx, callable, descr.clone(), Some(&mutate));
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
     let field_op = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, callable, descr);
     ctx.trace_ctx.try_set_opref_concrete(
         field_op,
@@ -9955,10 +9963,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // the guard failed forever while the code object it stands for is
         // loop-invariant.
         //
-        // Keep GETFIELD+GUARD_VALUE even on a ConstPtr callable.
-        // `code?` matches `function.py getcode()` but Linux `test_uuid`
-        // SIGSEGV's with the marker: after `test_UUID` warms the JIT,
-        // `jit_bigint_int_eq` treats a small int as `*const BigInt`.
+        // On a ConstPtr callable the same sequence still runs:
+        // `record_quasiimmut_field` with `mutate_code` /
+        // `mutate_w_func_globals_obj` (`quasiimmut.py get_mutate_field_name`),
+        // then GETFIELD + GUARD_VALUE (`walker_guard_function_field`). The
+        // marker revokes a `__code__` / globals store; the value guards are
+        // the identity check the reads below assume.
         walker_guard_function_field(
             ctx,
             op.pc,
@@ -9999,11 +10009,18 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             {
                 return resolved_inline_decline(op.pc, line!());
             }
-            let closure_op = crate::state::opimpl_getfield_gc_r(
+            let closure_descr = crate::descr::function_closure_descr();
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&closure_descr)
+                .expect("Function.closure has mutate_closure");
+            crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 callable_guard_op,
-                crate::descr::function_closure_descr(),
+                closure_descr.clone(),
+                Some(&mutate),
             );
+            walker_flush_guard_not_invalidated(ctx, op.pc)?;
+            let closure_op =
+                crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, callable_guard_op, closure_descr);
             ctx.trace_ctx.try_set_opref_concrete(
                 closure_op,
                 majit_ir::Value::Ref(majit_ir::GcRef(live_closure() as usize)),
@@ -10071,11 +10088,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `mutate_defs_w` slot, and a baked `ConstPtr` is the pointer the note
         // above says must not be loaded through.
         if guards_the_callee_function {
+            let defs_w = crate::descr::function_defs_w_descr();
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&defs_w)
+                .expect("Function.defs_w has mutate_defs_w");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 callable_guard_op,
-                crate::descr::function_defs_w_descr(),
-                None,
+                defs_w,
+                Some(&mutate),
             );
         }
         let defaults_op = ctx.trace_ctx.record_op_with_descr(
@@ -10276,11 +10296,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let kw_defs_descr = crate::descr::function_w_kw_defs_descr();
         if callable_guard_op.is_constant() {
             let callable_const = ctx.trace_ctx.const_ref(live_callable() as i64);
+            let mutate = crate::descr::mutate_descr_for_quasi_field(&kw_defs_descr)
+                .expect("Function.w_kw_defs has mutate_w_kw_defs");
             crate::state::record_quasiimmut_field(
                 ctx.trace_ctx,
                 callable_const,
                 kw_defs_descr,
-                None,
+                Some(&mutate),
             );
         } else {
             walker_guard_function_field(
@@ -10296,11 +10318,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // the `Ok(false)` the wrapper would return.  The marker names that
         // box through `QuasiImmutDescr.struct_ptr`, which is forwarded.
         let strategy_const = ctx.trace_ctx.const_ref(resolved.strategy as i64);
+        let version_mutate = crate::descr::module_dict_mutate_version_descr();
         crate::state::record_quasiimmut_field(
             ctx.trace_ctx,
             strategy_const,
             crate::descr::module_dict_version_descr(),
-            None,
+            Some(&version_mutate),
         );
         // One guard drains both markers: it asks whether anything recorded
         // this epoch was invalidated, not which.
@@ -16876,11 +16899,17 @@ fn descend_generatorentry<Sym: WalkSym>(
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        let pycode_descr = crate::descr::make_immutable_field_descr(
+        let pycode_descr = crate::descr::gc_cached_field_descr(
+            "generator::GeneratorIterator",
+            "pycode",
+            "GeneratorIterator.pycode",
             std::mem::offset_of!(pyre_object::generator::GeneratorIterator, pycode),
             std::mem::size_of::<pyre_object::PyObjectRef>(),
             majit_ir::Type::Ref,
             false,
+            true,
+            false,
+            u32::MAX,
         );
         let pycode_op =
             ctx.trace_ctx
@@ -17160,11 +17189,17 @@ fn walk_generator_resume<Sym: WalkSym>(
     // re-reads the suspended frame each iteration instead of baking the
     // address from this recording.
     let frame_offset = std::mem::offset_of!(pyre_object::generator::GeneratorIterator, frame_ptr);
-    let frame_descr = crate::descr::make_field_descr(
+    let frame_descr = crate::descr::gc_cached_field_descr(
+        "generator::GeneratorIterator",
+        "frame_ptr",
+        "GeneratorIterator.frame_ptr",
         frame_offset,
         std::mem::size_of::<*mut u8>(),
         majit_ir::Type::Ref,
         false,
+        false,
+        false,
+        u32::MAX,
     );
     let frame_box =
         ctx.trace_ctx

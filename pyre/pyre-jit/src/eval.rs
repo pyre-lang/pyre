@@ -617,16 +617,16 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     if !weak_subclasses.is_null() {
         drop(unsafe { Box::from_raw(weak_subclasses) });
     }
-    // The `mutate__version_tag` instance (`quasiimmut.py get_current_qmut_instance
-    // get_current_qmut_instance`) is Rust-owned and off-GC too. A type that was
-    // compiled against and never mutated afterwards still holds one, so without
-    // this the box outlives the only pointer to it.  `name?` is the same
-    // shape: `descr_set__name__` is the only writer, and a type compiled
-    // against and never renamed still holds the instance.  `flag_cpython_immutabletype?`
-    // is the Freeze/construction twin: a type compiled against and never
-    // frozen still holds the instance.
-    unsafe { (*t).quasi_immut_watchers.reclaim() };
-    unsafe { (*t).w_name_watchers.reclaim() };
+    // The `mutate_version_tag` instance (`quasiimmut.py get_current_qmut_instance`)
+    // is Rust-owned and off-GC too. A type that was compiled against and never
+    // mutated afterwards still holds one, so without this the box outlives the
+    // only pointer to it.  `w_name?` is the same shape: `descr_set__name__` is
+    // the only writer, and a type compiled against and never renamed still
+    // holds the instance.  `flag_cpython_immutabletype?` is the Freeze /
+    // construction twin: a type compiled against and never frozen still holds
+    // the instance.
+    unsafe { (*t).mutate_version_tag.reclaim() };
+    unsafe { (*t).mutate_w_name.reclaim() };
     unsafe { (*t).mutate_flag_cpython_immutabletype.reclaim() };
 }
 
@@ -650,9 +650,9 @@ unsafe fn type_object_destructor(obj_addr: usize) {
 /// `W_Property` prefix, so the same cast covers that layout.
 unsafe fn property_destructor(obj_addr: usize) {
     let p = obj_addr as *const pyre_object::descriptor::W_Property;
-    unsafe { (*p).fget_watchers.reclaim() };
-    unsafe { (*p).fset_watchers.reclaim() };
-    unsafe { (*p).fdel_watchers.reclaim() };
+    unsafe { (*p).mutate_fget.reclaim() };
+    unsafe { (*p).mutate_fset.reclaim() };
+    unsafe { (*p).mutate_fdel.reclaim() };
 }
 
 /// The `w_function?` counterpart of [`property_destructor`] for `staticmethod`.
@@ -664,7 +664,7 @@ unsafe fn property_destructor(obj_addr: usize) {
 /// that layout.
 unsafe fn staticmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::StaticMethod;
-    unsafe { (*m).w_function_watchers.reclaim() };
+    unsafe { (*m).mutate_w_function.reclaim() };
 }
 
 /// The `classmethod` twin of [`staticmethod_destructor`].
@@ -676,7 +676,7 @@ unsafe fn staticmethod_destructor(obj_addr: usize) {
 /// that layout.
 unsafe fn classmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::ClassMethod;
-    unsafe { (*m).w_function_watchers.reclaim() };
+    unsafe { (*m).mutate_w_function.reclaim() };
 }
 
 /// Custom trace for `GeneratorIterator` (generator.py GeneratorIterator).

@@ -5713,8 +5713,8 @@ impl TraceCtx {
             if let Some(&value) = boxes.get(field_index) {
                 // pyjitpl.py `gen_store_back_in_vable` records SETFIELD_GC
                 // with `vinfo.static_field_descrs[i]` (`cpu.fielddescrof`).
-                // OptHeap keys the lazy-set cache by descr identity, so
-                // reuse `static_field_struct_descr` or last_instr is stored twice.
+                // That is the listed SizeDescr row, the same Arc
+                // `static_field_struct_descr` returns.
                 let descr = info.static_field_struct_descr(field_index);
                 // pyjitpl.py `gen_store_back_in_vable`. A store has no
                 // `resvalue` and `SETFIELD_GC` is never pure, so no cpu.
@@ -6462,17 +6462,13 @@ impl TraceCtx {
     }
 
     /// Resolve a `setfield_vable`/`getfield_vable` static field descr
-    /// (the vinfo's `static_field_descrs[idx]`) to the parent-struct-layout
-    /// `FieldDescr` for
-    /// recording a real heap op on a NONSTANDARD virtualizable.
+    /// (the vinfo's `static_field_descrs[idx]`) to the FieldDescr recorded
+    /// on a NONSTANDARD virtualizable.
     ///
-    /// A nonstandard virtualizable can be a force-materialized inline-callee
-    /// VIRTUAL frame; its `NewWithVtable` construction stores the field via the
-    /// parent struct descr, and the optimizer pairs reads/writes on a virtual by
-    /// `index_in_parent`. The vinfo descr's `index_in_parent` follows the vinfo
-    /// `[token, statics, arrays]` order, which diverges from struct declaration
-    /// order for PyFrame — so recording the vinfo descr pairs the op against the
-    /// WRONG slot. Resolve to the struct descr; unknown descrs pass through.
+    /// `virtualizable.py` builds those descrs with `cpu.fielddescrof(VTYPE,
+    /// name)`, the listed SizeDescr row, so this is the same Arc a
+    /// `NewWithVtable` construction stores through. Unknown descrs pass
+    /// through.
     fn vable_static_record_descr(&self, fielddescr: &DescrRef) -> DescrRef {
         self.virtualizable_info
             .as_ref()

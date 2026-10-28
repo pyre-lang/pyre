@@ -9,33 +9,43 @@
 //! `Atomic::load` does not lower (`Acquire` drops the function;
 //! `Relaxed` aliases the load to the atomic object), and an immutable
 //! `static` folds to its initializer.
+//!
+//! The hidden `mutate_gil_ready` field lives on this STRUCT
+//! (`rclass.py InstanceRepr._setup_repr` / `quasiimmut.py
+//! get_mutate_field_name`).
 
 use std::sync::Arc;
 
-/// Process-wide cell. One field, `repr(C)`, so the translated read is
-/// offset 0 / 8 bytes / `Int`.
+/// Process-wide cell. `repr(C)` pins `gil_ready` at offset 0 / 8 bytes /
+/// `Int` and the hidden watcher immediately after it.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("gil_ready?")]
 pub struct GilReadyState {
     /// 0 until the first `setup_threads`, then 1.
     pub gil_ready: i64,
+    /// Hidden `mutate_gil_ready` for the field spelled `gil_ready?`.
+    pub mutate_gil_ready: crate::quasiimmut::QuasiImmutField,
 }
 
 const _: () = assert!(std::mem::offset_of!(GilReadyState, gil_ready) == 0);
-const _: () = assert!(std::mem::size_of::<GilReadyState>() == 8);
+const _: () = assert!(std::mem::offset_of!(GilReadyState, mutate_gil_ready) == 8);
+const _: () = assert!(
+    std::mem::size_of::<GilReadyState>()
+        == 8 + std::mem::size_of::<crate::quasiimmut::QuasiImmutField>()
+);
 
 /// `static mut` so a translated read is a field load of the live cell,
 /// not the initializer folded into the flow graph.
-pub static mut GIL_READY_STATE: GilReadyState = GilReadyState { gil_ready: 0 };
-
-/// Hidden `mutate_gil_ready` for the field spelled `gil_ready?`.
-/// Not a field of [`GIL_READY_STATE`]: the value itself stays the single
-/// `i64` at offset 0.
-static GIL_READY_WATCHERS: crate::quasiimmut::QuasiImmutField =
-    crate::quasiimmut::QuasiImmutField::new();
+pub static mut GIL_READY_STATE: GilReadyState = GilReadyState {
+    gil_ready: 0,
+    mutate_gil_ready: crate::quasiimmut::QuasiImmutField::new(),
+};
 
 /// `quasiimmut.py get_current_qmut_instance` for `GILThreadLocals.gil_ready`.
 pub fn gil_ready_current_qmut() -> Arc<crate::quasiimmut::QuasiImmut> {
-    GIL_READY_WATCHERS.get_current_qmut_instance()
+    // Raw place: edition 2024 rejects a reference to `static mut`.
+    // SAFETY: same single-writer protocol as [`gil_ready_word`].
+    unsafe { (*(&raw const GIL_READY_STATE.mutate_gil_ready)).get_current_qmut_instance() }
 }
 
 /// Plain field read of [`GIL_READY_STATE`]. Not `dont_look_inside`.
@@ -61,11 +71,50 @@ pub fn gil_ready_is_set() -> bool {
 /// Invalidate first, then store, so a loop that folded the zero fails its
 /// `GUARD_NOT_INVALIDATED` before any other thread observes 1.
 pub fn publish_gil_ready() {
-    GIL_READY_WATCHERS.invalidate_then_store(|| {
-        // SAFETY: same single-writer protocol as [`gil_ready_word`]. The
-        // watcher lock is held across the store.
-        unsafe {
-            GIL_READY_STATE.gil_ready = 1;
+    // SAFETY: same single-writer protocol as [`gil_ready_word`]. The
+    // watcher lock is held across the store. `&raw mut` is the edition-2024
+    // place for a `static mut` field.
+    unsafe {
+        let state = &raw mut GIL_READY_STATE;
+        (*state).mutate_gil_ready.invalidate_then_store(|| {
+            (*state).gil_ready = 1;
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutate_gil_ready_offset_lands_on_the_static_field() {
+        let state = &raw const GIL_READY_STATE;
+        // Field projection of `static mut` is a mutable-static place.
+        let mutate = unsafe { &raw const GIL_READY_STATE.mutate_gil_ready };
+        let via = (state as *const u8)
+            .wrapping_add(std::mem::offset_of!(GilReadyState, mutate_gil_ready));
+        assert_eq!(via, mutate as *const u8);
+    }
+
+    /// `publish_gil_ready` unlinks the instance `gil_ready_current_qmut`
+    /// handed out (`quasiimmut.py make_invalidation_function._invalidate_now`).
+    /// Restore the unpublished word so later list-lock tests still see 0.
+    #[test]
+    fn publish_gil_ready_invalidates_the_current_qmut() {
+        struct RestoreGilReadyWord;
+        impl Drop for RestoreGilReadyWord {
+            fn drop(&mut self) {
+                // SAFETY: test-only restore of the unpublished word.
+                unsafe {
+                    (*(&raw mut GIL_READY_STATE)).gil_ready = 0;
+                }
+            }
         }
-    });
+        let _restore = RestoreGilReadyWord;
+        let recorded = gil_ready_current_qmut();
+        assert!(recorded.is_current());
+        publish_gil_ready();
+        assert!(!recorded.is_current());
+        assert_eq!(gil_ready_word(), 1);
+    }
 }
