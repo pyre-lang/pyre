@@ -382,7 +382,7 @@ fn snapshot_box_from_tagged<'c>(
     trb: &TraceRecordBuffer,
     unique_cache: &'c [Option<Operand>],
 ) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
-    use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX};
+    use crate::opencoder::{TAG_MASK, TAG_SHIFT, TAGBOX, TAGCONSTPTR};
     let tag = (tagged & TAG_MASK as i64) as u8;
     if tag == TAGBOX {
         let v = tagged >> TAG_SHIFT;
@@ -400,8 +400,22 @@ fn snapshot_box_from_tagged<'c>(
             crate::resume::SnapshotBox {
                 opref: cached.to_opref(),
                 cached: None,
+                const_gcref: None,
             },
             Some(cached),
+        );
+    }
+    // SnapshotIterator._untag TAGCONSTPTR: ConstPtr(trace._refs[v]), no intern.
+    if tag == TAGCONSTPTR {
+        let v = tagged >> TAG_SHIFT;
+        let addr = trb.current_ref(v as usize);
+        return (
+            crate::resume::SnapshotBox {
+                opref: OpRef::NONE,
+                cached: None,
+                const_gcref: Some(GcRef(addr as usize)),
+            },
+            None,
         );
     }
     let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
@@ -3222,6 +3236,42 @@ mod tests {
         });
         let stored = rec.trb.as_ref().expect("byte buffer").current_ref(2);
         assert_eq!(stored, forwarded_b.0 as u64);
+    }
+
+    /// Byte TAGCONSTPTR numbering: `_refs[v]` goes to `getconst_ref` as
+    /// `Const::Ref`, and a second number of the same snapshot reuses the tag.
+    #[test]
+    fn number_byte_snapshot_tagconstptr_pools_the_refs_address() {
+        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
+        let addr = GcRef(0x9C_0000_1000);
+        let (_cptr, _restore) = intern_const_ptr(addr);
+        let mut rec = Trace::new();
+        let i0 = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+        rec.record_guard(OpCode::GuardTrue, &[i0], None);
+        let offset = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![SnapshotFrame {
+                jitcode_index: 1,
+                pc: 10,
+                boxes: vec![SnapshotTagged::const_ref(addr.0)],
+            }],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        let env = crate::resume::SimpleBoxEnv::new();
+        let mut memo = crate::resume::ResumeDataLoopMemo::new();
+        let first = rec
+            .number_byte_snapshot(offset, &[], &mut memo, &env, -1)
+            .expect("number TAGCONSTPTR snapshot");
+        assert_eq!(memo.consts()[0].getref_base(), addr);
+        let first_items = crate::resumecode::unpack_numbering(&first.create_numbering());
+        let second = rec
+            .number_byte_snapshot(offset, &[], &mut memo, &env, -1)
+            .expect("renumber TAGCONSTPTR snapshot");
+        let second_items = crate::resumecode::unpack_numbering(&second.create_numbering());
+        assert_eq!(first_items, second_items);
+        assert_eq!(memo.consts().len(), 1);
     }
 
     #[test]

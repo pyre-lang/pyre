@@ -147,9 +147,9 @@ impl ShortPreamble {
         visit_oprefs(&mut self.inputargs, visitor);
         visit_oprefs(&mut self.used_boxes, visitor);
         visit_oprefs(&mut self.jump_args, visitor);
-        for constant in self.constants.values() {
-            if let majit_ir::Const::Ref(index) = constant {
-                majit_ir::const_ptr_table::trace_index(*index, visitor);
+        for constant in self.constants.values_mut() {
+            if let majit_ir::Const::Ref(gcref) = constant {
+                visitor(gcref);
             }
         }
         for info in self.inputarg_infos.iter_mut().flatten() {

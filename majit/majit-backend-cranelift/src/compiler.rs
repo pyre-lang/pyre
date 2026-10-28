@@ -21049,7 +21049,8 @@ fn collect_guards(
                             vidx_to_slot.insert(*vidx, new_slots.len());
                             ExitValueSourceLayout::Virtual(*vidx)
                         }
-                        RebuiltValue::Const(c) => {
+                        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+                            let c = val.const_at_use(rd_consts_ref);
                             ExitValueSourceLayout::Constant(c.as_raw_i64(), c.get_type())
                         }
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,

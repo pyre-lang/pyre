@@ -6360,6 +6360,11 @@ impl<S: JitState> JitDriver<S> {
                 return Err(Decline::ReplayIncomplete);
             }
             let fail_types = resume.fail_arg_types.clone();
+            let rd_consts = resume
+                .storage
+                .as_ref()
+                .and_then(|s| s.rd_consts())
+                .unwrap_or(&[]);
             // `resume.py:1051` `jitcodes[jitcode_pos]` — the same flat registry
             // the blackhole rebuild resolves through, so a frame names its
             // jitcode absolutely and no walk of a parent's `descrs` is needed
@@ -6557,7 +6562,8 @@ impl<S: JitState> JitDriver<S> {
                                     let opref = ctx.load_box_from_cpu(*n as u32, *kind, typed);
                                     (opref, value)
                                 }
-                                RebuiltValue::Const(c) => {
+                                RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+                                    let c = values[cursor].const_at_use(rd_consts);
                                     let bits = c.as_raw_i64();
                                     let opref = match bank {
                                         majit_ir::Type::Ref => ctx.const_ref(bits),

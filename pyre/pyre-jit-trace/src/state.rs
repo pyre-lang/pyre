@@ -9454,6 +9454,11 @@ fn bridge_decode_box(
 ) -> (OpRef, majit_ir::Value) {
     use majit_ir::resumedata::RebuiltValue;
     let callinfocollection = ctx.callinfocollection.clone();
+    let rd_consts = resume_data
+        .storage
+        .as_ref()
+        .and_then(|s| s.rd_consts())
+        .unwrap_or(&[]);
     match v {
         RebuiltValue::Box(n, tp) => {
             let opref = OpRef::input_arg_typed(*n as u32, *tp);
@@ -9472,7 +9477,8 @@ fn bridge_decode_box(
             };
             (opref, value_for_slot(effective_tp, bits))
         }
-        RebuiltValue::Const(c) => {
+        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+            let c = v.const_at_use(rd_consts);
             let opref = match c.get_type() {
                 Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
                 Type::Float => ctx.const_float(c.getfloatstorage()),

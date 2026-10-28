@@ -313,16 +313,31 @@ pub enum RebuiltValue {
     /// box's `.type` matches that kind. majit stores the kind on the
     /// variant so consumers don't need a parallel `fail_arg_types` lookup.
     Box(usize, Type),
-    /// TAGCONST / TAGINT: compile-time constant. Carries a `Const`
+    /// TAGINT, TAGCONST Int/Float, and NULLREF. Carries a `Const`
     /// (Int/Float/Ref), matching RPython's `decode_box` which returns a
-    /// `ConstInt`/`ConstFloat`/`ConstPtr` regardless of whether the value
-    /// came from the inline TAGINT encoding or the TAGCONST pool
-    /// (resume.py).
+    /// `ConstInt`/`ConstFloat`/`ConstPtr` for those encodings (resume.py).
     Const(crate::Const),
+    /// TAGCONST naming a `Const::Ref` in `rd_consts`: the pool index.
+    /// resume.py `decode_ref` reads `consts[num - TAG_CONST_OFFSET]` at
+    /// the use, after any `allocate()`; consumers load the live pool
+    /// entry there instead of carrying a copy.
+    ConstRef(usize),
     /// TAGVIRTUAL(n): virtual object index n.
     Virtual(usize),
     /// Uninitialized/unassigned slot.
     Unassigned,
+}
+
+impl RebuiltValue {
+    /// The `Const` of a `Const` / `ConstRef` slot. `ConstRef` loads the
+    /// live `rd_consts` entry here, at the use (resume.py `decode_ref`).
+    pub fn const_at_use(&self, rd_consts: &[crate::Const]) -> crate::Const {
+        match self {
+            RebuiltValue::Const(c) => *c,
+            RebuiltValue::ConstRef(idx) => rd_consts[*idx],
+            other => panic!("RebuiltValue::const_at_use on {other:?}"),
+        }
+    }
 }
 
 /// Decoded frame from rd_numb.
@@ -368,14 +383,17 @@ pub fn decode_tagged_value(
                 // rebuilt from a truncated `rd_consts` would run on it instead
                 // of failing, while `ResumeDataDirectReader`'s `decode_int` /
                 // `decode_ref` panic on the very same index.
-                let Some(c) = rd_consts.get(idx).copied() else {
+                let Some(c) = rd_consts.get(idx) else {
                     panic!(
                         "decode_tagged_value: TAGCONST index {idx} is past the \
                          guard's {} consts (tagged {tagged})",
                         rd_consts.len(),
                     );
                 };
-                RebuiltValue::Const(c)
+                match c {
+                    crate::Const::Ref(_) => RebuiltValue::ConstRef(idx),
+                    other => RebuiltValue::Const(*other),
+                }
             }
         }
         TAGBOX => {

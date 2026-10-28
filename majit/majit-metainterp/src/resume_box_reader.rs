@@ -1613,13 +1613,21 @@ pub fn rebuilt_value_to_opref(
     cache: &mut BridgeVirtualCache<'_>,
 ) -> OpRef {
     use majit_ir::resumedata::RebuiltValue;
+    let rd_consts = resume_data
+        .storage
+        .as_ref()
+        .and_then(|s| s.rd_consts())
+        .unwrap_or(&[]);
     match v {
         RebuiltValue::Box(n, tp) => decode_box(ctx, cache, *n as u32, *tp),
-        RebuiltValue::Const(c) => match c.get_type() {
-            majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
-            majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
-            _ => ctx.const_int(c.getint()),
-        },
+        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+            let c = v.const_at_use(rd_consts);
+            match c.get_type() {
+                majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
+                majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
+                _ => ctx.const_int(c.getint()),
+            }
+        }
         RebuiltValue::Virtual(vidx) => {
             materialize_bridge_virtual(ctx, *vidx, rd_virtuals, resume_data, cache)
         }
@@ -1901,7 +1909,7 @@ pub fn seed_bridge_virtualizable_boxes(
     use majit_ir::resumedata::RebuiltValue;
     use majit_ir::{Const, GcRef, Type, Value};
 
-    fn concrete(v: &RebuiltValue, fail_values: &[i64]) -> Option<Value> {
+    fn concrete(v: &RebuiltValue, fail_values: &[i64], rd_consts: &[Const]) -> Option<Value> {
         let typed = |ty: Type, bits: i64| match ty {
             Type::Int => Value::Int(bits),
             Type::Float => Value::Float(f64::from_bits(bits as u64)),
@@ -1910,10 +1918,13 @@ pub fn seed_bridge_virtualizable_boxes(
         };
         match v {
             RebuiltValue::Box(n, ty) => fail_values.get(*n).map(|&bits| typed(*ty, bits)),
-            RebuiltValue::Const(Const::Int(i)) => Some(Value::Int(*i)),
-            RebuiltValue::Const(Const::Float(f)) => Some(Value::Float(*f)),
-            RebuiltValue::Const(Const::Ref(r)) => {
-                Some(Value::Ref(majit_ir::const_ptr_table::resolve(*r)))
+            RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+                let c = v.const_at_use(rd_consts);
+                match c {
+                    Const::Int(i) => Some(Value::Int(i)),
+                    Const::Float(f) => Some(Value::Float(f)),
+                    Const::Ref(r) => Some(Value::Ref(r)),
+                }
             }
             // Unassigned has nothing to write. A virtual is materialized
             // below (`ResumeDataBoxReader.allocate` / `getvirtual_ptr`)
@@ -1921,6 +1932,12 @@ pub fn seed_bridge_virtualizable_boxes(
             RebuiltValue::Virtual(_) | RebuiltValue::Unassigned => None,
         }
     }
+
+    let rd_consts = resume_data
+        .storage
+        .as_ref()
+        .and_then(|s| s.rd_consts())
+        .unwrap_or(&[]);
 
     let Some((identity, slots)) = resume_data.virtualizable_boxes.split_first() else {
         return false;
@@ -1932,7 +1949,8 @@ pub fn seed_bridge_virtualizable_boxes(
     // dereferencing whatever value sits there would be a wild read; decline
     // the seed instead, which leaves the guard deopting through the blackhole
     // exactly as it did before — `compile.py compile.giveup()`.
-    let Some(identity_value @ Value::Ref(vable_ref)) = concrete(identity, fail_values) else {
+    let Some(identity_value @ Value::Ref(vable_ref)) = concrete(identity, fail_values, rd_consts)
+    else {
         return false;
     };
     let vable_ptr = vable_ref.as_usize() as *const u8;
@@ -1990,7 +2008,7 @@ pub fn seed_bridge_virtualizable_boxes(
             boxes.push(op);
             continue;
         }
-        match concrete(slot, fail_values) {
+        match concrete(slot, fail_values, rd_consts) {
             Some(value) => values.push(value),
             None => return false,
         }

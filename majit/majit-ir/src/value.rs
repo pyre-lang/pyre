@@ -192,9 +192,9 @@ impl Value {
 pub enum Const {
     Int(i64),
     Float(f64),
-    /// Index into [`crate::const_ptr_table`], not the referent address.
-    /// `getref_base` reads the address at the use. `history.py` `ConstPtr`.
-    Ref(u32),
+    /// history.py ConstPtr.value — the referent address. Holders that keep a
+    /// Const across a collection are walked and the walk writes this field.
+    Ref(GcRef),
 }
 
 impl PartialEq for Const {
@@ -217,10 +217,10 @@ impl Eq for Const {}
 ///
 /// RPython stores one mutable list object on the guard and reference-shares it
 /// with copied descriptors and every resume-data reader.  Rust needs interior
-/// mutability because the stop-the-world GC root walker forwards `Const::Ref`
-/// entries after the pool has been shared.  The JIT and collector run under
-/// the same single-threaded/GIL contract; mutator access resumes only after
-/// collection has finished.
+/// mutability because the stop-the-world GC root walker forwards the
+/// `Const::Ref` field after the pool has been shared.  The JIT and collector
+/// run under the same single-threaded/GIL contract; mutator access resumes
+/// only after collection has finished.
 pub struct SharedConstPool {
     values: std::cell::UnsafeCell<Vec<Const>>,
     visited_generation: std::sync::atomic::AtomicU64,
@@ -327,7 +327,7 @@ impl Const {
         match self {
             Const::Int(v) => Value::Int(v),
             Const::Float(v) => Value::Float(v),
-            Const::Ref(v) => Value::Ref(crate::const_ptr_table::resolve(v)),
+            Const::Ref(v) => Value::Ref(v),
         }
     }
 
@@ -355,13 +355,13 @@ impl Const {
 
     /// history.py `ConstPtr(value)`.
     pub fn from_gcref(v: GcRef) -> Self {
-        Const::Ref(crate::const_ptr_table::intern(v))
+        Const::Ref(v)
     }
 
     /// history.py ConstPtr.getref_base — current GC pointer value.
     pub fn getref_base(&self) -> GcRef {
         match self {
-            Const::Ref(v) => crate::const_ptr_table::resolve(*v),
+            Const::Ref(v) => *v,
             other => panic!("Const::getref_base on non-Ref variant: {other:?}"),
         }
     }
@@ -380,7 +380,7 @@ impl Const {
     pub fn as_raw_i64(&self) -> i64 {
         match self {
             Const::Int(v) => *v,
-            Const::Ref(v) => crate::const_ptr_table::resolve(*v).0 as i64,
+            Const::Ref(v) => v.0 as i64,
             Const::Float(v) => v.to_bits() as i64,
         }
     }

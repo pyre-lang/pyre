@@ -968,6 +968,19 @@ impl PtrInfoHandle {
             PtrInfoHandle::Live(rc) => rc.borrow().clone(),
         }
     }
+
+    /// `info.py` `ConstPtrInfo._const.getref_base()` read through the
+    /// handle, without copying the info.
+    pub fn constant_ref(&self) -> Option<GcRef> {
+        match self {
+            PtrInfoHandle::Const(PtrInfo::Constant(g)) => Some(*g),
+            PtrInfoHandle::Live(rc) => match &*rc.borrow() {
+                PtrInfo::Constant(g) => Some(*g),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for PtrInfoHandle {
@@ -5986,7 +5999,8 @@ impl OptContext {
     /// `get_box_replacement(op)`: walk the operand's own `_forwarded`
     /// chain. A self-resolved InputArg in the peeled body keeps the
     /// constant rejoin of `imported_inputarg_operand`. Debug builds check
-    /// the result against the positional resolver.
+    /// the result against the positional resolver, which still consults
+    /// the `OpRef` store, so a second box for one position fails there.
     pub fn resolve_operand_operand(&self, arg: &Operand) -> Operand {
         if arg.is_constant() {
             return arg.clone();
@@ -5995,16 +6009,12 @@ impl OptContext {
             return self.get_box_replacement_operand(arg.to_opref());
         }
         let resolved = arg.get_box_replacement(false);
-        // Self-resolved: the canonical box for this position may live in
-        // the OpRef store (`get_box_replacement_operand`), the same
-        // fallback `resolve_operand_operand_positional` takes.
+        // `resoperation.py AbstractValue.get_box_replacement` is the walk
+        // alone. A self-resolved recorder InputArg of the peeled body still
+        // takes the preamble-constant rejoin: `import_state` forwards the
+        // phase 2 host, not the box the body operations hold.
         let resolved = if resolved.same_box(arg) {
-            if let Some(imported) = self.imported_inputarg_operand(arg) {
-                imported
-            } else {
-                self.get_box_replacement_operand_opt(arg.to_opref())
-                    .unwrap_or(resolved)
-            }
+            self.imported_inputarg_operand(arg).unwrap_or(resolved)
         } else {
             resolved
         };
@@ -9351,10 +9361,8 @@ impl OptContext {
         &mut self,
         op: &Operand,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        use crate::optimizeopt::info::PtrInfo;
-        let gcref = match self.getptrinfo(op) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
+        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
+            return None;
         };
         if gcref.is_null() {
             return None;
@@ -9373,9 +9381,8 @@ impl OptContext {
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
         use crate::optimizeopt::info::PtrInfo;
         // info.py:719: ref = self._const.getref_base()
-        let gcref = match self.getptrinfo(op) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
+        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
+            return None;
         };
         // info.py:720-721: if not ref: raise InvalidLoop. Recorded as a
         // deferred signal (checked by the driver) and `None` returned so
@@ -9439,11 +9446,9 @@ impl OptContext {
         op: &Operand,
         descr: DescrRef,
     ) -> Option<&mut crate::optimizeopt::info::PtrInfo> {
-        use crate::optimizeopt::info::PtrInfo;
         // info.py:729: ref = self._const.getref_base()
-        let gcref = match self.getptrinfo(op) {
-            Some(PtrInfo::Constant(g)) => g,
-            _ => return None,
+        let Some(gcref) = self.getptrinfo_handle(op).and_then(|h| h.constant_ref()) else {
+            return None;
         };
         // info.py:730-731: if not ref: raise InvalidLoop. Deferred signal +
         // `None` return; the driver aborts at the next barrier.

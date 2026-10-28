@@ -15131,15 +15131,27 @@ fn rebuild_typed_from_rd_numb(
         virtuals_cache: &mut DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
+        let rd_consts = exit_layout
+            .storage
+            .as_deref()
+            .and_then(|s| s.rd_consts())
+            .unwrap_or(&[]);
         match rv {
             RebuiltValue::Box(idx, _tp) => {
-                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "resume.py decode_box: liveboxes[{idx}] is past the deadframe (len {})",
+                        dead_frame_typed.len()
+                    )
+                })
             }
             // history.py Const → Value: direct variant projection.
-            RebuiltValue::Const(c) => c.to_value(),
+            RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+                let c = rv.const_at_use(rd_consts);
+                c.to_value()
+            }
             RebuiltValue::Virtual(vidx) => {
                 let storage = exit_layout.storage.as_deref();
-                let rd_consts = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
                 let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
                 materialize_virtual_from_rd(
                     *vidx,
@@ -15150,7 +15162,7 @@ fn rebuild_typed_from_rd_numb(
                     virtuals_cache,
                 )
             }
-            _ => Value::Int(0),
+            RebuiltValue::Unassigned => Value::Int(0),
         }
     }
     // resume.py rebuild_from_resumedata parity:
@@ -15491,15 +15503,27 @@ fn build_resumed_frames(
         virtuals_cache: &mut DirectVirtualsCache,
     ) -> Value {
         use majit_ir::resumedata::RebuiltValue;
+        let rd_consts = exit_layout
+            .storage
+            .as_deref()
+            .and_then(|s| s.rd_consts())
+            .unwrap_or(&[]);
         match rv {
             RebuiltValue::Box(idx, _tp) => {
-                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "resume.py decode_box: liveboxes[{idx}] is past the deadframe (len {})",
+                        dead_frame_typed.len()
+                    )
+                })
             }
             // history.py Const → Value: direct variant projection.
-            RebuiltValue::Const(c) => c.to_value(),
+            RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+                let c = rv.const_at_use(rd_consts);
+                c.to_value()
+            }
             RebuiltValue::Virtual(vidx) => {
                 let storage = exit_layout.storage.as_deref();
-                let rd_consts = storage.and_then(|s| s.rd_consts()).unwrap_or(&[]);
                 let rd_virtuals = storage.and_then(|s| s.rd_virtuals());
                 materialize_virtual_from_rd(
                     *vidx,
@@ -15510,7 +15534,7 @@ fn build_resumed_frames(
                     virtuals_cache,
                 )
             }
-            _ => Value::Int(0),
+            RebuiltValue::Unassigned => Value::Int(0),
         }
     }
     // resume.py consume_vref_and_vable: vable header is extracted
@@ -15818,10 +15842,18 @@ fn _prepare_next_section(
     for val in &frame.values {
         let decoded = match val {
             RebuiltValue::Box(idx, _tp) => {
-                dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
+                dead_frame_typed.get(*idx).cloned().unwrap_or_else(|| {
+                    panic!(
+                        "resume.py decode_box: liveboxes[{idx}] is past the deadframe (len {})",
+                        dead_frame_typed.len()
+                    )
+                })
             }
             // history.py Const → Value: direct variant projection.
-            RebuiltValue::Const(c) => c.to_value(),
+            RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+                let c = val.const_at_use(rd_consts);
+                c.to_value()
+            }
             // resume.py: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num)
             RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
                 *vidx,

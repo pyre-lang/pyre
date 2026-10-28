@@ -292,6 +292,9 @@ pub struct SnapshotBox {
     /// seed OpRefs only); `_number_one` then falls back to the
     /// positional resolver.
     pub cached: Option<Operand>,
+    /// opencoder.py SnapshotIterator._untag TAGCONSTPTR: ConstPtr(trace._refs[v]),
+    /// read at the untag. Numbering passes it to getconst without an OpRef.
+    pub const_gcref: Option<majit_ir::GcRef>,
 }
 
 impl SnapshotBox {
@@ -299,6 +302,7 @@ impl SnapshotBox {
         SnapshotBox {
             opref,
             cached: None,
+            const_gcref: None,
         }
     }
 
@@ -306,6 +310,7 @@ impl SnapshotBox {
         SnapshotBox {
             opref,
             cached: None,
+            const_gcref: None,
         }
     }
 
@@ -323,6 +328,7 @@ impl SnapshotBox {
         SnapshotBox {
             opref: f(self.opref),
             cached: self.cached.clone(),
+            const_gcref: self.const_gcref,
         }
     }
 
@@ -1828,11 +1834,11 @@ impl EncodedResumeData {
     /// Walks all frames via _number_boxes, assigning compact sequential
     /// TAGBOX numbers to unique liveboxes (resume.py).
     ///
-    /// Unlike `ResumeDataLoopMemo::encode_shared`, this is a single-shot
-    /// encoder (no cross-guard dedup). It builds a local memo that shares
-    /// the same encoding logic so the tagged output is bit-compatible with
-    /// the shared path. Used by tests and standalone embedders that don't
-    /// carry a memo instance.
+    /// Single-shot encoder (no cross-guard dedup). It builds a local memo
+    /// that shares the production numbering path (`encode_tagged_source`)
+    /// so the tagged output is bit-compatible with `ResumeDataLoopMemo`.
+    /// Used by tests and standalone embedders that don't carry a memo
+    /// instance.
     fn from_semantic(
         vable_array: &[ResumeValueSource],
         vref_array: &[ResumeValueSource],
@@ -2962,7 +2968,7 @@ pub struct ResumeDataLoopMemo {
     large_ints: indexmap::IndexMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
     refs: indexmap::IndexMap<i64, i16>,
-    /// resume.py:147 self.consts — constant pool for encode_shared.
+    /// resume.py self.consts — shared constant pool.
     /// Becomes storage.rd_consts (resume.py:467).
     ///
     /// resume.py:150-151 — cached box/virtual numbering.
@@ -3132,8 +3138,8 @@ impl ResumeDataLoopMemo {
         // holds exclusive access to this optimizer memo.
         let consts = unsafe { self.consts.as_mut_vec_for_gc() };
         for c in consts.iter_mut() {
-            if let majit_ir::Const::Ref(index) = c {
-                majit_ir::const_ptr_table::trace_index(*index, visitor);
+            if let majit_ir::Const::Ref(gcref) = c {
+                visitor(gcref);
             }
         }
         if self.refs.is_empty() {
@@ -3143,12 +3149,11 @@ impl ResumeDataLoopMemo {
         for (_, &tagged) in self.refs.iter() {
             let (num, _) = untag(tagged);
             let idx = (num - TAG_CONST_OFFSET) as usize;
-            if let Some(majit_ir::Const::Ref(index)) = self.consts.get(idx) {
-                let addr = majit_ir::const_ptr_table::resolve(*index);
-                if addr.is_null() {
+            if let Some(majit_ir::Const::Ref(gcref)) = self.consts.get(idx) {
+                if gcref.is_null() {
                     continue;
                 }
-                rebuilt.insert(majit_ir::gc_id_or_identityhash(addr.0) as i64, tagged);
+                rebuilt.insert(majit_ir::gc_id_or_identityhash(gcref.0) as i64, tagged);
             }
         }
         self.refs = rebuilt;
@@ -3181,40 +3186,20 @@ impl ResumeDataLoopMemo {
 
     /// resume.py getconst for REF type.
     ///
-    /// `history.py` `ConstPtr` identity is the interned box: intern the
-    /// address first so a forwarded `value` still names the pool slot
-    /// that already holds that index.
+    /// `history.py` `ConstPtr.value` is the referent; `_newconst` appends
+    /// that box. `resume.py` `new_ref_dict` keys the cache by `identityhash`.
     pub fn getconst_ref(&mut self, val: i64) -> Result<i16, TagOverflow> {
         if val == 0 {
             return Ok(NULLREF);
         }
-        // `resume.py` `new_ref_dict`: the key hash is `identityhash`.
         let key = majit_ir::gc_id_or_identityhash(val as usize) as i64;
-        if let Some(&tagged) = self.refs.get(&key) {
-            return Ok(tagged);
-        }
-        let index = majit_ir::const_ptr_table::intern(majit_ir::GcRef(val as usize));
-        self.getconst_ref_index(index)
-    }
-
-    /// `getconst` for an already-interned `ConstPtr`. `_newconst` appends
-    /// that box; do not intern the referent again.
-    fn getconst_ref_index(&mut self, index: u32) -> Result<i16, TagOverflow> {
-        if index == 0 {
-            return Ok(NULLREF);
-        }
-        let addr = majit_ir::const_ptr_table::resolve(index);
-        if addr.is_null() {
-            return Ok(NULLREF);
-        }
-        let key = majit_ir::gc_id_or_identityhash(addr.0) as i64;
         if let Some(&tagged) = self.refs.get(&key) {
             return Ok(tagged);
         }
         let tagged = tag(self.consts.len() as i32 + TAG_CONST_OFFSET, TAGCONST)?;
         unsafe {
             self.consts
-                .push_during_optimization(majit_ir::Const::Ref(index));
+                .push_during_optimization(majit_ir::Const::Ref(majit_ir::GcRef(val as usize)));
         }
         self.refs.insert(key, tagged);
         Ok(tagged)
@@ -3255,9 +3240,10 @@ impl ResumeDataLoopMemo {
     }
 
     /// resume.py getconst — i64-sized variant used by the rd_numb
-    /// encoder (`encode_shared`). Shares the pool (`self.consts`) with the
-    /// i16 variant (`getconst`) so there is exactly one `rd_consts` per
-    /// memo, matching RPython's single `self.consts: list[Const]`.
+    /// encoder (`encode_tagged_source`). Shares the pool (`self.consts`)
+    /// with the i16 variant (`getconst`) so there is exactly one
+    /// `rd_consts` per memo, matching RPython's single
+    /// `self.consts: list[Const]`.
     fn getconst_i64(&mut self, c: &majit_ir::Const) -> i64 {
         match c {
             // resume.py: try tag(val, TAGINT).
@@ -3287,13 +3273,13 @@ impl ResumeDataLoopMemo {
                 }
                 tag_i64(encode_len(index), TAGCONST)
             }
-            majit_ir::Const::Ref(index) => {
+            majit_ir::Const::Ref(gcref) => {
                 // resume.py val = 0 → NULLREF sentinel (no pool
                 // entry allocated). `NULLREF = tag(-1, TAGCONST)` —
                 // encoder emits `tag_i64(-1, TAGCONST)` and the
                 // matching decoder in `decode_box` recognizes
                 // `ENCODED_NULLREF` before the positive-index branch.
-                let gcref = majit_ir::const_ptr_table::resolve(*index);
+                let gcref = *gcref;
                 let raw = gcref.0 as i64;
                 if raw == 0 {
                     return tag_i64(ENCODED_NULLREF, TAGCONST);
@@ -3306,7 +3292,7 @@ impl ResumeDataLoopMemo {
                 let pool_index = self.consts.len();
                 unsafe {
                     self.consts
-                        .push_during_optimization(majit_ir::Const::Ref(*index));
+                        .push_during_optimization(majit_ir::Const::Ref(gcref));
                 }
                 // See the Int arm on why an unrepresentable tag skips the cache.
                 if let Ok(tagged_i16) = tag((pool_index as i32) + TAG_CONST_OFFSET, TAGCONST) {
@@ -3777,6 +3763,10 @@ impl ResumeDataLoopMemo {
         numb_state: &mut NumberingState,
         env: &dyn BoxEnv,
     ) -> Result<(), TagOverflow> {
+        if let Some(g) = snapshot_box.const_gcref {
+            numb_state.append_short(self.getconst_ref(g.0 as i64)?); // null → NULLREF
+            return Ok(());
+        }
         let raw_opref = snapshot_box.opref();
         if raw_opref.is_none() {
             numb_state.append_short(NULLREF);
@@ -4452,90 +4442,6 @@ impl ResumeDataLoopMemo {
 
         Ok((rd_numb, rd_consts, rd_virtuals, ordered_liveboxes))
     }
-
-    /// resume.py finish (on ResumeDataVirtualAdder) — encode with shared pool.
-    pub fn encode_shared(&mut self, rd: &ResumeData) -> EncodedResumeData {
-        let mut rd_numb = Vec::new();
-        // resume.py compact TAGBOX numbering state.
-        let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: indexmap::IndexMap<usize, usize> = indexmap::IndexMap::new();
-
-        // resume.py:234-235: reserve slots
-        rd_numb.push(0); // [0] = items_resume_section
-        rd_numb.push(0); // [1] = count
-        rd_numb.push(encode_len(rd.vable_array.len()));
-        for source in &rd.vable_array {
-            let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
-            rd_numb.push(tagged);
-        }
-        // resume.py:243-247: vref_array (pairs).
-        assert!(
-            rd.vref_array.len().is_multiple_of(2),
-            "vref_array must have even length (pairs)"
-        );
-        rd_numb.push(encode_len(rd.vref_array.len() / 2));
-        for source in &rd.vref_array {
-            let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
-            rd_numb.push(tagged);
-        }
-
-        // resume.py number: per-frame jitcode_index, pc, [tagged_values...].
-        let mut frame_sizes = Vec::with_capacity(rd.frames.len());
-        for frame in &rd.frames {
-            rd_numb.push(frame.jitcode_index as i64);
-            rd_numb.push(encode_u64(frame.pc));
-            for source in &frame.slot_map {
-                let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
-                rd_numb.push(tagged);
-            }
-            frame_sizes.push(frame.slot_map.len());
-        }
-
-        let rd_virtuals = rd.virtuals.clone();
-
-        // resume.py:412-418: register virtual field boxes.
-        for vinfo in &rd_virtuals {
-            for source in vinfo.field_sources() {
-                if let ResumeValueSource::FailArg(index) = source {
-                    box_map.entry(*index).or_insert_with(|| {
-                        let n = liveboxes.len();
-                        liveboxes.push(*index);
-                        n
-                    });
-                }
-            }
-        }
-
-        // resume.py:420-430: walk pending fields — register + encode.
-        // Collect first, then encode — can't hold iter borrow and call
-        // `&mut self` method in the same expression.
-        let pending_fields_snapshot: Vec<_> = rd.pending_fields.to_vec();
-        let rd_pendingfields: Vec<_> = pending_fields_snapshot
-            .into_iter()
-            .map(|pending| EncodedPendingFieldWrite {
-                // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
-                // the encoded form carries the descr itself, not a handle.
-                descr: pending.descr.clone(),
-                target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
-                value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
-                item_index: pending.item_index,
-            })
-            .collect();
-
-        // resume.py:260 patch_current_size, resume.py:464 patch count
-        rd_numb[0] = encode_len(rd_numb.len());
-        rd_numb[1] = encode_len(liveboxes.len());
-
-        EncodedResumeData {
-            rd_numb,
-            // resume.py:451 storage.rd_consts = self.memo.consts — single pool.
-            rd_consts: self.consts.snapshot(),
-            rd_pendingfields,
-            rd_virtuals,
-            liveboxes,
-            frame_sizes,
-        }
-    }
 }
 
 impl Default for ResumeDataLoopMemo {
@@ -4679,7 +4585,6 @@ mod tests {
     /// address with a fresh one.
     #[test]
     fn walking_the_memo_forwards_its_ref_consts_and_rekeys_the_cache() {
-        let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
         let mut memo = super::ResumeDataLoopMemo::new();
         let before = 0x9B_0000_1000i64;
         let after = 0x9B_0000_2000i64;
@@ -4690,12 +4595,11 @@ mod tests {
             "cached before the move"
         );
 
-        majit_ir::const_ptr_table::walk(&mut |slot: &mut majit_ir::GcRef| {
-            if slot.0 as i64 == before {
+        memo.walk_const_ptr_refs_mut(&mut |slot| {
+            if slot.0 == before as usize {
                 *slot = majit_ir::GcRef(after as usize);
             }
         });
-        memo.walk_const_ptr_refs_mut(&mut |_| {});
 
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
@@ -4710,24 +4614,35 @@ mod tests {
         );
     }
 
-    /// Intern identity survives `set_slot`; the memo cache is keyed by
-    /// `identityhash` of the live word (`new_ref_dict`). A miss without
-    /// the memo walk is genuine (`_newconst`). The production pairing is
-    /// the intern-table walk plus `walk_const_ptr_refs_mut`, which rekeys
-    /// the cache so the forwarded word reuses the tag.
+    /// resume.py getconst keyed by identityhash: a forwarded word reuses
+    /// the tag that already names the pool slot (`_newconst` is not a
+    /// second append). The vacated address must not inherit that slot.
     #[test]
-    fn getconst_ref_reuses_the_pool_slot_by_intern_index() {
+    fn getconst_ref_reuses_the_pool_slot_after_a_move() {
         let mut memo = super::ResumeDataLoopMemo::new();
         let before = 0x9B_0000_3000i64;
         let after = 0x9B_0000_4000i64;
         let tagged = memo.getconst_ref(before).expect("pool the ref const");
-        let idx = majit_ir::const_ptr_table::intern(majit_ir::GcRef(before as usize));
-        majit_ir::const_ptr_table::set_slot(idx, majit_ir::GcRef(after as usize));
-        memo.walk_const_ptr_refs_mut(&mut |_| {});
+        memo.walk_const_ptr_refs_mut(&mut |s| {
+            if s.0 == before as usize {
+                *s = majit_ir::GcRef(after as usize);
+            }
+        });
         assert_eq!(
             memo.getconst_ref(after).unwrap(),
             tagged,
-            "intern-table walk plus memo rekey reuses the tag"
+            "the forwarded word reuses the tag its pool slot already holds"
+        );
+        assert_ne!(
+            memo.getconst_ref(before).unwrap(),
+            tagged,
+            "the vacated address names nothing; a later object there must not \
+             inherit the moved object's pool slot"
+        );
+        assert_eq!(
+            memo.consts()[0].getref_base(),
+            majit_ir::GcRef(after as usize),
+            "the same pool slot holds the forwarded address"
         );
     }
 
@@ -4771,12 +4686,18 @@ mod tests {
     #[test]
     fn resume_register_box_pairs_failargs_and_consts() {
         let fail_values = [11i64, 22];
-        let (op, bits) =
-            super::resume_register_box(&RebuiltValue::Box(1, majit_ir::Type::Int), &fail_values);
+        let (op, bits) = super::resume_register_box(
+            &RebuiltValue::Box(1, majit_ir::Type::Int),
+            &fail_values,
+            &[],
+        );
         assert_eq!(op, majit_ir::OpRef::input_arg_typed(1, majit_ir::Type::Int));
         assert_eq!(bits, 22);
-        let (op, bits) =
-            super::resume_register_box(&RebuiltValue::Const(majit_ir::Const::Int(7)), &fail_values);
+        let (op, bits) = super::resume_register_box(
+            &RebuiltValue::Const(majit_ir::Const::Int(7)),
+            &fail_values,
+            &[],
+        );
         assert_eq!(op, majit_ir::OpRef::const_int(7));
         assert_eq!(bits, 7);
     }
@@ -4785,20 +4706,23 @@ mod tests {
     #[should_panic(expected = "liveboxes[4] is past the deadframe")]
     fn resume_register_box_box_past_deadframe_panics() {
         let fail_values = [11i64, 22];
-        let _ =
-            super::resume_register_box(&RebuiltValue::Box(4, majit_ir::Type::Int), &fail_values);
+        let _ = super::resume_register_box(
+            &RebuiltValue::Box(4, majit_ir::Type::Int),
+            &fail_values,
+            &[],
+        );
     }
 
     #[test]
     #[should_panic(expected = "UNINITIALIZED is not a live-register box")]
     fn resume_register_box_unassigned_panics() {
-        let _ = super::resume_register_box(&RebuiltValue::Unassigned, &[]);
+        let _ = super::resume_register_box(&RebuiltValue::Unassigned, &[], &[]);
     }
 
     #[test]
     #[should_panic(expected = "TAGVIRTUAL is getvirtual_ptr")]
     fn resume_register_box_leftover_virtual_panics() {
-        let _ = super::resume_register_box(&RebuiltValue::Virtual(0), &[]);
+        let _ = super::resume_register_box(&RebuiltValue::Virtual(0), &[], &[]);
     }
 
     #[test]
@@ -7353,7 +7277,12 @@ impl<'a> ResumeDataDirectReader<'a> {
     #[cold]
     #[inline(never)]
     fn cpu_get_value_slice(&self, index: usize) -> i64 {
-        self.deadframe_slice.get(index).copied().unwrap_or(0)
+        *self.deadframe_slice.get(index).unwrap_or_else(|| {
+            panic!(
+                "resume.py cpu.get_value: deadframe slot {index} is past the deadframe (len {})",
+                self.deadframe_slice.len()
+            )
+        })
     }
 
     /// resume.py _prepare — init virtuals and pending fields.
@@ -9148,6 +9077,7 @@ pub fn read_frame_liveness_reg_indices(
 pub fn resume_register_box(
     value: &majit_ir::resumedata::RebuiltValue,
     fail_values: &[i64],
+    rd_consts: &[majit_ir::Const],
 ) -> (majit_ir::OpRef, i64) {
     use majit_ir::resumedata::RebuiltValue;
     match value {
@@ -9160,13 +9090,13 @@ pub fn resume_register_box(
             });
             (majit_ir::OpRef::input_arg_typed(*n as u32, *kind), bits)
         }
-        RebuiltValue::Const(majit_ir::Const::Int(v)) => (majit_ir::OpRef::const_int(*v), *v),
-        RebuiltValue::Const(majit_ir::Const::Ref(index)) => {
-            let g = majit_ir::const_ptr_table::resolve(*index);
-            (majit_ir::OpRef::ConstPtr(*index), g.0 as i64)
-        }
-        RebuiltValue::Const(majit_ir::Const::Float(f)) => {
-            (majit_ir::OpRef::const_float(*f), f.to_bits() as i64)
+        RebuiltValue::Const(_) | RebuiltValue::ConstRef(_) => {
+            let c = value.const_at_use(rd_consts);
+            match c {
+                majit_ir::Const::Int(v) => (majit_ir::OpRef::const_int(v), v),
+                majit_ir::Const::Ref(g) => (majit_ir::OpRef::const_ptr(g), g.0 as i64),
+                majit_ir::Const::Float(f) => (majit_ir::OpRef::const_float(f), f.to_bits() as i64),
+            }
         }
         RebuiltValue::Virtual(_) => {
             panic!("resume.py decode_box: TAGVIRTUAL is getvirtual_ptr, not a skipped slot")
