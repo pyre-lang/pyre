@@ -702,3 +702,6 @@ pub(in crate::front::mir) fn mark_local_def(
         defs.insert(local_idx);
     }
 }
+
+#[cfg(test)]
+mod tests;

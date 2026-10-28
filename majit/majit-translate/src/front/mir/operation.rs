@@ -9029,3 +9029,6 @@ pub(in crate::front::mir) fn push_ptr_to_unsigned_cast(
     };
     (retype, result)
 }
+
+#[cfg(test)]
+mod tests;

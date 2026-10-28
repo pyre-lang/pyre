@@ -11067,3 +11067,6 @@ pub(crate) fn host_rthread_threadlocalref_llop(path: &str) -> Option<ThreadLocal
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests;

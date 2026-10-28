@@ -4775,3 +4775,6 @@ pub(in crate::front::mir) enum SpanKind {
         ty: ValueType,
     },
 }
+
+#[cfg(test)]
+mod tests;

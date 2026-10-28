@@ -5908,3 +5908,6 @@ pub(in crate::front::mir) fn rust_vec_as_ptr_helper_segments() -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
+
+#[cfg(test)]
+mod tests;

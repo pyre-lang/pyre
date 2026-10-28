@@ -4131,3 +4131,6 @@ pub(in crate::front::mir) fn scalar_value_to_u64(v: &serde_json::Value) -> Optio
     }
     None
 }
+
+#[cfg(test)]
+mod tests;

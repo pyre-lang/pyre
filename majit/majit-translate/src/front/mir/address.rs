@@ -5285,3 +5285,6 @@ pub(in crate::front::mir) fn clone_tyref(ty: &TyRef) -> TyRef {
         TyRef::Other(v) => TyRef::Other(v.clone()),
     }
 }
+
+#[cfg(test)]
+mod tests;

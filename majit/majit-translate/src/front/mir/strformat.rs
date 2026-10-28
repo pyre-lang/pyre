@@ -2838,3 +2838,6 @@ pub(in crate::front::mir) fn can_thread_var_to_block(
         cur = p;
     }
 }
+
+#[cfg(test)]
+mod tests;

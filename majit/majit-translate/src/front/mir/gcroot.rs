@@ -7383,3 +7383,6 @@ pub(in crate::front::mir) fn root_scope_drop_sites(
     }
     sites
 }
+
+#[cfg(test)]
+mod tests;

@@ -2768,3 +2768,6 @@ pub(in crate::front::mir) fn result_try_err_successor(
     }
     Ok((err_sources, err_specs, err_target))
 }
+
+#[cfg(test)]
+mod tests;

@@ -3528,3 +3528,6 @@ impl<'a> Lowering<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
