@@ -5092,6 +5092,11 @@ pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
 /// `obj` must point to a valid `W_DictObject`.
 #[inline]
 pub unsafe fn w_dict_length_object_strategy(obj: PyObjectRef) -> usize {
+    majit_ir::icf_identity!(concat!(
+        module_path!(),
+        "::",
+        "w_dict_length_object_strategy"
+    ));
     // `AbstractTypedStrategy.length`: `len(self.unerase(w_dict.dstorage))`.
     // `rordereddict.rtype_len` is `getfield num_live_items` (no custom eq/hash
     // on the typed tables; object-strategy `ll_dict_len` is the same field).
@@ -5456,6 +5461,7 @@ pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) ->
 /// [`crate::dictmultiobject::INT_DICT_STRATEGY`].
 #[inline]
 pub unsafe fn w_dict_length_int_strategy(obj: PyObjectRef) -> usize {
+    majit_ir::icf_identity!(concat!(module_path!(), "::", "w_dict_length_int_strategy"));
     // `AbstractTypedStrategy.length` / `IntDictStrategy`:
     // `len(self.unerase(w_dict.dstorage))` → `getfield num_live_items`.
     let dict = &*(obj as *const W_DictObject);
@@ -5671,6 +5677,11 @@ pub unsafe fn w_dict_delitem_bytes_strategy(obj: PyObjectRef, key: PyObjectRef) 
 /// Same as [`w_dict_bytes_storage`].
 #[inline]
 pub unsafe fn w_dict_length_bytes_strategy(obj: PyObjectRef) -> usize {
+    majit_ir::icf_identity!(concat!(
+        module_path!(),
+        "::",
+        "w_dict_length_bytes_strategy"
+    ));
     // `AbstractTypedStrategy.length` / `BytesDictStrategy`:
     // `len(self.unerase(w_dict.dstorage))` → `getfield num_live_items`.
     let dict = &*(obj as *const W_DictObject);

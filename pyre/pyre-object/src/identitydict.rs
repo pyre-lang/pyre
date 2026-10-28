@@ -96,6 +96,11 @@ unsafe fn identity_storage<'a>(obj: PyObjectRef) -> &'a IdentityDictStorage {
 /// `obj` must point to a valid `W_DictObject` on [`IDENTITY_DICT_STRATEGY`].
 #[inline]
 pub unsafe fn w_dict_length_identity_strategy(obj: PyObjectRef) -> usize {
+    majit_ir::icf_identity!(concat!(
+        module_path!(),
+        "::",
+        "w_dict_length_identity_strategy"
+    ));
     // `rordereddict.rtype_len` / `ll_dict_len` is `getfield num_live_items`.
     // `RDict::len` residualizes through `look_inside_iff(isvirtual(d))`.
     // Two field reads, same shape as `w_dict_length_object_strategy`.

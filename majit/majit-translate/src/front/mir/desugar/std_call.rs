@@ -6706,7 +6706,8 @@ impl<'a> Lowering<'a> {
             .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::forget")
     }
 
-    /// `majit_ir::icf::icf_identity_token::<ID>()` — empty `nomem` asm
+    /// `majit_ir::icf::icf_identity_token::<ID>()` /
+    /// `majit_ir::icf::icf_identity_token_of::<T>()` — empty `nomem` asm
     /// natively / a volatile const read on wasm32, returning `()`.
     /// `ItemMeta::name_path` is the template path, so every const generic
     /// instance is this one item. genc `FunctionCodeGenerator` never
@@ -6715,9 +6716,11 @@ impl<'a> Lowering<'a> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
-        self.llbc
-            .fn_by_id(*id)
-            .is_some_and(|fd| fd.item_meta.name_path() == "majit_ir::icf::icf_identity_token")
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            let path = fd.item_meta.name_path();
+            path == "majit_ir::icf::icf_identity_token"
+                || path == "majit_ir::icf::icf_identity_token_of"
+        })
     }
 
     /// `core::mem::drop(value)` runs `value`'s destructor at the call.

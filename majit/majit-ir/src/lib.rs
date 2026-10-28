@@ -1,5 +1,5 @@
 #[macro_use]
-mod icf;
+pub mod icf;
 pub use icf::{icf_identity_token, icf_path_hash};
 pub mod bitstring;
 pub mod const_ptr_table;

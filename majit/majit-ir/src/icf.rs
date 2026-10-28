@@ -60,6 +60,55 @@ pub fn icf_identity_token<const ID: u64>() {
     }
 }
 
+/// Per-instance [`icf_identity_token`] for a generic helper: the asm
+/// comment names `icf_type_marker::<T>`'s symbol, so each
+/// monomorphization carries a distinct operand.
+#[inline(always)]
+pub fn icf_identity_token_of<T: ?Sized>() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: the template is a comment; nomem/nostack/preserves_flags,
+        // so the block neither reads nor writes memory.
+        unsafe {
+            core::arch::asm!(
+                "/* {0} */",
+                sym icf_type_marker::<T>,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let f: fn() = icf_type_marker::<T>;
+        let _ = unsafe { core::ptr::read_volatile(&raw const f) };
+    }
+}
+
+/// Marker whose symbol [`icf_identity_token_of`] names with `sym`.
+/// The body names that same symbol so MergeFunctions cannot fold two
+/// empty monomorphizations onto one address.
+#[doc(hidden)]
+#[inline(never)]
+pub fn icf_type_marker<T: ?Sized>() {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // SAFETY: the template is a comment; nomem/nostack/preserves_flags,
+        // so the block neither reads nor writes memory.
+        unsafe {
+            core::arch::asm!(
+                "/* {0} */",
+                sym icf_type_marker::<T>,
+                options(nomem, nostack, preserves_flags)
+            );
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let f: fn() = icf_type_marker::<T>;
+        let _ = unsafe { core::ptr::read_volatile(&raw const f) };
+    }
+}
+
 /// Expand to [`icf_identity_token`] so macro and hand-written sites share
 /// one helper. `token` is a string literal or `concat!` of path pieces.
 #[macro_export]
