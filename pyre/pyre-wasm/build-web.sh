@@ -43,9 +43,11 @@ RUSTFLAGS='-C link-arg=--export-table -C link-arg=--growable-table -C link-arg=-
 # Snapshot before anything else can clobber the shared output path, then drive
 # wasm-bindgen from the snapshot. `--out-name pyre_wasm` keeps the emitted
 # pyre_wasm.js / pyre_wasm_bg.wasm names index.html imports, regardless of the
-# snapshot's filename.
+# snapshot's filename. `--keep-lld-exports` keeps the linker-synthesized
+# `__indirect_function_table` export, which wasm-bindgen otherwise strips, so
+# the JIT glue can receive the table.
 cp "$raw_wasm" "$web_wasm"
-wasm-bindgen --target web --out-dir "$www_dir" --out-name pyre_wasm "$web_wasm"
+wasm-bindgen --target web --keep-lld-exports --out-dir "$www_dir" --out-name pyre_wasm "$web_wasm"
 
 # The JIT glue module the page imports alongside the bindgen output.
 cp "$glue_src" "$www_dir/jit_glue.js"

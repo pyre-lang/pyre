@@ -10,9 +10,10 @@ use std::path::Path;
 /// (`_sre`, `_json`, `_random`, `_abc`, `_weakref`, `itertools`,
 /// `_collections`, `_thread`) are builtin; the wrappers they back
 /// (`operator.py`, `codecs.py`, `json/{decoder,encoder,scanner}.py`)
-/// still have to be embedded. `importlib._bootstrap` is deliberately
-/// omitted: installing it routes imports through POSIX PathFinder,
-/// which `stat`s `/lib-python/3` and raises ENOTSUP on the VFS.
+/// still have to be embedded. The `importlib` bootstrap sources are
+/// embedded so startup installs `_frozen_importlib` and imports go
+/// through `sys.meta_path`, and the VFS answers the directory listings
+/// `FileFinder` makes.
 #[cfg(feature = "wasm_vfs")]
 const STDLIB_CLOSURE: &[&str] = &[
     "__future__.py",
@@ -55,6 +56,9 @@ const STDLIB_CLOSURE: &[&str] = &[
     "heapq.py",
     "html/__init__.py",
     "html/entities.py",
+    "importlib/__init__.py",
+    "importlib/_bootstrap.py",
+    "importlib/_bootstrap_external.py",
     "io.py",
     "ipaddress.py",
     "json/__init__.py",

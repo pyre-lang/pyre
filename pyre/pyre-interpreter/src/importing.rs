@@ -625,6 +625,26 @@ impl SourceProvider for VfsProvider {
             )),
         }
     }
+    /// Direct children of an embedded directory, sorted.
+    fn list_dir(&self, path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
+        match self.map.get(path) {
+            Some(VfsEntry::Dir) => {
+                let mut names: Vec<Vec<u8>> = self
+                    .map
+                    .keys()
+                    .filter(|k| k.parent() == Some(path))
+                    .filter_map(|k| k.file_name())
+                    .map(|name| name.as_encoded_bytes().to_vec())
+                    .collect();
+                names.sort();
+                Ok(names)
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("not a directory in embedded stdlib: {}", path.display()),
+            )),
+        }
+    }
 }
 
 /// Mount the embedded stdlib closure at `mount`, add `mount` to `sys.path`, and
@@ -9449,6 +9469,24 @@ mod tests {
         assert!(src.contains("def compile"));
         assert!(vfs.read_to_bytes(&mount.join("re/_nope.py")).is_err());
         assert!(!vfs.is_file(&mount.join("re/_nope.py")));
+
+        assert!(vfs.is_file(&mount.join("importlib/_bootstrap.py")));
+        assert!(vfs.is_file(&mount.join("importlib/_bootstrap_external.py")));
+        assert!(vfs.is_file(&mount.join("importlib/__init__.py")));
+
+        let re_dir = vfs.list_dir(&mount.join("re")).unwrap();
+        assert!(re_dir.contains(&b"__init__.py".to_vec()));
+        assert!(re_dir.contains(&b"_parser.py".to_vec()));
+        let mut re_dir_sorted = re_dir.clone();
+        re_dir_sorted.sort();
+        assert_eq!(re_dir, re_dir_sorted);
+
+        let root = vfs.list_dir(mount).unwrap();
+        assert!(root.contains(&b"re".to_vec()));
+        assert!(root.contains(&b"enum.py".to_vec()));
+
+        assert!(vfs.list_dir(&mount.join("enum.py")).is_err());
+        assert!(vfs.list_dir(&mount.join("nope")).is_err());
     }
 
     #[cfg(all(
