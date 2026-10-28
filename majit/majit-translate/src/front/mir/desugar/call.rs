@@ -1425,9 +1425,9 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `prebuilt_str_storage(&str)` is the literal's prebuilt
-                // `STR` (`CONST_STR_CACHE`, `BaseLLStringRepr.convert_const`),
-                // which the `&str` operand already is.
+                // `prebuilt_str_storage(&str)` / `prebuilt_wtf8_storage(&Wtf8)` is
+                // the name's prebuilt `STR` (`CONST_STR_CACHE`,
+                // `BaseLLStringRepr.convert_const`), which the operand already is.
                 if args.len() == 1 && self.is_prebuilt_str_storage_identity(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), false);
                     let target_bb = self.block_id[target];

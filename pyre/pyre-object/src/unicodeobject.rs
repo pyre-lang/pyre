@@ -1188,6 +1188,13 @@ pub fn prebuilt_str_storage(value: &str) -> *mut UnicodeValueStorage {
     prebuilt_str_storage_bytes(value.as_bytes())
 }
 
+/// [`prebuilt_str_storage`] for a WTF-8 name (a lone surrogate allowed):
+/// the same immortal `STR`, keyed on the same bytes.
+#[majit_macros::dont_look_inside]
+pub fn prebuilt_wtf8_storage(value: &Wtf8) -> *mut UnicodeValueStorage {
+    prebuilt_str_storage_bytes(value.as_bytes())
+}
+
 /// `CONST_STR_CACHE` keyed on the raw `STR` bytes (`BaseLLStringRepr.convert_const`
 /// copies characters with no encoding check). Lone-surrogate WTF-8 is a valid
 /// payload.

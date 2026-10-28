@@ -2702,7 +2702,11 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        fd.item_meta.name_path() == "pyre_object::unicodeobject::prebuilt_str_storage"
+        matches!(
+            fd.item_meta.name_path().as_str(),
+            "pyre_object::unicodeobject::prebuilt_str_storage"
+                | "pyre_object::unicodeobject::prebuilt_wtf8_storage"
+        )
     }
 
     /// `utf8_payload_bytes(*const UnicodeValueStorage) -> &[u8]` — byte view

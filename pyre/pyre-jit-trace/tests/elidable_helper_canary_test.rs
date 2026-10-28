@@ -467,7 +467,7 @@ fn emit_ref_lookup_shape_all_const_folds_to_const_ptr() {
 //
 // The recorder records but does not execute the call (pyjitpl.py),
 // so a synthetic concrete result stands in — the real wrapper would
-// dereference `w_name` and walk the MRO, which needs a live objspace.
+// read the `name` STR and walk the MRO, which needs a live objspace.
 
 #[test]
 fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
@@ -488,15 +488,15 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
     assert!(matches!(action, BackEdgeAction::StartedTracing));
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
-    let w_name: usize = 0x4A3E_2222;
+    let name: usize = 0x4A3E_2222;
     let version_tag: i64 = 0x5236;
     // Synthetic descriptor pointer; the wrapper is NOT invoked here.
     let concrete_result: usize = 0xDE5C_2222;
 
     let w_type_arg = OpRef::input_arg_ref(0);
-    let (w_name_arg, version_arg) = {
+    let (name_arg, version_arg) = {
         let ctx = meta.trace_ctx().expect("active trace");
-        (ctx.const_ref(w_name as i64), ctx.const_int(version_tag))
+        (ctx.const_ref(name as i64), ctx.const_int(version_tag))
     };
 
     let resbox = {
@@ -504,12 +504,12 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
         emit_trace_call_ref_typed_elidable_cannot_raise(
             ctx,
             func_ptr,
-            &[w_type_arg, w_name_arg, version_arg],
+            &[w_type_arg, name_arg, version_arg],
             &[Type::Ref, Type::Ref, Type::Int],
             &[
                 Value::Int(func_ptr as usize as i64),
                 Value::Ref(GcRef(live_type)),
-                Value::Ref(GcRef(w_name)),
+                Value::Ref(GcRef(name)),
                 Value::Int(version_tag),
             ],
             Value::Ref(GcRef(concrete_result)),
@@ -536,7 +536,7 @@ fn real_lookup_wrapper_records_call_pure_r_when_type_not_const() {
 
 #[test]
 fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
-    // Hot-loop shape: w_type promoted, w_name interned, version_tag guarded
+    // Hot-loop shape: w_type promoted, name a prebuilt STR, version_tag guarded
     // -> all three args const -> the lookup call is fully cut and folds to a
     // ConstPtr (Value::Ref), the cross-iteration fold the getattr inline delivers.
     let mut meta = MetaInterp::<()>::new(0);
@@ -553,15 +553,15 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
 
     let func_ptr = pyre_interpreter::residual_word_addr!(3, jit_lookup_where_with_method_cache);
     let w_type: usize = 0x710E_3333;
-    let w_name: usize = 0x4A3E_3333;
+    let name: usize = 0x4A3E_3333;
     let version_tag: i64 = 0x5237;
     let concrete_result: usize = 0xDE5C_3333;
 
-    let (w_type_arg, w_name_arg, version_arg) = {
+    let (w_type_arg, name_arg, version_arg) = {
         let ctx = meta.trace_ctx().expect("active trace");
         (
             ctx.const_ref(w_type as i64),
-            ctx.const_ref(w_name as i64),
+            ctx.const_ref(name as i64),
             ctx.const_int(version_tag),
         )
     };
@@ -571,12 +571,12 @@ fn real_lookup_wrapper_all_const_folds_to_const_ptr() {
         emit_trace_call_ref_typed_elidable_cannot_raise(
             ctx,
             func_ptr,
-            &[w_type_arg, w_name_arg, version_arg],
+            &[w_type_arg, name_arg, version_arg],
             &[Type::Ref, Type::Ref, Type::Int],
             &[
                 Value::Int(func_ptr as usize as i64),
                 Value::Ref(GcRef(w_type)),
-                Value::Ref(GcRef(w_name)),
+                Value::Ref(GcRef(name)),
                 Value::Int(version_tag),
             ],
             Value::Ref(GcRef(concrete_result)),

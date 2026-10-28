@@ -777,7 +777,10 @@ fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
         // (`inherit_flag_map_or_seq`), so that subtree is done.
         //
         // `set_flags_recursive` also stops on IMMUTABLETYPE, which
-        // `PyType_Freeze` sets on a heap type without clearing its heap-type bit.
+        // `PyType_Freeze` sets on a heap type without clearing its heap-type
+        // bit; `interp_abc.py` has no such stop.  [3.15-spec] observable:
+        // `contextvars.Context` is immutable and registered as a `Mapping`, so
+        // `match copy_context(): case {}` fails on 3.15 and matches on PyPy.
         if !typeobject::w_type_is_heaptype(w_type)
             || typeobject::w_type_is_cpython_immutabletype(w_type)
             || typeobject::w_type_get_flag_map_or_seq(w_type) == flag

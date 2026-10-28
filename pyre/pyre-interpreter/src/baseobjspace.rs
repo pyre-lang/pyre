@@ -11629,23 +11629,6 @@ pub(crate) unsafe fn lookup_where_class_uncached(
     lookup_where(w_type, name).map(|(src, _value)| src)
 }
 
-/// Residual interned `w_name` for type lookup. `typeobject.py` `lookup_where`
-/// does not intern (`_lookup_where`, `_lookup_where_all_typeobjects`);
-/// `ObjSpace.new_interned_str` is code-object / constant creation. Probe
-/// `interned_strings.get` only (`get_interned_str`).
-fn interned_lookup_w_name(name: &Wtf8) -> Option<PyObjectRef> {
-    pyre_object::unicodeobject::get_interned_wtf8(name)
-}
-
-/// `W_UnicodeObject._utf8` of a live str object (`unicodeobject.py`).
-/// A Ptr(STR) getfield, not a derived `&Wtf8` chars interior.
-#[inline]
-unsafe fn w_name_utf8(w_name: PyObjectRef) -> &'static Wtf8 {
-    pyre_object::unicodeobject::utf8_payload_wtf8(unsafe {
-        pyre_object::unicodeobject::w_str_storage(w_name)
-    })
-}
-
 /// Rebuild the `(w_class, w_value)` pair of [`lookup_where`] from its two
 /// single-register `dont_look_inside` projections
 /// ([`lookup_where_class_uncached`] and [`lookup_in_type_where_uncached`]),
@@ -11676,28 +11659,25 @@ pub unsafe fn lookup_where_pair(
     // the same reason the two live side by side here — the walk is shared, the
     // cell handling is not.
     //
-    // Residual ABI needs a `w_name`. `lookup_where` does not intern
-    // (`typeobject.py` `_lookup_where`); `ObjSpace.new_interned_str` is
-    // code-object / constant creation. Probe only; a miss walks with the
-    // borrowed name (`getitem_str`) and does not intern-insert.
-    let Some(w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
-        return lookup_where(w_type, name);
-    };
+    // `name` is an RPython `str` (`Ptr(STR)`): on the trace
+    // `prebuilt_str_storage` is the operand itself, so both residuals carry
+    // the one-word STR.  Native code returned above and never reaches it.
+    let name_str = pyre_object::unicodeobject::prebuilt_str_storage(name);
     for _ in 0..8 {
         let tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
         // `_lookup_where` is a dict/MRO walk, not a collecting malloc.
-        let value = _lookup_in_type_uncached(w_type, w_name);
+        let value = _lookup_in_type_uncached(w_type, name_str);
         if value.is_null() {
             if pyre_object::typeobject::w_type_get_version_tag(w_type) == tag {
                 return None;
             }
             continue;
         }
-        let class = _lookup_where_class_uncached(w_type, w_name);
+        let class = _lookup_where_class_uncached(w_type, name_str);
         if class.is_null() {
             continue;
         }
-        let hit = crate::type_dict_lookup_wtf8_no_unwrapping(class, w_name_utf8(w_name));
+        let hit = crate::type_dict_lookup_wtf8_no_unwrapping(class, Wtf8::new(name));
         if hit == Some(value) {
             // `getdictvalue`'s unwrap, on the one entry both residuals agreed
             // on.  A type store parks a cell only around a live value, so the
@@ -11713,7 +11693,7 @@ pub unsafe fn lookup_where_pair(
 }
 
 /// [`lookup_where_pair`] with the namespace entry left as stored, for the
-/// `MethodCache` fill.  Same two residuals, same retry, same interned `w_name`:
+/// `MethodCache` fill.  Same two residuals, same retry, same STR name:
 /// the only difference is that a `MutableCell` reaches the cache intact, which
 /// is what lets `lookup_where_with_method_cache` unwrap at its front door.
 pub(crate) unsafe fn lookup_where_pair_no_unwrapping(
@@ -11725,29 +11705,25 @@ pub(crate) unsafe fn lookup_where_pair_no_unwrapping(
         // walk answers both halves at once.
         return lookup_where_no_unwrapping(w_type, name);
     }
-    // Traced code uses an already-interned `w_name` so both residuals carry
-    // thin pointers only, the way `lookup_in_type_uncached_split` does for
-    // the value half: the `&str` projections above cannot be published as
-    // residual targets, and an unpublished callee blocks every descent whose
-    // body reaches this arm. Probe only (`lookup_where` does not intern).
-    let Some(w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
-        return lookup_where_no_unwrapping(w_type, name);
-    };
+    // `name` is an RPython `str` (`Ptr(STR)`): on the trace
+    // `prebuilt_str_storage` is the operand itself, so both residuals carry
+    // the one-word STR.  Native code returned above and never reaches it.
+    let name_str = pyre_object::unicodeobject::prebuilt_str_storage(name);
     for _ in 0..8 {
         let tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
         // `_lookup_where` is a dict/MRO walk, not a collecting malloc.
-        let value = _lookup_in_type_uncached(w_type, w_name);
+        let value = _lookup_in_type_uncached(w_type, name_str);
         if value.is_null() {
             if pyre_object::typeobject::w_type_get_version_tag(w_type) == tag {
                 return None;
             }
             continue;
         }
-        let class = _lookup_where_class_uncached(w_type, w_name);
+        let class = _lookup_where_class_uncached(w_type, name_str);
         if class.is_null() {
             continue;
         }
-        let hit = crate::type_dict_lookup_wtf8_no_unwrapping(class, w_name_utf8(w_name));
+        let hit = crate::type_dict_lookup_wtf8_no_unwrapping(class, Wtf8::new(name));
         if hit == Some(value) {
             return Some((class, value));
         }
@@ -11822,55 +11798,54 @@ pub(crate) unsafe fn lookup_in_type_wtf8_uncached(
 }
 
 /// Residual-call twin of [`lookup_in_type_wtf8_uncached`] for traced code:
-/// the name arrives as an interned, immortal str object (`box_str_constant`)
-/// because the residual call ABI cannot pass a `&Wtf8`, and the result is a
-/// raw pointer with null for `None`.  The same shape as
+/// `name` is the RPython `str` (`Ptr(STR)`, one word) that the caller's
+/// `&str` already is on the trace, and the result is a raw pointer with null
+/// for `None`.  The same shape as
 /// [`_pure_lookup_where_with_method_cache`] next to the cached arm, without
 /// the elidable marker: this arm serves types without a version tag.
 ///
 /// # Safety
-/// `w_type` may be null or a non-type; `w_name` must be a live str object.
+/// `w_type` may be null or a non-type; `name` must be a live STR.
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn _lookup_in_type_uncached(
     w_type: *mut PyObject,
-    w_name: *mut PyObject,
+    name: *mut pyre_object::unicodeobject::UnicodeValueStorage,
 ) -> *mut PyObject {
-    lookup_in_type_wtf8_uncached(w_type, w_name_utf8(w_name)).unwrap_or(std::ptr::null_mut())
+    lookup_in_type_wtf8_uncached(w_type, pyre_object::unicodeobject::utf8_payload_wtf8(name))
+        .unwrap_or(std::ptr::null_mut())
 }
 
-/// Class-half twin of [`_lookup_in_type_uncached`] for traced code: the
-/// same boxed-name, thin-pointer ABI over [`lookup_where_class_uncached`],
+/// Class-half twin of [`_lookup_in_type_uncached`] for traced code: the same
+/// one-word STR name and thin-pointer ABI over [`lookup_where_class_uncached`],
 /// null for `None`.
 ///
 /// # Safety
-/// `w_type` may be null or a non-type; `w_name` must be a live str object.
+/// `w_type` may be null or a non-type; `name` must be a live STR.
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn _lookup_where_class_uncached(
     w_type: *mut PyObject,
-    w_name: *mut PyObject,
+    name: *mut pyre_object::unicodeobject::UnicodeValueStorage,
 ) -> *mut PyObject {
-    lookup_where_pair_wtf8_uncached(w_type, w_name_utf8(w_name))
+    lookup_where_pair_wtf8_uncached(w_type, pyre_object::unicodeobject::utf8_payload_wtf8(name))
         .map_or(std::ptr::null_mut(), |(src, _value)| src)
 }
 
 /// The uncached arms of [`lookup_in_type_where_wtf8`].  The ordinary
-/// interpreter passes its borrowed name straight through; traced code uses
-/// an already-interned `w_name` so the residual call carries thin pointers
+/// interpreter passes its borrowed name straight through; traced code passes
+/// the name as one STR so the residual call carries thin pointers
 /// only, which keeps the un-lowerable `&Wtf8` callee out of every gateway
 /// body that reaches a type lookup (`descent_decline` scans a body for such
-/// callees regardless of which arm executes). Probe only: a never-interned
-/// name walks with the borrowed bytes (`_lookup_where`).
+/// callees regardless of which arm executes).
 #[inline]
 unsafe fn lookup_in_type_uncached_split(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
     if !majit_metainterp::jit::we_are_jitted() {
         return lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v));
     }
-    // Residual ABI needs a `w_name`. Probe interned_strings.get only
-    // (`typeobject.py` `_lookup_where`); a miss walks with the borrowed name.
-    let Some(w_name) = interned_lookup_w_name(name) else {
-        return lookup_in_type_wtf8_uncached(w_type, name).and_then(|v| unwrap_looked_up_value(v));
-    };
-    let v = _lookup_in_type_uncached(w_type, w_name);
+    // `name` is an RPython `str` (`Ptr(STR)`): on the trace
+    // `prebuilt_wtf8_storage` is the operand itself, so both residuals carry
+    // the one-word STR.  Native code returned above and never reaches it.
+    let name_str = pyre_object::unicodeobject::prebuilt_wtf8_storage(name);
+    let v = _lookup_in_type_uncached(w_type, name_str);
     unwrap_looked_up_value(v)
 }
 
@@ -12192,11 +12167,10 @@ pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
 /// thread-local / `String` machinery stays off the trace surface, as the
 /// former `dont_look_inside` ensured.
 ///
-/// `name` arrives on this JIT-only projection as `w_name`, an interned
-/// immortal str object (`box_str_constant`), because the elidable call ABI
-/// cannot pass a `&Wtf8`; the body reads the untranslated WTF-8 view back via
-/// `w_str_get_wtf8`. The ordinary interpreter passes its borrowed name directly
-/// to [`_cached_lookup_where_name`], matching upstream. The result here is a
+/// `name` is the RPython `str` (`Ptr(STR)`, one word) that the caller's
+/// `&str` already is on the trace.  The ordinary interpreter passes its
+/// borrowed name directly to [`_cached_lookup_where_name`], matching
+/// upstream. The result here is a
 /// raw pointer — null is the cached negative result (`None`), since the call
 /// ABI cannot carry `Option`.  The `is_type` / `version_tag == 0` guards live in
 /// the front door, so this is only ever entered with a valid promoted
@@ -12207,7 +12181,7 @@ pub unsafe fn w_type_version_tag(w_type: PyObjectRef) -> u64 {
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_lookup_where_with_method_cache(
     w_type: *mut PyObject,
-    w_name: *mut PyObject,
+    name: *mut pyre_object::unicodeobject::UnicodeValueStorage,
     version_tag: u64,
 ) -> *mut PyObject {
     // PyPy's elidable returns the cached `(w_class, w_value)` tuple
@@ -12216,7 +12190,12 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
     // need the defining class go through the interpreter front door
     // `lookup_where_with_method_cache`, which reads the same cache
     // entry.
-    _cached_lookup_where(w_type, w_name, version_tag).1
+    _cached_lookup_where_name(
+        w_type,
+        pyre_object::unicodeobject::utf8_payload_wtf8(name),
+        version_tag,
+    )
+    .1
 }
 
 /// `lookup_where` *class* projection — the `@elidable` companion of
@@ -12231,19 +12210,24 @@ pub unsafe fn _pure_lookup_where_with_method_cache(
 /// trace surface.  The value half runs first and fills the slot, so this
 /// call is a guaranteed cache hit.
 ///
-/// See [`_pure_lookup_where_with_method_cache`] for the JIT-only interned
-/// `w_name` ABI and the null-as-`None` convention (a negative result has a
-/// null `w_class`).
+/// See [`_pure_lookup_where_with_method_cache`] for the one-word STR `name`
+/// and the null-as-`None` convention (a negative result has a null
+/// `w_class`).
 #[majit_macros::elidable]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_lookup_class_with_method_cache(
     w_type: *mut PyObject,
-    w_name: *mut PyObject,
+    name: *mut pyre_object::unicodeobject::UnicodeValueStorage,
     version_tag: u64,
 ) -> *mut PyObject {
-    _cached_lookup_where(w_type, w_name, version_tag).0
+    _cached_lookup_where_name(
+        w_type,
+        pyre_object::unicodeobject::utf8_payload_wtf8(name),
+        version_tag,
+    )
+    .0
 }
 
 /// `typeobject.py _pure_getdictvalue_no_unwrapping` — the `@elidable` read of
@@ -12261,50 +12245,31 @@ pub unsafe fn _pure_lookup_class_with_method_cache(
 /// walks `mro_w` itself and reads each class past `w_starttype` with
 /// `w_class.getdictvalue(space, name)`.
 ///
-/// `name` arrives as `w_name`, an interned immortal str object
-/// (`box_str_constant`), for the reason it does on that sibling: the residual
-/// call ABI carries one machine word per argument and a `&Wtf8` is two.  The
-/// result is a raw pointer because the same ABI cannot carry an `Option`; null
-/// is the absent attribute.  The `is_type` / `version_tag == 0` guards live in
-/// the front door, so this is only entered with a valid promoted tag.
+/// `name` is the RPython `str` (`Ptr(STR)`, one word) that the caller's
+/// `&str` already is on the trace.  The result is a raw pointer because the
+/// same ABI cannot carry an `Option`; null is the absent attribute.
+/// The `is_type` / `version_tag == 0` guards live in the front door, so this
+/// is only entered with a valid promoted tag.
 #[majit_macros::elidable]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn _pure_getdictvalue_no_unwrapping(
     w_type: *mut PyObject,
-    w_name: *mut PyObject,
+    name: *mut pyre_object::unicodeobject::UnicodeValueStorage,
     version_tag: u64,
 ) -> *mut PyObject {
     // The tag is the elidable's key, not an input its body reads — upstream's
     // body is likewise just `self._getdictvalue_no_unwrapping(space, attr)`.
     let _ = version_tag;
-    let name = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(w_name) };
+    let name = unsafe { pyre_object::unicodeobject::utf8_payload_wtf8(name) };
     crate::type_dict_lookup_wtf8_no_unwrapping(w_type, name).unwrap_or(PY_NULL)
-}
-
-/// The `MethodCache` probe/fill shared by the `@elidable` JIT surface
-/// and the interpreter front door.  Probes the `(version_tag, name)`
-/// slot; on a miss runs the raw MRO walk (`typeobject.py:478-489
-/// _lookup_where_all_typeobjects`) and fills the slot with the
-/// `(w_class, w_value)` pair (`typeobject.py:545-549`).
-///
-/// `w_name` must be an exact string accepted by `w_str_get_wtf8`; the shared
-/// cache itself is content-keyed, exactly like upstream's untranslated name
-/// array.
-unsafe fn _cached_lookup_where(
-    w_type: PyObjectRef,
-    w_name: PyObjectRef,
-    version_tag: u64,
-) -> (PyObjectRef, PyObjectRef) {
-    let name = pyre_object::unicodeobject::w_str_get_wtf8(w_name);
-    _cached_lookup_where_name(w_type, name, version_tag)
 }
 
 /// Untranslated-WTF-8 MethodCache probe/fill used by the ordinary
 /// interpreter. This is the direct Rust shape of
 /// `typeobject.py:_pure_lookup_where_with_method_cache(name, version_tag)`;
-/// the `w_name` wrapper above exists only for the JIT residual-call ABI.
+/// the elidable projections above call it with the STR's WTF-8 view.
 unsafe fn _cached_lookup_where_name(
     w_type: PyObjectRef,
     name: &Wtf8,
@@ -12450,10 +12415,9 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // tuple is split across two single-register elidable residuals over the
     // same cache entry (see `_pure_lookup_class_with_method_cache`), so the
     // `MethodCache` read stays off the trace surface and the lookup folds to
-    // a `CALL_PURE_R` instead of aborting the trace.  The interned `w_name`
-    // is the green token the trace folds on; both residuals share it.
-    // `lookup_where` does not intern: probe `interned_strings.get` only.
-    // A miss walks the interpreter cache with the borrowed name.
+    // a `CALL_PURE_R` instead of aborting the trace.  `name` is the RPython
+    // `str` the trace already holds (`prebuilt_str_storage` is the operand
+    // itself), the green token both residuals fold on.
     // Upstream reads the pair atomically because it returns one tuple,
     // whereas each residual here takes the cache mutex separately, so a
     // concurrent `mutated()` can land between them.  That is no weaker than
@@ -12461,15 +12425,12 @@ pub(crate) unsafe fn lookup_where_with_method_cache(
     // no other thread invalidates the type: both halves are then read under
     // a tag that is no longer current, exactly as a lookup that had completed
     // one instruction earlier would have been.
-    let Some(w_name) = interned_lookup_w_name(Wtf8::new(name)) else {
-        let (w_class, w_value) = _cached_lookup_where_name(w_type, Wtf8::new(name), version_tag);
-        return unwrap_method_cache_value(w_class, w_value);
-    };
-    let w_value = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
+    let name_str = pyre_object::unicodeobject::prebuilt_str_storage(name);
+    let w_value = _pure_lookup_where_with_method_cache(w_type, name_str, version_tag);
     if w_value.is_null() {
         None
     } else {
-        let w_class = _pure_lookup_class_with_method_cache(w_type, w_name, version_tag);
+        let w_class = _pure_lookup_class_with_method_cache(w_type, name_str, version_tag);
         // `isinstance(w_value, MutableCell): return w_class, unwrap`.
         // A non-cell keeps the cached pair.
         unwrap_method_cache_value(w_class, w_value)
@@ -12547,11 +12508,12 @@ pub(crate) unsafe fn w_type_getdictvalue(
     // (`super_getattribute_code_name`), and boxing it again would put a
     // `box_str_constant` residual on the traced path -- which is a symbolic
     // fnaddr the sub-walk cannot name, so the descent declines there instead.
-    // Threading the wrapper down also spares the ordinary interpreter the
-    // process-global `WEAK_INTERN` mutex once per lookup (`intern_lookup`),
-    // which is the cost `lookup_in_type_where_wtf8` documents paying for the
-    // same ABI.
-    let w_value = _pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
+    // Its `_utf8` field is the STR the elidable takes.
+    let w_value = _pure_getdictvalue_no_unwrapping(
+        w_type,
+        pyre_object::unicodeobject::w_str_storage(w_name),
+        version_tag,
+    );
     if w_value.is_null() {
         None
     } else {
@@ -12588,15 +12550,11 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
         let v = _cached_lookup_where_name(w_type, name, version_tag).1;
         return unwrap_looked_up_value(v);
     }
-    // The JIT elidable projection takes an interned str object because its
-    // residual call ABI cannot pass a `&Wtf8`. `lookup_where` does not intern
-    // (`typeobject.py` `_lookup_where`); probe `interned_strings.get` only.
-    // A miss walks with the borrowed name and does not intern-insert.
-    let Some(w_name) = interned_lookup_w_name(name) else {
-        return lookup_in_type_uncached_split(w_type, name);
-    };
+    // `name` is an RPython `str` (`Ptr(STR)`): on the trace
+    // `prebuilt_wtf8_storage` is the operand itself.
+    let name_str = pyre_object::unicodeobject::prebuilt_wtf8_storage(name);
     // typeobject.py — `_pure_lookup_where_with_method_cache(name, version_tag)`.
-    let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
+    let v = _pure_lookup_where_with_method_cache(w_type, name_str, version_tag);
     unwrap_looked_up_value(v)
 }
 

@@ -358,8 +358,8 @@ pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
 /// `@elidable` method-cache lookup keyed on `(w_type, w_name, version_tag)`,
 /// recorded as a foldable `CALL_PURE_R` so repeated same-key lookups in a
 /// hot loop collapse to a constant `w_descr` pointer (null = `None`).  The
-/// promoted `version_tag` and interned immortal `w_name`
-/// (`box_str_constant`) are the green tokens the trace folds on.
+/// promoted `version_tag` and the name `STR` are the green tokens the
+/// trace folds on.
 ///
 /// A plain `extern "C"` i64-ABI wrapper, like `jit_namespace_cell_lookup`:
 /// the `#[elidable]` macro cannot emit a trampoline for the
@@ -367,18 +367,18 @@ pub(crate) fn namespace_slot_lookup_result(result: PyObjectRef) -> Value {
 /// primitive types), so the recordable surface is this wrapper, recorded
 /// with an explicit `ElidableCannotRaise` effect — the raw-pointer return
 /// (null = `None`) genuinely cannot raise.  Null on a null `w_type` /
-/// `w_name`; callers (the front door) already guarded `is_type` /
+/// `name`; callers (the front door) already guarded `is_type` /
 /// `version_tag == 0`.
 pub extern "C" fn jit_lookup_where_with_method_cache(
     w_type: PyObjectRef,
-    w_name: PyObjectRef,
+    name: *mut pyre_object::unicodeobject::UnicodeValueStorage,
     version_tag: i64,
 ) -> PyObjectRef {
-    if w_type.is_null() || w_name.is_null() {
+    if w_type.is_null() || name.is_null() {
         return PY_NULL;
     }
     let w_descr = unsafe {
-        pyre_interpreter::_pure_lookup_where_with_method_cache(w_type, w_name, version_tag as u64)
+        pyre_interpreter::_pure_lookup_where_with_method_cache(w_type, name, version_tag as u64)
     };
     w_descr
 }
@@ -405,9 +405,9 @@ unsafe fn is_mapdict_carrier(w_obj: PyObjectRef) -> bool {
 /// recorded as a normal residual call — NOT pure: the instance dict mutates,
 /// so the result is guarded `null` per iteration rather than folded.  `w_name`
 /// is the interned immortal name pointer; the body reads it back via
-/// `w_str_get_wtf8`, mirroring [`jit_lookup_where_with_method_cache`].  Null
-/// on a null receiver / name or a non-carrier receiver (the fast path
-/// already pinned the receiver type with `guard_class`).
+/// `w_str_get_wtf8`.  Null on a null receiver / name or a non-carrier
+/// receiver (the fast path already pinned the receiver type with
+/// `guard_class`).
 pub extern "C" fn jit_instance_getdictvalue(
     w_obj: PyObjectRef,
     w_name: PyObjectRef,
