@@ -26,6 +26,10 @@ pub use crate::translator::rtyper::rmodel::{InteriorPtrRepr, LLADTMethRepr, PtrR
 /// the pointer names a graph). Otherwise the hop is `indirect_call` with
 /// a trailing `inputconst(Void, None)` — no known graphs — after
 /// `hop.exception_is_here()`. The result type is `FUNC.RESULT`.
+///
+/// Arguments are `hop.inputargs(*hop.args_r)`: the caller already
+/// emitted `cast_instance_to_base_ptr` at the source call site
+/// (`annlowlevel.py`).
 pub(crate) fn rtype_simple_call(r: &PtrRepr, hop: &HighLevelOp) -> RTypeResult {
     let func_type = ptr_target_func(&r.ptrtype().TO).ok_or_else(|| {
         TyperError::message(format!("calling a non-function {:?}", r.ptrtype().TO))
@@ -77,7 +81,7 @@ mod tests {
     use crate::flowspace::model::{
         Block, BlockKey, ConstValue, Constant, FunctionGraph, Hlvalue, SpaceOperation, Variable,
     };
-    use crate::model::{FunctionGraph as LegacyGraph, OpKind, ValueType};
+    use crate::model::{CallTarget, FunctionGraph as LegacyGraph, OpKind, ValueType};
     use crate::translator::rtyper::call_registry::CallRegistry;
     use crate::translator::rtyper::cutover::specialize_legacy_graph_with_registry_returning_value_to_var;
     use crate::translator::rtyper::flowspace_adapter::function_graph_to_flowspace;
@@ -391,5 +395,221 @@ mod tests {
         };
         assert_eq!(c_graphs.concretetype, Some(LowLevelType::Void));
         assert_eq!(c_graphs.value, ConstValue::None);
+    }
+
+    #[test]
+    fn fn_ptr_indirect_call_wraps_instance_arg_with_cast_instance_to_base_ptr() {
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("call_stored_fn_instance_arg");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "f".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn(&FnPtrInstArg) -> bool".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let inst_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "inst".to_string(),
+                    ty: ValueType::Ref(Some("FnPtrInstArg".to_string())),
+                    class_root: Some("FnPtrInstArg".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        graph.push_inputarg_var(entry, f_var.clone());
+        graph.push_inputarg_var(entry, inst_var.clone());
+        let wrap_kind = crate::model::cast_instance_to_base_ptr_call(inst_var.clone());
+        match &wrap_kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                assert_eq!(
+                    segments.as_slice(),
+                    [
+                        "rpython",
+                        "rtyper",
+                        "annlowlevel",
+                        "cast_instance_to_base_ptr"
+                    ]
+                );
+            }
+            other => panic!("front-end wrap emits cast_instance_to_base_ptr, got {other:?}"),
+        }
+        let wrap_var = graph.push_op_var(entry, wrap_kind, true).unwrap();
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: f_var,
+                    args: vec![wrap_var.clone()],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let lifted = function_graph_to_flowspace(&graph, &registry)
+            .expect("wrap Call and stored fn-ptr IndirectCall must lift");
+        let start = lifted.graph.borrow().startblock.clone();
+        let lifted_ops = start.borrow().operations.clone();
+        let helper = lifted_ops.iter().find(|op| {
+            op.opname == "simple_call"
+                && matches!(
+                    op.args.first(),
+                    Some(Hlvalue::Constant(c))
+                        if matches!(
+                            &c.value,
+                            ConstValue::HostObject(h)
+                                if h.qualname() == "annlowlevel.cast_instance_to_base_ptr"
+                        )
+                )
+        });
+        assert!(
+            helper.is_some(),
+            "adapter must emit simple_call of cast_instance_to_base_ptr"
+        );
+
+        let (value_to_var, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("wrapped instance arg must annotate and rtype");
+        let wrap_result = value_to_var
+            .get(&wrap_var)
+            .expect("cast_instance_to_base_ptr result must project");
+        {
+            let cell = wrap_result.annotation.borrow();
+            match cell.as_ref().map(|rc| rc.as_ref()) {
+                Some(SomeValue::Ptr(_)) => {}
+                other => panic!(
+                    "cast_instance_to_base_ptr annotates as SomePtr(OBJECTPTR), got {other:?}"
+                ),
+            }
+        }
+        let result_var = value_to_var.get(&r_var).expect("call result must project");
+        {
+            let cell = result_var.annotation.borrow();
+            match cell.as_ref().map(|rc| rc.as_ref()) {
+                Some(SomeValue::Bool(_)) => {}
+                other => panic!("SomePtr.call of wrapped args returns RESULT, got {other:?}"),
+            }
+        }
+
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        assert!(
+            rtyped.iter().any(|op| op.opname == "cast_pointer"),
+            "cast_instance_to_base_ptr rtypes as cast_pointer"
+        );
+        assert!(
+            rtyped.iter().any(|op| op.opname == "indirect_call"),
+            "PtrRepr.rtype_simple_call emits indirect_call"
+        );
+    }
+
+    #[test]
+    fn fn_ptr_indirect_call_wraps_none_arg_as_nullptr_constant() {
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let _lock = anchor_lock();
+        let mut graph = LegacyGraph::new("call_stored_fn_none_arg");
+        let entry = graph.startblock;
+        let f_var = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "f".to_string(),
+                    ty: ValueType::Int,
+                    class_root: Some("fn(&FnPtrInstArg) -> bool".to_string()),
+                },
+                true,
+            )
+            .unwrap();
+        let none_var = graph.push_op_var(entry, OpKind::ConstNone, true).unwrap();
+        graph.push_inputarg_var(entry, f_var.clone());
+        let wrap_kind = crate::model::cast_instance_to_base_ptr_call(none_var);
+        let wrap_var = graph.push_op_var(entry, wrap_kind, true).unwrap();
+        let r_var = graph
+            .push_op_var(
+                entry,
+                OpKind::IndirectCall {
+                    funcptr: f_var,
+                    args: vec![wrap_var.clone()],
+                    graphs: None,
+                    family_key: None,
+                    result_ty: ValueType::Bool,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, Some(r_var.clone()));
+
+        let registry = CallRegistry::new(Rc::new(Bookkeeper::new()));
+        let (value_to_var, _) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("cast_instance_to_base_ptr(None) must annotate and rtype");
+        let wrap_result = value_to_var
+            .get(&wrap_var)
+            .expect("cast_instance_to_base_ptr result must project");
+        {
+            let cell = wrap_result.annotation.borrow();
+            match cell.as_ref().map(|rc| rc.as_ref()) {
+                Some(SomeValue::Ptr(_)) => {}
+                other => {
+                    panic!("cast_instance_to_base_ptr(None) annotates as SomePtr, got {other:?}")
+                }
+            }
+        }
+
+        let (ann, _) = registry.ensure_session().expect("session after specialize");
+        let graph_ref = ann
+            .annotated
+            .borrow()
+            .values()
+            .find_map(|g| g.clone())
+            .expect("specialized subject graph");
+        let start = graph_ref.borrow().startblock.clone();
+        let rtyped = start.borrow().operations.clone();
+        let null_llptr = match OBJECTPTR.clone() {
+            LowLevelType::Ptr(ptr) => ptr._defl(),
+            other => panic!("OBJECTPTR must be Ptr, got {other:?}"),
+        };
+        assert!(
+            rtyped.iter().any(|op| {
+                op.opname == "same_as"
+                    && matches!(
+                        op.args.first(),
+                        Some(Hlvalue::Constant(c))
+                            if matches!(&c.value, ConstValue::LLPtr(got) if **got == null_llptr)
+                    )
+            }),
+            "NoneRepr arm of cast_instance_to_base_ptr is a null LLPtr constant, ops={:?}",
+            rtyped
+                .iter()
+                .map(|op| (op.opname.as_str(), op.args.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            rtyped.iter().any(|op| op.opname == "indirect_call"),
+            "PtrRepr.rtype_simple_call emits indirect_call"
+        );
     }
 }

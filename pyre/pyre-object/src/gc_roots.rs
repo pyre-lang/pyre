@@ -441,6 +441,10 @@ pub fn root_stack_depth() -> usize {
 /// living across the bracketed allocation call. Dropping the scope
 /// executes the equivalent of `pop_roots(hop, livevars)` by rewinding
 /// the shadow stack to the length captured at construction time.
+///
+/// The guard is its `save_point` word (the JIT carries it as that Int, and
+/// `pop_roots` restores `root_stack_top` by value).
+#[repr(transparent)]
 #[must_use = "RootScope is the live-roots guard; dropping it pops the roots — \
               binding it to `_roots` makes the scope explicit, while binding \
               to `_` would pop immediately and defeat the bracket"]
@@ -471,149 +475,57 @@ impl RootScope {
         self.save_point
     }
 
-    /// Scope-local [`pin_root`] on this thread's root-stack cell.
+    /// [`pin_root`]; the guard only scopes the call.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     #[must_use = "a pinned root may have been normalized; use the returned live word or bind it to `let _ =` for liveness-only pins"]
     pub fn pin_root(&self, root: PyObjectRef) -> PyObjectRef {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        let stack_slot = shadow_stack_cell();
-        // SAFETY: `stack_slot` is this thread's root-stack cell, alive for the
-        // bracket; `incr_stack` returns the slot it just claimed.
-        let index = unsafe {
-            let stack = &*stack_slot;
-            let index = stack.len();
-            *stack.incr_stack() = root;
-            index
-        };
-        // SAFETY: `stack_slot` is this thread's live root-stack cell.
-        normalize_published_slot(unsafe { &*stack_slot }, index)
+        pin_root(root)
     }
 
-    /// Scope-local [`shadow_stack_get`] on this thread's root-stack cell.
+    /// [`shadow_stack_get`]; the guard only scopes the call.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     pub fn get(&self, index: usize) -> PyObjectRef {
-        let stack_slot = shadow_stack_cell();
-        // SAFETY: same cell; `slot` bounds-checks `index`.
-        unsafe { *(*stack_slot).slot(index) }
+        shadow_stack_get(index)
     }
 
-    /// Scope-local [`publish_roots`] on this thread's root-stack cell.
+    /// [`publish_roots`]; the guard only scopes the call.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     pub fn publish(&self, roots: &[PyObjectRef]) -> usize {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        let stack_slot = shadow_stack_cell();
-        // SAFETY: this thread's cell, alive for the bracket; `incr_stack`
-        // returns the slot it just claimed.
-        unsafe {
-            let stack = &*stack_slot;
-            let base = stack.len();
-            for &root in roots {
-                *stack.incr_stack() = root;
-            }
-            base
-        }
+        publish_roots(roots)
     }
 
-    /// Scope-local [`pin_roots`]: publish every live word, then normalize
-    /// the run. Sequential [`Self::pin_root`] would query after the first
-    /// write and leave later values invisible to a foreign collection.
-    ///
-    /// One cell resolution covers both halves: `publish` then
-    /// `normalize` each used to call [`shadow_stack_cell`], and the
-    /// second `_tlv_get_addr` sat on every `with_roots!` bracket.
+    /// [`pin_roots`]; the guard only scopes the call: publish every live word,
+    /// then normalize the run. Sequential [`Self::pin_root`] would query after
+    /// the first write and leave later values invisible to a foreign collection.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     pub fn pin_roots(&self, roots: &[PyObjectRef]) -> usize {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        let stack_slot = shadow_stack_cell();
-        // SAFETY: this thread's cell, alive for the bracket; `incr_stack`
-        // returns the slot it just claimed, and `publish` semantics claim
-        // every index in the run `normalize_published_run` then reads.
-        unsafe {
-            let stack = &*stack_slot;
-            let base = stack.len();
-            for &root in roots {
-                *stack.incr_stack() = root;
-            }
-            let _ = normalize_published_run(stack, base, roots.len());
-            base
-        }
+        pin_roots(roots)
     }
 
-    /// One-word residual ABI for [`Self::publish`], the
-    /// [`publish_roots_jit_abi`] twin.
-    #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn publish_jit_abi(
-        &self,
-        array: *const crate::object_array::GcTypedArray,
-    ) -> i64 {
-        let items = gcarray_ref_items(array);
-        self.publish(&items) as i64
-    }
-
-    /// One-word residual ABI for [`Self::pin_roots`], the
-    /// [`publish_roots_jit_abi`] twin.
-    #[majit_macros::dont_look_inside_cannot_raise]
-    pub extern "C" fn pin_roots_jit_abi(
-        &self,
-        array: *const crate::object_array::GcTypedArray,
-    ) -> i64 {
-        let items = gcarray_ref_items(array);
-        self.pin_roots(&items) as i64
-    }
-
-    /// Scope-local [`normalize_roots`] on this thread's root-stack cell.
+    /// [`normalize_roots`]; the guard only scopes the call.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     pub fn normalize(&self, base: usize, len: usize) {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        let stack_slot = shadow_stack_cell();
-        // SAFETY: `publish` claimed every index in this range, and
-        // `stack_slot` is this thread's live root-stack cell.
-        let _ = normalize_published_run(unsafe { &*stack_slot }, base, len);
+        normalize_roots(base, len)
     }
 
-    /// [`normalize`](Self::normalize), reporting whether any slot in the run
-    /// named a forwarding stub.
-    ///
-    /// A caller that has to rebuild a native view of the run from the slots
-    /// only owes that rebuild when the run actually moved; `false` says the
-    /// words it already holds are the live ones.
+    /// [`normalize_roots_moved`]; the guard only scopes the call.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     pub fn normalize_moved(&self, base: usize, len: usize) -> bool {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        let stack_slot = shadow_stack_cell();
-        // SAFETY: this thread's live cell; `publish` claimed the range.
-        normalize_published_run(unsafe { &*stack_slot }, base, len)
+        normalize_roots_moved(base, len)
     }
 
-    /// Scope-local [`shadow_stack_set`] on this thread's root-stack cell — the
-    /// write a slot whose contents change over the bracket takes on each update.
+    /// [`shadow_stack_set`]; the guard only scopes the call — the write a slot
+    /// whose contents change over the bracket takes on each update.
     #[inline]
-    #[majit_macros::dont_look_inside_cannot_raise]
+    #[majit_macros::always_inline]
     pub fn set(&self, index: usize, root: PyObjectRef) {
-        #[cfg(debug_assertions)]
-        assert_shadow_stack_not_walking();
-        let stack_slot = shadow_stack_cell();
-        // Publish the raw value before the query, for the reason [`pin_root`]
-        // gives: the slot is what a walker reads, so it must name the value
-        // before anything consults the collector about it. One cell
-        // resolution covers the store and the normalize.
-        // SAFETY: same cell; `slot` bounds-checks `index`.
-        unsafe {
-            let stack = &*stack_slot;
-            *stack.slot(index) = root;
-            normalize_published_slot(stack, index);
-        }
+        shadow_stack_set(index, root)
     }
 }
 
@@ -627,10 +539,10 @@ impl Drop for RootScope {
 /// Truncate the shadow stack to the length captured at construction time,
 /// mirroring `pop_roots`'s discard of the bracketed `livevars` slots.
 ///
-/// This is the bracket's close spelled as a call taking the guard by
-/// reference. A crate that sees `RootScope` only as an opaque cross-crate
-/// stub cannot read `save_point` to close a bracket inline, but it can name
-/// this function; the field read then happens behind it.
+/// Native `Drop` of the guard calls this, reading `save_point` behind the
+/// reference. The lowered close is [`root_scope_close_word`]: the JIT
+/// already carries the guard as that one word, so the residual takes it
+/// as an Int rather than a reference.
 ///
 /// A residual for the same reason `pin_root` and `shadow_stack_cell_truncate`
 /// are: the bracket's helpers are named by the runtime rather than looked
@@ -639,6 +551,16 @@ impl Drop for RootScope {
 #[inline]
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn root_scope_close(scope: &RootScope) {
+    root_scope_close_word(scope.save_point);
+}
+
+/// The close a lowered `Drop` of the guard calls. The JIT carries a `RootScope`
+/// as its one word, so the call hands over `save_point` itself as an Int, not
+/// the guard's address; `pop_roots` likewise restores the saved
+/// `root_stack_top` by value.
+#[inline]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn root_scope_close_word(save_point: usize) {
     #[cfg(debug_assertions)]
     assert_shadow_stack_not_walking();
     let cell = shadow_stack_cell();
@@ -647,12 +569,12 @@ pub fn root_scope_close(scope: &RootScope) {
     // this one's pins: the guard, or a value owning it, outlived that
     // bracket, and every slot it reads back is gone.
     debug_assert!(
-        scope.save_point <= shadow_stack_cell_len(cell),
+        save_point <= shadow_stack_cell_len(cell),
         "a root scope closed after a bracket that enclosed it"
     );
     // `truncate` is a no-op if `save_point >= len()`, which is
     // the steady-state case for an empty bracket.
-    shadow_stack_cell_truncate(cell, scope.save_point);
+    shadow_stack_cell_truncate(cell, save_point);
 }
 
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
@@ -1122,6 +1044,21 @@ pub fn normalize_roots(base: usize, len: usize) {
     with_shadow_stack(|stack| {
         let _ = normalize_published_run(stack, base, len);
     });
+}
+
+/// [`normalize_roots`], reporting whether any slot in the run named a forwarding stub.
+///
+/// A caller that has to rebuild a native view of the run from the slots
+/// only owes that rebuild when the run actually moved; `false` says the
+/// words it already holds are the live ones.
+#[inline]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn normalize_roots_moved(base: usize, len: usize) -> bool {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    let stack_slot = shadow_stack_cell();
+    // SAFETY: this thread's live cell; `publish` claimed the range.
+    normalize_published_run(unsafe { &*stack_slot }, base, len)
 }
 
 /// Current length of the thread-local shadow stack. Used by

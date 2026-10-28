@@ -184,7 +184,8 @@ fn entries_item_ptr_gcentries_i64_gcref_items_offset_is_8() {
     )
     .expect("substituted entries_item_ptr body");
     let context = super::LowerContext::new(&llbc);
-    let struct_fields = super::struct_field_registry_from_rows(&context.struct_fields);
+    let struct_fields =
+        super::struct_field_registry_from_rows(&context.struct_fields, &context.foreign_callables);
     let accum = super::AccumulatorFacts::build(&llbc, &body);
     let jitdriver_receiver_roots =
         crate::codewriter::jtransform::default_jitdriver_receiver_roots();

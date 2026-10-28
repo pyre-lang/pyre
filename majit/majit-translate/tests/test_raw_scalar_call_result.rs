@@ -14,8 +14,9 @@
 //! (`RawMalloc` / `RawStore` / `RawFree`). `history.py` `getkind` banks
 //! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
 //! Two borrows of one place share that address. A raw pointer of that
-//! place uses the same address. A raw pointer with no referent is not
-//! lowered. A raw pointer taken while its local is still clean reloads
+//! place uses the same address. A raw pointer of another primitive
+//! place (`&raw mut other`) is a second address. A raw pointer with no
+//! referent is not lowered. A raw pointer taken while its local is still clean reloads
 //! a later store of the address, including through a callee that
 //! returns that load and through a field that holds the pointer. A
 //! borrow of a field or a constant index names that path
@@ -32,9 +33,10 @@
 //! (`attach_aliasing_raw_arguments`). A pointer packed into a tuple,
 //! struct, or array stays on the caller's place
 //! (`local_hides_spill_alias`), so that call stays unlowered. An
-//! address-sized integer whose place this walk cannot name stays
-//! unlowered (`spill_address_source`): `pair.0`, a parameter, and a
-//! call result. An integer literal still lowers. `[q; N]` keeps `q`'s
+//! address-sized integer that is a call result, arithmetic, or
+//! `pair.0` stays unlowered (`spill_address_source`). A parameter that
+//! is a plain integer stays the caller's value (`hash_known`). An
+//! integer literal still lowers. `[q; N]` keeps `q`'s
 //! referent on each element (`repeat_slots`). A union folds that
 //! referent onto the local (`rvalue_referent`); its fields overlap, so
 //! they are not split (`aggregate_slots`). A store through an index
@@ -589,6 +591,8 @@ enum Pass {
     Direct { ret_local: u64 },
     /// Copy the word, then pass `&mut` of the original, then return the copy.
     CopyThenMutBorrow,
+    /// rustc `&mut word` coerced to `*mut T`: `_r = &mut word; _p = &raw mut (*_r)`.
+    MutBorrowThenRawPtr,
 }
 
 fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass) -> FunctionGraph {
@@ -662,6 +666,30 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
                 vec![json!({"Copy": place(1, &flag)}), json!({"Move": borrow})],
                 place(5, &ret),
                 3,
+            )
+        }
+        Pass::MutBorrowThenRawPtr => {
+            let borrowed = borrow_ty(word_ty, "Mut");
+            let raw = raw_ptr(word_ty, "Mut");
+            locals.push(local(3, None, &borrowed));
+            locals.push(local(4, None, &raw));
+            locals.push(local(5, None, &ret));
+            let word = place(2, word_ty);
+            let borrow = place(3, &borrowed);
+            let raw_place = place(4, &raw);
+            let deref = json!({"kind": {"Projection": [borrow.clone(), "Deref"]}, "ty": word_ty});
+            (
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow, {"Ref": {
+                        "place": word, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [raw_place.clone(), {"RawPtr": {
+                        "place": deref, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Copy": place(1, &flag)}), json!({"Move": raw_place})],
+                place(5, &ret),
+                2,
             )
         }
     };
@@ -927,6 +955,141 @@ fn mut_borrow_of_i64_passed_to_raw_pointer_reloads_the_word() {
         },
     );
     assert_address_spill(&graph, true, true);
+}
+
+/// rustc `&mut keyhash` into `hash_out: *mut i64` is `_r = &mut keyhash;
+/// _p = &raw mut (*_r)`. The call operand is already a raw pointer whose
+/// value is the aliased word; that pointer still has to be spilled.
+#[test]
+fn rustc_mut_borrow_coerced_to_raw_pointer_spills_the_word() {
+    let word = i64_ty();
+    let graph = lower_probe(
+        "keyhash",
+        &word,
+        &raw_ptr(&word, "Mut"),
+        Pass::MutBorrowThenRawPtr,
+    );
+    assert_address_spill(&graph, true, true);
+}
+
+/// `w_dict_object_setitem_callback_free(obj, key, keyhash, hash_known,
+/// value, &mut keyhash)` after rustc's `&mut` → `*mut i64` coercion.
+/// `obj` / `value` are raw ADT pointers, `keyhash` is the spilled word,
+/// and `hash_known` is another address-sized integer. None of those is
+/// the spill address.
+#[test]
+fn coerced_raw_pointer_beside_object_and_hash_word_spills() {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let obj_ty = adt_ty(0, vec![]);
+    let obj_ptr = raw_ptr(&obj_ty, "Mut");
+    let borrowed = borrow_ty(&word, "Mut");
+    let hash_out_ty = raw_ptr(&word, "Mut");
+    let obj = place(1, &obj_ptr);
+    let hash = place(2, &word);
+    let hash_known = place(3, &word);
+    let value = place(4, &obj_ptr);
+    let keyhash = place(5, &word);
+    let borrow = place(6, &borrowed);
+    let raw = place(7, &hash_out_ty);
+    let dest = place(8, &ret);
+    let deref = json!({"kind": {"Projection": [borrow.clone(), "Deref"]}, "ty": word});
+    let caller = json!({
+        "def_id": 0,
+        "item_meta": meta(&["probe", "write_hash"]),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [obj_ptr.clone(), word.clone(), word.clone(), obj_ptr.clone()],
+            "output": ret.clone()
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 4, "locals": vec![
+                local(0, None, &ret),
+                local(1, Some("obj"), &obj_ptr),
+                local(2, Some("hash"), &word),
+                local(3, Some("hash_known"), &word),
+                local(4, Some("value"), &obj_ptr),
+                local(5, Some("keyhash"), &word),
+                local(6, None, &borrowed),
+                local(7, None, &hash_out_ty),
+                local(8, None, &ret),
+            ]},
+            "body": [
+                {"statements": [
+                    {"span": span, "kind": {"Assign": [
+                        keyhash.clone(),
+                        {"Use": [{"Copy": hash.clone()}, "Yes"]}
+                    ]}},
+                    {"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": keyhash.clone(), "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                    {"span": span, "kind": {"Assign": [raw.clone(), {"RawPtr": {
+                        "place": deref, "kind": "Mut", "ptr_metadata": null
+                    }}]}},
+                ], "terminator": {"span": span, "kind": {"Call": {
+                    "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                        "args": [
+                            {"Copy": obj},
+                            {"Copy": keyhash},
+                            {"Copy": hash_known},
+                            {"Copy": value},
+                            {"Move": raw}
+                        ],
+                        "dest": dest.clone()},
+                    "target": 1, "on_unwind": 2
+                }}}},
+                {"statements": [{"span": span, "kind": {"Assign": [
+                    place(0, &ret),
+                    {"Use": [{"Copy": dest}, "Yes"]}
+                ]}}], "terminator": {"span": span, "kind": "Return"}},
+                {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+            ]
+        }}
+    });
+    let params = vec![
+        obj_ptr.clone(),
+        word.clone(),
+        word.clone(),
+        obj_ptr,
+        hash_out_ty,
+    ];
+    let sink = json!({
+        "def_id": 1,
+        "item_meta": meta(&["probe", "sink_pair"]),
+        "signature": {"is_unsafe": false, "inputs": params.clone(), "output": ret.clone()},
+        "body": idle_body(&ret, &params)
+    });
+    let decls = json!([{
+        "def_id": 0,
+        "item_meta": meta(&["probe", "Obj"]),
+        "kind": {"Struct": [field_decl("pad", &word)]},
+        "src": "Normal"
+    }]);
+    let graph = probe_graph(decls, json!([caller, sink]), "write_hash");
+    let call = sink_call(&graph);
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spill address\n{}", op_lines(&graph));
+    assert_eq!(call_arg(call, 4), &ptrs[0], "hash_out is the spill");
+    assert_ne!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "keyhash stays the word\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(
+        call_arg(call, 2),
+        &ptrs[0],
+        "hash_known stays the word\n{}",
+        op_lines(&graph)
+    );
+    assert_ne!(
+        call_arg(call, 0),
+        &ptrs[0],
+        "obj stays the object pointer\n{}",
+        op_lines(&graph)
+    );
 }
 
 #[test]
@@ -1769,18 +1932,30 @@ fn raw_pointer_to_the_spilled_place_uses_that_address() {
 }
 
 #[test]
-fn raw_pointer_to_another_place_stays_put() {
-    let graph = lower_raw_alias(RawAlias::OtherPlace).unwrap_or_else(|err| {
-        panic!("a raw pointer of another place must still free the spill: {err}")
-    });
+fn raw_pointer_to_another_place_gets_its_own_address() {
+    let graph = lower_raw_alias(RawAlias::OtherPlace)
+        .unwrap_or_else(|err| panic!("a raw pointer of another primitive place must spill: {err}"));
     let ptrs = malloc_ptrs(&graph);
-    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    assert_eq!(
+        ptrs.len(),
+        2,
+        "each primitive place gets an address\n{}",
+        op_lines(&graph)
+    );
     let call = sink_call(&graph);
     assert_eq!(call_arg(call, 0), &ptrs[0]);
-    assert_ne!(call_arg(call, 1), &ptrs[0]);
-    assert!(
-        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
-        "the spill is freed after the call\n{}",
+    assert_eq!(call_arg(call, 1), &ptrs[1]);
+    assert_ne!(
+        call_arg(call, 0),
+        call_arg(call, 1),
+        "the two places do not share an address\n{}",
+        op_lines(&graph)
+    );
+    let frees = raw_ops(&graph, |kind| matches!(kind, OpKind::RawFree { .. }));
+    assert_eq!(
+        frees.len(),
+        2,
+        "each spill is freed after the call\n{}",
         op_lines(&graph)
     );
 }
@@ -2443,7 +2618,8 @@ enum TracedInt {
     FieldOther,
     /// `pair.0` is the literal `0usize`.
     FieldConst,
-    /// The second parameter is an incoming `usize`.
+    /// The second parameter is an incoming `usize`. It cannot name this
+    /// function's by-value local, so it stays the caller's value.
     Param,
     /// `q = usize_source(); f(&mut word, q)`.
     CallResult,
@@ -2936,8 +3112,8 @@ fn field_usize_constant_still_frees() {
 }
 
 #[test]
-fn usize_parameter_beside_the_spill_is_not_lowered() {
-    assert_traced_escapes(TracedInt::Param);
+fn usize_parameter_beside_the_spill_still_frees() {
+    assert_traced_frees(TracedInt::Param);
 }
 
 #[test]

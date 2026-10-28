@@ -2087,6 +2087,17 @@ impl HostEnv {
         lltype.module_set("free", HostObject::new_builtin_callable("lltype.free"));
         lltype.module_set("malloc", HostObject::new_builtin_callable("lltype.malloc"));
 
+        // `rpython.rtyper.annlowlevel.cast_instance_to_base_ptr` —
+        // `annlowlevel.py`. The body is `@specialize.argtype(0)` and
+        // calls `cast_object_to_ptr(OBJECTPTR, instance)`; pyre has
+        // no graph for that helper, so HOST_ENV plus the analyser /
+        // typer stand in for `CastObjectToPtrEntry`.
+        let annlowlevel = HostObject::new_module("rpython.rtyper.annlowlevel");
+        annlowlevel.module_set(
+            "cast_instance_to_base_ptr",
+            HostObject::new_builtin_callable("annlowlevel.cast_instance_to_base_ptr"),
+        );
+
         // `rpython.rtyper.lltypesystem.llmemory` — address-arithmetic
         // and weakref typing callables routed through
         // `@typer_for(llmemory.<name>)` decorators upstream.
@@ -2227,6 +2238,14 @@ impl HostEnv {
         std_slice.module_set(
             "from_raw_parts_mut",
             HostObject::new_builtin_callable("std.slice.from_raw_parts_mut"),
+        );
+        // `<[T]>::to_vec` is `alloc::slice::<Impl>::to_vec`. One-word-item
+        // copies stay a residual (`mir.rs` `is_slice_to_vec`); the registry
+        // surface lets source lift of `_temporarily_as_objects` proceed.
+        let alloc_slice_impl = HostObject::new_module("alloc.slice.<Impl>");
+        alloc_slice_impl.module_set(
+            "to_vec",
+            HostObject::new_builtin_callable("alloc.slice.<Impl>.to_vec"),
         );
 
         // `BigInt::from(v)` callsites in `pyre-object` (longobject /
@@ -2369,6 +2388,11 @@ impl HostEnv {
         // how pyre spells that — `populate_call_registry_from_call_graphs`
         // skips the lifted body so Layer-3b resolution reaches this entry,
         // whose analyzer answers `not_const(s_arg)`.
+        let majit_gc = HostObject::new_module("majit_gc");
+        majit_gc.module_set(
+            "add_memory_pressure",
+            HostObject::new_builtin_callable("majit_gc.add_memory_pressure"),
+        );
         let majit_rlib_nonconst = HostObject::new_module("majit_rlib.nonconst");
         majit_rlib_nonconst.module_set(
             "non_constant",
@@ -2537,6 +2561,8 @@ impl HostEnv {
             "with_capacity",
             HostObject::new_builtin_callable("vec.Vec.with_capacity"),
         );
+        vec_crate.module_set("deref", HostObject::new_builtin_callable("vec.Vec.deref"));
+        vec_ty.module_set("deref", HostObject::new_builtin_callable("Vec.deref"));
         let bigint_crate = HostObject::new_module("bigint.BigInt");
         bigint_crate.module_set(
             "from",
@@ -2704,6 +2730,7 @@ impl HostEnv {
         mods.insert("rpython.rlib.objectmodel".into(), objectmodel);
         mods.insert("collections".into(), collections);
         mods.insert("rpython.rtyper.lltypesystem.lltype".into(), lltype);
+        mods.insert("rpython.rtyper.annlowlevel".into(), annlowlevel);
         mods.insert("rpython.rtyper.lltypesystem.llmemory".into(), llmemory);
         mods.insert("rpython.rtyper.lltypesystem.rffi".into(), rffi);
         mods.insert("rpython.rtyper.lltypesystem.ll2ctypes".into(), ll2ctypes);
@@ -2722,11 +2749,13 @@ impl HostEnv {
         mods.insert("std.alloc".into(), std_alloc);
         mods.insert("alloc.alloc".into(), alloc_alloc);
         mods.insert("std.slice".into(), std_slice);
+        mods.insert("alloc.slice.<Impl>".into(), alloc_slice_impl);
         mods.insert("BigInt".into(), bigint);
         mods.insert("longlong2float".into(), longlong2float);
         mods.insert("majit_metainterp".into(), majit_metainterp);
         mods.insert("majit_metainterp.jit".into(), majit_metainterp_jit);
         mods.insert("majit_rlib.jit".into(), majit_rlib_jit);
+        mods.insert("majit_gc".into(), majit_gc);
         mods.insert("majit_rlib.nonconst".into(), majit_rlib_nonconst);
         mods.insert("nonconst".into(), nonconst);
         mods.insert("u32".into(), primitive_u32);

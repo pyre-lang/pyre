@@ -4315,6 +4315,17 @@ impl Repr for InstanceRepr {
                 self.lowleveltype.clone(),
             ));
         }
+        // `PY_NULL` is a GCREF Null folded as `ConstValue::LLPtr` whose
+        // `_obj is None`. RPython's `value is None` is the same conversion.
+        if let ConstValue::LLPtr(ptr) = value {
+            if !ptr.nonzero() {
+                let null = self.null_instance()?;
+                return Ok(Constant::with_concretetype(
+                    ConstValue::LLPtr(Box::new(null)),
+                    self.lowleveltype.clone(),
+                ));
+            }
+        }
 
         // upstream: `isinstance(value, types.MethodType)` —
         //   bound method redirect to its `im_self`.
@@ -6556,6 +6567,30 @@ mod tests {
             err.to_string().contains("expected HostObject or None"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn instance_repr_convert_const_null_llptr_returns_null_instance() {
+        // `PY_NULL` is a GCREF Null folded as `ConstValue::LLPtr` with
+        // `_obj is None`. RPython's `value is None` arm is the same
+        // `null_instance` conversion.
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("pkg.NullLlptr", None);
+        let inst = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        let null = inst.null_instance().expect("null_instance");
+        assert!(!null.nonzero());
+        let c = (inst.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::LLPtr(Box::new(null)))
+            .expect("convert_const(null LLPtr)");
+        assert_eq!(c.concretetype.as_ref(), Some(inst.lowleveltype()));
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!(
+                "convert_const(null LLPtr) must produce LLPtr, got {:?}",
+                c.value
+            );
+        };
+        assert!(!ptr.nonzero(), "null LLPtr must convert to null_instance");
     }
 
     #[test]

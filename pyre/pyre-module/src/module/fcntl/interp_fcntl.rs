@@ -341,7 +341,9 @@ fn fcntl(
         // falling back to `space.int_w`; a TypeError from the buffer
         // arm is the signal to take the integer one.
         if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
-            let data = match arg_readbuf(w_arg, "fcntl") {
+            let data = match pyre_object::with_roots!(w_cmd, w_arg => {
+                arg_readbuf(w_arg, "fcntl")
+            }) {
                 Ok(data) => data,
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
                     let arg = pyre_object::with_roots!(w_cmd, w_arg => {
@@ -467,23 +469,25 @@ fn ioctl(
             // exporter that is neither `bytes` nor `str` — those two
             // always take the read-only form however it is set.
             let mutate = if args.len() >= 4 {
-                pyre_object::with_roots!(arg =>
+                pyre_object::with_roots!(arg, w_arg, w_mutate, w_request => {
                     pyre_interpreter::baseobjspace::is_true(w_mutate)
-                )?
+                })?
             } else {
                 true
             };
             let immutable =
                 unsafe { pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg) };
             if mutate && !immutable {
-                let written = pyre_object::with_roots!(arg => unsafe {
+                let written = pyre_object::with_roots!(arg, w_arg, w_mutate, w_request => unsafe {
                     pyre_interpreter::builtins::fileio_writebuf(arg)
                 });
                 if let Ok((slice, _owner, _made_view)) = written {
                     return ioctl_mutable(fd, request, slice);
                 }
             }
-            match arg_readbuf(arg, "ioctl") {
+            match pyre_object::with_roots!(w_request, w_mutate, w_arg => {
+                arg_readbuf(w_arg, "ioctl")
+            }) {
                 Ok(buf) => return ioctl_readonly(fd, request, buf),
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {}
                 Err(e) => return Err(e),

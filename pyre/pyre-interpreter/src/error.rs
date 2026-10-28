@@ -3616,7 +3616,11 @@ impl PyError {
     pub fn message_text(&self) -> String {
         let mut this = PyError(self.0);
         this.ensure_deferred_computed();
-        if this.has_display_message() || this.exc_object.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = this.pin(&_roots);
+        let has_msg = this.has_display_message();
+        this.reload(&_roots, handle_slot);
+        if has_msg || this.exc_object.is_null() {
             // Display-side only: `message` is WTF-8 and may hold a lone
             // surrogate, so spend the escape the stream would spend rather
             // than folding it to U+FFFD.  A caller that needs the value
@@ -3640,7 +3644,11 @@ impl PyError {
     pub fn message_wtf8(&self) -> Wtf8Buf {
         let mut this = PyError(self.0);
         this.ensure_deferred_computed();
-        if this.has_display_message() || this.exc_object.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = this.pin(&_roots);
+        let has_msg = this.has_display_message();
+        this.reload(&_roots, handle_slot);
+        if has_msg || this.exc_object.is_null() {
             return this.display_message_buf();
         }
         unsafe { crate::display::py_str_wtf8(this.exc_object) }

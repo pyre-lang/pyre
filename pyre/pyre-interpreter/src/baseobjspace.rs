@@ -8871,6 +8871,8 @@ unsafe fn module_getattr_fallback(
 /// hook, so the caller emits the terminal miss — `Ok(null)` when `suppress`,
 /// otherwise AttributeError. Used before constructing that error so
 /// `_PyObject_LookupAttr` does not build one to throw away.
+/// Residual: `get` / `property_no_accessor` / `py_repr_wtf8` are unlowered.
+#[majit_macros::dont_look_inside]
 unsafe fn try_instance_getattr_hook(
     w_type: PyObjectRef,
     obj: PyObjectRef,
@@ -16702,11 +16704,106 @@ pub fn call(
 
 /// PyPy `descroperation.py call_args` — dispatch one structured
 /// `Arguments` instance without flattening its keyword half.
+///
+/// `Function.call_args` → `PyCode.funcrun` → `Arguments.parse_into_scope`.
+/// `_Method.call_args` prepends the instance and recurses. Everything else
+/// forwards the original `keyword_names_w` objects through
+/// `call_with_kwargs_in_ctx_impl` (builtins, types, `__call__`).
 pub fn call_args(
     callable: PyObjectRef,
     args: &crate::argument::Arguments,
 ) -> Result<PyObjectRef, PyError> {
-    crate::call::call_args(callable, args)
+    if crate::call::is_user_pycode_function(callable) {
+        return crate::call::funcrun(callable, args);
+    }
+    if unsafe { pyre_object::is_method(callable) } {
+        let func = unsafe { pyre_object::w_method_get_func(callable) };
+        let receiver = unsafe { pyre_object::w_method_get_self(callable) };
+        if crate::call::is_user_pycode_function(func) {
+            return crate::call::funcrun_obj(func, receiver, args);
+        }
+        // `prepend` → `replace_arguments` → `freeze_gc_arrays` allocates.
+        // `func` is read after that malloc; pin it (`argument.py prepend`
+        // builds a new `Arguments`, then `_Method.call_args` recurses).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let func_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(func);
+        let receiver = pyre_object::gc_roots::pin_root(receiver);
+        let prepended = args.prepend(receiver);
+        return call_args(
+            pyre_object::gc_roots::shadow_stack_get(func_slot),
+            &prepended,
+        );
+    }
+    let nkw = crate::argument::arguments_keyword_count(args);
+    if nkw != 0 {
+        return call_args_keyword_pairs(callable, args);
+    }
+    call_args_generic(callable, args)
+}
+
+/// Residual: `call_callable_in_ctx` walks `make_user_call_frame` →
+/// `finish_for_call_with_globals_obj`, where `alloc_frame_locals_array`'s
+/// residual `*mut FixedObjectArray` annotates as List and
+/// `__cast_instance_intrinsic` to `PyObject` fails. User-function CALL_KW
+/// already took `funcrun` above; this arm is the non-Function dispatcher.
+#[majit_macros::dont_look_inside]
+fn call_args_generic(
+    callable: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    crate::call::call_callable_in_ctx(
+        crate::call::getexecutioncontext(),
+        callable,
+        &args.arguments_w,
+    )
+}
+
+/// Residual: `descroperation.py call_args` looks up `__call__` and
+/// `get_and_call_args`s the original `Arguments`. Forward
+/// `keyword_names_w` / `keywords_w` without reminting
+/// (`call_with_kwargs_in_ctx_impl`). The helper is residual so
+/// `call_args` stays loop-free (`look_inside_graph` residualizes a loopy
+/// graph; `call_args` is not `unroll_safe`).
+#[majit_macros::dont_look_inside]
+fn call_args_keyword_pairs(
+    callable: PyObjectRef,
+    args: &crate::argument::Arguments,
+) -> Result<PyObjectRef, PyError> {
+    let keyword_names_w: &[PyObjectRef] = args.keyword_names_w.as_deref().unwrap_or(&[]);
+    let keywords_w: &[PyObjectRef] = args.keywords_w.as_deref().unwrap_or(&[]);
+    let pos = args.arguments_w.as_slice();
+    debug_assert_eq!(keyword_names_w.len(), keywords_w.len());
+    for &name in keyword_names_w {
+        if unsafe { !is_str(name) } {
+            return Err(PyError::type_error("keywords must be strings"));
+        }
+    }
+    // `Arguments.keyword_names_w` stays the mapping's own key objects
+    // (`_collect_keyword_args` setitems that name). Pin the callable, the
+    // positionals, the values and the names (`pin_roots` publishes the run
+    // then normalizes) and reload each word from its slot.
+    let npos = pos.len();
+    let nkw = keyword_names_w.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let callable_slot = roots.pin_roots(&[callable]);
+    let pos_base = roots.pin_roots(pos);
+    let values_base = roots.pin_roots(keywords_w);
+    let names_base = roots.pin_roots(keyword_names_w);
+    let callable = roots.get(callable_slot);
+    let pos_now: Vec<PyObjectRef> = (0..npos).map(|i| roots.get(pos_base + i)).collect();
+    let values_now: Vec<PyObjectRef> = (0..nkw).map(|i| roots.get(values_base + i)).collect();
+    let names_now: Vec<PyObjectRef> = (0..nkw).map(|i| roots.get(names_base + i)).collect();
+    crate::call::call_with_kwargs_in_ctx_impl(
+        crate::call::getexecutioncontext(),
+        callable,
+        &pos_now,
+        &names_now,
+        &values_now,
+        true,
+        std::ptr::null_mut(),
+        args.methodcall,
+    )
 }
 
 /// PyPy: baseobjspace.py `call_obj_args` — add a leading object before args.
@@ -16774,6 +16871,7 @@ pub fn call_valuestack(
 /// Returns the shadow-stack base and the offset table written back after the
 /// hook. No heap allocation: publishing after a `Vec` would collect before
 /// the children were visible.
+#[majit_macros::dont_look_inside]
 fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static [usize])> {
     if exc.is_null() || unsafe { !pyre_object::interp_exceptions::is_exception(exc) } {
         return None;
@@ -16788,7 +16886,8 @@ fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static
         pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.len() <= 35
     );
     debug_assert!(offsets.len() <= buf.len());
-    for (index, &offset) in offsets.iter().enumerate() {
+    for index in 0..offsets.len() {
+        let offset = offsets[index];
         buf[index] = unsafe { *((exc as usize + offset) as *const PyObjectRef) };
     }
     let base = pyre_object::gc_roots::publish_roots(&buf[..offsets.len()]);
@@ -16796,11 +16895,13 @@ fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static
     Some((base, offsets))
 }
 
+#[majit_macros::dont_look_inside]
 fn write_unmanaged_exception_children(exc: PyObjectRef, base: usize, offsets: &[usize]) {
     if exc.is_null() {
         return;
     }
-    for (index, &offset) in offsets.iter().enumerate() {
+    for index in 0..offsets.len() {
+        let offset = offsets[index];
         let live = pyre_object::gc_roots::shadow_stack_get(base + index);
         unsafe { *((exc as usize + offset) as *mut PyObjectRef) = live };
     }
@@ -16849,6 +16950,31 @@ pub fn call_args_and_c_profile(
     call_args_and_c_profile_args(frame, callable, &mut arguments, &rooted_args)
 }
 
+/// Copy `arguments_w` / `keyword_names_w` / `keywords_w` back from the
+/// shadow-stack pins taken before a collecting profile hook, then rebuild
+/// the `make_sure_not_resized` twins. `argument.py Arguments.__init__` keeps
+/// all three lists in GC storage; `keyword_names_w is None` stays None.
+#[majit_macros::dont_look_inside]
+fn refresh_arguments_from_roots(
+    arguments: &mut crate::argument::Arguments,
+    positional_base: usize,
+    keyword_names_base: Option<usize>,
+    keyword_base: Option<usize>,
+) {
+    pyre_object::gc_roots::shadow_stack_copy_range(positional_base, &mut arguments.arguments_w);
+    if let Some(base) = keyword_names_base {
+        if let Some(ref mut keyword_names_w) = arguments.keyword_names_w {
+            pyre_object::gc_roots::shadow_stack_copy_range(base, keyword_names_w);
+        }
+    }
+    if let Some(base) = keyword_base {
+        if let Some(ref mut keywords_w) = arguments.keywords_w {
+            pyre_object::gc_roots::shadow_stack_copy_range(base, keywords_w);
+        }
+    }
+    arguments.freeze_gc_arrays();
+}
+
 /// `baseobjspace.py call_args_and_c_profile` with a
 /// pre-built `Arguments` instance.
 ///
@@ -16864,59 +16990,79 @@ pub fn call_args_and_c_profile(
 /// `flat_args` is the legacy flat slice (positional + trailing kwargs
 /// dict) that `call_function` still expects until the call surface
 /// itself learns about Arguments.
+///
+/// Residual: `c_call_trace` / `c_return_trace` / `c_exception_trace`
+/// return `Result<(), PyError>`, and matching that Err projects
+/// `__pos_0` on the unspecialized `Result::Err` ClassDef. The profile
+/// protocol is off the user-function CALL_KW hot path (`funcrun`).
+#[majit_macros::dont_look_inside]
 pub fn call_args_and_c_profile_args(
     frame: &mut crate::pyframe::PyFrame,
     callable: PyObjectRef,
     arguments: &mut crate::argument::Arguments,
-    flat_args: &[PyObjectRef],
+    _flat_args: &[PyObjectRef],
 ) -> PyObjectRef {
     // Reaching here means a profile function is installed, so the tracer hooks
-    // below run Python — and the callee runs in between.  `callable`, the flat
-    // slice and the `Arguments` vectors are native storage no root walker
-    // updates.  Root them all, dispatch from the roots, and refresh the
-    // `Arguments` vectors before the return hook reads them again.
+    // below run Python — and the callee runs in between.  `callable` and the
+    // `Arguments` vectors are native storage no root walker updates.  Root
+    // them, dispatch from the roots, and refresh the `Arguments` vectors
+    // before the return hook reads them again.
     let roots = pyre_object::gc_roots::push_roots();
     let callable_slot = pyre_object::gc_roots::publish_roots(&[callable]);
-    let flat_base = pyre_object::gc_roots::publish_roots(flat_args);
     let positional_base = pyre_object::gc_roots::publish_roots(&arguments.arguments_w);
-    let keyword_base = arguments
-        .keywords_w
-        .as_ref()
-        .map(|values| pyre_object::gc_roots::publish_roots(values));
-    let keyword_len = arguments.keywords_w.as_ref().map(|v| v.len()).unwrap_or(0);
-    pyre_object::gc_roots::normalize_roots(
-        callable_slot,
-        1 + flat_args.len() + arguments.arguments_w.len() + keyword_len,
-    );
-    let callable = || pyre_object::gc_roots::shadow_stack_get(callable_slot);
-    let refresh = |arguments: &mut crate::argument::Arguments| {
-        for (index, slot) in arguments.arguments_w.iter_mut().enumerate() {
-            *slot = pyre_object::gc_roots::shadow_stack_get(positional_base + index);
-        }
-        if let (Some(base), Some(values)) = (keyword_base, arguments.keywords_w.as_mut()) {
-            for (index, slot) in values.iter_mut().enumerate() {
-                *slot = pyre_object::gc_roots::shadow_stack_get(base + index);
-            }
-        }
+    let names: &[PyObjectRef] = arguments.keyword_names_w.as_deref().unwrap_or(&[]);
+    let keywords: &[PyObjectRef] = arguments.keywords_w.as_deref().unwrap_or(&[]);
+    let npos = arguments.arguments_w.len();
+    let nnames = names.len();
+    let nkw = keywords.len();
+    // `argument.py Arguments.__init__` stores `keyword_names_w` as None or a
+    // list. Pin the list only when it holds objects so a collecting
+    // `c_call_trace` cannot leave stale name words in the native Vec.
+    let (keyword_names_base, names_len) = if arguments.keyword_names_w.is_some() && nnames != 0 {
+        (Some(pyre_object::gc_roots::publish_roots(names)), nnames)
+    } else {
+        (None, 0)
     };
+    let (keyword_base, keyword_len) = if nkw == 0 {
+        (None, 0)
+    } else {
+        (Some(pyre_object::gc_roots::publish_roots(keywords)), nkw)
+    };
+    pyre_object::gc_roots::normalize_roots(callable_slot, 1 + npos + names_len + keyword_len);
 
+    // Read the first positional from its pin. `normalize_roots` may
+    // collect, so `arguments.arguments_w[0]` is stale; indexing the
+    // Vec also shares the `is_empty`/`len` graph with List (`RustVec ∪ List`).
+    let w_firstarg = if npos == 0 {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(positional_base)
+    };
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    if !ec.is_null()
-        && let Err(err) = unsafe {
+    if !ec.is_null() {
+        let traced = unsafe {
             (*ec).c_call_trace(
                 frame as *mut crate::pyframe::PyFrame,
-                callable(),
-                Some(arguments),
+                pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                w_firstarg,
             )
+        };
+        if let Err(err) = traced {
+            crate::call::set_call_error(err);
+            return pyre_object::PY_NULL;
         }
-    {
-        crate::call::set_call_error(err);
-        return pyre_object::PY_NULL;
     }
-    let flat_args: Vec<PyObjectRef> = (0..flat_args.len())
-        .map(|index| pyre_object::gc_roots::shadow_stack_get(flat_base + index))
-        .collect();
-    let w_res = call_function(callable(), &flat_args);
+    refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base);
+    let w_res = match call_args(
+        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+        arguments,
+    ) {
+        Ok(result) => result,
+        Err(error) => {
+            crate::call::set_call_error(error);
+            pyre_object::PY_NULL
+        }
+    };
     if w_res == pyre_object::PY_NULL {
         if !ec.is_null() {
             // baseobjspace.py:1274-1276 — `except OperationError:
@@ -16939,7 +17085,10 @@ pub fn call_args_and_c_profile_args(
                 let parked_base = err.pin(&roots);
                 let exc_children = pin_unmanaged_exception_children(err.exc_object);
                 let traced = unsafe {
-                    (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
+                    (*ec).c_exception_trace(
+                        frame as *mut crate::pyframe::PyFrame,
+                        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                    )
                 };
                 err.reload(&roots, parked_base);
                 if let Some((child_base, offsets)) = exc_children {
@@ -16949,7 +17098,10 @@ pub fn call_args_and_c_profile_args(
                 traced
             } else {
                 unsafe {
-                    (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
+                    (*ec).c_exception_trace(
+                        frame as *mut crate::pyframe::PyFrame,
+                        pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                    )
                 }
             };
             if let Err(trace_err) = traced {
@@ -16958,22 +17110,30 @@ pub fn call_args_and_c_profile_args(
         }
         return pyre_object::PY_NULL;
     }
-    refresh(arguments);
-    // The return hook runs Python too, so the callee's result is published
-    // before it and read back afterwards.
+    // `refresh_arguments_from_roots` freezes new GcArray twins and can
+    // collect. Pin the callee result first; `c_return_trace` also runs
+    // Python, so the same slot is what the return hook reads back.
     let result_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_res);
-    if !ec.is_null()
-        && let Err(err) = unsafe {
+    refresh_arguments_from_roots(arguments, positional_base, keyword_names_base, keyword_base);
+    // Same pin as the c_call_trace firstarg: `c_return_trace` runs Python.
+    let w_firstarg = if npos == 0 {
+        pyre_object::PY_NULL
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(positional_base)
+    };
+    if !ec.is_null() {
+        let traced = unsafe {
             (*ec).c_return_trace(
                 frame as *mut crate::pyframe::PyFrame,
-                callable(),
-                Some(arguments),
+                pyre_object::gc_roots::shadow_stack_get(callable_slot),
+                w_firstarg,
             )
+        };
+        if let Err(err) = traced {
+            crate::call::set_call_error(err);
+            return pyre_object::PY_NULL;
         }
-    {
-        crate::call::set_call_error(err);
-        return pyre_object::PY_NULL;
     }
     pyre_object::gc_roots::shadow_stack_get(result_slot)
 }

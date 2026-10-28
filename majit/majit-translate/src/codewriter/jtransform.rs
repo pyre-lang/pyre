@@ -2739,6 +2739,36 @@ fn retarget_field_bases(
     }
 }
 
+/// Address of a one-word-item `Vec` field (`RustVecRepr`).
+///
+/// `field_ty_is_inline_vec` stays false so the header stays Int, not Ref.
+/// The live field is the 24-byte `{ptr, cap, len}` header; a GETFIELD of
+/// the 8-byte FLAG_UNSIGNED descr loads the first word (or the GC-header
+/// capacity). `_match_signature` / `gcarray_from_pyobject_vec` take the
+/// header address (`rewrite_op_getsubstruct`). A three-word `inline_vec`
+/// borrow keeps [`wide_inline_borrow_offset`] and its GC abort.
+fn rust_vec_header_substruct_offset(
+    field: &FieldDescriptor,
+    cc: Option<&crate::call::CallControl>,
+) -> Option<usize> {
+    if !field.taken_by_address || field.vec_part.is_some() || field.inline_vec {
+        return None;
+    }
+    let cc = cc?;
+    let owner = field.owner_root.as_deref()?;
+    let word = crate::layout::target_word_size();
+    if let Some(layout) = cc.struct_layout_for(owner)
+        && let Some(row) = layout.fields.iter().find(|row| row.name == field.name)
+    {
+        return (row.flag == majit_ir::descr::ArrayFlag::Unsigned && row.size == word)
+            .then_some(row.offset);
+    }
+    let descr = cc.fielddescrof(0, owner, field.owner_id, &field.name)?;
+    let fd = descr.as_field_descr()?;
+    (fd.field_flag() == majit_ir::descr::ArrayFlag::Unsigned && fd.field_size() == word)
+        .then_some(fd.offset())
+}
+
 /// `Rvalue::Ref` / `RawPtr` borrow of [`inline_aggregate_offset`].
 fn wide_inline_borrow_offset(
     field: &FieldDescriptor,
@@ -7540,6 +7570,28 @@ impl<'a> Transformer<'a> {
                 },
             }]);
         }
+        // One-word-item `Vec` header (`RustVecRepr`): the field address
+        // is `rewrite_op_getsubstruct` on a raw owner; a GC owner is
+        // refused as upstream does. `inline_vec` stays false so this
+        // does not open the GC+inline_vec abort below.
+        if let Some(offset) = rust_vec_header_substruct_offset(field, self.callcontrol.as_deref()) {
+            if crate::codewriter::type_state::field_owner_is_gc(field, self.callcontrol.as_deref())
+            {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]);
+            }
+            let OpKind::FieldRead { base, .. } = &op.kind else {
+                unreachable!("rewrite_op_getfield called on non-FieldRead op")
+            };
+            return self.rewrite_raw_substruct_address(op, base, offset, graph);
+        }
+
         // `jtransform.py rewrite_op_getsubstruct`: `int_add(ptr, ofs)`.
         // A raw address is an int. A later getfield/setfield/raw_load/
         // raw_store through it keeps that int base (`_gckind == 'raw'`).
@@ -9479,34 +9531,48 @@ impl<'a> Transformer<'a> {
         // the call to it (`codewriter::alloc_and_set`). The nonzero
         // fill is that helper's loop, traced under `look_inside_iff`
         // (`rlist.py _ll_alloc_and_set_nonnull`); `do_fixed_newlist`
-        // refuses a non-zero default. A zero fill is the jit arm's
-        // `new_array_clear`. Without an ARRAY identity the marker
-        // stays a residual call. `LIST` is folded, so the helper
-        // takes `(count, item)`.
+        // refuses a non-zero default. A constant-zero fill is
+        // `_ll_alloc_and_set_jit`'s `_ll_zero_or_null` arm:
+        // `new_array_clear` at the site (`do_fixed_newlist_clear`),
+        // so the family is not minted. Without an ARRAY identity the
+        // marker stays a residual call. `LIST` is folded, so the
+        // helper takes `(count, item)`.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__array_repeat"]
             && args.len() == 2
             && let Some(result) = op.result.as_ref()
             && let Some(identity) = fixed_repeat_identity(graph, result, result_ty)
-            && let Some(cc) = self.callcontrol.as_deref_mut()
         {
-            let path = crate::codewriter::alloc_and_set::ll_fixed_alloc_and_set_path(cc, &identity);
             FunctionGraph::set_concretetype_of_inline(
                 result,
                 crate::codewriter::type_state::ConcreteType::GcRef,
             );
-            let helper_call = SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::Call {
-                    target: CallTarget::FunctionPath {
-                        segments: path.segments.clone(),
-                        fun_decl_id: None,
+            if is_falsy_source_constant(graph, &args[0]) {
+                return RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::NewArrayClear {
+                        length: args[1].clone(),
+                        item_ty: identity.item_ty,
+                        array_type_id: Some(identity.array_type_id),
                     },
-                    args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
-                    result_ty: ValueType::Ref(None),
-                },
-            };
-            return self.rewrite_operation(&helper_call, graph_name, graph);
+                }]);
+            }
+            if let Some(cc) = self.callcontrol.as_deref_mut() {
+                let path =
+                    crate::codewriter::alloc_and_set::ll_fixed_alloc_and_set_path(cc, &identity);
+                let helper_call = SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: path.segments.clone(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![args[1].clone(), args[0].clone()]),
+                        result_ty: ValueType::Ref(None),
+                    },
+                };
+                return self.rewrite_operation(&helper_call, graph_name, graph);
+            }
         }
         // `rffi.get_raw_address_of_string` (`rffi.py`): `@jit.dont_look_inside`.
         // The skip-spine leftover is `__majit_get_raw_address_of_string(s)`;
@@ -17830,6 +17896,159 @@ mod tests {
                 OpKind::FieldRead { field, .. } if field.name == "tags"
             )),
             "a GC base does not load word 0 of the inline Vec"
+        );
+    }
+
+    /// A one-word-item `Vec` field (`FLAG_UNSIGNED`, word size) taken by
+    /// address is `rewrite_op_getsubstruct` on a raw owner: offset 0 is
+    /// `cast_ptr_to_int`. A GC owner is refused (`Abort` / `RawAddr`) as
+    /// `rewrite_op_getsubstruct` does. The GC+`inline_vec` abort stays
+    /// for the three-word borrow above.
+    #[test]
+    fn rust_vec_header_borrow_is_field_address_on_raw_owner_only() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::FieldDescriptor;
+
+        fn holder(owner: &str, gc: bool) -> CallControl {
+            let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+            let word = crate::layout::target_word_size();
+            let mut cc = CallControl::new();
+            cc.set_struct_layout(
+                owner_id,
+                StructLayout {
+                    size: 10 * word,
+                    align: word,
+                    gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                    fields: vec![
+                        StructFieldLayout {
+                            name: "arguments_w".into(),
+                            offset: 0,
+                            size: word,
+                            flag: majit_ir::descr::ArrayFlag::Unsigned,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                        StructFieldLayout {
+                            name: "keyword_names_w".into(),
+                            offset: 3 * word,
+                            size: word,
+                            flag: majit_ir::descr::ArrayFlag::Unsigned,
+                            field_type: majit_ir::value::Type::Int,
+                            rank: None,
+                        },
+                    ],
+                    host: None,
+                    ll_struct: std::cell::RefCell::new(None),
+                    ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+                },
+            );
+            let storage = if gc {
+                crate::StructStorageDescriptor::headerless(owner)
+            } else {
+                crate::StructStorageDescriptor::raw(owner)
+            };
+            cc.set_struct_storage(&[storage]);
+            cc
+        }
+
+        fn graph_for(owner: &str) -> FunctionGraph {
+            let mut graph = FunctionGraph::new("match_signature");
+            let args = graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::Input {
+                        name: "self".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph.push_inputarg_var(graph.startblock, args.clone());
+            graph
+                .push_op_var(
+                    graph.startblock,
+                    OpKind::FieldRead {
+                        base: args,
+                        field: FieldDescriptor::new("arguments_w", Some(owner.into()))
+                            .with_taken_by_address(true),
+                        ty: ValueType::Int,
+                        pure: false,
+                    },
+                    true,
+                )
+                .unwrap();
+            graph
+        }
+
+        let owner = "jtransform_vec_header::Arguments";
+        let gc_owner = "jtransform_vec_header_gc::Arguments";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let gc_id = majit_ir::descr::StructId::from_canonical(gc_owner);
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+                (gc_owner.to_string(), Some(gc_id)),
+            ]));
+        let config = GraphTransformConfig::default();
+
+        let mut cc = holder(owner, false);
+        let out = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph_for(owner));
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+            )),
+            "offset 0 Vec header is cast_ptr_to_int; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } if field.name == "arguments_w"
+            )),
+            "the Vec header is not loaded as its first word; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a raw one-word-item Vec header is not refused; ops={ops:?}"
+        );
+
+        let mut gc_cc = holder(gc_owner, true);
+        let gc_out = Transformer::new(&config)
+            .with_callcontrol(&mut gc_cc)
+            .transform(&graph_for(gc_owner));
+        let gc_ops: Vec<_> = gc_out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            gc_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Abort { kind: crate::model::UnknownKind::UnsupportedExpr { variant } }
+                    if *variant == crate::model::UnsupportedExprKind::RawAddr
+            )),
+            "a GC one-word-item Vec header is refused; ops={gc_ops:?}"
+        );
+        assert!(
+            gc_ops.iter().all(|op| !matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"
+            )),
+            "a GC owner is not rewritten to an address; ops={gc_ops:?}"
         );
     }
 
@@ -29681,9 +29900,10 @@ mod tests {
     /// `rtype_alloc_and_set`, so a recovered ARRAY identity redirects to
     /// `ll_fixed_alloc_and_set` (`rlist.py`). The nonzero fill is that
     /// helper's loop, traced under `look_inside_iff`; the call site does
-    /// not emit N `setarrayitem`s. A zero fill is the jit arm's
-    /// `new_array_clear`. A headerless reader, a nested item, or two
-    /// consumers that name different items stay the residual call.
+    /// not emit N `setarrayitem`s. A constant-zero fill is
+    /// `new_array_clear` at the site (`do_fixed_newlist_clear`). A
+    /// headerless reader, a nested item, or two consumers that name
+    /// different items stay the residual call.
     #[test]
     fn fixed_array_repeat_redirects_to_alloc_and_set() {
         fn is_repeat(kind: &OpKind) -> bool {
@@ -29928,8 +30148,9 @@ mod tests {
             );
         }
 
-        // Zero fill redirects to the same outer helper. The clear is the
-        // jit arm, not N stores and not a site-level `new_array_clear`.
+        // Constant-zero fill is `_ll_zero_or_null` → `new_array_clear`
+        // at the site (`do_fixed_newlist_clear`). The family is not
+        // minted; the site does not unroll N stores.
         {
             let graph = repeat_graph(
                 "repeat_zero",
@@ -29937,9 +30158,35 @@ mod tests {
                 OpKind::ConstInt(0),
                 Some(OpKind::ConstInt(4)),
             );
-            let (ops, _) = transform_with_cc(&graph);
+            let (ops, cc) = transform_with_cc(&graph);
+            assert!(
+                !ops.iter().any(|op| is_repeat(&op.kind)),
+                "zero repeat must rewrite, got {ops:?}"
+            );
+            assert_eq!(
+                ops.iter()
+                    .filter(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::NewArrayClear {
+                                array_type_id: Some(id),
+                                ..
+                            } if id == "[i64]"
+                        )
+                    })
+                    .count(),
+                1,
+                "zero fill is one new_array_clear, got {ops:?}"
+            );
+            assert!(
+                inline_name(&ops).is_none(),
+                "zero fill does not inline the family, got {ops:?}"
+            );
             let names = crate::codewriter::alloc_and_set::alloc_and_set_names("[i64]");
-            assert_redirect(&ops, &names.outer);
+            assert!(
+                !cc.has_function_graph(&crate::parse::CallPath::from_segments([&names.outer])),
+                "zero fill does not mint ll_fixed_alloc_and_set"
+            );
         }
 
         // Non-null object fill: the nonnull alloc clears, then one store.
@@ -30476,6 +30723,10 @@ mod tests {
                 crate::front::mir::fixed_array_index_identity(false, "&[i64; 4]");
             assert_eq!(param_id.as_deref(), Some("[i64]"));
             assert!(!param_nolength);
+            let (mut_id, mut_nolength) =
+                crate::front::mir::fixed_array_index_identity(false, "&mut [i64; 64]");
+            assert_eq!(mut_id.as_deref(), Some("[i64]"));
+            assert!(!mut_nolength);
             let (host_id, host_nolength) =
                 crate::front::mir::fixed_array_index_identity(false, "&[u8; 16]");
             assert_eq!(host_id.as_deref(), Some("[u8; 16]"));

@@ -241,6 +241,12 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
     }
 }
 
+/// `option::Option<??TypeVar>::None`: the payload type variable was not
+/// substituted, so the variant stayed a class instead of a null pointer.
+fn unresolved_option_none_name(name: &str) -> bool {
+    name.contains("Option<") && name.contains("??") && name.ends_with("::None")
+}
+
 /// True when two `ClassDef` name strings denote ONE struct reached by two
 /// frontend name spellings: a dot-joined crate-included constructor qualname
 /// (`pyre_object.celldict.VersionTag`, the flowspace_adapter
@@ -256,9 +262,8 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// Constructors and field reads now normalize at
 /// `Bookkeeper::intern_class_by_qualname`, including header-bearing structs;
 /// normalization keeps the crate-relative module path so their full base-chain
-/// walk still runs.  Keep this compare-time fallback for registry-absent or
-/// ambiguous constructor spellings: it fires only where `commonbase` is
-/// already None.
+/// walk still runs.  This compare uses that same intern key and fires only
+/// where `commonbase` is already None.
 ///
 /// It runs the intern's own key derivation — [`normalize_class_qualname`] then
 /// `canonical_struct_name` — rather than a second rule of its own.  A separate
@@ -275,12 +280,6 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// normalization above is a crate-root strip only; it does not collapse the
 /// module path, so the walk still runs.  Any future widening of it has to
 /// re-measure that number.
-/// `option::Option<??TypeVar>::None`: the payload type variable was not
-/// substituted, so the variant stayed a class instead of a null pointer.
-fn unresolved_option_none_name(name: &str) -> bool {
-    name.contains("Option<") && name.contains("??") && name.ends_with("::None")
-}
-
 fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
         majit_ir::descr::canonical_struct_name(

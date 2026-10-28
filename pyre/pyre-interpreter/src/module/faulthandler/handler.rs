@@ -775,38 +775,37 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             pyre_interpreter::make_builtin_function_with_signature(
                 "register",
                 |args| {
-                    let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if w_signum.is_null() {
+                    if args.first().copied().unwrap_or(pyre_object::PY_NULL).is_null() {
                         return Err(pyre_interpreter::PyError::type_error(
                             "register() missing signal",
                         ));
                     }
-                    // `handler.py register` `@unwrap_spec(signum=int)`.
-                    let signum =
-                        pyre_interpreter::baseobjspace::gateway_int_w(w_signum)? as libc::c_int;
-                    // `handler.py register` `@unwrap_spec(all_threads=int, chain=int)`
-                    // with defaults `all_threads=1, chain=0`: the arguments are
-                    // coerced as integers (`gateway_int_w`, raising on a non-int),
-                    // not by truthiness; `register` then tests `if all_threads:`.  An
-                    // omitted keyword leaves a null slot from the signature binding, so
-                    // treat null as the default.
-                    let all_threads = args
-                        .get(2)
-                        .copied()
-                        .filter(|a| !a.is_null())
-                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                        .transpose()?
-                        .unwrap_or(1)
-                        != 0;
-                    let chain = args
-                        .get(3)
-                        .copied()
-                        .filter(|a| !a.is_null())
-                        .map(pyre_interpreter::baseobjspace::gateway_int_w)
-                        .transpose()?
-                        .unwrap_or(0)
-                        != 0;
-                    let max_threads = int_arg(args, 4, 100)? as libc::c_int;
+                    // `handler.py register` `@unwrap_spec(signum=int, all_threads=int, chain=int)`.
+                    // `int_w` can run `__index__`, so the slice is pinned first.
+                    // Defaults `all_threads=1, chain=0, max_threads=100`: the
+                    // arguments are coerced as integers (`gateway_int_w`, raising
+                    // on a non-int), not by truthiness; `register` then tests
+                    // `if all_threads:`.  An omitted keyword leaves a null slot
+                    // from the signature binding, so treat null as the default.
+                    let nargs = args.len();
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let base = pyre_object::gc_roots::pin_roots(args);
+                    // `int_arg` over the pinned slice: an absent or null slot is the default.
+                    let pinned_int = |index: usize, default: i64| -> Result<i64, pyre_interpreter::PyError> {
+                        if index < nargs {
+                            let w_value = pyre_object::gc_roots::shadow_stack_get(base + index);
+                            if !w_value.is_null() {
+                                return pyre_interpreter::baseobjspace::gateway_int_w(w_value);
+                            }
+                        }
+                        Ok(default)
+                    };
+                    let signum = pyre_interpreter::baseobjspace::gateway_int_w(
+                        pyre_object::gc_roots::shadow_stack_get(base),
+                    )? as libc::c_int;
+                    let all_threads = pinned_int(2, 1)? != 0;
+                    let chain = pinned_int(3, 0)? != 0;
+                    let max_threads = pinned_int(4, 100)? as libc::c_int;
                     #[cfg(all(unix, feature = "host_env"))]
                     {
                         // Resolving the file runs a user `fileno()` and `flush()`.
@@ -816,9 +815,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         // must not run those side effects at all — so this sits
                         // after the coercions above and inside the support gate.
                         check_signum(signum)?;
-                        let (fd, w_file) = faulthandler_get_fileno_and_file(
-                            args.get(1).copied().unwrap_or(pyre_object::PY_NULL),
-                        )?;
+                        let w_file_arg = if nargs > 1 {
+                            pyre_object::gc_roots::shadow_stack_get(base + 1)
+                        } else {
+                            pyre_object::PY_NULL
+                        };
+                        let (fd, w_file) = faulthandler_get_fileno_and_file(w_file_arg)?;
                         // Nothing else names the resolved file between here and the
                         // owner store below, so keep it rooted across the install.
                         let _roots = pyre_object::gc_roots::push_roots();

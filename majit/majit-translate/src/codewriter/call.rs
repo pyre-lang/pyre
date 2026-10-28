@@ -8817,6 +8817,9 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
         // pointer-to-Raw-T result. `getkind` of that pointer is Signed,
         // so the call banks as int; the annotator shell is SomePtr.
         Some(s) if s.starts_with("raw:") && s.len() > 4 => Type::Int,
+        // `fn:<spelling>` is `Ptr(FuncType)` (`get_eval_fn`). Same int bank;
+        // the stub shell is `SomePtr`.
+        Some(s) if s.starts_with("fn:") => Type::Int,
         _ => Type::Ref,
     }
 }
@@ -10760,6 +10763,24 @@ impl CallControl {
         for block in graph.iterblocks() {
             for op in &block.operations {
                 let reason = match &op.kind {
+                    // Same leaf as `analyze_forces_virtualizable`: the rtyped
+                    // graph still names `jit_force_virtualizable` /
+                    // `jit_force_virtual` before
+                    // `jtransform.rewrite_op_jit_force_virtualizable` deletes
+                    // it. `VableForce` is the already-transformed spelling.
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if witness == EffectWitness::ForcesVirtualizable
+                        && segments.last().is_some_and(|leaf| {
+                            matches!(
+                                leaf.as_str(),
+                                "jit_force_virtualizable" | "jit_force_virtual"
+                            )
+                        }) =>
+                    {
+                        Some("forces a virtualizable".to_string())
+                    }
                     OpKind::VableForce { .. } if witness == EffectWitness::ForcesVirtualizable => {
                         Some("forces a virtualizable".to_string())
                     }
@@ -10967,9 +10988,18 @@ impl CallControl {
                 // `analyze_random_effects` keeps returning False for it, as
                 // `RandomEffectsAnalyzer.analyze_simple_operation` does
                 // (effectinfo.py).
-                return self
-                    .external_funcobj(path)
-                    .is_some_and(|f| f.random_effects_on_gcobjs || f.canmallocgc);
+                //
+                // `GraphAnalyzer.analyze` (`graphanalyze.py`): a non-external
+                // funcobj with no `graph` is AttributeError → `top_result()`.
+                // CollectAnalyzer.top_result is True. A registered FunDecl
+                // whose build produced no graph is that funcobj
+                // (`names_funcobj`); a `mark_*` record with no store slot is
+                // the external arm above.
+                let (random_effects, canmallocgc) = match self.external_funcobj(path) {
+                    Some(f) => (f.random_effects_on_gcobjs, f.canmallocgc),
+                    None => (false, false),
+                };
+                return random_effects || canmallocgc || self.function_graphs.names_funcobj(path);
             }
         };
         if !seen.enter(path.clone(), analyzed) {
@@ -21077,6 +21107,61 @@ mod tests {
             !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
             "effectinfo.py:417-418 — the same allocation answers \
              `RandomEffectsAnalyzer` False, so an elidable caller stays legal"
+        );
+    }
+
+    /// A registered funcobj whose build produced no graph is
+    /// `GraphAnalyzer.analyze`'s AttributeError arm (`graphanalyze.py`):
+    /// CollectAnalyzer.top_result is True. The hop that dropped
+    /// `jit_bigint_add` was that funcobj answering False through the
+    /// external-call arm, so a caller whose only Call is that funcobj
+    /// never reached the `canmallocgc` mark on the real allocator.
+    #[test]
+    fn a_graphless_registered_funcobj_can_collect_its_caller() {
+        let impl_path = CallPath::from_segments(["alloc_impl"]);
+        let wrapper = CallPath::from_segments(["alloc_wrapper"]);
+        let caller = CallPath::from_segments(["top_caller"]);
+
+        let mut cc = CallControl::new();
+        cc.function_graphs.insert_deferred(
+            impl_path.clone(),
+            (None, "alloc_impl".to_string()),
+            || None,
+        );
+
+        let mut wrapper_graph = FunctionGraph::new("alloc_wrapper");
+        let start = wrapper_graph.startblock;
+        wrapper_graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(["alloc_impl"])));
+        wrapper_graph.set_return(start, None);
+        cc.register_function_graph(wrapper.clone(), wrapper_graph);
+
+        let mut caller_graph = FunctionGraph::new("top_caller");
+        let start = caller_graph.startblock;
+        caller_graph.blocks[start.0]
+            .operations
+            .push(direct_call_op(CallTarget::function_path(["alloc_wrapper"])));
+        caller_graph.set_return(start, None);
+        cc.register_function_graph(caller.clone(), caller_graph);
+
+        assert!(
+            cc.function_graphs.get(&impl_path).is_none(),
+            "the impl's build produced no graph"
+        );
+        assert!(
+            cc.function_graphs.names_funcobj(&impl_path),
+            "the impl stays a registered funcobj after the failed build"
+        );
+        assert!(
+            cc.analyze_can_collect(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "GraphAnalyzer.analyze (graphanalyze.py) — the caller of a non-external \
+             funcobj with no graph collects"
+        );
+        assert!(
+            !cc.analyze_random_effects(&caller, &mut CallTracker::new(), &mut new_analyzed_calls()),
+            "the AttributeError arm is CollectAnalyzer-only; \
+             RandomEffectsAnalyzer stays False"
         );
     }
 

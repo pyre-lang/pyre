@@ -581,6 +581,20 @@ fn root_scope_drop_is_classified_and_live() {
     assert!(super::is_frame_anchor_release_call(&release));
     assert!(super::is_shadow_stack_bracket_close(&release));
     assert!(!super::is_root_scope_drop_glue_call(&release));
+    let close = crate::model::OpKind::Call {
+        target: crate::model::CallTarget::FunctionPath {
+            segments: vec![
+                "pyre_object".to_string(),
+                "gc_roots".to_string(),
+                super::ROOT_SCOPE_CLOSE.to_string(),
+            ],
+            fun_decl_id: None,
+        },
+        args: Vec::new(),
+        result_ty: crate::model::ValueType::Void,
+    };
+    assert!(super::is_root_scope_drop_glue_call(&close));
+    assert!(super::is_shadow_stack_bracket_close(&close));
 
     // `_1` is written in bb0 and read only by bb1's Drop.
     let span = || {
