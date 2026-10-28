@@ -418,15 +418,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 snapshot_sym: sym_ptr,
 
                 class_of_last_exc_is_const: sym.class_of_last_exc_is_const(),
-                // Top-level bridge walks seed the jitcode start so the
-                // merge-point handler can skip a `jit_merge_point` the walk
-                // resumed into (`generate_guard` default `resumepc` at the
-                // opcode boundary or the pre-merge header diamond). Loop
-                // compiles leave it `None`.
-                bridge_entry_merge_pc: match (trace_ctx.is_bridge_trace, entry_py_pc) {
-                    (true, EntryPyPc::Py(_)) => Some(position),
-                    _ => None,
-                },
                 ..Default::default()
             },
             session,

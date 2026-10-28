@@ -8561,6 +8561,48 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(
     }
 }
 
+/// Residual callee for `dispatch_bytecode`'s jitted arm
+/// (`pyopcode.py`): `ec.bytecode_only_trace(frame)`.
+///
+/// Void result (`residual_call_r_v`), matching `bh_bytecode_trace_jitted_slow`:
+/// always returns 0; an exception is published through `BH_LAST_EXC_VALUE`
+/// for the trailing `GuardNoException`.
+pub extern "C" fn bh_bytecode_only_trace_jitted(
+    ec: *mut pyre_interpreter::PyExecutionContext,
+    frame_ptr: *mut PyFrame,
+) -> i64 {
+    if ec.is_null() {
+        return 0;
+    }
+    let before = if frame_ptr.is_null() {
+        -1
+    } else {
+        unsafe { (*frame_ptr).last_instr }
+    };
+    match unsafe { (*ec).bytecode_only_trace(frame_ptr) } {
+        Ok(frame) => {
+            // eval_loop_jit after `bytecode_trace`: "A trace callback may
+            // perform a debugger line-jump" (`fset_f_lineno` →
+            // `last_instr = best_addr`). Rebase through
+            // `set_last_instr_from_next_instr` so a later interpreter
+            // `continue` (`LoopResult::ContinueRunningNormally`) lands on
+            // the target via `next_instr() = last_instr + 1`.
+            if !frame.is_null() {
+                let after = unsafe { (*frame).last_instr };
+                if after != before {
+                    let jump_target = after as usize;
+                    unsafe { (*frame).set_last_instr_from_next_instr(jump_target) };
+                }
+            }
+            0
+        }
+        Err(mut err) => {
+            publish_residual_call_exception(err.to_exc_object());
+            0
+        }
+    }
+}
+
 /// UNARY_INVERT residual (`unary_invert` HLOp → `residual_call_r_r`).
 /// Computes `~value` through `opcode_ops::unary_invert_value` (`invert`); a
 /// user `__invert__` may run Python (`MayForce`).  On error the exception

@@ -77,9 +77,10 @@ use crate::rd_payload::RdPayload;
 //     one trailing `counter_value_spill` slot.  When the operand is present it
 //     is authoritative; nothing indexes `fail_values` with the slot.
 //   * cranelift records a FAIL-ARGUMENT position, because its slot space is the
-//     dense fail-argument vector.  It supplies no `guard_value_operand`, and
-//     `must_compile_with_values` resolves the same index out of `fail_values`
-//     — which is why leaving it `None` there is the contract, not a gap.
+//     dense fail-argument vector.  Its raw entry resolves the index the way the
+//     deadframe's `get_value_direct` does (through `rd_locs`, else the raw frame
+//     slot) and hands the result over as `guard_value_operand`, because the
+//     jitdriver run loop calls `must_compile` with no fail values.
 pub const STATUS_BUSY_FLAG: u64 = 0x01;
 pub const STATUS_TYPE_MASK: u64 = 0x06;
 pub const STATUS_SHIFT: u32 = 3;

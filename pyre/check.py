@@ -465,9 +465,11 @@ WASM_MODULE_PATH = "target/wasm32-unknown-unknown/release/pyre_wasm.wasm-host.wa
 # `--export-table` exposes the indirect-call table the runner patches for JIT
 # re-entry; `--growable-table` drops its fixed maximum so the host can append
 # compiled trace functions for inter-trace call_indirect chaining;
+# `-zstack-size=8388608` raises the 1 MiB default shadow stack (see `.cargo/config.toml`);
 # `getrandom_backend="custom"` selects the no-import getrandom backend.
 WASM_RUSTFLAGS = (
     '-C link-arg=--export-table -C link-arg=--growable-table '
+    '-C link-arg=-zstack-size=8388608 '
     '--cfg getrandom_backend="custom"'
 )
 # Stable toolchain, no build-std. Kept as a (possibly empty) arg list so the

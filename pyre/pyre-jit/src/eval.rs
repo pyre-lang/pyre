@@ -10112,17 +10112,14 @@ fn eval_with_jit_inner(
     }
     // This door tests only `frame_tracing_active`, which is true when the
     // frame's `f_trace` is non-null (`pyframe.rs` `frame_tracing_active`).
-    // That frame owes a `line` event from `ec.bytecode_trace` in the
-    // dispatch loop, which compiled code does not call, so it runs
-    // interpreted. `is_being_profiled` is a green on
+    // A frame that arrives with `f_trace` already armed takes this path so
+    // `eval_loop_jit`'s `bytecode_trace` fires its `line` events, including
+    // an `f_lineno` jump (`set_last_instr_from_next_instr` then `continue`).
+    // Compiled code fires later `line` events from `dispatch_bytecode`'s
+    // jitted arm (`bytecode_only_trace` residual after `last_instr`).
+    // `is_being_profiled` is a green on
     // `pypy/module/pypyjit/interp_jit.py` `PyPyJitDriver` (`pypyjitdriver`)
     // and is not tested here.
-    //
-    // A frame that arrives with `f_trace` already armed takes this path.
-    // One that the bracket below arms is past this test; `try_function_entry_jit`
-    // and the portal merge point's debugdata guard keep it off compiled
-    // code, so its `line` events still come from `eval_loop_jit`'s
-    // `bytecode_trace`.
     if pyre_interpreter::pyframe::frame_tracing_active(frame) {
         pyre_interpreter::reload_resume_args_opt!(pins.as_ref(), &mut resume);
         return frame.execute_frame_plain(resume);
@@ -11233,18 +11230,15 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // pending the actionflag port.
         //
         // This is `dispatch_bytecode`'s NON-jitted arm only.  Its jitted arm
-        // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) has no
-        // counterpart here because this body is never traced: pyre records
-        // from a per-CodeObject JitCode built by `jit/codewriter.rs` and walked
-        // by `pyre-jit-trace`'s `run_perfn_walk`, not from this Rust loop.  The
-        // port of that arm is `record_portal_debugdata_guard`
-        // (`pyre-jit-trace/src/jitcode_dispatch/mod.rs`), which runs at the
-        // portal merge point — the walker's counterpart of this loop's top.
-        // `we_are_jitted()` here would be a runtime thread-local set only while
-        // cranelift-compiled code is on the stack, not the folded compile-time
-        // constant upstream's translator sees, so splitting on it would strip
-        // the ticker from nested interpreted frames rather than from traced
-        // ones.
+        // (`if jit.we_are_jitted(): _d = self.debugdata; ...`) lives in the
+        // per-CodeObject JitCode: after each `last_instr` store the codewriter
+        // emits the `debugdata` and `w_f_trace` null tests and, past both,
+        // a residual `bytecode_only_trace`.  This body is never
+        // traced — pyre records from that JitCode via `run_perfn_walk`.  `we_are_jitted()`
+        // here would be a runtime thread-local set only while cranelift-compiled code is
+        // on the stack, not the folded compile-time constant upstream's translator sees,
+        // so splitting on it would strip the ticker from nested interpreted frames rather
+        // than from traced ones.
         if !ec_ptr.is_null() {
             // Keep the JIT portal's concrete dispatch in lockstep with
             // `pyre_interpreter::eval::eval_loop`'s opcode boundary.  The
@@ -13225,16 +13219,16 @@ fn dump_bytecode_enabled() -> bool {
 pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     let mut frame_root = FrameRoot::new(frame);
     // A frame carrying its own `f_trace` owes a `line` event at every
-    // instruction that can start one, and those are fired by
-    // `ec.bytecode_trace` from the dispatch loop.  Compiled code has no route
-    // to that call, and this door runs the WHOLE frame compiled rather than a
-    // loop inside it, so it has no merge point for
-    // `record_portal_debugdata_guard` to place its guard at.  Measured on a
-    // callee whose `f_trace` is armed by the `ec.call_trace` at the portal:
-    // the `line` events stop at the 1239th call — the entry threshold — and
-    // never resume, at any length of tail, while `call` and `return` keep
-    // arriving from the bracket.  Leave such a frame to `eval_loop_jit`, whose
-    // per-opcode `bytecode_trace` fires them.
+    // instruction that can start one.  This door runs the WHOLE frame
+    // compiled rather than a loop inside it; leave such a frame to
+    // `eval_loop_jit`, whose per-opcode `bytecode_trace` fires them and
+    // honours an `f_lineno` jump (`set_last_instr_from_next_instr` then
+    // `continue`).  A compiled loop fires later `line` events from
+    // `dispatch_bytecode`'s jitted arm.  Measured on a callee whose
+    // `f_trace` is armed by the `ec.call_trace` at the portal: the `line`
+    // events stop at the 1239th call — the entry threshold — and never
+    // resume, at any length of tail, while `call` and `return` keep arriving
+    // from the bracket.
     if !frame_root.frame().get_w_f_trace().is_null() {
         return None;
     }

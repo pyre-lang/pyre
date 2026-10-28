@@ -80,6 +80,9 @@ pub(crate) fn preceding_live_marker(payload: &crate::PyJitCode, op_pc: usize) ->
 /// the opcode-start twin then re-executes the residual before the jump
 /// (`bhimpl_goto_if_not` must re-run only the jump). When `op_pc` is still
 /// the instruction after a `-live-`, [`preceding_live_marker`] recovers it.
+/// The opcode-start marker of a loop-header floor is past its `jit_merge_point`
+/// (`jtransform.py handle_jit_marker__jit_merge_point` op2 `-live-`), the
+/// point the opcode body re-executes from.
 pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: usize) -> i32 {
     let op_live = crate::state::op_live();
     if payload.jitcode.can_decode_live_vars(op_pc, op_live)
@@ -89,7 +92,12 @@ pub(crate) fn plain_guard_resume_jitcode_pc(payload: &crate::PyJitCode, op_pc: u
     } else {
         preceding_live_marker(payload, op_pc)
             .or_else(|| payload.resume_marker_for_jitcode_pc(op_pc))
-            .map(|m| m as i32)
+            .map(|m| {
+                jit_merge_point_pc_in_containing_floor(payload, op_pc)
+                    .filter(|&merge_pc| m < merge_pc && merge_pc < op_pc)
+                    .and_then(|merge_pc| resume_pc_past_merge_point(payload, merge_pc))
+                    .unwrap_or(m) as i32
+            })
             .unwrap_or(op_pc as i32)
     }
 }
@@ -158,7 +166,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard<Sym: WalkSym>(
 ///
 /// Loop-header py_pcs lower `emit_portal_is_being_profiled_read` at the floor
 /// and `jit_merge_point` later in the same `py_floor_by_jit_pc` region.
-fn jit_merge_point_pc_in_containing_floor(
+pub(super) fn jit_merge_point_pc_in_containing_floor(
     payload: &crate::PyJitCode,
     jit_pc: usize,
 ) -> Option<usize> {
@@ -187,9 +195,28 @@ fn jit_merge_point_pc_in_containing_floor(
     None
 }
 
+/// True when `op_pc` sits in a loop-header floor *before* that floor's
+/// `jit_merge_point`: the `PyFrame.get_is_being_profiled` diamond
+/// (`emit_portal_is_being_profiled_read`) and the green promotes that
+/// `interp_jit.py PyFrame.dispatch` evaluates ahead of `jit_merge_point`.
+pub(super) fn ptr_iszero_is_before_merge_in_floor<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+) -> bool {
+    walked_snapshot_jitcode(ctx)
+        .and_then(|jc| {
+            jit_merge_point_pc_in_containing_floor(&jc.payload, op_pc)
+                .map(|merge_pc| op_pc < merge_pc)
+        })
+        .unwrap_or(false)
+}
+
 /// Byte after `jit_merge_point`: the op2 `-live-` when present, otherwise
 /// `op.next_pc` (`jtransform.py handle_jit_marker__jit_merge_point`).
-fn resume_pc_past_merge_point(payload: &crate::PyJitCode, merge_pc: usize) -> Option<usize> {
+pub(super) fn resume_pc_past_merge_point(
+    payload: &crate::PyJitCode,
+    merge_pc: usize,
+) -> Option<usize> {
     trailing_live_marker(payload, merge_pc).or_else(|| {
         crate::jitcode_runtime::decode_op_at(payload.jitcode.code.as_slice(), merge_pc)
             .map(|op| op.next_pc)
@@ -857,28 +884,32 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             | OpCode::GuardClass
                             | OpCode::GuardTrue
                             | OpCode::GuardFalse
+                            | OpCode::GuardIsnull
+                            | OpCode::GuardNonnull
                     )
                 )
             {
                 // #366: carry the `-live-` marker offset, NOT the raw guard
-                // `op_pc`. Reached only on the
-                // specialization guards (`GuardValue`/`GuardClass`) and all
-                // branch guards (`GuardTrue`/`GuardFalse`). For every guard
-                // here the codewrite-time twin resolves the
-                // `-live-` marker, keeping the
-                // encoder reg-bank window and decoder liveness symmetric.  It is
-                // a valid startpoint (`can_decode_live_vars` holds).
+                // `op_pc`. Reached on the specialization guards
+                // (`GuardValue`/`GuardClass`), the compare-fused branch
+                // guards (`GuardTrue`/`GuardFalse`), and the pointer-nullity
+                // pair (`GuardIsnull`/`GuardNonnull`) from
+                // `_establish_nullity` (`opimpl_goto_if_not_ptr_iszero` /
+                // `opimpl_goto_if_not_ptr_nonzero`). For every guard here
+                // the codewrite-time twin resolves the `-live-` marker,
+                // keeping the encoder reg-bank window and decoder liveness
+                // symmetric.  It is a valid startpoint
+                // (`can_decode_live_vars` holds).
                 // The `after_residual_call` family is excluded — it routes
                 // through the separate post-call catch-marker twin, so the
                 // ordinary marker would name a different resume point.
                 // Every guard-capture point is emitted after a `-live-` marker;
                 // its populated codewrite-time twin is therefore total here.
-                // Specialization guards (`GuardValue`/`GuardClass`) and branch
-                // guards (`GuardTrue`/`GuardFalse`) source the resume
-                // coordinate from the walk cursor's per-op `-live-` BEFORE
-                // (`ctx.live_before_jit_pc`). Branch guards are
-                // `generate_guard(resumepc=orgpc)` (`pyjitpl.py
-                // opimpl_goto_if_not`); blackhole `bhimpl_goto_if_not`
+                // All of these source the resume coordinate from the walk
+                // cursor's per-op `-live-` BEFORE (`ctx.live_before_jit_pc`).
+                // That is `generate_guard(resumepc=orgpc)` (`pyjitpl.py
+                // opimpl_goto_if_not` / `_establish_nullity`); blackhole
+                // `bhimpl_goto_if_not` / `bhimpl_goto_if_not_ptr_iszero`
                 // re-evaluates the restored condition. `op_pc` is already
                 // that `-live-` for a branch capture; the opcode-start twin
                 // is only the fallback when neither the capture pc nor the
@@ -1117,27 +1148,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // the carried static outer JitCode coordinate; an absent coordinate
     // declines instead of reconstructing one from the Python pc.
     //
-    // The item class check inside `list_iter_descr_next` is recorded as
-    // `GuardNonnull` and `GuardClass`. `optimize_GUARD_CLASS` folds that
-    // pair into `GuardNonnullClass` and keeps the `GuardNonnull` resume,
-    // so both guards carry the post-merge `-live-`. Their boxes were
-    // collected at that pc. Every other guard keeps the preamble marker.
+    // A collapsed helper or inlined callee carries the parent resume
+    // coordinate on `outer_resume_marker_jit_pc`. On a loop-header opcode
+    // that is the op2 `-live-` after `jit_merge_point` (`jtransform.py
+    // handle_jit_marker__jit_merge_point`). Active boxes were collected
+    // at that same pc.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let guard_opcode = ctx.trace_ctx.last_op_opcode();
-    let class_guard_pc = if matches!(
-        guard_opcode,
-        Some(OpCode::GuardNonnull | OpCode::GuardClass)
-    ) {
-        ctx.frame_state
-            .borrow()
-            .list_iter_class_guard_resume
-            .as_ref()
-            .map(|(pc, _)| *pc)
-    } else {
-        None
-    };
-    let arm_word = class_guard_pc
-        .or(ctx.outer_resume_marker_jit_pc)
+    let arm_word = ctx
+        .outer_resume_marker_jit_pc
         .map(|m| m as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
     let Some(arm_pc_word) =
@@ -1152,16 +1170,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    let active = if class_guard_pc.is_some() {
-        ctx.frame_state
-            .borrow_mut()
-            .list_iter_class_guard_resume
-            .take()
-            .map(|(_, boxes)| boxes)
-            .unwrap_or_default()
-    } else {
-        std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes)
-    };
+    let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
     publish_single_frame_snapshot(
         ctx,
         scope.guard_stamp,
@@ -1174,11 +1183,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         "carried",
         op_pc,
     );
-    if let Some(pc) = class_guard_pc {
-        ctx.frame_state.borrow_mut().list_iter_class_guard_resume = Some((pc, active));
-    } else {
-        ctx.frame_state.borrow_mut().outer_active_boxes = active;
-    }
+    ctx.frame_state.borrow_mut().outer_active_boxes = active;
     Ok(())
 }
 
@@ -2972,8 +2977,10 @@ pub(crate) fn compute_inline_helper_call_entry_frame<Sym: WalkSym>(
     if !pjc.is_populated() || pjc.code_ptr.is_null() {
         return Err(unavail("Unavail::Helper/NotPopulated"));
     }
-    let resume_marker_jit_pc = pjc
-        .resume_marker_for_jitcode_pc(call_jit_pc)
+    // Same parent resume as `run_orthodox_helper_subwalk`: the op2 `-live-`
+    // after `jit_merge_point` on a loop-header opcode
+    // (`jtransform.py handle_jit_marker__jit_merge_point`).
+    let resume_marker_jit_pc = super::specialize::collapsed_parent_resume_marker(&pjc, call_jit_pc)
         .ok_or_else(|| unavail("Unavail::Helper/NoResumeMarker"))?;
     let boxes = if caller_code.is_some() {
         collect_callee_active_boxes(

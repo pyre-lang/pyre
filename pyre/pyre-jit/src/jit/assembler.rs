@@ -1221,6 +1221,13 @@ fn dispatch_op(
             let field = expect_field_bh_descr(&args[1], "getfield_gc_i");
             state.builder.getfield_gc_i_bh(dst, struct_reg, field);
         }
+        "getfield_gc_r" => {
+            let dst = expect_result_reg(result, Kind::Ref, "getfield_gc_r needs result");
+            assert_eq!(args.len(), 2, "getfield_gc_r expects [struct, fielddescr]");
+            let struct_reg = expect_reg(&args[0], Kind::Ref);
+            let field = expect_field_bh_descr(&args[1], "getfield_gc_r");
+            state.builder.getfield_gc_r_bh(dst, struct_reg, field);
+        }
         "setfield_gc_i" => {
             assert_eq!(
                 args.len(),

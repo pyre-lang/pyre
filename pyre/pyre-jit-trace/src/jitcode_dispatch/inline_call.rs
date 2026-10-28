@@ -19,6 +19,7 @@ use pyre_interpreter::locals_w;
 use rustpython_wtf8::Wtf8;
 
 use super::*;
+use majit_ir::descr::{FieldDescr, SwitchDescr};
 
 #[derive(Clone, Copy)]
 struct BoundMethodInline {
@@ -571,6 +572,247 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
     }
 }
 
+/// Callee-body ops a fresh inlined frame would execute.
+///
+/// The inlined callee frame is a virtual whose `debugdata` is None
+/// (`PyFrame.__init__`). `dispatch_bytecode`'s `_d is not None` therefore
+/// folds (`pyjitpl.py` `_establish_nullity` records nothing for a known-null
+/// box), so a `goto_if_not_ptr_iszero` of that `getfield_vable_r` follows only
+/// its fallthrough and is itself not yielded. Ops reachable only through the
+/// non-null arm are dropped.
+///
+/// `None` when a reachable instruction cannot be decoded. Walks the CFG from
+/// pc 0: fallthrough, `goto` targets, both successors of every other
+/// conditional, `switch` targets, and catch/landing edges
+/// ([`summarize_descent_blockers`]).
+pub(crate) fn decoded_ops_on_fresh_frame(
+    body_code: &[u8],
+    descr_refs: &[DescrRef],
+) -> Option<Vec<DecodedOp>> {
+    if body_code.is_empty() {
+        return Some(Vec::new());
+    }
+    let ops = linear_decoded_ops(body_code)?;
+    let n = body_code.len();
+    let mut at = vec![None; n];
+    for (i, op) in ops.iter().enumerate() {
+        if op.pc < n {
+            at[op.pc] = Some(i);
+        }
+    }
+    if at[0].is_none() {
+        return None;
+    }
+    let mut reachable = vec![false; n];
+    let mut folded_goto = vec![false; n];
+    let mut work = vec![0usize];
+    reachable[0] = true;
+    let starts: Vec<usize> = ops.iter().map(|op| op.pc).collect();
+    while let Some(pc) = work.pop() {
+        let Some(idx) = at[pc] else {
+            return None;
+        };
+        let d = &ops[idx];
+        let pred = previous_non_live_op(&ops, idx);
+        let folded = is_fresh_frame_debugdata_null_goto(body_code, d, pred, descr_refs);
+        if folded {
+            folded_goto[pc] = true;
+        }
+        for succ in fresh_frame_successors(body_code, d, descr_refs, folded, &starts) {
+            if succ >= n || reachable[succ] {
+                continue;
+            }
+            if at[succ].is_none() {
+                continue;
+            }
+            reachable[succ] = true;
+            work.push(succ);
+        }
+    }
+    Some(
+        ops.into_iter()
+            .filter(|op| reachable[op.pc] && !folded_goto[op.pc])
+            .collect(),
+    )
+}
+
+fn is_live_marker(opname: &str) -> bool {
+    opname == "live" || opname.starts_with("live/")
+}
+
+fn previous_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Option<&'a DecodedOp> {
+    let mut i = idx;
+    while i > 0 {
+        i -= 1;
+        if !is_live_marker(ops[i].opname) {
+            return Some(&ops[i]);
+        }
+    }
+    None
+}
+
+fn linear_decoded_ops(code: &[u8]) -> Option<Vec<DecodedOp>> {
+    let mut ops = Vec::new();
+    let mut pc = 0usize;
+    while pc < code.len() {
+        let d = crate::jitcode_runtime::decode_op_at(code, pc)?;
+        if d.next_pc <= pc {
+            return None;
+        }
+        pc = d.next_pc;
+        ops.push(d);
+    }
+    Some(ops)
+}
+
+fn body_descr_at(descr_refs: &[DescrRef], descr_index: usize) -> Option<DescrRef> {
+    if descr_refs.is_empty() {
+        crate::jitcode_runtime::descr_ref_table().at(descr_index)
+    } else {
+        descr_refs.get(descr_index).cloned()
+    }
+}
+
+fn descr_is_vable_debugdata(descr: &DescrRef) -> bool {
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    if info.static_field_by_descr(descr)
+        == Some(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX)
+    {
+        return true;
+    }
+    // Per-fn pools rebuild field descrs (`make_descr_from_bh`), so they do
+    // not share Arc identity with `vinfo.static_field_descrs`. The vable
+    // slot is still that field: `PyFrame.__init__` leaves `debugdata` None.
+    let vable = info.static_field_descr(crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX);
+    if std::sync::Arc::ptr_eq(descr, &vable)
+        || std::sync::Arc::ptr_eq(descr, &crate::descr::pyframe_debugdata_descr())
+    {
+        return true;
+    }
+    descr.as_field_descr().is_some_and(|field| {
+        field.offset() == crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET
+            && debugdata_field_name(field.field_name())
+    })
+}
+
+fn debugdata_field_name(name: &str) -> bool {
+    name == "debugdata" || name.rsplit(['.', ':']).next() == Some("debugdata")
+}
+
+/// `goto_if_not_ptr_iszero` of the `debugdata` virtualizable static field
+/// written by the immediately preceding `getfield_vable_r`.
+fn is_fresh_frame_debugdata_null_goto(
+    code: &[u8],
+    op: &DecodedOp,
+    pred: Option<&DecodedOp>,
+    descr_refs: &[DescrRef],
+) -> bool {
+    if op.opname != "goto_if_not_ptr_iszero" {
+        return false;
+    }
+    let Some(pred) = pred else {
+        return false;
+    };
+    // Assembler may emit `live/` between the vable read and the null test
+    // (`dispatch_bytecode`'s jitted arm). The producer is still that
+    // `getfield_vable_r`; adjacency of the two pcs is not required.
+    if !pred.opname.starts_with("getfield_vable_r") {
+        return false;
+    }
+    let Some(&cond) = code.get(op.pc + 1) else {
+        return false;
+    };
+    let Some(&dst) = code.get(pred.next_pc.wrapping_sub(1)) else {
+        return false;
+    };
+    if cond != dst {
+        return false;
+    }
+    let Some(descr_index) = descr_operand_index(code, pred) else {
+        return false;
+    };
+    body_descr_at(descr_refs, descr_index)
+        .as_ref()
+        .is_some_and(descr_is_vable_debugdata)
+}
+
+fn switch_targets_for_body(descr_refs: &[DescrRef], descr_index: usize) -> Option<Vec<usize>> {
+    let descr = body_descr_at(descr_refs, descr_index)?;
+    let switch = descr.as_switch_descr()?;
+    switch
+        .const_keys_in_order()
+        .iter()
+        .map(|&key| switch.lookup(key))
+        .collect()
+}
+
+fn fresh_frame_successors(
+    code: &[u8],
+    d: &DecodedOp,
+    descr_refs: &[DescrRef],
+    folded_debugdata_goto: bool,
+    all_starts: &[usize],
+) -> Vec<usize> {
+    let label = label_operand_offset(d.argcodes).map(|off| read_label(code, d, off));
+    match d.opname {
+        "ref_return" | "int_return" | "float_return" | "void_return" => Vec::new(),
+        "goto" => label.into_iter().collect(),
+        "raise" | "reraise" => crate::jitcode_dispatch::try_catch_exception_at(code, d.next_pc)
+            .into_iter()
+            .collect(),
+        "catch_exception" => {
+            let mut succs = Vec::new();
+            if let Some(target) = label {
+                succs.push(target);
+            }
+            succs.push(d.next_pc);
+            succs
+        }
+        "switch" => match descr_operand_index(code, d)
+            .and_then(|index| switch_targets_for_body(descr_refs, index))
+        {
+            Some(mut targets) => {
+                targets.push(d.next_pc);
+                targets
+            }
+            None => all_starts.to_vec(),
+        },
+        name if name.starts_with("goto_if") => {
+            if folded_debugdata_goto {
+                vec![d.next_pc]
+            } else {
+                let mut succs = Vec::new();
+                if let Some(target) = label {
+                    succs.push(target);
+                }
+                succs.push(d.next_pc);
+                succs
+            }
+        }
+        _ => {
+            let mut succs = Vec::new();
+            if let Some(target) = label {
+                succs.push(target);
+            }
+            succs.push(d.next_pc);
+            succs
+        }
+    }
+}
+
+fn descr_refs_for_jitcode_index(jitcode_index: usize) -> &'static [DescrRef] {
+    crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
+        .and_then(|pjc| {
+            if pjc.code_ptr.is_null() {
+                None
+            } else {
+                crate::state::sub_jitcode_descr_pool_for_code(pjc.code_ptr as *const ())
+                    .map(|(refs, _, _)| refs)
+            }
+        })
+        .unwrap_or(&[])
+}
+
 /// The FBW fast-path inline convention (`try_walker_inline_user_call`) first
 /// checks whether the callee body can be followed, before the full inline path
 /// seeds the callee's positional arguments and its own frame/ec reds. A callee
@@ -588,12 +830,11 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
 ) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            // Undecodable tail — be conservative and decline the fast path.
-            return false;
-        };
+    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+        // Undecodable reachable op — be conservative and decline the fast path.
+        return false;
+    };
+    for d in &ops {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
             if fbw_strict_diag_enabled() {
                 eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
@@ -613,8 +854,8 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
         // `inline_resolvable_seeded_frame_op` return false, so this is inert
         // outside drained per-code jitcodes.
         if d.opname.contains("vable")
-            && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
-            && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
+            && !inline_resolvable_static_vable_read(body_code, d, callee_descr_refs, ctx)
+            && !inline_resolvable_seeded_frame_op(body_code, d, callee_frame_reg)
         {
             if fbw_strict_diag_enabled() {
                 eprintln!(
@@ -624,7 +865,6 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
             }
             return false;
         }
-        pc = d.next_pc;
     }
     true
 }
@@ -669,30 +909,29 @@ pub(crate) fn inline_resolvable_static_vable_read<Sym: WalkSym>(
 /// a loop in the callee needs a `jit_merge_point` the inline snapshot does
 /// not model, and a multi-target switch is not yet handled.
 ///
-/// Vable reads are accepted in two cases: (a) a scalar static-field read
+/// Vable ops are accepted in two cases: (a) a scalar static-field read
 /// (`pycode` / `w_globals`) resolvable without a seeded frame
-/// (`inline_resolvable_static_vable_read`), or (b) a frame-LOCAL read
-/// (`getfield_vable_r` / `getarrayitem_vable_r`) whose base register equals the
+/// (`inline_resolvable_static_vable_read`), or (b) a frame-LOCAL
+/// `getfield_vable_{i,r,f}` / `getarrayitem_vable_{i,r,f}` /
+/// `setfield_vable_*` / `setarrayitem_vable_*` whose base register equals the
 /// seeded callee frame reg `callee_frame_reg` — the multiframe path seeds that
 /// frame as a virtual object graph (`emit_new_pyframe_inline_with_params`), so
-/// the optimizer folds the read to the seeded param value rather than aborting
-/// `VableBoxNotSeeded`.  Every `setfield_vable_*` / `setarrayitem_vable_*`
-/// (a write into a vable, which would escape the virtual frame) and any vable
-/// op against a base reg OTHER than the seeded frame still decline.
+/// `opimpl_getfield_vable_*` (`pyjitpl.py`) folds a field of that virtual the
+/// same way `opimpl_getfield_gc_*` does.  A vable op against a base reg OTHER
+/// than the seeded frame still declines.
 pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
 ) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            if fbw_strict_diag_enabled() {
-                eprintln!("[strict-reject-mf] pc={pc} (undecodable)");
-            }
-            return false;
-        };
+    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+        if fbw_strict_diag_enabled() {
+            eprintln!("[strict-reject-mf] (undecodable reachable)");
+        }
+        return false;
+    };
+    for d in &ops {
         if d.opname.starts_with("switch") {
             if fbw_strict_diag_enabled() {
                 eprintln!("[strict-reject-mf] pc={} op={} (switch)", d.pc, d.opname);
@@ -709,7 +948,7 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
             let Some(off) = label_operand_offset(d.argcodes) else {
                 return false;
             };
-            let target = read_label(body_code, &d, off);
+            let target = read_label(body_code, d, off);
             if target <= d.pc {
                 if fbw_strict_diag_enabled() {
                     eprintln!(
@@ -721,8 +960,8 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
             }
         }
         if d.opname.contains("vable")
-            && !inline_resolvable_static_vable_read(body_code, &d, callee_descr_refs, ctx)
-            && !inline_resolvable_seeded_frame_op(body_code, &d, callee_frame_reg)
+            && !inline_resolvable_static_vable_read(body_code, d, callee_descr_refs, ctx)
+            && !inline_resolvable_seeded_frame_op(body_code, d, callee_frame_reg)
         {
             if fbw_strict_diag_enabled() {
                 eprintln!(
@@ -735,7 +974,6 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
             }
             return false;
         }
-        pc = d.next_pc;
     }
     true
 }
@@ -765,21 +1003,139 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
     if callee_frame_reg == u16::MAX || callee_frame_reg > u8::MAX as u16 {
         return false;
     }
-    // Only ref-base vable ops (`getfield_vable_r/rd>r`,
-    // `getarrayitem_vable_r/ridd>r`, `setfield_vable_*/rXd`,
-    // `setarrayitem_vable_*/riXdd`) carry the frame ref in operand 0.  The
-    // Any malformed non-Ref-base vable bytecode is not the seeded frame and is
+    // Every `*_vable_*` whose first operand is the frame ref (`r…`) names
+    // that frame in `body_code[d.pc + 1]`. The `_i` / `_r` / `_f` suffix is
+    // the value kind, not the base: `getfield_vable_i/rd>i` is still a
+    // `last_instr` read off the seeded frame (`dispatch_bytecode`'s jitted
+    // arm). A malformed non-Ref-base vable op is not the seeded frame and is
     // rejected here as a second line of defence behind the assembler.
-    let is_frame_vable = d.opname.starts_with("getfield_vable_r")
-        || d.opname.starts_with("getarrayitem_vable_r")
-        || (d.opname.starts_with("setfield_vable") && d.argcodes.starts_with('r'))
-        || (d.opname.starts_with("setarrayitem_vable") && d.argcodes.starts_with('r'));
+    let is_frame_vable = d.argcodes.starts_with('r')
+        && (d.opname.starts_with("getfield_vable")
+            || d.opname.starts_with("getarrayitem_vable")
+            || d.opname.starts_with("setfield_vable")
+            || d.opname.starts_with("setarrayitem_vable"));
     if !is_frame_vable {
         return false;
     }
     match body_code.get(d.pc + 1).copied() {
         Some(base) => base as u16 == callee_frame_reg,
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod seeded_frame_op_tests {
+    use super::*;
+
+    fn vable_op(opname: &'static str, argcodes: &'static str, next_pc: usize) -> DecodedOp {
+        DecodedOp {
+            key: "",
+            opname,
+            argcodes,
+            pc: 0,
+            next_pc,
+        }
+    }
+
+    #[test]
+    fn seeded_frame_accepts_int_and_float_getfield_off_the_callee_frame() {
+        let code = [0u8, 3, 0, 0, 0];
+        let frame = 3u16;
+        assert!(inline_resolvable_seeded_frame_op(
+            &code,
+            &vable_op("getfield_vable_i", "rd>i", 5),
+            frame,
+        ));
+        assert!(inline_resolvable_seeded_frame_op(
+            &code,
+            &vable_op("getfield_vable_f", "rd>f", 5),
+            frame,
+        ));
+        assert!(inline_resolvable_seeded_frame_op(
+            &code,
+            &vable_op("getfield_vable_r", "rd>r", 5),
+            frame,
+        ));
+        assert!(!inline_resolvable_seeded_frame_op(
+            &code,
+            &vable_op("getfield_vable_i", "rd>i", 5),
+            4,
+        ));
+    }
+
+    fn insn(key: &str) -> u8 {
+        *crate::jitcode_runtime::insns_opname_to_byte()
+            .get(key)
+            .unwrap_or_else(|| panic!("{key} must be in the insns table"))
+    }
+
+    fn debugdata_null_goto_body(dead_op: u8, dead_operand: u8) -> (Vec<u8>, Vec<DescrRef>) {
+        let getfield = insn("getfield_vable_r/rd>r");
+        let live = insn("live/");
+        let goto_z = insn("goto_if_not_ptr_iszero/rL");
+        let int_ret = insn("int_return/i");
+        // Production arm: getfield_vable_r, live/, goto_if_not_ptr_iszero.
+        // pc 0: getfield_vable_r r0, descr0 -> r1
+        // pc 5: live/
+        // pc 8: goto_if_not_ptr_iszero r1, 14
+        // pc 12: int_return i0
+        // pc 14: dead arm
+        let code = vec![
+            getfield,
+            0,
+            0,
+            0,
+            1,
+            live,
+            0,
+            0,
+            goto_z,
+            1,
+            14,
+            0,
+            int_ret,
+            0,
+            dead_op,
+            dead_operand,
+        ];
+        let descrs = vec![crate::frame_layout::pyframe_static_field_descr(
+            crate::virtualizable_spec::DEBUGDATA_VABLE_FIELD_INDEX as u16,
+        )];
+        (code, descrs)
+    }
+
+    #[test]
+    fn fresh_frame_ops_drop_the_debugdata_null_goto_and_its_dead_arm() {
+        let raise = insn("raise/r");
+        let (code, descrs) = debugdata_null_goto_body(raise, 0);
+        let ops = decoded_ops_on_fresh_frame(&code, &descrs).expect("body must decode");
+        let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
+        assert_eq!(names, ["getfield_vable_r", "live", "int_return"]);
+        assert!(!callee_body_contains_raise(&code, &descrs));
+        assert!(exception_string_override_straight_line(&code, &descrs));
+    }
+
+    #[test]
+    fn fresh_frame_ops_keep_a_non_debugdata_ptr_iszero_and_its_arm() {
+        let raise = insn("raise/r");
+        let getfield = insn("getfield_vable_r/rd>r");
+        let goto_z = insn("goto_if_not_ptr_iszero/rL");
+        let int_ret = insn("int_return/i");
+        let code = vec![getfield, 0, 0, 0, 1, goto_z, 1, 11, 0, int_ret, 0, raise, 0];
+        let descrs = vec![crate::frame_layout::pyframe_static_field_descr(0)];
+        let ops = decoded_ops_on_fresh_frame(&code, &descrs).expect("body must decode");
+        let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
+        assert_eq!(
+            names,
+            [
+                "getfield_vable_r",
+                "goto_if_not_ptr_iszero",
+                "int_return",
+                "raise"
+            ]
+        );
+        assert!(callee_body_contains_raise(&code, &descrs));
+        assert!(!exception_string_override_straight_line(&code, &descrs));
     }
 }
 
@@ -792,18 +1148,9 @@ pub(crate) fn inline_resolvable_seeded_frame_op(
 /// bounded by `max_unroll_recursion` alone.
 /// Straight value-returning chains never raise, so they still inline to the
 /// full `fbw_max_multiframe_depth`.
-pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
-        };
-        if d.opname == "raise" {
-            return true;
-        }
-        pc = d.next_pc;
-    }
-    false
+pub(crate) fn callee_body_contains_raise(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
+    decoded_ops_on_fresh_frame(body_code, descr_refs)
+        .is_some_and(|ops| ops.iter().any(|d| d.opname == "raise"))
 }
 
 /// True iff `body_code` carries a `loop_header` (the lowered `can_enter_jit`
@@ -823,8 +1170,9 @@ pub(crate) fn callee_body_contains_raise(body_code: &[u8]) -> bool {
 /// The test is `loop_header`, not `jit_merge_point`: the merge point marks the
 /// portal's dispatch entry (`interp_jit.py PyFrame.dispatch`), while the
 /// back-edge is `can_enter_jit` (`interp_jit.py PyFrame.jump_absolute`).
-pub(crate) fn callee_body_owns_loop_header(body_code: &[u8]) -> bool {
-    crate::jitcode_runtime::decoded_ops(body_code).any(|op| op.opname == "loop_header")
+pub(crate) fn callee_body_owns_loop_header(body_code: &[u8], descr_refs: &[DescrRef]) -> bool {
+    decoded_ops_on_fresh_frame(body_code, descr_refs)
+        .is_some_and(|ops| ops.iter().any(|op| op.opname == "loop_header"))
 }
 
 /// Whether running a straight-line callee body before deciding to keep it can
@@ -917,11 +1265,10 @@ fn body_sample_safe_with(
     // First ref-slot accessor names the callee frame. A later `>r` that
     // overwrites that register drops the identity.
     let mut vable_reg: Option<u8> = None;
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
-        };
+    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+        return false;
+    };
+    for d in &ops {
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
             return false;
         }
@@ -968,7 +1315,6 @@ fn body_sample_safe_with(
         {
             vable_reg = None;
         }
-        pc = d.next_pc;
     }
     true
 }
@@ -1029,18 +1375,15 @@ pub(crate) fn index_inline_sample_safe(
 /// The bounded builtin-dispatch route only admits a straight-line app-level
 /// override. A control-flow-bearing method stays on the original residual
 /// dispatch path, where the interpreter owns its frame and branch semantics.
-pub(crate) fn exception_string_override_straight_line(body_code: &[u8]) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return false;
-        };
-        if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
-            return false;
-        }
-        pc = d.next_pc;
-    }
-    true
+pub(crate) fn exception_string_override_straight_line(
+    body_code: &[u8],
+    descr_refs: &[DescrRef],
+) -> bool {
+    let Some(ops) = decoded_ops_on_fresh_frame(body_code, descr_refs) else {
+        return false;
+    };
+    ops.iter()
+        .all(|d| !d.opname.starts_with("goto_if_not") && !d.opname.starts_with("switch"))
 }
 
 /// The un-lowered helper a descent into this jitcode body can reach on a path
@@ -1168,6 +1511,7 @@ pub(crate) fn helper_resume_reaches_blocker(
             &mut switch_descr_targets,
             &entry_array_lengths,
             &mut jitcode_fnaddr_for_descr,
+            descr_refs_for_jitcode_index(jitcode_index),
         );
         summary.body_not_walked
             || summary.blocker_effect_free.is_some()
@@ -1358,6 +1702,7 @@ fn collect_descent_effect_aware_blockers(
         &mut residual_call_is_effect_free,
         &mut switch_descr_targets,
         &[],
+        descr_refs_for_jitcode_index(jitcode_index),
     );
     for (blocker, effect) in here {
         record_reachable_blocker(out, blocker, entry_effect || effect);
@@ -2137,6 +2482,7 @@ fn summarize_descent_blockers_with_entry_inner(
         &mut residual_call_is_effect_free,
         &mut switch_descr_targets,
         entry_array_lengths,
+        descr_refs_for_jitcode_index(jitcode_index),
     );
     seen.pop();
     summary
@@ -2167,6 +2513,7 @@ pub(crate) fn summarize_body_blockers(
         &mut |_blocker, _effect| true,
         &mut |_descr_index| false,
         &mut |_descr_index| None,
+        &[],
         &[],
     )
 }
@@ -2216,6 +2563,7 @@ pub(crate) fn summarize_body_blockers_resume_fnaddr(
         &mut |_descr_index| None,
         &[],
         &mut callee_fnaddr,
+        &[],
     )
 }
 
@@ -2258,6 +2606,7 @@ pub(crate) fn summarize_body_blockers_with(
     call_effect_free: &mut dyn FnMut(usize) -> bool,
     switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
     entry_array_lengths: &[(usize, usize)],
+    descr_refs: &[DescrRef],
 ) -> DescentBlockerSummary {
     summarize_body_blockers_from(
         None,
@@ -2270,6 +2619,7 @@ pub(crate) fn summarize_body_blockers_with(
         switch_targets,
         entry_array_lengths,
         &mut jitcode_fnaddr_for_descr,
+        descr_refs,
     )
 }
 
@@ -2290,6 +2640,7 @@ fn summarize_body_blockers_from(
     switch_targets: &mut dyn FnMut(usize) -> Option<Vec<usize>>,
     entry_array_lengths: &[(usize, usize)],
     callee_fnaddr: &mut dyn FnMut(usize) -> Option<i64>,
+    descr_refs: &[DescrRef],
 ) -> DescentBlockerSummary {
     let mut summary = DescentBlockerSummary::default();
 
@@ -2300,9 +2651,17 @@ fn summarize_body_blockers_from(
     // order has to be the body's own rather than a hash order: which of
     // several blockers the answer names would otherwise change per process.
     let mut starts = Vec::new();
+    let mut folded_debugdata_goto = vec![false; code.len().max(1)];
     let mut pc = 0usize;
+    let mut prev_non_live: Option<DecodedOp> = None;
     while let Some(d) = crate::jitcode_runtime::decode_op_at(code, pc) {
         starts.push(pc);
+        if is_fresh_frame_debugdata_null_goto(code, &d, prev_non_live.as_ref(), descr_refs) {
+            folded_debugdata_goto[pc] = true;
+        }
+        if !is_live_marker(d.opname) {
+            prev_non_live = Some(d.clone());
+        }
         pc = d.next_pc;
         if pc >= code.len() {
             break;
@@ -2715,20 +3074,26 @@ fn summarize_body_blockers_from(
                     push!(points, work, target, state);
                 }
             }
-            name if name.starts_with("goto_if") => match known_goto_if_taken(code, &d, &known_i) {
-                Some(true) => {
-                    if let Some(target) = label {
-                        push!(points, work, target, state);
-                    }
-                }
-                Some(false) => push!(points, work, d.next_pc, state),
-                None => {
-                    if let Some(target) = label {
-                        push!(points, work, target, state.clone());
-                    }
+            name if name.starts_with("goto_if") => {
+                if folded_debugdata_goto.get(d.pc).copied().unwrap_or(false) {
                     push!(points, work, d.next_pc, state);
+                } else {
+                    match known_goto_if_taken(code, &d, &known_i) {
+                        Some(true) => {
+                            if let Some(target) = label {
+                                push!(points, work, target, state);
+                            }
+                        }
+                        Some(false) => push!(points, work, d.next_pc, state),
+                        None => {
+                            if let Some(target) = label {
+                                push!(points, work, target, state.clone());
+                            }
+                            push!(points, work, d.next_pc, state);
+                        }
+                    }
                 }
-            },
+            }
             "catch_exception" => {
                 // The exception this handler catches can be raised by any op in
                 // the region it protects, so the handler is entered with the
@@ -2822,11 +3187,10 @@ pub(crate) fn exception_string_override_has_nested_call(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
 ) -> bool {
-    let mut pc = 0usize;
-    while pc < body_code.len() {
-        let Some(d) = crate::jitcode_runtime::decode_op_at(body_code, pc) else {
-            return true;
-        };
+    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+        return true;
+    };
+    for d in &ops {
         if d.opname.starts_with("cond_call")
             || d.opname.starts_with("call_assembler")
             || d.opname.starts_with("inline_call")
@@ -2834,12 +3198,11 @@ pub(crate) fn exception_string_override_has_nested_call(
             return true;
         }
         if d.opname.starts_with("residual_call")
-            && residual_call_helper_kind_in_body(body_code, &d, callee_descr_refs)
+            && residual_call_helper_kind_in_body(body_code, d, callee_descr_refs)
                 == Some(majit_ir::RuntimeHelperKind::CallFn)
         {
             return true;
         }
-        pc = d.next_pc;
     }
     false
 }
@@ -5298,36 +5661,37 @@ fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::
     // Resolved after the two lookups above so that a code object without an
     // installed body never caches a verdict computed from an absent one.
     let pjc = crate::state::pyjitcode_for_code(code)?;
-    Some(
-        *pjc.inline_body_facts
-            .get_or_init(|| crate::pyjitcode::InlineBodyFacts {
-                contains_raise: callee_body_contains_raise(body.code),
-                has_abort_permanent: crate::jitcode_runtime::decoded_ops(body.code)
-                    .any(|op| op.opname == "abort_permanent"),
-                exc_override_straight_line: exception_string_override_straight_line(body.code),
-                exc_override_sample_safe: exception_string_override_sample_safe(
-                    body.code,
-                    descr_refs,
-                    body.num_regs_i,
-                    body.constants_i,
-                ),
-                index_sample_safe: index_inline_sample_safe(
-                    body.code,
-                    descr_refs,
-                    body.num_regs_i,
-                    body.constants_i,
-                ),
-                exc_override_has_nested_call: exception_string_override_has_nested_call(
-                    body.code, descr_refs,
-                ),
-                owns_loop_header: callee_body_owns_loop_header(body.code),
-                has_exception_table: unsafe {
-                    let raw = pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
-                        as *const pyre_interpreter::CodeObject;
-                    !raw.is_null() && !(&(*raw).exceptiontable).is_empty()
-                },
-            }),
-    )
+    Some(*pjc.inline_body_facts.get_or_init(|| {
+        crate::pyjitcode::InlineBodyFacts {
+            contains_raise: callee_body_contains_raise(body.code, descr_refs),
+            has_abort_permanent: decoded_ops_on_fresh_frame(body.code, descr_refs)
+                .is_some_and(|ops| ops.iter().any(|op| op.opname == "abort_permanent")),
+            exc_override_straight_line: exception_string_override_straight_line(
+                body.code, descr_refs,
+            ),
+            exc_override_sample_safe: exception_string_override_sample_safe(
+                body.code,
+                descr_refs,
+                body.num_regs_i,
+                body.constants_i,
+            ),
+            index_sample_safe: index_inline_sample_safe(
+                body.code,
+                descr_refs,
+                body.num_regs_i,
+                body.constants_i,
+            ),
+            exc_override_has_nested_call: exception_string_override_has_nested_call(
+                body.code, descr_refs,
+            ),
+            owns_loop_header: callee_body_owns_loop_header(body.code, descr_refs),
+            has_exception_table: unsafe {
+                let raw = pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject;
+                !raw.is_null() && !(&(*raw).exceptiontable).is_empty()
+            },
+        }
+    }))
 }
 
 pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
@@ -5964,15 +6328,13 @@ fn caller_frame_box_for(ctx: &TraceCtx, frame_ptr: usize) -> Option<OpRef> {
 /// (`jitcode_dispatch/mod.rs`) for a trace function and by the green for a
 /// profiler.
 ///
-/// ⛔ Neither of the two gates that USED to hide this is a correctness
-/// argument for it, and neither should be cited as one.
 /// `eval_with_jit_inner` (`pyre-jit/src/eval.rs`) routing every frame for
 /// which `frame_tracing_active` holds to `execute_frame_plain` is a
-/// compilation gate, not a reporting one.  And the portal frame's `debugdata`
-/// guard (`record_portal_debugdata_guard`) is about the CALLER's frame: it
-/// says nothing about a callee whose own `call_trace` / `return_trace` this
-/// walker declines to inline, and it does not fire at all for a global tracer
-/// that leaves the caller's `f_trace` unset.
+/// compilation gate, not a reporting one.  The portal frame's jitted arm
+/// reads that frame's own `debugdata.w_f_trace`; it says nothing about a
+/// callee whose own `call_trace` / `return_trace` this walker declines to
+/// inline, and it does not fire at all for a global tracer that leaves the
+/// caller's `f_trace` unset.
 ///
 /// The escape branch runs in both worlds.  Concretely it marks the caller and
 /// forces the leaving vref; in the trace it records the force as
@@ -7141,7 +7503,7 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
         unsafe {
             let jc = &*sym.jitcode();
             let jc_index = jc.index as u32;
-            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            let marker = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
             // Forward py twin first (#73 phase-3): equals the
             // containing coordinate plus trivia normalization by
             // construction; the containing lookup survives for the
@@ -7743,7 +8105,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         unsafe {
             let jc = &*sym.jitcode();
             let jc_index = jc.index as u32;
-            let marker = jc.payload.resume_marker_for_jitcode_pc(op.pc);
+            let marker = super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc);
             let mut py = jc
                 .payload
                 .forward_py_pc_for_jitcode_pc(op.pc)
@@ -10646,7 +11008,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     );
                     (
                         jc_index,
-                        jc.payload.resume_marker_for_jitcode_pc(op.pc),
+                        super::specialize::collapsed_parent_resume_marker(&jc.payload, op.pc),
                         py_pc as u32,
                     )
                 };
@@ -20252,11 +20614,6 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
         current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
         outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
-        list_iter_class_guard_resume: ctx
-            .frame_state
-            .borrow()
-            .list_iter_class_guard_resume
-            .clone(),
         vstack_boxes: Vec::new(),
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_saved: None,

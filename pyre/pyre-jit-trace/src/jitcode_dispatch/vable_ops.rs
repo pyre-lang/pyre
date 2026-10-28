@@ -692,6 +692,36 @@ fn vable_store_is_stack_push<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, index
         .is_some_and(|(_, value)| matches!(value, Value::Int(depth) if depth == index))
 }
 
+/// Heapcache forward of a scalar vable field read off the inlined callee's
+/// own seeded virtual frame. The constructor and `setfield_vable_*` install
+/// the value under the parent-struct descr `vable_static_record_descr` uses;
+/// a hit is the walker's half of `optimize_getfield_gc` on that virtual
+/// (`virtualize.py`).
+fn seeded_virtual_frame_getfield<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+    descr: &majit_ir::DescrRef,
+) -> Option<OpRef> {
+    let seeded = ctx
+        .frame_state
+        .borrow()
+        .callee_shadow
+        .as_ref()
+        .map(|shadow| shadow.frame_box);
+    if seeded != Some(obj) {
+        return None;
+    }
+    let field_index = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .and_then(|info| {
+            info.static_field_by_descr(descr)
+                .map(|idx| info.static_field_struct_descr(idx).index())
+        })
+        .unwrap_or_else(|| descr.index());
+    ctx.trace_ctx.heapcache_getfield_cached(obj, field_index)
+}
+
 /// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
 /// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
 ///
@@ -754,7 +784,6 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
         return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
     }
     let descr = read_descr(code, op, 1, ctx)?;
-
     // R7 parity: RPython `opimpl_getfield_vable_{i,r,f}(box, fielddescr,
     // pc)` threads orgpc through `_nonstandard_virtualizable(pc, ...)`
     // (pyjitpl.py).  Pyre's walker has the matching
@@ -777,6 +806,18 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     let cpu = crate::pyre_cpu::shared();
     let (result, shadow_value) = with_replace_frames(ctx, |ctx| {
         let nonstandard = walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?;
+        // Seeded virtual callee frame: fold a scalar field through the heapcache
+        // `emit_new_pyframe_inline_with_params` and `setfield_vable_*` install
+        // under the parent-struct descr (`vable_static_record_descr`). Twin of
+        // `getarrayitem_vable_via_metainterp`'s per-slot OpRef shadow: no GC op,
+        // so `last_instr` reads the preceding `setfield_vable_i_imm` and
+        // `debugdata` reads the constructor's PY_NULL. `opimpl_getfield_vable_*`
+        // (`pyjitpl.py`) reaches that heapcache read
+        // through `_nonstandard_virtualizable`; a miss falls through to
+        // `vable_getfield_*_checked`.
+        if nonstandard && let Some(cached) = seeded_virtual_frame_getfield(ctx, obj, &descr) {
+            return Ok((cached, ctx.trace_ctx.concrete_of_opref(cached)));
+        }
         Ok(match dst_bank {
             'i' => ctx.trace_ctx.vable_getfield_int_checked(
                 nonstandard,

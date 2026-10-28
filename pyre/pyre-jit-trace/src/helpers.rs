@@ -1800,9 +1800,9 @@ pub fn emit_box_float_inline(
 /// in a frame the interpreter builds.
 ///
 /// `None` when `w_globals` is not the namespace this frame would answer with:
-/// the emitted frame carries no `debugdata`, so `get_w_globals` on it reads the
-/// code object's published namespace (`pyframe.py get_w_globals`), and a callee
-/// running under a different dictionary needs the override
+/// the emitted frame stores PY_NULL into `debugdata`, so `get_w_globals` on it
+/// reads the code object's published namespace (`pyframe.py get_w_globals`),
+/// and a callee running under a different dictionary needs the override
 /// `createframe_obj` allocates. Callers already decline a global-storing callee
 /// (`pycode.py frame_stores_global`) before they get here; this is the frame
 /// shape's own statement of what it can represent.
@@ -1928,6 +1928,12 @@ pub fn emit_new_pyframe_inline_with_params(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
+    // `pyframe.py` leaves `debugdata` unset (lazily allocated). Store
+    // PY_NULL so a `getfield_vable_r` of that slot on this virtual folds
+    // to the constructor value (`dispatch_bytecode`'s jitted arm) and
+    // `get_w_globals` still takes the null-`debugdata` arm.
+    store_inline_frame_debugdata_null(ctx, new_frame);
+
     let zero = ctx.const_int(0);
     let flags_descr = pyframe_flags_descr();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, zero], flags_descr);
@@ -1962,6 +1968,17 @@ pub fn emit_new_pyframe_inline_with_params(
     // `space.builtin` for an unset slot.
 
     Some(new_frame)
+}
+
+/// `pyframe.py` leaves `debugdata` unset. Record PY_NULL so a later
+/// `getfield_vable_r` of that slot on this virtual folds to the constructor
+/// value (`dispatch_bytecode`'s jitted arm / `goto_if_not_ptr_iszero`).
+fn store_inline_frame_debugdata_null(ctx: &mut TraceCtx, new_frame: OpRef) {
+    let null_ref = ctx.const_ref(0);
+    let debugdata_descr = crate::descr::pyframe_debugdata_descr();
+    let debugdata_idx = debugdata_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], debugdata_descr);
+    ctx.heapcache_setfield_cached(new_frame, debugdata_idx, null_ref);
 }
 
 /// Whether a `debugdata`-less frame for `pycode` answers `w_globals` from
@@ -2077,6 +2094,8 @@ pub fn emit_new_pyframe_inline_self_recursive(
     let last_instr_idx = last_instr_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
+
+    store_inline_frame_debugdata_null(ctx, new_frame);
 
     let zero = ctx.const_int(0);
     let flags_descr = pyframe_flags_descr();
