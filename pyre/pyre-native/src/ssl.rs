@@ -150,6 +150,8 @@ pub struct Context {
     kx_groups: Option<Vec<&'static dyn rustls::crypto::SupportedKxGroup>>,
     /// Schemes from `SSLContext.set_server_sigalgs` (`SSL_CTX_set1_sigalgs_list`).
     server_sigalgs: Option<Vec<rustls::SignatureScheme>>,
+    /// Schemes from `SSLContext.set_client_sigalgs` (`SSL_CTX_set1_client_sigalgs_list`).
+    client_sigalgs: Option<Vec<rustls::SignatureScheme>>,
     certified_keys: Vec<Arc<CertifiedKey>>,
     num_tickets: Option<usize>,
     server_session_store: Arc<dyn rustls::server::StoresServerSessions>,
@@ -309,6 +311,7 @@ impl Context {
             tls13_cipher_suites: None,
             kx_groups: None,
             server_sigalgs: None,
+            client_sigalgs: None,
             certified_keys: Vec::new(),
             num_tickets: None,
             server_session_store: rustls::server::ServerSessionMemoryCache::new(256),
@@ -1937,6 +1940,19 @@ pub unsafe fn context_set_server_sigalgs(
     Ok(())
 }
 
+/// `_ssl__SSLContext_set_client_sigalgs_impl`: `SSL_CTX_set1_client_sigalgs_list`.
+///
+/// # Safety
+/// `context` must point to a live [`Context`].
+#[inline(never)]
+pub unsafe fn context_set_client_sigalgs(
+    context: *mut Context,
+    list: &str,
+) -> Result<(), &'static str> {
+    unsafe { (*context).client_sigalgs = Some(parse_sigalgs(list)?) };
+    Ok(())
+}
+
 #[derive(Debug)]
 struct NoCertificateVerification;
 
@@ -2376,16 +2392,29 @@ impl rustls::sign::SigningKey for RestrictedSigningKey {
     }
 }
 
+fn scheme_allowed(
+    schemes: &[rustls::SignatureScheme],
+    signature: &rustls::DigitallySignedStruct,
+) -> bool {
+    schemes.contains(&signature.scheme)
+}
+
+/// The configured schemes the verifier supports, in the configured order.
+fn restrict_verify_schemes(
+    schemes: &[rustls::SignatureScheme],
+    supported: Vec<rustls::SignatureScheme>,
+) -> Vec<rustls::SignatureScheme> {
+    schemes
+        .iter()
+        .copied()
+        .filter(|scheme| supported.contains(scheme))
+        .collect()
+}
+
 #[derive(Debug)]
 struct RestrictedVerifySchemes {
     inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
     schemes: Vec<rustls::SignatureScheme>,
-}
-
-impl RestrictedVerifySchemes {
-    fn scheme_allowed(&self, signature: &rustls::DigitallySignedStruct) -> bool {
-        self.schemes.contains(&signature.scheme)
-    }
 }
 
 impl rustls::client::danger::ServerCertVerifier for RestrictedVerifySchemes {
@@ -2407,7 +2436,7 @@ impl rustls::client::danger::ServerCertVerifier for RestrictedVerifySchemes {
         cert: &CertificateDer<'_>,
         signature: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if !self.scheme_allowed(signature) {
+        if !scheme_allowed(&self.schemes, signature) {
             return Err(rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
         }
         self.inner.verify_tls12_signature(message, cert, signature)
@@ -2419,18 +2448,14 @@ impl rustls::client::danger::ServerCertVerifier for RestrictedVerifySchemes {
         cert: &CertificateDer<'_>,
         signature: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        if !self.scheme_allowed(signature) {
+        if !scheme_allowed(&self.schemes, signature) {
             return Err(rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
         }
         self.inner.verify_tls13_signature(message, cert, signature)
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner
-            .supported_verify_schemes()
-            .into_iter()
-            .filter(|scheme| self.schemes.contains(scheme))
-            .collect()
+        restrict_verify_schemes(&self.schemes, self.inner.supported_verify_schemes())
     }
 
     fn requires_raw_public_keys(&self) -> bool {
@@ -2448,6 +2473,81 @@ fn restrict_server_verifier(
 ) -> Arc<dyn rustls::client::danger::ServerCertVerifier> {
     match schemes {
         Some(schemes) => Arc::new(RestrictedVerifySchemes {
+            inner: verifier,
+            schemes: schemes.to_vec(),
+        }),
+        None => verifier,
+    }
+}
+
+#[derive(Debug)]
+struct RestrictedClientVerifySchemes {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    schemes: Vec<rustls::SignatureScheme>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for RestrictedClientVerifySchemes {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        self.inner
+            .verify_client_cert(end_entity, intermediates, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        if !scheme_allowed(&self.schemes, signature) {
+            return Err(rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
+        self.inner.verify_tls12_signature(message, cert, signature)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        signature: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        if !scheme_allowed(&self.schemes, signature) {
+            return Err(rustls::PeerMisbehaved::SignedHandshakeWithUnadvertisedSigScheme.into());
+        }
+        self.inner.verify_tls13_signature(message, cert, signature)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        restrict_verify_schemes(&self.schemes, self.inner.supported_verify_schemes())
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+}
+
+fn restrict_client_verifier(
+    verifier: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    schemes: Option<&[rustls::SignatureScheme]>,
+) -> Arc<dyn rustls::server::danger::ClientCertVerifier> {
+    match schemes {
+        Some(schemes) => Arc::new(RestrictedClientVerifySchemes {
             inner: verifier,
             schemes: schemes.to_vec(),
         }),
@@ -2947,12 +3047,15 @@ fn client_config(
             supported,
         )
     };
-    let certified_keys = completed_certified_keys(
-        context,
-        CertificatePurpose::ClientAuth,
-        roots.clone(),
-        root_der.clone(),
-        supported,
+    let certified_keys = restrict_certified_keys(
+        completed_certified_keys(
+            context,
+            CertificatePurpose::ClientAuth,
+            roots.clone(),
+            root_der.clone(),
+            supported,
+        ),
+        context.client_sigalgs.as_deref(),
     );
     let wants_client_cert = if context.verify_mode == CERT_NONE {
         let verifier: Arc<dyn rustls::client::danger::ServerCertVerifier> =
@@ -3077,7 +3180,10 @@ fn server_config(
         .build()
         .map_err(|error| (0, format!("[SSL] cannot build client verifier: {error}")))?;
         (
-            builder.with_client_cert_verifier(verifier),
+            builder.with_client_cert_verifier(restrict_client_verifier(
+                verifier,
+                context.client_sigalgs.as_deref(),
+            )),
             Some(chain_builder),
         )
     };
@@ -4747,6 +4853,40 @@ mod tests {
             let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
                 context_set_server_sigalgs(client, "rsa_pss_rsae_sha256").unwrap();
                 context_set_server_sigalgs(server, "rsa_pss_rsae_sha384").unwrap();
+            });
+            assert!(handshake_pair(client, server, server_ctx).is_err());
+            free_pair(client_ctx, server_ctx, client, server);
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    unsafe fn enable_mutual_auth(client: *mut Context, server: *mut Context) {
+        unsafe {
+            let certdata = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../lib-python/3/test/certdata");
+            let cert_path = certdata.join("keycert3.pem");
+            let ca_path = certdata.join("capath/ceff1710.0");
+            context_load_cert_chain(client, &cert_path, &cert_path, None).unwrap();
+            context_load_verify_file(server, &ca_path).unwrap();
+            context_set_verify_mode(server, CERT_REQUIRED);
+        }
+    }
+
+    #[cfg(feature = "host_env")]
+    #[test]
+    fn client_sigalgs_constrain_client_auth() {
+        unsafe {
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                enable_mutual_auth(client, server);
+                context_set_client_sigalgs(client, "rsa_pss_rsae_sha384").unwrap();
+            });
+            handshake_pair(client, server, server_ctx).unwrap();
+            free_pair(client_ctx, server_ctx, client, server);
+
+            let (client_ctx, server_ctx, client, server) = tls13_pair(|client, server| {
+                enable_mutual_auth(client, server);
+                context_set_client_sigalgs(client, "rsa_pss_rsae_sha256").unwrap();
+                context_set_client_sigalgs(server, "rsa_pss_rsae_sha384").unwrap();
             });
             assert!(handshake_pair(client, server, server_ctx).is_err());
             free_pair(client_ctx, server_ctx, client, server);

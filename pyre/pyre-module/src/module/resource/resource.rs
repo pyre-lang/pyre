@@ -132,6 +132,28 @@ fn rlim_w(obj: pyre_object::PyObjectRef) -> Result<libc::rlim_t, pyre_interprete
     })
 }
 
+/// `RLIM_SAVED_CUR` and `RLIM_SAVED_MAX`, where the host header defines them.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+const RLIM_SAVED: Option<(libc::rlim_t, libc::rlim_t)> =
+    Some((libc::RLIM_SAVED_CUR, libc::RLIM_SAVED_MAX));
+/// `<sys/resource.h>` defines both as `RLIM_INFINITY`; the libc crate does not export them.
+#[cfg(target_vendor = "apple")]
+const RLIM_SAVED: Option<(libc::rlim_t, libc::rlim_t)> =
+    Some((libc::RLIM_INFINITY, libc::RLIM_INFINITY));
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_vendor = "apple"
+)))]
+const RLIM_SAVED: Option<(libc::rlim_t, libc::rlim_t)> = None;
+
 /// resource module — `lib_pypy/resource.py` (PyPy keeps it app-level
 /// via `_resource_cffi`).  pyre takes CPython's `Modules/resource.c`
 /// shape since pyre has no app-level stdlib.
@@ -373,6 +395,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         );
         let mut w_inf = pyre_object::with_roots!(ns => rlim_as_w(host_resource::RLIM_INFINITY));
         pyre_interpreter::__pyre_store!(ns, "RLIM_INFINITY", w_inf);
+        if let Some((saved_cur, saved_max)) = RLIM_SAVED {
+            let mut w_saved_cur = pyre_object::with_roots!(ns => rlim_as_w(saved_cur));
+            pyre_interpreter::__pyre_store!(ns, "RLIM_SAVED_CUR", w_saved_cur);
+            let mut w_saved_max = pyre_object::with_roots!(ns => rlim_as_w(saved_max));
+            pyre_interpreter::__pyre_store!(ns, "RLIM_SAVED_MAX", w_saved_max);
+        }
     }
     Ok(())
 }

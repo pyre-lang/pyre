@@ -2129,54 +2129,6 @@ fn constants_tuple(obj: PyObjectRef, code: &crate::CodeObject) -> PyObjectRef {
     w_tuple_new(constants.take())
 }
 
-fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
-    fn encode_pair(mut address: usize, mut line: i64, out: &mut Vec<u8>) {
-        while address > 255 {
-            out.extend_from_slice(&[255, 0]);
-            address -= 255;
-        }
-        while line < -128 {
-            out.extend_from_slice(&[address as u8, 128]);
-            line += 128;
-            address = 0;
-        }
-        while line > 127 {
-            out.extend_from_slice(&[address as u8, 127]);
-            line -= 127;
-            address = 0;
-        }
-        out.extend_from_slice(&[address as u8, line as i8 as u8]);
-    }
-
-    let mut out = Vec::new();
-    let mut line = firstlineno;
-    let mut start_offset = 0usize;
-    let mut range = PyCodeAddressRange::new(
-        &code.linetable,
-        firstlineno.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-    );
-    while range.advance() {
-        // CPython's `decode_linetable` follows the computed line rather than
-        // `ar_line`, so a NO_LOCATION range does not manufacture a -1 delta.
-        let next_line = range.computed_line as i64;
-        if next_line != line {
-            // `int bdelta = bounds.ar_start - code_offset;` is signed and
-            // wraps upstream. A hand-written `co_linetable` can carry
-            // `ar_end` past `i32` and hand back a start below the previous
-            // one; saturating keeps the byte-delta loop below finite.
-            let offset = range.ar_start as usize;
-            encode_pair(
-                offset.saturating_sub(start_offset),
-                next_line - line,
-                &mut out,
-            );
-            line = next_line;
-            start_offset = offset;
-        }
-    }
-    out
-}
-
 /// `PyCode.typedef` field getters. Each type-dict descriptor delegates here so
 /// the object carries one authoritative compiler `CodeObject`, matching
 /// `pycode.py`'s direct `co_*` attributes rather than a parallel side table.
@@ -2184,27 +2136,6 @@ fn legacy_lnotab(code: &crate::CodeObject, firstlineno: i64) -> Vec<u8> {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn code_get_field(obj: PyObjectRef, name: &str) -> Result<PyObjectRef, crate::PyError> {
-    if name == "co_lnotab" {
-        // CPython 3.14 `code_getlnotab`: issue the warning before decoding or
-        // allocating the bytes result, and propagate warnings-as-errors.
-        unsafe { require_code(obj, name)? };
-        // Warning dispatch can run arbitrary Python, so it is a collection
-        // point.  `obj` arrives as a plain Rust local, which no root walker
-        // scans: pin it on the shadow stack and read it back afterwards, then
-        // reacquire the immutable CodeObject view rather than retaining a Rust
-        // borrow across the re-entrant boundary.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        crate::warn::warn_deprecation("co_lnotab is deprecated, use co_lines instead.")?;
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        let code = unsafe { require_code(obj, name)? };
-        return Ok(pyre_object::bytesobject::w_bytes_from_bytes(
-            &legacy_lnotab(code, unsafe {
-                (*(obj as *const PyCode)).co_firstlineno_raw as i64
-            }),
-        ));
-    }
     let code = unsafe { require_code(obj, name)? };
     Ok(match name {
         "co_argcount" => w_int_new(code.arg_count as i64),

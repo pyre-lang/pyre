@@ -290,6 +290,12 @@ pub unsafe fn context_set_server_sigalgs(
 ) -> Result<(), &'static str> {
     Err(UNAVAILABLE)
 }
+pub unsafe fn context_set_client_sigalgs(
+    _context: *mut Context,
+    _list: &str,
+) -> Result<(), &'static str> {
+    Err(UNAVAILABLE)
+}
 
 pub struct DecodedCertificate;
 

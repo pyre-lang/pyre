@@ -607,6 +607,14 @@ majit_math2_gateway!(copysign, |x, y| {
 majit_math2_gateway!(atan2, |x, y| {
     return _float_atan2(x, y);
 });
+// `math_fmax_impl` / `math_fmin_impl` call libm `fmax` / `fmin`, which are
+// total, including NaN and signed zero.
+majit_math2_gateway!(fmax, |x, y| {
+    return pyre_interpreter::objspace::descroperation::_float_pos(libm_fmax(x, y));
+});
+majit_math2_gateway!(fmin, |x, y| {
+    return pyre_interpreter::objspace::descroperation::_float_pos(libm_fmin(x, y));
+});
 
 /// `floor` / `ceil` / `trunc` on an exact float inside the signed machine
 /// range. `2**63` is the strict upper bound (`i64::MAX` is not a float).
@@ -1011,6 +1019,73 @@ pub fn ulp(args: &[PyObjectRef]) -> PyResult {
 
 // ── 2-arg float→float via pymath ─────────────────────────────────────
 
+// `math_fmax_impl` / `math_fmin_impl` call libm `fmax` / `fmin` so signed
+// zero follows the platform, not `f64::max` / `f64::min`. libc 0.2.186
+// does not export those names.
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg_attr(unix, link(name = "m"))]
+unsafe extern "C" {
+    #[link_name = "fmax"]
+    fn libm_fmax_c(x: f64, y: f64) -> f64;
+    #[link_name = "fmin"]
+    fn libm_fmin_c(x: f64, y: f64) -> f64;
+}
+
+fn libm_fmax(x: f64, y: f64) -> f64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        unsafe { libm_fmax_c(x, y) }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        ieee_fmax(x, y)
+    }
+}
+fn libm_fmin(x: f64, y: f64) -> f64 {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        unsafe { libm_fmin_c(x, y) }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        ieee_fmin(x, y)
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ieee_fmax(x: f64, y: f64) -> f64 {
+    if x.is_nan() {
+        y
+    } else if y.is_nan() {
+        x
+    } else if x < y {
+        y
+    } else if y < x {
+        x
+    } else if x.is_sign_negative() {
+        y
+    } else {
+        x
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn ieee_fmin(x: f64, y: f64) -> f64 {
+    if x.is_nan() {
+        y
+    } else if y.is_nan() {
+        x
+    } else if x < y {
+        x
+    } else if y < x {
+        y
+    } else if x.is_sign_negative() {
+        x
+    } else {
+        y
+    }
+}
+
 /// Domain pin via pymath; box the pymath success value.  The walker
 /// still descends the unboxed two-arg leaf.
 fn math2_pymath(
@@ -1046,6 +1121,18 @@ pub fn fmod(args: &[PyObjectRef]) -> PyResult {
 }
 pub fn copysign(args: &[PyObjectRef]) -> PyResult {
     math2_pymath("copysign", args, pymath::math::copysign)
+}
+fn fmax_libm(x: f64, y: f64) -> Result<f64, pymath::Error> {
+    Ok(libm_fmax(x, y))
+}
+fn fmin_libm(x: f64, y: f64) -> Result<f64, pymath::Error> {
+    Ok(libm_fmin(x, y))
+}
+pub fn fmax(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("fmax", args, fmax_libm)
+}
+pub fn fmin(args: &[PyObjectRef]) -> PyResult {
+    math2_pymath("fmin", args, fmin_libm)
 }
 pub fn remainder(args: &[PyObjectRef]) -> PyResult {
     math2_pymath("remainder", args, pymath::math::remainder)
@@ -1372,6 +1459,33 @@ pub fn isfinite(args: &[PyObjectRef]) -> PyResult {
     Ok(w_bool_from(pymath::math::isfinite(try_get_double(
         args[0],
     )?)))
+}
+
+pub fn isnormal(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "isnormal() takes exactly 1 argument",
+        ));
+    }
+    Ok(w_bool_from(try_get_double(args[0])?.is_normal()))
+}
+
+pub fn issubnormal(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "issubnormal() takes exactly 1 argument",
+        ));
+    }
+    Ok(w_bool_from(try_get_double(args[0])?.is_subnormal()))
+}
+
+pub fn signbit(args: &[PyObjectRef]) -> PyResult {
+    if args.is_empty() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "signbit() takes exactly 1 argument",
+        ));
+    }
+    Ok(w_bool_from(try_get_double(args[0])?.is_sign_negative()))
 }
 
 pub fn isclose(args: &[PyObjectRef]) -> PyResult {

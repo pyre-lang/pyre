@@ -917,8 +917,10 @@ fn convert_value_slow(mut value: PyObjectRef, conv: i64) -> Result<PyObjectRef, 
     // immediate has no `w_class`; `py_str_wtf8` formats it below.
     let tagged =
         pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(value);
-    if !tagged && !value.is_null() && unsafe { pyre_object::is_instance(value) } {
+    if !tagged && !value.is_null() {
         let str_conv = conv == 0 || conv == 3;
+        // `DescrOperation.str` looks up `__str__` on the type for every
+        // object; `object.descr___str__` is skipped inside the helper.
         if str_conv
             && let Some(result) = pyre_object::with_roots!(value =>
                 unsafe { crate::display::try_call_dunder_obj_above_object(value, "__str__") }
@@ -926,7 +928,8 @@ fn convert_value_slow(mut value: PyObjectRef, conv: i64) -> Result<PyObjectRef, 
         {
             return Ok(result);
         }
-        if (str_conv || conv == 1)
+        if unsafe { pyre_object::is_instance(value) }
+            && (str_conv || conv == 1)
             && let Some(result) = pyre_object::with_roots!(value =>
                 unsafe { crate::display::try_call_dunder_obj(value, "__repr__") }
             )?

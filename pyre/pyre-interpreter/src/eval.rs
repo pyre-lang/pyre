@@ -6561,13 +6561,13 @@ impl OpcodeStepExecutor for PyFrame {
     }
 
     // ── ListExtend ──
-    // pypy/interpreter/pyopcode.py LIST_EXTEND — calls
-    // `list.extend(iterable)`; on failure surfaces "Value after * must be
-    // an iterable, not <T>" when the operand isn't iterable, else
-    // re-raises the inner error.
-    fn list_extend(&mut self, _i: usize) -> Result<(), PyError> {
+    // pypy/interpreter/pyopcode.py LIST_EXTEND — pops the iterable and
+    // calls `list.extend(iterable)` on `peekvalue(oparg - 1)`; on failure
+    // surfaces "Value after * must be an iterable, not <T>" when the
+    // operand isn't iterable, else re-raises the inner error.
+    fn list_extend(&mut self, i: usize) -> Result<(), PyError> {
         let iterable = self.pop();
-        let list = self.peek();
+        let list = PyFrame::peek_at(self, i - 1);
         crate::opcode_ops::list_extend_value(list, iterable)
     }
 

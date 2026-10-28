@@ -1259,6 +1259,20 @@ mod context_methods {
                 .map_err(ssl_error)
         }
 
+        /// `_ssl__SSLContext_get_groups_impl`. `SSL_CTX_get0_implemented_groups` needs OpenSSL 3.5;
+        /// `OPENSSL_VERSION_NUMBER` is `0x30000000`, so this raises.
+        fn get_groups(
+            &self,
+            #[kwonly]
+            #[default(false)]
+            include_aliases: bool,
+        ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            let _ = include_aliases;
+            Err(pyre_interpreter::PyError::not_implemented(
+                "Getting implemented groups requires OpenSSL 3.5 or later.",
+            ))
+        }
+
         fn set_server_sigalgs(
             &mut self,
             sigalgslist: PyObjectRef,
@@ -1270,6 +1284,21 @@ mod context_methods {
             }
             let sigalgslist = pyre_interpreter::baseobjspace::str_utf8_w(sigalgslist)?;
             unsafe { pyre_native::ssl::context_set_server_sigalgs(self.backend, sigalgslist) }
+                .map_err(ssl_error)
+        }
+
+        fn set_client_sigalgs(
+            &mut self,
+            sigalgslist: PyObjectRef,
+        ) -> Result<(), pyre_interpreter::PyError> {
+            if !unsafe { is_str(sigalgslist) } {
+                return Err(pyre_interpreter::PyError::type_error(format!(
+                    "set_client_sigalgs() argument must be str, not {}",
+                    pyre_interpreter::type_methods::clinic_arg_type_name(sigalgslist)
+                )));
+            }
+            let sigalgslist = pyre_interpreter::baseobjspace::str_utf8_w(sigalgslist)?;
+            unsafe { pyre_native::ssl::context_set_client_sigalgs(self.backend, sigalgslist) }
                 .map_err(ssl_error)
         }
 

@@ -15,10 +15,17 @@ fn main() {
     println!("cargo:rustc-check-cfg=cfg(clibffi_longdouble)");
     if target_has_clibffi() {
         compile_longdouble_helpers();
+        if !target_is_windows() {
+            compile_complex_type_helpers();
+        }
         if long_double_is_its_own_type() {
             println!("cargo:rustc-cfg=clibffi_longdouble");
         }
     }
+}
+
+fn target_is_windows() -> bool {
+    std::env::var("CARGO_CFG_WINDOWS").is_ok()
 }
 
 fn target_has_clibffi() -> bool {
@@ -54,6 +61,37 @@ double clibffi_longdouble_to_f64(const void *src) {
         .warnings(false)
         .cargo_warnings(false)
         .compile("clibffi_ld");
+}
+
+/// Return the libffi `ffi_type_complex_*` statics by pointer so `elements`
+/// and `type = FFI_TYPE_COMPLEX` survive. Apple's `ffi.h` makes
+/// `ffi_type_complex_longdouble` a macro for `ffi_type_complex_double` on
+/// non-x86, so naming the symbol from Rust would fail to link.
+fn compile_complex_type_helpers() {
+    let out = Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("complex-helpers");
+    if std::fs::create_dir_all(&out).is_err() {
+        return;
+    }
+    let source = out.join("complex.c");
+    let body = r#"
+#if defined(__APPLE__)
+#include <ffi/ffi.h>
+#else
+#include <ffi.h>
+#endif
+ffi_type *clibffi_type_complex_float(void) { return &ffi_type_complex_float; }
+ffi_type *clibffi_type_complex_double(void) { return &ffi_type_complex_double; }
+ffi_type *clibffi_type_complex_longdouble(void) { return &ffi_type_complex_longdouble; }
+"#;
+    if std::fs::write(&source, body).is_err() {
+        return;
+    }
+    cc::Build::new()
+        .file(&source)
+        .out_dir(&out)
+        .warnings(false)
+        .cargo_warnings(false)
+        .compile("clibffi_complex");
 }
 
 /// Whether the target's `long double` is wider than its `double`, which is

@@ -876,14 +876,11 @@ pub(super) fn new_simplecdata_obj(
         // back where it is stored.
         let v_slot = pyre_object::gc_roots::shadow_stack_len();
         let v = pyre_object::gc_roots::pin_root(_value_roots.get(value_slot));
-        let mut bytes = encode_value_into(tc, v, _roots.get(base), "0")?;
-        if unsafe {
+        let swapped = unsafe {
             pyre_interpreter::baseobjspace::lookup_in_type(_roots.get(base + 1), "_swappedbytes_")
         }
-        .is_some()
-        {
-            bytes.reverse();
-        }
+        .is_some();
+        let bytes = encode_simple_swapped(tc, v, _roots.get(base), "0", swapped)?;
         let n = bytes.len().min(size);
         let ba = cdata_buffer(_roots.get(base)).expect("new cdata object has a backing buffer");
         unsafe {
@@ -949,7 +946,7 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     let mut cls = unsafe { pyre_object::w_instance_get_type(obj) };
     let tc =
         type_code_of(cls).ok_or_else(|| pyre_interpreter::PyError::type_error("abstract class"))?;
-    let mut bytes = pyre_object::with_roots!(cls => cdata_bytes(obj))
+    let bytes = pyre_object::with_roots!(cls => cdata_bytes(obj))
         .ok_or_else(|| pyre_interpreter::PyError::type_error("ctypes instance has no buffer"))?;
     // A BSTR carries no swapped spelling — `X` has no entry in the byte-order
     // tables — so it is read before the reversal below could reach it.
@@ -964,12 +961,7 @@ fn value_getter(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
     }
     let swapped =
         unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }.is_some();
-    let owned;
-    if swapped {
-        owned = bytes.iter().rev().copied().collect::<Vec<_>>();
-        bytes = &owned;
-    }
-    decode_slot(&tc, bytes)
+    decode_simple_swapped(&tc, bytes, swapped)
 }
 
 /// `_SimpleCData.value` setter — `(descr, instance, value)`.
@@ -989,14 +981,11 @@ fn set_simple_value(obj: PyObjectRef, value: PyObjectRef) -> Result<(), pyre_int
     // and read the slot back where it is stored.
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[value, obj, cls]);
-    let mut bytes = encode_value_into(&tc, roots.get(base), roots.get(base + 1), "0")?;
-    if unsafe {
+    let swapped = unsafe {
         pyre_interpreter::baseobjspace::lookup_in_type(roots.get(base + 2), "_swappedbytes_")
     }
-    .is_some()
-    {
-        bytes.reverse();
-    }
+    .is_some();
+    let bytes = encode_simple_swapped(&tc, roots.get(base), roots.get(base + 1), "0", swapped)?;
     // `BSTR_set` frees what the slot held only once the new string exists, so
     // a conversion that refuses its value leaves the previous one readable.
     release_bstr_slot(&tc, cdata_addr(roots.get(base + 1)).unwrap_or(0));
@@ -1237,19 +1226,19 @@ pub(super) fn ctype_pep3118_format(cls: PyObjectRef, forced_big: Option<bool>) -
         ParamFunc::Struct => struct_pep3118_format(cls),
         ParamFunc::Union => "B".to_string(),
         _ => {
-            let Some(code) = type_code_of(cls).and_then(|s| s.chars().next()) else {
+            let Some(tc) = type_code_of(cls) else {
                 return "B".to_string();
+            };
+            let pep = match tc.as_char() {
+                Some(code) => cfield::simple_type_pep3118_code(code).to_string(),
+                None => tc.to_string(),
             };
             let big = forced_big.unwrap_or_else(|| {
                 unsafe { pyre_interpreter::baseobjspace::lookup_in_type(cls, "_swappedbytes_") }
                     .is_some()
                     ^ cfg!(target_endian = "big")
             });
-            format!(
-                "{}{}",
-                if big { '>' } else { '<' },
-                cfield::simple_type_pep3118_code(code),
-            )
+            format!("{}{}", if big { '>' } else { '<' }, pep)
         }
     }
 }
@@ -1926,20 +1915,21 @@ pub(super) fn share_objects_for_cast(result: PyObjectRef, source: PyObjectRef) {
 
 // ── type-code metadata (StgInfo equivalent, derived from `_type_`) ─────
 
-/// A ctypes type code: the single character `_type_` names, or the `"void"`
+/// A ctypes type code: the single character `_type_` names, the two-character
+/// C-complex codes (`Zd`/`Zf`/`Zg`), or the `"void"`
 /// [`super::funcptr::build_layout`] gives a zero-sized member.
 ///
 /// It carries its own bytes rather than a `String` because a foreign call
 /// reads one per argument and one for the return value, and a heap allocation
 /// per read is most of what such a call does.
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub(super) struct TypeCode {
+pub struct TypeCode {
     bytes: [u8; Self::CAPACITY],
     len: u8,
 }
 
 impl TypeCode {
-    /// Wide enough for `"void"`; every other code is one character.
+    /// Wide enough for `"void"` and the two-character C-complex codes.
     pub(super) const CAPACITY: usize = 4;
 
     /// The code `text` spells, or `None` when it is longer than any code is.
@@ -1990,8 +1980,8 @@ impl TypeCode {
         core::str::from_utf8(&self.bytes[..self.len as usize]).unwrap_or("")
     }
 
-    /// The one character a simple-type code is, or `None` for `"void"` and the
-    /// empty code.
+    /// The one character a simple-type code is, or `None` for `"void"`, the
+    /// two-character C-complex codes, and the empty code.
     pub(super) fn as_char(&self) -> Option<char> {
         let mut chars = self.as_str().chars();
         chars.next().filter(|_| chars.next().is_none())
@@ -2074,14 +2064,21 @@ pub(super) fn is_pointer_code(code: &str) -> bool {
 }
 
 pub(super) fn invalid_type_code_error() -> pyre_interpreter::PyError {
-    // Mirrors PyCSimpleType_init: an unrecognised `_type_` is an
-    // AttributeError, so `ctypes.__init__`'s complex-type probe
-    // (`try: class c_double_complex(_SimpleCData): _type_="D"; ...
-    // except AttributeError`) is skipped when the code is unsupported.
-    pyre_interpreter::PyError::attribute_error(format!(
-        "class must define a '_type_' attribute which must be a single character string containing one of '{}'",
-        cfield::simple_type_chars(),
-    ))
+    // `PyCSimpleType_init`: an unrecognised `_type_` is an AttributeError, so
+    // `ctypes.__init__`'s `try` around `c_double_complex` is skipped when the
+    // code is unsupported. The two-line form is used when
+    // `_ctypes_get_complex_type_formats` is non-NULL.
+    match cfield::complex_type_formats() {
+        Some(complex) => pyre_interpreter::PyError::attribute_error(format!(
+            "class must define a '_type_' attribute which must be\none of these characters: '{}',\nor one of these strings: {}.",
+            cfield::simple_type_chars(),
+            complex,
+        )),
+        None => pyre_interpreter::PyError::attribute_error(format!(
+            "class must define a '_type_' attribute which must be a single character string containing one of '{}'",
+            cfield::simple_type_chars(),
+        )),
+    }
 }
 
 // ── scalar value ⇄ bytes ──────────────────────────────────────────────
@@ -2119,6 +2116,14 @@ pub(super) fn decode_slot(
     tc: &str,
     bytes: &[u8],
 ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    decode_slot_endian(tc, bytes, false)
+}
+
+pub(super) fn decode_slot_endian(
+    tc: &str,
+    bytes: &[u8],
+    swapped: bool,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
     #[cfg(windows)]
     if tc == "X" {
         return Ok(bstr_to_pyobject(bytes));
@@ -2146,7 +2151,9 @@ pub(super) fn decode_slot(
         Some(size) if size < bytes.len() => &bytes[..size],
         _ => bytes,
     };
-    Ok(decoded_to_pyobject(cfield::decode_type_code(tc, bytes)))
+    Ok(decoded_to_pyobject(cfield::decode_type_code_endian(
+        tc, bytes, swapped,
+    )))
 }
 
 /// Release the BSTR a slot holds before something else is written over it.
@@ -2230,6 +2237,64 @@ pub(super) fn encode_instance_or_value(
     }
 }
 
+/// Same-type copy or `setfunc`, honoring `_swappedbytes_`. C-complex codes
+/// use `Zd_set_sw` / `Zf_set_sw` (per-component); every other code keeps the
+/// whole-buffer reverse.
+pub(super) fn encode_instance_or_value_swapped(
+    tc: &str,
+    value: PyObjectRef,
+    dest: PyObjectRef,
+    key: &str,
+    swapped: bool,
+) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    match same_type_bytes(tc, value) {
+        Some(mut bytes) => {
+            if swapped {
+                if cfield::simple_type_is_complex(tc) {
+                    cfield::swap_complex_components(tc, &mut bytes);
+                } else {
+                    bytes.reverse();
+                }
+            }
+            Ok(bytes)
+        }
+        None => encode_simple_swapped(tc, value, dest, key, swapped),
+    }
+}
+
+fn encode_simple_swapped(
+    tc: &str,
+    value: PyObjectRef,
+    dest: PyObjectRef,
+    key: &str,
+    swapped: bool,
+) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    if cfield::simple_type_is_complex(tc) {
+        encode_value_into_endian(tc, value, dest, key, swapped)
+    } else {
+        let mut bytes = encode_value_into(tc, value, dest, key)?;
+        if swapped {
+            bytes.reverse();
+        }
+        Ok(bytes)
+    }
+}
+
+fn decode_simple_swapped(
+    tc: &str,
+    bytes: &[u8],
+    swapped: bool,
+) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+    if cfield::simple_type_is_complex(tc) {
+        decode_slot_endian(tc, bytes, swapped)
+    } else if swapped {
+        let owned: Vec<u8> = bytes.iter().rev().copied().collect();
+        decode_slot(tc, &owned)
+    } else {
+        decode_slot(tc, bytes)
+    }
+}
+
 /// Encode a Python scalar into the native-endian buffer bytes for `tc`.
 ///
 /// This is the type's own setter (`setfunc`), which takes a value and not a
@@ -2239,6 +2304,14 @@ pub(super) fn encode_instance_or_value(
 pub(super) fn encode_value(
     tc: &str,
     obj: PyObjectRef,
+) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    encode_value_endian(tc, obj, false)
+}
+
+fn encode_value_endian(
+    tc: &str,
+    obj: PyObjectRef,
+    swapped: bool,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     use cfield::SimpleStorageValue as V;
     let val = match tc {
@@ -2271,6 +2344,10 @@ pub(super) fn encode_value(
             V::Signed(pyre_interpreter::baseobjspace::truncatedint_w(indexed)? as i128)
         }
         "f" | "d" | "g" => V::Float(pyre_interpreter::baseobjspace::float_w(obj)?),
+        "Zd" | "Zf" | "Zg" => {
+            let (re, im) = pyre_interpreter::builtins::complex_as_ccomplex(obj)?;
+            V::Complex(re, im)
+        }
         "?" | "v" => V::Bool(pyre_interpreter::baseobjspace::is_true(obj)?),
         "u" => {
             if !unsafe { pyre_object::is_str(obj) } {
@@ -2348,7 +2425,9 @@ pub(super) fn encode_value(
         "O" => V::ObjectId(pyobj_container_add(obj)),
         _ => V::Signed(pyre_interpreter::baseobjspace::int_w(obj)? as i128),
     };
-    Ok(cfield::simple_storage_value_to_bytes_endian(tc, val, false))
+    Ok(cfield::simple_storage_value_to_bytes_endian(
+        tc, val, swapped,
+    ))
 }
 
 /// Encode `value` for storage into slot `key` of `dest`, threading `char*`
@@ -2357,9 +2436,19 @@ pub(super) fn encode_value(
 /// `_objects_`; every other case defers to [`encode_value`].
 pub(super) fn encode_value_into(
     tc: &str,
+    value: PyObjectRef,
+    dest: PyObjectRef,
+    key: &str,
+) -> Result<Vec<u8>, pyre_interpreter::PyError> {
+    encode_value_into_endian(tc, value, dest, key, false)
+}
+
+fn encode_value_into_endian(
+    tc: &str,
     mut value: PyObjectRef,
     mut dest: PyObjectRef,
     key: &str,
+    swapped: bool,
 ) -> Result<Vec<u8>, pyre_interpreter::PyError> {
     if tc == "z" && unsafe { pyre_object::is_bytes(value) } {
         let raw = unsafe { pyre_object::bytesobject::w_bytes_data(value) };
@@ -2378,7 +2467,7 @@ pub(super) fn encode_value_into(
         return Ok(cfield::simple_storage_value_to_bytes_endian(
             tc,
             cfield::SimpleStorageValue::Pointer(addr),
-            false,
+            swapped,
         ));
     }
     if tc == "Z" && unsafe { pyre_object::is_str(value) } {
@@ -2396,10 +2485,10 @@ pub(super) fn encode_value_into(
         return Ok(cfield::simple_storage_value_to_bytes_endian(
             tc,
             cfield::SimpleStorageValue::Pointer(addr),
-            false,
+            swapped,
         ));
     }
-    encode_value(tc, value)
+    encode_value_endian(tc, value, swapped)
 }
 
 /// A `u64` as a non-negative Python integer: an `int` while it fits `i64`, a
@@ -2421,6 +2510,7 @@ pub(super) fn decoded_to_pyobject(d: cfield::DecodedValue) -> PyObjectRef {
         D::Signed(i) => pyre_object::w_int_new(i),
         D::Unsigned(u) => u64_to_pyobject(u),
         D::Float(f) => pyre_object::w_float_new(f),
+        D::Complex(re, im) => pyre_object::w_complex_new(re, im),
         D::Bool(b) => pyre_object::w_bool_from(b),
         D::Pointer(p) => u64_to_pyobject(p as u64),
         D::String(s) => pyre_object::w_str_new_managed(&s),

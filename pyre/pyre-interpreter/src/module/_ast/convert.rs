@@ -248,6 +248,8 @@ pub fn check_func_type_ast(mut object: PyObjectRef) -> Result<(), crate::PyError
         depth: 0,
         carried_ignores: Vec::new(),
         line_len: 0,
+        lines: Vec::new(),
+        columns: Vec::new(),
         locations: core::cell::RefCell::new(None),
     };
     pyre_object::with_roots!(object => converter.check_root_mode(object, "FunctionType"))
@@ -279,13 +281,14 @@ pub fn compile_object(
         depth: 0,
         carried_ignores: Vec::new(),
         line_len: 0,
+        lines: Vec::new(),
+        columns: Vec::new(),
         locations: core::cell::RefCell::new(None),
     };
     pyre_object::with_roots!(object => converter.validate_module_mode(object, mode))?;
-    // The compiler reads a node's position out of the source text the range
-    // indexes, so a tree that came from objects needs a text to index.  Stand
-    // one up whose lines are wide enough for every column the tree names; the
-    // characters are never read, only counted.
+    // A tree that came from objects still needs a text whose ranges keep the
+    // order of positions and which of them share a line.  The coordinates
+    // themselves come from the location table.
     let text = pyre_object::with_roots!(object => converter.synthetic_source(object))?;
     let module = converter.module(object)?;
     // compiling.py:73 — the tree is walked before it reaches the compiler.
@@ -405,12 +408,13 @@ pub fn preprocess_object_to_object(
         depth: 0,
         carried_ignores: Vec::new(),
         line_len: 0,
+        lines: Vec::new(),
+        columns: Vec::new(),
         locations: core::cell::RefCell::new(None),
     };
-    // Both directions have to read positions out of the same text, and a tree
-    // handed in as objects arrives without one.  The synthetic source stands
-    // in for it so the round trip gives every node back the line and column it
-    // came with.
+    // A tree handed in as objects arrives without a text.  The synthetic
+    // source keeps the order of positions and which share a line; the
+    // coordinates themselves come from the location table.
     let synthetic =
         pyre_object::with_roots!(ast_module, object => converter.synthetic_source(object))?;
     let mut module = pyre_object::with_roots!(ast_module => converter.module(object))?;
@@ -440,9 +444,13 @@ struct ObjectConverter {
     /// The `TypeIgnore`s the incoming `Module` carried. The compiler AST has
     /// no field for them, so they ride here and are republished unchanged.
     carried_ignores: Vec<super::type_comments::TypeComment>,
-    /// Characters on each line of the synthetic source, excluding the newline.
+    /// Characters per synthetic line, `columns.len() + 1`.
     /// Zero until `synthetic_source` has measured the tree.
     line_len: usize,
+    /// Distinct positive line numbers the tree names, sorted; line `lines[i]` is synthetic line `i + 1`.
+    lines: Vec<i64>,
+    /// Distinct positive columns the tree names, sorted; column `columns[i]` is synthetic column `i + 1`.
+    columns: Vec<i64>,
     /// Signed Python coordinates for nodes converted from objects.  Parser
     /// `TextRange`s cannot store lineno 0 or a negative column; the compiler
     /// reads this table through each node's `node_index`.
@@ -516,34 +524,44 @@ impl ObjectConverter {
         )))
     }
 
-    /// Blank text with a line for every line the tree names and columns for
-    /// the widest of them, so that `location` can turn a node's `lineno` and
-    /// `col_offset` into an offset the compiler can map back.
+    /// Blank text with one line per distinct line the tree names and one
+    /// column per distinct column, in sorted order, so ranges keep order and
+    /// same-line identity.  The real coordinates come from the location table.
     fn synthetic_source(&mut self, object: PyObjectRef) -> AstResult<String> {
-        let mut extent = (0usize, 0usize);
+        let mut extent = (Vec::new(), Vec::new());
         self.scan_extent(object, &mut extent)?;
-        let (max_line, max_col) = extent;
-        if max_line == 0 {
+        let (mut lines, mut columns) = extent;
+        lines.sort_unstable();
+        lines.dedup();
+        columns.sort_unstable();
+        columns.dedup();
+        self.lines = lines;
+        self.columns = columns;
+        if self.lines.is_empty() {
             return Ok(String::new());
         }
-        self.line_len = max_col.saturating_add(1);
+        self.line_len = self.columns.len() + 1;
         let mut source = String::new();
         let width = self.line_len.saturating_add(1);
         source
-            .try_reserve(width.saturating_mul(max_line))
+            .try_reserve(width.saturating_mul(self.lines.len()))
             .map_err(|_| crate::PyError::memory_error("source location is too large"))?;
-        for _ in 0..max_line {
+        for _ in 0..self.lines.len() {
             source.extend(core::iter::repeat_n(' ', self.line_len));
             source.push('\n');
         }
         Ok(source)
     }
 
-    /// Widen `extent` to the last line and rightmost column any node in the
-    /// tree claims.  The walk is over `_fields` rather than the typed
-    /// conversion below, because it runs before anything has been validated
-    /// and must not reject a tree the converter would go on to accept.
-    fn scan_extent(&mut self, object: PyObjectRef, extent: &mut (usize, usize)) -> AstResult<()> {
+    /// Collect every positive line and column any node in the tree claims.
+    /// The walk is over `_fields` rather than the typed conversion below,
+    /// because it runs before anything has been validated and must not reject
+    /// a tree the converter would go on to accept.
+    fn scan_extent(
+        &mut self,
+        object: PyObjectRef,
+        extent: &mut (Vec<i64>, Vec<i64>),
+    ) -> AstResult<()> {
         if unsafe { pyre_object::is_list(object) } {
             let items = unsafe {
                 pyre_object::w_list_items_copy_as_vec_mode(
@@ -584,7 +602,7 @@ impl ObjectConverter {
             )? && let Ok(line) = self.obj_to_int(value)
                 && line > 0
             {
-                extent.0 = extent.0.max(line as usize);
+                extent.0.push(line);
             }
             if let Some(value) = self.optional_field(
                 pyre_object::gc_roots::shadow_stack_get(obj_slot),
@@ -592,7 +610,7 @@ impl ObjectConverter {
             )? && let Ok(column) = self.obj_to_int(value)
                 && column > 0
             {
-                extent.1 = extent.1.max(column as usize);
+                extent.1.push(column);
             }
         }
         let Some(fields) =
@@ -624,13 +642,31 @@ impl ObjectConverter {
         Ok(())
     }
 
-    /// Offset of a one-based line and a zero-based column in the synthetic
-    /// source, clamped to the line it names.
+    /// Offset of a one-based line and a zero-based column in the rank-compressed
+    /// synthetic source.  A value the scan did not see lands on the nearest
+    /// lower rank so the mapping stays monotonic.
     fn offset_of(&self, line: i64, column: i64) -> u32 {
-        let line = usize::try_from(line).unwrap_or(1).max(1);
-        let column = usize::try_from(column).unwrap_or(0).min(self.line_len);
+        let line_rank = if line <= 0 {
+            1
+        } else {
+            match self.lines.binary_search(&line) {
+                Ok(i) => i + 1,
+                Err(i) => i.max(1),
+            }
+        };
+        let column_rank = if column <= 0 {
+            0
+        } else {
+            match self.columns.binary_search(&column) {
+                Ok(i) => i + 1,
+                Err(i) => i,
+            }
+        }
+        .min(self.line_len);
         let width = self.line_len.saturating_add(1);
-        let offset = (line - 1).saturating_mul(width).saturating_add(column);
+        let offset = (line_rank - 1)
+            .saturating_mul(width)
+            .saturating_add(column_rank);
         u32::try_from(offset).unwrap_or(u32::MAX)
     }
 

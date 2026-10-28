@@ -680,7 +680,7 @@ fn simple_init_stginfo(mut cls: PyObjectRef) -> PyResult {
     // Judged on what the class declared, not on the code it was read as: a
     // declaration too long to be one reads back as no code, which is what an
     // abstract intermediate looks like too.
-    if declared.chars().count() != 1 || !cfield::simple_type_chars().contains(declared) {
+    if !cfield::simple_type_code_accepted(declared) {
         return Err(cdata::invalid_type_code_error());
     }
     let tc = cdata::TypeCode::new(declared).ok_or_else(cdata::invalid_type_code_error)?;
@@ -696,7 +696,7 @@ fn simple_init_stginfo(mut cls: PyObjectRef) -> PyResult {
 
     let endian_capable = matches!(
         tc.as_str(),
-        "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L" | "q" | "Q" | "f" | "d" | "g"
+        "b" | "B" | "h" | "H" | "i" | "I" | "l" | "L" | "q" | "Q" | "f" | "d" | "g" | "Zd" | "Zf"
     );
     if endian_capable && size == 1 {
         pyre_object::with_roots!(cls => {
@@ -1665,7 +1665,8 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
             let start = offset.min(all.len());
             let end = (offset + size).min(all.len());
             let mut field_bytes = all[start..end].to_vec();
-            if field_needs_swap(obj, proto, size) {
+            let swapped = field_needs_swap(obj, proto, size);
+            if swapped && !cfield::simple_type_is_complex(&tc) {
                 field_bytes.reverse();
             }
             if pyre_object::with_roots!(cfield => cf_bool(cfield, "is_bitfield")) {
@@ -1687,7 +1688,11 @@ fn cfield_get(args: &[PyObjectRef]) -> PyResult {
                 }
                 return Ok(pyre_object::longobject::w_long_new(BigInt::from(raw)));
             }
-            cdata::decode_slot(&tc, &field_bytes)
+            if cfield::simple_type_is_complex(&tc) {
+                cdata::decode_slot_endian(&tc, &field_bytes, swapped)
+            } else {
+                cdata::decode_slot(&tc, &field_bytes)
+            }
         }
         ParamFunc::Array => {
             let element = stginfo::stginfo_of(proto).and_then(stginfo::stginfo_proto);
@@ -1779,15 +1784,14 @@ fn cfield_set(args: &[PyObjectRef]) -> PyResult {
             // across that call; later reads use the slots.
             let _roots = pyre_object::gc_roots::push_roots();
             let base = _roots.pin_roots(&[value, obj, proto]);
-            let mut bytes = cdata::encode_instance_or_value(
+            let swapped = field_needs_swap(_roots.get(base + 1), _roots.get(base + 2), size);
+            let bytes = cdata::encode_instance_or_value_swapped(
                 &tc,
                 _roots.get(base),
                 _roots.get(base + 1),
                 &index.to_string(),
+                swapped,
             )?;
-            if field_needs_swap(_roots.get(base + 1), _roots.get(base + 2), size) {
-                bytes.reverse();
-            }
             cdata::release_bstr_slot(
                 &tc,
                 cdata::cdata_addr(_roots.get(base + 1)).unwrap_or(0) + offset,

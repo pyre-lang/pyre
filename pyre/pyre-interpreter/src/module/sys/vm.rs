@@ -2804,6 +2804,27 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::baseobjspace::setdictvalue_native(roots.get(impl_slot), "_multiarch", multiarch);
         module_ns_store(roots.get(ns_slot), "implementation", roots.get(impl_slot));
     }
+    // sys.abi_info — `make_abi_info`.
+    {
+        let abi_obj = w_instance_new(simple_namespace_type());
+        let abi_slot = roots.pin_roots(&[abi_obj]);
+        let pointer_bits = w_int_new(usize::BITS as i64);
+        crate::baseobjspace::setdictvalue_native(roots.get(abi_slot), "pointer_bits", pointer_bits);
+        // pyre stores `sys.abiflags == "t"` and `Py_GIL_DISABLED == 1`.
+        let free_threaded = w_bool_from(true);
+        crate::baseobjspace::setdictvalue_native(
+            roots.get(abi_slot),
+            "free_threaded",
+            free_threaded,
+        );
+        // `sysconfig` `Py_DEBUG == 0`.
+        let debug = w_bool_from(false);
+        crate::baseobjspace::setdictvalue_native(roots.get(abi_slot), "debug", debug);
+        let byteorder = crate::runtime_ops::module_ns_get(roots.get(ns_slot), "byteorder")
+            .expect("sys.byteorder was installed above");
+        crate::baseobjspace::setdictvalue_native(roots.get(abi_slot), "byteorder", byteorder);
+        module_ns_store(roots.get(ns_slot), "abi_info", roots.get(abi_slot));
+    }
     // `system.py:get_hash_info|get_float_info|get_thread_info|get_int_info`:
     // these values are instances of their named structseq classes, not
     // namespace-shaped records. Tuple storage is observable through indexing,

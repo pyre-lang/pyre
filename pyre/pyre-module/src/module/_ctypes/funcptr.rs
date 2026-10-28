@@ -3237,10 +3237,7 @@ pub(super) fn build_layout(mut t: PyObjectRef) -> Result<CTypeLayout, pyre_inter
             let tc = cdata::type_code_of(t).ok_or_else(|| {
                 pyre_interpreter::PyError::type_error("simple type has no '_type_'")
             })?;
-            let ch = tc
-                .as_char()
-                .ok_or_else(|| pyre_interpreter::PyError::type_error("empty '_type_' code"))?;
-            Ok(CTypeLayout::Simple(ch))
+            Ok(CTypeLayout::Simple(tc))
         }
         ParamFunc::Pointer => Ok(CTypeLayout::Pointer),
         ParamFunc::Array => {

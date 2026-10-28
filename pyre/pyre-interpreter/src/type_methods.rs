@@ -7133,6 +7133,44 @@ fn dict_update1_dict_dict_store(
     }
 }
 
+/// `PyMapping_Keys` / `method_output_as_list`: obtain an iterator over a
+/// mapping's `keys()` result. A `TypeError` from `iter` (not from later
+/// iteration) is replaced by `"%T.keys() must return an iterable, not %T"`,
+/// where the first `%T` is the fully-qualified type of the mapping operand
+/// and the second that of the `keys()` result.
+pub(crate) fn iter_mapping_keys(w_obj: PyObjectRef, w_keys: PyObjectRef) -> crate::PyResult {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let sp = _roots.pin_roots(&[w_obj, w_keys]);
+    match crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(sp + 1)) {
+        Ok(it) => Ok(it),
+        Err(err) if err.kind == crate::PyErrorKind::TypeError => {
+            let w_obj = pyre_object::gc_roots::shadow_stack_get(sp);
+            let w_keys = pyre_object::gc_roots::shadow_stack_get(sp + 1);
+            Err(crate::PyError::type_error(crate::display::wtf8_format!(
+                unsafe { crate::display::type_fully_qualified_name_of(w_obj) },
+                ".keys() must return an iterable, not ",
+                unsafe { crate::display::type_fully_qualified_name_of(w_keys) },
+            )))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+/// `PyMapping_Keys` / `method_output_as_list`: collect a mapping's `keys()`
+/// result into a list. An exact `list` (`is_exact_list`) is returned through
+/// `listview`; a list subclass is not exact. Otherwise the result is iterated
+/// through [`iter_mapping_keys`] and collected.
+pub(crate) fn mapping_keys_listview(
+    w_obj: PyObjectRef,
+    w_keys: PyObjectRef,
+) -> Result<Vec<PyObjectRef>, crate::PyError> {
+    if unsafe { is_exact_list(w_keys) } {
+        crate::baseobjspace::listview(w_keys, -1)
+    } else {
+        crate::baseobjspace::listview(iter_mapping_keys(w_obj, w_keys)?, -1)
+    }
+}
+
 /// `dictmultiobject.py update1_keys` —
 /// `for k in o.keys(): dict.__setitem__(d, k, o[k])`.
 fn dict_update1_keys(
@@ -7147,8 +7185,11 @@ fn dict_update1_keys(
     // [3.14-spec] dictmultiobject.py update1_keys iterates w_keys lazily; CPython v3.14.6 dict_merge
     // takes PyMapping_Keys (a list) first (measured: keys() generator side effects all precede the
     // first __getitem__). Engineered as space.listview(w_keys) + the update1_keys loop.
-    let keys =
-        crate::baseobjspace::listview(pyre_object::gc_roots::shadow_stack_get(root_base + 2), -1)?;
+    // The keys() result is read through `mapping_keys_listview` (`PyMapping_Keys`).
+    let keys = mapping_keys_listview(
+        data(),
+        pyre_object::gc_roots::shadow_stack_get(root_base + 2),
+    )?;
     let keys_base = pyre_object::gc_roots::pin_roots(&keys);
     let key_len = keys.len();
     for i in 0..key_len {

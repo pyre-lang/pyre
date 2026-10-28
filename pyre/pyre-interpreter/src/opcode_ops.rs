@@ -934,7 +934,7 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
     let source_now = || pyre_object::gc_roots::shadow_stack_get(sp + 1);
     let keys_method = crate::baseobjspace::getattr_str(source_now(), "keys")?;
     let keys_obj = crate::call::call_function_impl_result(keys_method, &[])?;
-    let keys = crate::builtins::collect_iterable(keys_obj)?;
+    let keys = crate::type_methods::mapping_keys_listview(source_now(), keys_obj)?;
     unsafe {
         // A generic mapping's keys are not pre-validated the way a dict's
         // are (`update1` above copies from the backing mapping) —
@@ -964,22 +964,33 @@ pub fn dict_update(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError
     Ok(())
 }
 
-/// DICT_UPDATE — `PyDict_Update`, then the handler's own rewrite: an
+/// DICT_UPDATE — `PyDict_Update`, then `_DICT_UPDATE`'s rewrite: an
 /// `AttributeError` the update surfaced is reported as `'<T>' object is not a
-/// mapping`.  `inst(DICT_UPDATE)` draws that line *after* the update rather
-/// than before it, so a user `keys()` raising `AttributeError` reads the same
-/// way; `PyFrame.DICT_UPDATE` gates `space.ismapping_w` ahead of the call
-/// instead and lets such an error through.  Shared by the interpreter's
-/// `dict_update` and the JIT residual `bh_dict_update_fn`.
+/// mapping` only when the operand has no `keys` (`PyObject_HasAttrWithError`).
+/// When `keys` is present the original `AttributeError` propagates; when the
+/// lookup itself raises a non-`AttributeError`, that error propagates.
+/// Shared by the interpreter's `dict_update` and the JIT residual
+/// `bh_dict_update_fn`.
 pub fn dict_update_value(dict: PyObjectRef, source: PyObjectRef) -> Result<(), PyError> {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.pin_roots(&[dict, source]);
     match dict_update(roots.get(base), roots.get(base + 1)) {
         Err(e) if e.kind == crate::PyErrorKind::AttributeError => {
-            // The update ran Python, so the operand is named at the address it
-            // has now rather than the one the call was made with.  `%T` is the
-            // Python-visible class: a class deriving from a builtin shares that
-            // builtin's storage while presenting its own name.
+            // `_DICT_UPDATE`: after the merge fails with an AttributeError,
+            // look up `keys` on the operand (`PyObject_HasAttrWithError`).
+            // Absent → "'%T' object is not a mapping"; present → original
+            // AttributeError; a non-AttributeError from the lookup propagates.
+            let mut e = e;
+            let e_slot = e.pin(&roots);
+            match crate::baseobjspace::getattr_str_impl(roots.get(base + 1), "keys", true, true) {
+                Ok(value) if value.is_null() => {}
+                Err(e2) if e2.kind == crate::PyErrorKind::AttributeError => {}
+                Ok(_) => {
+                    e.reload(&roots, e_slot);
+                    return Err(e);
+                }
+                Err(e2) => return Err(e2),
+            }
             let type_name = crate::error::type_name_of(roots.get(base + 1));
             Err(PyError::type_error(format!(
                 "'{type_name}' object is not a mapping"
@@ -1033,16 +1044,10 @@ pub fn dict_merge_value(
     let source_is_dict = unsafe { crate::baseobjspace::isinstance_w(source(), w_dict_type()) };
     if !source_is_dict {
         unroll_safe = false;
-        // [3.15-spec] `_PyEval_FormatKwargsError` / DICT_MERGE formats
-        // "Value after ** must be a mapping, not %T" with no function-name
-        // prefix. pyopcode.py `_dict_merge` uses `raise_type_error` /
-        // `"%s argument after ** must be a mapping, not %T"`.
-        if !crate::baseobjspace::ismapping_w(source()) {
-            return Err(crate::argument::type_error_oefmt(
-                "Value after ** must be a mapping, not %T",
-                &[crate::error::FmtArg::Obj(source())],
-            ));
-        }
+        // [3.15-spec] pyopcode.py _dict_merge rejects a non-mapping up front with ismapping_w; _DICT_MERGE has no
+        // pre-check and _PyEval_FormatKwargsError rewrites only an AttributeError from an operand without `keys`
+        // (an object with keys() but no __getitem__ fails in __getitem__ instead), so the check is left to the
+        // `keys` lookup in _dict_merge_loop.
     } else {
         // `pyopcode.py _dict_merge`: an empty target calls `update1`
         // (`dictmultiobject.py`), which copies a dict subclass whose
@@ -1106,8 +1111,10 @@ fn _dict_merge_loop(
     )?;
     let keys_obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(keys_obj);
-    let w_iterator =
-        crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(keys_obj_slot))?;
+    let w_iterator = crate::type_methods::iter_mapping_keys(
+        source(),
+        pyre_object::gc_roots::shadow_stack_get(keys_obj_slot),
+    )?;
     let iter_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_iterator);
     loop {

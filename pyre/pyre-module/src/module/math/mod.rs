@@ -30,15 +30,19 @@ pyre_interpreter::py_module! {
         // Rounding / truncation: floor/ceil/trunc are installed in `extra_init`.
 
         // Floating-point manipulation. `fabs`, `ulp`, `frexp`, `ldexp`,
-        // `fmod`, `copysign` and `remainder` are installed in `extra_init`.
+        // `fmod`, `copysign`, `remainder`, `fmax` and `fmin` are installed
+        // in `extra_init`.
         "modf"      / 1 = m::modf,
         "nextafter" / * = m::nextafter; pyre_interpreter::Signature::new(vec!["x", "y", "steps"], None, None, 1, 2),
         "fma"       / 3 = m::fma,
 
         // Classification. `isclose` is installed in `extra_init`.
-        "isinf"    / 1 = m::isinf,
-        "isnan"    / 1 = m::isnan,
-        "isfinite" / 1 = m::isfinite,
+        "isinf"        / 1 = m::isinf,
+        "isnan"        / 1 = m::isnan,
+        "isfinite"     / 1 = m::isfinite,
+        "isnormal"     / 1 = m::isnormal,
+        "issubnormal"  / 1 = m::issubnormal,
+        "signbit"      / 1 = m::signbit,
 
         // Conversion. `degrees` and `radians` are installed in `extra_init`.
 
@@ -148,6 +152,8 @@ pyre_interpreter::py_module! {
         ns = install2(ns, "fmod", m::__majit_wrap_math_fmod);
         ns = install2(ns, "copysign", m::__majit_wrap_math_copysign);
         ns = install2(ns, "remainder", m::__majit_wrap_math_remainder);
+        ns = install2(ns, "fmax", m::__majit_wrap_math_fmax);
+        ns = install2(ns, "fmin", m::__majit_wrap_math_fmin);
         ns = install2(ns, "atan2", m::__majit_wrap_math_atan2);
         ns = install2(ns, "ldexp", m::__majit_wrap_math_ldexp);
         // Trailing defaults live on `Function.defs_w` / `w_kw_defs`

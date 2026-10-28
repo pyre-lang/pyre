@@ -13985,6 +13985,14 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     } {
         return crate::runtime_ops::obj_or_memory_error(unsafe { pyre_object::descr_str(obj) });
     }
+    // `descroperation.py` `str`: remaining TypeDef / `pyre_methods` `__str__`
+    // after the builtin leaves above. Returns the app-level object;
+    // `py_str_wtf8` below is the WTF-8 formatter.
+    if let Some(r) = pyre_object::with_roots!(obj => unsafe {
+        crate::display::try_call_dunder_obj_above_object(obj, "__str__")
+    })? {
+        return Ok(r);
+    }
     let w = unsafe { crate::py_str_wtf8(obj)? };
     // `StdObjSpace.str` returns the ordinary movable `space.newtext` result.
     // The input is fully consumed above, so only the newly built WTF-8 value
@@ -27609,7 +27617,8 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
 
 /// `PyComplex_AsCComplex`: a complex (subclass included) keeps its lanes,
 /// then `__complex__` when the type defines it, then `PyFloat_AsDouble` for
-/// the real lane. Every error propagates unchanged.
+/// the real lane: `__float__`, else `__index__`. Every error propagates
+/// unchanged.
 pub fn complex_as_ccomplex(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     unsafe {
         if pyre_object::is_complex(obj) {
@@ -27622,6 +27631,18 @@ pub fn complex_as_ccomplex(obj: PyObjectRef) -> Result<(f64, f64), crate::PyErro
     let mut obj = obj;
     if let Some(lanes) = pyre_object::with_roots!(obj => try_complex_special_method(obj))? {
         return Ok(lanes);
+    }
+    // `PyFloat_AsDouble`: `__float__` first, else `__index__` then
+    // `PyLong_AsDouble`. `space.float_w` does not consult `__index__`.
+    let use_index = unsafe {
+        pyre_object::with_roots!(obj => {
+            crate::baseobjspace::lookup(obj, "__float__").is_none()
+                && crate::baseobjspace::lookup(obj, "__index__").is_some()
+        })
+    };
+    if use_index {
+        let w_int = pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj))?;
+        return Ok((crate::baseobjspace::float_w(w_int)?, 0.0));
     }
     Ok((crate::baseobjspace::float_w(obj)?, 0.0))
 }

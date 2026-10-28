@@ -323,6 +323,257 @@ pub(super) fn is_normalized(args: &[PyObjectRef]) -> PyResult {
     Ok(w_bool_from(ucd_core::is_normalized(form, text)))
 }
 
+/// `unicodedata.isxidstart` — `XID_Start`. A lone surrogate is not a `char`,
+/// so the predicate is false (`CodePoint::to_char`).
+pub(super) fn isxidstart(args: &[PyObjectRef]) -> PyResult {
+    Ok(w_bool_from(
+        one_char("isxidstart", args)?
+            .to_char()
+            .map(ucd_core::identifier::is_xid_start)
+            .unwrap_or(false),
+    ))
+}
+
+/// `unicodedata.isxidcontinue` — `XID_Continue`. Same lone-surrogate rule as
+/// [`isxidstart`].
+pub(super) fn isxidcontinue(args: &[PyObjectRef]) -> PyResult {
+    Ok(w_bool_from(
+        one_char("isxidcontinue", args)?
+            .to_char()
+            .map(ucd_core::identifier::is_xid_continue)
+            .unwrap_or(false),
+    ))
+}
+
+pub(super) fn grapheme_cluster_break(args: &[PyObjectRef]) -> PyResult {
+    Ok(w_str_new_managed(
+        ucd_core::grapheme::grapheme_cluster_break(one_char("grapheme_cluster_break", args)?),
+    ))
+}
+
+pub(super) fn indic_conjunct_break(args: &[PyObjectRef]) -> PyResult {
+    Ok(w_str_new_managed(ucd_core::grapheme::indic_conjunct_break(
+        one_char("indic_conjunct_break", args)?,
+    )))
+}
+
+pub(super) fn extended_pictographic(args: &[PyObjectRef]) -> PyResult {
+    Ok(w_bool_from(ucd_core::grapheme::extended_pictographic(
+        one_char("extended_pictographic", args)?,
+    )))
+}
+
+/// Cursor for [`W_GraphemeBreakIterator`] (`GraphemePosition` in
+/// `iter_graphemes`). `state.advance` reports a boundary *before* the
+/// consumed code point.
+struct GraphemePosition {
+    start: usize,
+    start_byte: usize,
+    pos: usize,
+    pos_byte: usize,
+    end: usize,
+    end_byte: usize,
+    state: ucd_core::grapheme::GraphemeBreakState,
+}
+
+/// A grapheme cluster as code-point indices into the parent `str`.
+/// Instantiation is refused (`w_type_set_disallow_instantiation`).
+#[pyre_interpreter::pyre_class("unicodedata.Segment", cpython_heaptype)]
+pub struct W_Segment {
+    string: PyObjectRef,
+    start: usize,
+    end: usize,
+    bytes: core::ops::Range<usize>,
+}
+
+pub(super) mod segment_class {
+    use super::*;
+
+    #[pyre_interpreter::pyre_methods]
+    impl W_Segment {
+        #[getter]
+        fn start(&self) -> usize {
+            self.start
+        }
+
+        #[getter]
+        fn end(&self) -> usize {
+            self.end
+        }
+
+        fn __str__(&self) -> PyObjectRef {
+            // `W_UnicodeObject(self._utf8[start:end], length)`: the slice roots its source across the allocation.
+            let length = self.end - self.start;
+            let utf8 = unsafe { w_str_storage(self.string) };
+            let sliced = pyre_object::lowlevel_string::ll_stringslice_startstop(
+                utf8,
+                self.bytes.start as i64,
+                self.bytes.end as i64,
+            );
+            w_str_from_storage_and_length(sliced, length)
+        }
+
+        fn __repr__(&self) -> String {
+            format!("<Segment {}:{}>", self.start, self.end)
+        }
+    }
+}
+
+/// Extended-grapheme-cluster iterator over a `str` window.
+/// Instantiation is refused (`w_type_set_disallow_instantiation`).
+#[pyre_interpreter::pyre_class("unicodedata.GraphemeBreakIterator", cpython_heaptype)]
+pub struct W_GraphemeBreakIterator {
+    string: PyObjectRef,
+    position: GraphemePosition,
+}
+
+pub(super) mod grapheme_iter_class {
+    use super::*;
+
+    #[pyre_interpreter::pyre_methods]
+    impl W_GraphemeBreakIterator {
+        fn __iter__(&self, args: &[PyObjectRef]) -> PyObjectRef {
+            args[0]
+        }
+
+        fn __next__(&mut self) -> Result<PyObjectRef, PyError> {
+            grapheme_iter_next(self as *mut W_GraphemeBreakIterator as PyObjectRef)
+        }
+    }
+}
+
+fn grapheme_iter_next(self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(self_obj);
+    let self_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let this =
+        W_GraphemeBreakIterator::from_obj(pyre_object::gc_roots::shadow_stack_get(self_slot))
+            .expect("GraphemeBreakIterator payload");
+    if this.position.start >= this.position.end {
+        return Err(PyError::stop_iteration());
+    }
+    let start = this.position.start;
+    let start_byte = this.position.start_byte;
+    let scan_byte = this.position.pos_byte;
+    let string = pyre_object::gc_roots::pin_root(this.string);
+    let string_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Pinning `string` may have moved the iterator: read its payload again.
+    let this =
+        W_GraphemeBreakIterator::from_obj(pyre_object::gc_roots::shadow_stack_get(self_slot))
+            .expect("GraphemeBreakIterator payload");
+    let wtf8 = unsafe { w_str_get_wtf8(string) };
+    let mut points = wtf8[scan_byte..this.position.end_byte]
+        .code_point_indices()
+        .peekable();
+    let (end, end_byte) = loop {
+        let Some((offset, point)) = points.next() else {
+            this.position.start = this.position.pos;
+            this.position.start_byte = this.position.end_byte;
+            break (this.position.pos, this.position.end_byte);
+        };
+        let byte = scan_byte + offset;
+        let index = this.position.pos;
+        let boundary = this.position.state.advance(point);
+        this.position.pos += 1;
+        this.position.pos_byte = points
+            .peek()
+            .map_or(this.position.end_byte, |(offset, _)| scan_byte + offset);
+        if boundary {
+            this.position.start = index;
+            this.position.start_byte = byte;
+            break (index, byte);
+        }
+    };
+    let string = pyre_object::gc_roots::shadow_stack_get(string_slot);
+    let _ = segment_class::type_object();
+    Ok(W_Segment::allocate_stable(W_Segment {
+        ob: PyObject {
+            ob_type: std::ptr::null(),
+            w_class: std::ptr::null_mut(),
+        },
+        string,
+        start,
+        end,
+        bytes: start_byte..end_byte,
+    }))
+}
+
+/// Convert `start`/`end` through `__index__` (`space_index` then `int_w`).
+fn ssize_index(obj: PyObjectRef, default: i64) -> Result<i64, PyError> {
+    if obj.is_null() {
+        return Ok(default);
+    }
+    let mut w_index = pyre_interpreter::baseobjspace::space_index(obj)?;
+    pyre_object::with_roots!(w_index => pyre_interpreter::baseobjspace::int_w(w_index))
+}
+
+/// `unicodedata.iter_graphemes(unistr, start=0, end=sys.maxsize, /)`.
+pub(super) fn iter_graphemes(args: &[PyObjectRef]) -> PyResult {
+    let given = args.iter().filter(|a| !a.is_null()).count();
+    if given == 0 {
+        return Err(PyError::type_error(
+            "iter_graphemes expected at least 1 argument, got 0",
+        ));
+    }
+    if given > 3 {
+        return Err(PyError::type_error(format!(
+            "iter_graphemes expected at most 3 arguments, got {given}"
+        )));
+    }
+    let mut unistr = args[0];
+    if !unsafe { is_str(unistr) } {
+        let ty = pyre_interpreter::baseobjspace::object_functionstr_type_name(unistr);
+        return Err(PyError::type_error(format!(
+            "iter_graphemes() argument 1 must be str, not {ty}"
+        )));
+    }
+    let mut start_obj = args.get(1).copied().unwrap_or(PY_NULL);
+    let mut end_obj = args.get(2).copied().unwrap_or(PY_NULL);
+    // Convert in argument order, including overflow, before adjusting bounds
+    // (`iter_graphemes`).
+    let mut start =
+        pyre_object::with_roots!(unistr, start_obj, end_obj => ssize_index(start_obj, 0))?;
+    let mut end = pyre_object::with_roots!(unistr, end_obj => ssize_index(end_obj, i64::MAX))?;
+    let len = unsafe { w_str_len(unistr) } as i64;
+    if end > len {
+        end = len;
+    } else if end < 0 {
+        end = (end + len).max(0);
+    }
+    if start < 0 {
+        start = (start + len).max(0);
+    }
+    let start = start as usize;
+    let end = end as usize;
+    let len_u = unsafe { w_str_len(unistr) };
+    let start_byte = pyre_object::with_roots!(unistr => unsafe { w_str_index_to_byte(unistr, start.min(len_u)) });
+    let end_byte =
+        pyre_object::with_roots!(unistr => unsafe { w_str_index_to_byte(unistr, end.min(len_u)) });
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(unistr);
+    let unistr_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let _ = grapheme_iter_class::type_object();
+    let unistr = pyre_object::gc_roots::shadow_stack_get(unistr_slot);
+    Ok(W_GraphemeBreakIterator::allocate_stable(
+        W_GraphemeBreakIterator {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            string: unistr,
+            position: GraphemePosition {
+                start,
+                start_byte,
+                pos: start,
+                pos_byte: start_byte,
+                end,
+                end_byte,
+                state: ucd_core::grapheme::GraphemeBreakState::default(),
+            },
+        },
+    ))
+}
+
 /// PyPy `interp_ucd.py:UCD` — a Unicode database view whose methods are
 /// descriptors on the type, rather than entries in an instance dictionary.
 // CPython 3.14 Modules/unicodedata.c:PyInit_unicodedata uses PyType_FromSpec;

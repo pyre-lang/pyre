@@ -113,22 +113,24 @@ pub(crate) unsafe fn try_call_dunder_obj(
     }
 }
 
+/// `descroperation.py` `str` / `repr`: `space.lookup(w_obj, name)` then
+/// `get_and_call_function`, skipping `object` so `descr___str__` (`space.repr`)
+/// is not re-entered. A `pyre_methods` `__str__` lives on the type the same
+/// way `__repr__` does; `is_instance` is not the filter — user instances and
+/// interp-level TypeDefs share this lookup.
 pub(crate) unsafe fn try_call_dunder_obj_above_object(
     obj: PyObjectRef,
     name: &str,
 ) -> Result<Option<PyObjectRef>, crate::PyError> {
     unsafe {
-        if !pyre_object::is_instance(obj) {
-            return Ok(None);
-        }
-        let Some(w_type) = crate::typedef::r#type(obj) else {
-            return Ok(None);
-        };
         // Published across the allocating MRO walk, as in `try_call_dunder_obj`.
         let _roots = pyre_object::gc_roots::push_roots();
         let root_base = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(obj);
         let obj = || pyre_object::gc_roots::shadow_stack_get(root_base);
+        let Some(w_type) = crate::typedef::r#type(obj()) else {
+            return Ok(None);
+        };
         let Some((src, method)) =
             crate::baseobjspace::lookup_where_with_method_cache(w_type.as_ptr(), name)
         else {
@@ -1601,6 +1603,16 @@ pub unsafe fn py_str_wtf8(mut obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyErro
         if pyre_object::is_module(obj)
             && let Some(r) =
                 pyre_object::with_roots!(obj => module_user_dunder_obj(obj, "__str__"))?
+        {
+            return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
+        }
+        // `descroperation.py` `str`: `space.lookup(w_obj, '__str__')` then
+        // `get_and_call_function`. Native formatters above already handled
+        // the builtin leaves; this is the TypeDef / `pyre_methods` path
+        // `py_repr_wtf8` already has for `__repr__`. `object.descr___str__`
+        // is `space.repr`, so that owner is skipped and we fall through.
+        if let Some(r) =
+            pyre_object::with_roots!(obj => try_call_dunder_obj_above_object(obj, "__str__"))?
         {
             return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
         }

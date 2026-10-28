@@ -210,7 +210,7 @@ mod imp {
     const FFI_ARG_SIZE: usize = std::mem::size_of::<clibffi::ffi_arg>();
 
     fn is_float_code(code: &str) -> bool {
-        matches!(code, "f" | "d" | "g")
+        matches!(code, "f" | "d" | "g" | "Zd" | "Zf" | "Zg")
     }
 
     fn ffi_result_slot_width(ret: &funcptr::Ret) -> usize {

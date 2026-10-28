@@ -25,6 +25,12 @@ pyre_interpreter::py_module! {
         "lookup"           / 1 = interp_ucd::lookup,
         "normalize"        / 2 = interp_ucd::normalize,
         "is_normalized"    / 2 = interp_ucd::is_normalized,
+        "isxidstart"              / 1 = interp_ucd::isxidstart,
+        "isxidcontinue"           / 1 = interp_ucd::isxidcontinue,
+        "grapheme_cluster_break"  / 1 = interp_ucd::grapheme_cluster_break,
+        "indic_conjunct_break"    / 1 = interp_ucd::indic_conjunct_break,
+        "extended_pictographic"   / 1 = interp_ucd::extended_pictographic,
+        "iter_graphemes" / * = interp_ucd::iter_graphemes; pyre_interpreter::Signature::new(vec!["unistr", "start", "end"], None, None, 0, 3),
     },
     extra_init: |ns| {
         // `unicodedata.ucd_3_2_0` — a `UCD` instance pinned to the Unicode
@@ -45,12 +51,25 @@ pyre_interpreter::py_module! {
                 pyre_interpreter::__pyre_store!(ns, name, function);
             }
         }
+        if let Some(mut function) = unsafe { pyre_object::w_dict_getitem_str(ns, "iter_graphemes") } {
+            function =
+                pyre_interpreter::gateway::function_set_null_positional_defaults(function, 2);
+            pyre_interpreter::__pyre_store!(ns, "iter_graphemes", function);
+        }
         let ucd_type = pyre_object::with_roots!(ns => interp_ucd::type_object());
         // `interp_ucd.py UCD.typedef` declares no `__new__`, so the two
         // database instances the module exports are the only ones that exist;
         // reaching generic allocation would hand back a `UCD` with no
         // database at all.
         unsafe { pyre_object::w_type_set_disallow_instantiation(ucd_type) };
+        // `Segment` / `GraphemeBreakIterator` live in module state only;
+        // they are not stored as module attributes.
+        let segment_type =
+            pyre_object::with_roots!(ns => interp_ucd::segment_class::type_object());
+        unsafe { pyre_object::w_type_set_disallow_instantiation(segment_type) };
+        let grapheme_iter_type =
+            pyre_object::with_roots!(ns => interp_ucd::grapheme_iter_class::type_object());
+        unsafe { pyre_object::w_type_set_disallow_instantiation(grapheme_iter_type) };
         // Installing the module attribute can allocate; keep the freshly
         // allocated instance rooted until the namespace owns it.
         let mut ucd = pyre_object::with_roots!(ns => interp_ucd::ucd_3_2_0());
@@ -67,6 +86,24 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
     // at a managed heap type — is the only edge its marker forwards.
     types.push(ModuleGcType {
         descriptor: <interp_ucd::W_UCD as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `unicodedata.Segment` keeps the parent `str` in a traced payload field
+    // beside the code-point and byte window.
+    types.push(ModuleGcType {
+        descriptor: <interp_ucd::W_Segment as PyreClassPyTypeOf>::DESCRIPTOR,
+        layout: ModuleGcLayout::PyreClass {
+            memory_pressure_offset: None,
+        },
+        destructor: None,
+    });
+    // `unicodedata.GraphemeBreakIterator` keeps the scanned `str` in a traced
+    // payload field beside the break cursor.
+    types.push(ModuleGcType {
+        descriptor: <interp_ucd::W_GraphemeBreakIterator as PyreClassPyTypeOf>::DESCRIPTOR,
         layout: ModuleGcLayout::PyreClass {
             memory_pressure_offset: None,
         },

@@ -36,6 +36,9 @@ pub const FFI_BAD_TYPEDEF: INT = libffi_sys::ffi_status_FFI_BAD_TYPEDEF as INT;
 pub const FFI_DEFAULT_ABI: FFI_ABI = libffi_sys::ffi_abi_FFI_DEFAULT_ABI;
 /// `cConfig.FFI_TYPE_STRUCT`.
 pub const FFI_TYPE_STRUCT: u16 = libffi_sys::FFI_TYPE_STRUCT;
+/// `FFI_TYPE_COMPLEX` (`libffi` 15). The C-complex records keep this `type`
+/// and a non-NULL `elements` array (`FFI_COMPLEX_TYPEDEF`).
+pub const FFI_TYPE_COMPLEX: u16 = libffi_sys::FFI_TYPE_COMPLEX;
 
 /// `clibffi.LoadLibrary` (`rwin32.LoadLibrary`).
 #[cfg(windows)]
@@ -286,6 +289,32 @@ crate::rffi::llexternal!(
 unsafe extern "C" {
     fn clibffi_f64_to_longdouble(x: f64, dst: *mut u8);
     fn clibffi_longdouble_to_f64(src: *const u8) -> f64;
+}
+
+#[cfg(not(windows))]
+unsafe extern "C" {
+    fn clibffi_type_complex_float() -> FFI_TYPE_P;
+    fn clibffi_type_complex_double() -> FFI_TYPE_P;
+    fn clibffi_type_complex_longdouble() -> FFI_TYPE_P;
+}
+
+/// libffi `ffi_type_complex_float` static (`TABLE_ENTRY` `pffi_type`).
+#[cfg(not(windows))]
+pub fn ffi_type_complex_float() -> FFI_TYPE_P {
+    unsafe { clibffi_type_complex_float() }
+}
+
+/// libffi `ffi_type_complex_double` static (`TABLE_ENTRY` `pffi_type`).
+#[cfg(not(windows))]
+pub fn ffi_type_complex_double() -> FFI_TYPE_P {
+    unsafe { clibffi_type_complex_double() }
+}
+
+/// libffi `ffi_type_complex_longdouble` static. On Apple arm64 this is the
+/// `ffi_type_complex_double` object (`ffi.h` macro alias).
+#[cfg(not(windows))]
+pub fn ffi_type_complex_longdouble() -> FFI_TYPE_P {
+    unsafe { clibffi_type_complex_longdouble() }
 }
 
 /// Width of the immortal `ffi_type_longdouble` record.
@@ -816,5 +845,31 @@ mod tests {
             result as i32
         };
         assert_eq!(value, 42);
+    }
+}
+
+#[cfg(all(test, not(windows)))]
+mod complex_tests {
+    use super::*;
+
+    #[test]
+    fn ffi_type_complex_records_keep_elements() {
+        unsafe {
+            let f = ffi_type_complex_float();
+            let d = ffi_type_complex_double();
+            let g = ffi_type_complex_longdouble();
+            assert!(!f.is_null());
+            assert!(!d.is_null());
+            assert!(!g.is_null());
+            assert_eq!((*f).type_, FFI_TYPE_COMPLEX);
+            assert_eq!((*d).type_, FFI_TYPE_COMPLEX);
+            assert_eq!((*g).type_, FFI_TYPE_COMPLEX);
+            assert!(!(*f).elements.is_null());
+            assert!(!(*d).elements.is_null());
+            assert!(!(*g).elements.is_null());
+            assert_eq!((*f).size, 2 * size_of::<f32>());
+            assert_eq!((*d).size, 2 * size_of::<f64>());
+            assert_eq!((**(*d).elements).type_, libffi_sys::FFI_TYPE_DOUBLE);
+        }
     }
 }

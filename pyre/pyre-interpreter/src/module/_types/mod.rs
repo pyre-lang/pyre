@@ -106,6 +106,11 @@ pub fn init(ns: PyObjectRef) -> Result<(), crate::PyError> {
     );
     store(
         pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "FrameLocalsProxyType",
+        crate::pyframe::frame_locals_proxy::type_object(),
+    );
+    store(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "FrameType",
         crate::typedef::gettypeobject(&crate::pyframe::FRAME_TYPE),
     );

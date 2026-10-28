@@ -12399,13 +12399,14 @@ fn init_mappingproxy_type(ns: PyObjectRef) {
             crate::gateway::make_builtin_function_with_doc(
                 "__str__",
                 |args| {
-                    require_mappingproxy_receiver(args, "__str__", false)?;
+                    let proxy = require_mappingproxy_receiver(args, "__str__", false)?;
                     crate::type_methods::arity_slot(args, 0)?;
-                    unsafe {
-                        Ok(pyre_object::w_str_from_wtf8_managed(
-                            crate::display::py_str_wtf8(args[0])?,
-                        ))
-                    }
+                    let mut mapping = unsafe { pyre_object::w_dict_proxy_get_mapping(proxy) };
+                    Ok(pyre_object::w_str_from_wtf8_managed(
+                        pyre_object::with_roots!(mapping => unsafe {
+                            crate::display::py_str_wtf8(mapping)
+                        })?,
+                    ))
                 },
                 "Return str(self).",
             )
@@ -20674,7 +20675,6 @@ fn init_code_type(ns: PyObjectRef) {
         "co_firstlineno",
         "co_linetable",
         "co_exceptiontable",
-        "co_lnotab",
     ] {
         // The getter pin lives across this iteration's descriptor store.
         let _pyre_store_roots = ::pyre_object::gc_roots::push_roots();

@@ -10457,7 +10457,6 @@ pub(crate) fn object_getattr_miss(
                     | "co_firstlineno"
                     | "co_linetable"
                     | "co_exceptiontable"
-                    | "co_lnotab"
             )
         {
             return crate::pycode::code_get_field(obj, name);
@@ -16278,11 +16277,8 @@ pub(crate) enum AttrErrorSite {
 ///
 /// `site` names the terminal that is reporting.  A store or a removal that
 /// misses on a receiver with no instance dict cannot ever succeed, so
-/// `Objects/object.c _PyObject_GenericSetAttrWithDict` names that reason in the
-/// message; a read miss on the same receiver does not.  The same function is
-/// also where a removal that reached an existing dictionary raises without an
-/// error context, which is why the removal terminal is distinguished from the
-/// namespace ones that share its wording.
+/// `_PyObject_GenericSetAttrWithDict` names that reason in the message; a
+/// read miss on the same receiver does not.
 // dont_look_inside: attribute-miss / read-only AttributeError construction; slow path.
 #[majit_macros::dont_look_inside]
 pub(crate) fn raiseattrerror(
@@ -16342,14 +16338,6 @@ pub(crate) fn raiseattrerror(
         ""
     };
     let message = format!("{subject} has no attribute '{name}'{no_dict_suffix}");
-    if site == AttrErrorSite::Delete && !no_dict_slot {
-        // The removal reached an existing dictionary and found no entry, which
-        // `PyDict_Pop` reports through a bare
-        // `PyErr_SetObject(PyExc_AttributeError, name)`.  That leaves
-        // `name`/`obj` unset, unlike every shape that goes on to
-        // `set_attribute_error_context`.
-        return PyError::attribute_error(message);
-    }
     PyError::attribute_error_with_context(message, obj, name)
 }
 

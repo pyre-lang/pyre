@@ -14,6 +14,7 @@ use majit_rlib::clibffi::{
 use majit_rlib::rffi::{INT, VOIDP};
 use std::ffi::{c_long, c_ulong, c_void};
 
+use super::cdata::TypeCode;
 use super::cfield;
 
 #[derive(Clone, Copy)]
@@ -143,8 +144,8 @@ pub(super) fn dyld_shared_cache_contains_path(path: &str) -> Result<bool, std::f
 /// [`call`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CTypeLayout {
-    /// Simple type identified by its ctypes code ('i', 'd', 'P', 'u', ...).
-    Simple(char),
+    /// Simple type identified by its ctypes `_type_` code (`i`, `d`, `Zd`, ...).
+    Simple(TypeCode),
     /// Any pointer-kind field (`POINTER(T)`, `c_void_p`/`z`/`Z`, function pointer).
     Pointer,
     /// Struct with per-field layouts in declaration order; `size`/`align` are
@@ -177,10 +178,7 @@ impl CTypeLayout {
     /// Total size in bytes.
     pub fn size(&self) -> usize {
         match self {
-            Self::Simple(code) => {
-                let mut buf = [0u8; 4];
-                cfield::simple_type_size(code.encode_utf8(&mut buf)).unwrap_or(0)
-            }
+            Self::Simple(code) => cfield::simple_type_size(code.as_str()).unwrap_or(0),
             Self::Pointer => cfield::pointer_size(),
             Self::Struct { size, .. }
             | Self::Union { size, .. }
@@ -192,10 +190,7 @@ impl CTypeLayout {
     /// Declared alignment in bytes.
     pub fn align(&self) -> usize {
         match self {
-            Self::Simple(code) => {
-                let mut buf = [0u8; 4];
-                cfield::simple_type_align(code.encode_utf8(&mut buf)).unwrap_or(1)
-            }
+            Self::Simple(code) => cfield::simple_type_align(code.as_str()).unwrap_or(1),
             Self::Pointer => cfield::pointer_align(),
             Self::Struct { align, .. }
             | Self::Union { align, .. }
@@ -207,11 +202,8 @@ impl CTypeLayout {
     /// Lower to a libffi type. `Err` if a simple code is unrecognized.
     pub fn to_ffi_type(&self) -> Result<FfiType, CallError> {
         match self {
-            Self::Simple(code) => {
-                let mut buf = [0u8; 4];
-                let code = code.encode_utf8(&mut buf);
-                ffi_type_from_code(code).ok_or_else(|| CallError::UnknownTypeCode(code.to_string()))
-            }
+            Self::Simple(code) => ffi_type_from_code(code.as_str())
+                .ok_or_else(|| CallError::UnknownTypeCode(code.to_string())),
             Self::Pointer => Ok(ffi_pointer_type()),
             Self::Struct {
                 fields,
@@ -351,6 +343,12 @@ pub fn ffi_type_from_code(ty: &str) -> Option<FfiType> {
         "f" => clibffi::ffi_type_float(),
         "d" => clibffi::ffi_type_double(),
         "g" => clibffi::ffi_type_longdouble(),
+        #[cfg(not(windows))]
+        "Zd" if cfield::complex_type_formats().is_some() => clibffi::ffi_type_complex_double(),
+        #[cfg(not(windows))]
+        "Zf" if cfield::complex_type_formats().is_some() => clibffi::ffi_type_complex_float(),
+        #[cfg(not(windows))]
+        "Zg" if cfield::complex_type_formats().is_some() => clibffi::ffi_type_complex_longdouble(),
         "z" | "Z" | "P" | "X" | "O" => clibffi::ffi_type_pointer(),
         "void" => clibffi::ffi_type_void(),
         _ => return None,
@@ -464,8 +462,16 @@ pub enum CallError {
     LibFFI(LibFFIError),
 }
 
+const SCALAR_CELL_LEN: usize = 32;
+
 struct ScalarCell {
-    buf: [u8; 16],
+    buf: [u8; SCALAR_CELL_LEN],
+}
+
+fn empty_scalar_cell() -> ScalarCell {
+    ScalarCell {
+        buf: [0u8; SCALAR_CELL_LEN],
+    }
 }
 
 enum ArgCell<'a> {
@@ -527,7 +533,7 @@ fn ffi_value_from_type_code(type_code: &str, buffer: &[u8]) -> (u128, usize, boo
             let w = std::mem::size_of::<libc::wchar_t>();
             (read_uint_ne(buffer, w), w, false)
         }
-        "f" | "d" | "g" => (0, 0, true),
+        "f" | "d" | "g" | "Zd" | "Zf" | "Zg" => (0, 0, true),
         "z" | "Z" | "P" | "X" | "O" => (
             cfield::read_pointer_from_buffer(buffer) as u128,
             std::mem::size_of::<usize>(),
@@ -539,7 +545,7 @@ fn ffi_value_from_type_code(type_code: &str, buffer: &[u8]) -> (u128, usize, boo
 
 fn push_typed_cell(ty: &FfiType, type_code: &str, buffer: &[u8]) -> ScalarCell {
     let ffitp = ty.as_ptr();
-    let mut cell = ScalarCell { buf: [0u8; 16] };
+    let mut cell = empty_scalar_cell();
     let (arg, arg_size, is_raw) = ffi_value_from_type_code(type_code, buffer);
     unsafe {
         if is_raw {
@@ -558,7 +564,7 @@ fn push_typed_cell(ty: &FfiType, type_code: &str, buffer: &[u8]) -> ScalarCell {
 
 fn push_int_cell(ty: &FfiType, value: i32) -> ScalarCell {
     let ffitp = ty.as_ptr();
-    let mut cell = ScalarCell { buf: [0u8; 16] };
+    let mut cell = empty_scalar_cell();
     unsafe {
         clibffi::push_arg_as_ffiptr(
             ffitp,
@@ -572,7 +578,7 @@ fn push_int_cell(ty: &FfiType, value: i32) -> ScalarCell {
 
 fn push_f64_cell(ty: &FfiType, value: f64) -> ScalarCell {
     let ffitp = ty.as_ptr();
-    let mut cell = ScalarCell { buf: [0u8; 16] };
+    let mut cell = empty_scalar_cell();
     let bytes = value.to_ne_bytes();
     unsafe {
         clibffi::push_arg_as_ffiptr_bytes(
@@ -587,7 +593,7 @@ fn push_f64_cell(ty: &FfiType, value: f64) -> ScalarCell {
 
 fn push_pointer_cell(ty: &FfiType, value: usize) -> ScalarCell {
     let ffitp = ty.as_ptr();
-    let mut cell = ScalarCell { buf: [0u8; 16] };
+    let mut cell = empty_scalar_cell();
     unsafe {
         clibffi::push_arg_as_ffiptr(
             ffitp,
@@ -797,7 +803,9 @@ fn call_with_prepared_inner(
         _ => false,
     };
     let is_integral = match ret {
-        CallRet::Code(code) => !matches!(code, "f" | "d" | "g" | "void") && !is_pointer,
+        CallRet::Code(code) => {
+            !matches!(code, "f" | "d" | "g" | "void" | "Zd" | "Zf" | "Zg") && !is_pointer
+        }
         _ => false,
     };
     let pointer_value = {

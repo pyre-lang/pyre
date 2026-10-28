@@ -36,6 +36,11 @@ pub(super) fn simple_type_size(ty: &str) -> Option<usize> {
         "f" => Some(core::mem::size_of::<c_float>()),
         "d" => Some(core::mem::size_of::<c_double>()),
         "g" => Some(majit_rlib::clibffi::longdouble_size()),
+        "Zd" if complex_type_formats().is_some() => Some(2 * core::mem::size_of::<c_double>()),
+        "Zf" if complex_type_formats().is_some() => Some(2 * core::mem::size_of::<c_float>()),
+        "Zg" if complex_type_formats().is_some() => {
+            Some(2 * majit_rlib::clibffi::longdouble_size())
+        }
         "z" | "Z" | "P" | "X" | "O" => Some(core::mem::size_of::<usize>()),
         "void" => Some(0),
         _ => None,
@@ -59,6 +64,9 @@ pub(super) fn simple_type_align(ty: &str) -> Option<usize> {
         "f" => Some(core::mem::align_of::<c_float>()),
         "d" => Some(core::mem::align_of::<c_double>()),
         "g" => Some(majit_rlib::clibffi::longdouble_align()),
+        "Zd" if complex_type_formats().is_some() => Some(core::mem::align_of::<c_double>()),
+        "Zf" if complex_type_formats().is_some() => Some(core::mem::align_of::<c_float>()),
+        "Zg" if complex_type_formats().is_some() => Some(majit_rlib::clibffi::longdouble_align()),
         "z" | "Z" | "P" | "X" | "O" => Some(core::mem::align_of::<usize>()),
         "void" => Some(0),
         _ => None,
@@ -196,6 +204,7 @@ pub(super) enum SimpleStorageValue {
     Wchar(u32),
     Signed(i128),
     Float(f64),
+    Complex(f64, f64),
     Bool(bool),
     Pointer(usize),
     ObjectId(usize),
@@ -206,6 +215,7 @@ pub(super) enum DecodedValue {
     Signed(i64),
     Unsigned(u64),
     Float(f64),
+    Complex(f64, f64),
     Bool(bool),
     Pointer(usize),
     String(String),
@@ -444,6 +454,18 @@ pub(super) fn simple_storage_value_to_bytes_endian(
             }
             result
         }
+        "Zd" => complex_float_bytes_endian(value, 8, swapped),
+        "Zf" => complex_float_bytes_endian(value, 4, swapped),
+        "Zg" => {
+            // `Zg_set` is native-only (`TABLE_ENTRY(Zg)`, no swapped pair).
+            let (re, im) = match value {
+                SimpleStorageValue::Complex(re, im) => (re, im),
+                _ => (0.0, 0.0),
+            };
+            let mut result = majit_rlib::clibffi::f64_to_longdouble_bytes(re);
+            result.extend(majit_rlib::clibffi::f64_to_longdouble_bytes(im));
+            result
+        }
         "?" => match value {
             SimpleStorageValue::Bool(value) => vec![u8::from(value)],
             _ => vec![0],
@@ -488,6 +510,16 @@ pub(super) fn clone_as_null_terminated(bytes: &[u8]) -> Vec<u8> {
 
 /// `cfield.c` getfunc — decode a simple slot.
 pub(super) fn decode_type_code(type_code: &str, bytes: &[u8]) -> DecodedValue {
+    decode_type_code_endian(type_code, bytes, false)
+}
+
+/// `cfield.c` getfunc / `Zd_get_sw` / `Zf_get_sw` — `swapped` is per-component
+/// for `Zd`/`Zf` and ignored for every other code.
+pub(super) fn decode_type_code_endian(
+    type_code: &str,
+    bytes: &[u8],
+    swapped: bool,
+) -> DecodedValue {
     match type_code {
         "c" => DecodedValue::Bytes(bytes.to_vec()),
         "b" => DecodedValue::Signed(if !bytes.is_empty() {
@@ -595,6 +627,9 @@ pub(super) fn decode_type_code(type_code: &str, bytes: &[u8]) -> DecodedValue {
             })
         }
         "g" => DecodedValue::Float(majit_rlib::clibffi::longdouble_bytes_to_f64(bytes)),
+        "Zd" => decode_complex_float_endian(bytes, 8, swapped),
+        "Zf" => decode_complex_float_endian(bytes, 4, swapped),
+        "Zg" => decode_complex_longdouble(bytes),
         "?" => DecodedValue::Bool(!bytes.is_empty() && bytes[0] != 0),
         "v" => {
             const SIZE: usize = core::mem::size_of::<c_short>();
@@ -680,6 +715,19 @@ pub(super) unsafe fn callback_arg_value(
             let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, n) };
             DecodedValue::Float(majit_rlib::clibffi::longdouble_bytes_to_f64(bytes))
         }
+        Some("Zd") => {
+            let p = ptr as *const c_double;
+            DecodedValue::Complex(unsafe { *p }, unsafe { *p.add(1) })
+        }
+        Some("Zf") => {
+            let p = ptr as *const c_float;
+            DecodedValue::Complex(unsafe { *p } as f64, unsafe { *p.add(1) } as f64)
+        }
+        Some("Zg") => {
+            let n = majit_rlib::clibffi::longdouble_size();
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, 2 * n) };
+            decode_complex_longdouble(bytes)
+        }
         Some("v") => DecodedValue::Bool(unsafe { *(ptr as *const i16) } != 0),
         Some("u") => {
             let wc = if WCHAR_SIZE == 2 {
@@ -715,6 +763,108 @@ pub(super) unsafe fn callback_arg_value(
 /// Type codes whose value is a pointer (`TYPEFLAG_ISPOINTER`).
 pub(super) fn simple_type_is_pointer(code: &str) -> bool {
     matches!(code, "z" | "Z" | "P" | "s" | "X" | "O")
+}
+
+/// C-complex simple codes (`_ctypes_get_fielddesc` `Zd`/`Zf`/`Zg`).
+pub(super) fn simple_type_is_complex(code: &str) -> bool {
+    matches!(code, "Zd" | "Zf" | "Zg")
+}
+
+/// `_ctypes_get_complex_type_formats` — `Some("'Zf', 'Zd', 'Zg'")` where
+/// libffi has C-complex types, `None` on Windows and wasm32.
+pub(super) fn complex_type_formats() -> Option<&'static str> {
+    #[cfg(all(not(windows), not(target_arch = "wasm32")))]
+    {
+        Some("'Zf', 'Zd', 'Zg'")
+    }
+    #[cfg(any(windows, target_arch = "wasm32"))]
+    {
+        None
+    }
+}
+
+/// Whether `_type_` is a simple code this build accepts (`PyCSimpleType_init`
+/// via `_ctypes_get_fielddesc`).
+pub(super) fn simple_type_code_accepted(declared: &str) -> bool {
+    (declared.chars().count() == 1 && simple_type_chars().contains(declared))
+        || (complex_type_formats().is_some() && matches!(declared, "Zd" | "Zf" | "Zg"))
+}
+
+fn complex_lanes(value: SimpleStorageValue) -> (f64, f64) {
+    match value {
+        SimpleStorageValue::Complex(re, im) => (re, im),
+        _ => (0.0, 0.0),
+    }
+}
+
+fn complex_float_bytes_endian(value: SimpleStorageValue, size: usize, swapped: bool) -> Vec<u8> {
+    let (re, im) = complex_lanes(value);
+    let mut out = float_to_sized_bytes_endian(re, size, swapped).unwrap_or_else(|| vec![0; size]);
+    out.extend(float_to_sized_bytes_endian(im, size, swapped).unwrap_or_else(|| vec![0; size]));
+    out
+}
+
+fn decode_complex_float_endian(bytes: &[u8], size: usize, swapped: bool) -> DecodedValue {
+    let re = float_from_sized_bytes_endian(bytes.get(..size).unwrap_or(&[]), size, swapped);
+    let im = float_from_sized_bytes_endian(bytes.get(size..).unwrap_or(&[]), size, swapped);
+    DecodedValue::Complex(re, im)
+}
+
+fn decode_complex_longdouble(bytes: &[u8]) -> DecodedValue {
+    let n = majit_rlib::clibffi::longdouble_size();
+    let re = majit_rlib::clibffi::longdouble_bytes_to_f64(bytes.get(..n).unwrap_or(&[]));
+    let im = majit_rlib::clibffi::longdouble_bytes_to_f64(bytes.get(n..).unwrap_or(&[]));
+    DecodedValue::Complex(re, im)
+}
+
+fn float_from_sized_bytes_endian(bytes: &[u8], size: usize, swapped: bool) -> f64 {
+    match size {
+        4 if bytes.len() >= 4 => {
+            let arr: [u8; 4] = bytes[..4].try_into().expect("size checked");
+            let value = if swapped {
+                #[cfg(target_endian = "little")]
+                {
+                    f32::from_be_bytes(arr)
+                }
+                #[cfg(target_endian = "big")]
+                {
+                    f32::from_le_bytes(arr)
+                }
+            } else {
+                f32::from_ne_bytes(arr)
+            };
+            value as f64
+        }
+        8 if bytes.len() >= 8 => {
+            let arr: [u8; 8] = bytes[..8].try_into().expect("size checked");
+            if swapped {
+                #[cfg(target_endian = "little")]
+                {
+                    f64::from_be_bytes(arr)
+                }
+                #[cfg(target_endian = "big")]
+                {
+                    f64::from_le_bytes(arr)
+                }
+            } else {
+                f64::from_ne_bytes(arr)
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+/// `Zd_set_sw` / `Zf_set_sw` — reverse each component, keep component order.
+pub(super) fn swap_complex_components(code: &str, bytes: &mut [u8]) {
+    let n = match code {
+        "Zd" => core::mem::size_of::<c_double>(),
+        "Zf" => core::mem::size_of::<c_float>(),
+        _ => return,
+    };
+    if bytes.len() >= 2 * n {
+        bytes[..n].reverse();
+        bytes[n..2 * n].reverse();
+    }
 }
 
 /// Valid simple `_type_` codes on this platform.
