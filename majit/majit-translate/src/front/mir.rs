@@ -1842,7 +1842,7 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+        if declared_result_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
         }
         Some(stamp.apply(graph))
@@ -2051,7 +2051,7 @@ impl<'l> CrateLowering<'l> {
             ),
             &self.state.raw_alloc_flavor_structs,
         );
-        if result_exc_ok_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
+        if declared_result_is_unit(fd, self.llbc, self.static_addrs.error_carrier) {
             graph.return_type = Some("()".to_string());
         }
         spec.header.graph_stamp().apply(graph)
@@ -2520,8 +2520,9 @@ impl SemanticFunctionHeader {
         // `i64` (`history.py` `getkind` of `Ptr`): a primitive scalar
         // pointer, or a declared-Raw ADT pointer
         // (`raw_ptr_node_is_declared_raw` / `declared_raw_adt_node`).
-        // `scalar_result_token` matches that spelling. Ordinary
-        // looked-inside graphs keep FUNC.RESULT unstamped so
+        // `scalar_result_token` matches that spelling, including `"()"` so
+        // a `fn(...) -> ()` graph declares `FUNC.RESULT = Void`. Ordinary
+        // looked-inside aggregate graphs keep FUNC.RESULT unstamped so
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
@@ -2640,6 +2641,7 @@ impl SemanticFunctionHeader {
             return_class_root: self.return_class_root.clone(),
             return_is_str: self.return_is_str,
             return_container_root: self.return_container_root.clone(),
+            return_type: self.return_type.clone(),
         }
     }
 
@@ -2719,6 +2721,10 @@ pub(crate) struct GraphStamp {
     return_class_root: Option<String>,
     return_is_str: bool,
     return_container_root: Option<String>,
+    /// `funcptr._obj.TO.RESULT` from the LLBC signature. `GraphTransform`
+    /// stamps the same token at registration; the graph itself has to
+    /// carry it so `declared_result_type_for_*` can read Void for `()`.
+    return_type: Option<String>,
 }
 
 impl GraphStamp {
@@ -2738,6 +2744,9 @@ impl GraphStamp {
         graph.return_class_root = self.return_class_root.clone();
         graph.return_is_str = self.return_is_str;
         graph.return_container_root = self.return_container_root.clone();
+        if let Some(rt) = &self.return_type {
+            graph.return_type = Some(rt.clone());
+        }
         graph
     }
 }
@@ -5516,6 +5525,16 @@ fn result_exc_ok_is_unit(
         && crate::front::result_exc::tyref_result_ok_is_unit(&fd.signature.output, llbc)
 }
 
+/// Declared `FUNC.RESULT` is Void: a Rust `()` return, or a scoped
+/// `Result<(), PyError>` whose `Ok` payload is unit.
+fn declared_result_is_unit(
+    fd: &FunDecl,
+    llbc: &Llbc,
+    error_carrier: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    is_unit_type(&fd.signature.output, llbc) || result_exc_ok_is_unit(fd, llbc, error_carrier)
+}
+
 fn lower_unstructured_with_static_addrs_and_attrs(
     llbc: &Llbc,
     fd: &FunDecl,
@@ -5808,6 +5827,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 // whole-program annotation fixpoint, destabilises it.
                 lo.graph.return_type = Some("()".to_string());
             }
+        }
+        if declared_result_is_unit(fd, llbc, static_addrs.error_carrier) {
+            // A plain `fn(...) -> ()` is the same Void RESULT: the CFG
+            // still returns the unit shell as Ref. Stamp FUNC.RESULT only;
+            // do not rewrite the return value here.
+            lo.graph.return_type = Some("()".to_string());
         }
         // The `?`-diamond rewrite (`rewire_result_exc_call_sites`) detaches
         // the pre-rewrite branch / discriminant / break blocks: the call

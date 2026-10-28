@@ -3959,9 +3959,11 @@ pub(in crate::front::mir) fn tyref_payload_enum_class_root_with(
 
 /// Machine-scalar FUNC.RESULT spellings.  `"ref"` is not one: it collapses
 /// every aggregate onto a GC reference, which the call-signature validator
-/// must not start enforcing for ordinary struct returns.
+/// must not start enforcing for ordinary struct returns. `"()"` is Void,
+/// the declared result of a `fn(...) -> ()` (and of `Result<(), PyError>`
+/// after the `Ok` projection).
 pub(in crate::front::mir) fn scalar_result_token(token: &str) -> bool {
-    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64")
+    matches!(token, "bool" | "i64" | "u64" | "f32" | "f64" | "()")
 }
 
 /// FUNC.RESULT token for a non-unit tuple return: `Tuple<t0,t1,…>` of
@@ -4010,12 +4012,12 @@ pub(in crate::front::mir) fn tuple_residual_return_token(
 ///
 /// The tokens are the Rust primitive spellings the codewriter's
 /// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
-/// `u64`/`f64` → int/float), plus the `ref` sentinel for any pointer /
-/// reference / opaque-ADT return (codewriter wildcards it to
-/// `Type::Ref`, matching `valuetype_to_concrete(Ref) = GcRef`).  `None`
-/// keeps the historic declared-void behaviour for unit returns and for
-/// `Unknown` results (whose legacy concrete is also Unknown — the
-/// dead-var backfill family, not a genuine kind mismatch).
+/// `u64`/`f64` → int/float), plus `"()"` for unit (`FUNC.RESULT = Void`)
+/// and the `ref` sentinel for any pointer / reference / opaque-ADT return
+/// (codewriter wildcards it to `Type::Ref`, matching
+/// `valuetype_to_concrete(Ref) = GcRef`).  `None` is only for `Unknown`
+/// results (whose legacy concrete is also Unknown — the dead-var backfill
+/// family, not a genuine kind mismatch).
 pub(in crate::front::mir) fn dont_look_inside_return_token(
     output: &TyRef,
     llbc: &Llbc,
@@ -4048,7 +4050,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_token(
     };
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
-        return None;
+        return Some("()".to_string());
     }
     // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
     // `return_type_string_to_value_type` reads the `i64` token as that int.

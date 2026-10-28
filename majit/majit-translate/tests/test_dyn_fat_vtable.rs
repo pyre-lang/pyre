@@ -5,11 +5,16 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use majit_charon_reader::Llbc;
+use majit_translate::HostStaticAddrs;
+use majit_translate::call::CallControl;
+use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::flowspace::model::Variable;
-use majit_translate::front::mir::lower_function;
+use majit_translate::front::mir::{
+    build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
+};
 use majit_translate::model::{
-    BlockId, CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation, ValueType,
-    VecFieldPart,
+    BlockId, CallFuncPtr, CallTarget, ConcreteType, FunctionGraph, OpKind, SpaceOperation,
+    ValueType, VecFieldPart,
 };
 
 const OBJECT_LLBC: &str = concat!(
@@ -518,4 +523,190 @@ fn producer(graph: &FunctionGraph, var_id: u64) -> Option<(BlockId, &SpaceOperat
             })
             .map(|op| (block.id, op))
     })
+}
+
+/// Trait-impl graph whose `FUNC.RESULT` is `return_type`, with a Ref
+/// receiver plus `extra_args` Ref formals.
+fn trait_method_graph(name: &str, extra_args: usize, return_type: &str) -> FunctionGraph {
+    let mut graph = FunctionGraph::new(name);
+    graph
+        .push_op_var(
+            graph.startblock,
+            OpKind::Input {
+                name: "self".into(),
+                ty: ValueType::Ref(None),
+                class_root: None,
+            },
+            true,
+        )
+        .unwrap();
+    for i in 0..extra_args {
+        graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: format!("a{i}"),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+    }
+    graph.set_return(graph.startblock, None);
+    graph.with_return_type(return_type)
+}
+
+/// Dyn-vtable residual of a trait method whose caller still carries the
+/// front-end unit/GC-reference `Ref` shell. `family_key` is cleared the
+/// way `lower_indirect_calls` leaves it; `graphs` is the family witness.
+fn transform_indirect_vtable_residual_graph(
+    trait_root: &str,
+    method: &str,
+    impl_type: &str,
+    extra_args: usize,
+    callee: FunctionGraph,
+) -> (char, char, usize) {
+    let mut cc = CallControl::new();
+    cc.register_trait_method(method, Some(trait_root), impl_type, callee);
+    let family = cc.all_impls_for_indirect(trait_root, method);
+    assert_eq!(family.len(), 1);
+
+    let mut graph = FunctionGraph::new("caller");
+    let bb = graph.startblock;
+    let funcptr = graph.alloc_value_var_with_type(ConcreteType::Signed);
+    let args: Vec<_> = (0..=extra_args)
+        .map(|_| graph.alloc_value_var_with_type(ConcreteType::GcRef))
+        .collect();
+    let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+    graph.block_mut(bb).operations.push(SpaceOperation {
+        result: Some(result),
+        kind: OpKind::IndirectCall {
+            funcptr,
+            args,
+            graphs: Some(family),
+            family_key: None,
+            result_ty: ValueType::Ref(None),
+        },
+    });
+    graph.set_return(bb, None);
+
+    let config = GraphTransformConfig::default();
+    let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+    let transformed = transformer.transform(&graph);
+    transformed
+        .graph
+        .block(bb)
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::CallResidual {
+                funcptr: CallFuncPtr::Value(_),
+                descriptor,
+                result_kind,
+                indirect_targets: None,
+                ..
+            } => Some((*result_kind, descriptor.result_type, descriptor.result_size)),
+            _ => None,
+        })
+        .expect("indirect call lowered to a residual")
+}
+
+fn transform_indirect_vtable_residual(
+    method: &str,
+    extra_args: usize,
+    return_type: &str,
+) -> (char, char, usize) {
+    transform_indirect_vtable_residual_graph(
+        "Store",
+        method,
+        "IdentityStore",
+        extra_args,
+        trait_method_graph("IdentityStore::method", extra_args, return_type),
+    )
+}
+
+/// `fn(&self, ...) -> ()` trait method: the unit `()` shell is Ref on the
+/// call, `FUNC.RESULT` is Void, residual is `_v` with `result_size` 0.
+#[test]
+fn indirect_unit_trait_method_residual_is_void() {
+    let (result_kind, result_type, result_size) =
+        transform_indirect_vtable_residual("store", 3, "()");
+    assert_eq!(result_kind, 'v');
+    assert_eq!(result_type, 'v');
+    assert_eq!(result_size, 0);
+}
+
+/// A trait method returning a GC reference (`ref` token) stays a Ref
+/// residual.
+#[test]
+fn indirect_gcref_trait_method_residual_stays_ref() {
+    let (result_kind, result_type, result_size) =
+        transform_indirect_vtable_residual("load", 2, "ref");
+    assert_eq!(result_kind, 'r');
+    assert_eq!(result_type, 'r');
+    assert_eq!(result_size, 8);
+}
+
+/// MIR-built `IdentityDictStrategy::setitem(&self, ...) -> ()` declares
+/// Void `FUNC.RESULT`; an indirect vtable residual through that graph is
+/// `_v` with `result_size` 0.
+#[test]
+fn mir_identity_dict_setitem_declares_void_and_indirect_residual_is_void() {
+    let Some(llbc) = object_llbc() else {
+        return;
+    };
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(llbc),
+        HostStaticAddrs::default(),
+        &["identitydict"],
+        &["setitem"],
+    )
+    .expect("build DictStrategy::setitem graphs");
+    let setitems: Vec<_> = program
+        .functions
+        .iter()
+        .map(|function| {
+            (
+                function.name.as_str(),
+                function.self_ty_root.as_deref(),
+                function.trait_root.as_deref(),
+                function.return_type.clone(),
+            )
+        })
+        .collect();
+    let func = program
+        .functions
+        .iter()
+        .find(|function| {
+            function.name == "setitem"
+                && function.trait_root.as_deref() == Some("DictStrategy")
+                && function
+                    .self_ty_root
+                    .as_deref()
+                    .is_some_and(|owner| owner.ends_with("IdentityDictStrategy"))
+        })
+        .unwrap_or_else(|| panic!("IdentityDictStrategy::setitem not in {setitems:?}"));
+    assert_eq!(
+        func.return_type.as_deref(),
+        Some("()"),
+        "header FUNC.RESULT: {:?}",
+        func.return_type
+    );
+    assert_eq!(
+        func.graph().return_type.as_deref(),
+        Some("()"),
+        "graph FUNC.RESULT: {:?}",
+        func.graph().return_type
+    );
+    let (result_kind, result_type, result_size) = transform_indirect_vtable_residual_graph(
+        "DictStrategy",
+        "setitem",
+        "IdentityDictStrategy",
+        3,
+        func.graph().clone(),
+    );
+    assert_eq!(result_kind, 'v');
+    assert_eq!(result_type, 'v');
+    assert_eq!(result_size, 0);
 }
