@@ -4158,6 +4158,32 @@ impl Bookkeeper {
         }
     }
 
+    /// A stored tagged `Option`/`Result` is the instantiation class
+    /// (`InstanceRepr._setup_repr` / `getuniqueclassdef`), not a union of
+    /// variant payloads. Unregistered instantiations stay lattice bottom.
+    fn project_tagged_enum_instantiation(self: &Rc<Self>, stripped: &str) -> SomeValue {
+        let root = majit_ir::descr::canonical_struct_name(stripped);
+        let template = majit_ir::descr::strip_generic_args(stripped);
+        let root_template = majit_ir::descr::strip_generic_args(&root);
+        let registered = self.struct_fields.borrow().as_ref().is_some_and(|reg| {
+            reg.fields.contains_key(stripped)
+                || reg.fields.contains_key(root.as_str())
+                || reg.fields.contains_key(template.as_ref())
+                || reg.fields.contains_key(root_template.as_ref())
+        });
+        if !registered {
+            return SomeValue::Impossible;
+        }
+        match self.getuniqueclassdef_for_struct_root(&root) {
+            Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+            Err(_) => SomeValue::Impossible,
+        }
+    }
+
     /// TODO: no upstream equivalent.  Project a Rust type
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
@@ -4448,26 +4474,11 @@ impl Bookkeeper {
             let s_none = super::model::s_none();
             match super::model::unionof([&s_inner, &s_none]) {
                 Ok(s) => return s,
-                Err(_) => {
-                    let root = majit_ir::descr::canonical_struct_name(stripped);
-                    return match self.getuniqueclassdef_for_struct_root(&root) {
-                        Ok(classdef) => SomeValue::Instance(super::model::SomeInstance::new(
-                            Some(classdef),
-                            false,
-                            std::collections::BTreeMap::new(),
-                        )),
-                        Err(_) => SomeValue::Impossible,
-                    };
-                }
+                Err(_) => return self.project_tagged_enum_instantiation(stripped),
             }
         }
-        if let Some(inner) = strip_generic_one(stripped, "Result<") {
-            let parts = split_generic_args(inner);
-            if parts.len() == 2 {
-                let s_ok = self.project_struct_field_type(parts[0]);
-                let s_err = self.project_struct_field_type(parts[1]);
-                return super::model::unionof([&s_ok, &s_err]).unwrap_or(SomeValue::Impossible);
-            }
+        if strip_generic_one(stripped, "Result<").is_some() {
+            return self.project_tagged_enum_instantiation(stripped);
         }
         for dict_wrapper in ["HashMap<", "BTreeMap<", "IndexMap<"] {
             if let Some(inner) = strip_generic_one(stripped, dict_wrapper) {
@@ -7491,6 +7502,72 @@ mod tests {
             );
             assert_eq!(classdef.borrow().name, root);
         }
+    }
+
+    #[test]
+    fn tagged_result_projects_instantiation_classdef() {
+        // A stored `Result<T, E>` is the tagged instantiation class, not
+        // `union(T, E)`. `Result<i64, i64>` would otherwise collapse to
+        // an integer and drop `__discriminant` (`InstanceRepr._setup_repr`
+        // / `getuniqueclassdef`).
+        use crate::front::StructFieldRegistry;
+
+        let _registry = crate::test_support::register_struct_origins_serialized(
+            std::collections::HashMap::new(),
+        );
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        for (root, ok_ty, err_ty) in [
+            ("Result<i64,i64>", "i64", "i64"),
+            ("Result<usize,bool>", "usize", "bool"),
+        ] {
+            reg.fields.insert(
+                root.to_string(),
+                vec![("__discriminant".to_string(), "i64".to_string())],
+            );
+            reg.fields.insert(
+                format!("{root}::Ok"),
+                vec![("__pos_0".to_string(), ok_ty.to_string())],
+            );
+            reg.fields.insert(
+                format!("{root}::Err"),
+                vec![("__pos_0".to_string(), err_ty.to_string())],
+            );
+        }
+        bk.set_struct_fields(Rc::new(reg));
+
+        for row in ["Result<i64,i64>", "Result<usize,bool>"] {
+            assert_eq!(
+                majit_ir::descr::canonical_struct_name(row),
+                row,
+                "intern_class_by_qualname / canonical_struct_name of {row}"
+            );
+            let projected = bk.project_struct_field_type(row);
+            let SomeValue::Instance(inst) = &projected else {
+                panic!("{row} must project to SomeInstance, got {projected:?}");
+            };
+            let classdef = inst
+                .classdef
+                .as_ref()
+                .expect("tagged Result must carry a classdef")
+                .clone();
+            let expected = bk
+                .getuniqueclassdef_for_struct_root(row)
+                .unwrap_or_else(|_| panic!("{row} classdef"));
+            assert!(
+                Rc::ptr_eq(&classdef, &expected),
+                "{row} classdef must be the instantiation, got {}",
+                classdef.borrow().name
+            );
+            assert_eq!(classdef.borrow().name, row);
+        }
+        assert!(
+            matches!(
+                bk.project_struct_field_type("Result<UnregisteredA,UnregisteredB>"),
+                SomeValue::Impossible
+            ),
+            "unregistered Result instantiation cannot mint a classdef"
+        );
     }
 
     #[test]
