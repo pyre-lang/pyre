@@ -93,6 +93,11 @@ CHARON_CORE_INCLUDE = [
     # `Instance(Adt) ∪ Integer`.
     "--include",
     "core::ops::range::RangeInclusive",
+    # Declared `repr(transparent)` + unique field give the size/align of `Cell<T>` (= `T`).
+    "--include",
+    "core::cell::Cell",
+    "--include",
+    "core::cell::UnsafeCell",
     "--include",
     "core::cmp::impls::_::le",
     "--include",
@@ -122,6 +127,39 @@ CHARON_CORE_INCLUDE = [
     "core::result::_::as_ref",
     "--include",
     "core::option::_::map_or",
+    # Deref of a refcounted handle is a field read of `data` past the
+    # counts; the body must be visible. Pattern shape matches
+    # `core::option::_::map_or`. Chain from extracted bodies:
+    # Deref -> inherent `inner()` -> `NonNull::as_ref` -> `as_ptr` ->
+    # `*mut T::cast_const`; Deref Field-projects `ArcInner`/`RcInner`
+    # (`data` / `value`); `inner` Field-projects `Arc`/`Rc` (`ptr`).
+    "--include",
+    "alloc::sync::_::deref",
+    "--include",
+    "alloc::rc::_::deref",
+    "--include",
+    "alloc::sync::_::inner",
+    "--include",
+    "alloc::rc::_::inner",
+    "--include",
+    "alloc::sync::ArcInner",
+    "--include",
+    "alloc::rc::RcInner",
+    "--include",
+    "alloc::sync::Arc",
+    "--include",
+    "alloc::rc::Rc",
+    "--include",
+    "core::ptr::non_null::_::as_ref",
+    "--include",
+    "core::ptr::non_null::_::as_ptr",
+    "--include",
+    "core::ptr::mut_ptr::_::cast_const",
+    # `MIFrame` is a foreign workspace struct whose fields stay
+    # `kind: Opaque` unless the type itself is included; `code_cursor`
+    # then reads as a named Struct field (`RangeInclusive` above).
+    "--include",
+    "majit_metainterp::pyjitpl::frame::MIFrame",
 ]
 CHARON_ARGS = [
     "--hide-marker-traits",

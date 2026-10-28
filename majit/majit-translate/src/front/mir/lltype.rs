@@ -4999,7 +4999,14 @@ pub(in crate::front::mir) fn tyref_is_one_word_str_view(ty: &TyRef, llbc: &Llbc)
 /// same split: a Struct field is walked, a Ptr is one `setfield` of the
 /// STRUCT's own name (`get_field_descr`). A transparent GC handle's
 /// field-row spelling is that pointer
-/// ([`transparent_handle_field_spelling`]).
+/// ([`transparent_handle_field_spelling`]). A one-word std handle that
+/// is not `repr(transparent)` (unique sized pointer plus ZST markers:
+/// `Rc`, `Arc`) is `lltype.Ptr` too
+/// ([`one_word_handle_payload_field`] /
+/// [`tyref_one_word_handle_payload_field`], the Field-projection
+/// identity); `all_fielddescrs` does not recurse, so
+/// `PyreDecodeContext.pos_delta` is one
+/// `getfield(PyreDecodeContext, "pos_delta")`.
 pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     ty: &TyRef,
     llbc: &'l Llbc,
@@ -5038,6 +5045,9 @@ pub(in crate::front::mir) fn tyref_by_value_struct_decl<'l>(
     )
     .is_some()
     {
+        return None;
+    }
+    if tyref_one_word_handle_payload_field(ty, llbc, tombstoned).is_some() {
         return None;
     }
     Some(td)
@@ -5575,18 +5585,15 @@ pub(in crate::front::mir) fn tyref_atomic_is_ptr(ty: &TyRef, llbc: &Llbc) -> boo
         .is_some_and(|arg| arg.contains_key("RawPtr"))
 }
 
-/// Index and name of the one sized field of a `#[repr(transparent)]` struct.
+/// Index and name of the unique sized field of a struct.
 ///
 /// Zero-sized fields occupy no bytes and are ignored, so a wrapper whose
 /// only sized field is a scalar (plus a marker) is that scalar.
-/// [`strip_ty_wrappers`] peels `&T` / `&mut T` and leaves `RawPtr` alone, so
-/// a borrow of the wrapper is the same word a fieldless-enum borrow is
-/// ([`tyref_is_borrowed_fieldless_enum`]). A raw pointer remains an address.
-pub(in crate::front::mir) fn transparent_nonzst_field(
+pub(in crate::front::mir) fn unique_nonzst_field(
     decl: &TypeDecl,
     llbc: &Llbc,
 ) -> Option<(usize, String)> {
-    if !decl.is_repr_transparent() || decl.published_struct_copy {
+    if decl.published_struct_copy {
         return None;
     }
     let TypeDeclKind::Struct(fields) = &decl.kind else {
@@ -5609,6 +5616,21 @@ pub(in crate::front::mir) fn transparent_nonzst_field(
     found
 }
 
+/// Index and name of the one sized field of a `#[repr(transparent)]` struct.
+///
+/// [`strip_ty_wrappers`] peels `&T` / `&mut T` and leaves `RawPtr` alone, so
+/// a borrow of the wrapper is the same word a fieldless-enum borrow is
+/// ([`tyref_is_borrowed_fieldless_enum`]). A raw pointer remains an address.
+pub(in crate::front::mir) fn transparent_nonzst_field(
+    decl: &TypeDecl,
+    llbc: &Llbc,
+) -> Option<(usize, String)> {
+    if !decl.is_repr_transparent() {
+        return None;
+    }
+    unique_nonzst_field(decl, llbc)
+}
+
 pub(in crate::front::mir) fn tyref_transparent_nonzst_field(
     ty: &TyRef,
     llbc: &Llbc,
@@ -5616,6 +5638,67 @@ pub(in crate::front::mir) fn tyref_transparent_nonzst_field(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
     transparent_nonzst_field(decl, llbc)
+}
+
+/// Unique sized field of a one-word std handle that is not
+/// `#[repr(transparent)]`.
+///
+/// The word *is* that field: ZST markers (`PhantomData`, a ZST allocator)
+/// occupy no bytes, so the unique pointer field sits at offset 0
+/// (`lltype.Ptr` of a one-field struct). The handle collapses to that
+/// word exactly when the ADT has no class root
+/// ([`adt_node_class_root_identity`]); a local GC class with one pointer
+/// field keeps `InstanceRepr.getfield`. The unique field must itself be
+/// one pointer word so a scalar unique field is not collapsed.
+///
+/// A type-parameter field is sized only at the place's instantiation
+/// ([`substitute_spill_typevars`]): the generic decl stores the allocator
+/// as a `TypeVar`, and a ZST argument (empty `Global`) occupies no bytes.
+pub(in crate::front::mir) fn one_word_handle_payload_field(
+    decl: &TypeDecl,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<(usize, String)> {
+    if decl.is_repr_transparent() || decl.published_struct_copy {
+        return None;
+    }
+    if adt_node_class_root_identity(owner, llbc, tombstoned).is_some() {
+        return None;
+    }
+    let TypeDeclKind::Struct(fields) = &decl.kind else {
+        return None;
+    };
+    let mut found = None;
+    for (index, field) in fields.iter().enumerate() {
+        let ty = substitute_spill_typevars(&field.ty, owner, llbc)
+            .unwrap_or_else(|| clone_tyref(&field.ty));
+        if field_is_zst(&ty, llbc) {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let name = field
+            .name
+            .clone()
+            .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(index));
+        found = Some((index, name, ty));
+    }
+    let (index, name, ty) = found?;
+    let field_node = tyref_node(&ty, llbc)?;
+    one_word_pointer_pointee(field_node, llbc)?;
+    Some((index, name))
+}
+
+pub(in crate::front::mir) fn tyref_one_word_handle_payload_field(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<(usize, String)> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let decl = llbc.type_by_id(adt_node_def_id(node)?)?;
+    one_word_handle_payload_field(decl, node, llbc, tombstoned)
 }
 
 /// Inner struct of a by-value `#[repr(transparent)]` newtype.
@@ -6180,6 +6263,25 @@ pub(crate) fn same_nominal_adt(llbc: &Llbc, a: u64, b: u64) -> bool {
     x.item_meta.instantiation().is_some()
         && y.item_meta.instantiation().is_some()
         && x.item_meta.name_path() == y.item_meta.name_path()
+}
+
+/// Instantiated type arguments of an ADT node (`generics.types`).
+pub(in crate::front::mir) fn adt_node_type_subst(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+) -> Vec<serde_json::Value> {
+    let Some(adt) = node
+        .as_object()
+        .and_then(|obj| obj.get("Adt"))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return Vec::new();
+    };
+    type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The generic arguments of the type a `TypeDeclRef` names.  A

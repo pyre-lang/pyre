@@ -10,4 +10,4 @@ description = "Stable-Rust parser for Charon .llbc / .ullbc JSON; consumed by ma
 memchr = "2"
 parking_lot = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["unbounded_depth"] }

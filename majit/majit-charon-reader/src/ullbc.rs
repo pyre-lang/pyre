@@ -451,7 +451,7 @@ impl TypeDecl {
         self.layout_entries
             .get_or_init(|| {
                 let raw = self.layout.as_ref()?;
-                serde_json::from_str::<Vec<TargetLayout>>(raw.get()).ok()
+                parse_layout_json(raw.get())
             })
             .as_deref()
     }
@@ -460,7 +460,7 @@ impl TypeDecl {
         self.layout_values
             .get_or_init(|| {
                 let raw = self.layout.as_ref()?;
-                serde_json::from_str::<Vec<Value>>(raw.get()).ok()
+                parse_layout_json(raw.get())
             })
             .as_deref()
     }
@@ -545,6 +545,16 @@ impl TypeDecl {
                     .is_some_and(|repr| repr.transparent)
             })
     }
+}
+
+/// Parse a TypeDecl `layout` array. Charon records a deep `inhabited`
+/// proof next to size/align; serde's default recursion limit of 128
+/// declines that tree and would drop the align `Deduplicated` chosen
+/// value `layout_measure` still has to read.
+fn parse_layout_json<'a, T: Deserialize<'a>>(raw: &'a str) -> Option<T> {
+    let mut de = serde_json::Deserializer::from_str(raw);
+    de.disable_recursion_limit();
+    T::deserialize(&mut de).ok()
 }
 
 /// The entry keyed `target`, else the only entry.

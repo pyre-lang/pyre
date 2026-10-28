@@ -12592,6 +12592,15 @@ pub(in crate::front::mir) fn llbc_with_types(
     types: Vec<serde_json::Value>,
     funs: Vec<serde_json::Value>,
 ) -> Llbc {
+    llbc_with_types_impls(crate_name, types, funs, vec![])
+}
+
+fn llbc_with_types_impls(
+    crate_name: &str,
+    types: Vec<serde_json::Value>,
+    funs: Vec<serde_json::Value>,
+    trait_impls: Vec<serde_json::Value>,
+) -> Llbc {
     let file = serde_json::json!({
         "charon_version": "0.1.201",
         "has_errors": false,
@@ -12601,7 +12610,7 @@ pub(in crate::front::mir) fn llbc_with_types(
             "fun_decls": funs,
             "global_decls": [],
             "trait_decls": [],
-            "trait_impls": []
+            "trait_impls": trait_impls
         }
     });
     Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses")
@@ -26062,6 +26071,1018 @@ fn interior_field_transparent_pointee_stays_direct_ptradd() {
         )),
         "the transparent word is the pointer; ops={ops:?}"
     );
+}
+
+/// A one-word std handle whose unique sized field is a pointer is that
+/// pointer. `repr(transparent)` is not required: ZST markers sit beside
+/// the word (`lltype.Ptr` of a one-field struct is the field). A type
+/// parameter instantiated to an empty allocator is one of those markers.
+#[test]
+fn one_word_handle_unique_pointer_field_is_identity() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty);
+    let phantom = interior_struct(1, &["core", "marker", "PhantomData"], &[], 0, &[], false);
+    let global = interior_struct(2, &["alloc", "alloc", "Global"], &[], 0, &[], false);
+    let alloc_ty = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let handle = interior_struct(
+        0,
+        &["alloc", "sync", "Handle"],
+        &[
+            ("ptr", ptr_ty.clone()),
+            ("phantom", interior_adt(1)),
+            ("alloc", alloc_ty),
+        ],
+        8,
+        &[0, 8, 8],
+        false,
+    );
+    let handle_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [interior_adt(2)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let field = serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(1, &handle_ty),
+                {"Field": [null, 0]}
+            ]
+        },
+        "ty": ptr_ty
+    });
+    let caller = interior_caller(
+        "read_ptr",
+        1,
+        vec![handle_ty.clone()],
+        ptr_ty.clone(),
+        vec![
+            interior_local(0, None, &ptr_ty),
+            interior_local(1, Some("h"), &handle_ty),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &ptr_ty),
+                interior_use(field),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types("fixture", vec![handle, phantom, global], vec![caller]);
+    let graph = lower_interior(&llbc, "read_ptr");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().all(|op| !matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. } if field.name == "ptr"
+        )),
+        "the handle word is the unique pointer field; ops={ops:?}"
+    );
+}
+
+/// A by-value field whose type is a one-word handle (unique sized
+/// pointer plus ZST markers, `Rc` / `Arc`) is `lltype.Ptr`, so
+/// [`tyref_by_value_struct_decl`] is `None`.
+/// `heaptracker.all_fielddescrs` recurses only for
+/// `isinstance(FIELD, lltype.Struct)`; the Field-projection identity is
+/// [`tyref_one_word_handle_payload_field`]. An ordinary multi-word
+/// by-value struct is still walked (`Some`).
+#[test]
+fn one_word_handle_by_value_struct_decl_is_none() {
+    let i64_ty = interior_i64();
+    let ptr_ty = interior_raw_mut(i64_ty.clone());
+    let phantom = interior_struct(1, &["core", "marker", "PhantomData"], &[], 0, &[], false);
+    let global = interior_struct(2, &["alloc", "alloc", "Global"], &[], 0, &[], false);
+    let alloc_ty = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let handle = interior_struct(
+        0,
+        &["alloc", "rc", "Rc"],
+        &[
+            ("ptr", ptr_ty),
+            ("phantom", interior_adt(1)),
+            ("alloc", alloc_ty),
+        ],
+        8,
+        &[0, 8, 8],
+        false,
+    );
+    let pair = interior_struct(
+        3,
+        &["fixture", "Pair"],
+        &[("a", i64_ty.clone()), ("b", i64_ty)],
+        16,
+        &[0, 8],
+        false,
+    );
+    let handle_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [interior_adt(2)],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let pair_ty = TyRef::Other(serde_json::json!({
+        "Adt": {
+            "id": 3,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    }));
+    let llbc = llbc_with_types("fixture", vec![handle, phantom, global, pair], vec![]);
+    let tomb = no_tombstoned_leaves();
+    let gc_struct_ids = std::collections::HashSet::new();
+    let raw_alloc = std::collections::HashSet::<String>::new();
+    assert!(
+        super::tyref_by_value_struct_decl(&handle_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_none(),
+        "a unique sized pointer plus ZST markers is lltype.Ptr, not an inlined STRUCT"
+    );
+    assert!(
+        super::tyref_by_value_struct_decl(&pair_ty, &llbc, tomb, &gc_struct_ids, &raw_alloc)
+            .is_some(),
+        "an ordinary multi-word by-value struct is still walked as an inlined STRUCT"
+    );
+}
+
+/// Generic `{u64, u64, T}` `repr(C)` whose layout offsets are unresolved.
+/// `Align` does not change field offsets (`llmemory.offsetof`).
+fn generic_repr_c_inner_decl(payload_ty: serde_json::Value) -> serde_json::Value {
+    let u64_ty = scalar_ty("U64");
+    serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": u64_ty, "attr_info": null},
+            {"name": "b", "ty": u64_ty, "attr_info": null},
+            {"name": "payload", "ty": payload_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    })
+}
+
+/// Index-pair field 2 of a generic `repr(C)` `{u64, u64, T}`: T align 8
+/// starts at 16, T align 32 starts at 32.
+#[test]
+fn generic_repr_c_index_pair_field_offset() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let wide = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Wide"], true),
+        "kind": {"Struct": [
+            {"name": "pad", "ty": u64_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 32,
+                "align": 32,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "C", "align_modif": null, "transparent": false}
+            }
+        }]
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![generic_repr_c_inner_decl(typevar), wide],
+        vec![],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[interior_adt(1)], 2),
+        Some(32)
+    );
+}
+
+/// Field type whose `layout_for_target` is None (unresolved offsets) but
+/// `size_align_for_target` still has size/align 8 (`json_ty_byte_size`).
+fn unresolved_offset_word_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Word"], true),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [{"chosen": null}]}],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }
+        }]
+    })
+}
+
+/// `{Word, Word, T}` `repr(C)`: Word is Opaque with size/align 8 and
+/// unresolved offsets, so the C walk uses `size_align_for_target`.
+#[test]
+fn generic_repr_c_offset_uses_size_align_when_layout_offsets_unresolved() {
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let word_ty = interior_adt(1);
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": word_ty.clone(), "attr_info": null},
+            {"name": "b", "ty": word_ty.clone(), "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![inner, unresolved_offset_word_decl()],
+        vec![],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[scalar_ty("U64")], 2),
+        Some(16)
+    );
+}
+
+/// `{Count, Count, T}` `repr(C)`: Count is a `repr(C)` word whose field
+/// is a transparent wrapper of `TraitType` (`Clause` Bound[0,0]). Two
+/// impls bind the assoc type differently so uniqueness cannot resolve
+/// it; the Adt node's `trait_refs` selects the u64 impl → offset 16.
+#[test]
+fn generic_repr_c_offset_resolves_clause_assoc_field() {
+    let u64_ty = scalar_ty("U64");
+    let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let clause = serde_json::json!({
+        "kind": {"Clause": [{"Bound": [0, 0]}, {"regions": []}]},
+        "trait_decl_ref": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+    });
+    let projection = serde_json::json!({
+        "TraitType": [
+            clause,
+            0,
+            {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        ]
+    });
+    let wrap = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["fixture", "Wrap"], true),
+        "kind": {"Struct": [
+            {"name": "v", "ty": typevar.clone(), "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": true},
+                "variant_layouts": [{"field_offsets": [{"chosen": null}]}]
+            }
+        }]
+    });
+    let count = serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "Count"], true),
+        "kind": {"Struct": [
+            {"name": "v", "ty": {
+                "Adt": {
+                    "id": 1,
+                    "generics": {
+                        "regions": [],
+                        "types": [projection],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            }, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": null, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let impl_ref = serde_json::json!({
+        "regions": [],
+        "regions_outlive": [],
+        "types_outlive": [],
+        "skip_binder": {
+            "kind": {"TraitImpl": {"id": 0, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}},
+            "trait_decl_ref": {"id": 0, "generics": {"regions": [], "types": [u64_ty.clone()], "const_generics": [], "trait_refs": []}}
+        }
+    });
+    let count_u64 = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": [impl_ref]
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": count_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": count_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": {"Align": 2}, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let binding = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "kind": {"TraitType": [0, 0]},
+            "skip_binder": {"value": ty}
+        })
+    };
+    let impl_row = |ty: &serde_json::Value| {
+        serde_json::json!({
+            "impl_trait": {"id": 0, "generics": {"types": [ty]}},
+            "types": [binding(ty)],
+            "implied_trait_refs": []
+        })
+    };
+    let llbc = llbc_with_types_impls(
+        "fixture",
+        vec![inner, wrap, count],
+        vec![],
+        vec![impl_row(&u64_ty), impl_row(&u32_ty)],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+}
+
+/// `{Atomic<u64>, Atomic<u64>, T}` `repr(C)`: Atomic is Opaque, so the
+/// C walk uses [`tyref_atomic_arg`] — layout-identical to the inner
+/// scalar (`tyref_atomic_inner_value_type`) → offset 16.
+#[test]
+fn generic_repr_c_offset_atomic_word_is_inner_scalar() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let atomic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+        "kind": "Opaque",
+        "layout": []
+    });
+    let atomic_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": atomic_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": atomic_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "C", "align_modif": {"Align": 2}, "transparent": false},
+                "variant_layouts": []
+            }
+        }]
+    });
+    let llbc = llbc_with_types("fixture", vec![inner, atomic], vec![]);
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+}
+
+/// Charon layout scalar `{"Constant": {"Value": [id, [Integer, ty]]}}`.
+/// `layout_u64_resolved` reads it from the layout-expression table.
+fn layout_scalar_constant(id: u64, n: u64) -> serde_json::Value {
+    serde_json::json!({
+        "Value": [id, {"Constant": {"Value": [id, [
+            {"Integer": {"Unsigned": ["Usize", n.to_string()]}},
+            {"Deduplicated": 54}
+        ]]}}]
+    })
+}
+
+/// Nested `inhabited` proof Charon stores beside size/align. Depth 140
+/// exceeds serde's default recursion limit of 128 so `layout_values`
+/// must parse it with the limit disabled (`llmemory.sizeof`).
+fn deep_inhabited(depth: usize) -> serde_json::Value {
+    let mut v = serde_json::json!("True");
+    for _ in 0..depth {
+        v = serde_json::json!({"And": [v, "True"]});
+    }
+    v
+}
+
+/// Opaque payload whose layout is the live Charon shape: nested
+/// `chosen`/`Value`/`Constant`/`Integer` size, align
+/// `{chosen: {Deduplicated: 4}}` resolved through layout scalar 4 = 8.
+fn opaque_nested_chosen_payload_decl() -> serde_json::Value {
+    serde_json::json!({
+        "def_id": 2,
+        "item_meta": interior_meta(&["fixture", "Payload"], true),
+        "kind": "Opaque",
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "size": {
+                    "chosen": {
+                        "Value": [1307, {"Constant": {"Value": [671, [
+                            {"Integer": {"Unsigned": ["Usize", "1352"]}},
+                            {"Deduplicated": 54}
+                        ]]}}]
+                    },
+                    "guarantee": null
+                },
+                "align": {"chosen": {"Deduplicated": 4}, "guarantee": null},
+                "discriminator": {"Known": 0},
+                "inhabited": deep_inhabited(140),
+                "variant_layouts": [],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }
+        }]
+    })
+}
+
+/// `{Atomic<u64>, Atomic<u64>, T}` `repr(C)`: T is Opaque with the nested
+/// Charon size/align JSON. Align 8 starts field 2 at 16
+/// (`llmemory.offsetof` / `rewrite_op_getsubstruct`).
+#[test]
+fn generic_repr_c_offset_opaque_nested_chosen_align() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let atomic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+        "kind": "Opaque",
+        "layout": []
+    });
+    let atomic_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": atomic_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": atomic_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [inner, atomic, opaque_nested_chosen_payload_decl()],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [layout_scalar_constant(4, 8)]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[interior_adt(2)], 2),
+        Some(16)
+    );
+}
+
+/// Live Arc::deref call site: T is `{Deduplicated: 43}` of the Opaque
+/// payload Adt, not an inline `{"Adt": ...}` node.
+#[test]
+fn generic_repr_c_offset_dedup_payload_arg() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let atomic = serde_json::json!({
+        "def_id": 1,
+        "item_meta": interior_meta(&["core", "sync", "atomic", "Atomic"], false),
+        "kind": "Opaque",
+        "layout": []
+    });
+    let atomic_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "sync", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": atomic_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": atomic_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [inner, atomic, opaque_nested_chosen_payload_decl()],
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [
+            layout_scalar_constant(4, 8),
+            {"Value": [43, interior_adt(2)]}
+        ]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(
+            &llbc,
+            decl,
+            &[serde_json::json!({"Deduplicated": 43})],
+            2
+        ),
+        Some(16)
+    );
+}
+
+/// Owner subst still the interned TypeVar (`tyref_node` of a shared
+/// `Dedup` template). The Field place already holds the instantiated
+/// payload; bind that slot (`llmemory.offsetof`).
+#[test]
+fn generic_repr_c_offset_binds_field_place_when_owner_subst_is_typevar() {
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            generic_repr_c_inner_decl(typevar.clone()),
+            serde_json::json!({
+                "def_id": 1,
+                "item_meta": interior_meta(&["fixture", "Payload"], true),
+                "kind": "Opaque",
+                "layout": [{
+                    "key": "fixture-target",
+                    "value": {
+                        "size": 8,
+                        "align": 8,
+                        "variant_layouts": [],
+                        "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+                    }
+                }]
+            }),
+        ],
+        vec![],
+    );
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    let subst_before = vec![typevar];
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &subst_before, 2),
+        None
+    );
+    let subst_after =
+        super::subst_bind_projected_field(&llbc, decl, &subst_before, 2, &interior_adt(1));
+    assert_eq!(subst_after, vec![interior_adt(1)]);
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &subst_after, 2),
+        Some(16)
+    );
+}
+
+/// `repr(transparent)` unique-field wrapper (`Cell` / `UnsafeCell` shape).
+fn transparent_unique_field_decl(
+    def_id: u64,
+    path: &[&str],
+    field_ty: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": interior_meta(path, false),
+        "kind": {"Struct": [
+            {"name": "value", "ty": field_ty, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": true},
+                "variant_layouts": [{"field_offsets": [0]}]
+            }
+        }]
+    })
+}
+
+/// `{Cell<u64>, Cell<u64>, T}` `repr(C)`: Cell / UnsafeCell are
+/// transparent Struct decls. Size/align of the count word is size/align
+/// of `u64` → offset 16 (`llmemory.offsetof`).
+#[test]
+fn generic_repr_c_offset_transparent_struct_word_is_inner_scalar() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let unsafe_cell =
+        transparent_unique_field_decl(2, &["core", "cell", "UnsafeCell"], typevar.clone());
+    let cell_field = serde_json::json!({
+        "Adt": {
+            "id": 2,
+            "generics": {
+                "regions": [],
+                "types": [typevar.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell = transparent_unique_field_decl(1, &["core", "cell", "Cell"], cell_field);
+    let cell_u64 = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let inner = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "rc", "Inner"], true),
+        "kind": {"Struct": [
+            {"name": "a", "ty": cell_u64.clone(), "attr_info": null},
+            {"name": "b", "ty": cell_u64, "attr_info": null},
+            {"name": "payload", "ty": typevar, "attr_info": null}
+        ]},
+        "layout": [{
+            "key": "fixture-target",
+            "value": {
+                "repr": {
+                    "repr_algo": "C",
+                    "align_modif": {"Align": 2},
+                    "transparent": false
+                },
+                "variant_layouts": []
+            }
+        }]
+    });
+    let llbc = llbc_with_types("fixture", vec![inner, cell, unsafe_cell], vec![]);
+    let decl = llbc.type_by_id(0).expect("Inner decl");
+    assert_eq!(
+        super::repr_c_struct_field_offset(&llbc, decl, &[u64_ty], 2),
+        Some(16)
+    );
+}
+
+/// `&(*p).payload` on a classdef-less `repr(C)` pointee is
+/// `int_add(p, offsetof)` (`rewrite_op_getsubstruct`).
+#[test]
+fn raw_repr_c_substruct_borrow_emits_int_add() {
+    let u64_ty = scalar_ty("U64");
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let inner_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [u64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let ptr = interior_raw_mut(inner_ty.clone());
+    let ret = interior_shared(u64_ty.clone());
+    let field = interior_field(1, &ptr, &inner_ty, &u64_ty, 2);
+    let caller = interior_caller(
+        "borrow_payload",
+        1,
+        vec![ptr.clone()],
+        ret.clone(),
+        vec![
+            interior_local(0, None, &ret),
+            interior_local(1, Some("p"), &ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &ret),
+                serde_json::json!({
+                    "Ref": {"place": field, "kind": "Shared", "ptr_metadata": null}
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![generic_repr_c_inner_decl(typevar)],
+        vec![caller],
+    );
+    let graph = lower_interior(&llbc, "borrow_payload");
+    let ops = graph_ops(&graph);
+    let add_offsets: Vec<i64> = ops
+        .iter()
+        .filter_map(|op| {
+            let OpKind::BinOp { op: name, rhs, .. } = &op.kind else {
+                return None;
+            };
+            if name != "add" {
+                return None;
+            }
+            ops.iter().find_map(|c| match (&c.kind, c.result.as_ref()) {
+                (OpKind::ConstInt(n), Some(r)) if r == rhs => Some(*n),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(add_offsets, vec![16]);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "add"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::ConstInt(16)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::Abort { .. }))
+            .count(),
+        0
+    );
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .count(),
+        0
+    );
+}
+
+/// Live Arc::deref shape: Deref place ty is `Deduplicated` of generic
+/// `Inner<T>` (shared table still has the TypeVar); Field place ty is
+/// the instantiated payload. `subst_bind_projected_field` fills slot 0.
+#[test]
+fn raw_repr_c_substruct_borrow_dedup_owner_binds_field_place() {
+    let typevar = serde_json::json!({"TypeVar": {"Bound": [0, 0]}});
+    let inner_adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [{"Deduplicated": 2}],
+                "const_generics": [],
+                "trait_refs": []
+            },
+            "builtin": null
+        }
+    });
+    let payload = interior_adt(1);
+    let owner_ty = serde_json::json!({"Deduplicated": 387});
+    let field_ty = serde_json::json!({"Deduplicated": 43});
+    let ptr = interior_raw_mut(owner_ty.clone());
+    let ret = interior_shared(field_ty.clone());
+    let field = interior_field(1, &ptr, &owner_ty, &field_ty, 2);
+    let caller = interior_caller(
+        "borrow_payload",
+        1,
+        vec![ptr.clone()],
+        ret.clone(),
+        vec![
+            interior_local(0, None, &ret),
+            interior_local(1, Some("p"), &ptr),
+        ],
+        vec![interior_bb(
+            vec![interior_assign(
+                interior_place(0, &ret),
+                serde_json::json!({
+                    "Ref": {"place": field, "kind": "Shared", "ptr_metadata": null}
+                }),
+            )],
+            interior_return(),
+        )],
+    );
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [
+                generic_repr_c_inner_decl(typevar.clone()),
+                serde_json::json!({
+                    "def_id": 1,
+                    "item_meta": interior_meta(&["fixture", "Payload"], true),
+                    "kind": "Opaque",
+                    "layout": [{
+                        "key": "fixture-target",
+                        "value": {
+                            "size": 8,
+                            "align": 8,
+                            "variant_layouts": [],
+                            "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+                        }
+                    }]
+                })
+            ],
+            "fun_decls": [caller],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        },
+        "pad": [
+            {"Value": [2, typevar]},
+            {"Value": [387, inner_adt]},
+            {"Value": [43, payload]}
+        ]
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = lower_interior(&llbc, "borrow_payload");
+    let ops = graph_ops(&graph);
+    let add_offsets: Vec<i64> = ops
+        .iter()
+        .filter_map(|op| {
+            let OpKind::BinOp { op: name, rhs, .. } = &op.kind else {
+                return None;
+            };
+            if name != "add" {
+                return None;
+            }
+            ops.iter().find_map(|c| match (&c.kind, c.result.as_ref()) {
+                (OpKind::ConstInt(n), Some(r)) if r == rhs => Some(*n),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(add_offsets, vec![16]);
+    assert_eq!(
+        ops.iter()
+            .filter(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .count(),
+        0
+    );
+}
+
+/// Live `ArcInner<MetaInterpStaticData>` offsetof. Ignored: loads pyre-jit.ullbc.
+#[test]
+#[ignore]
+fn live_arcinner_misd_offsetof_and_subst() {
+    let llbc = Llbc::load(crate::runtime_names::artifacts::JIT_ULLBC).expect("load pyre-jit.ullbc");
+    let misd = serde_json::json!({"Deduplicated": 43});
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let decl152 = llbc.type_by_id(152).expect("MISD");
+    assert_eq!(
+        decl152.size_align_for_target(&llbc, &target),
+        Some((Some(1352), Some(8)))
+    );
+    let inner = llbc.type_by_id(776).expect("ArcInner");
+    let subst = [misd.clone()];
+    let off = super::repr_c_struct_field_offset(&llbc, inner, &subst, 2);
+    let fd = llbc.fn_by_id(811).expect("Arc::deref");
+    let types = vec![misd, serde_json::json!({"Deduplicated": 20})];
+    let body = crate::front::clause_spec::substituted_unstructured(fd, &llbc, &[], &types, &[])
+        .expect("substituted deref body");
+    let mut field_offs = Vec::new();
+    for bb in &body.body {
+        for st in &bb.statements {
+            let Ok(majit_charon_reader::ullbc::StmtKind::Assign(_, rv)) = st.stmt_kind() else {
+                continue;
+            };
+            let place = match &rv {
+                majit_charon_reader::ullbc::Rvalue::Ref { place, .. }
+                | majit_charon_reader::ullbc::Rvalue::RawPtr { place, .. } => place,
+                _ => continue,
+            };
+            let majit_charon_reader::ullbc::PlaceKind::Projection(
+                inner_pl,
+                majit_charon_reader::ullbc::ProjectionElem::Tagged(elem),
+            ) = &place.kind
+            else {
+                continue;
+            };
+            let majit_charon_reader::ullbc::PlaceKind::Projection(
+                _,
+                majit_charon_reader::ullbc::ProjectionElem::Atom(deref),
+            ) = &inner_pl.kind
+            else {
+                continue;
+            };
+            if deref != "Deref" {
+                continue;
+            }
+            let Some(payload) = elem.as_object().and_then(|m| m.get("Field")) else {
+                continue;
+            };
+            let owner_node = super::strip_ty_wrappers(
+                super::tyref_node(&inner_pl.ty, &llbc).expect("owner node"),
+                &llbc,
+            )
+            .expect("owner stripped");
+            let owner_id = super::adt_node_def_id(owner_node).expect("owner id");
+            let owner = llbc.type_by_id(owner_id).expect("owner decl");
+            let field_idx = super::field_projection_index(payload).expect("field idx");
+            let subst = super::adt_node_type_subst(owner_node, &llbc);
+            let subst_b = super::subst_bind_projected_field(
+                &llbc,
+                owner,
+                &subst,
+                field_idx,
+                &super::tyref_json(&place.ty),
+            );
+            field_offs.push(super::repr_c_struct_field_offset(
+                &llbc, owner, &subst_b, field_idx,
+            ));
+        }
+    }
+    assert_eq!(off, Some(16));
+    assert_eq!(field_offs, vec![Some(16)]);
 }
 
 /// `entry_valid` on a real artefact: `(*entry_ptr(self).add(slot)).f_valid`

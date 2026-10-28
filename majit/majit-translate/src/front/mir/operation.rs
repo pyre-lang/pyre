@@ -5059,16 +5059,34 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let payload = elem.as_object()?.get("Field")?;
-        // Named `{"Adt": ...}` only. `resolve_adt_field` does not decode
-        // that container, so a nonzero offset would otherwise collapse to
-        // the parent pointer (`resolve_place`'s unmatched projection).
-        // An index pair `[null, i]` / `[variant, i]` is a `FieldRead`.
-        // `mark_place_address_of` sets `taken_by_address`, and
-        // `rewrite_op_getsubstruct` turns that read into the interior
-        // address. Returning the parent variable would give the field's
-        // consumer the container's type; casting that GC pointer onto the
-        // raw field struct is not `getsubstruct`.
-        self.inline_substruct_named_adt_offset(place, payload)
+        let owner_node = strip_ty_wrappers(tyref_node(&inner.ty, self.llbc)?, self.llbc)?;
+        let owner_id = adt_node_def_id(owner_node)?;
+        let owner = self.llbc.type_by_id(owner_id)?;
+        if !matches!(owner.kind, TypeDeclKind::Struct(_)) {
+            return None;
+        }
+        // A classdef-less `repr(C)` pointee is `rewrite_op_getsubstruct`
+        // (`int_add(p, offsetof)`). Index pair `[null, i]`
+        // (`indexed_field_parts`) and named `{"Adt": ...}` both name
+        // field `i`. A GC inline struct keeps the named-Adt path: an
+        // index pair on a class is a `FieldRead`; treating it as
+        // `getsubstruct` would alias the field to the parent.
+        let classdef_less =
+            adt_node_class_root_identity(owner_node, self.llbc, self.tombstoned_leaves).is_none();
+        if classdef_less {
+            let field_idx = field_projection_index(payload)?;
+            let subst = adt_node_type_subst(owner_node, self.llbc);
+            let subst = subst_bind_projected_field(
+                self.llbc,
+                owner,
+                &subst,
+                field_idx,
+                &tyref_json(&place.ty),
+            );
+            repr_c_struct_field_offset(self.llbc, owner, &subst, field_idx)
+        } else {
+            self.inline_substruct_named_adt_offset(place, payload)
+        }
     }
 
     /// `{"Adt": ...}` field container. `None` when the payload is an index
@@ -5132,10 +5150,11 @@ impl<'a> Lowering<'a> {
     }
 
     /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
-    /// `rewrite_op_getsubstruct` does.  Offset zero is `p` itself.  A nonzero
-    /// offset takes the same deferred refusal `rewrite_op_getfield` gives a
-    /// nonzero `getsubstruct`: an interior address cannot enter the Ref bank,
-    /// so the graph aborts the trace when it reaches the access.
+    /// `jtransform.py rewrite_op_getsubstruct` does. Offset zero is `p`
+    /// itself. A nonzero offset on a classdef-less `repr(C)` pointee is
+    /// `int_add(p, offsetof)` (`_gckind == 'raw'`). A GC interior address
+    /// still takes the deferred `RawAddr` refusal: it cannot enter the
+    /// Ref bank.
     pub(in crate::front::mir) fn lower_inline_substruct_address(
         &mut self,
         mir_bb: usize,
@@ -5148,18 +5167,73 @@ impl<'a> Lowering<'a> {
             unreachable!("inline_substruct_field_offset matched a projection");
         };
         let base = self.resolve_place(mir_bb, clone_place(inner))?;
-        if offset != 0 {
-            let bb_id = self.emit_bb(mir_bb);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::Abort {
-                    kind: crate::model::UnknownKind::UnsupportedExpr {
-                        variant: crate::model::UnsupportedExprKind::RawAddr,
-                    },
-                },
-            });
+        if offset == 0 {
+            return Ok(Some(base));
         }
+        let classdef_less = tyref_node(&inner.ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .is_some_and(|node| {
+                adt_node_class_root_identity(node, self.llbc, self.tombstoned_leaves).is_none()
+            });
+        if classdef_less {
+            return Ok(Some(
+                self.emit_raw_substruct_address(mir_bb, base, offset, &place.ty),
+            ));
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Abort {
+                kind: crate::model::UnknownKind::UnsupportedExpr {
+                    variant: crate::model::UnsupportedExprKind::RawAddr,
+                },
+            },
+        });
         Ok(Some(base))
+    }
+
+    /// `rewrite_op_getsubstruct` for a raw pointee: `int_add(p, offset)`.
+    ///
+    /// A field whose declared type is a GC class is an interior pointer
+    /// into the allocation — the same `cast_ptr_to_int` + add +
+    /// `cast_int_to_ptr` + `cast_instance` sequence
+    /// [`Self::emit_array_tail_item_ptr`] already emits for a class
+    /// living at a byte offset. A classdef-less field stays in the int
+    /// bank (`rewrite_raw_substruct_address`,
+    /// [`Self::items_block_item_address`]).
+    pub(in crate::front::mir) fn emit_raw_substruct_address(
+        &mut self,
+        mir_bb: usize,
+        base: Variable,
+        offset: u64,
+        field_ty: &TyRef,
+    ) -> Variable {
+        let bb_id = self.emit_bb(mir_bb);
+        if let Some(root) = tyref_class_root_with(field_ty, self.llbc, self.tombstoned_leaves) {
+            return self.emit_array_tail_item_ptr(bb_id, base, offset, &root);
+        }
+        let addr = push_cast_ptr_to_int(&mut self.graph, bb_id, base);
+        let off = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        let off_n = i64::try_from(offset).expect("substruct offset fits in Signed");
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(off.clone()),
+            kind: OpKind::ConstInt(off_n),
+        });
+        let sum = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(sum.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: addr,
+                rhs: off,
+                result_ty: ValueType::Int,
+            },
+        });
+        sum
     }
 
     pub(in crate::front::mir) fn place_ref_is_address_of(place: &Place) -> bool {
@@ -5601,7 +5675,23 @@ impl<'a> Lowering<'a> {
                     // treats a fieldless enum. A zero-sized marker in the same
                     // struct still has no bytes. Emitting a FieldRead would
                     // try to dereference that word as an aggregate base.
-                    if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc) {
+                    //
+                    // A one-word std handle that is not `repr(transparent)`
+                    // (a pointer plus ZST markers) is the same declared
+                    // layout: the unique sized field *is* the word
+                    // (`lltype.Ptr` of a one-field struct). [`deref_cast_root`]
+                    // refuses to reinterpret that word as `T` — it addresses
+                    // the refcount header — so this projection is the header
+                    // pointer, not a `getfield` of a classdef-less instance.
+                    if let Some((_, name)) = tyref_transparent_nonzst_field(&inner.ty, self.llbc)
+                        .or_else(|| {
+                            tyref_one_word_handle_payload_field(
+                                &inner.ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            )
+                        })
+                    {
                         if field_name == name {
                             let wrapper_ty = clone_tyref(&inner.ty);
                             let base = self.resolve_place(mir_bb, *inner)?;

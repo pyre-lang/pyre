@@ -1824,6 +1824,87 @@ mod tests {
         );
     }
 
+    /// `Deduplicated` of a generic Adt whose `types` intern a TypeVar
+    /// unwraps; slot 0 becomes the replacement (`ArcInner.data`).
+    #[test]
+    fn substitute_type_vars_unwraps_deduplicated_adt_containing_typevar() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let typevar = json!({"TypeVar": {"Bound": [0, 0]}});
+        let inner_adt = json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [{"Deduplicated": 2}],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let replacement = json!({
+            "Adt": {
+                "id": 152,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                },
+                "builtin": null
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [{"Value": [2, typevar]}],
+                        "output": {"Value": [387, inner_adt]}
+                    },
+                    "body": null
+                }],
+                "files": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert_eq!(
+            llbc.dedup_body(2),
+            Some(&json!({"TypeVar": {"Bound": [0, 0]}}))
+        );
+        let mut place = json!({"ty": {"Deduplicated": 387}});
+        substitute_type_vars(&mut place, &llbc, &[replacement.clone()], &[]);
+        assert_eq!(
+            place,
+            json!({
+                "ty": {
+                    "Adt": {
+                        "id": 0,
+                        "generics": {
+                            "regions": [],
+                            "types": [replacement],
+                            "const_generics": [],
+                            "trait_refs": []
+                        },
+                        "builtin": null
+                    }
+                }
+            }),
+            "{place}"
+        );
+    }
+
     /// A Bound[1] TypeVar is still open: specializing it would name `spec_v0`.
     #[test]
     fn concrete_type_args_rejects_bound1_type_var() {

@@ -6080,6 +6080,29 @@ pub(in crate::front::mir) fn host_field_index(
     ))
 }
 
+/// Field index of a Charon `Field` payload: `[null, i]` or named
+/// `{"Adt": ...}` with a null variant. Enum variant indices decline.
+pub(in crate::front::mir) fn field_projection_index(payload: &serde_json::Value) -> Option<usize> {
+    let arr = payload.as_array()?;
+    if arr.len() != 2 {
+        return None;
+    }
+    let idx = arr.get(1)?.as_u64()? as usize;
+    if arr[0].is_null() {
+        return Some(idx);
+    }
+    if arr[0].as_u64().is_some() {
+        return None;
+    }
+    let adt = arr[0].as_object()?.get("Adt")?;
+    if let Some(parts) = adt.as_array()
+        && parts.get(1).is_some_and(|variant| !variant.is_null())
+    {
+        return None;
+    }
+    Some(idx)
+}
+
 /// `[null, i]` or `[variant, i]`. `None` when the payload is a named
 /// `{"Adt": ...}` container.
 pub(in crate::front::mir) fn indexed_field_parts(
