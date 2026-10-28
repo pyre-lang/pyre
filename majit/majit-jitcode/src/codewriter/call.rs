@@ -144,6 +144,83 @@ pub fn is_callable_fnaddr(fnaddr: i64) -> bool {
     fnaddr != 0 && !is_symbolic_fnaddr(fnaddr)
 }
 
+/// The `constants_i` values each working `i` register of an assembled body can
+/// receive through the flattener's register moves (`flatten.py
+/// insert_renamings`): `int_copy/i>i`, and the `int_push`/`int_pop` pair that
+/// breaks a renaming cycle. Index `r` of the result lists register `r`'s
+/// values.
+///
+/// A `residual_call_*` whose funcptr is a link variable rather than a
+/// `Constant` names a working register, filled by one of those moves, so a
+/// scan for the targets a body can call reads the register's values here.
+/// Only instruction starts are decoded, so an operand byte is never read as
+/// an opcode.
+pub fn int_register_constant_sources(
+    code: &[u8],
+    starts: impl IntoIterator<Item = usize>,
+    num_regs_i: usize,
+    constants_i: &[i64],
+) -> Vec<Vec<i64>> {
+    use crate::codewriter::insns::{BC_INT_POP, BC_INT_PUSH, BC_MOVE_I};
+
+    // Node `num_regs_i` is the single `int_push` slot.
+    let slot = num_regs_i;
+    let mut sources: Vec<Vec<i64>> = vec![Vec::new(); num_regs_i + 1];
+    let mut moves: Vec<(usize, usize)> = Vec::new();
+    for pc in starts {
+        // `(source byte, destination node)`; a `None` source is the slot.
+        let (src, dst) = match code.get(pc) {
+            Some(&BC_MOVE_I) => match (code.get(pc + 1), code.get(pc + 2)) {
+                (Some(&src), Some(&dst)) => (Some(src as usize), dst as usize),
+                _ => continue,
+            },
+            Some(&BC_INT_PUSH) => match code.get(pc + 1) {
+                Some(&src) => (Some(src as usize), slot),
+                None => continue,
+            },
+            Some(&BC_INT_POP) => match code.get(pc + 1) {
+                Some(&dst) => (None, dst as usize),
+                None => continue,
+            },
+            _ => continue,
+        };
+        if dst > slot || (dst == slot && src.is_none()) {
+            continue;
+        }
+        match src {
+            None => moves.push((slot, dst)),
+            Some(src) if src < num_regs_i => moves.push((src, dst)),
+            Some(src) => {
+                if let Some(&value) = constants_i.get(src - num_regs_i)
+                    && !sources[dst].contains(&value)
+                {
+                    sources[dst].push(value);
+                }
+            }
+        }
+    }
+    loop {
+        let mut changed = false;
+        for &(src, dst) in &moves {
+            if src == dst {
+                continue;
+            }
+            for index in 0..sources[src].len() {
+                let value = sources[src][index];
+                if !sources[dst].contains(&value) {
+                    sources[dst].push(value);
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    sources.truncate(num_regs_i);
+    sources
+}
+
 pub fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {
     use std::hash::Hasher;
 
@@ -193,4 +270,38 @@ pub fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
 pub fn symbolic_fnaddr_for_segments<'a>(segments: impl IntoIterator<Item = &'a str>) -> i64 {
     let path = CallPath::from_segments(segments);
     symbolic_fnaddr_for_path(&path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::int_register_constant_sources;
+    use crate::codewriter::insns::{BC_INT_POP, BC_INT_PUSH, BC_MOVE_I, BC_RESIDUAL_CALL_R_R};
+
+    /// Two working registers, constants at bytes 2.. : a direct copy, a copy
+    /// chain, and a push/pop pair each reach the register; an operand byte
+    /// equal to `int_copy` is not decoded.
+    #[test]
+    fn int_register_constant_sources_follows_moves() {
+        let constants = [11, 22, 33];
+        let code = vec![
+            BC_MOVE_I,
+            2,
+            0, // r0 <- 11
+            BC_MOVE_I,
+            0,
+            1, // r1 <- r0
+            BC_INT_PUSH,
+            3, // slot <- 22
+            BC_INT_POP,
+            1, // r1 <- slot
+            BC_RESIDUAL_CALL_R_R,
+            BC_MOVE_I,
+            4,
+            0, // operand bytes only
+        ];
+        let starts = [0, 3, 6, 8, 10];
+        let mut sources = int_register_constant_sources(&code, starts, 2, &constants);
+        sources.iter_mut().for_each(|values| values.sort_unstable());
+        assert_eq!(sources, vec![vec![11], vec![11, 22]]);
+    }
 }

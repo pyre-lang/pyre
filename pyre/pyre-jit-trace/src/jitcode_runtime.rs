@@ -3317,6 +3317,64 @@ pub fn decoded_ops(code: &[u8]) -> impl Iterator<Item = DecodedOp> + '_ {
     })
 }
 
+/// Instruction starts the blackhole can dispatch from `pc` on: the
+/// fallthrough of every instruction that does not end its block, plus every
+/// `L` label operand (`blackhole.py` `bhimpl_goto*` return the label or the
+/// next position). `None` when a reached instruction cannot be decoded or
+/// branches through a descr (`switch/id`), so the caller reads the whole body.
+pub fn reachable_starts_from(code: &[u8], pc: usize) -> Option<Vec<usize>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut work = vec![pc];
+    while let Some(pc) = work.pop() {
+        if pc >= code.len() || !seen.insert(pc) {
+            continue;
+        }
+        let op = decode_op_at(code, pc)?;
+        if op.opname == "switch" {
+            return None;
+        }
+        let mut cursor = pc + 1;
+        if op.opname != "live" {
+            let mut chars = op.argcodes.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    'L' => {
+                        work.push(
+                            (*code.get(cursor)? as usize)
+                                | ((*code.get(cursor + 1)? as usize) << 8),
+                        );
+                        cursor += 2;
+                    }
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'd' | 'j' => cursor += 2,
+                    'I' | 'R' | 'F' => cursor += 1 + *code.get(cursor)? as usize,
+                    '>' => {
+                        chars.next();
+                        cursor += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let ends_block = matches!(
+            op.opname,
+            "goto"
+                | "int_return"
+                | "ref_return"
+                | "float_return"
+                | "void_return"
+                | "raise"
+                | "reraise"
+                | "abort"
+                | "abort_permanent"
+        );
+        if !ends_block {
+            work.push(op.next_pc);
+        }
+    }
+    Some(seen.into_iter().collect())
+}
+
 fn split_key(key: &str) -> (&str, &str) {
     match key.split_once('/') {
         Some((name, codes)) => (name, codes),
@@ -4751,6 +4809,36 @@ mod tests {
         assert_eq!(op.opname, "int_add");
         assert_eq!(op.argcodes, "ii>i");
         assert_eq!(op.next_pc, 4);
+    }
+
+    #[test]
+    fn reachable_starts_follow_labels_and_stop_at_block_ends() {
+        let byte = |key: &str| {
+            *insns_opname_to_byte()
+                .get(key)
+                .unwrap_or_else(|| panic!("{key} must be in insns table"))
+        };
+        // 0: goto 7 | 3: int_add (skipped) | 7: goto_if_not r0, 14
+        // | 11: void_return | 12: ... | 14: void_return
+        let code = [
+            byte("goto/L"),
+            7,
+            0,
+            byte("int_add/ii>i"),
+            1,
+            2,
+            3,
+            byte("goto_if_not/iL"),
+            0,
+            14,
+            0,
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("void_return/"),
+            byte("void_return/"),
+        ];
+        assert_eq!(reachable_starts_from(&code, 0), Some(vec![0, 7, 11, 14]));
+        assert_eq!(reachable_starts_from(&code, 3), Some(vec![3, 7, 11, 14]));
     }
 
     #[test]
