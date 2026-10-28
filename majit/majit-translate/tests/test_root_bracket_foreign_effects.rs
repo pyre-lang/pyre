@@ -11,7 +11,7 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
 use majit_translate::front::mir::{
-    apply_published_structs, erased_root_bracket_guards, fn_returns_owned_scope,
+    RootStackState, apply_published_structs, erased_root_bracket_guards, fn_returns_owned_scope,
     harvest_published_structs, harvest_root_stack_touching_paths, harvest_scope_owning_identities,
     lower_function, mark_foreign_scope_owners, scope_owner_identity,
 };
@@ -73,6 +73,7 @@ fn only_foreign_non_root_callees(paths: &[String]) -> bool {
 /// answer.
 fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
     let (mut opening, mut erased) = (0, 0);
+    let root_stack_state = RootStackState::new(llbc);
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
@@ -88,7 +89,7 @@ fn erased_bodies(llbc: &Llbc) -> (usize, usize) {
             break;
         }
         opening += 1;
-        if !erased_root_bracket_guards(llbc, fd, &body).is_empty() {
+        if !erased_root_bracket_guards(llbc, fd, &body, &root_stack_state).is_empty() {
             erased += 1;
         }
     }

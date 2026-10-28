@@ -2174,6 +2174,27 @@ impl<'a> Lowering<'a> {
                     ) {
                         return Ok((None, raw));
                     }
+                    // An address word cast to a raw-flavored instance pointer is
+                    // `cast_int_to_ptr` of the raw `InstanceRepr` lowleveltype
+                    // (`rbuiltin.py` `gen_cast`); routing it through GCREF would
+                    // need a GC→raw cast that `lltype.castable` forbids.
+                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && matches!(dst_kind, ValueType::Ref(_))
+                        && let Some(root) = flavor_raw_pointer_class_root(
+                            dest_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                            &self.raw_alloc_flavor_structs,
+                        )
+                    {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(crate::model::cast_instance_call(root, arg.clone())),
+                            res,
+                        ));
+                    }
                     // `p as usize as *mut T` is `lltype.cast_opaque_ptr`.
                     // Fold the int→ptr half back to the original GC pointer
                     // so OptEarlyForce does not force_box a virtual

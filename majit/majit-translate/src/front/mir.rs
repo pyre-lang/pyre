@@ -1342,6 +1342,10 @@ impl CrateLoweringState {
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
+        let raw_alloc_flavor_structs =
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                llbc,
+            ));
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1352,7 +1356,12 @@ impl CrateLoweringState {
             mut struct_field_attrs,
             mut exact_layouts,
             mut struct_ids,
-        ) = derive_program_metadata(llbc, gc_struct_ids, &immutable_fields);
+        ) = derive_program_metadata(
+            llbc,
+            gc_struct_ids,
+            &immutable_fields,
+            &raw_alloc_flavor_structs,
+        );
         promote_cross_crate_stripped_keys(
             llbc,
             cross_tombstoned_leaves,
@@ -1491,10 +1500,6 @@ impl CrateLoweringState {
         } else {
             func_hints
         };
-        let raw_alloc_flavor_structs =
-            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
-                llbc,
-            ));
         for fd in llbc.iter_local_fns() {
             note_body_crate_root_into(fd, &mut struct_fields);
         }
@@ -3370,6 +3375,7 @@ fn derive_program_metadata(
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
+    raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> (
     std::collections::HashSet<String>,
     std::collections::HashSet<String>,
@@ -3380,10 +3386,6 @@ fn derive_program_metadata(
     std::collections::HashMap<majit_ir::descr::StructId, crate::front::semantic::ExactLayout>,
     std::collections::HashMap<String, Option<majit_ir::descr::StructId>>,
 ) {
-    let raw_alloc_flavor_structs =
-        crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(llbc));
-    let raw_alloc_flavor_structs = &raw_alloc_flavor_structs;
-
     // Charon resolves layout per target; the LLBC carries a single
     // entry for the extraction target (build-script `TARGET`).  An
     // absent/non-matching target falls back to the sole entry inside
@@ -4398,6 +4400,9 @@ impl DuplicateLeafFacts {
                 llbc,
                 &harvest_declared_gc_facts(llbc).gc_struct_ids(),
                 no_immutable_fields(),
+                &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
+                    std::slice::from_ref(llbc),
+                ),
             );
         let crate_name = llbc.crate_name().to_string();
         let prefix = format!("{crate_name}::");
@@ -4930,8 +4935,16 @@ impl<'a> LowerContext<'a> {
         let immutable_fields = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(llbc),
         );
-        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) =
-            derive_program_metadata(llbc, &gc_struct_ids, &immutable_fields);
+        let raw_alloc_flavor_structs =
+            crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                llbc,
+            ));
+        let (_, _, struct_fields, _, _, struct_field_attrs, _, _) = derive_program_metadata(
+            llbc,
+            &gc_struct_ids,
+            &immutable_fields,
+            &raw_alloc_flavor_structs,
+        );
         Self {
             llbc,
             struct_field_attrs,
@@ -4939,9 +4952,7 @@ impl<'a> LowerContext<'a> {
             dont_look_inside: dont_look_inside_set_of(llbc),
             tombstoned_leaves: tombstoned_leaves_of(llbc),
             gc_struct_ids,
-            raw_alloc_flavor_structs: crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(
-                std::slice::from_ref(llbc),
-            ),
+            raw_alloc_flavor_structs,
             immutable_fields,
         }
     }
@@ -4964,6 +4975,34 @@ pub fn lower_fun_decl_with_static_addrs(
     fd: &FunDecl,
     static_addrs: crate::HostStaticAddrs<'_>,
 ) -> Result<FunctionGraph, LowerError> {
+    lower_fun_decl_with_static_addrs_and_root_stack(
+        context,
+        fd,
+        static_addrs,
+        &RootStackState::new(context.llbc),
+    )
+}
+
+/// Lower `fd` using the caller's per-program [`RootStackState`].
+pub fn lower_fun_decl_with_root_stack(
+    context: &LowerContext<'_>,
+    fd: &FunDecl,
+    root_stack_state: &RootStackState,
+) -> Result<FunctionGraph, LowerError> {
+    lower_fun_decl_with_static_addrs_and_root_stack(
+        context,
+        fd,
+        crate::HostStaticAddrs::default(),
+        root_stack_state,
+    )
+}
+
+fn lower_fun_decl_with_static_addrs_and_root_stack(
+    context: &LowerContext<'_>,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    root_stack_state: &RootStackState,
+) -> Result<FunctionGraph, LowerError> {
     let llbc = context.llbc;
     let struct_fields = struct_field_registry_from_rows(&context.struct_fields);
     crate::local_crates::with_local_crate_root(llbc.crate_name(), || {
@@ -4981,6 +5020,7 @@ pub fn lower_fun_decl_with_static_addrs(
             &context.gc_struct_ids,
             &context.immutable_fields,
             &context.raw_alloc_flavor_structs,
+            root_stack_state,
         )
     })
 }
@@ -5055,6 +5095,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    root_stack_state: &RootStackState,
 ) -> Result<FunctionGraph, LowerError> {
     let mut u = fd.unstructured().ok_or_else(|| {
         LowerError::Unsupported(format!(
@@ -5082,7 +5123,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         raw_alloc_flavor_structs,
         builder_mode,
         &accum,
-        &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
+        &RootStackAnalyzer::new(llbc, root_stack_state),
         None,
         false,
         None,
@@ -5132,6 +5173,7 @@ fn lower_fat_dyn_callee(
         gc_struct_ids,
         immutable_fields,
         raw_alloc_flavor_structs,
+        &RootStackState::new(llbc),
     )
     .ok()
 }
@@ -5242,13 +5284,14 @@ pub(crate) use self::desugar::rewire::{
     is_core_default_path,
 };
 pub use self::gcroot::{
-    PublishedStructBody, PublishedStructField, apply_published_structs, erased_root_bracket_guards,
-    fn_returns_owned_scope, harvest_published_structs, harvest_root_stack_touching_paths,
-    harvest_scope_owning_identities, mark_foreign_scope_owners, scope_owner_identity,
+    PublishedStructBody, PublishedStructField, RootStackState, apply_published_structs,
+    erased_root_bracket_guards, fn_returns_owned_scope, harvest_published_structs,
+    harvest_root_stack_touching_paths, harvest_scope_owning_identities, mark_foreign_scope_owners,
+    scope_owner_identity,
 };
 pub(crate) use self::gcroot::{
-    ROOT_SCOPE_CLOSE, RootStackAnalyzer, RootStackState, is_root_scope_drop_glue_call,
-    is_rust_vec_free_call, is_shadow_stack_bracket_close, is_slice_buffer_free_call,
+    ROOT_SCOPE_CLOSE, RootStackAnalyzer, is_root_scope_drop_glue_call, is_rust_vec_free_call,
+    is_shadow_stack_bracket_close, is_slice_buffer_free_call,
 };
 pub(crate) use self::lltype::{
     ThreadLocalRefLlop, adt_head_instantiation_suffix, charon_array_len_to_string,

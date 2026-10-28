@@ -1442,7 +1442,7 @@ pub(crate) struct RootStackAnalyzer<'a> {
 }
 
 /// The per-artefact caches a [`RootStackAnalyzer`] fills.
-pub(crate) struct RootStackState {
+pub struct RootStackState {
     /// Whether this artefact defines the root-stack API.  A dependency cannot
     /// name a crate built on top of it, so a foreign body here reaches the
     /// root stack only through a callback it is handed, and that callback is
@@ -1482,7 +1482,7 @@ pub(in crate::front::mir) type RootStackTracker =
     crate::translator::backendopt::graphanalyze::DependencyTracker<bool, u64>;
 
 impl RootStackState {
-    pub(crate) fn new(llbc: &Llbc) -> Self {
+    pub fn new(llbc: &Llbc) -> Self {
         let root_api_is_local = llbc.iter_type_decls().any(|decl| {
             decl.item_meta.is_local && gc_root_scope_type_path(&decl.item_meta.name_path())
         });
@@ -4851,7 +4851,16 @@ pub(in crate::front::mir) fn analyze_root_brackets(
 /// An erased bracket publishes nothing, so it owes no rewind and lowers no
 /// close.  A test that counts closes needs this to tell that case from a close
 /// the lowering dropped on the floor.
-pub fn erased_root_bracket_guards(llbc: &Llbc, fd: &FunDecl, body: &Unstructured) -> Vec<usize> {
+///
+/// The caller keeps one state per program so the `scope_constructors` /
+/// `analyzed_calls` memo survives across bodies (`graphanalyze.py`
+/// `GraphAnalyzer._analyzed_calls`).
+pub fn erased_root_bracket_guards(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    body: &Unstructured,
+    root_stack_state: &RootStackState,
+) -> Vec<usize> {
     // A body the scalar replacement rewrote keeps no bracket at all.
     if let Ok(Some(_)) = shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
         return (0..body.locals.locals.len())
@@ -4859,8 +4868,7 @@ pub fn erased_root_bracket_guards(llbc: &Llbc, fd: &FunDecl, body: &Unstructured
             .collect();
     }
     let moved = MovedOutLocals::new(body, llbc);
-    let root_stack_state = RootStackState::new(llbc);
-    let root_stack = RootStackAnalyzer::new(llbc, &root_stack_state);
+    let root_stack = RootStackAnalyzer::new(llbc, root_stack_state);
     analyze_root_brackets(body, llbc, &moved, &root_stack)
         .scopes
         .iter()

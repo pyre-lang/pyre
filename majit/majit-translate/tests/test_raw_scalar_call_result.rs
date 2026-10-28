@@ -528,6 +528,150 @@ fn map_terminator_w_cls_overlay_cast_is_dest_typed_someptr() {
     );
 }
 
+fn is_mapnode_leaf(root: &str) -> bool {
+    root.rsplit("::").next() == Some("MapNode")
+}
+
+fn operand_is_word(graph: &FunctionGraph, arg: &LinkArg) -> bool {
+    match arg {
+        LinkArg::Const(c) => matches!(c.value, ConstValue::Int(_) | ConstValue::UInt(_)),
+        _ => arg
+            .as_variable()
+            .is_some_and(|var| var_is_word(graph, var, 0)),
+    }
+}
+
+fn var_is_word(
+    graph: &FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match root_op(graph, var) {
+        // `promote(map_word as MapRef)` may commute to `promote(map_word) as
+        // MapRef`; the Hint is still the address word (`rlib/jit.py promote`).
+        Some(OpKind::Hint { value, .. }) => var_is_word(graph, value, depth + 1),
+        Some(OpKind::Call { result_ty, .. }) => {
+            matches!(result_ty, ValueType::Int | ValueType::Unsigned)
+        }
+        Some(OpKind::FieldRead { ty, .. }) => {
+            matches!(ty, ValueType::Int | ValueType::Unsigned)
+        }
+        Some(OpKind::GcLoadIndexed { item_ty, .. }) => {
+            matches!(item_ty, ValueType::Int | ValueType::Unsigned)
+        }
+        Some(OpKind::ConstInt(_) | OpKind::ConstUInt(_)) => true,
+        _ => false,
+    }
+}
+
+/// Word → MapNode, or a later identity of that raw instance (promote of
+/// `map_word as MapRef`). A GCREF / GC-object operand is the
+/// `lltype.castable` refuse.
+fn mapnode_cast_operand_is_raw(graph: &FunctionGraph, arg: &LinkArg) -> bool {
+    if operand_is_word(graph, arg) {
+        return true;
+    }
+    let Some(var) = arg.as_variable() else {
+        return false;
+    };
+    var_is_raw_mapnode(graph, var, 0)
+}
+
+fn var_is_raw_mapnode(
+    graph: &FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+    depth: usize,
+) -> bool {
+    if depth > 32 {
+        return false;
+    }
+    match root_op(graph, var) {
+        Some(OpKind::Hint { value, .. }) => var_is_raw_mapnode(graph, value, depth + 1),
+        Some(kind) => majit_translate::model::cast_instance_root(kind).is_some_and(is_mapnode_leaf),
+        None => false,
+    }
+}
+
+fn assert_mapnode_casts_are_word_operands(graph: &FunctionGraph) {
+    let mut saw_mapnode = false;
+    let mut saw_word = false;
+    for op in ops(graph) {
+        let Some(root) = majit_translate::model::cast_instance_root(&op.kind) else {
+            continue;
+        };
+        if !is_mapnode_leaf(root) {
+            continue;
+        }
+        saw_mapnode = true;
+        let OpKind::Call { args, .. } = &op.kind else {
+            continue;
+        };
+        let operand = args
+            .first()
+            .unwrap_or_else(|| panic!("{} MapNode cast has no operand", graph.name));
+        if operand_is_word(graph, operand) {
+            saw_word = true;
+        }
+        assert!(
+            mapnode_cast_operand_is_raw(graph, operand),
+            "{} MapNode cast operand is GCREF-typed: producer={:?}",
+            graph.name,
+            operand.as_variable().and_then(|v| root_op(graph, v)),
+        );
+    }
+    assert!(
+        saw_mapnode,
+        "{} must contain __cast_instance_intrinsic toward MapNode",
+        graph.name
+    );
+    assert!(
+        saw_word,
+        "{} must contain a word → MapNode __cast_instance_intrinsic",
+        graph.name
+    );
+}
+
+/// Word → flavor-raw `MapNode` is `__cast_instance_intrinsic` of an
+/// integer operand (`rbuiltin.py` `gen_cast` Primitive→Ptr →
+/// `cast_int_to_ptr`). A GCREF operand toward `MapNode` is the
+/// `lltype.castable` refuse.
+#[test]
+fn instance_getclass_word_to_mapnode_is_int_cast_instance() {
+    let llbc = load_llbc(OBJECT_LLBC);
+    let context = lower_context_for(llbc);
+    let fns = mapdict_fns(&llbc, "instance_getclass");
+    assert!(!fns.is_empty(), "instance_getclass is in pyre-object LLBC");
+    for fd in fns {
+        let graph = lower_fun_decl(&context, fd)
+            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+        assert_mapnode_casts_are_word_operands(&graph);
+    }
+
+    let interp = load_llbc(INTERPRETER_LLBC);
+    let interp_ctx = lower_context_for(interp);
+    let terms = mapdict_fns(&interp, "_get_mapdict_map");
+    for fd in terms {
+        let graph = lower_fun_decl(&interp_ctx, fd)
+            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+        let has_word_mapnode = ops(&graph).any(|op| {
+            majit_translate::model::cast_instance_root(&op.kind).is_some_and(is_mapnode_leaf)
+                && operand_is_word(
+                    &graph,
+                    match &op.kind {
+                        OpKind::Call { args, .. } => args.first().unwrap(),
+                        _ => return false,
+                    },
+                )
+        });
+        if has_word_mapnode {
+            assert_mapnode_casts_are_word_operands(&graph);
+        }
+    }
+}
+
 fn i64_ty() -> Value {
     json!({"Scalar": {"Integer": {"Signed": "I64"}}})
 }

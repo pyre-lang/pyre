@@ -42,7 +42,8 @@ use majit_translate::HostStaticAddrs;
 use majit_translate::call::CallControl;
 use majit_translate::codewriter::jtransform::{GraphTransformConfig, Transformer};
 use majit_translate::front::mir::{
-    LowerContext, erased_root_bracket_guards, lower_fun_decl, lower_fun_decl_with_static_addrs,
+    LowerContext, RootStackState, erased_root_bracket_guards, lower_fun_decl,
+    lower_fun_decl_with_root_stack, lower_fun_decl_with_static_addrs,
 };
 use majit_translate::model::{CallTarget, FunctionGraph, OpKind};
 
@@ -156,11 +157,12 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
     let Some(llbc) = object_llbc() else { return };
     let mut bodies = 0usize;
     let context = lower_context_for(llbc);
+    let root_stack_state = RootStackState::new(llbc);
     for fd in llbc.iter_local_fns() {
         let Some(body) = fd.unstructured() else {
             continue;
         };
-        let erased = erased_root_bracket_guards(llbc, fd, &body);
+        let erased = erased_root_bracket_guards(llbc, fd, &body, &root_stack_state);
         let moved = moved_out_locals(&body);
         let opens = opener_blocks(llbc, &body);
         let distant = guard_drop_sites(llbc, &body).any(|(bb, local)| {
@@ -172,7 +174,7 @@ fn bracket_closes_when_the_drop_is_not_adjacent_to_the_binding() {
             continue;
         }
         bodies += 1;
-        let Ok(graph) = lower_fun_decl(&context, fd) else {
+        let Ok(graph) = lower_fun_decl_with_root_stack(&context, fd, &root_stack_state) else {
             continue;
         };
         assert!(
@@ -227,6 +229,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
     let Some(llbc) = object_llbc() else { return };
     let mut dropping = 0usize;
     let context = lower_context_for(llbc);
+    let root_stack_state = RootStackState::new(llbc);
     let mut left_open: Vec<String> = Vec::new();
     let mut moved_out = 0usize;
     for fd in llbc.iter_local_fns() {
@@ -237,7 +240,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
             continue;
         }
         dropping += 1;
-        let Ok(graph) = lower_fun_decl(&context, fd) else {
+        let Ok(graph) = lower_fun_decl_with_root_stack(&context, fd, &root_stack_state) else {
             continue;
         };
         if calls_to(&graph, "root_scope_close") > 0 {
@@ -245,7 +248,7 @@ fn only_a_moved_out_or_erased_guard_keeps_its_bracket_open() {
         }
         let name = fd.item_meta.name_path().to_string();
         let moved = moved_out_locals(&body);
-        let erased = erased_root_bracket_guards(llbc, fd, &body);
+        let erased = erased_root_bracket_guards(llbc, fd, &body, &root_stack_state);
         let excused = guard_drop_sites(llbc, &body)
             .any(|(_, local)| moved.contains(&local) || erased.contains(&(local as usize)));
         assert!(
@@ -329,20 +332,22 @@ fn nearly_every_dropped_bracket_closes() {
         .map(|llbc| (llbc, lower_context_for(llbc)))
         .collect();
     let mut work: Vec<(
+        usize,
         &LowerContext<'_>,
         &majit_charon_reader::ullbc::FunDecl,
         usize,
     )> = Vec::new();
-    for (llbc, context) in &programs {
+    for (i, (llbc, context)) in programs.iter().enumerate() {
+        let root_stack_state = RootStackState::new(llbc);
         for fd in llbc.iter_local_fns() {
             let Some(body) = fd.unstructured() else {
                 continue;
             };
-            let want = owed_closes(llbc, fd, &body);
+            let want = owed_closes(llbc, fd, &body, &root_stack_state);
             if want == 0 {
                 continue;
             }
-            work.push((context, fd, want));
+            work.push((i, context, fd, want));
         }
     }
     let bodies = work.len();
@@ -352,14 +357,20 @@ fn nearly_every_dropped_bracket_closes() {
         .min(work.len().max(1));
     let chunk = work.len().div_ceil(threads).max(1);
     let results = std::thread::scope(|scope| {
+        let programs = &programs;
         let handles: Vec<_> = work
             .chunks(chunk)
             .map(|slice| {
                 scope.spawn(move || {
+                    let states: Vec<RootStackState> = programs
+                        .iter()
+                        .map(|(llbc, _)| RootStackState::new(llbc))
+                        .collect();
                     let mut closed = 0usize;
                     let mut short = Vec::new();
-                    for &(context, fd, want) in slice {
-                        let Ok(graph) = lower_fun_decl(context, fd) else {
+                    for &(i, context, fd, want) in slice {
+                        let Ok(graph) = lower_fun_decl_with_root_stack(context, fd, &states[i])
+                        else {
                             continue;
                         };
                         if reachable_closes(&graph) >= want {
@@ -398,9 +409,10 @@ fn owed_closes(
     llbc: &Llbc,
     fd: &majit_charon_reader::ullbc::FunDecl,
     body: &Unstructured,
+    root_stack_state: &RootStackState,
 ) -> usize {
     let moved = moved_out_locals(body);
-    let erased = erased_root_bracket_guards(llbc, fd, body);
+    let erased = erased_root_bracket_guards(llbc, fd, body, root_stack_state);
     let live = reachable_without_unwind(llbc, body);
     guard_drop_sites(llbc, body)
         .filter(|(bb, local)| {

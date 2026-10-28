@@ -1162,7 +1162,8 @@ pub(crate) fn recipe_parent_frame_from_recipe(
     //     pc) routes to the reconstructed frame's `frame`/`ec` box, NOT the
     //     slot-indexed register file;
     //   * every other live color reads its semantic `locals_cells_stack_w` slot
-    //     from the slot-indexed `registers_r` (the reconstruct decode).
+    //     from the slot-indexed `registers_r` (the reconstruct decode);
+    //   * a live color with no slot reads the decoded color bank (`registers_r_color`).
     for &color in &banks.ref_ {
         let c = color as usize;
         if result_register == Some(('r', c)) {
@@ -1185,8 +1186,12 @@ pub(crate) fn recipe_parent_frame_from_recipe(
             } else {
                 ec_box
             }
+        } else if let Some(slot) = semantic_idx {
+            recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE)
+        } else if let Some(&b) = recipe.registers_r_color.get(c).filter(|b| !b.is_none()) {
+            b
         } else {
-            let slot = semantic_idx.or_else(|| (c < recipe.valuestackdepth).then_some(c))?;
+            let slot = (c < recipe.valuestackdepth).then_some(c)?;
             recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE)
         };
         boxes.push(opref);

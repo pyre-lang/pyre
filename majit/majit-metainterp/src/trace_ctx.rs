@@ -931,6 +931,11 @@ pub struct ReconstructRecipe {
     pub registers_r: Vec<OpRef>,
     pub registers_f: Vec<OpRef>,
     pub concrete_r: Vec<majit_ir::Value>,
+    /// Live Ref registers by color, as decoded from the resume section
+    /// (`resume.py` `_callback_r` into `MIFrame.registers_r`). Holds the
+    /// live colors that have no `locals_cells_stack_w` slot too. Empty for
+    /// a level whose decode fills only the slot bank.
+    pub registers_r_color: Vec<OpRef>,
     /// The level's `frame` red, decoded from its resume section like every
     /// other live register (`resume.py consume_boxes`).  The walk resumes the
     /// callee on this box, so the frame the parent trace entered — the one its
@@ -986,6 +991,7 @@ impl ReconstructRecipe {
     pub fn for_each_box(&self, mut f: impl FnMut(OpRef)) {
         self.registers_r
             .iter()
+            .chain(self.registers_r_color.iter())
             .chain(std::iter::once(&self.frame))
             .chain(self.return_substitute.iter())
             .chain(self.rebuilt_frame.iter())

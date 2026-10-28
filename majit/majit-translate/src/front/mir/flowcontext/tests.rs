@@ -4822,6 +4822,7 @@ fn dict_strategy_ref_imp_layout_is_dyn_fat() {
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
     );
     let spelling = ["dictmultiobject::DictStrategyRef", "DictStrategyRef"]
         .iter()
@@ -6221,8 +6222,12 @@ fn closure_capturing_fieldless_enum_annotates() {
         "fieldless Discriminant must not emit __cast_instance_intrinsic; roots={tag_cast_roots:?}"
     );
 
-    let (_, _, fields, _, _, attrs, _, _) =
-        super::derive_program_metadata(&llbc, &gc_struct_ids, super::no_immutable_fields());
+    let (_, _, fields, _, _, attrs, _, _) = super::derive_program_metadata(
+        &llbc,
+        &gc_struct_ids,
+        super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
+    );
     let closure_key = "fixture::capture::closure";
     let attr_rows = attrs
         .get("capture::closure")
@@ -6272,7 +6277,15 @@ fn closure_capturing_fieldless_enum_annotates() {
     let tag_ann = RPythonAnnotator::new(None, None, None, false);
     let tag_bk = &tag_ann.bookkeeper;
     tag_bk.set_struct_fields(Rc::new(
-        super::derive_program_metadata(&llbc, &gc_struct_ids, super::no_immutable_fields()).2,
+        super::derive_program_metadata(
+            &llbc,
+            &gc_struct_ids,
+            super::no_immutable_fields(),
+            &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(
+                &llbc,
+            )),
+        )
+        .2,
     ));
     let tag_registry = CallRegistry::new(tag_bk.clone());
     let tag_lifted = function_graph_to_flowspace(&tag_graph, &tag_registry).expect("lift tag");
@@ -9434,6 +9447,7 @@ fn pyerror_exc_object_registry_retains_instance_ref() {
         &llbc,
         &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
         super::no_immutable_fields(),
+        &crate::front::llbc_hints::harvest_alloc_flavor_raw_from_llbcs(std::slice::from_ref(&llbc)),
     );
     let (owner, ty) = fields
         .fields

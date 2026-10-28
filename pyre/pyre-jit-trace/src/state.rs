@@ -8586,6 +8586,7 @@ fn reconstruct_transparent_helper_recipe(
         registers_r,
         registers_f,
         concrete_r: Vec::new(),
+        registers_r_color: Vec::new(),
         frame: OpRef::NONE,
         nargs: 0,
         return_substitute: None,
@@ -8675,6 +8676,7 @@ fn reconstruct_inline_recipe(
             registers_r: Vec::new(),
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             return_substitute: Some(instance),
@@ -8725,6 +8727,7 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            registers_r_color: Vec::new(),
             frame: OpRef::NONE,
             nargs: 0,
             return_substitute: None,
@@ -8981,30 +8984,71 @@ fn reconstruct_inline_recipe(
     let pending_result_abs_slot = pending_result_color.and_then(|color| {
         semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color)
     });
+    // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
+    // post-regalloc color). Built once here so the LiveRefColorUnmapped check,
+    // both portal returns, and the generic tail share the same vector.
+    let mut by_color_r: Vec<OpRef> = Vec::new();
+    let mut by_color_c: Vec<majit_ir::Value> = Vec::new();
+    let mut value_cursor = int_len;
+    for &reg_idx in &reg_indices.ref_ {
+        let (op, val) = bridge_decode_box(
+            ctx,
+            values[value_cursor],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        let reg_idx = reg_idx as usize;
+        if reg_idx >= by_color_r.len() {
+            by_color_r.resize(reg_idx + 1, OpRef::NONE);
+            by_color_c.resize(reg_idx + 1, majit_ir::Value::Void);
+        }
+        by_color_r[reg_idx] = op;
+        by_color_c[reg_idx] = publish_fresh_recipe_ref(ctx, op, val);
+        value_cursor += 1;
+    }
+    // resume.py `_callback_r` writes every live register; here the encoder
+    // (`collect_outer_active_boxes`) writes `CONST_NULL` for a slot-less color
+    // it could not source from the walk register, because the shared `-live-`
+    // marker's union liveness can list colors dead at this PC (`pyjitpl.py`
+    // `get_list_of_active_boxes` has per-PC liveness and no such marker). The
+    // decoder cannot tell that marker from a live NULL, so such a frame
+    // declines; a slot-less color that carries a real box stays in
+    // `registers_r_color`. Portal reds (`pframe_reg`/`pec_reg`) are the vable
+    // restore inputs, not this check; it runs before the classifier so a
+    // dropped extra color cannot enter the portal arm.
+    for &reg_idx in &reg_indices.ref_ {
+        if reg_idx == pframe_reg || reg_idx == pec_reg {
+            continue;
+        }
+        let c = reg_idx as usize;
+        let mapped =
+            semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, c).is_some();
+        // Encoder writes `OpRef::const_ptr(GcRef(0))`. Numbering may keep
+        // that as `ConstPtr` (`opref_is_null_const_ptr`) or emit TAGBOX whose
+        // failarg bits are 0 (`InputArgRef` + `Value::Ref(GcRef(0))`).
+        let dropped = by_color_r.get(c).is_none_or(|&b| {
+            b.is_none()
+                || crate::jitcode_dispatch::opref_is_null_const_ptr(b)
+                || matches!(by_color_c.get(c), Some(majit_ir::Value::Ref(g)) if g.is_null())
+        });
+        if !mapped && dropped {
+            decline!("LiveRefColorUnmapped");
+        }
+    }
     // resume.py `rebuild_from_resumedata` / `consume_boxes` rebuilds
     // every paused frame and fills EVERY live register from the resume stream
     // with no shape classifier. Pyre recovers a portal callee's locals from the
     // `frame` red's own `locals_cells_stack_w` virtual array (below) rather than
-    // the register section, so accept any paused portal callee whose every live
-    // non-red color names a semantic slot at this pc (the `pcdep` inversion the
-    // encoder used): the reds are recovered through the `frame`, and each live
-    // operand kept across a CALL — e.g. `result1` in `f(a) + g(b)` at the second
-    // CALL — is decoded semantic-ordered from the flushed array. This single
-    // predicate subsumes the canonical `[frame, ec]` and the reduced `[frame]`
-    // in-a-call shapes; a slot the pause-time flush did not cover still declines
-    // at the mandatory-operand check below.
-    let portal_callee = has_frame
-        && reg_indices.ref_.iter().all(|&c| {
-            c == pframe_reg
-                || c == pec_reg
-                || semantic_ref_slot_for_reg_color(
-                    nlocals,
-                    stack_only,
-                    &maps.pcdep_entries,
-                    c as usize,
-                )
-                .is_some()
-        });
+    // the register section. Extra slot-less live Ref colors are resume.py
+    // `_callback_r` registers, not a reason to skip the frame image restore
+    // (`ResumeDataBoxReader.consume_vable_info`); they ride in
+    // `registers_r_color`.
+    let portal_callee = has_frame;
     if pframe_reg != u32::from(u16::MAX) && pec_reg != u32::from(u16::MAX) && portal_callee {
         // Distinguish the sibling-operand admission (a live color beyond the
         // portal reds) from the canonical reds-only shape so the corpus shows
@@ -9130,6 +9174,7 @@ fn reconstruct_inline_recipe(
                 registers_r,
                 registers_f,
                 concrete_r,
+                registers_r_color: by_color_r,
                 frame: frame_box,
                 nargs: frame_nlocals,
                 return_substitute: None,
@@ -9290,6 +9335,7 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f,
             concrete_r,
+            registers_r_color: by_color_r,
             frame: frame_red,
             nargs: frame_nlocals,
             return_substitute: None,
@@ -9306,45 +9352,22 @@ fn reconstruct_inline_recipe(
     // (`load_local_value` / `stack_slot_reg_idx` /
     // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
     // by `locals_cells_stack_w` slot). Otherwise every live color is placed
-    // by the `pcdep_entries` color → slot inversion below, or declined
-    // as LiveRefColorUnmapped when a live color has no slot.
+    // by the `pcdep_entries` color → slot inversion below, and every decoded
+    // live color, slotted or not, is kept by color in `registers_r_color`
+    // except a slot-less color whose decoded box is the encoder's CONST_NULL
+    // drop marker (LiveRefColorUnmapped, above).
     if maps.pcdep_entries.is_empty() {
         crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
         return None;
     }
 
-    // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
-    // post-regalloc color). The reconstructed inline frame's `registers_r`/
-    // `concrete_r` are read SLOT-indexed (`assemble_bridge_inline_pending` seeds
+    // The reconstructed inline frame's `registers_r`/`concrete_r` are read
+    // SLOT-indexed (`assemble_bridge_inline_pending` seeds
     // `locals_cells_stack_w[k]` and the resumed tracer reads LOAD_FAST's
-    // `nlocals + stack_idx`), so invert color→slot below — for a borrowed local
-    // pushed on the stack the color ≠ slot, and a color-indexed seed lands the
-    // value at the wrong slot.  The int/float banks were decoded above and need
-    // no inversion.
-    let mut by_color_r: Vec<OpRef> = Vec::new();
-    let mut by_color_c: Vec<majit_ir::Value> = Vec::new();
-    let mut value_cursor = int_len;
-    for &reg_idx in &reg_indices.ref_ {
-        let (op, val) = bridge_decode_box(
-            ctx,
-            values[value_cursor],
-            Type::Ref,
-            rd_virtuals,
-            resume_data,
-            fail_values,
-            fail_types,
-            backend,
-            cache,
-        );
-        let reg_idx = reg_idx as usize;
-        if reg_idx >= by_color_r.len() {
-            by_color_r.resize(reg_idx + 1, OpRef::NONE);
-            by_color_c.resize(reg_idx + 1, majit_ir::Value::Void);
-        }
-        by_color_r[reg_idx] = op;
-        by_color_c[reg_idx] = publish_fresh_recipe_ref(ctx, op, val);
-        value_cursor += 1;
-    }
+    // `nlocals + stack_idx`), so invert the COLOR-indexed decode from above
+    // — for a borrowed local pushed on the stack the color ≠ slot, and a
+    // color-indexed seed lands the value at the wrong slot.  The int/float
+    // banks were decoded above and need no inversion.
 
     // `pyframe.py valuestackdepth`: locals + cells + stack. Pure cellvars
     // are gated out above; a cellvar that overlaps a varname is that
@@ -9375,17 +9398,6 @@ fn reconstruct_inline_recipe(
         if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
             registers_r[s] = by_color_r[c];
             concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
-        }
-    }
-    // resume.py `_callback_r` writes every live register. The slot-indexed
-    // recipe banks have nowhere to put a color without a slot, so such a
-    // frame declines instead of dropping the value.
-    for &reg_idx in &reg_indices.ref_ {
-        let mapped = maps.pcdep_entries.iter().any(|&(bank, c, s)| {
-            bank == 1 && c as usize == reg_idx as usize && (s as usize) < valuestackdepth
-        });
-        if !mapped {
-            decline!("LiveRefColorUnmapped");
         }
     }
 
@@ -9432,6 +9444,7 @@ fn reconstruct_inline_recipe(
         registers_r,
         registers_f,
         concrete_r,
+        registers_r_color: by_color_r,
         frame: OpRef::NONE,
         nargs: frame_nlocals,
         return_substitute: None,
@@ -17268,8 +17281,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
 
     let max_reg = valuestackdepth
         .max(frame_reg as usize + 1)
-        .max(ec_reg as usize + 1);
+        .max(ec_reg as usize + 1)
+        .max(recipe.registers_r_color.len());
     let mut argboxes_r: Vec<OpRef> = vec![OpRef::NONE; max_reg];
+    // `consume_boxes` refills every live register; the color bank carries
+    // the live temporaries that have no slot. Reds and slots are written
+    // after it, so they keep their current precedence.
+    for (color, &b) in recipe.registers_r_color.iter().enumerate() {
+        if !b.is_none() {
+            argboxes_r[color] = b;
+        }
+    }
     argboxes_r[frame_reg as usize] = frame_vable;
     argboxes_r[ec_reg as usize] = ec_seed;
     // The recipe's `registers_r` is SEMANTIC-slot-indexed (filled from the

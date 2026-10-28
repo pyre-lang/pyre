@@ -1743,6 +1743,15 @@ fn fn_null_constant(
     }
 }
 
+/// `classdesc.get_param('_alloc_flavor_')` (`rclass.py` `getgcflavor`).
+/// Default `'gc'`, inherited.
+fn classdef_alloc_flavor(classdef: &Rc<RefCell<ClassDef>>) -> ConstValue {
+    let classdesc = classdef.borrow().classdesc.clone();
+    classdesc
+        .borrow()
+        .get_param("_alloc_flavor_", Some(ConstValue::byte_str("gc")), true)
+}
+
 /// Null of a raw-address niche — `lltype.nullptr(T)` as `SomePtr` of
 /// that raw `Struct` (`rnone.py` `rtype_is_None` → `ptr_iszero`) when
 /// the spelling is a storage-raw owner (`raw_struct_ptr_annotation`),
@@ -1785,22 +1794,14 @@ pub(crate) fn raw_ptr_null_constant(
             // `classdesc.get_param('_alloc_flavor_')`. Stamp keys that
             // param from `raw_alloc_flavor_structs` the same way
             // `Bookkeeper::stamp_raw_alloc_flavor` does.
-            if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(spelling) {
-                let alloc_flavor = {
-                    let classdesc = classdef.borrow().classdesc.clone();
-                    classdesc.borrow().get_param(
-                        "_alloc_flavor_",
-                        Some(ConstValue::byte_str("gc")),
-                        true,
-                    )
-                };
-                if alloc_flavor.as_text() == Some("raw") {
-                    return Ok(SomeValue::Instance(super::model::SomeInstance::new(
-                        Some(classdef),
-                        true,
-                        std::collections::BTreeMap::new(),
-                    )));
-                }
+            if let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(spelling)
+                && classdef_alloc_flavor(&classdef).as_text() == Some("raw")
+            {
+                return Ok(SomeValue::Instance(super::model::SomeInstance::new(
+                    Some(classdef),
+                    true,
+                    std::collections::BTreeMap::new(),
+                )));
             }
             Err(AnnotatorError::new(format!(
                 "ptr::null_raw() type argument is not a raw pointer: {spelling}"
@@ -2213,6 +2214,21 @@ fn cast_instance_intrinsic(
                 "__cast_instance_intrinsic: non-address operand for raw root {root:?}: {other:?}"
             ))),
         };
+    }
+    // An address word cast to a flavor-raw instance pointer is
+    // `ann_cast_int_to_ptr` (`lltype.py`). Address zero yields a null
+    // pointer, so the instance stays None-able and `bool_behavior` does
+    // not fold its truth value. A GC root refuses Integer
+    // (`lltype.castable` never takes int→GC this way).
+    if matches!(operand, SomeValue::Integer(_))
+        && let Ok(classdef) = bk.getuniqueclassdef_for_struct_root(&root)
+        && classdef_alloc_flavor(&classdef).as_text() == Some("raw")
+    {
+        return Ok(SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            true,
+            std::collections::BTreeMap::new(),
+        )));
     }
     // Carry the operand's nullability onto the downcast result instead
     // of unconditionally narrowing to non-None: a downcast of a nullable
@@ -5044,6 +5060,61 @@ mod tests {
         };
         assert_eq!(st._name, owner);
         assert_eq!(st._gckind, GcKind::Raw);
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_integer_flavor_raw_is_nullable_instance() {
+        let bk = bk();
+        bk.set_raw_alloc_flavor_structs(std::collections::HashSet::from(["FlavorRaw".to_string()]));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("FlavorRaw")
+            .expect("flavor-raw classdef");
+        let s_int = SomeValue::Integer(SomeInteger::new(false, true));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("FlavorRaw"))
+            .expect("flavor-raw root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_int), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("Integer → flavor-raw is ann_cast_int_to_ptr");
+        let SomeValue::Instance(inst) = out else {
+            panic!("int→flavor-raw must be SomeInstance, got {out:?}");
+        };
+        assert!(
+            inst.can_be_none,
+            "address zero casts to a null pointer; bool() must not fold to True"
+        );
+        let inst_classdef = inst.classdef.as_ref().expect("classdef");
+        assert!(
+            Rc::ptr_eq(inst_classdef, &classdef),
+            "int→flavor-raw instance must be the interned classdef"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_integer_gc_root_errors() {
+        let bk = bk();
+        let _classdef = bk
+            .getuniqueclassdef_for_struct_root("GcRoot")
+            .expect("gc classdef");
+        let s_int = SomeValue::Integer(SomeInteger::new(false, true));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("GcRoot"))
+            .expect("gc root constant");
+        let err = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_int), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect_err("Integer → GC root is not castable");
+        assert!(
+            err.to_string().contains("non-pointer"),
+            "GC root must refuse Integer, got {err}"
+        );
     }
 
     #[test]

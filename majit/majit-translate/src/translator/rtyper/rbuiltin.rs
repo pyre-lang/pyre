@@ -5041,6 +5041,18 @@ pub fn rtype_cast_instance_intrinsic(
     if r_arg0.lowleveltype() == &result_lltype {
         return Ok(Some(v_ptr));
     }
+    // Primitive → raw `Ptr` is `cast_int_to_ptr` (`rbuiltin.py` `gen_cast`).
+    // Unsigned first `cast_uint_to_int`. A GC pointer to a raw dest is
+    // not this arm (`lltype.castable` / `rgcref.py`).
+    if matches!(
+        r_arg0.lowleveltype(),
+        LowLevelType::Signed | LowLevelType::Unsigned
+    ) && let LowLevelType::Ptr(dest) = &result_lltype
+        && dest._gckind() == crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+    {
+        let mut llops = hop.llops.borrow_mut();
+        return Ok(Some(gen_cast(&mut llops, &result_lltype, v_ptr)?));
+    }
     // Unrelated raw owners share one address word. `cast_pointer` requires
     // a parent chain (`lltype.castable`); `llmemory.cast_ptr_to_adr` then
     // `cast_adr_to_ptr` is the retype that does not change gc status.
@@ -8099,6 +8111,104 @@ mod tests {
         assert!(
             ops._called_exception_is_here_or_cannot_occur,
             "rtype_cast_instance_intrinsic calls exception_cannot_occur"
+        );
+    }
+
+    #[test]
+    fn rtype_cast_instance_intrinsic_int_to_raw_emits_cast_int_to_ptr() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::model::{SomeInstance, SomeInteger};
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{Flavor, getinstancerepr};
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let s_int = SomeValue::Integer(SomeInteger::new(false, false));
+        let r_int = hop.rtyper.getrepr(&s_int).expect("IntegerRepr");
+        let v = Variable::named("addr");
+        v.set_concretetype(Some(r_int.lowleveltype().clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v));
+        hop.args_s.borrow_mut().push(s_int);
+        hop.args_r.borrow_mut().push(Some(r_int));
+
+        let classdef = ClassDef::new_standalone("pkg.RawC", None);
+        classdef
+            .borrow()
+            .classdesc
+            .borrow()
+            .pyobj
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let s_result = SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let r_result = hop.rtyper.getrepr(&s_result).expect("getrepr");
+        Repr::setup(r_result.as_ref()).expect("setup flavor-raw InstanceRepr");
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let _out = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
+            .expect("Integer → Raw")
+            .expect("cast_int_to_ptr result");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "cast_int_to_ptr"),
+            "Integer → Raw InstanceRepr emits cast_int_to_ptr, ops={:?}",
+            ops.ops
+                .iter()
+                .map(|op| op.opname.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            ops._called_exception_is_here_or_cannot_occur,
+            "rtype_cast_instance_intrinsic calls exception_cannot_occur"
+        );
+        drop(ops);
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let r_src = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("classdef-less");
+        Repr::setup(r_src.as_ref() as &dyn Repr).expect("setup object");
+        let v = Variable::named("gcref");
+        v.set_concretetype(Some(r_src.lowleveltype().clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            )));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(r_src as std::sync::Arc<dyn Repr>));
+
+        let classdef = ClassDef::new_standalone("pkg.RawC2", None);
+        classdef
+            .borrow()
+            .classdesc
+            .borrow()
+            .pyobj
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
+        let s_result = SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let r_result = hop.rtyper.getrepr(&s_result).expect("getrepr");
+        Repr::setup(r_result.as_ref()).expect("setup flavor-raw InstanceRepr");
+        *hop.r_result.borrow_mut() = Some(r_result);
+
+        let err = rtype_cast_instance_intrinsic(&hop, &HashMap::new())
+            .expect_err("GCREF → Raw must refuse");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not castable") || msg.contains("refuses"),
+            "GCREF → Raw must still error, got {msg}"
         );
     }
 }

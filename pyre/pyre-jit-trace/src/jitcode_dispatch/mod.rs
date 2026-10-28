@@ -7724,7 +7724,7 @@ fn do_jit_force_virtual_guard(ei: &majit_ir::EffectInfo, pc: usize) -> Result<()
 /// `true` when `op` is a `ConstPtr` carrying the NULL gcref (`GcRef(0)`) —
 /// the encoding an unset vable shadow slot decodes to.  Distinct from
 /// `OpRef::NONE` (no value at all).
-fn opref_is_null_const_ptr(op: OpRef) -> bool {
+pub(crate) fn opref_is_null_const_ptr(op: OpRef) -> bool {
     op.as_const_ptr().is_some_and(|g| g.is_null())
 }
 
