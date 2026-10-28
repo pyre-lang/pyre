@@ -461,6 +461,37 @@
       cursor: pointer;
     }
 
+    .example-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 10px 0 12px;
+    }
+
+    .example-chip {
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line-strong);
+      background: transparent;
+      color: var(--muted);
+      font: inherit;
+      font-size: 0.85rem;
+      cursor: pointer;
+      transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease;
+    }
+
+    .example-chip:hover,
+    .example-chip:focus-visible {
+      color: var(--text);
+      border-color: var(--accent);
+    }
+
+    .example-chip[aria-pressed="true"] {
+      color: var(--accent);
+      border-color: var(--accent);
+      background: color-mix(in srgb, var(--accent) 14%, transparent);
+    }
+
     .output-wrap .status {
       min-height: 48px;
       display: flex;
@@ -701,7 +732,7 @@
             <div>
               <h2>Run pyre in your browser</h2>
               <p>
-                This runs the WASM build of pyre directly in the page. It is meant for quick experiments and basic examples.
+                This runs the WASM build of pyre, tracing JIT included, directly in the page. Pick an example or write your own: much of the pure-Python standard library (re, json, datetime, collections, heapq, …) is available.
               </p>
             </div>
           </div>
@@ -709,6 +740,7 @@
           <div class="playground-grid">
             <div class="editor-wrap">
               <div class="label">Source</div>
+              <div class="example-bar" id="example-bar" role="group" aria-label="Examples"></div>
               <textarea id="source" spellcheck="false">def fib(n):
     a, b = 0, 1
     for _ in range(n):
@@ -718,7 +750,6 @@
 print(fib(100))</textarea>
               <div class="playground-controls">
                 <button class="button primary" id="run-button" disabled>Run</button>
-                <button class="button secondary" id="example-button" type="button">Load loop example</button>
               </div>
             </div>
 
@@ -802,11 +833,12 @@ print(fib(100))</textarea>
   </div>
 
   <script type="module">
+    import { examples } from "./examples.js";
     const statusNode = document.getElementById("playground-status");
     const sourceNode = document.getElementById("source");
     const outputNode = document.getElementById("output");
     const runButton = document.getElementById("run-button");
-    const exampleButton = document.getElementById("example-button");
+    const exampleBar = document.getElementById("example-bar");
     const themeToggle = document.getElementById("theme-toggle");
     const sunIcon = '<svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path></svg>';
     const moonIcon = '<svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path></svg>';
@@ -862,12 +894,6 @@ print(fib(100))</textarea>
     panelResizeObserver.observe(sourceNode);
     panelResizeObserver.observe(outputNode);
 
-    const loopExample = `total = 0
-for i in range(100000):
-    total += i
-
-print(total)`;
-
     let runPython = null;
 
     function setStatus(text, kind) {
@@ -905,21 +931,48 @@ print(total)`;
       runButton.disabled = true;
       setStatus("Running...", "");
 
-      try {
-        const result = runPython(sourceNode.value);
-        setOutput(result || "");
-        setStatus("Ready", "ready");
-      } catch (error) {
-        console.error(error);
-        setStatus("Execution failed", "error");
-        setOutput(String(error));
-      } finally {
-        runButton.disabled = false;
-      }
+      setTimeout(() => {
+        try {
+          const t0 = performance.now();
+          const result = runPython(sourceNode.value);
+          const elapsed = (performance.now() - t0).toFixed(1);
+          setOutput(result + (result ? "\n" : "") + "─── " + elapsed + " ms");
+          setStatus("Ready", "ready");
+        } catch (error) {
+          console.error(error);
+          setStatus("Execution failed", "error");
+          setOutput(String(error));
+        } finally {
+          runButton.disabled = false;
+        }
+      }, 10);
     });
 
-    exampleButton.addEventListener("click", () => {
-      sourceNode.value = loopExample;
+    for (const example of examples) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "example-chip";
+      button.textContent = example.label;
+      button.dataset.example = example.id;
+      button.setAttribute("aria-pressed", example.id === "fib" ? "true" : "false");
+      exampleBar.appendChild(button);
+    }
+
+    exampleBar.addEventListener("click", (event) => {
+      const chip = event.target.closest(".example-chip");
+      if (!chip) {
+        return;
+      }
+
+      const example = examples.find((entry) => entry.id === chip.dataset.example);
+      if (!example) {
+        return;
+      }
+
+      sourceNode.value = example.source;
+      for (const other of exampleBar.querySelectorAll(".example-chip")) {
+        other.setAttribute("aria-pressed", other === chip ? "true" : "false");
+      }
       sourceNode.focus();
     });
 
