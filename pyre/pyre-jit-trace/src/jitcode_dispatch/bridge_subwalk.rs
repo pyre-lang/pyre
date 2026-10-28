@@ -1462,6 +1462,24 @@ pub(crate) enum FrameHandlerEntry {
     },
 }
 
+/// Seed one bridge-resume shadow slot.
+///
+/// A `Ref` whose OpRef is `NONE` has no box. `_opimpl_getarrayitem_vable`
+/// returns the box, so that copy is not stored. `Int` / `Float` and a
+/// boxed or constant `Ref` are.
+fn seed_bridge_shadow_concrete(
+    shadow: &mut CalleeLocalsShadow,
+    frame_reg: u16,
+    slot: i64,
+    opref: OpRef,
+    value: Value,
+) {
+    if opref.is_none() && matches!(value, Value::Ref(_)) {
+        return;
+    }
+    shadow.set_concrete(frame_reg, slot, value);
+}
+
 /// Issue #215 item 2: drive the reconstructed deepest
 /// callee frame of a multi-frame bridge as an INLINE SUB-WALK
 /// (`is_top_level = false`) rooted on the caller-visible portal `root_sym`.
@@ -2006,13 +2024,22 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 .set_opref(slot as i64, opref);
         }
         for (slot, &v) in rooted_local_concretes.iter().enumerate() {
-            sub_wc
-                .frame_state
-                .borrow_mut()
-                .callee_shadow
-                .as_mut()
-                .unwrap()
-                .set_concrete(callee_pjc.metadata.portal_frame_reg, slot as i64, v);
+            let opref = local_oprefs
+                .get(slot)
+                .copied()
+                .unwrap_or(majit_ir::OpRef::NONE);
+            seed_bridge_shadow_concrete(
+                sub_wc
+                    .frame_state
+                    .borrow_mut()
+                    .callee_shadow
+                    .as_mut()
+                    .unwrap(),
+                callee_pjc.metadata.portal_frame_reg,
+                slot as i64,
+                opref,
+                v,
+            );
         }
         // The decoded multi-frame recipe carries this callee's semantic
         // operand stack after its locals/cells prefix.  Preserve that red
@@ -2030,17 +2057,22 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 .set_opref((stack_base + s) as i64, opref);
         }
         for (s, &value) in rooted_stack_concretes.iter().enumerate() {
-            sub_wc
-                .frame_state
-                .borrow_mut()
-                .callee_shadow
-                .as_mut()
-                .unwrap()
-                .set_concrete(
-                    callee_pjc.metadata.portal_frame_reg,
-                    (stack_base + s) as i64,
-                    value,
-                );
+            let opref = resumed_stack_oprefs
+                .get(s)
+                .copied()
+                .unwrap_or(majit_ir::OpRef::NONE);
+            seed_bridge_shadow_concrete(
+                sub_wc
+                    .frame_state
+                    .borrow_mut()
+                    .callee_shadow
+                    .as_mut()
+                    .unwrap(),
+                callee_pjc.metadata.portal_frame_reg,
+                (stack_base + s) as i64,
+                opref,
+                value,
+            );
         }
         if let Some(frame) = ActiveResumeFrame::current(session, root_sym_ptr)
             && frame.0.jitcode.code.as_ptr() == callee_code.as_ptr()
@@ -2482,4 +2514,49 @@ pub(crate) fn drive_bridge_middle_frame_from_handler<Sym: WalkSym>(
             catch_target,
         }),
     )
+}
+
+#[cfg(test)]
+mod bridge_seed_tests {
+    use super::*;
+
+    #[test]
+    fn seed_bridge_shadow_concrete_skips_a_ref_with_no_box() {
+        let mut shadow = CalleeLocalsShadow::default();
+        let copied = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
+        seed_bridge_shadow_concrete(&mut shadow, 4, 0, OpRef::NONE, copied);
+        assert!(shadow.concrete.get(&0).is_none());
+        assert!(shadow.opref.get(&0).is_none());
+
+        seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Int(7));
+        assert_eq!(
+            shadow.concrete.get(&1).map(|entry| entry.value),
+            Some(Value::Int(7))
+        );
+        seed_bridge_shadow_concrete(&mut shadow, 4, 1, OpRef::NONE, Value::Float(1.25));
+        assert_eq!(
+            shadow.concrete.get(&1).map(|entry| entry.value),
+            Some(Value::Float(1.25))
+        );
+
+        let boxed = OpRef::input_arg_ref(0);
+        seed_bridge_shadow_concrete(&mut shadow, 4, 2, boxed, copied);
+        assert_eq!(
+            shadow
+                .concrete
+                .get(&2)
+                .map(|entry| (entry.frame_reg, entry.value)),
+            Some((4, copied))
+        );
+
+        let constant = OpRef::const_ptr(majit_ir::GcRef(pyre_object::w_bool_from(true) as usize));
+        seed_bridge_shadow_concrete(
+            &mut shadow,
+            4,
+            3,
+            constant,
+            Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(true) as usize)),
+        );
+        assert!(shadow.concrete.get(&3).is_some());
+    }
 }
