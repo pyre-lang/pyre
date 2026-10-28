@@ -2420,13 +2420,19 @@ fn emit_portal_is_being_profiled_read(
         super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
     ]));
 
-    let null_state = current_state.clone();
+    let null_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        current_state.copy(&mut fresh)
+    };
     let null_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(null_state.clone()));
     null_arm.block().borrow_mut().inputargs = null_state.getvariables();
     all_walker_blocks.push(null_arm.clone());
 
     let debugdata_in = graph.fresh_variable(Kind::Ref);
-    let nonnull_state = current_state.clone();
+    let nonnull_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        current_state.copy(&mut fresh)
+    };
     let nonnull_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(nonnull_state.clone()));
     let mut nonnull_inputs = nonnull_state.getvariables();
     nonnull_inputs.push(debugdata_in.into());
@@ -2450,7 +2456,10 @@ fn emit_portal_is_being_profiled_read(
     set_last_bool_exitcase(&current_block.block(), false);
 
     let profiled_phi = graph.fresh_variable(Kind::Int);
-    let join_state = current_state.clone();
+    let join_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        current_state.copy(&mut fresh)
+    };
     let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
     let mut join_inputs = join_state.getvariables();
     join_inputs.push(profiled_phi.into());
@@ -2505,13 +2514,19 @@ fn emit_ptr_iszero_split(
         super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
     ]));
 
-    let null_state = current_state.clone();
+    let null_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        current_state.copy(&mut fresh)
+    };
     let null_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(null_state.clone()));
     null_arm.block().borrow_mut().inputargs = null_state.getvariables();
     all_walker_blocks.push(null_arm.clone());
 
     let ptr_in = graph.fresh_variable(Kind::Ref);
-    let nonnull_state = current_state.clone();
+    let nonnull_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        current_state.copy(&mut fresh)
+    };
     let nonnull_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(nonnull_state.clone()));
     let mut nonnull_inputs = nonnull_state.getvariables();
     nonnull_inputs.push(ptr_in.into());
@@ -2534,13 +2549,16 @@ fn emit_ptr_iszero_split(
     (null_arm, nonnull_arm, ptr_in)
 }
 
-fn link_to_join(source: &SpamBlockRef, source_state: &FrameState, join: &SpamBlockRef) {
+fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
+    let source_state = source
+        .framestate()
+        .expect("dispatch_bytecode arm carries a FrameState");
     let join_state = join
         .framestate()
         .expect("dispatch_bytecode join carries a FrameState");
     append_exit(
         &source.block(),
-        output_link(source_state, &join_state, join.block()),
+        output_link(&source_state, &join_state, join.block()),
     );
 }
 
@@ -2600,13 +2618,16 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
     arm_blocks.push(dd_null.block());
     arm_blocks.push(dd_nonnull.block());
 
-    let join_state = current_state.clone();
+    let join_state = {
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        current_state.copy(&mut fresh)
+    };
     let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
     join.block().borrow_mut().inputargs = join_state.getvariables();
     all_walker_blocks.push(join.clone());
     arm_blocks.push(join.block());
 
-    link_to_join(&dd_null, current_state, &join);
+    link_to_join(&dd_null, &join);
 
     let w_f_trace = emit_graph_op_with_result(
         graph,
@@ -2619,17 +2640,20 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
         Kind::Ref,
         py_pc as i64,
     );
+    let dd_nonnull_state = dd_nonnull
+        .framestate()
+        .expect("ptr_iszero non-null arm carries a FrameState");
     let (tr_null, tr_armed, _) = emit_ptr_iszero_split(
         graph,
         &dd_nonnull,
-        current_state,
+        &dd_nonnull_state,
         w_f_trace,
         all_walker_blocks,
     );
     arm_blocks.push(tr_null.block());
     arm_blocks.push(tr_armed.block());
 
-    link_to_join(&tr_null, current_state, &join);
+    link_to_join(&tr_null, &join);
 
     let _ = record_residual_call_graph_op(
         graph,
@@ -2654,13 +2678,15 @@ fn emit_dispatch_bytecode_jitted_trace_arm(
             graph,
             &tr_armed.block(),
             &site.landing,
-            current_state,
+            &tr_armed
+                .framestate()
+                .expect("ptr_iszero armed arm carries a FrameState"),
             site,
             unwind_memo,
             depth_at_pc,
         );
     }
-    link_to_join(&tr_armed, current_state, &join);
+    link_to_join(&tr_armed, &join);
     restore_canraise_exit_order(&tr_armed.block());
 
     join
@@ -2899,7 +2925,13 @@ fn emit_jump_absolute_tick(
         joinpoints,
         &goto_block,
         &{
-            let mut branch_state = current_state.clone();
+            let mut branch_state = if emit_header {
+                goto_block
+                    .framestate()
+                    .unwrap_or_else(|| current_state.clone())
+            } else {
+                current_state.clone()
+            };
             branch_state.next_offset = target_py_pc;
             branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
             branch_state
@@ -3939,10 +3971,10 @@ fn lookup_or_create_shared_unwind(
         if !entry.processed {
             return (entry.landing.clone(), entry.lasti_int);
         }
-        // `flowcontext.py mergeblock`: an emitted landing whose state
-        // already covers this edge is reused; otherwise the edge gets a
+        // `flowcontext.py FlowContext.mergeblock`: an emitted landing whose
+        // state already covers this edge is reused; otherwise the edge gets a
         // new landing carrying the generalized state, queued for emission.
-        // The emitted landing keeps its body for its existing predecessors.
+        // The old landing is retired and forwards to the new one.
         let generalized = entry.landing.framestate().and_then(|existing| {
             let mut fresh = |kind| fresh_variable_for_state(graph, kind);
             existing
@@ -3964,6 +3996,25 @@ fn lookup_or_create_shared_unwind(
                 .borrow_mut()
                 .inputargs
                 .push(lasti_int.into());
+        }
+        if let Some(new_state) = landing.framestate() {
+            let old = entry.landing.clone();
+            let old_state = old
+                .framestate()
+                .expect("emitted unwind landing carries a FrameState");
+            let old_lasti = entry.lasti_int;
+            old.mark_dead();
+            old.block().borrow_mut().operations.clear();
+            old.block().borrow_mut().exitswitch = None;
+            let mut args = old_state.getoutputargs(&new_state);
+            if site.push_lasti {
+                if let Some(old_lasti) = old_lasti {
+                    args.push(old_lasti.into());
+                }
+            }
+            old.block().recloseblock(vec![
+                super::flow::Link::new(args, Some(landing.block()), None).into_ref(),
+            ]);
         }
         let entry = &mut memo[index];
         entry.landing = landing.clone();
@@ -9584,6 +9635,9 @@ impl CodeWriter {
                                 &mut all_walker_blocks,
                             );
                             current_block = join_block;
+                            if let Some(state) = current_block.framestate() {
+                                current_state = state;
+                            }
                             needs_fallthrough = true;
                             let jdindex = PYTHON_PORTAL_JD_INDEX;
                             let scratch_pycode_reg =
@@ -9752,7 +9806,10 @@ impl CodeWriter {
                             // `raise` and then `insert_exits` would see the
                             // diamond's `ptr_iszero` exitswitch, dropping
                             // `catch_exception`.
-                            let mut arm_state = current_state.clone();
+                            let mut arm_state = {
+                                let mut fresh = |kind| fresh_variable_for_state(&mut graph, kind);
+                                current_state.copy(&mut fresh)
+                            };
                             arm_state.next_offset = py_pc;
                             arm_state.blocklist = frame_blocks_for_offset(code, py_pc);
                             let arm_block = SpamBlockRef::new(
