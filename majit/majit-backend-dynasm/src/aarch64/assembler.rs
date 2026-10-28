@@ -5915,95 +5915,6 @@ impl<'a> AssemblerARM64<'a> {
         );
     }
 
-    // genop_* — control flow
-
-    /// FINISH: store result (if any), store descr ptr, return jf_ptr.
-    #[allow(dead_code)]
-    fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
-        // compiler.rs parity: trust explicit FINISH types only when
-        // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
-        let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
-            if explicit.len() == finish_refs.len() {
-                explicit.to_vec()
-            } else {
-                finish_refs
-                    .iter()
-                    .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
-                    .collect()
-            }
-        } else {
-            finish_refs
-                .iter()
-                .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
-                .collect()
-        };
-        // compile.py parity: use type-specific global singleton.
-        // FINISH op exit (DoneWithThisFrame*) — `compile.py:185` skips these.
-        // Finish ops write the type-appropriate singleton pointer to jf_descr
-        // so CALL_ASSEMBLER's fast path CMP matches the correct variant.
-        let result_type = if fail_arg_types.is_empty() {
-            Type::Void
-        } else {
-            fail_arg_types[0]
-        };
-        let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-        // Singleton-direct push (see OpCode::Finish above for rationale).
-        let descr: majit_ir::DescrRef = self
-            .done_with_this_frame_descr_arc_for_type(result_type)
-            .expect(
-                "genop_finish requires cpu-attached singleton — \
-                 call `attach_default_test_descrs` or use `MetaInterp::new`",
-            );
-
-        // If there's a result argument, store it to jf_frame[0].
-        // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
-        if op.num_args() > 0 {
-            let arg0 = op.arg(0).to_opref();
-            let slot0_offset = Self::slot_offset(0);
-            if result_type == Type::Float {
-                // Float: load to xmm0, store via MOVSD
-                self.load_arg_to_rax(arg0); // loads raw bits
-                dynasm!(self.mc ; .arch aarch64
-                    ; str x0, [x29, slot0_offset as u32]
-                );
-            } else {
-                self.load_arg_to_rax(arg0);
-                dynasm!(self.mc ; .arch aarch64
-                    ; str x0, [x29, slot0_offset as u32]
-                );
-            }
-        }
-
-        // Store descr pointer at jf_ptr[0] (jf_descr slot).
-        // compile.py:665-674 parity: use global singleton pointer.
-        let descr_ptr = global_descr_ptr;
-        self.emit_mov_imm64(0, descr_ptr);
-        dynasm!(self.mc ; .arch aarch64
-            ; str x0, [x29, JF_DESCR_OFS as u32]
-        );
-
-        if result_type == Type::Ref {
-            if let Some(gcmap) = self.finish_gcmap {
-                gcmap_set_bit(gcmap, 0);
-                self.push_gcmap(gcmap);
-            } else {
-                self.push_gcmap(self.gcmap_for_finish);
-            }
-        } else if let Some(gcmap) = self.finish_gcmap {
-            self.push_gcmap(gcmap);
-        } else {
-            self.pop_gcmap();
-        }
-
-        // Emit epilogue (return jf_ptr).
-        self._call_footer();
-
-        // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
-        // not the cell pointer (see OpCode::Finish comment above).
-        self.fail_descrs.push(descr.clone());
-    }
-
     // genop_* — type conversions
 
     // Float helpers
@@ -7627,8 +7538,7 @@ impl<'a> AssemblerARM64<'a> {
         base_size: i64,
         item_size: i64,
     ) {
-        // The length comes from its regalloc location, for the reason
-        // `genop_alloc_varsize` states below: `consider_raw_call_like` plans
+        // The length comes from its regalloc location: `consider_raw_call_like` plans
         // these opcodes, and `before_call` leaves a value bound to a
         // callee-saved member of the allocation pool in its register, where
         // `resolve_opref` cannot see it.
@@ -7649,58 +7559,6 @@ impl<'a> AssemblerARM64<'a> {
             ; blr x8
             ; ldp x29, x30, [sp], #16
         );
-    }
-
-    /// Shared implementation for NEW_ARRAY.
-    /// Allocates base_size + length * item_size bytes, zero-fills,
-    /// and writes length to the header.
-    #[allow(dead_code)] // assembler.py genop_new_array / genop_alloc_varsize
-    fn genop_alloc_varsize(&mut self, op: &Op, arglocs: &[Loc], base_size: i64, item_size: i64) {
-        // The length comes from its regalloc location.  `prepare_raw_call_like`
-        // plans these opcodes, and `before_call` leaves a value bound to a
-        // callee-saved member of the allocation pool in its register, where
-        // `resolve_opref` cannot see it.  The load is consumed by the very next
-        // instruction, so rax/x0 doubling as ABI arg0 is safe here.
-        let [len_loc, ..] = arglocs else {
-            panic!("varsize allocation expects a length location, got {arglocs:?}");
-        };
-        self.emit_load_to_rax(*len_loc);
-        let malloc_ptr = libc::malloc as *const () as i64;
-        let memset_ptr = libc::memset as *const () as i64;
-
-        dynasm!(self.mc ; .arch aarch64
-            ; str x0, [sp, #-16]!               // save length
-        );
-        if item_size != 1 {
-            self.emit_mov_imm64(1, item_size);
-            dynasm!(self.mc ; .arch aarch64 ; mul x0, x0, x1);
-        }
-        dynasm!(self.mc ; .arch aarch64
-            ; add x0, x0, base_size as u32
-            ; str x0, [sp, #-16]!               // save total_size
-        );
-        dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
-        self.emit_mov_imm64(8, malloc_ptr);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x8
-            ; ldp x29, x30, [sp], #16
-            ; ldr x2, [sp], #16                 // total_size
-            ; str x0, [sp, #-16]!               // save ptr on stack
-            ; mov x1, 0                          // val = 0
-            ; stp x29, x30, [sp, #-16]!
-        );
-        self.emit_mov_imm64(8, memset_ptr);
-        dynasm!(self.mc ; .arch aarch64
-            ; blr x8
-            ; ldp x29, x30, [sp], #16
-            ; ldr x0, [sp], #16                  // restore ptr from stack
-            ; ldr x1, [sp], #16                  // length
-            ; str x1, [x0, 8]                    // store length at offset 8
-        );
-
-        if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
-        }
     }
 
     /// ZERO_ARRAY: zero a range in an array.

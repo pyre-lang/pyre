@@ -134,6 +134,7 @@ static APPLEVEL_FORK_CALLBACKS: crate::module::thread::ForkMutex<ApplevelForkCal
 // `fork_under_stw` uses for `GcSync::quiesce`: an OS-backed mutex, owned on
 // both sides, dropped on both sides.  A `parking_lot` mutex would carry the
 // parent's userspace waiter queue into the child.
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 static FORK_SERIALIZER: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// `rpy_init_mutexes` half for the posix fork tables.  Writes only.
@@ -442,6 +443,7 @@ pub(crate) fn walk_fork_callback_roots(visitor: &mut dyn FnMut(&mut PyObjectRef)
     }
 }
 
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 fn run_fork_callbacks(kind: &str) {
     let reverse = kind == "before";
     let initial_len = {
@@ -491,6 +493,7 @@ fn run_fork_callbacks(kind: &str) {
     }
 }
 
+#[cfg(not(windows))]
 fn register_at_fork(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     // Bound scope: `**kwds` (`interp_posix.py register_at_fork` unpacks
     // `__args__`). Named kw-only slots cannot carry a PY_NULL default
@@ -2233,6 +2236,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // Placeholders the POSIX blocks further down overwrite with the real libc
     // values — the wait options beside the `W*` predicates, the `PRIO_*` trio
     // beside `getpriority`. A build that reaches neither keeps the zero.
+    #[cfg(unix)]
     fn install_zero_constants(ns: PyObjectRef, names: &[&str]) {
         let _root_scope = pyre_object::gc_roots::push_roots();
         let ns_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -3066,10 +3070,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::PyError::os_error_syscall(errno, w_path)
     }
 
+    #[cfg(unix)]
     fn io_err(e: std::io::Error, path: &str) -> crate::PyError {
         errno_err(crate::builtins::io_error_posix_errno(&e, 0), path)
     }
 
+    #[cfg(all(unix, not(feature = "sandbox")))]
     fn io_err_with_filename(e: std::io::Error, w_path: PyObjectRef) -> crate::PyError {
         errno_err_with_filename(crate::builtins::io_error_posix_errno(&e, 0), w_path)
     }
@@ -3339,6 +3345,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         )
     }
 
+    #[cfg(all(
+        any(target_os = "linux", target_os = "freebsd", target_os = "macos"),
+        feature = "host_env",
+        not(feature = "sandbox")
+    ))]
     fn posix_posonly_builtin(
         name: &'static str,
         func: crate::gateway::BuiltinCodeFn,

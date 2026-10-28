@@ -763,7 +763,7 @@ pub(crate) fn current_exceptions() -> PyObjectRef {
 }
 
 /// `pypy/module/thread/os_thread.py:reinit_threads`.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn after_fork_child() {
     let ident = current_ident();
     // Before anything below, which reaches Python objects and can therefore
@@ -1603,7 +1603,7 @@ impl W_ThreadHandle {
     /// touched there.  Preserve only the plain handle fields and install new
     /// native synchronization state before `threading._after_fork` joins the
     /// vanished main thread.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn after_fork_reinit(&self, current_ident: i64) -> bool {
         let this = self as *const Self as *mut Self;
         unsafe {
@@ -1818,7 +1818,7 @@ mod local_class {
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
+        #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         pub(super) fn after_fork_reinit(&self) {
             let this = self as *const Self as *mut Self;
             unsafe {
@@ -2271,6 +2271,7 @@ impl Bootstrapper {
     /// os_thread.py `Bootstrapper.reinit`, in the child after `fork()`: no
     /// bootstrapping thread survived, so the fields are cleared and the lock
     /// is free.
+    #[cfg(unix)]
     fn reinit(&self) {
         self.release();
     }

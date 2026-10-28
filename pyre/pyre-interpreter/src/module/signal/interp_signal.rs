@@ -338,6 +338,7 @@ fn windows_handles_signal(signum: i32) -> bool {
 
 /// interp_signal.py `signal` SIG_IGN arm: `pypysig_ignore` then
 /// `handlers_w[signum] = w_handler`.
+#[cfg(all(unix, not(feature = "sandbox")))]
 fn signal_ignore(signum: i32, w_handler: PyObjectRef) {
     signalstate::pypysig_ignore(signum);
     set_handler(signum, w_handler);

@@ -54,7 +54,6 @@ fn sound_name(sound: PyObjectRef) -> Result<Vec<u16>, pyre_interpreter::PyError>
             roots.get(fspath_slot),
             &[roots.get(sound_slot)],
         )?;
-        let resolved_slot = pyre_object::gc_roots::shadow_stack_len();
         let resolved = roots.pin_root(resolved);
         if !unsafe { pyre_object::is_str(resolved) } {
             return Err(pyre_interpreter::PyError::type_error(format!(

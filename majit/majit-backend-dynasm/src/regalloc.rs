@@ -2824,7 +2824,6 @@ mod tests {
         Lea {
             dst: Loc,
             index_loc: Loc,
-            base_loc: Loc,
         },
     }
 
@@ -2898,13 +2897,12 @@ mod tests {
             dst: Loc,
             index_loc: &Loc,
             _itemsize: i64,
-            base_loc: &Loc,
+            _base_loc: &Loc,
             _ofs: i64,
         ) {
             self.emitted.push(Emitted::Lea {
                 dst,
                 index_loc: *index_loc,
-                base_loc: *base_loc,
             });
         }
     }

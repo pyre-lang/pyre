@@ -13,7 +13,7 @@
 //! `getbuffer` makes the `bytes` out of it once the read has completed.
 
 use parking_lot::Mutex;
-use pyre_object::{PY_NULL, PyObject, PyObjectRef};
+use pyre_object::{PyObject, PyObjectRef};
 use rustpython_host_env::overlapped as host_overlapped;
 use rustpython_host_env::winapi as host_winapi;
 

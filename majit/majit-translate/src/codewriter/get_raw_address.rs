@@ -16,7 +16,7 @@
 //! `build_ll_get_raw_address_of_string_helper_graph` (`gc_can_move`,
 //! `gc_move_out_of_nursery`, NUL `setarrayitem` on `STR.chars`, and a
 //! `direct_call` to `_get_raw_address_buf_from_string`) and
-//! `build_get_raw_address_buf_from_string_helper_graph` (`gc_id`,
+//! `build_get_raw_address_buf_from_string_family` (`gc_id`,
 //! `ll_dict_getitem` with a KeyError exit, `str2charp`, `ll_dict_setitem`,
 //! `cast_opaque_ptr`, `gc_fq_register`). Native LLBC of the majit-rlib
 //! body would hide those as `RawStore` / `HashMap` and miss

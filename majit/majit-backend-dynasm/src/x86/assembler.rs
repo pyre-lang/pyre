@@ -79,38 +79,6 @@ use crate::regalloc::{RegAlloc, RegAllocAssembler};
 use crate::regloc::Loc;
 use crate::runner::GuardGcTypeInfo;
 
-/// x86/assembler.py: managed general-purpose registers.
-const X86_GEN_REGS: [crate::regloc::RegLoc; 16] = [
-    crate::regloc::RegLoc::new(0, false),
-    crate::regloc::RegLoc::new(1, false),
-    crate::regloc::RegLoc::new(2, false),
-    crate::regloc::RegLoc::new(3, false),
-    crate::regloc::RegLoc::new(4, false),
-    crate::regloc::RegLoc::new(5, false),
-    crate::regloc::RegLoc::new(6, false),
-    crate::regloc::RegLoc::new(7, false),
-    crate::regloc::RegLoc::new(8, false),
-    crate::regloc::RegLoc::new(9, false),
-    crate::regloc::RegLoc::new(10, false),
-    crate::regloc::RegLoc::new(11, false),
-    crate::regloc::RegLoc::new(12, false),
-    crate::regloc::RegLoc::new(13, false),
-    crate::regloc::RegLoc::new(19, false),
-    crate::regloc::RegLoc::new(20, false),
-];
-
-/// x86/assembler.py: managed XMM/float registers.
-const X86_FLOAT_REGS: [crate::regloc::RegLoc; 8] = [
-    crate::regloc::RegLoc::new(0, true),
-    crate::regloc::RegLoc::new(1, true),
-    crate::regloc::RegLoc::new(2, true),
-    crate::regloc::RegLoc::new(3, true),
-    crate::regloc::RegLoc::new(4, true),
-    crate::regloc::RegLoc::new(5, true),
-    crate::regloc::RegLoc::new(6, true),
-    crate::regloc::RegLoc::new(7, true),
-];
-
 /// A LABEL publishes an in-buffer offset and only becomes an absolute address
 /// in `fixup_target_tokens`; 0 means its target was never compiled.  The first
 /// page is never mapped, so any value below it is one of those two and can only
@@ -2766,19 +2734,6 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// Emit: load a regalloc Loc into the dedicated scratch (R11), which is
-    /// outside `ALL_CORE_REGS`, so the load cannot clobber a value the
-    /// regalloc still has live in an allocatable register.  Counterpart of
-    /// the AArch64 `emit_load_loc_to_ip0`.
-    fn emit_load_loc_to_scratch(&mut self, loc: Loc) {
-        let scratch = crate::regloc::X86_64_SCRATCH_REG;
-        match loc {
-            // already there
-            Loc::Reg(r) if !r.is_xmm && r.value == scratch.value => {}
-            _ => self.regalloc_mov(&loc, &Loc::Reg(scratch)),
-        }
-    }
-
     /// Emit: load the value of `opref` into RCX (x64) / X1 (aarch64).
     fn load_arg_to_rcx(&mut self, opref: OpRef) {
         match self.resolve_opref(opref) {
@@ -3004,6 +2959,7 @@ impl<'a> Assembler386<'a> {
         base + if needs_pad { WORD as i32 } else { 0 }
     }
 
+    #[cfg(target_os = "windows")]
     fn emit_reserve_abi_call_area(&mut self, extra_pushes: usize, stack_slots: usize) -> i32 {
         let adjust = Self::abi_reserved_call_area_size(extra_pushes, stack_slots);
         if adjust != 0 {
@@ -3012,6 +2968,7 @@ impl<'a> Assembler386<'a> {
         adjust
     }
 
+    #[cfg(target_os = "windows")]
     fn emit_release_abi_call_area(&mut self, adjust: i32) {
         if adjust != 0 {
             rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
@@ -3037,25 +2994,6 @@ impl<'a> Assembler386<'a> {
         // Body rsp is already 0 mod 16 (`_call_header`). A register-only
         // call fits in `PASS_ON_MY_FRAME`, including the Win64 shadow.
         self.emit_abi_call_rax();
-    }
-
-    fn emit_abi_call_rax_after_one_push(&mut self) {
-        self.emit_abi_call_rax_with_extra_pushes(1);
-    }
-
-    fn emit_abi_call_reg_with_extra_pushes(&mut self, reg: u8, extra_pushes: usize) {
-        let adjust = Self::abi_reserved_call_area_size(extra_pushes, 0);
-        if adjust != 0 {
-            rx86::sub_ri(&mut self.mc, rx86::ESP, adjust);
-        }
-        self.mc.CALL(Operand::R(reg));
-        if adjust != 0 {
-            rx86::add_ri(&mut self.mc, rx86::ESP, adjust);
-        }
-    }
-
-    fn emit_abi_call_reg(&mut self, reg: u8) {
-        self.emit_abi_call_reg_with_extra_pushes(reg, 0);
     }
 
     // assembler.py:2153 _call_footer — function epilogue
@@ -7033,89 +6971,6 @@ impl<'a> Assembler386<'a> {
         self.mc.MOV(Operand::B(JF_FORCE_DESCR_OFS), scratch);
     }
 
-    // genop_* — control flow
-
-    /// FINISH: store result (if any), store descr ptr, return jf_ptr.
-    #[allow(dead_code)]
-    fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
-        // compiler.rs parity: trust explicit FINISH types only when
-        // they match the actual result arity; otherwise infer from the op args.
-        let finish_refs: Vec<OpRef> = op.args_slice().iter().map(|a| a.to_opref()).collect();
-        let fail_arg_types = if let Some(explicit) = op.get_fail_arg_types() {
-            if explicit.len() == finish_refs.len() {
-                explicit.to_vec()
-            } else {
-                finish_refs
-                    .iter()
-                    .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
-                    .collect()
-            }
-        } else {
-            finish_refs
-                .iter()
-                .map(|opref| self.opref_type_at(*opref, None).unwrap_or(Type::Int))
-                .collect()
-        };
-        // compile.py parity: use type-specific global singleton.
-        // FINISH op exit (DoneWithThisFrame*) — `compile.py:185` skips these.
-        // Finish ops write the type-appropriate singleton pointer to jf_descr
-        // so CALL_ASSEMBLER's fast path CMP matches the correct variant.
-        let result_type = if fail_arg_types.is_empty() {
-            Type::Void
-        } else {
-            fail_arg_types[0]
-        };
-        let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-        // Singleton-direct push (see OpCode::Finish above for rationale).
-        let descr: majit_ir::DescrRef = self
-            .done_with_this_frame_descr_arc_for_type(result_type)
-            .expect(
-                "genop_finish requires cpu-attached singleton — \
-                 call `attach_default_test_descrs` or use `MetaInterp::new`",
-            );
-
-        // If there's a result argument, store it to jf_frame[0].
-        // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
-        if op.num_args() > 0 {
-            let arg0 = op.arg(0).to_opref();
-            let slot0_offset = Self::slot_offset(0);
-            if result_type == Type::Float {
-                // Float: load to xmm0, store via MOVSD
-                self.load_arg_to_rax(arg0); // loads raw bits
-                rx86::mov_br(&mut self.mc, slot0_offset, rx86::EAX); // store float bits via GPR
-            } else {
-                self.load_arg_to_rax(arg0);
-                rx86::mov_br(&mut self.mc, slot0_offset, rx86::EAX);
-            }
-        }
-
-        // Store descr pointer at jf_ptr[0] (jf_descr slot).
-        // compile.py:665-674 parity: use global singleton pointer.
-        let descr_ptr = global_descr_ptr;
-        rx86::mov_ri(&mut self.mc, rx86::EAX, descr_ptr);
-        rx86::mov_br(&mut self.mc, JF_DESCR_OFS, rx86::EAX);
-
-        if result_type == Type::Ref {
-            if let Some(gcmap) = self.finish_gcmap {
-                gcmap_set_bit(gcmap, 0);
-                self.push_gcmap(gcmap);
-            } else {
-                self.push_gcmap(self.gcmap_for_finish);
-            }
-        } else if let Some(gcmap) = self.finish_gcmap {
-            self.push_gcmap(gcmap);
-        } else {
-            self.pop_gcmap();
-        }
-
-        // Emit epilogue (return jf_ptr).
-        self._call_footer();
-
-        // Singleton: jf_descr bakes the cpu-attached `global_descr_ptr`,
-        // not the cell pointer (see OpCode::Finish comment above).
-        self.fail_descrs.push(descr.clone());
-    }
-
     // genop_* — type conversions
 
     // Float helpers
@@ -8862,8 +8717,7 @@ impl<'a> Assembler386<'a> {
         base_size: i64,
         item_size: i64,
     ) {
-        // The length comes from its regalloc location, for the reason
-        // `genop_alloc_varsize` states below: `consider_raw_call_like` plans
+        // The length comes from its regalloc location: `consider_raw_call_like` plans
         // these opcodes, and `before_call` leaves a value bound to a
         // callee-saved member of the allocation pool in its register, where
         // `resolve_opref` cannot see it.
@@ -8881,59 +8735,6 @@ impl<'a> Assembler386<'a> {
             crate::runner::dynasm_malloc_lowlevel_string as *const () as i64,
         );
         self.emit_abi_call_rax();
-    }
-
-    /// Shared implementation for NEW_ARRAY.
-    /// Allocates base_size + length * item_size bytes, zero-fills,
-    /// and writes length to the header.
-    fn genop_alloc_varsize(&mut self, arglocs: &[Loc], base_size: i64, item_size: i64) {
-        // The length comes from its regalloc location.  `consider_raw_call_like`
-        // plans these opcodes, and `before_call` leaves a value bound to a
-        // callee-saved member of the allocation pool in its register, where
-        // `resolve_opref` cannot see it.  The load is consumed by the very next
-        // instruction, so rax/x0 doubling as ABI arg0 is safe here.
-        let [len_loc, ..] = arglocs else {
-            panic!("varsize allocation expects a length location, got {arglocs:?}");
-        };
-        self.emit_load_to_rax(*len_loc);
-        let malloc_ptr = libc::malloc as *const () as i64;
-        let memset_ptr = libc::memset as *const () as i64;
-
-        // Save length, compute total_size = base_size + length * item_size
-        dynasm!(self.mc ; .arch x64
-            ; push rax                           // save length
-        );
-        rx86::imul_ri(&mut self.mc, rx86::EAX, item_size as i32);
-        rx86::add_ri(&mut self.mc, rx86::EAX, base_size as i32);
-        dynasm!(self.mc ; .arch x64
-            ; push rax                           // save total_size
-        );
-        self.emit_abi_int_arg_from_reg(0, 0);
-        rx86::mov_ri(&mut self.mc, rx86::EAX, malloc_ptr);
-        // Two pushes sit below the scratch, so the outgoing shadow is
-        // not `PASS_ON_MY_FRAME`.
-        self.emit_abi_call_rax_with_extra_pushes(2);
-        dynasm!(self.mc ; .arch x64
-        ; pop rcx                            // rcx = total_size
-        );
-        dynasm!(self.mc ; .arch x64
-            ; push rax                           // save ptr
-        );
-        self.emit_abi_int_arg_from_reg(2, 1);
-        self.emit_abi_int_arg_from_imm(1, 0);
-        self.emit_abi_int_arg_from_reg(0, 0);
-        rx86::mov_ri(&mut self.mc, rx86::EAX, memset_ptr);
-        self.emit_abi_call_rax_with_extra_pushes(2);
-        dynasm!(self.mc ; .arch x64
-        ; pop rax                            // rax = ptr
-        );
-        dynasm!(self.mc ; .arch x64
-        ; pop rcx                            // rcx = length
-        );
-        dynasm!(self.mc ; .arch x64
-            // Store length at offset 8 (RPython string header)
-            ; mov [rax + 8], rcx
-        );
     }
 
     /// `AddressLoc(base_loc, _scaled_addr(...))` for ZERO_ARRAY, as INSN

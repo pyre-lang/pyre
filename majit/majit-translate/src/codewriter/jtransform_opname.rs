@@ -4090,13 +4090,6 @@ mod tests {
     fn lower_graph_lowers_twoway_list_helpers() {
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
-        let _search = crate::rlib::rstring::build_search_helper_graph(
-            &rtyper,
-            "_search",
-            STRPTR.clone(),
-            false,
-        )
-        .expect("_search");
         let prep = crate::rlib::rstring::build_twoway_preprocess_helper_graph(
             &rtyper,
             "_twoway_preprocess",
