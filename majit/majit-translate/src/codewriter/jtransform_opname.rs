@@ -1568,7 +1568,11 @@ pub(crate) fn materialize_constant(
         )
     };
     let kind = match c.concretetype.as_ref() {
-        Some(LowLevelType::Signed | LowLevelType::SignedLongLong) => match &c.value {
+        Some(LowLevelType::Signed) => match &c.value {
+            ConstValue::Int(n) => OpKind::ConstInt(*n),
+            _ => fail(),
+        },
+        Some(LowLevelType::SignedLongLong) => match &c.value {
             ConstValue::Int(n) => OpKind::ConstInt(*n),
             _ => fail(),
         },

@@ -702,6 +702,16 @@ impl CodeWriter {
                 || stamp_classdef_hints_on_graph(&mut graph_owned, value_to_var),
             );
         }
+        // `ll_copy` (`rlist.py`) of a fixed GcArray into a raw `Vec`.
+        // The rich graph still names `<[T]>::to_vec`; retarget a
+        // `FixedSizeListRepr` self to `ll_vec_copy_from_fixed_list_{segment}`.
+        if let Some(value_to_var) = real_value_to_var.as_ref() {
+            crate::codewriter::list_to_raw::rewrite_fixed_list_to_vec(
+                &mut graph_owned,
+                value_to_var,
+                callcontrol,
+            );
+        }
         // rstr.py `StringRepr.convert_const` resolves string literals into
         // prebuilt `Ptr(STR)` constants before the codewriter sees the
         // graph. Fold the synthetic `__str_const` calls the front lowers

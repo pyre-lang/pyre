@@ -51,6 +51,9 @@ pub mod minmax;
 pub mod strfind;
 // `str::as_ptr` residual of `rffi.get_raw_address_of_string`.
 pub mod get_raw_address;
+// `ll_copy` (`rlist.py`) of a fixed GcArray into a raw `Vec` — mints
+// `ll_vec_copy_from_fixed_list`.
+pub mod list_to_raw;
 // Opname-dispatch transducer ("Spine B"): lowers rtyper low-level helper
 // graphs (opname `SpaceOperation`s) to rich-`OpKind` graphs that re-enter the
 // shared flatten/regalloc/assembler tail. Port of `jtransform.py`'s

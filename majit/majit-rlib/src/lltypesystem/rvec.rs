@@ -980,6 +980,42 @@ fn gcarray_getitem_r(l2: GCREF, index: usize) -> GCREF {
     )) as GCREF
 }
 
+/// First item of a length-prefixed GcArray. `array_items_base` rounds
+/// the length word up to the item alignment (`repr(C)` `{ length, items }`).
+fn gcarray_items_base(ll_list: GCREF, align: usize) -> *mut u8 {
+    raw_ptradd(ll_list as usize, WORD.next_multiple_of(align)) as *mut u8
+}
+
+/// `ll_copy_list_to_raw_array` (`rrawarray.py`). `@jit.dont_look_inside`:
+/// the GC-address `raw_memcopy` stays a residual call. `get_raw_buf` is
+/// the item base. `Signed` and `Unsigned` share `_i`.
+fn ll_copy_list_to_raw_array(ll_list: GCREF, dst_ptr: usize, item_size: usize, align: usize) {
+    let len = gcarray_length_r(ll_list);
+    let nbytes = item_bytes(len, item_size).expect("Vec capacity overflow");
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            gcarray_items_base(ll_list, align),
+            dst_ptr as *mut u8,
+            nbytes,
+        );
+    }
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_copy_list_to_raw_array_i(ll_list: GCREF, dst_ptr: usize) {
+    ll_copy_list_to_raw_array(ll_list, dst_ptr, ITEM_SIZE_I, ITEM_ALIGN_I);
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_copy_list_to_raw_array_f(ll_list: GCREF, dst_ptr: usize) {
+    ll_copy_list_to_raw_array(ll_list, dst_ptr, ITEM_SIZE_F, ITEM_ALIGN_F);
+}
+
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn ll_copy_list_to_raw_array_r(ll_list: GCREF, dst_ptr: usize) {
+    ll_copy_list_to_raw_array(ll_list, dst_ptr, ITEM_SIZE_R, ITEM_ALIGN_R);
+}
+
 /// `rlist.ll_extend(l1, l2)` when `l2` is a one-word object slice: the
 /// GcArray word, not a `(items, length)` pair. Length is the array's
 /// header; each item is read by index from `l2` after `_ll_resize_ge`,
@@ -1846,6 +1882,9 @@ mod tests {
             "ll_slice_rotate_right_r",
             "ll_slice_rotate_left_f",
             "ll_slice_bounds_panic",
+            "ll_copy_list_to_raw_array_i",
+            "ll_copy_list_to_raw_array_f",
+            "ll_copy_list_to_raw_array_r",
         ] {
             let path = format!("{module}::{leaf}");
             assert!(
@@ -1881,6 +1920,63 @@ mod tests {
         let before = ll_vec_length_r(&mut l);
         ll_vec_extend_r(&mut l, &mut empty as *mut GcArrayWord as GCREF);
         assert_eq!(ll_vec_length_r(&mut l), before);
+    }
+
+    /// `ll_copy_list_to_raw_array` copies the item base (`array_items_base`)
+    /// into a raw buffer. A zero length leaves the destination unchanged.
+    #[test]
+    fn copy_list_to_raw_array_copies_gcarray_items() {
+        #[repr(C)]
+        struct Words {
+            length: usize,
+            items: [usize; 3],
+        }
+        let mut src = Words {
+            length: 3,
+            items: [1, 2, 3],
+        };
+        let mut dst = [0usize; 3];
+        ll_copy_list_to_raw_array_i(&mut src as *mut Words as GCREF, dst.as_mut_ptr() as usize);
+        assert_eq!(dst, [1, 2, 3]);
+
+        src.length = 0;
+        dst = [7, 7, 7];
+        ll_copy_list_to_raw_array_i(&mut src as *mut Words as GCREF, dst.as_mut_ptr() as usize);
+        assert_eq!(dst, [7, 7, 7]);
+
+        #[repr(C)]
+        struct Floats {
+            length: usize,
+            items: [f64; 2],
+        }
+        assert_eq!(
+            std::mem::offset_of!(Floats, items),
+            std::mem::size_of::<usize>().next_multiple_of(std::mem::align_of::<f64>()),
+        );
+        let mut floats = Floats {
+            length: 2,
+            items: [1.5, 2.5],
+        };
+        let mut fdst = [0.0f64; 2];
+        ll_copy_list_to_raw_array_f(
+            &mut floats as *mut Floats as GCREF,
+            fdst.as_mut_ptr() as usize,
+        );
+        assert_eq!(fdst, [1.5, 2.5]);
+
+        #[repr(C)]
+        struct Refs {
+            length: usize,
+            items: [GCREF; 2],
+        }
+        let mut refs = Refs {
+            length: 2,
+            items: [0x10 as GCREF, 0x20 as GCREF],
+        };
+        let mut rdst = [std::ptr::null_mut(), std::ptr::null_mut()];
+        ll_copy_list_to_raw_array_r(&mut refs as *mut Refs as GCREF, rdst.as_mut_ptr() as usize);
+        assert_eq!(rdst[0], 0x10 as GCREF);
+        assert_eq!(rdst[1], 0x20 as GCREF);
     }
 
     /// `ovfcheck(len1 + len2)` in `ll_extend`: a wrapping sum is MemoryError,

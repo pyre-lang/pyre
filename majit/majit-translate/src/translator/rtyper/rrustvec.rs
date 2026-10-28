@@ -26,7 +26,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, GCREF, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
 use crate::translator::rtyper::rlist::{
-    ListIteratorRepr, ListLayout, rtype_getslice_via_ll_listslice,
+    FixedSizeListRepr, ListIteratorRepr, ListLayout, ll_vec_copy_from_fixed_list_helper,
+    ll_vec_copy_from_fixed_list_into, rtype_getslice_via_ll_listslice,
 };
 use crate::translator::rtyper::rmodel::{
     RTypeResult, Repr, ReprState, hop_arg_const_string, inputconst_from_lltype,
@@ -62,6 +63,17 @@ pub fn rust_vec_lltype(item: &LowLevelType) -> LowLevelType {
 
 /// The item lltype of a [`rust_vec_lltype`] header pointer.
 pub fn rust_vec_item_lltype(ty: &LowLevelType) -> Option<&LowLevelType> {
+    let LowLevelType::Ptr(items) = rust_vec_ptr_lltype(ty)? else {
+        return None;
+    };
+    let PtrTarget::Array(array) = &items.TO else {
+        return None;
+    };
+    Some(&array.OF)
+}
+
+/// The `ptr` field of a [`rust_vec_lltype`] header: `Ptr(Array(ITEM))`.
+pub fn rust_vec_ptr_lltype(ty: &LowLevelType) -> Option<&LowLevelType> {
     let LowLevelType::Ptr(ptr) = ty else {
         return None;
     };
@@ -69,13 +81,7 @@ pub fn rust_vec_item_lltype(ty: &LowLevelType) -> Option<&LowLevelType> {
         return None;
     };
     header._hints.get(RUST_VEC_HINT)?;
-    let LowLevelType::Ptr(items) = header._flds.get("ptr")? else {
-        return None;
-    };
-    let PtrTarget::Array(array) = &items.TO else {
-        return None;
-    };
-    Some(&array.OF)
+    header._flds.get("ptr")
 }
 
 /// Register kind of an item lltype.
@@ -541,6 +547,78 @@ pub fn rtype_newrustvec(hop: &HighLevelOp) -> RTypeResult {
             lltype,
         )
     }
+}
+
+/// `ll_vec_copy_from_slice(ITEM, self)` — `ll_copy` (`rlist.py`) into a
+/// raw `Vec`. `ll_copy` has no oopspec and is inlined by the JIT.
+///
+/// Argument 0 is the constant item lowleveltype. A `FixedSizeListRepr`
+/// self `gendirectcall`s `ll_vec_copy_from_fixed_list_{segment}` when its
+/// item lowleveltype equals the result header's, or when the list stores
+/// `GCREF` (`externalvsinternal`, `gcref=True`) and the header item is
+/// the external one-word GC pointer (`SomeRustVec::for_kind(Ref)` is a
+/// classdef-less `InstanceRepr`, whose lowleveltype is `OBJECTPTR`).
+/// Those two pointers are the same word; the helper returns the header's
+/// own lowleveltype. Any other self stays a `direct_call` of `to_vec`.
+/// Replacing that call with `ll_vec_newemptylist_*` would drop the copied
+/// items.
+pub fn rtype_ll_vec_copy_from_slice(hop: &HighLevelOp) -> RTypeResult {
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_ll_vec_copy_from_slice: r_result missing"))?;
+    if r_result.repr_class_id() != super::pairtype::ReprClassId::RustVecRepr {
+        return Err(TyperError::message(
+            "rtype_ll_vec_copy_from_slice: hop.r_result is not a RustVecRepr",
+        ));
+    }
+    let lltype = r_result.lowleveltype().clone();
+    hop.exception_cannot_occur()?;
+    if hop.nb_args() != 2 {
+        return Err(TyperError::message(format!(
+            "rtype_ll_vec_copy_from_slice: expected (item, self), got {} args",
+            hop.nb_args()
+        )));
+    }
+    let self_repr = hop
+        .args_r
+        .borrow()
+        .get(1)
+        .and_then(|repr| repr.clone())
+        .ok_or_else(|| TyperError::message("rtype_ll_vec_copy_from_slice: missing self repr"))?;
+    let self_ll = self_repr.lowleveltype().clone();
+    let v_self = hop.inputarg(ConvertedTo::Repr(self_repr.as_ref()), 1)?;
+    let header_item = rust_vec_item_lltype(&lltype).cloned();
+    let fixed_item = {
+        let any_r: &dyn std::any::Any = self_repr.as_ref();
+        any_r
+            .downcast_ref::<FixedSizeListRepr>()
+            .map(|fixed| fixed.item_lowleveltype())
+    };
+    // Equal items share one segment. A fixed list of GC pointers stores
+    // `GCREF` while `RustVecRepr` keeps the external pointer in the
+    // header; the segment still comes from the list item, and the helper
+    // result is this header so `translate_hl_to_ll` sees one lowleveltype.
+    let segment = match (header_item.as_ref(), fixed_item.as_ref()) {
+        (Some(header), Some(fixed)) if fixed == header => rust_vec_item_key_segment(header),
+        (Some(header), Some(fixed))
+            if fixed == &*GCREF && vec_item_kind_of(header) == Some(VecItemKind::Ref) =>
+        {
+            Some("GCREF")
+        }
+        _ => None,
+    };
+    if segment.is_some() {
+        let fixed = fixed_item.expect("segment is set only when the list item is");
+        let helper = if header_item.as_ref() == Some(&fixed) {
+            ll_vec_copy_from_fixed_list_helper(&hop.rtyper, &fixed)?
+        } else {
+            ll_vec_copy_from_fixed_list_into(&hop.rtyper, &fixed, &lltype)?
+        };
+        return hop.gendirectcall(&helper, vec![v_self]);
+    }
+    genop_helper_call(hop, "to_vec", vec![v_self], vec![self_ll], lltype)
 }
 
 #[cfg(test)]
@@ -1314,5 +1392,64 @@ mod tests {
             names.iter().any(|n| n == "ll_listslice_startonly"),
             "getslice [start:] must mint an ll_listslice_startonly helper graph, got {names:?}"
         );
+    }
+
+    /// A fixed list of a classdef-less instance stores `GCREF`
+    /// (`externalvsinternal`, `gcref=True`). The `Vec` header keeps that
+    /// external pointer (`OBJECTPTR`). `ll_copy` still runs: the segment
+    /// is the list item, and the helper result is the header.
+    #[test]
+    fn rtype_gcref_fixed_list_into_external_ref_vec() {
+        use crate::annotator::model::SomeInstance;
+        use crate::flowspace::model::{SpaceOperation, Variable};
+        use std::collections::BTreeMap;
+
+        let (_ann, rtyper) = setup_rtyper();
+        let s_item = SomeValue::Instance(SomeInstance::new(None, false, BTreeMap::new()));
+        let item_repr = rtyper.getrepr(&s_item).expect("instance repr");
+        let fixed = std::sync::Arc::new(
+            FixedSizeListRepr::new(&rtyper, item_repr.clone()).expect("fixed list"),
+        );
+        let r_vec = std::sync::Arc::new(RustVecRepr::new(item_repr).expect("rust vec"));
+        let header_item = rust_vec_item_lltype(r_vec.lowleveltype())
+            .expect("header item")
+            .clone();
+        assert_eq!(fixed.item_lowleveltype(), *GCREF);
+        assert_ne!(header_item, *GCREF);
+        assert_eq!(vec_item_kind_of(&header_item), Some(VecItemKind::Ref));
+
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_self = Variable::new();
+        v_self.set_concretetype(Some(fixed.lowleveltype().clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(r_vec.lowleveltype().clone()));
+        let item_const = Hlvalue::Constant(crate::flowspace::model::Constant::new(
+            ConstValue::LowLevelType(Box::new((*GCREF).clone())),
+        ));
+        let self_h = Hlvalue::Variable(v_self);
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "ll_vec_copy_from_slice".to_string(),
+                vec![item_const.clone(), self_h.clone()],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        *hop.args_v.borrow_mut() = vec![item_const, self_h];
+        *hop.args_s.borrow_mut() = vec![s_item.clone(), s_item];
+        *hop.args_r.borrow_mut() = vec![Some(r_vec.clone()), Some(fixed)];
+        *hop.r_result.borrow_mut() = Some(r_vec.clone());
+
+        let returned = rtype_ll_vec_copy_from_slice(&hop).expect("rtype fixed-list copy");
+        let Some(Hlvalue::Variable(result)) = returned else {
+            panic!("helper must return the new Vec, got {returned:?}");
+        };
+        assert_eq!(result.concretetype().as_ref(), Some(r_vec.lowleveltype()));
+        assert_only_direct_call_to(&llops, "ll_vec_copy_from_fixed_list_GCREF");
     }
 }
