@@ -1868,18 +1868,20 @@ mod xmlparser_class {
                 let _ = self_obj;
                 w_none()
             }
-            fn SetParamEntityParsing(self_obj: PyObjectRef, flag: PyObjectRef) -> PyObjectRef {
-                let enabled = if unsafe { is_int(flag) } {
-                    unsafe { w_int_get_value(flag) != 0 }
-                } else {
-                    is_true_obj(flag)
-                };
+            fn SetParamEntityParsing(
+                mut self_obj: PyObjectRef,
+                mut flag: PyObjectRef,
+            ) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+                // interp_pyexpat.py `SetParamEntityParsing` `@unwrap_spec(flag=int)`.
+                let flag = pyre_object::with_roots!(
+                    self_obj, flag => pyre_interpreter::baseobjspace::gateway_int_w(flag)
+                )?;
                 pyre_interpreter::baseobjspace::setdictvalue_native(
                     self_obj,
                     "_pyre_param_entity_parsing",
-                    w_int_new(if enabled { 1 } else { 0 }),
+                    w_int_new(flag),
                 );
-                w_int_new(1)
+                Ok(w_int_new(1))
             }
             fn UseForeignDTD(
                 self_obj: PyObjectRef,
@@ -2149,10 +2151,14 @@ fn parser_create3(
 /// `ErrorString(code)` — map an error code to its message via the `errors`
 /// table.  Returns `None` for an unknown code (matching the C behaviour).
 fn error_string(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyError> {
-    let code = match args.first().copied() {
-        Some(o) if unsafe { is_int(o) } => unsafe { w_int_get_value(o) },
-        _ => return Ok(w_none()),
-    };
+    // interp_pyexpat.py `ErrorString` `@unwrap_spec(code=int)`.
+    let mut w_code = args
+        .first()
+        .copied()
+        .ok_or_else(|| pyre_interpreter::PyError::type_error("ErrorString() missing argument"))?;
+    let code = pyre_object::with_roots!(
+        w_code => pyre_interpreter::baseobjspace::gateway_int_w(w_code)
+    )?;
     Ok(ERROR_TABLE
         .iter()
         .find(|(_, c)| *c == code)

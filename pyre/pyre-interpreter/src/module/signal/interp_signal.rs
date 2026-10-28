@@ -908,25 +908,29 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             "set_wakeup_fd",
             |args| {
                 // Bound scope: pos-only `fd`, kw-only `warn_on_full_buffer`
-                // (`PY_NULL` omitted → True). interp_signal.py `set_wakeup_fd`.
-                let warn_on_full_buffer = args
+                // (`PY_NULL` omitted → True). interp_signal.py `set_wakeup_fd`
+                // `@unwrap_spec(fd="c_int", warn_on_full_buffer=bool)`.
+                let mut w_fd = args
+                    .first()
+                    .copied()
+                    .filter(|value| !value.is_null())
+                    .ok_or_else(|| {
+                        crate::PyError::type_error("set_wakeup_fd() requires an argument")
+                    })?;
+                let mut w_warn = args
                     .get(1)
                     .copied()
                     .filter(|value| !value.is_null())
-                    .map(crate::baseobjspace::is_true)
-                    .transpose()?
-                    .unwrap_or(true);
-                let fd = if let Some(&a) = args.first().filter(|value| !value.is_null()) {
-                    if !unsafe { pyre_object::is_int(a) } {
-                        return Err(crate::PyError::type_error(
-                            "set_wakeup_fd() argument must be an int",
-                        ));
-                    }
-                    (unsafe { pyre_object::w_int_get_value(a) }) as i32
+                    .unwrap_or(pyre_object::PY_NULL);
+                let fd = if w_warn.is_null() {
+                    pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?
                 } else {
-                    return Err(crate::PyError::type_error(
-                        "set_wakeup_fd() requires an argument",
-                    ));
+                    pyre_object::with_roots!(w_fd, w_warn => crate::baseobjspace::c_int_w(w_fd))?
+                };
+                let warn_on_full_buffer = if w_warn.is_null() {
+                    true
+                } else {
+                    pyre_object::with_roots!(w_fd => crate::baseobjspace::is_true(w_warn))?
                 };
                 // `PYPYSIG_USE_SEND` — set by the Windows probe below, which is
                 // the only place a descriptor is asked whether it is a socket.
@@ -938,7 +942,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if fd != -1 {
                     #[cfg(all(unix, not(feature = "sandbox")))]
                     {
-                        let mut w_fd = args[0];
                         let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
                         let fstat_ret = pyre_object::with_roots!(w_fd => unsafe {
                             majit_rlib::rposix::c_fstat(fd, &mut st)
@@ -1052,13 +1055,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let signum = if let Some(&a) = args.first() {
-                        unsafe { pyre_object::w_int_get_value(a) as i32 }
-                    } else {
-                        return Err(crate::PyError::type_error(
-                            "raise_signal() missing argument",
-                        ));
-                    };
+                    // interp_signal.py `raise_signal` `@unwrap_spec(signalnum=int)`.
+                    let mut w_signum = args.first().copied().ok_or_else(|| {
+                        crate::PyError::type_error("raise_signal() missing argument")
+                    })?;
+                    let signum =
+                        pyre_object::with_roots!(w_signum => signum_arg(w_signum))? as i32;
                     // The MSVC runtime reports a signal number it does not
                     // have through its invalid parameter handler, whose
                     // default action ends the process before `raise` can
@@ -1077,7 +1079,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     #[cfg(unix)]
                     let raised = {
-                        let mut w_signum = args[0];
                         let err = pyre_object::with_roots!(w_signum => unsafe {
                             majit_rlib::rsignal::c_raise(signum)
                         });
@@ -1251,13 +1252,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
-                        let secs = if let Some(&a) = args.first() {
-                            unsafe { pyre_object::w_int_get_value(a) as u32 }
-                        } else {
-                            return Err(crate::PyError::type_error("alarm() missing argument"));
-                        };
+                        // interp_signal.py `alarm` `@unwrap_spec(timeout=int)`.
+                        let mut w_timeout = args.first().copied().ok_or_else(|| {
+                            crate::PyError::type_error("alarm() missing argument")
+                        })?;
+                        let timeout = pyre_object::with_roots!(
+                            w_timeout => crate::baseobjspace::gateway_int_w(w_timeout)
+                        )?;
                         Ok(pyre_object::w_int_new(
-                            unsafe { majit_rlib::rsignal::c_alarm(secs as _) } as i64,
+                            unsafe { majit_rlib::rsignal::c_alarm(timeout as _) } as i64,
                         ))
                     }
                     #[cfg(not(feature = "host_env"))]

@@ -546,30 +546,40 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     "setlocale() takes 1 or 2 arguments",
                 ));
             }
-            if !unsafe { pyre_object::is_int(args[0]) } {
-                return Err(crate::PyError::type_error(
-                    "setlocale: category must be an integer",
-                ));
-            }
-            // `args` is the gateway's native copy; `str_utf8_w` can collect.
+            // `interp_locale.py setlocale` `@unwrap_spec(category=int)`:
+            // `gateway_int_w` before `text_w` of the locale.
             let mut w_category = args[0];
+            let mut w_locale = if args.len() >= 2 {
+                args[1]
+            } else {
+                pyre_object::PY_NULL
+            };
+            let cat = if w_locale.is_null() {
+                pyre_object::with_roots!(
+                    w_category => crate::baseobjspace::gateway_int_w(w_category)
+                )?
+            } else {
+                pyre_object::with_roots!(
+                    w_category, w_locale => crate::baseobjspace::gateway_int_w(w_category)
+                )?
+            } as i32;
             let locale_str: Option<String> =
-                if args.len() >= 2 && !unsafe { pyre_object::is_none(args[1]) } {
-                    if !unsafe { pyre_object::is_str(args[1]) } {
+                if !w_locale.is_null() && !unsafe { pyre_object::is_none(w_locale) } {
+                    if !unsafe { pyre_object::is_str(w_locale) } {
                         return Err(crate::PyError::type_error(
                             "setlocale: locale must be a string or None",
                         ));
                     }
                     let text = pyre_object::with_roots!(
-                        w_category => crate::baseobjspace::str_utf8_w(args[1])
+                        w_category => crate::baseobjspace::str_utf8_w(w_locale)
                     )?;
                     Some(text.to_string())
                 } else {
                     None
                 };
+            let _ = w_category;
             #[cfg(all(any(unix, windows), feature = "host_env"))]
             {
-                let cat = (unsafe { pyre_object::w_int_get_value(w_category) }) as i32;
                 // [3.14-spec] The embedded-NUL `ValueError` comes first, then
                 // the category, then the Windows name check: the argument
                 // clinic of `_localemodule.c _locale_setlocale` at v3.14.6
@@ -607,7 +617,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             {
                 // No libc available — every valid call resolves to the
                 // POSIX "C" locale.  `locale_str` is dropped on purpose.
-                let _ = (locale_str, w_category);
+                let _ = (locale_str, cat);
                 Ok(pyre_object::w_str_new_managed("C"))
             }
         })
@@ -633,16 +643,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     not(any(target_os = "android", target_os = "redox"))
                 ))]
                 {
-                    let item = if args.is_empty() {
-                        libc::CODESET as i64
-                    } else {
-                        if !unsafe { pyre_object::is_int(args[0]) } {
-                            return Err(crate::PyError::type_error(
-                                "nl_langinfo: item must be an integer",
-                            ));
-                        }
-                        unsafe { pyre_object::w_int_get_value(args[0]) }
-                    };
+                    // `interp_locale.py nl_langinfo` `@unwrap_spec(key=int)`.
+                    let mut w_key = args.first().copied().ok_or_else(|| {
+                        crate::PyError::type_error("nl_langinfo() missing argument")
+                    })?;
+                    let item = pyre_object::with_roots!(
+                        w_key => crate::baseobjspace::gateway_int_w(w_key)
+                    )?;
                     // `rlocale.py nl_langinfo` / `interp_locale.py nl_langinfo`:
                     // a key that is not a published nl_item is unsupported.
                     if !langinfo_constants().iter().any(|&(_, v)| v == item) {

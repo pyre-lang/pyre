@@ -1135,12 +1135,11 @@ fn sys_getframe(args: &[PyObjectRef]) -> crate::PyResult {
     }
     let depth = if args.is_empty() {
         0i64
-    } else if unsafe { pyre_object::is_int(args[0]) } {
-        unsafe { pyre_object::w_int_get_value(args[0]) }
     } else {
-        return Err(crate::PyError::type_error(
-            "_getframe(): argument must be an int",
-        ));
+        let mut w_depth = args[0];
+        pyre_object::with_roots!(
+            w_depth => crate::baseobjspace::gateway_int_w(w_depth)
+        )?
     };
     // `vm.py:37-38 if depth < 0: raise ... "frame index must not be negative"`
     // — the message differs from `getframe`'s exhausted-stack case.
