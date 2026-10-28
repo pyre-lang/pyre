@@ -3273,6 +3273,230 @@ fn a_nonstandard_vable_array_access_does_not_promote_the_index() {
     }
 }
 
+struct RetiredLocalRead {
+    outcome: Result<DispatchOutcome, DispatchError>,
+    /// Concrete stamped on the destination box.
+    concrete: Option<Value>,
+    /// Concrete from a second read of the same slot on this same walk state.
+    second_concrete: Option<Value>,
+    shadow_opref: Option<OpRef>,
+    shadow_value: Option<Value>,
+}
+
+/// Drive `getarrayitem_vable_r` through the `Void` fallback.
+///
+/// The checked read misses (`NewWithVtable` holes carry no runtime concrete,
+/// so `vable_box_result_at` returns `(op, None)`). `frame_ptr == 0` is "the
+/// live frame could not be consulted". A non-zero pointer is a real `PyFrame`
+/// whose slot 0 the handler may read when `code_ptr`'s local region covers it.
+fn read_retired_callee_local(
+    frame_ptr: usize,
+    code_ptr: *const pyre_interpreter::CodeObject,
+    stale: OpRef,
+    stale_value: Value,
+) -> RetiredLocalRead {
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+    let info = crate::frame_layout::build_pyframe_virtualizable_info();
+    let array_len = 3;
+    let slot_count = info.num_static_extra_boxes + array_len;
+    let standard = tc.const_ref(1);
+    // Unstamped recorded holes: a `const_null` box is a real `Ref(0)` concrete
+    // and the checked read would return it before the live-frame fallback.
+    let hole = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+    let initial_boxes = vec![hole; slot_count];
+    tc.install_virtualizable_info(info.clone());
+    tc.init_virtualizable_boxes(
+        &info,
+        standard,
+        Value::Ref(majit_ir::GcRef(1)),
+        &initial_boxes,
+        &[],
+        &[array_len],
+    );
+    // Distinct from `standard`, so the access is nonstandard and does not
+    // read the portal boxes. Address 2 is not a frame; the live word comes
+    // from `CalleeLocalsShadow.concrete_frame`.
+    let vable = OpRef::input_arg_ref(0);
+    tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+    let index = tc.const_int(0);
+    let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+        info.array_descrs[0]
+            .as_array_descr()
+            .expect("the fixture's array descr"),
+    );
+    let raw_pool = vec![
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+            majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+        )),
+        majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+    ];
+    // `ridd>r`: r-reg(0) + i-reg(1) + fdescr(0) + adescr(1) + dst(2).
+    let code: [u8; 8] = [0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02];
+    let mut shadow = CalleeLocalsShadow {
+        fold_frame_reg: u16::MAX,
+        concrete_frame: frame_ptr,
+        frame_box: vable,
+        frame_materialized: true,
+        code_ptr,
+        ..Default::default()
+    };
+    shadow.set_opref(0, stale);
+    shadow.set_concrete(0, 0, stale_value);
+    let regs_r = vec![vable, OpRef::NONE, OpRef::NONE];
+    let regs_i = vec![index, index];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: Some(shadow),
+            concrete_registers_r: vec![crate::state::ConcreteValue::Null; 3],
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::PerFn(&raw_pool),
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let op = DecodedOp {
+        key: "getarrayitem_vable_r/ridd>r",
+        opname: "getarrayitem_vable_r",
+        argcodes: "ridd>r",
+        pc: 0,
+        next_pc: code.len(),
+    };
+    let outcome = getarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r').map(|(out, _)| out);
+    let dst = wc.registers_r.get(2);
+    let concrete = dst.and_then(|opref| wc.trace_ctx.concrete_of_opref(opref));
+    // Same helper, same walk state: the live frame is still the first channel,
+    // so this read does not depend on the shadow having been rewritten.
+    let second = getarrayitem_vable_via_metainterp(&code, &op, &mut wc, 'r');
+    let second_concrete = second.ok().and_then(|_| {
+        wc.registers_r
+            .get(2)
+            .and_then(|opref| wc.trace_ctx.concrete_of_opref(opref))
+    });
+    let state = wc.frame_state.borrow();
+    let shadow = state
+        .callee_shadow
+        .as_ref()
+        .expect("shadow survives the read");
+    let shadow_opref = shadow.opref.get(&0).copied();
+    let shadow_value = shadow.concrete.get(&0).map(|entry| entry.value);
+    RetiredLocalRead {
+        outcome,
+        concrete,
+        second_concrete,
+        shadow_opref,
+        shadow_value,
+    }
+}
+
+/// `_opimpl_getarrayitem_vable` returns the slot's current box. After the
+/// fold is retired the checked read is `Void`, and a NULL word in the live
+/// frame is that box. A second read of the same slot, on the same walk state,
+/// returns that null again.
+///
+/// No Python snippet reaches this branch on 3.15. `FrameLocalsProxy` refuses
+/// `del frame.f_locals[name]` and `frame.clear()` on an executing or suspended
+/// frame. A traced `del x` lowers to `setarrayitem_vable` of a const null,
+/// which updates the shadow in the same step as the live slot, so the later
+/// `LOAD_FAST_CHECK` never sees a null live word behind a stale shadow.
+#[test]
+fn null_live_vable_slot_reads_null_not_the_shadow() {
+    let function = pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+    let code = function
+        .constants
+        .iter()
+        .find_map(|constant| match constant {
+            pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                Some((**code).clone())
+            }
+            _ => None,
+        })
+        .expect("function code");
+    assert_eq!(
+        code.varnames.len(),
+        1,
+        "slot 0 must be inside the local region"
+    );
+    let module = pyre_interpreter::compile_exec("x = 1\n").expect("module compile");
+    assert!(
+        module.varnames.is_empty(),
+        "a module assignment is not a fast local"
+    );
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(code.clone());
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+    let raw = crate::state::concrete_stack_value(frame_ptr, 0).expect("locals array slot 0");
+    assert!(raw.is_null(), "a fresh fast local starts as NULL");
+
+    let stale = OpRef::const_ptr(majit_ir::GcRef(0xABC0));
+    let stale_value = Value::Ref(majit_ir::GcRef(0xABC0));
+    let null = Value::Ref(majit_ir::GcRef(0));
+
+    let hit = read_retired_callee_local(frame_ptr, &code, stale, stale_value);
+    assert_eq!(
+        hit.outcome,
+        Ok(DispatchOutcome::Continue),
+        "null live read must dispatch, got {:?}",
+        hit.outcome
+    );
+    assert_eq!(
+        hit.concrete,
+        Some(null),
+        "a consulted NULL slot is the null reference, not the shadow"
+    );
+    assert_eq!(
+        hit.second_concrete,
+        Some(null),
+        "a second read of the same slot is also the null reference"
+    );
+
+    let no_frame = read_retired_callee_local(0, &code, stale, stale_value);
+    assert_eq!(no_frame.outcome, Ok(DispatchOutcome::Continue));
+    assert_eq!(
+        no_frame.concrete,
+        Some(stale_value),
+        "no live frame keeps the shadow fallback"
+    );
+    assert_eq!(no_frame.shadow_opref, Some(stale));
+    assert_eq!(no_frame.shadow_value, Some(stale_value));
+
+    // Slot 0 of `frame` is NULL, but this code's local region does not cover
+    // it. That is "could not consult", and the null word must not win.
+    let out_of_range = read_retired_callee_local(frame_ptr, &module, stale, stale_value);
+    assert_eq!(out_of_range.outcome, Ok(DispatchOutcome::Continue));
+    assert_eq!(
+        out_of_range.concrete,
+        Some(stale_value),
+        "an index outside the local region keeps the shadow fallback"
+    );
+    assert_eq!(out_of_range.shadow_opref, Some(stale));
+    assert_eq!(out_of_range.shadow_value, Some(stale_value));
+}
+
 #[test]
 #[ignore = "T3 audit probe — dumps runtime opnames + walker-handled set + \
                 per-opname JitCode hit count. Run with \
@@ -13949,6 +14173,179 @@ fn call_pure_i_nonconst_records_one_call_with_the_result() {
         .expect("CALL_PURE_I")
         .get_value();
     assert_eq!(born, Some(majit_ir::Value::Int(42)));
+}
+
+fn with_call_pure_walk<R>(
+    tc: &mut TraceCtx,
+    body: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>) -> R,
+) -> R {
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: Vec::new(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: test_outer_resume_jitcode_index(),
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    body(&mut wc)
+}
+
+/// All-const `CALL_PURE_R`. The folded const is the result box's address
+/// after the record, including when that box and the argument `ConstPtr`
+/// were forwarded the way `finish_payload_root_walker_writes_back_forwarded_const_ptr`
+/// writes a slot back.
+///
+/// A minor collection cannot be forced inside `record_bytes` from this
+/// harness. `TraceCtx::for_test_types` records into a host buffer
+/// (`TraceOpsBuf::double` → `alloc_host`), `MAJIT_GC_STRESS_TRACE_ALLOC` is a
+/// process-lifetime `LazyLock`, and `attach_live_byte_recorder` is a no-op
+/// under `cfg(test)`. The walk below is the crate's forced-collection
+/// writeback, applied to the live boxes the fold reads.
+#[test]
+fn call_pure_r_all_const_folded_const_is_the_forwarded_box() {
+    const ARG: usize = 0x9B_0000_1000;
+    const ARG_TO: usize = ARG + 0x80;
+    const RES: usize = 0x9B_0000_2000;
+    const RES_TO: usize = RES + 0x80;
+    let _restore = [
+        RestoreConstPtr::intern(ARG),
+        RestoreConstPtr::intern(RES),
+        RestoreConstPtr::intern(RES_TO),
+    ];
+    let _stw = majit_gc::gc_sync::quiesce_mutators();
+
+    {
+        let mut tc = fresh_trace_ctx();
+        let funcbox = tc.const_int(0x11);
+        let arg = tc.const_ref(ARG as i64);
+        let allboxes = [funcbox, arg];
+        let descr = make_call_descr(
+            91,
+            vec![Type::Ref],
+            Type::Ref,
+            majit_ir::ExtraEffect::ElidableCannotRaise,
+        );
+        let ops_before = tc.num_ops();
+        let folded = with_call_pure_walk(&mut tc, |wc| {
+            let patch_pos = wc.trace_ctx.get_trace_position();
+            let ei = descr
+                .as_call_descr()
+                .expect("CallPureR descr")
+                .get_extra_info()
+                .clone();
+            let (folded, _wb) = record_ordinary_residual_after_execute(
+                wc,
+                majit_ir::OpCode::CallPureR,
+                funcbox,
+                &allboxes,
+                descr.clone(),
+                &ei,
+                patch_pos,
+                Some(majit_ir::Value::Ref(majit_ir::GcRef(RES))),
+                false,
+                true,
+            );
+            folded
+        });
+        assert_eq!(tc.num_ops(), ops_before, "all-const CALL_PURE_R is cut");
+        assert_eq!(folded.as_const_ptr(), Some(majit_ir::GcRef(RES)));
+        assert_eq!(
+            tc.box_value(arg),
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(ARG))),
+        );
+    }
+
+    let mut tc = fresh_trace_ctx();
+    let funcbox = tc.const_int(0x11);
+    let arg = tc.const_ref(ARG as i64);
+    let allboxes = [funcbox, arg];
+    let descr = make_call_descr(
+        92,
+        vec![Type::Ref],
+        Type::Ref,
+        majit_ir::ExtraEffect::ElidableCannotRaise,
+    );
+    let patch_pos = tc.get_trace_position();
+    let ops_before = tc.num_ops();
+    let rec = tc.record_op_with_descr_value(
+        majit_ir::OpCode::CallPureR,
+        &allboxes,
+        descr.clone(),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(RES))),
+    );
+    assert_eq!(
+        tc.box_value(rec),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(RES))),
+        "the record stores the pre-move result on the live box",
+    );
+    {
+        let _wave = majit_ir::const_ptr_table::Wave::enter();
+        majit_ir::const_ptr_table::walk(&mut |slot| {
+            if slot.0 == ARG {
+                slot.0 = ARG_TO;
+            }
+        });
+    }
+    tc.set_opref_concrete(rec, majit_ir::Value::Ref(majit_ir::GcRef(RES_TO)));
+    assert_eq!(
+        tc.box_value(arg),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ARG_TO))),
+    );
+    assert_eq!(
+        tc.box_value(rec),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(RES_TO))),
+    );
+    let folded = with_call_pure_walk(&mut tc, |wc| {
+        record_executed_pure_call_result(
+            wc,
+            majit_ir::OpCode::CallPureR,
+            &allboxes,
+            descr,
+            patch_pos,
+            rec,
+        )
+    });
+    assert_eq!(tc.num_ops(), ops_before, "all-const CALL_PURE_R is cut");
+    assert_eq!(
+        folded.as_const_ptr(),
+        Some(majit_ir::GcRef(RES_TO)),
+        "the folded const is the forwarded result, not the pre-move address",
+    );
+    assert_eq!(
+        tc.box_value(arg),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(ARG_TO))),
+        "the argument ConstPtr keeps the forwarded address",
+    );
 }
 
 /// A `jit.not_in_trace` callee that returns normally.

@@ -1285,6 +1285,17 @@ pub(crate) fn walker_nonstandard_virtualizable<Sym: WalkSym>(
     }
 }
 
+/// One live-frame slot read on the `Void` getarrayitem fallback.
+enum LiveFrameSlot {
+    /// The array word is a non-null reference.
+    Present(Value),
+    /// The frame was readable and the slot word is NULL.
+    Null,
+    /// No frame, the index is outside the local region, or the array
+    /// could not be read.
+    Unavailable,
+}
+
 /// `getarrayitem_vable_<i|r|f>/ridd>X` handler. Operand layout `ridd>X`:
 /// 1B r-reg(vable) + 1B i-reg(index) + 2B fdescr(VableArray) + 2B
 /// adescr(Array) + 1B X-dst.
@@ -1438,34 +1449,47 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
             });
             (entry, slot_opref, live_frame)
         };
-        let live = live_frame.and_then(|frame| {
-            let nlocals = active_frame_nlocals(ctx)?;
-            if index_value < 0 || index_value >= nlocals {
-                return None;
+        // `_opimpl_getarrayitem_vable` returns
+        // `metainterp.virtualizable_boxes[index]`: the slot's current box is
+        // the value. A NULL word read from the live frame is that box. No
+        // frame, an index outside the local region, or an unreadable array
+        // leaves the shadow fallback in place.
+        let live = match live_frame {
+            Some(frame) => match active_frame_nlocals(ctx) {
+                Some(nlocals) if index_value >= 0 && index_value < nlocals => {
+                    match crate::state::concrete_stack_value(frame, index_value as usize) {
+                        Some(raw) if raw.is_null() => LiveFrameSlot::Null,
+                        Some(raw) => {
+                            LiveFrameSlot::Present(Value::Ref(majit_ir::GcRef(raw as usize)))
+                        }
+                        None => LiveFrameSlot::Unavailable,
+                    }
+                }
+                _ => LiveFrameSlot::Unavailable,
+            },
+            None => LiveFrameSlot::Unavailable,
+        };
+        match live {
+            LiveFrameSlot::Present(live) => live,
+            LiveFrameSlot::Null => Value::Ref(majit_ir::GcRef(0)),
+            LiveFrameSlot::Unavailable => {
+                // Prefer re-resolving the slot's SSA OpRef through the op-table (a
+                // GC-forwarded, rooted value channel) over the raw concrete copy the
+                // shadow holds: `CalleeLocalsShadow.concrete` is not visited by the
+                // trace-ref walker, so a Ref copy dangles if a minor collection moved a
+                // nursery object across the may-force residual. The op-table concrete IS
+                // forwarded. Fall back to the stored copy when the OpRef carries no live
+                // concrete (ints/floats are value copies of immutable payloads and are
+                // always safe). Only consult the OpRef when a frame-matched `concrete`
+                // entry exists, so the per-frame isolation the `frame_reg` filter gives
+                // `concrete` also bounds the OpRef re-resolution.
+                entry
+                    .and_then(|_| {
+                        slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref))
+                    })
+                    .or_else(|| entry.map(|entry| entry.value))
+                    .unwrap_or(Value::Void)
             }
-            let raw = crate::state::concrete_stack_value(frame, index_value as usize)?;
-            if raw.is_null() {
-                return None;
-            }
-            Some(Value::Ref(majit_ir::GcRef(raw as usize)))
-        });
-        if let Some(live) = live {
-            live
-        } else {
-            // Prefer re-resolving the slot's SSA OpRef through the op-table (a
-            // GC-forwarded, rooted value channel) over the raw concrete copy the
-            // shadow holds: `CalleeLocalsShadow.concrete` is not visited by the
-            // trace-ref walker, so a Ref copy dangles if a minor collection moved a
-            // nursery object across the may-force residual. The op-table concrete IS
-            // forwarded. Fall back to the stored copy when the OpRef carries no live
-            // concrete (ints/floats are value copies of immutable payloads and are
-            // always safe). Only consult the OpRef when a frame-matched `concrete`
-            // entry exists, so the per-frame isolation the `frame_reg` filter gives
-            // `concrete` also bounds the OpRef re-resolution.
-            entry
-                .and_then(|_| slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref)))
-                .or_else(|| entry.map(|entry| entry.value))
-                .unwrap_or(Value::Void)
         }
     } else {
         shadow_value

@@ -2278,7 +2278,14 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         {
             return Ok(None);
         }
-        let concrete_frame = if let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) {
+        // `force_virtualizable_if_necessary` / `force_now`: the fold's token
+        // is already clear, so this getter must not write the pre-force
+        // shadow over the heap. A later `f_locals` write-through lives only
+        // in the array; republishing the shadow slots puts the value from
+        // before that write back, and the callee's next `LOAD_FAST` reads it.
+        let concrete_frame = if ctx.receiver_inline_fold_retired(obj, concrete_addr) {
+            concrete_obj
+        } else if let Some(source) = ctx.receiver_trace_locals(obj, concrete_addr) {
             walker_publish_complete_frame_locals(ctx, obj, concrete_addr, &source)
                 as pyre_object::PyObjectRef
         } else if frame_locals_heap_is_trace_allocation(ctx, obj) {

@@ -11854,11 +11854,15 @@ impl<'a> Transformer<'a> {
             // count.
             //
             // `newlist` with no argument, or with a constant 0
-            // (`ll_vec_newemptylist_*`, oopspec `newlist(0)`), asks for zero
-            // items and gets that dangling address. `vec_buf_free` of a
-            // zero-slot buffer is a no-op, and it is tagged `OS_RAW_FREE`
-            // with the items pointer first. A raw header never takes the GC
-            // `newlist_clear` arm.
+            // (`ll_vec_newemptylist_*`, oopspec `newlist(0)`), stores the
+            // dangling `itemalign` address with length 0 and capacity 0 and
+            // makes no allocation call. That address stands for
+            // `_ll_new_empty_item_array`'s prebuilt empty array
+            // (`_ll_prebuilt_empty_array`, `specialize:memo`). `vec_buf_free`
+            // of a zero-capacity buffer returns before `dealloc`, so freeing
+            // the dangling address is a no-op; the leaf is tagged
+            // `OS_RAW_FREE` with the items pointer first. A raw header never
+            // takes the GC `newlist_clear` arm.
             "newlist" | "newlist_hint" | "newlist_clear" => {
                 let header = op.result.clone()?;
                 let size = const_int(graph, &mut ops, VEC_HEADER_WORDS * word);
@@ -11906,11 +11910,12 @@ impl<'a> Transformer<'a> {
                         .is_none_or(|length| raw_list_produced_const(graph, length) == Some(0));
                 let zero = oopspec_name == "newlist_clear";
                 let (items, length, capacity) = if empty_newlist {
-                    let n = const_int(graph, &mut ops, 0);
-                    let items =
-                        raw_list_item_malloc(self, graph, &mut ops, graph_name, kind, false, n);
+                    // `_ll_new_empty_item_array`: the memoized prebuilt empty
+                    // array, not a per-construction malloc. The dangling
+                    // alignment is that array's address.
+                    let (_, itemalign) = kind.size_align(word);
                     (
-                        items,
+                        const_int(graph, &mut ops, itemalign),
                         const_int(graph, &mut ops, 0),
                         const_int(graph, &mut ops, 0),
                     )
@@ -11949,7 +11954,7 @@ impl<'a> Transformer<'a> {
                 if oopspec_name == "newlist_hint" {
                     "newlist_hint → raw_malloc_varsize_char + vec_item_malloc(n) + raw_store x3"
                 } else if empty_newlist {
-                    "newlist → raw_malloc_varsize_char + vec_item_malloc(0) + raw_store x3"
+                    "newlist → raw_malloc_varsize_char + raw_store x3"
                 } else if oopspec_name == "newlist_clear" {
                     "newlist_clear → raw_malloc_varsize_char + vec_item_malloc_zero(n) + raw_store x3"
                 } else {
@@ -34917,10 +34922,12 @@ mod tests {
         );
     }
 
-    /// `newlist(0)` / `newlist_hint(n)` on a `RustVec` result allocate the
-    /// header through `raw_malloc_varsize_char` and the item buffer through
-    /// `vec_item_malloc_path(kind, false)`. `newlist(0)` passes a zero item
-    /// count; `newlist_hint` passes the hint, the item count.
+    /// `newlist` with no length, or with a constant 0, and `newlist_hint(n)`
+    /// on a `RustVec` result allocate the header through
+    /// `raw_malloc_varsize_char`. The empty arm stores the dangling item
+    /// alignment (`VecItemKind::size_align`) and makes no item-buffer call.
+    /// `newlist_hint` allocates through `vec_item_malloc_path(kind, false)`
+    /// and passes the hint, the item count.
     #[test]
     fn handle_list_call_rust_vec_constructors_store_the_header() {
         use majit_ir::rvec::{
@@ -34935,15 +34942,27 @@ mod tests {
             } => Some(segments.join("::")),
             _ => None,
         };
+        // `None` is `newlist` with no length. `Some(false)` is `newlist` whose
+        // length is a constant 0 already in the graph. `Some(true)` is
+        // `newlist_hint`.
         for kind in VecItemKind::ALL {
-            for hinted in [false, true] {
+            let (_, itemalign) = kind.size_align(word);
+            for hinted in [None, Some(false), Some(true)] {
                 let mut graph = FunctionGraph::new("raw_list_new");
                 let header = rust_vec_var(&mut graph, kind);
                 let hint = graph.alloc_value_var_with_type(ConcreteType::Signed);
-                let (oopspec, args) = if hinted {
-                    ("newlist_hint", vec![hint.clone()])
-                } else {
-                    ("newlist", vec![])
+                let zero = graph.alloc_value_var_with_type(ConcreteType::Signed);
+                graph
+                    .block_mut(graph.startblock)
+                    .operations
+                    .push(SpaceOperation {
+                        result: Some(zero.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                let (oopspec, args) = match hinted {
+                    Some(true) => ("newlist_hint", vec![hint.clone()]),
+                    Some(false) => ("newlist", vec![zero]),
+                    None => ("newlist", vec![]),
                 };
                 let ops = {
                     let config = GraphTransformConfig::default();
@@ -34973,17 +34992,6 @@ mod tests {
                     panic!("raw_malloc_varsize_char takes the size");
                 };
                 assert_eq!(const_int_of(&ops, size), (VEC_HEADER_WORDS * word) as i64);
-                let item_path = majit_ir::rvec::vec_item_malloc_path(kind, false);
-                let item_malloc = ops
-                    .iter()
-                    .find(|op| call_path(op).as_deref() == Some(item_path))
-                    .expect("item malloc");
-                let OpKind::Call { args: bargs, .. } = &item_malloc.kind else {
-                    unreachable!()
-                };
-                let [crate::model::LinkArg::Value(count)] = bargs.as_slice() else {
-                    panic!("vec_item_malloc takes the item count");
-                };
                 let stores: std::collections::BTreeMap<i64, crate::flowspace::model::Variable> =
                     ops.iter()
                         .filter_map(|op| match &op.kind {
@@ -35001,12 +35009,28 @@ mod tests {
                 assert_eq!(stores.len(), 3);
                 let at = |index| &stores[&(vec_word_offset(index, word) as i64)];
                 assert_eq!(const_int_of(&ops, at(VEC_LEN_WORD)), 0);
-                assert_eq!(at(VEC_PTR_WORD), item_malloc.result.as_ref().unwrap());
-                if hinted {
+                let item_path = majit_ir::rvec::vec_item_malloc_path(kind, false);
+                if hinted == Some(true) {
+                    let item_malloc = ops
+                        .iter()
+                        .find(|op| call_path(op).as_deref() == Some(item_path))
+                        .expect("item malloc");
+                    let OpKind::Call { args: bargs, .. } = &item_malloc.kind else {
+                        unreachable!()
+                    };
+                    let [crate::model::LinkArg::Value(count)] = bargs.as_slice() else {
+                        panic!("vec_item_malloc takes the item count");
+                    };
                     assert_eq!(count, &hint);
+                    assert_eq!(at(VEC_PTR_WORD), item_malloc.result.as_ref().unwrap());
                     assert_eq!(at(VEC_CAP_WORD), &hint);
                 } else {
-                    assert_eq!(const_int_of(&ops, count), 0);
+                    assert!(
+                        !ops.iter()
+                            .any(|op| call_path(op).as_deref() == Some(item_path)),
+                        "empty newlist stores the dangling itemalign and does not call"
+                    );
+                    assert_eq!(const_int_of(&ops, at(VEC_PTR_WORD)), itemalign as i64);
                     assert_eq!(const_int_of(&ops, at(VEC_CAP_WORD)), 0);
                 }
                 assert!(
