@@ -156,6 +156,12 @@ pub(crate) enum WalkEndCommitLeg {
     /// A bridge carrier sub-walk stopped on a walker capability gap after
     /// concrete-executing the reconstructed callee: its frames were converted
     /// and run forward instead of the drain rewinding to the guard.
+    /// Same stack publication as [`Self::TraceTooLong`] / [`Self::WalkAbort`]:
+    /// the paused-CALL OpRef mirror is `_copy_data_from_miframe` of the live
+    /// root, so `_run_forever` delivers the callee result into the caller's
+    /// pending CALL (`make_result_of_lastop` / `_resume_mainloop`) and runs
+    /// the root's remaining body. The snapshot array is the pre-walk stack
+    /// and would Finish the portal before that body ran.
     CarrierAbort = 10,
     /// An aborting `DispatchError` from the walker capability-gap family
     /// ([`crate::jitcode_dispatch::DispatchError::leaves_complete_image`])
@@ -3385,6 +3391,51 @@ fn adopt_blackhole_crn(snapshot: usize, live_root: usize, resume_py_pc: usize) {
     }
 }
 
+/// Canonical `CodeObject*` for the live portal frame, matching
+/// `MetaInterpStaticData::canonical_code_key_opt`: a raw code pointer is
+/// already the key, a `W_Code` wrapper unwraps through `w_code_get_ptr`.
+fn live_root_code_key(root_addr: usize) -> Option<usize> {
+    if root_addr == 0 {
+        return None;
+    }
+    // SAFETY: `root_addr` is the live portal `PyFrame` the walk and the
+    // adopter identity gate already named.
+    let pycode = unsafe { (*(root_addr as *const pyre_interpreter::PyFrame)).pycode };
+    if pycode.is_null() {
+        return None;
+    }
+    if !pyre_interpreter::live_code_wrapper(pycode).is_null() {
+        return Some(pycode as usize);
+    }
+    let raw = unsafe { pyre_interpreter::w_code_get_ptr(pycode as pyre_object::PyObjectRef) };
+    if raw.is_null() {
+        None
+    } else {
+        Some(raw as usize)
+    }
+}
+
+/// True when `latched_index` is a jitcode of the live root's own code object.
+///
+/// Portal and per-fn jitcodes of one function share that code object, so
+/// comparing jitcode indices would refuse a valid root image.
+/// `convert_and_run_from_pyjitpl` / `_run_forever` only raise
+/// `DoneWithThisFrame*` from the outermost (portal) frame.  A latched image
+/// whose first Python level is any other function's code would stash that
+/// frame's return as the bridge result before the root's remaining body ran.
+fn latched_is_live_root_code(latched_index: usize, root_addr: usize) -> bool {
+    let Ok(index) = i32::try_from(latched_index) else {
+        return false;
+    };
+    let Some(latched) = crate::state::pyjitcode_for_jitcode_index(index) else {
+        return false;
+    };
+    if latched.code_ptr.is_null() {
+        return false;
+    }
+    live_root_code_key(root_addr) == Some(latched.code_ptr as usize)
+}
+
 /// ⚠️`drive_single_frame_blackhole` **executes** — `bh.resume_mainloop()`
 /// (`jitdriver.rs`) runs the region, allocating and calling.  So every decline
 /// AFTER the drive discards work that already happened and returns to a caller
@@ -3449,11 +3500,14 @@ fn try_adopt_single_frame_blackhole(
     let preflighted = (commit_leg == WalkEndCommitLeg::TraceTooLong
         && crate::jitcode_dispatch::fbw_executed_effect_count() != 0)
         || commit_leg == WalkEndCommitLeg::SegmentTrace;
-    // All four full-image legs resume the blackhole at a pc it may leave by
+    // The full-image legs resume the blackhole at a pc it may leave by
     // arbitrary control flow, including back around a loop header where the
     // jitcode reloads operands from the virtualizable array.  The root operand
     // stack therefore has to be published with the locals
-    // (`fill_trace_too_long_register_banks`) for each leg.
+    // (`fill_trace_too_long_register_banks`) for each leg.  `CarrierAbort`
+    // joins them: `convert_and_run_from_pyjitpl` copies the paused-CALL
+    // banks (`_copy_data_from_miframe`) so `_run_forever` can run the live
+    // root's remaining body after the reconstructed callee returns.
     //
     // `WalkAbort` deliberately does NOT join `preflighted` above: that flag
     // promotes a post-latch decline to a release assert, which the too-long arm
@@ -3463,7 +3517,8 @@ fn try_adopt_single_frame_blackhole(
     let publishes_root_stack = commit_leg == WalkEndCommitLeg::TraceTooLong
         || commit_leg == WalkEndCommitLeg::WalkAbort
         || commit_leg == WalkEndCommitLeg::VableEscape
-        || commit_leg == WalkEndCommitLeg::SegmentTrace;
+        || commit_leg == WalkEndCommitLeg::SegmentTrace
+        || commit_leg == WalkEndCommitLeg::CarrierAbort;
     let Some(mut latched) = crate::jitcode_dispatch::take_single_frame_blackhole() else {
         assert!(
             !preflighted,
@@ -3585,6 +3640,28 @@ fn try_adopt_single_frame_blackhole(
         );
         return false;
     }
+    // Pointer identity names which invocation; code-object identity names
+    // which function (portal and per-fn jitcodes of one function share a
+    // code object).  `convert_and_run_from_pyjitpl` copies the whole
+    // framestack and `_run_forever` raises `DoneWithThisFrame*` only from
+    // the outermost (portal) frame (`_handle_jitexception_in_portal` / the
+    // bottommost `nextblackholeinterp is None` walk).  A collapsed callee
+    // whose frame red holds the live root would pass the pointer check with
+    // the callee's code, and `fbw_finish_concrete_set` would stash that
+    // callee's return as the bridge result before the root's remaining body
+    // ran.  Decline into the non-adopt epilogue;
+    // `run_blackhole_interp_to_cancel_tracing` then resumes from `rd_numb`.
+    if !latched_is_live_root_code(latched.miframe.jitcode.index(), root_addr) {
+        assert!(
+            !preflighted,
+            "preflighted blackhole jitcode is not the live root"
+        );
+        sfdbg!(
+            "decline leg={commit_leg:?} latched jitcode={} is not the live root",
+            latched.miframe.jitcode.index()
+        );
+        return false;
+    }
     let Some(mut locals_undo) = crate::state::capture_frame_locals(vable_frame) else {
         assert!(
             !preflighted,
@@ -3611,7 +3688,8 @@ fn try_adopt_single_frame_blackhole(
         let takes_mirror = commit_leg == WalkEndCommitLeg::WalkAbort
             || commit_leg == WalkEndCommitLeg::VableEscape
             || commit_leg == WalkEndCommitLeg::SegmentTrace
-            || commit_leg == WalkEndCommitLeg::TraceTooLong;
+            || commit_leg == WalkEndCommitLeg::TraceTooLong
+            || commit_leg == WalkEndCommitLeg::CarrierAbort;
         if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
             let from_array = crate::state::capture_frame_stack_for_publish(cf_addr, vable_frame)
                 .map(|stack| stack.roots_snapshot());
@@ -3877,6 +3955,11 @@ fn try_adopt_single_frame_blackhole(
             sfdbg!("adopted bail with resume_py_pc={resume_py_pc}");
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
         }
+        // The latched jitcode is the live root's (pre-drive check above), so
+        // this `DoneWithThisFrame*` is the portal's own return after
+        // `_run_forever` ran its remaining body
+        // (`run_blackhole_interp_to_cancel_tracing` /
+        // `convert_and_run_from_pyjitpl`).
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
         }
@@ -4165,6 +4248,22 @@ fn try_adopt_multi_frame_blackhole(
         );
         return false;
     }
+    // Same code-object gate as the single-frame arm: `_run_forever` raises
+    // `DoneWithThisFrame*` from the outermost Python level
+    // (`convert_and_run_from_pyjitpl`).  If that level is a callee whose
+    // frame red collapsed onto the live root, the pointer check above
+    // passes and the callee's return becomes the bridge result before the
+    // root's remaining body ran.  Decline; `run_blackhole_interp_to_cancel_tracing`
+    // resumes from `rd_numb`.
+    if let Some(index) = per_frame.iter().position(|&(ptr, _)| ptr != 0)
+        && !latched_is_live_root_code(latched.framestack.frames[index].jitcode.index(), root_addr)
+    {
+        mfdbg!(
+            "frame {index}: jitcode {} is not the live root",
+            latched.framestack.frames[index].jitcode.index()
+        );
+        return false;
+    }
     // `ExecutionContext::enter` parity for the resumed chain:
     // `frames[i].f_backref = frames[i - 1]`.  The blackhole re-executes each
     // level's residual `sys._getframe` against `ec.topframeref`/`f_backref`, so
@@ -4270,15 +4369,18 @@ fn try_adopt_multi_frame_blackhole(
     // is the pre-walk stack — including a NULL FOR_ITER iterator.  RPython
     // copies the live MIFrame banks (`_copy_data_from_miframe`); the
     // walker's OpRef mirror is that bank.  `WalkAbort` / `VableEscape`
-    // stop INSIDE an opcode; `ABORT_TOO_LONG` stops after the step but
-    // still on a root walk whose array was never refreshed.  Both
-    // multi-frame latches reconstruct frame 0 from the paused caller image
-    // (`capture_root_parent_resume_stack`) because their `ctx` is the
-    // innermost callee; a latch that could not build one leaves no mirror
-    // here, which declines the adopt and keeps the legacy replay.
+    // stop INSIDE an opcode; `ABORT_TOO_LONG` / `CarrierAbort` stop after
+    // the reconstructed callee has run, still on a root walk whose array
+    // was never refreshed.  Multi-frame latches reconstruct frame 0 from
+    // the paused caller image (`capture_root_parent_resume_stack`) because
+    // their `ctx` is the innermost callee; a latch that could not build
+    // one leaves no mirror here, which declines the adopt and keeps the
+    // legacy replay.  The paused-CALL mirror is what lets `_resume_mainloop`
+    // deliver the callee result and run the root's remaining body.
     let captured = if commit_leg == WalkEndCommitLeg::WalkAbort
         || commit_leg == WalkEndCommitLeg::VableEscape
         || commit_leg == WalkEndCommitLeg::TraceTooLong
+        || commit_leg == WalkEndCommitLeg::CarrierAbort
     {
         latched
             .mirror_stack
@@ -4649,6 +4751,11 @@ fn try_adopt_multi_frame_blackhole(
             adopt_blackhole_crn(cf_addr, root_addr, resume_py_pc);
             WALK_END_RESTART_PC.with(|slot| slot.set(Some(resume_py_pc)));
         }
+        // Outermost Python level is the live root (pre-drive check above), so
+        // this `DoneWithThisFrame*` is the portal's own return after
+        // `_run_forever` ran its remaining body
+        // (`run_blackhole_interp_to_cancel_tracing` /
+        // `convert_and_run_from_pyjitpl`).
         majit_metainterp::jitexc::JitException::DoneWithThisFrameVoid => {
             crate::jitcode_dispatch::fbw_finish_concrete_set(crate::state::ConcreteValue::Null);
         }
@@ -4761,10 +4868,16 @@ fn try_adopt_blackhole(
     commit_leg: WalkEndCommitLeg,
     crossed_inline_subwalk: bool,
 ) -> bool {
-    // A multi-frame image is the whole handoff. `try_adopt_multi_frame_blackhole`
-    // takes it, and a decline there must not fall through: the single-frame
-    // arm treats a missing image on an effectful too-long leg as a lost latch
-    // and aborts the process.
+    // `convert_and_run_from_pyjitpl` copies every frame from the stop
+    // coordinate out to the portal; `_run_forever` only raises
+    // `DoneWithThisFrame*` from that outermost frame.  Both arms below
+    // refuse a latched image whose first Python level is not the live
+    // root's own code object, so `fbw_finish_concrete_set` cannot record a
+    // callee return as the bridge result.  A multi-frame image is the whole
+    // handoff.
+    // `try_adopt_multi_frame_blackhole` takes it, and a decline there must
+    // not fall through: the single-frame arm treats a missing image on an
+    // effectful too-long leg as a lost latch and aborts the process.
     if crate::jitcode_dispatch::multi_frame_blackhole_is_latched() {
         return try_adopt_multi_frame_blackhole(
             flush_committed,
