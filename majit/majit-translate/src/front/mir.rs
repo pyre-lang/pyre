@@ -11592,8 +11592,8 @@ impl<'a> Lowering<'a> {
                 // (or copied onward the same way).
                 if !self.multi_assigned_locals.contains(&dest_local)
                     && !self.local_has_projected_store(dest_local)
-                    && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
                     && let Some(fields) = self.take_const_struct_fields(&rvalue)
+                    && const_struct_uses_are_field_reads(self.llbc, self.body, dest_local)
                 {
                     self.const_struct_fields[dest_local] = Some(fields);
                     self.local_var[dest_local] = None;
@@ -13924,7 +13924,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(id) = dest.kind else {
@@ -13986,7 +13986,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 if !matches!(dest.kind, PlaceKind::Projection(..)) {
@@ -14138,7 +14138,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(id) = dest.kind else {
@@ -14204,7 +14204,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 if let PlaceKind::Local(id) = dest.kind {
@@ -14379,7 +14379,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(index) = dest.kind else {
@@ -14530,7 +14530,7 @@ impl<'a> Lowering<'a> {
                 continue;
             }
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(index) = dest.kind else {
@@ -52204,7 +52204,7 @@ fn explicit_drop_guard_local(
     let (cur, _) = mem_drop_moved_place(call, name_of)?;
     let mut cur = cur as usize;
     for stmt in bb.statements.iter().rev() {
-        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
             continue;
         };
         if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -52262,7 +52262,7 @@ fn explicit_drop_is_the_only_move(
                 return false;
             }
             let Some(src) = bb.statements.iter().rev().find_map(|stmt| {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     return None;
                 };
                 if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -52320,7 +52320,7 @@ fn explicit_drop_temp_of_owned_guard(
             }
             steps -= 1;
             let Some(src) = bb.statements.iter().rev().find_map(|stmt| {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     return None;
                 };
                 if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -54486,7 +54486,7 @@ fn body_returns_owned_scope(
     let guards: bit_set::BitSet = body
         .body
         .iter()
-        .filter_map(|bb| match bb.term(llbc) {
+        .filter_map(|bb| match bb.term_ref(llbc) {
             Ok(TermKind::Call { call, .. }) => match (&call.func, &call.dest.kind) {
                 (CallFunc::Regular(reg), PlaceKind::Local(dest))
                     if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
@@ -54514,7 +54514,7 @@ fn body_returns_owned_scope(
             }
             for stmt in &bb.statements {
                 if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
-                    stmt.stmt_kind()
+                    stmt.stmt_kind_ref()
                     && let (PlaceKind::Local(dest), PlaceKind::Local(from)) =
                         (&place.kind, &src.kind)
                     && guards.contains(*from as usize)
@@ -54534,7 +54534,7 @@ fn body_returns_owned_scope(
             continue;
         }
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             let PlaceKind::Local(dest) = place.kind else {
@@ -54887,7 +54887,7 @@ fn root_pin_value_is_stable_in_bracket(
         return true;
     }
     let watched: bit_set::BitSet = std::iter::once(local).collect();
-    let get_dest = |bb: usize| match body.body[bb].term(llbc) {
+    let get_dest = |bb: usize| match body.body[bb].term_ref(llbc) {
         Ok(TermKind::Call { call, .. }) => match call.dest.kind {
             PlaceKind::Local(dest) => Some(dest as usize),
             _ => None,
@@ -54902,7 +54902,7 @@ fn root_pin_value_is_stable_in_bracket(
         }
         let in_region = region.contains(bb_idx);
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind() {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() {
                 if matches!(value, Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
                     && mentions_local(stmt.kind_value(), &watched)
                 {
@@ -55101,11 +55101,11 @@ fn pin_roots_slice_values(
             .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
             .flat_map(|(_, bb)| bb.statements.iter())
             .find_map(|stmt| {
-            match stmt.stmt_kind() {
+            match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, value))
                     if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
                 {
-                    Some(value)
+                    Some(value.clone())
                 }
                 _ => None,
             }
@@ -55173,11 +55173,11 @@ fn pin_roots_incoming_slice(
             .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
             .flat_map(|(_, bb)| bb.statements.iter())
             .find_map(|stmt| {
-                match stmt.stmt_kind() {
+                match stmt.stmt_kind_ref() {
                     Ok(StmtKind::Assign(place, value))
                         if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
                     {
-                        Some(value)
+                        Some(value.clone())
                     }
                     _ => None,
                 }
@@ -55239,11 +55239,11 @@ fn unique_assigned_rvalue(
         .enumerate()
         .filter(|(bb_idx, _)| forward_blocks[*bb_idx])
         .flat_map(|(_, bb)| bb.statements.iter())
-        .find_map(|stmt| match stmt.stmt_kind() {
+        .find_map(|stmt| match stmt.stmt_kind_ref() {
             Ok(StmtKind::Assign(place, value))
                 if matches!(place.kind, PlaceKind::Local(d) if d as usize == local) =>
             {
-                Some(value)
+                Some(value.clone())
             }
             _ => None,
         })
@@ -55534,7 +55534,7 @@ fn classify_root_slot_getter_body(
             continue;
         }
         for stmt in &bb.statements {
-            match stmt.stmt_kind().ok()? {
+            match stmt.stmt_kind_ref().ok()? {
                 StmtKind::StorageLive(_)
                 | StmtKind::StorageDead(_)
                 | StmtKind::Borrowck(_)
@@ -55889,10 +55889,10 @@ fn single_statement_rvalue(
             continue;
         }
         for stmt in &bb.statements {
-            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind()
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref()
                 && matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local)
             {
-                return Some(value);
+                return Some(value.clone());
             }
         }
     }
@@ -59304,7 +59304,7 @@ fn elaborate_explicit_root_closes(
         if !forward_blocks[bb_idx] {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let CallFunc::Regular(reg) = &call.func else {
@@ -59326,7 +59326,7 @@ fn elaborate_explicit_root_closes(
         let mut temps = Vec::new();
         let mut moves = Vec::new();
         for (i, stmt) in bb.statements.iter().enumerate().rev() {
-            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                 continue;
             };
             if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
@@ -59362,7 +59362,7 @@ fn elaborate_explicit_root_closes(
         if !forward_blocks[bb_idx] {
             continue;
         }
-        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && let CallFunc::Regular(reg) = &call.func
             && name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
             && let PlaceKind::Local(dest) = call.dest.kind
@@ -59372,7 +59372,7 @@ fn elaborate_explicit_root_closes(
     }
     let move_counts = local_move_counts(body, llbc);
     let drop_of = |bb: &majit_charon_reader::ullbc::BasicBlock| -> Option<usize> {
-        match bb.term(llbc) {
+        match bb.term_ref(llbc) {
             Ok(TermKind::Drop { place, .. }) => match place.kind {
                 PlaceKind::Local(l) => Some(l as usize),
                 _ => None,
@@ -59416,7 +59416,7 @@ fn elaborate_explicit_root_closes(
             let stmt_hit = bb.statements.iter().enumerate().any(|(i, stmt)| {
                 !chain.is_some_and(|c| c.moves.contains(&i))
                     && !matches!(
-                        stmt.stmt_kind(),
+                        stmt.stmt_kind_ref(),
                         Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_))
                     )
                     && mentions_local(stmt.kind_value(), &private)
@@ -59442,7 +59442,7 @@ fn elaborate_explicit_root_closes(
                 if !forward_blocks[bb_idx] {
                     return None;
                 }
-                match bb.term(llbc) {
+                match bb.term_ref(llbc) {
                     Ok(TermKind::Drop { place, fn_ptr, .. })
                         if matches!(place.kind, PlaceKind::Local(l) if l as usize == guard || temps.contains(l as usize))
                             && name_of(&fn_ptr)
@@ -59501,7 +59501,7 @@ fn elaborate_explicit_root_closes(
         for c in &mine {
             let Ok(TermKind::Call {
                 target, on_unwind, ..
-            }) = body.body[c.bb].term(llbc)
+            }) = body.body[c.bb].term_ref(llbc)
             else {
                 continue;
             };
@@ -59517,7 +59517,7 @@ fn elaborate_explicit_root_closes(
                 continue;
             }
             let is_dead = dead.contains(&bb_idx) || drop_of(bb).is_some_and(|l| temps.contains(l));
-            if is_dead && let Ok(TermKind::Drop { target, .. }) = bb.term(llbc) {
+            if is_dead && let Ok(TermKind::Drop { target, .. }) = bb.term_ref(llbc) {
                 rewrites.push((bb_idx, serde_json::json!({"Goto": {"target": target}})));
             }
         }
@@ -61782,7 +61782,7 @@ fn unstructured_address_escape(
             }
             let mut depths = incoming[index].clone();
             for stmt in &block.statements {
-                match stmt.stmt_kind() {
+                match stmt.stmt_kind_ref() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
                         let value = rvalue_address(&rvalue, &depths, llbc);
                         record_stored_address(
@@ -61812,7 +61812,7 @@ fn unstructured_address_escape(
                     Ok(StmtKind::Unknown) | Err(_) => escapes = true,
                 }
             }
-            match block.term(llbc) {
+            match block.term_ref(llbc) {
                 Ok(TermKind::Call {
                     call,
                     target,
@@ -61869,7 +61869,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -61877,7 +61877,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        on_unwind,
+                        *on_unwind,
                         &depths,
                         &mut escapes,
                     );
@@ -61909,7 +61909,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -61917,7 +61917,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        on_unwind,
+                        *on_unwind,
                         &depths,
                         &mut escapes,
                     );
@@ -61928,11 +61928,10 @@ fn unstructured_address_escape(
                         escapes = true;
                     }
                     let successors: Vec<u64> = match targets {
-                        SwitchTargets::If(then_bb, else_bb) => vec![then_bb, else_bb],
+                        SwitchTargets::If(then_bb, else_bb) => vec![*then_bb, *else_bb],
                         SwitchTargets::SwitchInt(_, arms, default) => {
-                            let mut successors: Vec<u64> =
-                                arms.into_iter().map(|(_, bb)| bb).collect();
-                            successors.push(default);
+                            let mut successors: Vec<u64> = arms.iter().map(|(_, bb)| *bb).collect();
+                            successors.push(*default);
                             successors
                         }
                     };
@@ -61952,7 +61951,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -61970,7 +61969,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        target,
+                        *target,
                         &depths,
                         &mut escapes,
                     );
@@ -61978,7 +61977,7 @@ fn unstructured_address_escape(
                         &mut reached,
                         index,
                         &mut incoming,
-                        on_unwind,
+                        *on_unwind,
                         &depths,
                         &mut escapes,
                     );
@@ -67751,7 +67750,8 @@ fn const_eq_u8_in_unstructured(llbc: &Llbc, body: &Unstructured) -> Option<u8> {
     let mut found = None;
     for bb in &body.body {
         for stmt in &bb.statements {
-            let Ok(StmtKind::Assign(_, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind() else {
+            let Ok(StmtKind::Assign(_, Rvalue::BinaryOp(op, lhs, rhs))) = stmt.stmt_kind_ref()
+            else {
                 continue;
             };
             if binop_label(&op).ok()?.as_str() != "eq" {
@@ -76705,7 +76705,7 @@ fn decoded_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<DecodedConst>
             continue;
         }
         for st in &blk.statements {
-            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind() else {
+            let Ok(StmtKind::Assign(place, rvalue)) = st.stmt_kind_ref() else {
                 continue;
             };
             let is_local0 = matches!(place.kind, PlaceKind::Local(0));
@@ -82940,7 +82940,7 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
                 continue;
             }
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(dest) = place.kind else {
@@ -82979,7 +82979,7 @@ fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
         if !forward_blocks[bb_idx] {
             continue;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let PlaceKind::Local(dest) = call.dest.kind else {
@@ -83039,7 +83039,7 @@ fn item_addr_locals(
                 continue;
             }
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(dest) = place.kind else {
@@ -83076,7 +83076,7 @@ fn item_addr_locals(
                     changed = true;
                 }
             }
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             let PlaceKind::Local(dest) = call.dest.kind else {
@@ -83448,7 +83448,7 @@ fn body_owner_view_locals(
     let mut list_call_def = vec![false; n];
     let is_body_local = |dest: usize| dest < n && !(dest >= 1 && dest <= arg_count);
     for bb in &body.body {
-        if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+        if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
             && let PlaceKind::Local(dest) = call.dest.kind
         {
             let dest = dest as usize;
@@ -83499,7 +83499,7 @@ fn body_owner_view_locals(
     while changed {
         changed = false;
         for bb in &body.body {
-            if let Ok(TermKind::Call { call, .. }) = bb.term(llbc)
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
                 && let PlaceKind::Local(dest) = call.dest.kind
             {
                 let dest = dest as usize;
@@ -83667,7 +83667,7 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     // `{ptr, len}` pair. `iter_mut` of that dest still walks the buffer.
     let mut whole_list_mut_dest = vec![false; n];
     for bb in &body.body {
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
         };
         let PlaceKind::Local(dest) = call.dest.kind else {
@@ -83699,7 +83699,7 @@ fn objectptr_pair_view_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
     while changed {
         changed = false;
         for bb in &body.body {
-            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
                 continue;
             };
             let PlaceKind::Local(dest) = call.dest.kind else {
@@ -83996,7 +83996,7 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
             .flat_map(|(_, bb)| {
                 bb.statements
                     .iter()
-                    .filter_map(|stmt| match stmt.stmt_kind() {
+                    .filter_map(|stmt| match stmt.stmt_kind_ref() {
                         Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
                             PlaceKind::Local(dest) => Some((dest as usize, place, rvalue)),
                             _ => None,
@@ -84103,37 +84103,37 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                     .kind_value()
                     .get("Assign")
                     .and_then(|assign| assign.get(1));
-                let allowed = match stmt.stmt_kind() {
+                let allowed = match stmt.stmt_kind_ref() {
                     Ok(
                         StmtKind::StorageLive(_)
                         | StmtKind::StorageDead(_)
                         | StmtKind::PlaceMention(_)
                         | StmtKind::Borrowck(_),
                     ) => true,
-                    Ok(StmtKind::Assign(place, rvalue)) => match (place.kind, &rvalue) {
+                    Ok(StmtKind::Assign(place, rvalue)) => match (&place.kind, rvalue) {
                         (PlaceKind::Local(dest), Rvalue::Aggregate(agg, _))
-                            if dest as usize == storage && aggregate_ctor_name(agg) == "Array" =>
+                            if *dest as usize == storage && aggregate_ctor_name(agg) == "Array" =>
                         {
                             !rvalue_json.is_some_and(|rv| {
                                 mentions_local_outside_raw_array_items(rv, &wanted, &roles)
                             })
                         }
                         (PlaceKind::Local(dest), Rvalue::Repeat(..))
-                            if dest as usize == storage =>
+                            if *dest as usize == storage =>
                         {
                             !rvalue_json.is_some_and(|rv| {
                                 mentions_local_outside_raw_array_items(rv, &wanted, &roles)
                             })
                         }
                         (PlaceKind::Local(dest), Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
-                            if roles[dest as usize] == Some(RawArrayRole::Borrow(storage)) =>
+                            if roles[*dest as usize] == Some(RawArrayRole::Borrow(storage)) =>
                         {
                             true
                         }
                         (
                             PlaceKind::Local(dest),
                             Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _),
-                        ) if roles[dest as usize] == Some(RawArrayRole::Borrow(storage))
+                        ) if roles[*dest as usize] == Some(RawArrayRole::Borrow(storage))
                             && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage))) =>
                         {
                             true
@@ -84144,7 +84144,7 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                         ) if cast_kind_is_unsize(op)
                             && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
                             && tyref_pair_slice_item_kind(
-                                &body.locals.locals[dest as usize].ty,
+                                &body.locals.locals[*dest as usize].ty,
                                 llbc,
                             ) == Some(kind) =>
                         {
@@ -84157,7 +84157,7 @@ fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>
                         ) if (cast_kind_is_unsize(op) || op.get("Unsize").is_some())
                             && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
                             && tyref_pair_slice_item_kind(
-                                &body.locals.locals[dest as usize].ty,
+                                &body.locals.locals[*dest as usize].ty,
                                 llbc,
                             ) == Some(kind) =>
                         {
@@ -84244,7 +84244,7 @@ fn raw_array_slice_is_push_roots_only(
     for (dest, _, rvalue) in body.body.iter().flat_map(|bb| {
         bb.statements
             .iter()
-            .filter_map(|stmt| match stmt.stmt_kind() {
+            .filter_map(|stmt| match stmt.stmt_kind_ref() {
                 Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
                     PlaceKind::Local(d) => Some((d as usize, place, rvalue)),
                     _ => None,
@@ -84274,7 +84274,7 @@ fn raw_array_slice_is_push_roots_only(
         let mut changed = false;
         for bb in &body.body {
             for stmt in &bb.statements {
-                let Ok(StmtKind::Assign(place, Rvalue::Use(op, _))) = stmt.stmt_kind() else {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(op, _))) = stmt.stmt_kind_ref() else {
                     continue;
                 };
                 let PlaceKind::Local(dest) = place.kind else {
@@ -84393,7 +84393,7 @@ fn local_is_rust_vec_deref(
         if !forward_blocks[bb_idx] {
             return None;
         }
-        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             return None;
         };
         if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
@@ -84422,7 +84422,7 @@ fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: us
         }
         if bb.statements.iter().any(|stmt| {
             !matches!(
-                stmt.stmt_kind(),
+                stmt.stmt_kind_ref(),
                 Ok(StmtKind::StorageLive(_)
                     | StmtKind::StorageDead(_)
                     | StmtKind::PlaceMention(_)

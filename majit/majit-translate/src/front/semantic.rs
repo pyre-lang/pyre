@@ -835,7 +835,15 @@ impl StructFieldRegistry {
             });
         }
         let tail = crate_relative_struct_path(stripped.as_ref(), &self.foreign_body_roots);
-        self.fields.keys().any(|k| {
+        self.ensure_field_path_index();
+        let index = self.field_path_index.borrow();
+        let Some(index) = index.as_ref() else {
+            return false;
+        };
+        let Some(bucket) = index.by_stripped_last.get(leaf) else {
+            return false;
+        };
+        bucket.iter().any(|k| {
             let ks = majit_ir::descr::strip_generic_args(k);
             let root = ks.split("::").next().unwrap_or(ks.as_ref());
             self.foreign_body_roots.iter().any(|r| r == root)
@@ -907,6 +915,8 @@ pub(crate) struct FieldPathIndex {
     by_last: rustc_hash::FxHashMap<String, Vec<String>>,
     /// Last segment of the parent path → keys with that parent leaf.
     by_parent_last: rustc_hash::FxHashMap<String, Vec<String>>,
+    /// Last `::` segment of [`majit_ir::descr::strip_generic_args`] of the key → keys.
+    by_stripped_last: rustc_hash::FxHashMap<String, Vec<String>>,
 }
 
 impl FieldPathIndex {
@@ -914,6 +924,8 @@ impl FieldPathIndex {
         let mut by_last: rustc_hash::FxHashMap<String, Vec<String>> =
             rustc_hash::FxHashMap::default();
         let mut by_parent_last: rustc_hash::FxHashMap<String, Vec<String>> =
+            rustc_hash::FxHashMap::default();
+        let mut by_stripped_last: rustc_hash::FxHashMap<String, Vec<String>> =
             rustc_hash::FxHashMap::default();
         for key in fields.keys() {
             let leaf = key.rsplit("::").next().unwrap_or(key.as_str());
@@ -928,12 +940,19 @@ impl FieldPathIndex {
                     .or_default()
                     .push(key.clone());
             }
+            let stripped = majit_ir::descr::strip_generic_args(key);
+            let stripped_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
+            by_stripped_last
+                .entry(stripped_leaf.to_string())
+                .or_default()
+                .push(key.clone());
         }
         Self {
             len: fields.len(),
             key_fp,
             by_last,
             by_parent_last,
+            by_stripped_last,
         }
     }
 }

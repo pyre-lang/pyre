@@ -64,6 +64,11 @@ pub struct FunDecl {
     /// declaration was not loaded through [`crate::Llbc::from_slice`].
     #[serde(skip)]
     promoted_inits: Option<Arc<Vec<Option<PromotedInit>>>>,
+    /// Whether [`FunDecl::unstructured`] splices promoted-constant reads: the artefact
+    /// table has an inlinable initializer and the body names a `Global`. Decided on first
+    /// query.
+    #[serde(skip)]
+    splices_promoted: OnceLock<bool>,
     /// Set on a body-less foreign declaration whose signature, span, and
     /// impl owner match one constructor a defining crate analysed as
     /// returning an owned root-bracket guard. Read only when
@@ -113,10 +118,13 @@ impl FunDecl {
         let mut u = serde_json::from_str::<Proj>(body.get())
             .ok()
             .map(|p| p.unstructured)?;
-        if let Some(table) = &self.promoted_inits
-            && table.iter().any(Option::is_some)
-            && body.get().contains("\"Global\"")
-        {
+        let splices = *self.splices_promoted.get_or_init(|| {
+            self.promoted_inits
+                .as_ref()
+                .is_some_and(|table| table.iter().any(Option::is_some))
+                && body.get().contains("\"Global\"")
+        });
+        if splices && let Some(table) = &self.promoted_inits {
             splice_promoted_reads(&mut u, table);
         }
         Some(u)
@@ -146,17 +154,13 @@ impl FunDecl {
     ///
     /// Call lowering asks this of a callee at every call site; the answer is
     /// a property of the declaration, so it is decided once, from the
-    /// variant tag alone: the basic blocks are skipped, not built.
+    /// first JSON key of the body (the externally tagged variant) alone:
+    /// the payload is not scanned.
     pub fn has_unstructured_body(&self) -> bool {
         *self.has_unstructured_body.get_or_init(|| {
-            #[derive(Deserialize)]
-            struct Proj {
-                #[serde(rename = "Unstructured")]
-                _unstructured: serde::de::IgnoredAny,
-            }
             self.body
                 .as_ref()
-                .is_some_and(|body| serde_json::from_str::<Proj>(body.get()).is_ok())
+                .is_some_and(|body| raw_object_first_key_is(body.get(), "Unstructured"))
         })
     }
 
@@ -224,6 +228,25 @@ impl FunDecl {
     }
 }
 
+/// Whether `raw` (valid JSON text) is an object whose first key is `key`.
+/// An externally tagged enum value carries its variant as that single key,
+/// so this answers the variant without scanning the payload.
+fn raw_object_first_key_is(raw: &str, key: &str) -> bool {
+    let Some(rest) = raw.trim_start().strip_prefix('{') else {
+        return false;
+    };
+    let Some(rest) = rest.trim_start().strip_prefix('"') else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(key) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('"') else {
+        return false;
+    };
+    rest.trim_start().starts_with(':')
+}
+
 /// Static or const item referenced via [`PlaceKind::Global`].
 ///
 /// Body / type / initialiser remain opaque (`Value`); the only field
@@ -278,6 +301,10 @@ pub struct TypeDecl {
     /// is absent or does not parse.
     #[serde(skip)]
     layout_entries: std::sync::OnceLock<Option<Vec<TargetLayout>>>,
+    /// [`Self::layout`] parsed as plain JSON values on first use, for the layout expressions
+    /// [`TargetLayout`] does not keep; `None` when absent or unparsable.
+    #[serde(skip)]
+    layout_values: std::sync::OnceLock<Option<Vec<Value>>>,
     /// Origin Charon recorded for this declaration. A compiler-generated
     /// closure environment is the object `{"Closure": …}`; an ordinary ADT
     /// is the string `"Normal"`. Kept raw so an
@@ -369,6 +396,15 @@ impl TypeDecl {
             .as_deref()
     }
 
+    fn layout_values(&self) -> Option<&[Value]> {
+        self.layout_values
+            .get_or_init(|| {
+                let raw = self.layout.as_ref()?;
+                serde_json::from_str::<Vec<Value>>(raw.get()).ok()
+            })
+            .as_deref()
+    }
+
     /// Project the per-target layout, selecting the entry whose target
     /// triple equals `target`, or the sole entry when exactly one is
     /// present (single-target extraction). Returns `None` when layout is
@@ -378,19 +414,24 @@ impl TypeDecl {
     /// `size` / `align` whose `chosen` value is a `Deduplicated` constant
     /// are resolved through `llbc`'s const table.
     pub fn layout_for_target(&self, llbc: &crate::Llbc, target: &str) -> Option<TypeLayout> {
-        let raw = self.layout.as_ref()?;
         let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
-            layout.size = layout_measure(llbc, raw.get(), target, "size");
+            layout.size = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "size"));
         }
         if layout.align.is_none() {
-            layout.align = layout_measure(llbc, raw.get(), target, "align");
+            layout.align = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "align"));
         }
         if layout
             .variant_layouts
             .iter()
             .any(|variant| variant.field_offsets.contains(&UNRESOLVED_OFFSET))
-            && let Some(rows) = resolved_field_offset_rows(llbc, raw.get(), target)
+            && let Some(rows) = self
+                .layout_values()
+                .and_then(|v| resolved_field_offset_rows(llbc, v, target))
             && rows.len() == layout.variant_layouts.len()
         {
             for (variant, row) in layout.variant_layouts.iter_mut().zip(rows) {
@@ -416,13 +457,16 @@ impl TypeDecl {
         llbc: &crate::Llbc,
         target: &str,
     ) -> Option<(Option<u64>, Option<u64>)> {
-        let raw = self.layout.as_ref()?;
         let mut layout = select_target_layout(self.layout_entries()?, target)?.clone();
         if layout.size.is_none() {
-            layout.size = layout_measure(llbc, raw.get(), target, "size");
+            layout.size = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "size"));
         }
         if layout.align.is_none() {
-            layout.align = layout_measure(llbc, raw.get(), target, "align");
+            layout.align = self
+                .layout_values()
+                .and_then(|v| layout_measure(llbc, v, target, "align"));
         }
         (layout.size.is_some() || layout.align.is_some()).then_some((layout.size, layout.align))
     }
@@ -508,10 +552,9 @@ fn de_layout_offsets<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u64>,
 /// [`layout_measure`] resolves `size` / `align`.
 fn resolved_field_offset_rows(
     llbc: &crate::Llbc,
-    raw: &str,
+    entries: &[Value],
     target: &str,
 ) -> Option<Vec<Vec<u64>>> {
-    let entries: Vec<Value> = serde_json::from_str(raw).ok()?;
     let entry = entries
         .iter()
         .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
@@ -532,8 +575,7 @@ fn resolved_field_offset_rows(
     Some(rows)
 }
 
-fn layout_measure(llbc: &crate::Llbc, raw: &str, target: &str, field: &str) -> Option<u64> {
-    let entries: Vec<Value> = serde_json::from_str(raw).ok()?;
+fn layout_measure(llbc: &crate::Llbc, entries: &[Value], target: &str, field: &str) -> Option<u64> {
     let entry = entries
         .iter()
         .find(|e| e.get("key").and_then(Value::as_str) == Some(target))
@@ -1377,7 +1419,7 @@ pub struct BasicBlock {
     /// Later [`term`](Self::term) calls clone this value instead of parsing
     /// the raw JSON again.
     #[serde(skip)]
-    term_cache: OnceLock<Result<TermKind, String>>,
+    term_cache: OnceLock<Box<Result<TermKind, String>>>,
 }
 
 impl From<BasicBlockDe> for BasicBlock {
@@ -1417,13 +1459,13 @@ impl BasicBlock {
     pub fn set_terminator_kind(&mut self, kind: Value) {
         self.terminator.kind =
             serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
-        self.terminator.value_cache = OnceLock::from(kind);
+        self.terminator.value_cache = OnceLock::from(Box::new(kind));
         self.term_cache = OnceLock::new();
     }
 
     fn term_cached(&self, llbc: &crate::Llbc) -> &Result<TermKind, String> {
         self.term_cache
-            .get_or_init(|| decode_term_kind(&self.terminator.kind, llbc))
+            .get_or_init(|| Box::new(decode_term_kind(&self.terminator.kind, llbc)))
     }
 }
 
@@ -1501,6 +1543,9 @@ pub(crate) fn attach_promoted_inits(file: &mut crate::schema::LlbcFile) {
     let table = Arc::new(collect_promoted_inits(file));
     for fd in file.translated.fun_decls.iter_mut().flatten() {
         fd.promoted_inits = Some(Arc::clone(&table));
+        // `collect_promoted_inits` parsed the initializer bodies before any
+        // table was attached; forget the splice decision made then.
+        fd.splices_promoted.take();
     }
 }
 
@@ -1799,7 +1844,7 @@ fn statement_from_kind(kind: Value, span: SpanRef) -> Statement {
         kind: serde_json::value::to_raw_value(&kind).expect("a JSON value serializes"),
         span,
         stmt_cache: OnceLock::new(),
-        value_cache: OnceLock::from(kind),
+        value_cache: OnceLock::from(Box::new(kind)),
     }
 }
 
@@ -1998,14 +2043,16 @@ pub struct Terminator {
     pub span: Option<SpanRef>,
     /// [`Terminator::kind_value`], parsed on first query.
     #[serde(skip)]
-    value_cache: OnceLock<Value>,
+    value_cache: OnceLock<Box<Value>>,
 }
 
 impl Terminator {
     /// The terminator kind as an untyped JSON tree, parsed on first query.
     pub fn kind_value(&self) -> &Value {
         self.value_cache.get_or_init(|| {
-            serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value")
+            Box::new(
+                serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value"),
+            )
         })
     }
 }
@@ -2020,17 +2067,19 @@ pub struct Statement {
     /// Later [`stmt_kind`](Self::stmt_kind) calls clone this value instead
     /// of parsing the raw JSON again.
     #[serde(skip)]
-    stmt_cache: OnceLock<Result<StmtKind, String>>,
+    stmt_cache: OnceLock<Box<Result<StmtKind, String>>>,
     /// [`Statement::kind_value`], parsed on first query.
     #[serde(skip)]
-    value_cache: OnceLock<Value>,
+    value_cache: OnceLock<Box<Value>>,
 }
 
 impl Statement {
     /// The statement kind as an untyped JSON tree, parsed on first query.
     pub fn kind_value(&self) -> &Value {
         self.value_cache.get_or_init(|| {
-            serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value")
+            Box::new(
+                serde_json::from_str(self.kind.get()).expect("raw kind is a parsed JSON value"),
+            )
         })
     }
 
@@ -2053,7 +2102,10 @@ impl Statement {
     fn stmt_cached(&self) -> &Result<StmtKind, String> {
         self.stmt_cache.get_or_init(|| {
             let kind = self.kind.get();
-            serde_json::from_str::<StmtKind>(kind).map_err(|e| format!("{e}; raw kind: {kind}"))
+            Box::new(
+                serde_json::from_str::<StmtKind>(kind)
+                    .map_err(|e| format!("{e}; raw kind: {kind}")),
+            )
         })
     }
 
@@ -2061,7 +2113,7 @@ impl Statement {
     /// old one so the next [`stmt_kind`](Self::stmt_kind) reads the new kind.
     fn set_kind(&mut self, kind: Value) {
         self.kind = serde_json::value::to_raw_value(&kind).expect("a JSON value serializes");
-        self.value_cache = OnceLock::from(kind);
+        self.value_cache = OnceLock::from(Box::new(kind));
         self.stmt_cache = OnceLock::new();
     }
 }
@@ -3201,6 +3253,12 @@ mod tests {
                     "item_meta": meta(serde_json::json!([{"Builtin": ["PromotedConst", 0]}])),
                     "global_kind": "AnonConst",
                     "value": [{"Call": [{"kind": {"Fun": 1}}]}]
+                }, {
+                    // Subject has 4 blocks so it is not inlinable, but collect_promoted_inits still parses it before the table is attached.
+                    "def_id": 1,
+                    "item_meta": meta(serde_json::json!([{"Builtin": ["PromotedConst", 1]}])),
+                    "global_kind": "AnonConst",
+                    "value": [{"Call": [{"kind": {"Fun": 0}}]}]
                 }]
             }
         });
@@ -3351,6 +3409,42 @@ mod tests {
         assert_eq!(
             body.body[2].terminator.kind_value(),
             &serde_json::json!("UnwindResume")
+        );
+    }
+
+    #[test]
+    fn raw_object_first_key_is_unstructured() {
+        assert!(raw_object_first_key_is(
+            r#"{"Unstructured":{}}"#,
+            "Unstructured"
+        ));
+        assert!(raw_object_first_key_is(
+            r#"{ "Unstructured" : {"a":1} }"#,
+            "Unstructured"
+        ));
+        assert!(!raw_object_first_key_is(
+            r#"{"Structured":{}}"#,
+            "Unstructured"
+        ));
+        assert!(!raw_object_first_key_is(r#""Opaque""#, "Unstructured"));
+        assert!(!raw_object_first_key_is(
+            r#"{"UnstructuredX":{}}"#,
+            "Unstructured"
+        ));
+        assert!(!raw_object_first_key_is(r#"{}"#, "Unstructured"));
+    }
+
+    #[test]
+    fn body_structs_keep_decode_caches_out_of_line() {
+        assert!(
+            std::mem::size_of::<Statement>() <= 128,
+            "{}",
+            std::mem::size_of::<Statement>()
+        );
+        assert!(
+            std::mem::size_of::<BasicBlock>() <= 192,
+            "{}",
+            std::mem::size_of::<BasicBlock>()
         );
     }
 }
