@@ -428,25 +428,25 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     #[cfg(all(any(unix, windows), feature = "host_env"))]
                     {
                         let mut w_file_arg = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                        let w_all_threads = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                        let mut w_all_threads = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
                         let mut w_c_stack = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
                         let mut w_max_threads = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
                         let all_threads = if w_all_threads.is_null() {
                             1
                         } else {
-                            pyre_object::with_roots!(w_file_arg, w_c_stack, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_all_threads))?
+                            pyre_object::with_roots!(w_all_threads, w_file_arg, w_c_stack, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_all_threads))?
                         };
                         // [3.15-spec] `c_stack: bool = True` is not
                         // upstream's; see `cintf::FatalError::c_stack`.
                         let c_stack = if w_c_stack.is_null() {
                             true
                         } else {
-                            pyre_object::with_roots!(w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::is_true(w_c_stack))?
+                            pyre_object::with_roots!(w_c_stack, w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::is_true(w_c_stack))?
                         };
                         let max_threads = if w_max_threads.is_null() {
                             100
                         } else {
-                            pyre_object::with_roots!(w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
+                            pyre_object::with_roots!(w_max_threads, w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
                         };
                         let (fd, w_file) = faulthandler_get_fileno_and_file(w_file_arg)?;
                         // Nothing else names the resolved file between here and the
@@ -672,17 +672,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let repeat = if w_repeat.is_null() {
                         0
                     } else {
-                        pyre_object::with_roots!(w_file_arg, w_exit, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_repeat))?
+                        pyre_object::with_roots!(w_repeat, w_file_arg, w_exit, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_repeat))?
                     };
                     let exit = if w_exit.is_null() {
                         0
                     } else {
-                        pyre_object::with_roots!(w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_exit))?
+                        pyre_object::with_roots!(w_exit, w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_exit))?
                     };
                     let max_threads = if w_max_threads.is_null() {
                         100
                     } else {
-                        pyre_object::with_roots!(w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
+                        pyre_object::with_roots!(w_max_threads, w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
                     };
                     // `ovfcheck_float_to_longlong`: in range or OverflowError,
                     // NaN included; the conversion truncates.
@@ -775,7 +775,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             pyre_interpreter::make_builtin_function_with_signature(
                 "register",
                 |args| {
-                    let w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+                    let mut w_signum = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                     if w_signum.is_null() {
                         return Err(pyre_interpreter::PyError::type_error(
                             "register() missing signal",
@@ -789,7 +789,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let mut w_chain = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
                     let mut w_max_threads = args.get(4).copied().unwrap_or(pyre_object::PY_NULL);
                     // `handler.py register` `@unwrap_spec(signum=int)`.
-                    let signum = pyre_object::with_roots!(w_file_arg, w_all_threads, w_chain, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_signum))? as libc::c_int;
+                    let signum = pyre_object::with_roots!(w_signum, w_file_arg, w_all_threads, w_chain, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_signum))? as libc::c_int;
                     // `handler.py register` `@unwrap_spec(all_threads=int, chain=int)`
                     // with defaults `all_threads=1, chain=0`: the arguments are
                     // coerced as integers (`gateway_int_w`, raising on a non-int),
@@ -799,17 +799,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     let all_threads = if w_all_threads.is_null() {
                         1
                     } else {
-                        pyre_object::with_roots!(w_file_arg, w_chain, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_all_threads))?
+                        pyre_object::with_roots!(w_all_threads, w_file_arg, w_chain, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_all_threads))?
                     } != 0;
                     let chain = if w_chain.is_null() {
                         0
                     } else {
-                        pyre_object::with_roots!(w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_chain))?
+                        pyre_object::with_roots!(w_chain, w_file_arg, w_max_threads => pyre_interpreter::baseobjspace::gateway_int_w(w_chain))?
                     } != 0;
                     let max_threads = if w_max_threads.is_null() {
                         100
                     } else {
-                        pyre_object::with_roots!(w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
+                        pyre_object::with_roots!(w_max_threads, w_file_arg => pyre_interpreter::baseobjspace::gateway_int_w(w_max_threads))?
                     } as libc::c_int;
                     #[cfg(all(unix, feature = "host_env"))]
                     {
