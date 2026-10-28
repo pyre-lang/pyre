@@ -328,10 +328,10 @@ fn fcntl(
         // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
         // `space.c_filedescriptor_w`, so an open file answers for the
         // number it wraps.  `@unwrap_spec(op=int)` is `gateway_int_w`.
-        let w_fd = args[0];
+        let mut w_fd = args[0];
         let mut w_cmd = args[1];
         let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-        let fd = pyre_object::with_roots!(w_cmd, w_arg =>
+        let fd = pyre_object::with_roots!(w_fd, w_cmd, w_arg =>
             pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
         )?;
         let cmd = pyre_object::with_roots!(w_cmd, w_arg => {
@@ -341,7 +341,7 @@ fn fcntl(
         // falling back to `space.int_w`; a TypeError from the buffer
         // arm is the signal to take the integer one.
         if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
-            let data = match arg_readbuf(w_arg, "fcntl") {
+            let data = match pyre_object::with_roots!(w_cmd, w_arg => arg_readbuf(w_arg, "fcntl")) {
                 Ok(data) => data,
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
                     let arg = pyre_object::with_roots!(w_cmd, w_arg => {
@@ -447,11 +447,11 @@ fn ioctl(
         // so an interrupted call surfaces rather than being re-issued.
         // `space.bigint_w(w_request).uintmask()` accepts `__index__`;
         // `truncatedint_w` is that conversion.
-        let w_fd = args[0];
+        let mut w_fd = args[0];
         let mut w_request = args[1];
         let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
         let mut w_mutate = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
-        let fd = pyre_object::with_roots!(w_request, w_arg, w_mutate =>
+        let fd = pyre_object::with_roots!(w_fd, w_request, w_arg, w_mutate =>
             pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
         )?;
         let raw_req = pyre_object::with_roots!(w_request, w_arg, w_mutate => {
@@ -467,7 +467,7 @@ fn ioctl(
             // exporter that is neither `bytes` nor `str` — those two
             // always take the read-only form however it is set.
             let mutate = if args.len() >= 4 {
-                pyre_object::with_roots!(arg =>
+                pyre_object::with_roots!(w_request, w_arg, w_mutate, arg =>
                     pyre_interpreter::baseobjspace::is_true(w_mutate)
                 )?
             } else {
@@ -476,14 +476,14 @@ fn ioctl(
             let immutable =
                 unsafe { pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg) };
             if mutate && !immutable {
-                let written = pyre_object::with_roots!(arg => unsafe {
+                let written = pyre_object::with_roots!(w_request, w_arg, w_mutate, arg => unsafe {
                     pyre_interpreter::builtins::fileio_writebuf(arg)
                 });
                 if let Ok((slice, _owner, _made_view)) = written {
                     return ioctl_mutable(fd, request, slice);
                 }
             }
-            match arg_readbuf(arg, "ioctl") {
+            match pyre_object::with_roots!(w_request, w_arg, w_mutate, arg => arg_readbuf(arg, "ioctl")) {
                 Ok(buf) => return ioctl_readonly(fd, request, buf),
                 Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {}
                 Err(e) => return Err(e),

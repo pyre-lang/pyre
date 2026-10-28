@@ -4258,11 +4258,14 @@ fn trait_path_is_majit_gc_gctype(path: &str) -> bool {
     crate_name == Some("majit_gc") && name == Some("GcType")
 }
 
-/// By-value field 0 of a struct, when that field is itself a struct or enum.
+/// By-value field 0 of a struct, when that field is itself a struct.
 ///
-/// A reference or raw pointer is not the inlined parent (`Struct.__init__`
-/// inlines a container only as the first field). `Ref` and `RawPtr` stay
-/// in place here; only an `Adt` node yields an id.
+/// `lltype.py` `Struct._first_struct` returns the first field only when
+/// `isinstance(FIRSTTYPE, Struct)` and `self._gckind == FIRSTTYPE._gckind`.
+/// That is the only parent relation (`castable`, `_upcast`). An Enum is
+/// never a parent. A reference or raw pointer is not the inlined parent
+/// (`Struct.__init__` inlines a container only as the first field). `Ref`
+/// and `RawPtr` stay in place here; only an `Adt` node yields an id.
 fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::StructId> {
     if td.published_struct_copy {
         return None;
@@ -4280,7 +4283,7 @@ fn struct_field0_type_id(llbc: &Llbc, td: &TypeDecl) -> Option<majit_ir::descr::
         return None;
     }
     match &inner.kind {
-        TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_) => Some(struct_id_for_type_decl(inner)),
+        TypeDeclKind::Struct(_) => Some(struct_id_for_type_decl(inner)),
         _ => None,
     }
 }
