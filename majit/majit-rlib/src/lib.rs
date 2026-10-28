@@ -74,3 +74,7 @@ pub mod rwin32file;
 pub fn malloc_raw<T>(value: T) -> *mut T {
     Box::into_raw(Box::new(value))
 }
+
+/// The `majit_gc` add_memory_pressure hook is process-global, so every test that installs it or charges pressure holds this lock.
+#[cfg(test)]
+pub(crate) static MEMORY_PRESSURE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());

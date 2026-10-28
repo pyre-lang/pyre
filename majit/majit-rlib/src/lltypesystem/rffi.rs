@@ -588,8 +588,9 @@ mod tests {
         fn hook(size: isize, _object: majit_ir::GcRef) {
             CHARGED.fetch_add(size, Ordering::SeqCst);
         }
-        static PRESSURE_HOOK_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = PRESSURE_HOOK_TEST.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::MEMORY_PRESSURE_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         CHARGED.store(0, Ordering::SeqCst);
         majit_gc::set_active_add_memory_pressure(Some(hook));
         let ptr = raw_malloc_varsize_char_extra_item_add_memory_pressure(5);
@@ -626,6 +627,9 @@ mod tests {
     /// Every CHAR leaf pairs with `ll_raw_free` (the residual `raw_free`).
     #[test]
     fn char_leaves_free_via_ll_raw_free() {
+        let _guard = crate::MEMORY_PRESSURE_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let n = 3usize;
         let leaves: [fn(usize) -> usize; 32] = [
             raw_malloc_varsize_char,
@@ -675,6 +679,9 @@ mod tests {
     /// writable, `_zero` clears the chars.
     #[test]
     fn length_bearing_char_stores_n_and_zero_clears() {
+        let _guard = crate::MEMORY_PRESSURE_HOOK_TEST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let n = 5usize;
         let word = CHAR_ARRAY_LENGTH_SIZE;
         let leaves: [fn(usize) -> usize; 8] = [
