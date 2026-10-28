@@ -1055,13 +1055,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 }
                 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                 {
-                    let signum = if let Some(&a) = args.first() {
-                        unsafe { pyre_object::w_int_get_value(a) as i32 }
-                    } else {
-                        return Err(crate::PyError::type_error(
-                            "raise_signal() missing argument",
-                        ));
-                    };
+                    // interp_signal.py `raise_signal` `@unwrap_spec(signalnum=int)`.
+                    let mut w_signum = args.first().copied().ok_or_else(|| {
+                        crate::PyError::type_error("raise_signal() missing argument")
+                    })?;
+                    let signum =
+                        pyre_object::with_roots!(w_signum => signum_arg(w_signum))? as i32;
                     // The MSVC runtime reports a signal number it does not
                     // have through its invalid parameter handler, whose
                     // default action ends the process before `raise` can
@@ -1080,7 +1079,6 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     };
                     #[cfg(unix)]
                     let raised = {
-                        let mut w_signum = args[0];
                         let err = pyre_object::with_roots!(w_signum => unsafe {
                             majit_rlib::rsignal::c_raise(signum)
                         });
@@ -1254,13 +1252,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
                     {
-                        let secs = if let Some(&a) = args.first() {
-                            unsafe { pyre_object::w_int_get_value(a) as u32 }
-                        } else {
-                            return Err(crate::PyError::type_error("alarm() missing argument"));
-                        };
+                        // interp_signal.py `alarm` `@unwrap_spec(timeout=int)`.
+                        let mut w_timeout = args.first().copied().ok_or_else(|| {
+                            crate::PyError::type_error("alarm() missing argument")
+                        })?;
+                        let timeout = pyre_object::with_roots!(
+                            w_timeout => crate::baseobjspace::gateway_int_w(w_timeout)
+                        )?;
                         Ok(pyre_object::w_int_new(
-                            unsafe { majit_rlib::rsignal::c_alarm(secs as _) } as i64,
+                            unsafe { majit_rlib::rsignal::c_alarm(timeout as _) } as i64,
                         ))
                     }
                     #[cfg(not(feature = "host_env"))]
