@@ -821,6 +821,39 @@ fn set_topology_incoming(
     topo.join_from = join_from;
 }
 
+/// Append one followed link's entries to `topo.incoming` and `topo.join_from`, the same
+/// entries [`unknown_topology_incoming`] derives for that link.
+fn push_topology_link(
+    topo: &mut UnknownTopology,
+    graph: &FunctionGraph,
+    block_idx: usize,
+    exit_idx: usize,
+) {
+    let Some(exit) = graph
+        .blocks
+        .get(block_idx)
+        .and_then(|block| block.exits.get(exit_idx))
+    else {
+        return;
+    };
+    let target = exit.target.0;
+    for (arg_idx, arg) in exit.args.iter().enumerate() {
+        let Some(dest) = graph
+            .blocks
+            .get(target)
+            .and_then(|block| block.inputargs.get(arg_idx))
+            .map(|var| var.id())
+        else {
+            continue;
+        };
+        let source = arg.as_variable().map(|var| var.id());
+        topo.incoming.entry(dest).or_default().push(source);
+        if let Some(id) = source {
+            topo.join_from.entry(id).or_default().push(dest);
+        }
+    }
+}
+
 fn unknown_topology(
     graph: &FunctionGraph,
     annotated: &[BlockAnn],
@@ -8047,6 +8080,7 @@ impl CallControl {
                 join_from: HashMap::new(),
                 ad_hint_result_ids,
             };
+            let mut topo_stale = false;
             drop(graph);
             let mut annotated = vec![BlockAnn::Unseen; n_blocks];
             let mut pending: Vec<usize> = Vec::new();
@@ -8341,7 +8375,14 @@ impl CallControl {
                     followed.push((block_idx, exit_idx));
                     cache_epoch += 1;
                     if let Some(graph) = self.function_graphs.get(&path) {
-                        set_topology_incoming(&mut topo, &graph, &followed);
+                        if topo_stale {
+                            set_topology_incoming(&mut topo, &graph, &followed);
+                            topo_stale = false;
+                        } else {
+                            push_topology_link(&mut topo, &graph, block_idx, exit_idx);
+                        }
+                    } else {
+                        topo_stale = true;
                     }
                     enqueue_block(&mut annotated, &mut pending, target);
                     // `annrpython.py` `follow_link` → `addpendingblock` →
@@ -8357,8 +8398,22 @@ impl CallControl {
                         && !dests.is_empty()
                         && let Some(graph) = self.function_graphs.get(&path)
                     {
-                        let old_followed = &followed[..followed.len() - 1];
-                        let old_incoming = unknown_topology_incoming(&graph, old_followed).0;
+                        let old_incoming = if topo_stale {
+                            unknown_topology_incoming(&graph, &followed[..followed.len() - 1]).0
+                        } else {
+                            // Only `dests` are queried below, and the link just followed appended exactly one entry,
+                            // the last one, to each of them.
+                            let mut old_incoming: HashMap<u64, Vec<Option<u64>>> = HashMap::new();
+                            for &dest in &dests {
+                                if let Some(sources) = topo.incoming.get(&dest)
+                                    && sources.len() > 1
+                                {
+                                    old_incoming
+                                        .insert(dest, sources[..sources.len() - 1].to_vec());
+                                }
+                            }
+                            old_incoming
+                        };
                         let unknown = close_unknown_ids_with(&topo, live_unknown.clone());
                         let ad_hinted = Self::access_directly_hinted_ids_with(
                             &graph,

@@ -1648,9 +1648,10 @@ impl Bookkeeper {
             .borrow()
             .as_ref()
             .map(|reg| {
+                let index = QualifiedKeys::new(&reg.fields);
                 reg.fields
                     .keys()
-                    .filter(|k| !is_bare_leaf_alias(k, &*reg.fields))
+                    .filter(|k| !is_bare_leaf_alias(k, &index))
                     .cloned()
                     .collect()
             })
@@ -5613,27 +5614,57 @@ impl Default for Bookkeeper {
     }
 }
 
-fn same_struct_id(key: &str, other: &str) -> bool {
-    match (
-        majit_ir::descr::struct_id_for_name(key),
-        majit_ir::descr::struct_id_for_name(other),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => other.rsplit("::").next() == Some(key),
+/// The `::`-qualified keys of a field registry, indexed for [`is_bare_leaf_alias`].
+struct QualifiedKeys<'a> {
+    /// `(struct id, key)` for qualified keys that have a struct id, sorted.
+    by_id: Vec<(majit_ir::descr::StructId, &'a str)>,
+    /// `(last path segment, key, has struct id)` for every qualified key, sorted.
+    by_leaf: Vec<(&'a str, &'a str, bool)>,
+}
+
+impl<'a> QualifiedKeys<'a> {
+    fn new(fields: &'a HashMap<String, Vec<crate::front::semantic::FieldRow>>) -> Self {
+        let mut by_id = Vec::new();
+        let mut by_leaf = Vec::new();
+        for key in fields.keys() {
+            if !key.contains("::") {
+                continue;
+            }
+            let id = majit_ir::descr::struct_id_for_name(key);
+            if let Some(id) = id {
+                by_id.push((id, key.as_str()));
+            }
+            let leaf = key.rsplit("::").next().unwrap_or(key.as_str());
+            by_leaf.push((leaf, key.as_str(), id.is_some()));
+        }
+        by_id.sort_unstable();
+        by_leaf.sort_unstable();
+        Self { by_id, by_leaf }
     }
 }
 
-fn is_bare_leaf_alias(
-    key: &str,
-    fields: &std::collections::HashMap<String, Vec<crate::front::semantic::FieldRow>>,
-) -> bool {
+fn is_bare_leaf_alias(key: &str, index: &QualifiedKeys<'_>) -> bool {
     if key.contains("::") || key.contains('<') {
         return false;
     }
-    let qualified: Vec<&String> = fields
-        .keys()
-        .filter(|other| other.contains("::") && same_struct_id(key, other))
-        .collect();
+    let id_k = majit_ir::descr::struct_id_for_name(key);
+    let leaf_start = index.by_leaf.partition_point(|&(leaf, _, _)| leaf < key);
+    let leaf_end = index.by_leaf.partition_point(|&(leaf, _, _)| leaf <= key);
+    let leaf_eq = &index.by_leaf[leaf_start..leaf_end];
+    let mut qualified: Vec<&str> = Vec::new();
+    if let Some(id) = id_k {
+        let start = index.by_id.partition_point(|&(sid, _)| sid < id);
+        let end = index.by_id.partition_point(|&(sid, _)| sid <= id);
+        qualified.extend(index.by_id[start..end].iter().map(|&(_, q)| q));
+        qualified.extend(
+            leaf_eq
+                .iter()
+                .filter(|&(_, _, has_id)| !has_id)
+                .map(|&(_, q, _)| q),
+        );
+    } else {
+        qualified.extend(leaf_eq.iter().map(|&(_, q, _)| q));
+    }
     match qualified.as_slice() {
         [] => false,
         [one]

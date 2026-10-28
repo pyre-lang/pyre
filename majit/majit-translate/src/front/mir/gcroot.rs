@@ -6736,13 +6736,30 @@ pub(in crate::front::mir) fn vec_transfer_stmt(
     }
 }
 
+/// [`term_dropped_local`] of each block's terminator, by block index.
+pub(in crate::front::mir) fn block_dropped_locals(
+    body: &Unstructured,
+    llbc: &Llbc,
+) -> Vec<Option<u64>> {
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    body.body
+        .iter()
+        .map(|block| {
+            block
+                .term_ref(llbc)
+                .ok()
+                .and_then(|term| term_dropped_local(term, &name_of))
+        })
+        .collect()
+}
+
 pub(in crate::front::mir) fn vec_transfer_term(
     s: u8,
     term: &TermKind,
     local: usize,
-    name_of: &impl Fn(&RegularCall) -> Option<String>,
+    dropped: Option<u64>,
 ) -> u8 {
-    if term_dropped_local(term, name_of) == Some(local as u64) {
+    if dropped == Some(local as u64) {
         return VEC_UNINIT;
     }
     match term {
@@ -6783,6 +6800,7 @@ pub(in crate::front::mir) fn vec_local_entry_bits(
     body: &Unstructured,
     llbc: &Llbc,
     local: usize,
+    dropped: &[Option<u64>],
 ) -> Vec<u8> {
     let n = body.body.len();
     let mut state = vec![0u8; n];
@@ -6795,15 +6813,25 @@ pub(in crate::front::mir) fn vec_local_entry_bits(
     } else {
         VEC_UNINIT
     };
-    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
+    let mut stmt_summary: Vec<Option<u8>> = vec![None; n];
     let mut work = vec![0usize];
     while let Some(bb) = work.pop() {
-        let mut s = state[bb];
-        for stmt in &body.body[bb].statements {
-            s = vec_transfer_stmt(s, stmt, local);
-        }
+        let summary = match stmt_summary[bb] {
+            Some(s) => s,
+            None => {
+                let s = body.body[bb]
+                    .statements
+                    .iter()
+                    .fold(0, |s, stmt| vec_transfer_stmt(s, stmt, local));
+                stmt_summary[bb] = Some(s);
+                s
+            }
+        };
+        // Folding from 0 is 0 when no statement changes the state, else the
+        // constant VEC_INIT / VEC_UNINIT (both nonzero).
+        let mut s = if summary == 0 { state[bb] } else { summary };
         if let Ok(term) = body.body[bb].term_ref(llbc) {
-            s = vec_transfer_term(s, term, local, &name_of);
+            s = vec_transfer_term(s, term, local, dropped[bb]);
         }
         for succ in model_successors(body, llbc, bb) {
             if state[succ] | s != state[succ] {
@@ -6834,7 +6862,8 @@ pub(in crate::front::mir) fn vec_init_at_drop(
     bb: usize,
     local: usize,
 ) -> VecInit {
-    let entry = vec_local_entry_bits(body, llbc, local);
+    let dropped = block_dropped_locals(body, llbc);
+    let entry = vec_local_entry_bits(body, llbc, local, &dropped);
     let bits = vec_init_bits_at_term(body, bb, local, entry.get(bb).copied().unwrap_or(0));
     vec_init_from_bits(bits)
 }
@@ -6847,7 +6876,6 @@ pub(in crate::front::mir) fn vec_init_at_drop(
 /// lowers to `ll_vec_free_*`), and a mixed (maybe-initialised) `Drop`
 /// is left for the lowering to decline rather than invent a drop flag.
 pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstructured) {
-    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let vec_locals: Vec<usize> = body
         .locals
         .locals
@@ -6858,16 +6886,16 @@ pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstruc
     if vec_locals.is_empty() {
         return;
     }
+    let dropped = block_dropped_locals(body, llbc);
     // `(block, dropped local, Drop/Call target)` for every block whose terminator drops a local.
     let drop_sites: Vec<(usize, u64, Option<u64>)> = (0..body.body.len())
         .filter_map(|bb_idx| {
             let term = body.body[bb_idx].term_ref(llbc).ok()?;
-            let dropped = term_dropped_local(term, &name_of)?;
             let target = match term {
                 TermKind::Drop { target, .. } | TermKind::Call { target, .. } => Some(*target),
                 _ => None,
             };
-            Some((bb_idx, dropped, target))
+            Some((bb_idx, dropped[bb_idx]?, target))
         })
         .collect();
     let mut rewrites: Vec<(usize, serde_json::Value)> = Vec::new();
@@ -6879,7 +6907,7 @@ pub(in crate::front::mir) fn elaborate_vec_drops(llbc: &Llbc, body: &mut Unstruc
         if sites.peek().is_none() {
             continue;
         }
-        let entry = vec_local_entry_bits(body, llbc, local);
+        let entry = vec_local_entry_bits(body, llbc, local, &dropped);
         for &(bb_idx, _, target) in sites {
             let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
             if vec_init_from_bits(at_term) != VecInit::Uninit {
@@ -6900,7 +6928,6 @@ pub(in crate::front::mir) fn definitely_init_vec_drop_blocks(
     body: &Unstructured,
     llbc: &Llbc,
 ) -> bit_set::BitSet {
-    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
     let vec_locals: Vec<usize> = body
         .locals
@@ -6909,11 +6936,12 @@ pub(in crate::front::mir) fn definitely_init_vec_drop_blocks(
         .filter(|local| tyref_is_owned_vec(&local.ty, llbc))
         .map(|local| local.index as usize)
         .collect();
+    if vec_locals.is_empty() {
+        return out;
+    }
+    let dropped = block_dropped_locals(body, llbc);
     let drop_sites: Vec<(usize, u64)> = (0..body.body.len())
-        .filter_map(|bb_idx| {
-            let term = body.body[bb_idx].term_ref(llbc).ok()?;
-            Some((bb_idx, term_dropped_local(term, &name_of)?))
-        })
+        .filter_map(|bb_idx| Some((bb_idx, dropped[bb_idx]?)))
         .collect();
     for local in vec_locals {
         let mut sites = drop_sites
@@ -6923,7 +6951,7 @@ pub(in crate::front::mir) fn definitely_init_vec_drop_blocks(
         if sites.peek().is_none() {
             continue;
         }
-        let entry = vec_local_entry_bits(body, llbc, local);
+        let entry = vec_local_entry_bits(body, llbc, local, &dropped);
         for &(bb_idx, _) in sites {
             let at_term = vec_init_bits_at_term(body, bb_idx, local, entry[bb_idx]);
             if vec_init_from_bits(at_term) == VecInit::Init {

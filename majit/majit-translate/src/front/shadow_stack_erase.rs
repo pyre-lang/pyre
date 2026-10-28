@@ -2381,6 +2381,8 @@ fn discover_stack_effects(
     let local: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
     let mut callers: HashMap<String, Vec<usize>> = HashMap::new();
     let mut class: HashMap<String, CalleeEffect> = HashMap::new();
+    let mut last_walk: Vec<Option<(Vec<(String, CalleeEffect)>, CalleeEffect)>> =
+        vec![None; fds.len()];
     let none_effect = |path: &str| {
         if local.contains(path) {
             CalleeEffect::none()
@@ -2406,7 +2408,18 @@ fn discover_stack_effects(
                 callers.entry(path).or_default().push(i);
             }
         }
-        let new = stack_walk(&body, llbc, &none_effect).effect();
+        let queried = std::cell::RefCell::new(Vec::new());
+        let effect = |path: &str| {
+            let answer = none_effect(path);
+            if local.contains(path) {
+                queried
+                    .borrow_mut()
+                    .push((path.to_string(), answer.clone()));
+            }
+            answer
+        };
+        let new = stack_walk(&body, llbc, &effect).effect();
+        last_walk[i] = Some((queried.into_inner(), new.clone()));
         if new.observes {
             observes_ids.push(i);
         } else {
@@ -2443,17 +2456,31 @@ fn discover_stack_effects(
             continue;
         }
         visits[i] = visits[i].saturating_add(1);
-        let Some(body) = fds[i].unstructured() else {
-            continue;
+        let new = if let Some((queried, prev)) = &last_walk[i]
+            && queried.iter().all(|(path, answer)| {
+                class.get(path).cloned().unwrap_or_else(CalleeEffect::none) == *answer
+            }) {
+            prev.clone()
+        } else {
+            let Some(body) = fds[i].unstructured() else {
+                continue;
+            };
+            let queried = std::cell::RefCell::new(Vec::new());
+            let effect = |path: &str| {
+                if local.contains(path) {
+                    let answer = class.get(path).cloned().unwrap_or_else(CalleeEffect::none);
+                    queried
+                        .borrow_mut()
+                        .push((path.to_string(), answer.clone()));
+                    answer
+                } else {
+                    callee_effect_of(llbc, path)
+                }
+            };
+            let new = stack_walk(&body, llbc, &effect).effect();
+            last_walk[i] = Some((queried.into_inner(), new.clone()));
+            new
         };
-        let effect = |path: &str| {
-            if local.contains(path) {
-                class.get(path).cloned().unwrap_or_else(CalleeEffect::none)
-            } else {
-                callee_effect_of(llbc, path)
-            }
-        };
-        let new = stack_walk(&body, llbc, &effect).effect();
         let old = class
             .get(&names[i])
             .cloned()
