@@ -5784,9 +5784,8 @@ fn rewire_question_site(
                     ),
                 );
             }
-            if let Some(disc_idx) = question.disc_idx {
-                assert_block_pure_besides(graph, disc_block, &[disc_idx], "discriminant", &name)?;
-            }
+            let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
+            assert_block_pure_besides(graph, disc_block, &recognized, "discriminant", &name)?;
         }
         chain = diamond_forward_chain(pred_of_branch, &question.path);
         (
@@ -6205,11 +6204,10 @@ fn rewire_one_call_site(
             catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
             return Ok(SiteOutcome::Rewrapped);
         }
-        if let Some(disc_idx) = question.disc_idx {
-            // Block C is bypassed too; only the discriminant read may carry an
-            // effect.  Reject any extra side-effecting op the switch would drop.
-            assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-        }
+        // Block C is bypassed too; only the discriminant read may carry an
+        // effect.  Reject any extra side-effecting op the switch would drop.
+        let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
+        assert_block_pure_besides(graph, c, &recognized, "discriminant", &name)?;
     }
     let continue_link = question.continue_link.clone();
     let break_link = question.break_link.clone();
@@ -19520,5 +19518,66 @@ mod control_flow_path_tests {
         let question = locate_control_flow_question(&graph, b, &cf, "cf_hop").expect("empty hop");
         assert_eq!(question.disc_block, c);
         assert_eq!(question.path, vec![b, h, c]);
+    }
+
+    #[test]
+    fn forwarded_discriminant_switch_block_with_effect_is_rejected() {
+        let mut graph = FunctionGraph::new("cf_forwarded_disc");
+        let b = graph.startblock;
+        let cf = graph.alloc_value_var();
+        graph.blocks[b.0].inputargs = vec![cf.clone()];
+        let disc_b = graph
+            .push_op_var(
+                b,
+                OpKind::FieldRead {
+                    base: cf.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        let (c, c_args) = graph.create_block_with_arg_vars(2);
+        graph.set_goto(b, c, vec![cf.clone(), disc_b]);
+        graph.push_op_var(
+            c,
+            OpKind::FieldWrite {
+                base: c_args[0].clone(),
+                field: FieldDescriptor::new("x", Some("S".into())),
+                value: LinkArg::Const(Constant::new(ConstValue::Int(1))),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let (cont, _) = graph.create_block_with_arg_vars(0);
+        let (brk, _) = graph.create_block_with_arg_vars(0);
+        graph.set_return(cont, None);
+        graph.set_return(brk, None);
+        graph.set_control_flow_metadata(
+            c,
+            Some(ExitSwitch::Value(c_args[1].clone())),
+            vec![
+                Link::new_mixed(vec![], cont, Some(ExitCase::Const(ConstValue::Int(0)))),
+                Link::new_mixed(vec![], brk, Some(ExitCase::Const(ConstValue::Int(1)))),
+            ],
+        );
+        let question = locate_control_flow_question(&graph, b.0, &cf, "cf_forwarded_disc")
+            .expect("forwarded discriminant");
+        assert!(question.disc_idx.is_none());
+        let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
+        let Err(err) = assert_block_pure_besides(
+            &graph,
+            question.disc_block,
+            &recognized,
+            "discriminant",
+            "cf_forwarded_disc",
+        ) else {
+            panic!("side-effecting switch block");
+        };
+        assert!(err.contains("carries a side-effecting operation"), "{err}");
     }
 }

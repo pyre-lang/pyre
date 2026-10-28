@@ -63,10 +63,6 @@ pub(crate) struct UnwrapSite {
     /// The enum's payload `T` projected to a [`ValueType`] — the `__pos_0`
     /// field kind and the extracted result kind.
     pub payload_ty: ValueType,
-    /// `Option<char>` / `Result<char, E>`: `__pos_0` is the INT code point
-    /// `Utf8StringIterator.next` (`rutf8.py`) yields; wrap `builtin_unichr`
-    /// so the extracted Rust `char` is `SomeUnicodeCodePoint`.
-    pub payload_is_char: bool,
     /// True for `Option::Some = 1`; false for `Result::Ok = 0`.
     pub payload_on_disc_true: bool,
     /// True when the receiver is a niche `Option<NonNull<_>>` — a one-word
@@ -247,11 +243,6 @@ fn rewire_one_unwrap_site(
         payload
     };
     let payload_value = emit_narrow(graph, payload_bb, &cast, payload);
-    let payload_value = if site.payload_is_char {
-        crate::front::mir::push_unichr(graph, payload_bb, payload_value)
-    } else {
-        payload_value
-    };
     let payload_link_args = reproduce_exit_args(
         &saved_exit,
         &out_var,
@@ -416,7 +407,6 @@ mod tests {
                 enum_owner: "core::option::Option".to_string(),
                 payload_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
-                payload_is_char: false,
                 payload_on_disc_true: true,
                 niche: false,
                 int_null: None,
@@ -500,7 +490,6 @@ mod tests {
                 enum_owner: "core::option::Option<(f64,f64)>".into(),
                 payload_owner: "core::option::Option<(f64,f64)>::Some".into(),
                 payload_ty: ValueType::Ref(None),
-                payload_is_char: false,
                 payload_on_disc_true: true,
                 niche: false,
                 int_null: None,
@@ -587,7 +576,6 @@ mod tests {
                 enum_owner: "core::result::Result<usize,TryFromIntError>".into(),
                 payload_owner: "core::result::Result<usize,TryFromIntError>::Ok".into(),
                 payload_ty: ValueType::Unsigned,
-                payload_is_char: false,
                 payload_on_disc_true: false,
                 niche: false,
                 int_null: None,
@@ -653,7 +641,6 @@ mod tests {
                 enum_owner: "core::option::Option".to_string(),
                 payload_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
-                payload_is_char: false,
                 payload_on_disc_true: true,
                 niche: false,
                 int_null: None,
@@ -693,7 +680,6 @@ mod tests {
                 enum_owner: "core::option::Option".to_string(),
                 payload_owner: "core::option::Option::Some".to_string(),
                 payload_ty: ValueType::Int,
-                payload_is_char: false,
                 payload_on_disc_true: true,
                 niche: true,
                 int_null: Some(crate::model::NicheIntNull::FnPtr(None)),

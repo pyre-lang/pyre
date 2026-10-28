@@ -784,7 +784,9 @@ pub(in crate::front::mir) fn str_render_op(
 /// `ll_strconcat`).  A default-spec `{:x}` interpolant (`hex`) is
 /// `rstr.py do_stringformat` over `'%x' % r_uint(n)`: `BinOp mod` of
 /// `__str_const("%x")` and `r_uint(n)`, skipping the cast when the
-/// value is already Unsigned.  Empty literal pieces are skipped.  The
+/// value is already Unsigned.  A signed interpolant whose tuple width is
+/// under 64 bits is then `and`-masked to that width (`int_to_int_cast`
+/// `And`).  Empty literal pieces are skipped.  The
 /// final op reuses `result` (the displaced `alloc::fmt::format` result
 /// var) so the downstream consumer is untouched.
 pub(in crate::front::mir) fn emit_fmt_expansion_ops(
@@ -793,6 +795,7 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
     value: &Variable,
     result: Variable,
     hex: bool,
+    hex_signed_bits: Option<u32>,
 ) -> Vec<SpaceOperation> {
     use crate::model::{CallTarget, OpKind, ValueType};
     let already_unsigned = hex && fmt_value_is_unsigned(graph, value);
@@ -831,7 +834,27 @@ pub(in crate::front::mir) fn emit_fmt_expansion_ops(
                 result: Some(masked.clone()),
                 kind: rarithmetic_mask("r_uint", value.clone(), ValueType::Unsigned),
             });
-            masked
+            if let Some(bits) = hex_signed_bits.filter(|&b| b < 64) {
+                let mask_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                ops.push(SpaceOperation {
+                    result: Some(mask_var.clone()),
+                    kind: OpKind::ConstUInt((1u64 << bits) - 1),
+                });
+                let truncated =
+                    graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                ops.push(SpaceOperation {
+                    result: Some(truncated.clone()),
+                    kind: OpKind::BinOp {
+                        op: "and".to_string(),
+                        lhs: masked,
+                        rhs: mask_var,
+                        result_ty: ValueType::Unsigned,
+                    },
+                });
+                truncated
+            } else {
+                masked
+            }
         };
         ops.push(SpaceOperation {
             result: Some(rendered.clone()),
@@ -1114,6 +1137,10 @@ pub(in crate::front::mir) struct FmtCollapse {
     /// Default-spec `FmtArgKind::LowerHex` over an integer interpolant:
     /// the placeholder is `'%x' % r_uint(n)` (`rstr.py do_stringformat`).
     pub(in crate::front::mir) hex: bool,
+    /// Signed `{:x}` interpolant width from the argument tuple ctor
+    /// (`Tuple<i8>` → 8). `None` when the interpolant is already unsigned,
+    /// a bool, or 64-bit (no extra mask).
+    pub(in crate::front::mir) hex_signed_bits: Option<u32>,
     /// `(block, exit_index, arg_pos, replacement)` — replace the chain
     /// value the link forwarded with the threaded rendered value.
     pub(in crate::front::mir) link_rewrites: Vec<(BlockId, usize, usize, Variable)>,
@@ -1145,6 +1172,13 @@ pub(in crate::front::mir) struct SingleArgFmtChainNav {
     /// The argument tuple is exactly Rust `(u8,)`; used by the LowerHex
     /// parity collapse to prove that two hexadecimal digits cannot truncate.
     pub(in crate::front::mir) context_is_u8: bool,
+    /// Signed interpolant width from the argument tuple ctor name
+    /// (`Tuple<i8>` → 8, `Tuple<i16>` → 16, `Tuple<i32>` → 32,
+    /// `Tuple<i64>` / `Tuple<isize>` → 64). `None` when the ctor is not
+    /// one of those shapes.
+    pub(in crate::front::mir) context_signed_bits: Option<u32>,
+    /// Argument tuple ctor is `Tuple<u8>` / `Tuple<u16>` / `Tuple<u32>` / `Tuple<u64>` / `Tuple<usize>`.
+    pub(in crate::front::mir) context_unsigned_int: bool,
     /// `(block, exit_index, arg_pos, replacement)` — re-thread the deleted
     /// chain value the link forwarded onto a still-live value so no link
     /// references a deleted result var after the chain ops are removed.
@@ -1252,13 +1286,25 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
     })?;
     // The rendered value written into the argument tuple field.
     let context = unwrap_fmt_arg_tuple_ref(graph, &arg_ref)?;
-    let context_is_u8 = block_0.operations.iter().any(|op| {
-        matches!(&op.kind,
-            OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { name, .. },
-                ..
-            } if op.result.as_ref().map(|r| r.id()) == Some(tuple_var.id()) && name == "Tuple<u8>")
+    let tuple_ctor_name = block_0.operations.iter().find_map(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::SyntheticTransparentCtor { name, .. },
+            ..
+        } if op.result.as_ref().map(|r| r.id()) == Some(tuple_var.id()) => Some(name.as_str()),
+        _ => None,
     });
+    let context_is_u8 = tuple_ctor_name == Some("Tuple<u8>");
+    let context_signed_bits = match tuple_ctor_name {
+        Some("Tuple<i8>") => Some(8),
+        Some("Tuple<i16>") => Some(16),
+        Some("Tuple<i32>") => Some(32),
+        Some("Tuple<i64>") | Some("Tuple<isize>") => Some(64),
+        _ => None,
+    };
+    let context_unsigned_int = matches!(
+        tuple_ctor_name,
+        Some("Tuple<u8>" | "Tuple<u16>" | "Tuple<u32>" | "Tuple<u64>" | "Tuple<usize>")
+    );
 
     // Thread `context` straight through the slots the chain values used:
     // B0→Bp forwards `context` where it forwarded `new_*`, Bp→Bf forwards
@@ -1286,6 +1332,8 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
         format_result,
         context,
         context_is_u8,
+        context_signed_bits,
+        context_unsigned_int,
         link_rewrites,
         dead_results,
         dead_bases,
@@ -1363,19 +1411,16 @@ pub(in crate::front::mir) fn fmt_value_is_rstr_string(
 
 /// Default-spec `{:x}` interpolant: a word-sized integer (Signed /
 /// Unsigned / Bool). Int128 / UInt128 / string stay residual. A missing
-/// producer (loop phi / function input) keeps the collapse, matching
-/// [`fmt_value_renders_via_rstr`] — `sre_pattern_flag_tail`'s `flags`
-/// is an i64 phi after the FLAG_NAMES loop.
-///
-/// `jtransform` skip-path uses the same predicate for leftover
-/// `'%x' % n` when dual-gate has not yet stamped Unsigned → Signed.
-pub(crate) fn fmt_value_is_integer_hex(
+/// producer (loop phi, e.g. `sre_pattern_flag_tail`'s `flags`) is not
+/// proof; `collect_fmt_collapse` takes the argument tuple's Rust integer
+/// type (`Tuple<i64>` …) as the proof instead.
+pub(in crate::front::mir) fn fmt_value_is_integer_hex(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> bool {
     use crate::model::{OpKind, ValueType};
     let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
-        return true;
+        return false;
     };
     let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
         return false;
@@ -1392,6 +1437,29 @@ pub(crate) fn fmt_value_is_integer_hex(
         | OpKind::Call { result_ty: ty, .. } => {
             matches!(ty, ValueType::Int | ValueType::Unsigned | ValueType::Bool)
         }
+        _ => false,
+    }
+}
+
+/// `ConstBool` / `ValueType::Bool` interpolants have no signed width.
+fn fmt_value_is_bool(graph: &FunctionGraph, var: &crate::flowspace::model::Variable) -> bool {
+    use crate::model::{OpKind, ValueType};
+    let Some((bid, idx)) = resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(block) = graph.blocks.iter().find(|b| b.id == bid) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    match &op.kind {
+        OpKind::ConstBool(_) => true,
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. } => matches!(ty, ValueType::Bool),
         _ => false,
     }
 }
@@ -1451,6 +1519,7 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
     }
     let mut pieces = nav.pieces;
     let mut hex = false;
+    let mut hex_signed_bits = None;
     match nav.kind {
         FmtArgKind::Display => {
             // `str` + `ll_strconcat` consume rstr `STR` (or an int `ll_int2dec`).
@@ -1469,8 +1538,18 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
         FmtArgKind::LowerHex => {
             // Default-spec `{:x}` only (`is_default` already excluded
             // `{:02x}` / `{:0width$x}`). Integer interpolant → `'%x' % r_uint`.
-            if !fmt_value_is_integer_hex(graph, &nav.context) {
+            // The argument tuple's Rust integer type is also proof.
+            let proven_integer = nav.context_signed_bits.is_some()
+                || nav.context_unsigned_int
+                || fmt_value_is_integer_hex(graph, &nav.context);
+            if !proven_integer {
                 return None;
+            }
+            if !nav.context_unsigned_int
+                && !fmt_value_is_unsigned(graph, &nav.context)
+                && !fmt_value_is_bool(graph, &nav.context)
+            {
+                hex_signed_bits = Some(nav.context_signed_bits?);
             }
             hex = true;
         }
@@ -1480,6 +1559,7 @@ pub(in crate::front::mir) fn collect_fmt_collapse(
         format_result: nav.format_result.id(),
         pieces,
         hex,
+        hex_signed_bits,
         link_rewrites: nav.link_rewrites,
         dead_results: nav.dead_results,
         dead_bases: nav.dead_bases,
@@ -1575,7 +1655,14 @@ pub(in crate::front::mir) fn collapse_fmt_chains(graph: &mut FunctionGraph) -> u
         else {
             continue;
         };
-        let expansion = emit_fmt_expansion_ops(graph, &site.pieces, &value, result, site.hex);
+        let expansion = emit_fmt_expansion_ops(
+            graph,
+            &site.pieces,
+            &value,
+            result,
+            site.hex,
+            site.hex_signed_bits,
+        );
         graph
             .block_mut(site.format_block)
             .operations

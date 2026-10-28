@@ -5242,7 +5242,7 @@ pub(crate) use self::operation::{
     cast_int_to_ptr_call, cast_ptr_to_int_call, lltype_for_direct_ptradd_pointer, value_type_bank,
 };
 pub(crate) use self::removeassert::bind_array_view_len_in_block;
-pub(crate) use self::strformat::{fmt_value_is_integer_hex, interpolant_is_rust_heap_string};
+pub(crate) use self::strformat::interpolant_is_rust_heap_string;
 pub(crate) use self::views::{fat_part_concretetype, fat_part_value_type, pair_len_field_name};
 
 /// Graphs that pass a pointer to `OwnerRootGuard` (or to an aggregate that

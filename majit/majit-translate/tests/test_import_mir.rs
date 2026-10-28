@@ -902,9 +902,10 @@ fn raising_op_result_does_not_flow_into_exception_link() {
 /// `oefmt` calls `expected_fmt_arg` with `'T'` and with
 /// `formats[i].chars().next().unwrap()`. A Rust `char` is `UniChar`
 /// (`builtin_unichr` / `IntegerRepr.rtype_unichr`); an int code point from
-/// `Utf8StringIterator.next` (`rutf8.py`) is not. Both call-site arguments
-/// must be the `as char` unichr op or a char constant, or mergeinputargs
-/// unions Integer with UnicodeCodePoint.
+/// `Utf8StringIterator.next` (`rutf8.py`) is not. Call-site arguments
+/// must be the `as char` unichr op, a char constant, or a `FieldRead` of
+/// `__pos_0` (the unwrap payload is the `__pos_0` read, already a UniChar),
+/// or mergeinputargs unions Integer with UnicodeCodePoint.
 #[test]
 fn oefmt_expected_fmt_arg_args_come_from_unichr_or_char_const() {
     let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
@@ -973,6 +974,7 @@ fn is_char_producing_op(kind: &OpKind) -> bool {
             ..
         } if segments.len() == 1 && segments[0] == "__majit_unichr" => true,
         OpKind::ConstInt(_) => true,
+        OpKind::FieldRead { field, .. } if field.name == "__pos_0" => true,
         _ => false,
     }
 }

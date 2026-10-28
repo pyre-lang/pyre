@@ -1065,9 +1065,12 @@ fn tuple_aggregate_items(
 }
 
 /// FatData+FatLen FieldWrite pairs formed in order between adjacent
-/// halves on one `(base, field.name)`. Rebuilt as `newtuple(data, len)`
-/// then `setattr` (`rtuple.py` `TupleRepr.newtuple`, `rclass.py`
-/// `InstanceRepr.setfield`).
+/// halves on one `(base, field.name)` whose layout spelling is a `&[u8]`
+/// window. Rebuilt as `newtuple(data, len)` then `setattr` (`rtuple.py`
+/// `TupleRepr.newtuple`, `rclass.py` `InstanceRepr.setfield`). A
+/// `FieldRead` or ordinary write of the same field name, or any
+/// side-effecting op, drops open halves; the caller rejects a half left
+/// without its partner.
 struct WindowFieldWritePair {
     at: usize,
     data_at: usize,
@@ -1080,7 +1083,10 @@ struct WindowFieldWritePair {
     len_ty: crate::model::ValueType,
 }
 
-fn window_field_write_pairs(operations: &[SpaceOperation]) -> Vec<WindowFieldWritePair> {
+fn window_field_write_pairs(
+    operations: &[SpaceOperation],
+    is_window_field: &dyn Fn(&crate::model::FieldDescriptor) -> bool,
+) -> Vec<WindowFieldWritePair> {
     type StoredHalf = (
         usize,
         Variable,
@@ -1137,7 +1143,9 @@ fn window_field_write_pairs(operations: &[SpaceOperation]) -> Vec<WindowFieldWri
                 let same_key = |p: &Partial| p.base_id == base.id() && p.name == field.name;
                 match field.vec_part {
                     Some(crate::model::VecFieldPart::FatData)
-                    | Some(crate::model::VecFieldPart::FatLen) => {
+                    | Some(crate::model::VecFieldPart::FatLen)
+                        if is_window_field(field) =>
+                    {
                         let is_data =
                             matches!(field.vec_part, Some(crate::model::VecFieldPart::FatData));
                         let stored = (
@@ -1182,14 +1190,18 @@ fn window_field_write_pairs(operations: &[SpaceOperation]) -> Vec<WindowFieldWri
                         }
                     }
                     _ => {
-                        open.retain(|p| !same_key(p));
+                        open.retain(|p| p.name != field.name);
                     }
                 }
             }
-            OpKind::FieldRead { base, field, .. } => {
-                open.retain(|p| !(p.base_id == base.id() && p.name == field.name));
+            OpKind::FieldRead { field, .. } => {
+                open.retain(|p| p.name != field.name);
             }
-            _ => {}
+            _ => {
+                if !crate::inline::can_remove_op(&op.kind) {
+                    open.clear();
+                }
+            }
         }
     }
     completed
@@ -6515,7 +6527,21 @@ fn function_graph_to_flowspace_inner(
                 Some((result, elements))
             })
             .collect();
-        let window_pairs = window_field_write_pairs(&legacy_block.operations);
+        let is_window_field = |field: &crate::model::FieldDescriptor| -> bool {
+            let Some(owner) = field.owner_root.as_deref() else {
+                return false;
+            };
+            let borrowed = call_registry.bookkeeper().struct_fields.borrow();
+            let Some(reg) = borrowed.as_ref() else {
+                return false;
+            };
+            let Some(ty) = reg.field_type(owner, &field.name) else {
+                return false;
+            };
+            majit_ir::descr::is_shared_u8_slice_spelling(ty)
+                || majit_ir::descr::is_option_of_u8_window_spelling(ty)
+        };
+        let window_pairs = window_field_write_pairs(&legacy_block.operations, &is_window_field);
         for (op_index, legacy_op) in legacy_block.operations.iter().enumerate() {
             if let Some(hlvalue) =
                 legacy_const_define_hlvalue_or_frontier(legacy_op, Some(call_registry))?
@@ -6726,6 +6752,20 @@ fn function_graph_to_flowspace_inner(
                 }
                 continue;
             }
+            if let OpKind::FieldWrite { field, .. } = &legacy_op.kind
+                && matches!(
+                    field.vec_part,
+                    Some(crate::model::VecFieldPart::FatData)
+                        | Some(crate::model::VecFieldPart::FatLen)
+                )
+                && is_window_field(field)
+            {
+                return Err(TyperError::message(format!(
+                    "flowspace_adapter: `&[u8]` window half-store `{}` has no partner half in its block; \
+                     a lone half cannot be stored as the `(data, len)` tuple (`rclass.py` `InstanceRepr.setfield`)",
+                    field.name
+                )));
+            }
             if let Some(ops) =
                 rewrite_wtf8_view_strlen(legacy, legacy_op, &value_map, call_registry)?
             {
@@ -6928,6 +6968,16 @@ mod tests {
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> CallRegistry {
         CallRegistry::new(Rc::new(Bookkeeper::new()))
+    }
+
+    fn call_registry_with_struct_field(owner: &str, field: &str, ty: &str) -> CallRegistry {
+        let bk = Rc::new(Bookkeeper::new());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(owner.to_string(), vec![(field.to_string(), ty.to_string())]);
+        bk.set_struct_fields(Rc::new(fields));
+        CallRegistry::new(bk)
     }
 
     #[test]
@@ -13006,8 +13056,11 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
-            .expect("window pair must adapt");
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("FmtArg::Bytes", "__pos_0", "&[u8]"),
+        )
+        .expect("window pair must adapt");
         let graph = output.graph.borrow();
         let startblock = graph.startblock.borrow();
         let opnames: Vec<&str> = startblock
@@ -13147,8 +13200,11 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
-            .expect("two window pairs around a read must adapt");
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("FmtArg::Bytes", "__pos_0", "&[u8]"),
+        )
+        .expect("two window pairs around a read must adapt");
         let graph = output.graph.borrow();
         let startblock = graph.startblock.borrow();
         let opnames: Vec<&str> = startblock
@@ -13264,8 +13320,11 @@ mod tests {
         };
         graph.blocks = vec![startblock, returnblock];
 
-        let output = function_graph_to_flowspace(&graph, &empty_call_registry())
-            .expect("ordinary write after window pair must adapt");
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("FmtArg::Bytes", "__pos_0", "&[u8]"),
+        )
+        .expect("ordinary write after window pair must adapt");
         let graph = output.graph.borrow();
         let startblock = graph.startblock.borrow();
         let opnames: Vec<&str> = startblock
@@ -13282,6 +13341,174 @@ mod tests {
             &startblock.operations[2].args[2],
             Hlvalue::Constant(c) if c.value == ConstValue::Int(30)
         ));
+    }
+
+    #[test]
+    fn fat_pair_on_non_byte_slice_field_is_not_paired() {
+        let mut graph = LegacyGraph::new("fat_pair_i64_slice");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new("__pos_0", Some("FmtArg::Bytes".into()));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![
+                SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Input {
+                        name: "base".to_string(),
+                        ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
+                        class_root: Some("FmtArg::Bytes".to_string()),
+                    },
+                },
+                SpaceOperation {
+                    result: Some(vars[2].clone()),
+                    kind: OpKind::ConstInt(10),
+                },
+                SpaceOperation {
+                    result: Some(vars[3].clone()),
+                    kind: OpKind::ConstInt(20),
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatData),
+                        value: LinkArg::Value(vars[2].clone()),
+                        ty: ValueType::Unsigned,
+                    },
+                },
+                SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: vars[1].clone(),
+                        field: field
+                            .clone()
+                            .with_vec_part(crate::model::VecFieldPart::FatLen),
+                        value: LinkArg::Value(vars[3].clone()),
+                        ty: ValueType::Int,
+                    },
+                },
+            ],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let output = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("FmtArg::Bytes", "__pos_0", "&[i64]"),
+        )
+        .expect("non-byte fat pair must adapt unpaired");
+        let graph = output.graph.borrow();
+        let startblock = graph.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(opnames, vec!["setattr", "setattr"], "got {opnames:?}");
+    }
+
+    #[test]
+    fn window_half_stores_split_by_a_call_are_not_paired() {
+        let mut graph = LegacyGraph::new("window_split_by_call");
+        let vars = mint_vars(&mut graph, 6);
+        let field = crate::model::FieldDescriptor::new("__pos_0", Some("FmtArg::Bytes".into()));
+        let operations = vec![
+            SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: vars[1].clone(),
+                    field: field
+                        .clone()
+                        .with_vec_part(crate::model::VecFieldPart::FatData),
+                    value: LinkArg::Value(vars[2].clone()),
+                    ty: ValueType::Unsigned,
+                },
+            },
+            SpaceOperation {
+                result: Some(vars[3].clone()),
+                kind: OpKind::Call {
+                    target: crate::model::CallTarget::function_path(["side_effect"]),
+                    args: crate::model::call_args(vec![vars[1].clone()]),
+                    result_ty: ValueType::Int,
+                },
+            },
+            SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: vars[1].clone(),
+                    field: field.with_vec_part(crate::model::VecFieldPart::FatLen),
+                    value: LinkArg::Value(vars[2].clone()),
+                    ty: ValueType::Int,
+                },
+            },
+        ];
+        let pairs = window_field_write_pairs(&operations, &|_| true);
+        assert!(pairs.is_empty(), "halves split by a call must not pair");
+
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: {
+                let mut ops = vec![
+                    SpaceOperation {
+                        result: Some(vars[1].clone()),
+                        kind: OpKind::Input {
+                            name: "base".to_string(),
+                            ty: ValueType::Ref(Some("FmtArg::Bytes".to_string())),
+                            class_root: Some("FmtArg::Bytes".to_string()),
+                        },
+                    },
+                    SpaceOperation {
+                        result: Some(vars[2].clone()),
+                        kind: OpKind::ConstInt(10),
+                    },
+                ];
+                ops.extend(operations);
+                ops
+            },
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(vars[1].clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: block_inputargs(&vars, &[4]),
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+
+        let err = function_graph_to_flowspace(
+            &graph,
+            &call_registry_with_struct_field("FmtArg::Bytes", "__pos_0", "&[u8]"),
+        )
+        .expect_err("lone window half-store must be rejected");
+        assert!(err.to_string().contains("no partner half"), "got {err}");
     }
 
     #[test]

@@ -738,14 +738,12 @@ impl<'a> Lowering<'a> {
             return None;
         };
         let payload_ty = self.tyref_option_payload_value_type(recv_ty)?;
-        let payload_is_char = tyref_enum_payload_is_by_value_char(recv_ty, self.llbc);
         let scalar_niche = is_option && !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
         Some(crate::front::option_unwrap::UnwrapSite {
             result_var: result_var.clone(),
             enum_owner,
             payload_owner,
             payload_ty,
-            payload_is_char,
             payload_on_disc_true,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
@@ -784,14 +782,11 @@ impl<'a> Lowering<'a> {
             &mut niche,
         );
         let scalar_niche = !niche && tyref_option_nonzero_scalar(recv_ty, self.llbc);
-        let payload_is_char = crate::front::result_exc::tyref_option_payload(recv_ty, self.llbc)
-            .is_some_and(|payload| tyref_is_by_value_char(&payload, self.llbc));
         Some(crate::front::option_expect::ExpectSite {
             result_var: result_var.clone(),
             option_owner,
             some_owner,
             payload_ty,
-            payload_is_char,
             niche,
             int_null: self.option_niche_int_null(recv_ty),
             scalar_niche,

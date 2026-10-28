@@ -2422,9 +2422,8 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
     let cf_c = question.cf_at_disc.clone();
     if c != b {
         assert_single_pred(graph, c, &name)?;
-        if let Some(disc_idx) = question.disc_idx {
-            assert_block_pure_besides(graph, c, &[disc_idx], "discriminant", &name)?;
-        }
+        let recognized: Vec<usize> = question.disc_idx.into_iter().collect();
+        assert_block_pure_besides(graph, c, &recognized, "discriminant", &name)?;
     }
     let continue_link = question.continue_link.clone();
     let break_link = question.break_link.clone();

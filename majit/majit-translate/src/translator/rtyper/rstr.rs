@@ -53,18 +53,19 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     build_ll_find_char_helper_graph, build_ll_find_helper_graph_on, build_ll_int_helper_graph,
     build_ll_join_chars_helper_graph, build_ll_join_chars_isvirtual_helper_graph,
     build_ll_join_chars_look_inside_iff_helper_graph, build_ll_join_chars_trampoline_helper_graph,
-    build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
-    build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
-    build_ll_str_is_true_helper_graph, build_ll_str_string_helper_graph,
-    build_ll_str2unicode_helper_graph, build_ll_strcmp_helper_graph,
-    build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
+    build_ll_join_strs_helper_graph, build_ll_join_strs_look_inside_iff_helper_graph,
+    build_ll_join_strs_trampoline_helper_graph, build_ll_replace_chr_chr_helper_graph,
+    build_ll_rfind_char_helper_graph, build_ll_startswith_char_helper_graph,
+    build_ll_startswith_helper_graph, build_ll_str_is_true_helper_graph,
+    build_ll_str_string_helper_graph, build_ll_str2unicode_helper_graph,
+    build_ll_strcmp_helper_graph, build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
     build_ll_strfasthash_helper_graph, build_ll_strhash_helper_graph,
     build_ll_string_casefold_helper_graph, build_ll_string_isxxx_helper_graph,
     build_ll_string2list_helper_graph, build_ll_stringslice_helper_graph,
     build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
     build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
     build_ll_strlen_helper_graph, build_ll_unichr2str_helper_graph, const_str_cache_llstr,
-    null_str_ptr,
+    null_str_ptr, temp_ptr_lltype,
 };
 use crate::translator::rtyper::rlist::build_ll_alloc_and_set_isconstant_helper_graph;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -949,6 +950,71 @@ pub(crate) fn ll_join_chars_helper(
             build_ll_join_chars_look_inside_iff_helper_graph(
                 "ll_join_chars",
                 items_ptr_lltype,
+                orig_fn,
+                trampoline_fn,
+                isconstant_fn,
+                isvirtual_fn,
+            )
+        },
+    )
+}
+
+/// Mint `LLHelpers.ll_join_strs` (`lltypesystem/rstr.py`) through
+/// `look_inside_iff` (`rlib/jit.py`) with `loop_unrolling_heuristic`
+/// (`cutoff=2`): original loop, `dont_look_inside` trampoline,
+/// `isconstant` / `isvirtual` predicates, and the wrapper named
+/// `ll_join_strs`. Returns the wrapper.
+pub(crate) fn ll_join_strs_helper(rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
+    let orig_args = vec![LowLevelType::Signed, temp_ptr_lltype()];
+    let orig = rtyper.lowlevel_helper_function_with_builder(
+        "ll_join_strs__orig".to_string(),
+        orig_args.clone(),
+        STRPTR.clone(),
+        move |_r, _a, _res| build_ll_join_strs_helper_graph("ll_join_strs__orig"),
+    )?;
+    let trampoline = {
+        let orig_fn = functionptr_const(rtyper, &orig)?;
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_join_strs_trampoline".to_string(),
+            orig_args.clone(),
+            STRPTR.clone(),
+            move |_r, _a, _res| {
+                build_ll_join_strs_trampoline_helper_graph("ll_join_strs_trampoline", orig_fn)
+            },
+        )?
+    };
+    // `rlib/jit.py isconstant`. Shared with alloc_and_set / ll_join_chars:
+    // the `(name, args, result)` cache hits on the second mint.
+    let isconstant = rtyper.lowlevel_helper_function_with_builder(
+        "_ll_alloc_and_set_isconstant".to_string(),
+        vec![LowLevelType::Signed],
+        LowLevelType::Bool,
+        |rtyper, _a, _res| {
+            build_ll_alloc_and_set_isconstant_helper_graph(rtyper, "_ll_alloc_and_set_isconstant")
+        },
+    )?;
+    let isvirtual = {
+        let items = temp_ptr_lltype();
+        rtyper.lowlevel_helper_function_with_builder(
+            "ll_join_strs_isvirtual".to_string(),
+            vec![items.clone()],
+            LowLevelType::Bool,
+            move |rtyper, _a, _res| {
+                build_ll_join_chars_isvirtual_helper_graph(rtyper, "ll_join_strs_isvirtual", items)
+            },
+        )?
+    };
+    let orig_fn = functionptr_const(rtyper, &orig)?;
+    let trampoline_fn = functionptr_const(rtyper, &trampoline)?;
+    let isconstant_fn = functionptr_const(rtyper, &isconstant)?;
+    let isvirtual_fn = functionptr_const(rtyper, &isvirtual)?;
+    rtyper.lowlevel_helper_function_with_builder(
+        "ll_join_strs".to_string(),
+        orig_args,
+        STRPTR.clone(),
+        move |_r, _a, _res| {
+            build_ll_join_strs_look_inside_iff_helper_graph(
+                "ll_join_strs",
                 orig_fn,
                 trampoline_fn,
                 isconstant_fn,
@@ -7054,6 +7120,10 @@ mod tests {
         assert!(
             ll_join_chars_helper(rtyper.as_ref(), items_ptr).is_ok(),
             "ll_join_chars_helper must mint"
+        );
+        assert!(
+            ll_join_strs_helper(rtyper.as_ref()).is_ok(),
+            "ll_join_strs_helper must mint"
         );
         let newlist = rtyper
             .lowlevel_helper_function_with_builder(

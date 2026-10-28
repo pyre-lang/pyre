@@ -8148,26 +8148,6 @@ pub(in crate::front::mir) fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
         })
 }
 
-/// By-value `char`, not `&char`. `Option<char>::unwrap` extracts a UniChar;
-/// `Option<&char>` extracts a pointer.
-pub(in crate::front::mir) fn tyref_is_by_value_char(ty: &TyRef, llbc: &Llbc) -> bool {
-    tyref_is_char(ty, llbc) && tyref_peel_one_ref_node(ty, llbc).is_none()
-}
-
-/// `Option<char>` / `Result<char, E>` payload is a by-value Rust `char`.
-/// `Utf8StringIterator.next` (`rutf8.py`) yields an INT code point;
-/// extracting it as `char` is `unichr(codepoint)` (`builtin_unichr`).
-pub(in crate::front::mir) fn tyref_enum_payload_is_by_value_char(ty: &TyRef, llbc: &Llbc) -> bool {
-    let payload = if crate::front::result_exc::tyref_is_option(ty, llbc) {
-        crate::front::result_exc::tyref_option_payload(ty, llbc)
-    } else if crate::front::result_exc::tyref_is_result(ty, llbc) {
-        crate::front::result_exc::tyref_result_ok(ty, llbc)
-    } else {
-        None
-    };
-    payload.is_some_and(|payload| tyref_is_by_value_char(&payload, llbc))
-}
-
 /// Needle of `str::contains<P>` after Pattern monomorphisation.
 pub(in crate::front::mir) enum StrContainsNeedleKind {
     /// `char`, including a utf8iter code-point Variable still typed as `char`.
