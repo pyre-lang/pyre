@@ -44,8 +44,21 @@ fn ctor_parts(target: &CallTarget) -> Option<(&[String], &str)> {
 /// reasoning [`crate::front::result_exc::result_ctor_kind`] applies to
 /// `Result`.
 fn is_core_option_path(head: &[String], tail: &str) -> bool {
-    let tail_base = tail.split_once('<').map_or(tail, |(base, _)| base);
-    head == ["core".to_string(), "option".to_string()] && tail_base == "Option"
+    // The last segment must be `Option` (plus an optional instantiation).
+    // Joining first and truncating at `<` would treat
+    // `core::option::Option<T>::None` as the type itself.
+    if majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(tail))
+        != "Option"
+    {
+        return false;
+    }
+    let joined = if head.is_empty() {
+        tail.to_string()
+    } else {
+        format!("{}::{tail}", head.join("::"))
+    };
+    let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
+    base == "core::option::Option"
 }
 
 /// The variant-leaf spelling: `(leaf, discriminant)` for a niladic

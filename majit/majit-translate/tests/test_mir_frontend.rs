@@ -2182,8 +2182,14 @@ fn a_borrowed_primitive_banks_by_its_container() {
     assert_eq!(
         payloads("range_start_index"),
         vec![
-            ("Bound<usize>::Included".to_string(), ValueType::Unsigned),
-            ("Bound<usize>::Excluded".to_string(), ValueType::Unsigned),
+            (
+                "ops::range::Bound<usize>::Included".to_string(),
+                ValueType::Unsigned,
+            ),
+            (
+                "ops::range::Bound<usize>::Excluded".to_string(),
+                ValueType::Unsigned,
+            ),
         ],
         "a `Bound` payload is an enum variant's too, though no `?` produces it",
     );
@@ -3250,7 +3256,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
         .iter()
         .flat_map(|block| &block.operations)
         .filter_map(|op| {
-            (majit_translate::model::cast_instance_root(&op.kind) == Some("PyFrame"))
+            (majit_translate::model::cast_instance_root(&op.kind) == Some("pyframe::PyFrame"))
                 .then(|| op.result.as_ref().map(|var| var.id()))
                 .flatten()
         })
@@ -3292,10 +3298,7 @@ fn frame_box_new_ptr_write_lowers_to_field_stores() {
                     &op.kind,
                     OpKind::FieldWrite { field, .. }
                         if field.name == "w_class"
-                            && field
-                                .owner_root
-                                .as_deref()
-                                .is_some_and(|owner| owner.ends_with("PyObject"))
+                            && field.owner_root.as_deref() == Some("pyobject::PyObject")
                 )
             }),
         "FrameBox::new must copy ob_header.w_class through the inner struct descriptor"
@@ -3507,7 +3510,7 @@ fn frame_box_owner_root_word_roundtrips() {
     let ret_op = defining_op(&deref_mut, deref_returns[0]);
     assert_eq!(
         majit_translate::model::cast_instance_root(&ret_op.kind),
-        Some("PyFrame"),
+        Some("pyframe::PyFrame"),
         "deref_mut must retarget frame_ptr's word to PyFrame, got {:?}",
         ret_op.kind
     );
@@ -3678,4 +3681,209 @@ fn call_names_owner_root_guard(call: &str) -> bool {
         || call.contains("shadow_stack::<Impl>::get")
         || call.contains("shadow_stack::<Impl>::set")
         || call.contains("shadow_stack::<Impl>::drop")
+}
+
+fn class_root_probe_span() -> serde_json::Value {
+    serde_json::json!({
+        "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}
+    })
+}
+
+fn class_root_probe_meta(path: &[&str]) -> serde_json::Value {
+    serde_json::json!({
+        "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+        "span": class_root_probe_span(),
+        "source_text": null,
+        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+        "is_local": true
+    })
+}
+
+fn class_root_probe_place(id: u64, ty: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"kind": {"Local": id}, "ty": ty})
+}
+
+fn class_root_probe_local(
+    index: u64,
+    name: Option<&str>,
+    ty: &serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "name": name,
+        "span": class_root_probe_span(),
+        "ty": ty
+    })
+}
+
+/// `PY_NULL` copies of `*mut PyObject` must keep the W_Root class boundary.
+#[test]
+fn py_null_global_narrows_to_w_root_class() {
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let span = class_root_probe_span();
+    let empty_g = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let w_root_adt = serde_json::json!({"Adt": {"id": 0, "generics": empty_g}});
+    let w_root_ptr = serde_json::json!({"RawPtr": [w_root_adt.clone(), "Mut"]});
+    let w_root = serde_json::json!({
+        "def_id": 0,
+        "item_meta": class_root_probe_meta(&["pyre_object", "pyobject", "PyObject"]),
+        "kind": {"Struct": [
+            {"name": "ob_type", "ty": w_root_ptr, "attr_info": null},
+            {"name": "w_class", "ty": w_root_ptr, "attr_info": null}
+        ]}
+    });
+    let py_null = serde_json::json!({
+        "def_id": 0,
+        "item_meta": class_root_probe_meta(&["pyre_object", "pyobject", "PY_NULL"]),
+        "global_kind": "Static",
+        "ty": w_root_ptr
+    });
+    let load_null = serde_json::json!({
+        "def_id": 0,
+        "item_meta": class_root_probe_meta(&["fixture", "load_null"]),
+        "signature": {"is_unsafe": false, "inputs": [], "output": w_root_ptr},
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 0, "locals": [
+                class_root_probe_local(0, None, &w_root_ptr)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        class_root_probe_place(0, &w_root_ptr),
+                        {"Use": [{"Copy": {
+                            "kind": {"Global": {"generics": empty_g, "id": 0}},
+                            "ty": w_root_ptr
+                        }}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [w_root],
+            "fun_decls": [load_null],
+            "global_decls": [py_null],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("PY_NULL fixture parses");
+    let graph = lower_function(&llbc, "load_null").expect("load_null lowers");
+    let has_nullable_instance = graph.blocks.iter().any(|block| {
+        block.operations.windows(2).any(|ops| {
+            matches!(
+                &ops[0].kind,
+                OpKind::Call { target, .. }
+                    if matches!(target, CallTarget::FunctionPath { segments, .. }
+                        if segments.as_slice() == ["core", "ptr", "null_mut"])
+            ) && majit_translate::model::cast_instance_root(&ops[1].kind)
+                == Some("pyobject::PyObject")
+        })
+    });
+    assert!(
+        has_nullable_instance,
+        "PY_NULL must lower as null_mut plus a pyobject::PyObject narrow; graph={}",
+        graph.dump()
+    );
+}
+
+/// `&ObjectKey` field reads must narrow onto the dict-key class before `.hash`.
+#[test]
+fn object_key_field_read_narrows_to_object_key_class() {
+    use majit_translate::model::OpKind;
+
+    let span = class_root_probe_span();
+    let empty_g = serde_json::json!({
+        "regions": [], "types": [], "const_generics": [], "trait_refs": []
+    });
+    let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+    let key_adt = serde_json::json!({"Adt": {"id": 0, "generics": empty_g}});
+    let key_ref = serde_json::json!({"Ref": ["Erased", key_adt.clone(), "Shared"]});
+    let object_key = serde_json::json!({
+        "def_id": 0,
+        "item_meta": class_root_probe_meta(&["pyre_object", "dictmultiobject", "ObjectKey"]),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": i64_ty, "attr_info": null},
+            {"name": "obj", "ty": i64_ty, "attr_info": null}
+        ]}
+    });
+    let hash_place = serde_json::json!({
+        "kind": {"Projection": [
+            {
+                "kind": {"Projection": [
+                    class_root_probe_place(1, &key_ref),
+                    "Deref"
+                ]},
+                "ty": key_adt
+            },
+            {"Field": [null, 0]}
+        ]},
+        "ty": i64_ty
+    });
+    let read_hash = serde_json::json!({
+        "def_id": 0,
+        "item_meta": class_root_probe_meta(&["fixture", "read_hash"]),
+        "signature": {"is_unsafe": false, "inputs": [key_ref], "output": i64_ty},
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {"arg_count": 1, "locals": [
+                class_root_probe_local(0, None, &i64_ty),
+                class_root_probe_local(1, Some("k"), &key_ref)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span,
+                    "kind": {"Assign": [
+                        class_root_probe_place(0, &i64_ty),
+                        {"Use": [{"Copy": hash_place}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [object_key],
+            "fun_decls": [read_hash],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("ObjectKey fixture parses");
+    let graph = lower_function(&llbc, "read_hash").expect("read_hash lowers");
+    let narrowed = graph.blocks.iter().any(|block| {
+        block.operations.windows(2).any(|ops| {
+            majit_translate::model::cast_instance_root(&ops[0].kind)
+                == Some("dictmultiobject::ObjectKey")
+                && matches!(
+                    &ops[1].kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "hash"
+                            && field.owner_root.as_deref()
+                                == Some("dictmultiobject::ObjectKey")
+                )
+        })
+    });
+    assert!(
+        narrowed,
+        "ObjectKey.hash must narrow onto dictmultiobject::ObjectKey; graph={}",
+        graph.dump()
+    );
 }

@@ -366,6 +366,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -376,6 +377,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -392,6 +394,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -402,6 +405,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -693,6 +697,7 @@ mod tests {
                             .map(|s| s.to_string())
                             .collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![header.clone(), offset]),
                     result_ty: ValueType::Ref(None),

@@ -905,6 +905,20 @@ pub fn with_instantiation_suffix(name: &str, suffix: &str) -> String {
     }
 }
 
+/// Leaf of a class-root spelling, including any instantiation suffix.
+///
+/// The last `::` that precedes the first `<` is the module/leaf split:
+/// `option::Option<i64>` → `Option<i64>`, `ops::range::RangeInclusive`
+/// → `RangeInclusive`, `option::Option<i64>::Some` → `Option<i64>::Some`.
+/// A spelling with no `::` before `<` is returned unchanged.
+pub fn class_root_leaf(root: &str) -> &str {
+    let base_end = root.find('<').unwrap_or(root.len());
+    let base = &root[..base_end];
+    let leaf = base.rsplit("::").next().unwrap_or(base);
+    let start = base.len() - leaf.len();
+    &root[start..]
+}
+
 /// Drop a trailing generic-argument suffix (`Foo<bar>` → `Foo`,
 /// `m::Foo<a, b>` → `m::Foo`), returning the ungeneric root.
 /// Truncates at the first `<`, so a nested argument's own `::` / `<`
@@ -11807,6 +11821,25 @@ mod tests {
             "Option<i64>"
         );
         assert_eq!(with_instantiation_suffix("Option", ""), "Option");
+    }
+
+    #[test]
+    fn class_root_leaf_strips_module_before_generic_args() {
+        assert_eq!(class_root_leaf("Option<i64>"), "Option<i64>");
+        assert_eq!(class_root_leaf("option::Option<i64>"), "Option<i64>");
+        assert_eq!(
+            class_root_leaf("ops::range::RangeInclusive<i64>"),
+            "RangeInclusive<i64>"
+        );
+        assert_eq!(
+            class_root_leaf("ops::range::RangeInclusive"),
+            "RangeInclusive"
+        );
+        assert_eq!(
+            class_root_leaf("option::Option<i64>::Some"),
+            "Option<i64>::Some"
+        );
+        assert_eq!(class_root_leaf("a::Dup"), "Dup");
     }
 
     // ── FFI call surface parity tests (rpython/jit/metainterp/test/test_fficall.py) ──

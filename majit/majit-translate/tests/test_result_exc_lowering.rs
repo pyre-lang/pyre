@@ -457,7 +457,9 @@ fn count_result_ctors(graph: &majit_translate::model::FunctionGraph) -> usize {
                     target: CallTarget::SyntheticTransparentCtor { owner_path, .. },
                     ..
                 } if owner_path.last().is_some_and(|leaf| {
-                    leaf.split_once('<').map_or(leaf.as_str(), |(base, _)| base) == "Result"
+                    majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(
+                        leaf,
+                    )) == "Result"
                 })
             )
         })
@@ -1069,7 +1071,7 @@ fn list_append_underflow_keeps_its_unfused_materialisation() {
 }
 
 /// Family C: the dual-gate slot on always-`Err` `__new__` wrappers is
-/// the `Result<*mut PyObject,PyError>::Ok.__pos_0` extract, not the
+/// the `result::Result<*mut PyObject,PyError>::Ok.__pos_0` extract, not the
 /// returnblock inputarg.
 /// The annotator never follows that arm (`links_followed`).  Indices
 /// move when the wrapper changes crates, so the test looks for the
@@ -1087,7 +1089,7 @@ fn wrap_new_always_err_ok_payload_is_result_fieldread() {
                 OpKind::FieldRead { field, .. }
                     if field.name == "__pos_0"
                         && field.owner_root.as_deref()
-                            == Some("Result<*mut PyObject,PyError>::Ok") =>
+                            == Some("result::Result<*mut PyObject,PyError>::Ok") =>
                 {
                     Some(field)
                 }

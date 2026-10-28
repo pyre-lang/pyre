@@ -683,8 +683,9 @@ fn compute_named_jitcode_index(name: &str) -> Option<usize> {
 }
 
 /// Resolve a JitCode by the graph key the codewriter allocated it under,
-/// spelled as `CallPath::canonical_key` — the `::`-joined segments, e.g.
-/// `pyre_interpreter::opcode_ops::compare_value`.
+/// spelled as `CallPath::display_name` — the `::`-joined segments, with
+/// `ACCESS_DIRECT_ALT_SUFFIX` on an AccessDirect copy so it stays distinct
+/// from its Regular origin, e.g. `pyre_interpreter::opcode_ops::compare_value`.
 ///
 /// `CallControl::get_jitcode` keys `self.jitcodes` by `CallPath`, mirroring
 /// `call.py get_jitcode`'s graph-keyed dict, and takes the JitCode's `name`
@@ -703,7 +704,8 @@ pub(crate) fn compute_pathed_jitcode_index(canonical_path: &str) -> Option<usize
     PATHED_JITCODE_INDEX.get(canonical_path).copied()
 }
 
-/// Process-wide `CallControl.jitcodes` keyed by `CallPath::canonical_key`.
+/// Process-wide reverse lookup of `CallControl.jitcodes` by
+/// `CallPath::display_name`.
 ///
 /// RPython keeps one dict on `CallControl` (`call.py get_jitcode`); pyre's
 /// frozen `jitcode_index().paths` is that dict's key column, allocation-aligned

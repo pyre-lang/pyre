@@ -3,9 +3,27 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `description.py FunctionDesc.cachedgraph` alt_name postfix for
+/// `specialize.py default_specialize`'s `(AccessDirect, None)` graph
+/// (`nameof(AccessDirect)` + `_` + `nameof(None)`). Display-only: the
+/// cache key is [`GraphSpecialization`], not this suffix.
+pub const ACCESS_DIRECT_ALT_SUFFIX: &str = "__AccessDirect_None";
+
+/// Which `FunctionDesc.cachedgraph` key a graph was built under
+/// (`specialize.py default_specialize`): `AccessDirect` is the
+/// `(AccessDirect, None)` key; `Regular` is every other graph.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GraphSpecialization {
+    #[default]
+    Regular,
+    AccessDirect,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CallPath {
     pub segments: Vec<String>,
+    #[serde(default)]
+    pub specialization: GraphSpecialization,
 }
 
 impl CallPath {
@@ -16,6 +34,19 @@ impl CallPath {
     {
         Self {
             segments: segments.into_iter().map(Into::into).collect(),
+            specialization: GraphSpecialization::Regular,
+        }
+    }
+
+    /// Same specialization, new segments (crate-strip / alias spellings).
+    pub fn with_segments<I, S>(&self, segments: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            segments: segments.into_iter().map(Into::into).collect(),
+            specialization: self.specialization,
         }
     }
 
@@ -50,7 +81,10 @@ impl CallPath {
             .map(|seg| seg.to_string())
             .collect();
         segments.push(method.to_string());
-        Self { segments }
+        Self {
+            segments,
+            specialization: GraphSpecialization::Regular,
+        }
     }
 
     /// Build the direct-call identity for one concrete trait-impl method.
@@ -73,8 +107,24 @@ impl CallPath {
         self.segments.last().map(String::as_str)
     }
 
+    /// Segment join only. Identity-free: does not encode
+    /// [`GraphSpecialization`]. Two graphs of one funcobj that differ
+    /// only by `specialize.py default_specialize` cache key share this
+    /// string.
     pub fn canonical_key(&self) -> String {
         self.segments.join("::")
+    }
+
+    /// Display name: `canonical_key()` for Regular, and
+    /// `canonical_key()` plus [`ACCESS_DIRECT_ALT_SUFFIX`] for
+    /// AccessDirect (`description.py FunctionDesc.cachedgraph` alt_name).
+    pub fn display_name(&self) -> String {
+        match self.specialization {
+            GraphSpecialization::Regular => self.canonical_key(),
+            GraphSpecialization::AccessDirect => {
+                format!("{}{ACCESS_DIRECT_ALT_SUFFIX}", self.canonical_key())
+            }
+        }
     }
 
     /// For a path built by `for_impl_method`, extract the impl type
@@ -94,7 +144,8 @@ impl CallPath {
 /// `canonical_key()` `String` allocation, which matters where the
 /// diagnostic is disabled: `format_args!` evaluates its arguments
 /// eagerly, so an allocating accessor there would cost on the path that
-/// prints nothing.
+/// prints nothing. AccessDirect appends the alt_name suffix
+/// (display-only).
 impl std::fmt::Display for CallPath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for (i, segment) in self.segments.iter().enumerate() {
@@ -103,7 +154,38 @@ impl std::fmt::Display for CallPath {
             }
             f.write_str(segment)?;
         }
+        if self.specialization == GraphSpecialization::AccessDirect {
+            f.write_str(ACCESS_DIRECT_ALT_SUFFIX)?;
+        }
         Ok(())
+    }
+}
+
+/// Display-only, mirroring `description.py FunctionDesc.cachedgraph` alt_name.
+/// Prints the pre-field shape: `CallPath { segments: [...] }`, with the
+/// last segment shown as its alt_name when AccessDirect.
+impl std::fmt::Debug for CallPath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CallPath")
+            .field("segments", &CallPathDebugSegments(self))
+            .finish()
+    }
+}
+
+struct CallPathDebugSegments<'a>(&'a CallPath);
+
+impl std::fmt::Debug for CallPathDebugSegments<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut list = f.debug_list();
+        let last = self.0.segments.len().checked_sub(1);
+        for (i, segment) in self.0.segments.iter().enumerate() {
+            if self.0.specialization == GraphSpecialization::AccessDirect && Some(i) == last {
+                list.entry(&format!("{segment}{ACCESS_DIRECT_ALT_SUFFIX}"));
+            } else {
+                list.entry(&segment.as_str());
+            }
+        }
+        list.finish()
     }
 }
 
@@ -122,7 +204,7 @@ pub fn canonical_leaf(name: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use super::CallPath;
+    use super::{ACCESS_DIRECT_ALT_SUFFIX, CallPath, GraphSpecialization};
 
     #[test]
     fn concrete_trait_impl_paths_keep_same_named_methods_distinct() {
@@ -134,5 +216,34 @@ mod tests {
             ["types", "dynamic", "Dynamic", "<Impl#1105>", "from"]
         );
         assert_ne!(bool_from, fnptr_from);
+    }
+
+    #[test]
+    fn display_name_tags_access_direct_without_changing_segments() {
+        let regular = CallPath::from_segments(["owner", "pop"]);
+        assert_eq!(regular.canonical_key(), "owner::pop");
+        assert_eq!(regular.display_name(), "owner::pop");
+        assert_eq!(regular.specialization, GraphSpecialization::Regular);
+
+        let ad = CallPath {
+            segments: regular.segments.clone(),
+            specialization: GraphSpecialization::AccessDirect,
+        };
+        assert_eq!(ad.segments, regular.segments);
+        assert_eq!(ad.canonical_key(), "owner::pop");
+        assert_eq!(
+            ad.display_name(),
+            format!("owner::pop{ACCESS_DIRECT_ALT_SUFFIX}")
+        );
+        assert_eq!(ad.to_string(), ad.display_name());
+        assert_eq!(
+            format!("{regular:?}"),
+            r#"CallPath { segments: ["owner", "pop"] }"#
+        );
+        assert_eq!(
+            format!("{ad:?}"),
+            r#"CallPath { segments: ["owner", "pop__AccessDirect_None"] }"#
+        );
+        assert_ne!(regular, ad);
     }
 }

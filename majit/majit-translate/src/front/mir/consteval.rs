@@ -1330,6 +1330,7 @@ pub(in crate::front::mir) fn encoding_name_const(segments: &[String]) -> Option<
         target: CallTarget::FunctionPath {
             segments: vec!["__str_const".to_string(), text.to_string()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![]),
         result_ty: ValueType::Ref(None),
@@ -1842,6 +1843,7 @@ pub(in crate::front::mir) fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) 
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), s],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),

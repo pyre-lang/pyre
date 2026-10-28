@@ -365,6 +365,7 @@ pub(crate) fn slice_len_op(
         target: CallTarget::FunctionPath {
             segments: vec![marker.to_string()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![base]),
         result_ty: ValueType::Int,

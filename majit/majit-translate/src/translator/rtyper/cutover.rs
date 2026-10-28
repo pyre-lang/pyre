@@ -545,7 +545,7 @@ fn unpoison_failed_subject_callees(
             .keys_for_entry(&key)
             .iter()
             .find_map(|k| {
-                let path = crate::parse::CallPath::from_segments(k.segments().iter().cloned());
+                let path = k.to_call_path();
                 let source = lift_sources.get(&path)?;
                 let signature = lift_sources.signature(&path)?;
                 Some((source, signature))
@@ -2508,15 +2508,15 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         if function_graphs.declared_funcobj(&path).is_some() {
             continue;
         }
-        // `{name}__AccessDirect_None` is `description.py cachedgraph`'s
-        // alt_name for the `(AccessDirect, key)` copy of the same
-        // FunctionDesc. Register it as an alias after this pass; inserting
-        // it as canonical would make `CallRegistry.alias` panic and would
-        // give the copy its own desc.
+        // An AccessDirect `CallPath` names `description.py cachedgraph`'s
+        // `(AccessDirect, key)` copy of the same FunctionDesc. Register it
+        // as an alias after this pass; inserting it as canonical would make
+        // `CallRegistry.alias` panic and would give the copy its own desc.
+        // The alt_name is display-only.
         if crate::codewriter::call::is_access_directly_path(&path) {
             continue;
         }
-        let key = FunctionPathKey::from_segments(path.segments.iter().cloned());
+        let key = FunctionPathKey::from(&path);
         let signature = crate::codewriter::call::StoreCore::signature_from_graph(&graph);
         let entry = if let Some(canonical_key) = by_canonical_path.get(&canonical_strip) {
             if canonical_key != &key {
@@ -2557,7 +2557,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
             .expect("a declared path names a funcobj");
         pending.push((key, graph, entry, signature, body));
     }
-    // `function_graphs.iter_declared()` yields `CallPath.segments` order,
+    // `function_graphs.iter_declared()` yields `CallPath.display_name` order,
     // so `alloc_desc_key` and first-alias-wins already follow that key.
     // Sort pending as a defense for the lift/prefill passes below.
     pending.sort_by(|a, b| a.0.segments().cmp(b.0.segments()));
@@ -2575,7 +2575,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         let Some(canonical_key) = by_canonical_path.get(&origin_strip) else {
             continue;
         };
-        let alias_key = FunctionPathKey::from_segments(path.segments.iter().cloned());
+        let alias_key = FunctionPathKey::from(&path);
         if &alias_key != canonical_key {
             registry.alias(alias_key, canonical_key);
         }
@@ -2738,7 +2738,7 @@ fn describe_declared_funcobj(
     key: &FunctionPathKey,
 ) -> Option<Rc<FunctionEntry>> {
     use crate::decline::gate::CALL_REGISTRY as REGISTRY_GATE;
-    let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
+    let path = key.to_call_path();
     let graph = store.declared_funcobj(&path)?;
     let foreign_callables = registry_foreign_callables(registry);
     if let Some(reason) = registration_decline(&path.segments)
@@ -2771,7 +2771,7 @@ fn existing_graphstore_entry(
     path: &crate::parse::CallPath,
 ) -> Option<Rc<FunctionEntry>> {
     for alias in store.alias_paths(path) {
-        let alias_key = FunctionPathKey::from_segments(alias.segments.iter().cloned());
+        let alias_key = FunctionPathKey::from(&alias);
         if let Some(entry) = registry.lookup_registered(&alias_key) {
             return Some(entry);
         }
@@ -2823,13 +2823,13 @@ fn graphstore_path_for_lookup_key(
     key: &FunctionPathKey,
     foreign_callables: &[(String, String)],
 ) -> Option<crate::parse::CallPath> {
-    let path = crate::parse::CallPath::from_segments(key.segments().iter().cloned());
+    let path = key.to_call_path();
     if store.names_funcobj(&path) {
         return Some(path);
     }
     let stripped = canonical_dedup_key(&path, foreign_callables);
     if stripped.as_slice() != key.segments() {
-        let stripped_path = crate::parse::CallPath::from_segments(stripped);
+        let stripped_path = path.with_segments(stripped);
         if store.names_funcobj(&stripped_path) {
             return Some(stripped_path);
         }
@@ -2871,7 +2871,7 @@ fn alias_opaque_stub_keys_onto_graphstore(
         if header.func.jit_look_inside != Some(false) {
             continue;
         }
-        let canonical_key = FunctionPathKey::from_segments(path.segments.iter().cloned());
+        let canonical_key = FunctionPathKey::from(&path);
         let signature = crate::codewriter::call::StoreCore::signature_from_graph(&header);
         let entry = registry.get_or_register_with_func(
             canonical_key.clone(),
@@ -2880,7 +2880,7 @@ fn alias_opaque_stub_keys_onto_graphstore(
         );
         alias_key_onto_entry(registry, &key, &entry);
         for alias in store.alias_paths(&path) {
-            let alias_key = FunctionPathKey::from_segments(alias.segments.iter().cloned());
+            let alias_key = FunctionPathKey::from(&alias);
             alias_key_onto_entry(registry, &alias_key, &entry);
         }
         publish_source_signature(&header, &entry);
@@ -3570,11 +3570,13 @@ fn declared_funcptr_type_from_legacy(
     let mut args = Vec::with_capacity(startblock.inputargs.len());
     for var in &startblock.inputargs {
         let (ty, class_root) = input_ty.get(var)?;
-        args.push(if class_root.as_deref() == Some("GCREF") {
-            crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
-        } else {
-            valuetype_to_lltype(ty)?
-        });
+        args.push(
+            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("GCREF") {
+                crate::translator::rtyper::lltypesystem::lltype::GCREF.clone()
+            } else {
+                valuetype_to_lltype(ty)?
+            },
+        );
     }
     // A `STR`-pointer result rtypes as `SomeString` (`declared_return_annotation`),
     // so its function type returns `Ptr(STR)` like the callable's typed
@@ -4763,9 +4765,7 @@ fn origin_function_entry(
     path: &crate::parse::CallPath,
 ) -> Option<Rc<FunctionEntry>> {
     let origin = function_graphs.access_directly_desc_origin(path);
-    call_registry.lookup(&FunctionPathKey::from_segments(
-        origin.segments.iter().cloned(),
-    ))
+    call_registry.lookup(&FunctionPathKey::from(&origin))
 }
 
 /// Wrap the AccessDirect subject's lifted body as the `PyGraph`
@@ -4901,8 +4901,7 @@ fn record_phase_a_skip(
 ) {
     {
         let mut tp = call_registry.two_phase();
-        tp.annotate_skipped
-            .insert(path.canonical_key(), reason.clone());
+        tp.annotate_skipped.insert(path.clone(), reason.clone());
     }
     if rtyper_verbose_enabled() {
         eprintln!("[PREPASS phaseA fail] {:?}: {reason}", path);
@@ -5382,27 +5381,20 @@ fn check_access_directly_sanity(
         let tp = call_registry.two_phase();
         for path in candidate_graphs {
             if crate::codewriter::call::is_access_directly_path(path) {
-                if let Some(pygraph) = tp
-                    .subjects
-                    .get(&path.canonical_key())
-                    .and_then(|s| s.pygraph.as_ref())
-                {
+                if let Some(pygraph) = tp.subjects.get(path).and_then(|s| s.pygraph.as_ref()) {
                     jit_graphs.insert(Rc::as_ptr(pygraph));
                     candidate_flow_graphs.push(pygraph.graph.clone());
                 }
                 let origin = function_graphs.access_directly_desc_origin(path);
-                if let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
-                    origin.segments.iter().cloned(),
-                )) && let Some(graph) = entry.function_desc.borrow().cached_access_direct_none()
+                if let Some(entry) = call_registry.lookup(&FunctionPathKey::from(&origin))
+                    && let Some(graph) = entry.function_desc.borrow().cached_access_direct_none()
                 {
                     jit_graphs.insert(Rc::as_ptr(&graph));
                     candidate_flow_graphs.push(graph.graph.clone());
                 }
                 continue;
             }
-            let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
-                path.segments.iter().cloned(),
-            )) else {
+            let Some(entry) = call_registry.lookup(&FunctionPathKey::from(path)) else {
                 continue;
             };
             let desc = entry.function_desc.borrow();
@@ -5473,21 +5465,21 @@ fn run_two_phase_prepass_inner(
     // Deterministic order (R3): candidate_graphs is a HashSet; iterating it
     // directly would make classdef numbering (and thus Match/Skip
     // classification) vary run-to-run. AccessDirect copies are first-class
-    // subjects keyed by their derived `{name}__AccessDirect_None` CallPath
+    // subjects keyed by [`crate::parse::GraphSpecialization`]
     // (`specialize.py default_specialize` / `cachedgraph`); they must not
     // reuse the regular graph's subject.
     let mut paths: Vec<&crate::parse::CallPath> = candidate_graphs
         .iter()
         .filter(|p| function_graphs.get(p).is_some())
         .collect();
-    paths.sort_by_key(|p| p.canonical_key());
+    paths.sort_by_cached_key(|p| p.display_name());
 
     // Alias spellings of one GraphStore slot are one prepass subject:
     // `description.py FunctionDesc.cachedgraph` returns the cached graph
     // on a hit, and `GraphStore::alias_paths` lists every spelling bound
     // to that GraphKey.
     let mut access_direct_alias_rep: HashMap<
-        String,
+        crate::parse::CallPath,
         (&crate::parse::CallPath, &crate::parse::CallPath),
     > = HashMap::new();
     for path in paths.iter().copied() {
@@ -5503,7 +5495,7 @@ fn run_two_phase_prepass_inner(
             continue;
         };
         if path != rep {
-            access_direct_alias_rep.insert(path.canonical_key(), (path, rep));
+            access_direct_alias_rep.insert(path.clone(), (path, rep));
         }
     }
 
@@ -5513,9 +5505,10 @@ fn run_two_phase_prepass_inner(
     // later askers reuse). `recursivecall` then annotates that graph
     // in place.
     let mut phase_a_reasons: Vec<String> = Vec::new();
-    let mut seeded_access_direct: HashMap<String, FlowspaceAdapterOutput> = HashMap::new();
+    let mut seeded_access_direct: HashMap<crate::parse::CallPath, FlowspaceAdapterOutput> =
+        HashMap::new();
     for path in paths.iter() {
-        if access_direct_alias_rep.contains_key(&path.canonical_key()) {
+        if access_direct_alias_rep.contains_key(*path) {
             continue;
         }
         if !crate::codewriter::call::is_access_directly_path(path) {
@@ -5529,7 +5522,7 @@ fn run_two_phase_prepass_inner(
         }));
         match attempt {
             Ok(Ok(lifted)) => {
-                seeded_access_direct.insert(path.canonical_key(), lifted);
+                seeded_access_direct.insert((*path).clone(), lifted);
             }
             other => {
                 if let Some(reason) = phase_a_failure_reason(&other) {
@@ -5541,24 +5534,24 @@ fn run_two_phase_prepass_inner(
 
     // ── Phase A — annotate-all over the portal closure ───────────────
     for (index, path) in paths.iter().enumerate() {
-        if access_direct_alias_rep.contains_key(&path.canonical_key()) {
+        if access_direct_alias_rep.contains_key(*path) {
             continue;
         }
         let Some(legacy) = function_graphs.get(path) else {
             continue;
         };
         if crate::codewriter::call::is_access_directly_path(path)
-            && !seeded_access_direct.contains_key(&path.canonical_key())
+            && !seeded_access_direct.contains_key(*path)
         {
             continue;
         }
         let session_at_entry = SubjectSessionSnapshot::capture(call_registry);
         if determinism_trace {
-            emit_determinism_trace("phaseA", index, &path.canonical_key());
+            emit_determinism_trace("phaseA", index, &path.display_name());
         }
         let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             if crate::codewriter::call::is_access_directly_path(path) {
-                let Some(lifted) = seeded_access_direct.remove(&path.canonical_key()) else {
+                let Some(lifted) = seeded_access_direct.remove(*path) else {
                     return Err(TyperError::message(format!(
                         "AccessDirect subject {path}: cache holds a graph this subject did not provide"
                     )));
@@ -5579,9 +5572,8 @@ fn run_two_phase_prepass_inner(
                 constant_hlvalues,
                 pygraph,
             ))) => {
-                let key = path.canonical_key();
                 call_registry.two_phase().subjects.insert(
-                    key,
+                    (*path).clone(),
                     crate::translator::rtyper::call_registry::TwoPhaseSubject {
                         graph: graph.clone(),
                         pygraph,
@@ -5619,12 +5611,12 @@ fn run_two_phase_prepass_inner(
         }
     }
 
-    let mut alias_keys: Vec<String> = access_direct_alias_rep.keys().cloned().collect();
-    alias_keys.sort();
+    let mut alias_keys: Vec<crate::parse::CallPath> =
+        access_direct_alias_rep.keys().cloned().collect();
+    alias_keys.sort_by_cached_key(|p| p.display_name());
     for alias_key in alias_keys {
         let (alias_path, rep) = access_direct_alias_rep[&alias_key];
-        let rep_key = rep.canonical_key();
-        let subject = call_registry.two_phase().subjects.get(&rep_key).cloned();
+        let subject = call_registry.two_phase().subjects.get(rep).cloned();
         if let Some(subject) = subject {
             call_registry
                 .two_phase()
@@ -5632,11 +5624,7 @@ fn run_two_phase_prepass_inner(
                 .insert(alias_key, subject);
             continue;
         }
-        let reason = call_registry
-            .two_phase()
-            .annotate_skipped
-            .get(&rep_key)
-            .cloned();
+        let reason = call_registry.two_phase().annotate_skipped.get(rep).cloned();
         if let Some(reason) = reason {
             record_phase_a_skip(call_registry, alias_path, reason, &mut phase_a_reasons);
         }
@@ -5729,11 +5717,10 @@ fn run_phase_b_rtype_isolated(
             .iter()
             .enumerate()
             .filter_map(|(index, path)| {
-                let canonical_key = path.canonical_key();
                 cache
                     .subjects
-                    .get(&canonical_key)
-                    .map(|subject| (subject.graph_key.clone(), (index, canonical_key)))
+                    .get(*path)
+                    .map(|subject| (subject.graph_key.clone(), (index, path.display_name())))
             })
             .collect::<Vec<_>>()
     });
@@ -6352,9 +6339,7 @@ fn function_desc_access_direct_pygraph_is_subject(
         return false;
     };
     let origin = function_graphs.access_directly_desc_origin(path);
-    let Some(entry) = call_registry.lookup(&FunctionPathKey::from_segments(
-        origin.segments.iter().cloned(),
-    )) else {
+    let Some(entry) = call_registry.lookup(&FunctionPathKey::from(&origin)) else {
         return false;
     };
     let Some(cached) = entry.function_desc.borrow().cached_access_direct_none() else {
@@ -6373,7 +6358,6 @@ pub(crate) fn dual_gate_outcome_from_cache(
     function_graphs: &crate::codewriter::call::GraphStore,
     path: &crate::parse::CallPath,
 ) -> Result<DualGateOutcome, String> {
-    let diag_key = path.canonical_key();
     // Clone the cached real types out so the cache borrow drops before the
     // legacy baseline runs (the baseline never touches the cache).
     // Three causes reach the Skip below and they are not the same finding:
@@ -6385,8 +6369,8 @@ pub(crate) fn dual_gate_outcome_from_cache(
     // a census could not separate "never attempted" from "attempted and
     // declined" — the same conflation the decline census exists to remove.
     // Neither spelling matches any `unported_category` arm, so
-    // classification is unchanged.  Lookup is by `diag_key` alone
-    // (`CallPath::canonical_key()` at both prepass insert and publish);
+    // classification is unchanged.  Lookup is by the subject [`CallPath`]
+    // (`GraphSpecialization` keeps AccessDirect distinct from Regular);
     // graph names are not unique (`default`, `new`, `call`, and
     // `<Impl>::copy` shared across Int/Unicode/Bytes/Object dict
     // strategies) so a name scan can publish another graph's
@@ -6395,7 +6379,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
     let cached = {
         let is_ad = crate::codewriter::call::is_access_directly_path(path);
         let tp = call_registry.two_phase();
-        match tp.subjects.get(&diag_key) {
+        match tp.subjects.get(path) {
             Some(subj) if !tp.rtype_skipped.contains(&subj.graph_key) => {
                 // An AccessDirect candidate must publish the annotator's
                 // `(AccessDirect, key)` PyGraph of the same FunctionDesc.
@@ -6425,7 +6409,7 @@ pub(crate) fn dual_gate_outcome_from_cache(
             }
             Some(_) => Err("two-phase: subject rtype-skipped in prepass".to_string()),
             None => {
-                if let Some(reason) = tp.annotate_skipped.get(&diag_key) {
+                if let Some(reason) = tp.annotate_skipped.get(path) {
                     Err(format!(
                         "two-phase: subject annotate-skipped in prepass: {reason}"
                     ))
@@ -6562,6 +6546,7 @@ mod tests {
         ] {
             let path = crate::parse::CallPath {
                 segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
             let mut graph = LegacyGraph::new("alloc_zeroed");
             graph.set_return(graph.startblock.clone(), None);
@@ -6678,6 +6663,7 @@ mod tests {
         ] {
             let path = crate::parse::CallPath {
                 segments: segments.iter().map(|s| (*s).to_string()).collect(),
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
             let mut graph = LegacyGraph::new("copy_nonoverlapping");
             graph.set_return(graph.startblock.clone(), None);
@@ -7061,6 +7047,7 @@ mod tests {
                                 "dummy_compute".into(),
                             ],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: vec![],
                         result_ty: ValueType::Int,
@@ -7076,6 +7063,7 @@ mod tests {
                                 "conditional_call_elidable1".into(),
                             ],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![
                             v_value.clone(),
@@ -7133,6 +7121,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let path = crate::parse::CallPath {
             segments: vec!["owner".into(), "flagged".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let mut graph = LegacyGraph::new("flagged");
         graph.set_return(graph.startblock, None);
@@ -7190,7 +7179,7 @@ mod tests {
         pygraph: &Rc<PyGraph>,
     ) {
         registry.two_phase().subjects.insert(
-            ad_path.canonical_key(),
+            ad_path.clone(),
             crate::translator::rtyper::call_registry::TwoPhaseSubject {
                 graph: pygraph.graph.clone(),
                 pygraph: Some(pygraph.clone()),
@@ -7344,6 +7333,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["no_such".into(), "callee".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Void,
@@ -7362,6 +7352,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let path = crate::parse::CallPath {
             segments: vec!["owner".into(), "failing_subject".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let graph = graph_calling_unregistered("failing_subject");
         let mut graphs = crate::codewriter::call::GraphStore::default();
@@ -7390,6 +7381,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let path = crate::parse::CallPath {
             segments: vec!["owner".into(), "unreached".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let graph = empty_return_graph("unreached");
         let mut graphs = crate::codewriter::call::GraphStore::default();
@@ -7414,6 +7406,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let path = crate::parse::CallPath {
             segments: vec!["owner".into(), "trivial".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let graph = empty_return_graph("trivial");
         let mut graphs = crate::codewriter::call::GraphStore::default();
@@ -7442,6 +7435,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let origin_path = crate::parse::CallPath {
             segments: vec!["owner".into(), "pop".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
         let mut origin = empty_return_graph("pop");
@@ -7449,6 +7443,7 @@ mod tests {
         let mut ad = empty_return_graph("pop__AccessDirect_None");
         ad.source_identity = Some("owner::pop".into());
         ad.access_directly = true;
+        ad.specialization = crate::parse::GraphSpecialization::AccessDirect;
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(origin_path.clone(), origin);
         graphs.insert(ad_path.clone(), ad.clone());
@@ -7469,10 +7464,7 @@ mod tests {
             &graphs,
         );
         let tp = registry.two_phase();
-        let subj = tp
-            .subjects
-            .get(&ad_path.canonical_key())
-            .expect("AccessDirect subject");
+        let subj = tp.subjects.get(&ad_path).expect("AccessDirect subject");
         let subject_pygraph = subj
             .pygraph
             .as_ref()
@@ -7510,7 +7502,7 @@ mod tests {
         let tp = registry.two_phase();
         let subj = tp
             .subjects
-            .get(&ad_path.canonical_key())
+            .get(&ad_path)
             .expect("AccessDirect hit-path subject");
         let on_graph: HashSet<Variable> = flowspace_copy_order_vars(&subj.graph.borrow())
             .into_iter()
@@ -7621,10 +7613,12 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let origin_path = crate::parse::CallPath {
             segments: vec!["owner".into(), "pop".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
         let alias_origin = crate::parse::CallPath {
             segments: vec!["crate".into(), "owner".into(), "pop".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let alias_ad = crate::codewriter::call::access_directly_path(&alias_origin);
         let mut origin = empty_return_graph("pop");
@@ -7632,6 +7626,7 @@ mod tests {
         let mut ad = empty_return_graph("pop__AccessDirect_None");
         ad.source_identity = Some("owner::pop".into());
         ad.access_directly = true;
+        ad.specialization = crate::parse::GraphSpecialization::AccessDirect;
         let mut graphs = crate::codewriter::call::GraphStore::default();
         graphs.insert(origin_path.clone(), origin);
         graphs.insert(ad_path.clone(), ad);
@@ -7647,13 +7642,11 @@ mod tests {
             &graphs,
         );
         let tp = registry.two_phase();
-        let ad_key = ad_path.canonical_key();
-        let alias_key = alias_ad.canonical_key();
         let both_subjects =
-            tp.subjects.contains_key(&ad_key) && tp.subjects.contains_key(&alias_key);
+            tp.subjects.contains_key(&ad_path) && tp.subjects.contains_key(&alias_ad);
         let both_skipped = match (
-            tp.annotate_skipped.get(&ad_key),
-            tp.annotate_skipped.get(&alias_key),
+            tp.annotate_skipped.get(&ad_path),
+            tp.annotate_skipped.get(&alias_ad),
         ) {
             (Some(a), Some(b)) => a == b,
             _ => false,
@@ -7723,6 +7716,7 @@ mod tests {
         let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
         let origin_path = crate::parse::CallPath {
             segments: vec!["owner".into(), "stack_base".into()],
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let ad_path = crate::codewriter::call::access_directly_path(&origin_path);
         let mut origin = int_identity_getter("stack_base");
@@ -7734,6 +7728,7 @@ mod tests {
             crate::codewriter::call::ACCESS_DIRECT_ALT_SUFFIX
         );
         ad.access_directly = true;
+        ad.specialization = crate::parse::GraphSpecialization::AccessDirect;
         ad.source_identity = Some("owner::stack_base".into());
         let signed = ad
             .blocks
@@ -7829,7 +7824,7 @@ mod tests {
         let subject_pygraph = registry
             .two_phase()
             .subjects
-            .get(&ad_path.canonical_key())
+            .get(&ad_path)
             .and_then(|s| s.pygraph.clone())
             .expect("subject PyGraph");
         assert!(!Rc::ptr_eq(&manufactured, &subject_pygraph));
@@ -7869,9 +7864,7 @@ mod tests {
         let origin = origin_function_entry(&registry, &graphs, &plain_ad)
             .expect("AccessDirect origin FunctionDesc");
         let identity_entry = registry
-            .lookup(&FunctionPathKey::from_segments(
-                identity.segments.iter().cloned(),
-            ))
+            .lookup(&FunctionPathKey::from(&identity))
             .expect("identity-qualified FunctionDesc");
         assert!(
             Rc::ptr_eq(&origin, &identity_entry),
@@ -7938,6 +7931,7 @@ mod tests {
         graphs.insert(
             crate::parse::CallPath {
                 segments: vec!["owner".into(), "memo_source".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             graph,
         );
@@ -8000,6 +7994,7 @@ mod tests {
         graphs.insert(
             crate::parse::CallPath {
                 segments: vec!["owner".into(), "native_memo".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             graph,
         );
@@ -8099,6 +8094,7 @@ mod tests {
             let mut graphs = crate::codewriter::call::GraphStore::default();
             let qualified = crate::parse::CallPath {
                 segments: vec!["eval".into(), "handle_exception_with_context".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
             graphs.insert(qualified.clone(), graph);
             let stubs = vec![(
@@ -8158,6 +8154,7 @@ mod tests {
             graph.push_hint("dont_look_inside");
             let qualified = crate::parse::CallPath {
                 segments: vec!["eval".into(), "handle_exception_with_context".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
             let decls = FuncObjDeclarations::default();
             decls.push(DeclaredFuncObj {
@@ -8220,6 +8217,7 @@ mod tests {
         graphs.insert(
             crate::parse::CallPath {
                 segments: vec!["f".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             graph,
         );
@@ -8270,6 +8268,7 @@ mod tests {
             graph.push_hint("specialize:argtype(0)");
             let qualified = crate::parse::CallPath {
                 segments: vec!["gc_storage".into(), "gc_alloc_young_storage_box".into()],
+                specialization: crate::parse::GraphSpecialization::Regular,
             };
             let decls = FuncObjDeclarations::default();
             decls.push(DeclaredFuncObj {
@@ -8380,6 +8379,7 @@ mod tests {
             graphs.insert(
                 crate::parse::CallPath {
                     segments: vec!["baseobjspace".into(), "_cached_lookup_where_name".into()],
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 graph,
             );
@@ -8438,14 +8438,10 @@ mod tests {
         graphs.share_path(identity.clone(), &inherent);
         populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
         let inherent_entry = registry
-            .lookup(&FunctionPathKey::from_segments(
-                inherent.segments.iter().cloned(),
-            ))
+            .lookup(&FunctionPathKey::from(&inherent))
             .expect("for_impl_method spelling");
         let identity_entry = registry
-            .lookup(&FunctionPathKey::from_segments(
-                identity.segments.iter().cloned(),
-            ))
+            .lookup(&FunctionPathKey::from(&identity))
             .expect("trait_impl_identity_path spelling");
         assert!(
             Rc::ptr_eq(&inherent_entry, &identity_entry),
@@ -8484,8 +8480,8 @@ mod tests {
         graphs.insert(inherent.clone(), graph);
         graphs.share_path(identity.clone(), &inherent);
         populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
-        let inherent_key = FunctionPathKey::from_segments(inherent.segments.iter().cloned());
-        let identity_key = FunctionPathKey::from_segments(identity.segments.iter().cloned());
+        let inherent_key = FunctionPathKey::from(&inherent);
+        let identity_key = FunctionPathKey::from(&identity);
         let inherent_entry = registry
             .lookup(&inherent_key)
             .expect("for_impl_method spelling");
@@ -8987,6 +8983,7 @@ mod tests {
             crate::model::CallTarget::FunctionPath {
                 segments: vec!["ordinary_scalar_call".to_string()],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             ValueType::Int,
         );
@@ -9704,6 +9701,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["side_effect".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![base.clone(), index.clone()]),
                     result_ty: ValueType::Ref(None),
@@ -10001,6 +9999,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["consume".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![pay.clone()]),
                     result_ty: ValueType::Int,
@@ -10079,6 +10078,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["consume_carrier".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![consumed_carrier.clone()]),
                 result_ty: ValueType::Void,
@@ -10350,6 +10350,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["consume".into()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![threaded.clone()]),
                         result_ty: ValueType::Int,
@@ -10651,6 +10652,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: hint_path.split("::").map(str::to_string).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![length.clone()]),
                         result_ty: ValueType::Ref(None),
@@ -10684,6 +10686,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: free_path.split("::").map(str::to_string).collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![header.clone()]),
                     result_ty: ValueType::Void,
@@ -11389,6 +11392,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![fill.clone(), count.clone()]),
                     result_ty: ValueType::Int,
@@ -11620,6 +11624,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: callee_segments.iter().map(|s| s.to_string()).collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![arg]),
                     result_ty: ValueType::Ref(None),
@@ -11800,6 +11805,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![v1_var.clone(), v2_var.clone()]),
                     result_ty: ValueType::Unknown,
@@ -11848,6 +11854,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["__array_repeat".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![foo_v10_var.clone(), foo_v11_var.clone()]),
                     result_ty: ValueType::Ref(None),

@@ -175,7 +175,13 @@ pub(crate) fn is_result_ok_call_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "ok" && receiver_root.as_deref() == Some("Result"),
+        } => {
+            name == "ok"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Result")
+        }
         CallTarget::FunctionPath { segments, .. } => {
             let n = segments.len();
             n >= 3
@@ -194,7 +200,13 @@ pub(crate) fn is_result_expect_call_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "expect" && receiver_root.as_deref() == Some("Result"),
+        } => {
+            name == "expect"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Result")
+        }
         CallTarget::FunctionPath { segments, .. } => {
             let n = segments.len();
             n >= 3
@@ -537,6 +549,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "slice".into(), "<Impl>".into(), leaf.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args),
                 result_ty: ValueType::Ref(None),
@@ -994,10 +1007,12 @@ mod tests {
         let impl_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "<Impl>", "ok"]),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let owner_path = CallTarget::FunctionPath {
             segments: segs(&["core", "result", "Result", "ok"]),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         let option_ok = CallTarget::Method {
             name: "ok".into(),
@@ -1009,6 +1024,7 @@ mod tests {
         let unrelated = CallTarget::FunctionPath {
             segments: segs(&["core", "option", "<Impl>", "ok"]),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         assert!(is_result_ok_call_target(&method));
         assert!(is_result_ok_call_target(&impl_path));

@@ -1,4 +1,4 @@
-//! A Rust-heap `String` is not rstr `STR`. `type_name_of` returns `String`.
+//! A Rust-heap `String` is not rstr `STR`. `type_name_of` returns `string::String`.
 //! `getitem_slot`'s `format!("'{}' object is not subscriptable", …)` may
 //! collapse via `str(value)` then `add` of rstr `STR` pieces; the
 //! `type_name_of` result itself must not be an `add` operand.
@@ -36,7 +36,7 @@ fn type_name_of_returns_instance_string_not_rstr() {
         "by-value String is not Ptr(STR): return_is_str={}",
         graph.return_is_str
     );
-    assert_eq!(graph.return_class_root.as_deref(), Some("String"));
+    assert_eq!(graph.return_class_root.as_deref(), Some("string::String"));
 }
 
 #[test]

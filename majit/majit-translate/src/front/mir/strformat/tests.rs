@@ -375,6 +375,7 @@ fn rewrite_debug_enum_fmt_site_splits_into_discriminant_switch() {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![fmt_args]),
                 result_ty: ValueType::Ref(None),
@@ -520,6 +521,7 @@ fn rewrite_debug_enum_fmt_site_renames_exitswitch_to_block_local() {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![fmt_args]),
                 result_ty: ValueType::Ref(None),

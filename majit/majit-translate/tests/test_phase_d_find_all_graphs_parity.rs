@@ -44,6 +44,7 @@ fn build_caller_graph(name: &str, callee_path: &CallPath) -> FunctionGraph {
                 target: CallTarget::FunctionPath {
                     segments: callee_path.segments.clone(),
                     fun_decl_id: None,
+                    specialization: majit_translate::GraphSpecialization::Regular,
                 },
                 args: Vec::new(),
                 result_ty: ValueType::Int,

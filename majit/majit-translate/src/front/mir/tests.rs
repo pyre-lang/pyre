@@ -2074,6 +2074,7 @@ fn window_param_to_vec_is_charpsize2str() {
                         CallTarget::FunctionPath {
                             segments,
                             fun_decl_id,
+                            ..
                         },
                     args,
                     ..
@@ -6278,6 +6279,49 @@ fn std_trait_call_fixture(
 }
 
 #[test]
+fn trait_as_ref_str_of_string_is_identity() {
+    let string_adt = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let recv = serde_json::json!({"Ref": ["Erased", string_adt, "Shared"]});
+    let str_ty = serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]});
+    let string_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["alloc", "string", "String"], false),
+        "kind": {"Struct": [
+            {"name": "ptr", "ty": window_usize(), "attr_info": null},
+            {"name": "len", "ty": window_usize(), "attr_info": null},
+            {"name": "cap", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let llbc = std_trait_call_fixture(
+        "string_as_ref_str",
+        &["core", "convert", "AsRef"],
+        "as_ref",
+        &[recv],
+        str_ty,
+        vec![string_decl],
+    );
+    let graph = super::lower_function(&llbc, "string_as_ref_str")
+        .expect("lower <String as AsRef<str>>::as_ref");
+    let ops = graph_ops(&graph);
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "as_ref"),
+        "Trait AsRef::as_ref of a string-family receiver to &str is identity; ops={ops:?} graph={}",
+        graph.dump()
+    );
+}
+
+#[test]
 fn trait_default_of_i64_is_zero() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let llbc = std_trait_call_fixture(
@@ -7546,7 +7590,7 @@ fn wraptuple_len2_item_reads_are_getarrayitem() {
         .as_ref()
         .unwrap_or_else(|| panic!("tuple_items_base must define a result; ops={ops:?}"));
     let narrowed_to_object_list = ops.iter().any(|op| {
-        crate::model::cast_instance_root(&op.kind) == Some("[PyObject]")
+        crate::model::cast_instance_root(&op.kind) == Some("[pyobject::PyObject]")
             && matches!(
                 &op.kind,
                 OpKind::Call { args, .. }
@@ -7558,7 +7602,7 @@ fn wraptuple_len2_item_reads_are_getarrayitem() {
     });
     assert!(
         narrowed_to_object_list,
-        "tuple_items_base result must annotate as [PyObject] GcArray; ops={ops:?}"
+        "tuple_items_base result must annotate as [pyobject::PyObject] GcArray; ops={ops:?}"
     );
 }
 
@@ -10137,6 +10181,214 @@ fn header_as_u8_add_chars_offset_fun(header_path: &[&str]) -> Llbc {
         .expect("header-as-u8 chars-offset add fixture parses")
 }
 
+/// `fn f(s: *mut Utf8Str) -> usize { unsafe { (*s).length } }` —
+/// `ll_stringslice_startstop`'s `(*s1).length`. A `*mut Utf8Str` is
+/// rstr `Ptr(STR)` (`rpython/rtyper/lltypesystem/rstr.py` `STR`), so
+/// the read is `LLHelpers.ll_strlen` and must not recast the STR as a
+/// Utf8Str class instance.
+#[test]
+fn raw_utf8str_length_read_lowers_without_a_class_cast() {
+    use crate::model::OpKind;
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ptr = serde_json::json!({"RawPtr": [utf8_adt.clone(), "Mut"]});
+    let n = window_usize();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n.clone(), "attr_info": null}
+        ]}
+    });
+    let length_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(
+                serde_json::json!({"Projection": [
+                    window_place(serde_json::json!({"Local": 1}), &utf8_ptr),
+                    "Deref"
+                ]}),
+                &utf8_adt
+            ),
+            {"Field": [null, 1]}
+        ]}),
+        &n,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "raw_utf8str_length"], true),
+        "signature": {"is_unsafe": true, "inputs": [utf8_ptr], "output": n},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &n),
+                window_local(1, &utf8_ptr)
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": window_span(),
+                    "kind": {"Assign": [
+                        window_place(serde_json::json!({"Local": 0}), &n),
+                        {"Use": [{"Copy": length_place}, "No"]}
+                    ]}
+                }],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller]);
+    let graph =
+        super::lower_function(&llbc, "raw_utf8str_length").expect("lower (*mut Utf8Str).length");
+    let ops = window_graph_ops(&graph);
+    let utf8str_casts: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .filter(|root| majit_ir::descr::class_root_leaf(root) == "Utf8Str")
+        .collect();
+    assert!(
+        utf8str_casts.is_empty(),
+        "(*s).length of *mut Utf8Str must not recast STR as a class; casts={utf8str_casts:?} graph={}",
+        graph.dump()
+    );
+    let length_read = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldRead { field, .. }
+                if field.name == "length"
+                    && field.owner_root.as_deref().is_some_and(|root| {
+                        majit_ir::descr::class_root_leaf(root) == "Utf8Str"
+                    })
+        )
+    });
+    assert!(
+        length_read,
+        "STR length is FieldRead length (`LLHelpers.ll_strlen`); graph={}",
+        graph.dump()
+    );
+}
+
+/// `fn f(h: &mut Holder, p: *mut UnicodeValueStorage) { h.value = p; }`
+/// — the field-write dest overlay recasts the STR pointer onto the
+/// declared class so `setattr("value")` unions with FORCE String.
+#[test]
+fn raw_unicode_value_storage_field_write_emits_a_class_cast() {
+    use crate::model::OpKind;
+
+    let storage_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+    });
+    let storage_ptr = serde_json::json!({"RawPtr": [storage_adt.clone(), "Mut"]});
+    let holder_ref = serde_json::json!({"Ref": ["Erased", holder_adt.clone(), "Mut"]});
+    let n = window_usize();
+    let storage = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(
+            &["pyre_object", "unicodeobject", "UnicodeValueStorage"],
+            true
+        ),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": n.clone(), "attr_info": null}
+        ]}
+    });
+    let holder = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "Holder"], true),
+        "kind": {"Struct": [{
+            "name": "value",
+            "ty": storage_ptr.clone(),
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        }]}
+    });
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(
+                serde_json::json!({"Projection": [
+                    window_place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}),
+                &holder_adt
+            ),
+            {"Field": [null, 0]}
+        ]}),
+        &storage_ptr,
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "store_unicode_value"], true),
+        "signature": {
+            "is_unsafe": true,
+            "inputs": [holder_ref.clone(), storage_ptr.clone()],
+            "output": storage_ptr.clone()
+        },
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &storage_ptr),
+                window_local(1, &holder_ref),
+                window_local(2, &storage_ptr)
+            ]},
+            "body": [{
+                "statements": [
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            field_place,
+                            {"Use": [{"Copy": window_place(
+                                serde_json::json!({"Local": 2}),
+                                &storage_ptr
+                            )}, "No"]}
+                        ]}
+                    },
+                    {
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 0}), &storage_ptr),
+                            {"Use": [{"Copy": window_place(
+                                serde_json::json!({"Local": 2}),
+                                &storage_ptr
+                            )}, "No"]}
+                        ]}
+                    }
+                ],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": "Return"}
+            }]
+        }}
+    });
+    let llbc = window_llbc(vec![storage, holder], vec![caller]);
+    let graph = super::lower_function(&llbc, "store_unicode_value")
+        .expect("lower (*h).value = p for *mut UnicodeValueStorage");
+    let ops = window_graph_ops(&graph);
+    let storage_casts: Vec<&str> = ops
+        .iter()
+        .filter_map(|op| crate::model::cast_instance_root(&op.kind))
+        .filter(|root| majit_ir::descr::class_root_leaf(root) == "UnicodeValueStorage")
+        .collect();
+    assert!(
+        !storage_casts.is_empty(),
+        "field write of *mut UnicodeValueStorage must recast onto the class; graph={}",
+        graph.dump()
+    );
+    let value_write = ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { field, .. } if field.name == "value"
+        )
+    });
+    assert!(
+        value_write,
+        "the store is FieldWrite value; graph={}",
+        graph.dump()
+    );
+}
+
 #[test]
 fn utf8str_as_u8_add_of_chars_offset_aliases_the_header() {
     let llbc = header_as_u8_add_chars_offset_fun(&["pyre_object", "unicodeobject", "Utf8Str"]);
@@ -11743,7 +11995,7 @@ fn popvalue_py_null_narrows_to_nullable_instance() {
             matches!(
                 &ops[0].kind,
                 OpKind::Call { target, .. } if target.to_string() == "core::ptr::null_mut"
-            ) && crate::model::cast_instance_root(&ops[1].kind) == Some("PyObject")
+            ) && crate::model::cast_instance_root(&ops[1].kind) == Some(super::W_ROOT_CLASS_ROOT)
         })
     });
     assert!(
@@ -11776,7 +12028,7 @@ fn call_method_ok_payload_narrows_to_the_instance_class() {
                     .owner_root
                     .as_deref()
                     .is_some_and(|owner| owner.contains("Result") && owner.contains("PyObject"))
-                && crate::model::cast_instance_root(&ops[1].kind) == Some("PyObject")
+                && crate::model::cast_instance_root(&ops[1].kind) == Some(super::W_ROOT_CLASS_ROOT)
         })
     });
     assert!(
@@ -19343,6 +19595,7 @@ fn decompose_valuefmt_lowers_string_accumulator_push_and_take() {
             crate::front::iter_next::is_iterator_next_target(&CallTarget::FunctionPath {
                 segments: (*segments).clone(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             })
         })
         .cloned()
@@ -20996,6 +21249,7 @@ pub(in crate::front::mir) fn push_fn_const(
                 target: CallTarget::FunctionPath {
                     segments,
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,

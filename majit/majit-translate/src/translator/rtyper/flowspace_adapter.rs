@@ -2269,9 +2269,7 @@ fn declared_llop(
     use crate::model::CallTarget;
     use crate::translator::rtyper::call_registry::FunctionPathKey;
     let key = match target {
-        CallTarget::FunctionPath { segments, .. } => {
-            FunctionPathKey::from_segments(segments.iter().cloned())
-        }
+        CallTarget::FunctionPath { .. } => FunctionPathKey::from(target.function_call_path()?),
         CallTarget::Method {
             name,
             receiver_root,
@@ -2279,10 +2277,10 @@ fn declared_llop(
             ..
         } => {
             if let Some(path) = resolved_path {
-                FunctionPathKey::from_segments(path.segments.iter().cloned())
+                FunctionPathKey::from(path)
             } else if let Some(receiver) = receiver_root.as_deref() {
                 let path = crate::parse::CallPath::for_impl_method(receiver, name);
-                FunctionPathKey::from_segments(path.segments)
+                FunctionPathKey::from(&path)
             } else {
                 return None;
             }
@@ -2298,6 +2296,696 @@ fn declared_llop(
         .as_ref()
         .and_then(HostObject::user_function)
         .and_then(|func| func._jit_llop_.clone())
+}
+
+/// A `CallTarget::FunctionPath` [`translate_op`] rewrites to a high-level
+/// op instead of `simple_call` of the path's graph.
+///
+/// `annrpython.py consider_op` never `recursivecall`s into that graph:
+/// the flow graph holds `newlist` / `getitem` / `next` / …, and
+/// `rlist.py rtype_newlist` `gendirectcall`s the helper at rtyping.
+enum FunctionPathHighLevel<'a> {
+    VecHelper(majit_ir::rvec::VecOp, majit_ir::rvec::VecItemKind),
+    VirtualizableHint(crate::hints::HintKind),
+    GcRootReload(&'static str),
+    Type,
+    DynCall,
+    JitForceVirtualizable,
+    CoreBridge(&'a str),
+    GetsliceMinusOne,
+    GetsliceRangeTo,
+    GetsliceRangeFrom,
+    GetsliceRange,
+    StringByteGetitem,
+    ArrayRepeat,
+    IterNext,
+    CoreMinMax(&'static str),
+    CastPointer,
+    CastInstance,
+    CastAddress,
+    LlArraymove,
+    BuiltinShim(&'static str),
+    StringBuilderNew,
+    StringBuilderAppend,
+    StringBuilderBuild,
+    Len,
+    SliceReverse,
+    VecCtor,
+    NewlistHint,
+    VecFromElem,
+    VecPush,
+    VecSetLen,
+    VecIndex,
+    VecExtendFromSlice,
+    RdictInsertOrGet(&'static str),
+}
+
+/// True when this `CallTarget::FunctionPath` is rewritten by [`translate_op`]
+/// to a high-level op (`newrustvec`, `getitem`, `next`, `len`, …) rather
+/// than a call of the path's graph. `annrpython.py consider_op` never
+/// `recursivecall`s into that graph.
+pub(crate) fn function_path_is_high_level_op(
+    target: &crate::model::CallTarget,
+    nargs: usize,
+) -> bool {
+    match target {
+        crate::model::CallTarget::FunctionPath { segments, .. } => {
+            function_path_high_level_kind(segments, nargs).is_some()
+        }
+        _ => false,
+    }
+}
+
+fn gc_root_reload_analyser(segments: &[String]) -> Option<&'static str> {
+    if crate::front::result_exc::is_try_gc_current_object_address_path(segments) {
+        return Some("pyre_object.gc_hook.try_gc_current_object_address");
+    }
+    if !segments.iter().any(|segment| segment == "gc_roots") {
+        return None;
+    }
+    match segments.last().map(String::as_str) {
+        Some("reload_top_root_at") => Some("pyre_object.gc_roots.reload_top_root_at"),
+        Some("reload_top_root") => Some("pyre_object.gc_roots.reload_top_root"),
+        _ => None,
+    }
+}
+
+fn is_single_segment(segments: &[String], name: &str) -> bool {
+    segments.len() == 1 && segments[0] == name
+}
+
+fn is_jit_force_virtualizable_segments(segments: &[String]) -> bool {
+    segments.len() == 3
+        && segments[0] == "pyre_interpreter"
+        && segments[1] == "executioncontext"
+        && segments[2] == "jit_force_virtualizable"
+}
+
+fn is_len_op_segments(segments: &[String]) -> bool {
+    (segments.len() == 1 && (segments[0] == "__len" || segments[0] == "__strlen"))
+        || (segments.len() == 4
+            && segments[0] == "core"
+            && segments[1] == "slice"
+            && segments[2] == "<Impl>"
+            && segments[3] == "len")
+        || (segments.len() >= 3
+            && segments[segments.len() - 3] == "str"
+            && segments[segments.len() - 2] == "<Impl>"
+            && segments[segments.len() - 1] == "len")
+}
+
+fn function_path_builtin_shim(segments: &[String]) -> Option<&'static str> {
+    use crate::runtime_names::shims;
+    if segments.len() != 1 {
+        return None;
+    }
+    let leaf = segments[0].as_str();
+    if leaf == shims::RANGE {
+        Some("range")
+    } else if leaf == shims::UNICHR {
+        Some("unichr")
+    } else if leaf == shims::ENUMERATE {
+        Some("enumerate")
+    } else if leaf == shims::CHR {
+        Some("chr")
+    } else if leaf == shims::UTF8_ITER {
+        Some("utf8iter")
+    } else if leaf == shims::UNICHAR_AS_UTF8 {
+        Some("unichr_as_utf8")
+    } else if leaf == shims::GET_RAW_ADDRESS_OF_STRING {
+        Some("get_raw_address_of_string")
+    } else if leaf == shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST {
+        Some("nonmoving_raw_ptr_for_resizable_list")
+    } else {
+        None
+    }
+}
+
+fn core_minmax_leaf(segments: &[String], nargs: usize) -> Option<&'static str> {
+    if segments.len() >= 3 && segments[0] == "core" && segments[1] == "cmp" && nargs == 2 {
+        match segments[segments.len() - 1].as_str() {
+            "min" => Some("min"),
+            "max" => Some("max"),
+            _ => None,
+        }
+    } else {
+        None
+    }
+}
+
+/// The high-level op [`translate_op`] emits for this FunctionPath, if any.
+/// Arms match [`translate_op`]'s FunctionPath early returns in order, so
+/// the predicate and the emitter cannot drift.
+fn function_path_high_level_kind<'a>(
+    segments: &'a [String],
+    nargs: usize,
+) -> Option<FunctionPathHighLevel<'a>> {
+    use crate::runtime_names::shims;
+    if let Some((vec_op, kind)) = majit_ir::rvec::vec_helper_for_path(&segments.join("::")) {
+        return Some(FunctionPathHighLevel::VecHelper(vec_op, kind));
+    }
+    if let Some(kind) = crate::hints::classify_hint_segments(segments.iter().map(String::as_str))
+        && virtualizable_hint_analyser_name(kind).is_some()
+    {
+        return Some(FunctionPathHighLevel::VirtualizableHint(kind));
+    }
+    if let Some(analyser) = gc_root_reload_analyser(segments) {
+        return Some(FunctionPathHighLevel::GcRootReload(analyser));
+    }
+    if is_single_segment(segments, "type") {
+        return Some(FunctionPathHighLevel::Type);
+    }
+    if is_single_segment(segments, "simple_call") || is_single_segment(segments, "__dyn_call") {
+        return Some(FunctionPathHighLevel::DynCall);
+    }
+    if is_jit_force_virtualizable_segments(segments) {
+        return Some(FunctionPathHighLevel::JitForceVirtualizable);
+    }
+    if let Some(opname) = nonraising_core_bridge_opname(segments, nargs) {
+        return Some(FunctionPathHighLevel::CoreBridge(opname));
+    }
+    if is_getslice_marker(segments, "__getslice_minusone") && nargs == 1 {
+        return Some(FunctionPathHighLevel::GetsliceMinusOne);
+    }
+    if is_getslice_marker(segments, "__getslice_rangeto") && nargs == 2 {
+        return Some(FunctionPathHighLevel::GetsliceRangeTo);
+    }
+    if is_getslice_marker(segments, "__getslice_rangefrom") && nargs == 2 {
+        return Some(FunctionPathHighLevel::GetsliceRangeFrom);
+    }
+    if is_getslice_marker(segments, "__getslice_range") && nargs == 3 {
+        return Some(FunctionPathHighLevel::GetsliceRange);
+    }
+    if is_single_segment(segments, "__string_byte_getitem") && nargs == 2 {
+        return Some(FunctionPathHighLevel::StringByteGetitem);
+    }
+    if is_single_segment(segments, "__array_repeat") && nargs == 2 {
+        return Some(FunctionPathHighLevel::ArrayRepeat);
+    }
+    if crate::front::iter_next::is_iter_next_segments(segments) && nargs == 1 {
+        return Some(FunctionPathHighLevel::IterNext);
+    }
+    if let Some(leaf) = core_minmax_leaf(segments, nargs) {
+        return Some(FunctionPathHighLevel::CoreMinMax(leaf));
+    }
+    if is_single_segment(segments, "__cast_pointer") {
+        return Some(FunctionPathHighLevel::CastPointer);
+    }
+    if is_single_segment(segments, shims::CAST_INSTANCE) {
+        return Some(FunctionPathHighLevel::CastInstance);
+    }
+    if is_single_segment(segments, shims::CAST_ADDRESS) {
+        return Some(FunctionPathHighLevel::CastAddress);
+    }
+    if is_single_segment(segments, shims::LL_ARRAYMOVE) {
+        return Some(FunctionPathHighLevel::LlArraymove);
+    }
+    if let Some(builtin) = function_path_builtin_shim(segments) {
+        return Some(FunctionPathHighLevel::BuiltinShim(builtin));
+    }
+    if segments.len() == 1 && segments[0] == shims::STRINGBUILDER_NEW {
+        return Some(FunctionPathHighLevel::StringBuilderNew);
+    }
+    if segments.len() == 1 && segments[0] == shims::STRINGBUILDER_APPEND {
+        return Some(FunctionPathHighLevel::StringBuilderAppend);
+    }
+    if segments.len() == 1 && segments[0] == shims::STRINGBUILDER_BUILD {
+        return Some(FunctionPathHighLevel::StringBuilderBuild);
+    }
+    if is_len_op_segments(segments) {
+        return Some(FunctionPathHighLevel::Len);
+    }
+    if is_slice_reverse_segments(segments) {
+        return Some(FunctionPathHighLevel::SliceReverse);
+    }
+    if is_vec_ctor_segments(segments) {
+        return Some(FunctionPathHighLevel::VecCtor);
+    }
+    if is_runtime_newlist_hint_segments(segments) {
+        return Some(FunctionPathHighLevel::NewlistHint);
+    }
+    if is_vec_from_elem_segments(segments, nargs) {
+        return Some(FunctionPathHighLevel::VecFromElem);
+    }
+    if is_vec_push_segments(segments) {
+        return Some(FunctionPathHighLevel::VecPush);
+    }
+    if is_vec_set_len_segments(segments) {
+        return Some(FunctionPathHighLevel::VecSetLen);
+    }
+    if vec_inherent_index_segments(segments) {
+        return Some(FunctionPathHighLevel::VecIndex);
+    }
+    if is_vec_extend_from_slice_segments(segments) {
+        return Some(FunctionPathHighLevel::VecExtendFromSlice);
+    }
+    if let Some(leaf) = rdict_insert_or_get_leaf(segments) {
+        return Some(FunctionPathHighLevel::RdictInsertOrGet(
+            if leaf == "insert" { "insert" } else { "get" },
+        ));
+    }
+    None
+}
+
+fn emit_function_path_high_level_op(
+    kind: FunctionPathHighLevel<'_>,
+    arg_hls: Vec<Hlvalue>,
+    result: Hlvalue,
+    op: &SpaceOperation,
+    call_registry: &crate::translator::rtyper::call_registry::CallRegistry,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    use crate::runtime_names::shims;
+    match kind {
+        FunctionPathHighLevel::VecHelper(vec_op, kind) => {
+            rust_vec_helper_ops(vec_op, kind, arg_hls, result, op.result.as_ref())
+        }
+        FunctionPathHighLevel::VirtualizableHint(kind) => {
+            let source = arg_hls.first().cloned().ok_or_else(|| {
+                TyperError::message("virtualizable hint call requires a value argument".to_string())
+            })?;
+            Ok(virtualizable_hint_ops(kind, source, result))
+        }
+        FunctionPathHighLevel::GcRootReload(analyser) => {
+            Ok(builtin_simple_call(analyser, arg_hls, result))
+        }
+        FunctionPathHighLevel::Type => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(
+                    "translate_op: FunctionPath [\"type\"] requires \
+                     one operand (flowspace/operation.py Type)"
+                        .to_string(),
+                ));
+            }
+            Ok(vec![FlowspaceOp::new("type", arg_hls, result)])
+        }
+        FunctionPathHighLevel::DynCall => {
+            if arg_hls.is_empty() {
+                return Err(TyperError::message(
+                    "translate_op: FunctionPath [\"simple_call\"] / \
+                     [\"__dyn_call\"] requires args[0] as the callable \
+                     (flowspace/operation.py SimpleCall.eval)"
+                        .to_string(),
+                ));
+            }
+            Ok(vec![FlowspaceOp::new("simple_call", arg_hls, result)])
+        }
+        FunctionPathHighLevel::JitForceVirtualizable => {
+            let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                HostObject::new_builtin_callable(
+                    "pyre_interpreter.executioncontext.jit_force_virtualizable",
+                ),
+            )));
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+            call_args.push(callable);
+            call_args.extend(arg_hls);
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::CoreBridge(opname) => {
+            Ok(vec![FlowspaceOp::new(opname, arg_hls, result)])
+        }
+        FunctionPathHighLevel::GetsliceMinusOne => {
+            let slice = arg_hls.into_iter().next().expect("slice arg");
+            Ok(vec![FlowspaceOp::new(
+                "getslice",
+                vec![
+                    slice,
+                    Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                    Hlvalue::Constant(Constant::new(ConstValue::Int(-1))),
+                ],
+                result,
+            )])
+        }
+        FunctionPathHighLevel::GetsliceRangeTo => {
+            let mut args = arg_hls.into_iter();
+            let slice = args.next().expect("slice arg");
+            let end = args.next().expect("RangeTo end arg");
+            Ok(vec![FlowspaceOp::new(
+                "getslice",
+                vec![
+                    slice,
+                    Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
+                    end,
+                ],
+                result,
+            )])
+        }
+        FunctionPathHighLevel::GetsliceRangeFrom => {
+            let mut args = arg_hls.into_iter();
+            let slice = args.next().expect("slice arg");
+            let start = args.next().expect("RangeFrom start arg");
+            Ok(vec![FlowspaceOp::new(
+                "getslice",
+                vec![
+                    slice,
+                    start,
+                    Hlvalue::Constant(Constant::new(ConstValue::None)),
+                ],
+                result,
+            )])
+        }
+        FunctionPathHighLevel::GetsliceRange => {
+            Ok(vec![FlowspaceOp::new("getslice", arg_hls, result)])
+        }
+        FunctionPathHighLevel::StringByteGetitem => {
+            let mut args = arg_hls.into_iter();
+            let string = args.next().expect("string byte-view arg");
+            let index = args.next().expect("string byte index arg");
+            let byte = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new("getitem", vec![string, index], byte.clone()),
+                FlowspaceOp::new("ord", vec![byte], result),
+            ])
+        }
+        FunctionPathHighLevel::ArrayRepeat | FunctionPathHighLevel::VecFromElem => {
+            let mut iter = arg_hls.into_iter();
+            let fill = iter.next().expect("repeat fill arg");
+            let count = iter.next().expect("repeat count arg");
+            let list = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new("newlist", vec![fill], list.clone()),
+                FlowspaceOp::new("mul", vec![list, count], result),
+            ])
+        }
+        FunctionPathHighLevel::IterNext => Ok(vec![FlowspaceOp::new("next", arg_hls, result)]),
+        FunctionPathHighLevel::CoreMinMax(leaf) => {
+            let builtin = HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
+                TyperError::message(format!("builtin `{leaf}` missing from HOST_ENV"))
+            })?;
+            let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(builtin)));
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+            call_args.push(callable);
+            call_args.extend(arg_hls);
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::CastPointer => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "__cast_pointer requires (operand, constant_root), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let callable_host = HOST_ENV
+                .import_module("rpython.rtyper.lltypesystem.lltype")
+                .and_then(|m| m.module_get("cast_pointer"))
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "HOST_ENV lltype module must expose cast_pointer".to_string(),
+                    )
+                })?;
+            let root = match &arg_hls[1] {
+                Hlvalue::Constant(c) => c.value.as_pystr().ok_or_else(|| {
+                    TyperError::message("__cast_pointer root must be a constant string".to_string())
+                })?,
+                _ => {
+                    return Err(TyperError::message(
+                        "__cast_pointer root must be a Constant".to_string(),
+                    ));
+                }
+            };
+            let class_host = call_registry.bookkeeper().intern_class_by_qualname(root);
+            let mut call_args = Vec::with_capacity(3);
+            call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                callable_host,
+            ))));
+            call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                class_host,
+            ))));
+            call_args.push(arg_hls[0].clone());
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::CastInstance => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "__cast_instance_intrinsic requires (operand, constant_root), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let callable_host = HOST_ENV
+                .lookup_builtin(shims::CAST_INSTANCE)
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                    )
+                })?;
+            let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+            call_args.push(callable);
+            call_args.extend(arg_hls);
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::CastAddress => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(format!(
+                    "__cast_address_intrinsic requires exactly one operand, got {}",
+                    arg_hls.len()
+                )));
+            }
+            let callable_host = HOST_ENV
+                .lookup_builtin(shims::CAST_ADDRESS)
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "__cast_address_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                    )
+                })?;
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+            call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                callable_host,
+            ))));
+            call_args.extend(arg_hls);
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::LlArraymove => {
+            if arg_hls.len() != 4 {
+                return Err(TyperError::message(format!(
+                    "__majit_ll_arraymove requires exactly four args, got {}",
+                    arg_hls.len()
+                )));
+            }
+            let callable_host = HOST_ENV
+                .lookup_builtin(shims::LL_ARRAYMOVE)
+                .ok_or_else(|| {
+                    TyperError::message(
+                        "__majit_ll_arraymove missing from HOST_ENV bootstrap".to_string(),
+                    )
+                })?;
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+            call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                callable_host,
+            ))));
+            call_args.extend(arg_hls);
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::BuiltinShim(builtin) => {
+            let callable_host = HOST_ENV.lookup_builtin(builtin).ok_or_else(|| {
+                TyperError::message(format!("{builtin} missing from HOST_ENV bootstrap"))
+            })?;
+            let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
+            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
+            call_args.push(callable);
+            call_args.extend(arg_hls);
+            Ok(vec![FlowspaceOp::new("simple_call", call_args, result)])
+        }
+        FunctionPathHighLevel::StringBuilderNew => {
+            Ok(vec![FlowspaceOp::new("newstringbuilder", arg_hls, result)])
+        }
+        FunctionPathHighLevel::StringBuilderAppend => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "__majit_stringbuilder_append requires exactly two args \
+                     (receiver, piece), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message(
+                    "__majit_stringbuilder_append requires a receiver arg".to_string(),
+                )
+            })?;
+            let piece = iter.next().ok_or_else(|| {
+                TyperError::message("__majit_stringbuilder_append requires a piece arg".to_string())
+            })?;
+            let bound_method = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new(
+                    "getattr",
+                    vec![
+                        receiver,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str("append"))),
+                    ],
+                    bound_method.clone(),
+                ),
+                FlowspaceOp::new("simple_call", vec![bound_method, piece], result),
+            ])
+        }
+        FunctionPathHighLevel::StringBuilderBuild => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(format!(
+                    "__majit_stringbuilder_build requires exactly one receiver arg, \
+                     got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message(
+                    "__majit_stringbuilder_build requires a receiver arg".to_string(),
+                )
+            })?;
+            let bound_method = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new(
+                    "getattr",
+                    vec![
+                        receiver,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str("build"))),
+                    ],
+                    bound_method.clone(),
+                ),
+                FlowspaceOp::new("simple_call", vec![bound_method], result),
+            ])
+        }
+        FunctionPathHighLevel::Len => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(format!(
+                    "len operation requires exactly one receiver arg, got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let arg = iter.next().ok_or_else(|| {
+                TyperError::message("len operation requires a receiver arg".to_string())
+            })?;
+            Ok(vec![FlowspaceOp::new("len", vec![arg], result)])
+        }
+        FunctionPathHighLevel::SliceReverse => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(format!(
+                    "slice.reverse requires exactly one receiver arg, got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message("slice.reverse requires a receiver arg".to_string())
+            })?;
+            let bound_method = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new(
+                    "getattr",
+                    vec![
+                        receiver,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str("reverse"))),
+                    ],
+                    bound_method.clone(),
+                ),
+                FlowspaceOp::new("simple_call", vec![bound_method], result),
+            ])
+        }
+        FunctionPathHighLevel::VecCtor => Ok(vec![FlowspaceOp::new("newlist", vec![], result)]),
+        FunctionPathHighLevel::NewlistHint => {
+            if arg_hls.len() != 1 {
+                return Err(TyperError::message(format!(
+                    "try_pyobject_vec_with_capacity requires exactly one size hint, got {}",
+                    arg_hls.len()
+                )));
+            }
+            Ok(vec![FlowspaceOp::new("newlist_hint", arg_hls, result)])
+        }
+        FunctionPathHighLevel::VecPush => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "Vec::push requires exactly two args (receiver, item), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message("Vec::push requires a receiver arg".to_string())
+            })?;
+            let item = iter
+                .next()
+                .ok_or_else(|| TyperError::message("Vec::push requires an item arg".to_string()))?;
+            let bound_method = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new(
+                    "getattr",
+                    vec![
+                        receiver,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str("append"))),
+                    ],
+                    bound_method.clone(),
+                ),
+                FlowspaceOp::new("simple_call", vec![bound_method, item], result),
+            ])
+        }
+        FunctionPathHighLevel::VecSetLen => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "Vec::set_len requires exactly two args (receiver, new_len), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message("Vec::set_len requires a receiver arg".to_string())
+            })?;
+            let new_len = iter.next().ok_or_else(|| {
+                TyperError::message("Vec::set_len requires a new_len arg".to_string())
+            })?;
+            Ok(vec![FlowspaceOp::new(
+                "setattr",
+                vec![
+                    receiver,
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
+                    new_len,
+                ],
+                result,
+            )])
+        }
+        FunctionPathHighLevel::VecIndex => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "Vec::index requires exactly two args (receiver, index), got {}",
+                    arg_hls.len()
+                )));
+            }
+            Ok(vec![FlowspaceOp::new("getitem", arg_hls, result)])
+        }
+        FunctionPathHighLevel::VecExtendFromSlice => {
+            if arg_hls.len() != 2 {
+                return Err(TyperError::message(format!(
+                    "Vec::extend_from_slice requires exactly two args \
+                     (receiver, slice), got {}",
+                    arg_hls.len()
+                )));
+            }
+            let mut iter = arg_hls.into_iter();
+            let receiver = iter.next().ok_or_else(|| {
+                TyperError::message("Vec::extend_from_slice requires a receiver arg".to_string())
+            })?;
+            let source = iter.next().ok_or_else(|| {
+                TyperError::message(
+                    "Vec::extend_from_slice requires a source-slice arg".to_string(),
+                )
+            })?;
+            let bound_method = Hlvalue::Variable(Variable::new());
+            Ok(vec![
+                FlowspaceOp::new(
+                    "getattr",
+                    vec![
+                        receiver,
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str("extend"))),
+                    ],
+                    bound_method.clone(),
+                ),
+                FlowspaceOp::new("simple_call", vec![bound_method, source], result),
+            ])
+        }
+        FunctionPathHighLevel::RdictInsertOrGet(leaf) => {
+            emit_rdict_insert_or_get(leaf, arg_hls, result)
+        }
+    }
 }
 
 pub fn translate_op(
@@ -2659,10 +3347,10 @@ pub fn translate_op(
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. }
             if field.name == "length"
-                && matches!(
-                    field.owner_root.as_deref(),
-                    Some("Utf8Str" | "LowlevelStringHeader" | "UnicodeValueStorage" | "BytesBlock")
-                ) =>
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(crate::front::mir::is_str_length_field_class_root) =>
         {
             // `Utf8Str` / `LowlevelStringHeader` carry the `rstr.py STR`
             // layout, which the bookkeeper annotates as `SomeString`: the
@@ -3121,118 +3809,18 @@ pub fn translate_op(
                     // args[0]).  The path names the op, not a second
                     // callable — do not wrap it again.
                     //
-                    // A call of an `ll_vec_*` helper is the `Vec` operation
-                    // it lowers, seen at the high level so `RustVecRepr`
-                    // chooses the helper again from the one table.
-                    if let Some((vec_op, kind)) =
-                        majit_ir::rvec::vec_helper_for_path(&segments.join("::"))
-                    {
-                        // The item lltype is an argument constant, read here
-                        // from the legacy result `stamp_rust_vec_header`
-                        // wrote. The annotator does not read concretetype.
-                        return rust_vec_helper_ops(
-                            vec_op,
+                    // A FunctionPath rewritten to a high-level op is not
+                    // `simple_call` of that path's graph
+                    // (`annrpython.py consider_op`; `rlist.py rtype_newlist`
+                    // `gendirectcall`s the helper at rtyping).
+                    if let Some(kind) = function_path_high_level_kind(segments, arg_hls.len()) {
+                        return emit_function_path_high_level_op(
                             kind,
                             arg_hls,
                             result,
-                            op.result.as_ref(),
+                            op,
+                            call_registry,
                         );
-                    }
-                    // Front may leave a hint-marker as a Call (unit tests;
-                    // `jtransform` classifies the same way). Virtualizable
-                    // kwargs go through the `hint` Entry, not `same_as`.
-                    if let Some(kind) =
-                        crate::hints::classify_hint_segments(segments.iter().map(String::as_str))
-                        && virtualizable_hint_analyser_name(kind).is_some()
-                    {
-                        let source = arg_hls.first().cloned().ok_or_else(|| {
-                            TyperError::message(
-                                "virtualizable hint call requires a value argument".to_string(),
-                            )
-                        })?;
-                        return Ok(virtualizable_hint_ops(kind, source, result));
-                    }
-                    // `gctransform` inserts `reload_top_root` after annotate.
-                    // Pyre spells them in source; the annotator must see the
-                    // identity (`rlib/jit.py` flag on the original value).
-                    // `try_gc_current_object_address` is the same identity
-                    // (`PyFrame::live_mut` forwarding lookup).
-                    if crate::front::result_exc::is_gc_root_reload(&op.kind) {
-                        let analyser =
-                            if crate::front::result_exc::is_try_gc_current_object_address_path(
-                                segments,
-                            ) {
-                                Some("pyre_object.gc_hook.try_gc_current_object_address")
-                            } else {
-                                match segments.last().map(String::as_str) {
-                                    Some("reload_top_root_at") => {
-                                        Some("pyre_object.gc_roots.reload_top_root_at")
-                                    }
-                                    Some("reload_top_root") => {
-                                        Some("pyre_object.gc_roots.reload_top_root")
-                                    }
-                                    _ => None,
-                                }
-                            };
-                        if let Some(analyser) = analyser {
-                            return Ok(builtin_simple_call(analyser, arg_hls, result));
-                        }
-                    }
-                    if segments.as_slice() == ["type"] {
-                        if arg_hls.len() != 1 {
-                            return Err(TyperError::message(
-                                "translate_op: FunctionPath [\"type\"] requires \
-                                 one operand (flowspace/operation.py Type)"
-                                    .to_string(),
-                            ));
-                        }
-                        return Ok(vec![FlowspaceOp::new("type", arg_hls, result)]);
-                    }
-                    if segments.as_slice() == ["simple_call"]
-                        || segments.as_slice() == ["__dyn_call"]
-                    {
-                        // `__dyn_call` is the front's spelling of a call
-                        // through a function pointer (`CallClass::Dynamic`
-                        // whose operand is not a recovered vtable slot).
-                        // The annotator sees a `simple_call` whose args[0]
-                        // is that pointer; `PtrRepr.rtype_simple_call`
-                        // then emits `indirect_call`.
-                        if arg_hls.is_empty() {
-                            return Err(TyperError::message(
-                                "translate_op: FunctionPath [\"simple_call\"] / \
-                                 [\"__dyn_call\"] requires args[0] as the callable \
-                                 (flowspace/operation.py SimpleCall.eval)"
-                                    .to_string(),
-                            ));
-                        }
-                        return Ok(vec![FlowspaceOp::new("simple_call", arg_hls, result)]);
-                    }
-                    // RPython `VirtualizableInstanceRepr.hook_access_field`
-                    // inserts the `jit_force_virtualizable` LLOp during
-                    // rtyping; it never asks the annotator to traverse a
-                    // runtime force-helper body.  Rust cannot attach the
-                    // hook to a field repr, so pyre-interpreter spells the
-                    // marker as an ordinary source call.  Reify that call as
-                    // an ExtRegistry builtin before CallRegistry lookup: its
-                    // `specialize_call` emits the identical LLOp and prevents
-                    // a failed lift of the runtime `FORCE_FRAME_HOOK` chain
-                    // from poisoning every descriptor gateway caller.
-                    if segments.as_slice()
-                        == [
-                            "pyre_interpreter",
-                            "executioncontext",
-                            "jit_force_virtualizable",
-                        ]
-                    {
-                        let callable = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                            HostObject::new_builtin_callable(
-                                "pyre_interpreter.executioncontext.jit_force_virtualizable",
-                            ),
-                        )));
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                        call_args.push(callable);
-                        call_args.extend(arg_hls);
-                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
                     }
                     // The interpreter's source spelling of the llop
                     // `rclass.py InstanceRepr.hook_setfield` genops during
@@ -3254,736 +3842,6 @@ pub fn translate_op(
                         call_args.push(callable);
                         call_args.extend(arg_hls);
                         return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                    }
-                    // `core` method spellings of upstream operations:
-                    // pyre source writes `a.min(b)` /
-                    // `a != b`-via-`PartialEq::ne` / `v.len()` /
-                    // `x.wrapping_mul(y)` where upstream Python
-                    // writes `min(a, b)` / the flowspace ops `ne` /
-                    // `len` / `mul` (flowspace/operation.py tables;
-                    // lltype `int_mul` wraps, so `wrapping_mul` is
-                    // the Rust spelling of upstream's plain `*` —
-                    // e.g. the `x * 1000003` green-key hash).
-                    // front::mir records the monomorphized core path
-                    // when the call survives as a trait/inherent
-                    // method call (primitive BinOps lower to
-                    // `OpKind::BinOp` and never reach here); map the
-                    // path back to the upstream spelling so the
-                    // chain reaches unaryop.py / binaryop.py /
-                    // rbuiltin.py instead of failing FunctionPath
-                    // resolution.
-                    // Pure bridges (cmp comparisons / slice len|iter /
-                    // num wrapping_mul) → a like-named non-raising
-                    // flowspace op.  `nonraising_core_bridge_opname` is
-                    // the shared table `op_canraise` mirrors.
-                    if let Some(opname) = nonraising_core_bridge_opname(segments, arg_hls.len()) {
-                        return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
-                    }
-                    // `slice[..slice.len() - 1]` is emitted by
-                    // `front::slice_index` as an unregistered marker rather
-                    // than frontend `getslice`/`ConstInt` ops.  The marker is
-                    // expanded here, after annotation, to the upstream
-                    // `getslice(slice, 0, -1)` contract.  This mirrors the
-                    // frontend/adapter split used by `__array_repeat`: an
-                    // untyped graph falling to the legacy walker retains an
-                    // ordinary residual call and cannot carry an unwired
-                    // `getslice` op to the assembler.
-                    //
-                    // Upstream: `decompose_slice_args` (`rtyper.rs`)
-                    // selects `SliceKind::MinusOne` for annotated constants
-                    // `0` and `-1`, then `rlist.py:906-911` calls
-                    // `ll_listslice_minusone` (asserting, not clamping).
-                    if is_getslice_marker(segments, "__getslice_minusone") && arg_hls.len() == 1 {
-                        let slice = arg_hls.into_iter().next().expect("slice arg");
-                        return Ok(vec![FlowspaceOp::new(
-                            "getslice",
-                            vec![
-                                slice,
-                                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
-                                Hlvalue::Constant(Constant::new(ConstValue::Int(-1))),
-                            ],
-                            result,
-                        )]);
-                    }
-                    if is_getslice_marker(segments, "__getslice_rangeto") && arg_hls.len() == 2 {
-                        // slice, end -> getslice(slice, 0, end)
-                        let mut args = arg_hls.into_iter();
-                        let slice = args.next().expect("slice arg");
-                        let end = args.next().expect("RangeTo end arg");
-                        return Ok(vec![FlowspaceOp::new(
-                            "getslice",
-                            vec![
-                                slice,
-                                Hlvalue::Constant(Constant::new(ConstValue::Int(0))),
-                                end,
-                            ],
-                            result,
-                        )]);
-                    }
-                    if is_getslice_marker(segments, "__getslice_rangefrom") && arg_hls.len() == 2 {
-                        // slice, start -> getslice(slice, start, None).
-                        // RPython `decompose_slice_args` selects StartOnly;
-                        // the frontend records only SliceIndex<usize>
-                        // consumers, which prove the runtime start nonnegative.
-                        let mut args = arg_hls.into_iter();
-                        let slice = args.next().expect("slice arg");
-                        let start = args.next().expect("RangeFrom start arg");
-                        return Ok(vec![FlowspaceOp::new(
-                            "getslice",
-                            vec![
-                                slice,
-                                start,
-                                Hlvalue::Constant(Constant::new(ConstValue::None)),
-                            ],
-                            result,
-                        )]);
-                    }
-                    if is_getslice_marker(segments, "__getslice_range") && arg_hls.len() == 3 {
-                        // slice, start, end -> getslice(slice, start, end)
-                        // This is the direct RPython flow-space shape for the
-                        // interpreter sites ported from `buffer[start:end]`.
-                        return Ok(vec![FlowspaceOp::new("getslice", arg_hls, result)]);
-                    }
-                    // Rust `Wtf8::as_bytes()[i]` is the byte-string operation
-                    // PyPy writes as `ord(utf8[i])` throughout rutf8.py. The
-                    // string repr's `getitem` yields SomeChar; preserve that
-                    // intermediate and let the ordinary `ord` rtyper turn it
-                    // into Signed.
-                    if segments.as_slice() == ["__string_byte_getitem"] && arg_hls.len() == 2 {
-                        let mut args = arg_hls.into_iter();
-                        let string = args.next().expect("string byte-view arg");
-                        let index = args.next().expect("string byte index arg");
-                        let byte = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new("getitem", vec![string, index], byte.clone()),
-                            FlowspaceOp::new("ord", vec![byte], result),
-                        ]);
-                    }
-                    // `[v; N]` array literal.  `front::mir` lowers
-                    // `Rvalue::Repeat` to the `__array_repeat` synthetic
-                    // carrying `(fill, count)` whenever the count decodes.
-                    // Expand it into the `[a] * b` shape upstream builds —
-                    // `newlist(a)` then `mul(list, b)` — which
-                    // `transform_allocate` (transform.py) collapses
-                    // into `alloc_and_set(b, a)`, the operation
-                    // `rtype_alloc_and_set` (rlist.py) lowers
-                    // through `ll_alloc_and_set` (rlist.py) to
-                    // `_ll_alloc_and_clear` / `_ll_alloc_and_set_nonnull`.
-                    //
-                    // The list must be `mul`'s arg 0: `transform_allocate`
-                    // matches on `op.args[0] in length1_lists` and reads the
-                    // count back out of `op.args[1]`, which is the order
-                    // `rtype_alloc_and_set` then consumes as
-                    // `hop.inputargs(Signed, r_list.item_repr)`.  Upstream's
-                    // `pairtype(SomeInteger, SomeList).mul` (binaryop.py)
-                    // exists but `transform_allocate` does not match it.
-                    // Both ops go out together so they share a block, which
-                    // is the scope `transform_allocate` scans.
-                    //
-                    // Emitting here rather than in `front::mir` is
-                    // deliberate: this adapter is only reached on the way to
-                    // the rtyper, so neither op can survive on a graph that
-                    // fell back to the legacy walker.
-                    if segments.len() == 1 && segments[0] == "__array_repeat" && arg_hls.len() == 2
-                    {
-                        let mut iter = arg_hls.into_iter();
-                        let fill = iter.next().expect("array repeat fill arg");
-                        let count = iter.next().expect("array repeat count arg");
-                        let list = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new("newlist", vec![fill], list.clone()),
-                            FlowspaceOp::new("mul", vec![list, count], result),
-                        ]);
-                    }
-                    // `[__iter_next]` (`front::iter_next`) → the raising
-                    // flowspace `next` op (`operation.rs` `OpKind::Next`,
-                    // `can_only_throw = [StopIteration, RuntimeError]`).  The
-                    // block's `LastException` exits — set by the front-end
-                    // `next`-diamond rewrite — carry the exception edges, so
-                    // no edge-building happens here (unlike a `?`-tail op).
-                    if crate::front::iter_next::is_iter_next_segments(segments)
-                        && arg_hls.len() == 1
-                    {
-                        return Ok(vec![FlowspaceOp::new("next", arg_hls, result)]);
-                    }
-                    // `min`/`max` are the exception: they lower to a
-                    // `simple_call(<builtin>)` (raising like any builtin
-                    // call), so they stay out of the pure-bridge table.
-                    if segments.len() >= 3
-                        && segments[0] == "core"
-                        && segments[1] == "cmp"
-                        && arg_hls.len() == 2
-                    {
-                        let leaf = segments[segments.len() - 1].as_str();
-                        if matches!(leaf, "min" | "max") {
-                            let builtin = HOST_ENV.lookup_builtin(leaf).ok_or_else(|| {
-                                TyperError::message(format!(
-                                    "builtin `{leaf}` missing from HOST_ENV"
-                                ))
-                            })?;
-                            let callable =
-                                Hlvalue::Constant(Constant::new(ConstValue::HostObject(builtin)));
-                            let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                            call_args.push(callable);
-                            call_args.extend(arg_hls);
-                            return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                        }
-                    }
-                    // `__cast_pointer` marker (`front::mir`
-                    // `cast_pointer_call`) — pyre's carrier for the
-                    // upstream `cast_pointer(PTRTYPE, ptr)` downcast
-                    // (lltype.py).  The root is a trailing ByteStr
-                    // Constant; intern it by qualname so every cast
-                    // site shares one `HostObject` Arc (`getdesc`
-                    // dedups on Arc identity).
-                    if segments.as_slice() == ["__cast_pointer"] {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "__cast_pointer requires (operand, constant_root), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let callable_host = HOST_ENV
-                            .import_module("rpython.rtyper.lltypesystem.lltype")
-                            .and_then(|m| m.module_get("cast_pointer"))
-                            .ok_or_else(|| {
-                                TyperError::message(
-                                    "HOST_ENV lltype module must expose cast_pointer".to_string(),
-                                )
-                            })?;
-                        let root = match &arg_hls[1] {
-                            Hlvalue::Constant(c) => c.value.as_pystr().ok_or_else(|| {
-                                TyperError::message(
-                                    "__cast_pointer root must be a constant string".to_string(),
-                                )
-                            })?,
-                            _ => {
-                                return Err(TyperError::message(
-                                    "__cast_pointer root must be a Constant".to_string(),
-                                ));
-                            }
-                        };
-                        let class_host = call_registry.bookkeeper().intern_class_by_qualname(root);
-                        let mut call_args = Vec::with_capacity(3);
-                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                            callable_host,
-                        ))));
-                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                            class_host,
-                        ))));
-                        call_args.push(arg_hls[0].clone());
-                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                    }
-                    // `__cast_instance_intrinsic` — front-end pointer-downcast
-                    // narrow (#298).  `front::mir` emits
-                    // `Call(["__cast_instance_intrinsic"], [operand, const(root)])`
-                    // for `obj as *const RegisteredStruct`.  The analyzer
-                    // reads the trailing `ByteStr` root to type the result
-                    // `SomeInstance(root)`, and the typer lowers the call
-                    // to a `cast_pointer`.  The callable resolves through
-                    // the `__cast_instance_intrinsic` HOST_ENV singleton so its
-                    // Arc identity matches the `BUILTIN_TYPER` key.
-                    if segments.as_slice() == [crate::runtime_names::shims::CAST_INSTANCE] {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "__cast_instance_intrinsic requires (operand, constant_root), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let callable_host = HOST_ENV
-                            .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
-                            .ok_or_else(|| {
-                                TyperError::message(
-                                    "__cast_instance_intrinsic missing from HOST_ENV bootstrap"
-                                        .to_string(),
-                                )
-                            })?;
-                        let callable =
-                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                        call_args.push(callable);
-                        call_args.extend(arg_hls);
-                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                    }
-                    // `__cast_address_intrinsic` — the erasing twin of the narrow
-                    // above (`front::mir` emits it for `p as *mut u8`).  It
-                    // carries no root, so the reconstruction is the plain
-                    // `simple_call(callable, operand)`; resolving through the
-                    // HOST_ENV singleton keeps the Arc identity that keys its
-                    // `BUILTIN_TYPER` entry, which a single-segment path
-                    // consulting the `PyreCallRegistry` first would lose.
-                    if segments.len() == 1
-                        && segments[0] == crate::runtime_names::shims::CAST_ADDRESS
-                    {
-                        if arg_hls.len() != 1 {
-                            return Err(TyperError::message(format!(
-                                "__cast_address_intrinsic requires exactly one operand, got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let callable_host = HOST_ENV
-                            .lookup_builtin(crate::runtime_names::shims::CAST_ADDRESS)
-                            .ok_or_else(|| {
-                                TyperError::message(
-                                    "__cast_address_intrinsic missing from HOST_ENV bootstrap"
-                                        .to_string(),
-                                )
-                            })?;
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                            callable_host,
-                        ))));
-                        call_args.extend(arg_hls);
-                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                    }
-                    // Exact RPython `rgc.ll_arraymove` call reconstructed by
-                    // the MIR list-storage adapter from Rust `ptr::copy`.
-                    if segments.len() == 1
-                        && segments[0] == crate::runtime_names::shims::LL_ARRAYMOVE
-                    {
-                        if arg_hls.len() != 4 {
-                            return Err(TyperError::message(format!(
-                                "__majit_ll_arraymove requires exactly four args, got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let callable_host = HOST_ENV
-                            .lookup_builtin(crate::runtime_names::shims::LL_ARRAYMOVE)
-                            .ok_or_else(|| {
-                                TyperError::message(
-                                    "__majit_ll_arraymove missing from HOST_ENV bootstrap"
-                                        .to_string(),
-                                )
-                            })?;
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                        call_args.push(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
-                            callable_host,
-                        ))));
-                        call_args.extend(arg_hls);
-                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                    }
-                    // `front::range_iter`'s synthesized `range(start, stop)`
-                    // (the exclusive int-`Range` for-loop divert).  It carries
-                    // the reserved `__majit_range` spelling rather than a bare
-                    // `["range"]` because the registry ladder below resolves a
-                    // single-segment path against the `CallRegistry`
-                    // *first* (the `frame.globals`-before-`__builtin__` order
-                    // of `flowcontext.py find_global`), and pyre's registry is one
-                    // flat namespace keyed by leaf-only `CallPath`s.  A pyre
-                    // free function whose leaf happens to be a builtin name —
-                    // `pyre_interpreter::module::_ast::convert::range`
-                    // registers as `["range"]` — would therefore bind this
-                    // synthesized call to *its* `HostObject`, and since
-                    // `BUILTIN_TYPER` is keyed by Arc identity
-                    // (`rbuiltin.rs`) the rtyper then fails
-                    // `findbltintyper` with "don't know about built-in
-                    // function <host range>".  Resolving the reserved
-                    // spelling straight to the `HOST_ENV` singleton keeps the
-                    // Arc identity that keys `rtype_builtin_range`
-                    // (`rrange.py:96-126`), the same discipline the
-                    // `__cast_instance_intrinsic` arm above documents.
-                    // `__majit_enumerate(lst)` is the front's spelling of
-                    // `enumerate(lst)` and resolves the same way.
-                    let builtin = match segments.as_slice() {
-                        [leaf] if leaf == crate::runtime_names::shims::RANGE => Some("range"),
-                        [leaf] if leaf == crate::runtime_names::shims::UNICHR => Some("unichr"),
-                        [leaf] if leaf == crate::runtime_names::shims::ENUMERATE => {
-                            Some("enumerate")
-                        }
-                        [leaf] if leaf == crate::runtime_names::shims::CHR => Some("chr"),
-                        [leaf] if leaf == crate::runtime_names::shims::UTF8_ITER => {
-                            Some("utf8iter")
-                        }
-                        [leaf] if leaf == crate::runtime_names::shims::UNICHAR_AS_UTF8 => {
-                            Some("unichr_as_utf8")
-                        }
-                        [leaf]
-                            if leaf == crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING =>
-                        {
-                            Some("get_raw_address_of_string")
-                        }
-                        [leaf]
-                            if leaf
-                                == crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST =>
-                        {
-                            Some("nonmoving_raw_ptr_for_resizable_list")
-                        }
-                        _ => None,
-                    };
-                    if let Some(builtin) = builtin {
-                        let callable_host = HOST_ENV.lookup_builtin(builtin).ok_or_else(|| {
-                            TyperError::message(format!(
-                                "{builtin} missing from HOST_ENV bootstrap"
-                            ))
-                        })?;
-                        let callable =
-                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host)));
-                        let mut call_args = Vec::with_capacity(arg_hls.len() + 1);
-                        call_args.push(callable);
-                        call_args.extend(arg_hls);
-                        return Ok(vec![FlowspaceOp::new("simple_call", call_args, result)]);
-                    }
-                    // `front::mir`'s builder-mode rewrite emits three reserved
-                    // single-segment markers for a *lifted* string-accumulator
-                    // (pass 2 of the two-pass lift gate).  A dropped graph
-                    // keeps the concat form and never reaches this lift-only
-                    // adapter, so the markers only ever appear where
-                    // `SomeStringBuilder` is fully typed.  Each lowers to the
-                    // flowspace shape the annotator's `find_method` /
-                    // `newstringbuilder` arms already consume, mirroring the
-                    // `Vec::push` / `slice.reverse` method arms below.
-                    //
-                    // `__majit_stringbuilder_new` → `newstringbuilder`, forwarding
-                    // the ctor operands verbatim: `new()` carries none and
-                    // `with_capacity(n)` carries the size `n`.  The operand count
-                    // mirrors `len(hop.args_v)` in
-                    // `AbstractStringBuilderRepr.rtyper_new` (rtyper/rbuilder.py),
-                    // which `rtype_newstringbuilder` honours — no arg selects
-                    // `ll_new(INIT_SIZE)`, the size arg threads `ll_new(n)`.
-                    if segments.len() == 1
-                        && segments[0] == crate::runtime_names::shims::STRINGBUILDER_NEW
-                    {
-                        return Ok(vec![FlowspaceOp::new("newstringbuilder", arg_hls, result)]);
-                    }
-                    // `__majit_stringbuilder_append(recv, piece)` →
-                    // `getattr(recv, "append") + simple_call(bound, piece)`,
-                    // reaching `StringBuilderRepr::rtype_method("append")`
-                    // (rstring.py) — identical to the `Vec::push` arm.
-                    if segments.len() == 1
-                        && segments[0] == crate::runtime_names::shims::STRINGBUILDER_APPEND
-                    {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "__majit_stringbuilder_append requires exactly two args \
-                                 (receiver, piece), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "__majit_stringbuilder_append requires a receiver arg".to_string(),
-                            )
-                        })?;
-                        let piece = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "__majit_stringbuilder_append requires a piece arg".to_string(),
-                            )
-                        })?;
-                        let bound_method = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new(
-                                "getattr",
-                                vec![
-                                    receiver,
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                                        "append",
-                                    ))),
-                                ],
-                                bound_method.clone(),
-                            ),
-                            FlowspaceOp::new("simple_call", vec![bound_method, piece], result),
-                        ]);
-                    }
-                    // `__majit_stringbuilder_build(recv)` →
-                    // `getattr(recv, "build") + simple_call(bound)`, reaching
-                    // `StringBuilderRepr::rtype_method("build")`
-                    // (rstring.py) → `SomeString` — identical to the
-                    // `slice.reverse` arm (no extra args on the bound method).
-                    if segments.len() == 1
-                        && segments[0] == crate::runtime_names::shims::STRINGBUILDER_BUILD
-                    {
-                        if arg_hls.len() != 1 {
-                            return Err(TyperError::message(format!(
-                                "__majit_stringbuilder_build requires exactly one receiver arg, \
-                                 got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "__majit_stringbuilder_build requires a receiver arg".to_string(),
-                            )
-                        })?;
-                        let bound_method = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new(
-                                "getattr",
-                                vec![
-                                    receiver,
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("build"))),
-                                ],
-                                bound_method.clone(),
-                            ),
-                            FlowspaceOp::new("simple_call", vec![bound_method], result),
-                        ]);
-                    }
-                    // The `len` operation in its three spellings: the
-                    // `__len` synthetic `front/mir.rs` lowers `Rvalue::Len`
-                    // (and the `<str>::is_empty` decomposition) to; the
-                    // slice-receiver `core::slice::<Impl>::len`; and the
-                    // `<str>::len` method.  Rust lowers `slice.len()` /
-                    // `s.len()` to MIR calls to those intrinsics, which
-                    // have no source body to register.  Route all three to
-                    // the rtyper's `len` operation (`rtyper.rs "len"
-                    // arm` → `Repr.rtype_len`), the same dispatch upstream
-                    // `op.len(v)` reaches via `unaryop.py`.  The
-                    // rtyper dispatches on the receiver repr: a slice maps
-                    // to `SomeList` (`ll_length`), a `&str` to `SomeString`
-                    // (`StringRepr.rtype_len` → `ll_strlen`).  The helper
-                    // is registered as an opname graph and lowered to the
-                    // `strlen`/`arraylen_gc` blackhole op
-                    // (`codewriter::jtransform_opname::lower_graph`), so
-                    // these are real `len` ops, not symbolic residuals.
-                    //
-                    // `__strlen` is a fourth frontend spelling
-                    // (`front/mir.rs` plants it for `Rvalue::Len` /
-                    // `slice::len` / `Wtf8::len` on a
-                    // `string_byte_view_locals` place).  A receiver that
-                    // is already the rstr takes this `len` op
-                    // (`StringRepr.rtype_len` → `ll_strlen`, `rstr.py`).
-                    // A `Wtf8`/`Str` cast of a wrapper is not that rstr:
-                    // [`rewrite_wtf8_view_strlen`] turns it into
-                    // `getattr` of the wrapper's one string field
-                    // (`W_UnicodeObject._utf8`, `len(w._utf8)`) before
-                    // this arm runs.  `ll_strlen` on the wrapper would
-                    // read `PyObject.w_class` at offset 8.
-                    let is_len_op = (segments.len() == 1
-                        && (segments[0] == "__len" || segments[0] == "__strlen"))
-                        || (segments.len() == 4
-                            && segments[0] == "core"
-                            && segments[1] == "slice"
-                            && segments[2] == "<Impl>"
-                            && segments[3] == "len")
-                        || (segments.len() >= 3
-                            && segments[segments.len() - 3] == "str"
-                            && segments[segments.len() - 2] == "<Impl>"
-                            && segments[segments.len() - 1] == "len");
-                    if is_len_op {
-                        if arg_hls.len() != 1 {
-                            return Err(TyperError::message(format!(
-                                "len operation requires exactly one receiver arg, got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let arg = iter.next().ok_or_else(|| {
-                            TyperError::message("len operation requires a receiver arg".to_string())
-                        })?;
-                        return Ok(vec![FlowspaceOp::new("len", vec![arg], result)]);
-                    }
-                    // `slice.reverse()` lowers (in Rust MIR) to a call to
-                    // `core::slice::<Impl>::reverse`, arriving as the
-                    // FunctionPath with no source body to register.  Unlike
-                    // `len`/`iter`, `reverse` has no rtyper operator arm, so
-                    // emit the *method* shape — `getattr(recv, "reverse")` +
-                    // `simple_call(bound_method)` — that the annotator's
-                    // `find_method("reverse")` (`unaryop.rs`) and
-                    // `BuiltinMethodRepr::rtype_simple_call` →
-                    // `rtype_method("reverse")` consume, identical to the
-                    // `CallTarget::Method` arm below.  `rtype_method_reverse`
-                    // (`rlist.py`) `gendirectcall`s `ll_reverse`
-                    // (`rlist.py:677-686`).
-                    if is_slice_reverse_segments(segments) {
-                        if arg_hls.len() != 1 {
-                            return Err(TyperError::message(format!(
-                                "slice.reverse requires exactly one receiver arg, got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message("slice.reverse requires a receiver arg".to_string())
-                        })?;
-                        let bound_method = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new(
-                                "getattr",
-                                vec![
-                                    receiver,
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                                        "reverse",
-                                    ))),
-                                ],
-                                bound_method.clone(),
-                            ),
-                            FlowspaceOp::new("simple_call", vec![bound_method], result),
-                        ]);
-                    }
-                    // `Vec::with_capacity(n)` / `Vec::new()` lower (in Rust
-                    // MIR) to a call to `vec::Vec::{with_capacity,new}`.  Emit
-                    // the `newlist` operation with no element args, which
-                    // `rtype_newlist` (`rlist.py`) lowers through
-                    // `newlist(llops, r_list, [])`.  The capacity operand is
-                    // dropped — see [`is_vec_ctor_segments`].
-                    if is_vec_ctor_segments(segments) {
-                        return Ok(vec![FlowspaceOp::new("newlist", vec![], result)]);
-                    }
-                    // `try_pyobject_vec_with_capacity(sizehint)?` is the
-                    // fallible Rust spelling of
-                    // `objectmodel.newlist_hint(sizehint)`. The
-                    // Result-to-exception pass has already made this call's
-                    // result the normal-edge Vec payload, so the synthetic op
-                    // has precisely the upstream one-argument/result shape.
-                    if is_runtime_newlist_hint_segments(segments) {
-                        if arg_hls.len() != 1 {
-                            return Err(TyperError::message(format!(
-                                "try_pyobject_vec_with_capacity requires exactly one size hint, got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        return Ok(vec![FlowspaceOp::new("newlist_hint", arg_hls, result)]);
-                    }
-                    // `vec![elem; count]` lowers (in Rust MIR) to a call to
-                    // `alloc::vec::from_elem(elem, count)`. Emit the same
-                    // `newlist(elem)` + `mul(list, count)` shape as the
-                    // `__array_repeat` synthetic above; see
-                    // [`is_vec_from_elem_segments`] for the upstream
-                    // `transform_allocate` / `rtype_alloc_and_set` path.
-                    if is_vec_from_elem_segments(segments, arg_hls.len()) {
-                        let mut iter = arg_hls.into_iter();
-                        let fill = iter.next().expect("from_elem fill arg");
-                        let count = iter.next().expect("from_elem count arg");
-                        let list = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new("newlist", vec![fill], list.clone()),
-                            FlowspaceOp::new("mul", vec![list, count], result),
-                        ]);
-                    }
-                    // `Vec::push(recv, item)` lowers (in Rust MIR) to a call
-                    // to `vec::Vec::push`. Emit the *method* shape
-                    // `getattr(recv, "append") + simple_call(bound_method,
-                    // item)` that the annotator's `find_method("append")`
-                    // (`unaryop.rs`) and `BuiltinMethodRepr::rtype_simple_call`
-                    // → `ListRepr::rtype_method("append")` consume —
-                    // identical to the `slice.reverse` arm above, but the
-                    // bound method takes the appended `item` arg.
-                    if is_vec_push_segments(segments) {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "Vec::push requires exactly two args (receiver, item), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message("Vec::push requires a receiver arg".to_string())
-                        })?;
-                        let item = iter.next().ok_or_else(|| {
-                            TyperError::message("Vec::push requires an item arg".to_string())
-                        })?;
-                        let bound_method = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new(
-                                "getattr",
-                                vec![
-                                    receiver,
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                                        "append",
-                                    ))),
-                                ],
-                                bound_method.clone(),
-                            ),
-                            FlowspaceOp::new("simple_call", vec![bound_method, item], result),
-                        ]);
-                    }
-                    // `Vec::set_len(recv, n)` is `l.length = n`
-                    // (`rlist.py` `_ll_list_resize_really`). Emit
-                    // `setattr(recv, "len", n)` so the rtyper writes the
-                    // header length field (`RustVecRepr.rtype_setattr` /
-                    // `PtrRepr.rtype_setattr`) instead of looking the
-                    // foreign method up in CallRegistry.
-                    if is_vec_set_len_segments(segments) {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "Vec::set_len requires exactly two args (receiver, new_len), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message("Vec::set_len requires a receiver arg".to_string())
-                        })?;
-                        let new_len = iter.next().ok_or_else(|| {
-                            TyperError::message("Vec::set_len requires a new_len arg".to_string())
-                        })?;
-                        return Ok(vec![FlowspaceOp::new(
-                            "setattr",
-                            vec![
-                                receiver,
-                                Hlvalue::Constant(Constant::new(ConstValue::byte_str("len"))),
-                                new_len,
-                            ],
-                            result,
-                        )]);
-                    }
-                    // `v[i]` (`vec::Vec::index`) is RPython `lst[i]`. Emit
-                    // `getitem(recv, index)` so `RustVecRepr.rtype_getitem`
-                    // / `pairtype(AbstractBaseListRepr, IntegerRepr).rtype_getitem`
-                    // (`rlist.py`) is the one lowering — the same op
-                    // [`OpKind::ArrayRead`] already emits. Every `Index<I>`
-                    // shares this path; a Range index is rewritten by
-                    // `front::slice_index` into `__getslice_*` markers before
-                    // it reaches here, so this arm is `lst[i]`.
-                    if vec_inherent_index_segments(segments) {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "Vec::index requires exactly two args (receiver, index), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        return Ok(vec![FlowspaceOp::new("getitem", arg_hls, result)]);
-                    }
-                    // `Vec::extend_from_slice(recv, slice)` — same method
-                    // shape as the `Vec::push` arm, but the bound method is
-                    // `extend` and its arg is the source slice (a non-resized
-                    // list). Reaches `ListRepr::rtype_method("extend")`.
-                    if is_vec_extend_from_slice_segments(segments) {
-                        if arg_hls.len() != 2 {
-                            return Err(TyperError::message(format!(
-                                "Vec::extend_from_slice requires exactly two args \
-                                 (receiver, slice), got {}",
-                                arg_hls.len()
-                            )));
-                        }
-                        let mut iter = arg_hls.into_iter();
-                        let receiver = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "Vec::extend_from_slice requires a receiver arg".to_string(),
-                            )
-                        })?;
-                        let source = iter.next().ok_or_else(|| {
-                            TyperError::message(
-                                "Vec::extend_from_slice requires a source-slice arg".to_string(),
-                            )
-                        })?;
-                        let bound_method = Hlvalue::Variable(Variable::new());
-                        return Ok(vec![
-                            FlowspaceOp::new(
-                                "getattr",
-                                vec![
-                                    receiver,
-                                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(
-                                        "extend",
-                                    ))),
-                                ],
-                                bound_method.clone(),
-                            ),
-                            FlowspaceOp::new("simple_call", vec![bound_method, source], result),
-                        ]);
-                    }
-                    // `RDict::get(recv, key)` is `dict.get`
-                    // (`OrderedDictRepr.rtype_method_get` → `ll_dict_get`
-                    // → `ll_dict_lookup`). Two arguments: the missing key
-                    // answers the `None` default that method pushes.
-                    // `RDict::insert(recv, key, value)` is one FLAG_STORE
-                    // probe: `ll_dict_lookup(FLAG_STORE)` then
-                    // `_ll_dict_setitem_lookup_done`
-                    // (`ll_dict_setitem_with_hash`), returning the
-                    // displaced value. One method call (`insert`).
-                    if let Some(leaf) = rdict_insert_or_get_leaf(segments) {
-                        return emit_rdict_insert_or_get(leaf, arg_hls, result);
                     }
                     // Fail-closed on an UNFUSED
                     // `lltype::malloc[_typed/_managed/_stable]`. A GC
@@ -5105,7 +4963,9 @@ fn legacy_const_define_hlvalue(
                     segments
                 ))
             })?;
-            let key = crate::translator::rtyper::call_registry::FunctionPathKey(segments.to_vec());
+            let key = crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
+                segments.to_vec(),
+            );
             let entry = call_registry.lookup_with_leaf_match(&key).ok_or_else(|| {
                 TyperError::message(format!(
                     "fn const {:?} did not resolve to a registered callee",
@@ -5487,7 +5347,7 @@ pub(crate) fn derive_subject_inputcells(
             }
             // Rust `char` is a Unicode scalar (`SomeUnicodeCodePoint`,
             // `rstr.py` UniChar). `getkind` of that repr is still `'int'`.
-            if class_root.as_deref() == Some("char") {
+            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("char") {
                 cells.push(crate::annotator::model::SomeValue::UnicodeCodePoint(
                     crate::annotator::model::SomeUnicodeCodePoint::new(false),
                 ));
@@ -5497,7 +5357,7 @@ pub(crate) fn derive_subject_inputcells(
             // `CCHARP`. `valuetype_to_someshell` would seed `SomeInteger`
             // (`r_uint`); seed `SomePtr(CCHARP)` so a `direct_ptradd`
             // result (`ann_direct_ptradd` returns `s_p`) unions.
-            if class_root.as_deref() == Some("CCHARP") {
+            if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("CCHARP") {
                 cells.push(lltype_to_annotation(
                     crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
                 ));
@@ -5522,7 +5382,7 @@ pub(crate) fn derive_subject_inputcells(
                 // SomePtr(GCREF), not the W_Root-like SomeInstance fallback,
                 // so heterogeneous StringRepr / InstanceRepr livevars meet
                 // only after their ordinary cast_opaque_ptr conversion.
-                if class_root.as_deref() == Some("GCREF") {
+                if class_root.as_deref().map(majit_ir::descr::class_root_leaf) == Some("GCREF") {
                     cells.push(
                         crate::translator::rtyper::llannotation::lltype_to_annotation(
                             crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
@@ -5553,20 +5413,14 @@ pub(crate) fn derive_subject_inputcells(
                 // would otherwise seed a `SomeInstance(String)` shell whose
                 // field writes poison classdef attr cells with
                 // instance-annotated strings.
-                if class_root.as_deref() == Some("String") || class_root.as_deref() == Some("str") {
-                    cells.push(crate::annotator::model::s_str0());
-                    continue;
-                }
                 // `BytesBlock` is the low-level owner of Python bytes'
-                // RPython-shaped `STR` storage, not a user-visible
-                // nominal instance.  The MIR front folds
+                // RPython-shaped `STR` storage. The MIR front folds
                 // `bytes_block_chars`'s exact `(chars, length)` raw-slice
                 // view back to this header, so seed the header with the same
                 // `SomeString` cell that `project_struct_field_type` assigns it.
-                // A generic raw-slice owner does not take this path.
-                if class_root.as_deref() == Some("BytesBlock")
-                    || class_root.as_deref() == Some("Utf8Str")
-                    || class_root.as_deref() == Some("UnicodeValueStorage")
+                if class_root
+                    .as_deref()
+                    .is_some_and(crate::front::mir::is_str_family_class_root)
                 {
                     cells.push(crate::annotator::model::s_str0());
                     continue;
@@ -5988,6 +5842,7 @@ fn op_defining<'a>(legacy: &'a FunctionGraph, var: &Variable) -> Option<&'a Spac
 }
 
 fn wtf8_str_cast_source(kind: &OpKind) -> Option<&Variable> {
+    // Crate-root `class_identity_spelling` of `rustpython_wtf8::Wtf8`.
     if crate::model::cast_instance_root(kind) != Some("Wtf8") {
         return None;
     }
@@ -8064,6 +7919,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![obj.clone()]),
                         result_ty: ValueType::Int,
@@ -8138,6 +7994,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
                 result_ty: ValueType::Int,
@@ -8159,6 +8016,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![obj.clone()]),
                 result_ty: ValueType::Int,
@@ -8363,6 +8221,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![dest.clone()]),
                         result_ty: ValueType::Int,
@@ -8533,6 +8392,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![view]),
                         result_ty: ValueType::Int,
@@ -8639,6 +8499,7 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: vec!["__strlen".to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![view]),
                         result_ty: ValueType::Int,
@@ -9262,6 +9123,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["a".into(), "b".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -9302,6 +9164,7 @@ mod tests {
                         "jit_force_virtualizable".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Void,
@@ -9350,7 +9213,7 @@ mod tests {
         func._jit_llop_ = Some("jit_force_quasi_immutable".into());
         let registry = empty_call_registry();
         registry.get_or_register_with_func(
-            FunctionPathKey::from_segments(path.segments.iter().cloned()),
+            FunctionPathKey::from(&path),
             Signature::new(vec!["self".into(), "mutatefieldname".into()], None, None),
             func,
         );
@@ -9408,7 +9271,7 @@ mod tests {
         );
         let registry = empty_call_registry();
         registry.get_or_register_with_func(
-            FunctionPathKey::from_segments(path.segments.iter().cloned()),
+            FunctionPathKey::from(&path),
             Signature::new(vec!["self".into(), "mutatefieldname".into()], None, None),
             func,
         );
@@ -9511,6 +9374,7 @@ mod tests {
                         "reload_top_root".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9548,6 +9412,7 @@ mod tests {
                         "try_gc_current_object_address".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9588,6 +9453,7 @@ mod tests {
                         "try_gc_current_object_address".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9615,6 +9481,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["pyre_object".into(), "try_gc_current_object_address".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9652,6 +9519,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__array_repeat".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
@@ -9687,6 +9555,7 @@ mod tests {
                         "try_pyobject_vec_with_capacity".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -9727,6 +9596,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Void,
@@ -9782,6 +9652,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments,
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                     result_ty: ValueType::Int,
@@ -9841,6 +9712,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["vec".into(), "Vec".into(), "index".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![v_var, i_var]),
                     result_ty: ValueType::Int,
@@ -9968,6 +9840,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_minusone".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10006,6 +9879,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangeto".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10041,6 +9915,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__getslice_rangefrom".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone(), vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10095,6 +9970,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["othermod".into(), "shared_leaf".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -10172,6 +10048,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["simple_call".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: vec![
                     LinkArg::from(ConstValue::HostObject(expected.clone())),
@@ -10221,6 +10098,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__dyn_call".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Int,
@@ -10262,6 +10140,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["int".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -10315,6 +10194,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__builtin__".into(), "float".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Float,
@@ -10365,6 +10245,7 @@ mod tests {
                         "cast_ptr_to_int".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -10412,6 +10293,7 @@ mod tests {
                         "path".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
@@ -10725,11 +10607,19 @@ mod tests {
                         target: crate::model::CallTarget::FunctionPath {
                             segments: path.split("::").map(String::from).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vars[2..2 + nargs].to_vec()),
                         result_ty: ValueType::Int,
                     },
                 };
+                let OpKind::Call { target, args, .. } = &spaceop.kind else {
+                    panic!("{path}: expected Call");
+                };
+                assert!(
+                    function_path_is_high_level_op(target, args.len()),
+                    "{path} must classify as a high-level op"
+                );
                 let translated = translate_op(&spaceop, &value_map, &empty_call_registry())
                     .unwrap_or_else(|err| panic!("{path} must lower: {err:?}"));
                 let last = translated.last().expect("at least one op");
@@ -10820,6 +10710,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: path.split("::").map(String::from).collect(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Int,
@@ -10858,6 +10749,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::ENUMERATE.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10901,6 +10793,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UTF8_ITER.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -10943,6 +10836,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Str,
@@ -10983,6 +10877,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Int,
@@ -11025,6 +10920,7 @@ mod tests {
                         crate::runtime_names::shims::NONMOVING_RAW_PTR_FOR_RESIZABLE_LIST.into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[0].clone()]),
                 result_ty: ValueType::Int,
@@ -11067,6 +10963,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_NEW.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Ref(None),
@@ -11099,6 +10996,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__majit_stringbuilder_new".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[2].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -11132,6 +11030,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_APPEND.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone(), vars[2].clone()]),
                 result_ty: ValueType::Void,
@@ -11185,6 +11084,7 @@ mod tests {
                         "insert".into(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![
                     vars[1].clone(),
@@ -11259,6 +11159,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Ref(None),
@@ -11361,6 +11262,7 @@ mod tests {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: segments.clone(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vars[..arity].iter().cloned()),
                     result_ty: ValueType::Bool,
@@ -11442,6 +11344,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: segments.clone(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vars[..3].iter().cloned()),
                 result_ty: ValueType::Ref(None),
@@ -11508,6 +11411,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: segments.clone(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vars[..5].iter().cloned()),
                 result_ty: ValueType::Void,
@@ -12275,7 +12179,12 @@ mod tests {
         let vars = mint_vars(&mut graph, 3);
         value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
         value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
-        for owner in ["Utf8Str", "LowlevelStringHeader"] {
+        for owner in [
+            "unicodeobject::Utf8Str",
+            "unicodeobject::UnicodeValueStorage",
+            "lowlevel_string::LowlevelStringHeader",
+            "bytesobject::BytesBlock",
+        ] {
             let op = SpaceOperation {
                 result: Some(vars[2].clone()),
                 kind: OpKind::FieldRead {
@@ -12291,6 +12200,21 @@ mod tests {
             assert_eq!(translated[0].opname, "len", "{owner}");
             assert_eq!(translated[0].args.len(), 1, "{owner}");
         }
+        let lookalike = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new("length", Some("other::Utf8Str".into())),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated = translate_op(&lookalike, &value_map, &empty_call_registry())
+            .expect("unrelated Utf8Str length still lowers");
+        assert_eq!(
+            translated[0].opname, "getattr",
+            "an unrelated Utf8Str owner is not ll_strlen"
+        );
     }
 
     #[test]
@@ -12458,6 +12382,7 @@ mod tests {
                 target: crate::model::CallTarget::FunctionPath {
                     segments: vec!["__strlen".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![vars[1].clone()]),
                 result_ty: ValueType::Int,
@@ -12585,6 +12510,7 @@ mod tests {
             target: crate::model::CallTarget::FunctionPath {
                 segments: segs.iter().map(|s| s.to_string()).collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args((0..argc).map(|_| Variable::new())),
             result_ty: ValueType::Int,
@@ -14079,6 +14005,7 @@ mod tests {
                     "-3".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -14121,6 +14048,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["__str_const".to_string(), "hi".to_string()],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -14140,6 +14068,7 @@ mod tests {
                     "re.IGNORECASE".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
             result_ty: ValueType::Ref(None),
@@ -14227,6 +14156,7 @@ mod tests {
                     "function".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: Vec::new(),
             result_ty: ValueType::Int,

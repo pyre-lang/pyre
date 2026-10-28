@@ -1,7 +1,9 @@
 //! Inherent-method metadata carrier shared across the front-end and
 //! codewriter. `CallPath` lives in `majit-jitcode`.
 
-pub use majit_jitcode::parse::{CallPath, canonical_leaf};
+pub use majit_jitcode::parse::{
+    ACCESS_DIRECT_ALT_SUFFIX, CallPath, GraphSpecialization, canonical_leaf,
+};
 
 #[derive(Debug, Clone)]
 pub struct InherentMethodInfo {

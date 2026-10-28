@@ -652,7 +652,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
     assert!(
         writes.iter().any(|ty| matches!(
             ty,
-            ValueType::Ref(Some(name)) if name.starts_with("Result<")
+            ValueType::Ref(Some(name)) if name.starts_with("result::Result<")
         )),
         "Break stores the Result value, got {writes:?}"
     );
@@ -2168,10 +2168,10 @@ fn live_rbigint_clone_result_is_rbigint_instance() {
         .blocks
         .iter()
         .flat_map(|block| &block.operations)
-        .any(|op| crate::model::cast_instance_root(&op.kind) == Some("RBigInt"));
+        .any(|op| crate::model::cast_instance_root(&op.kind) == Some("rbigint::RBigInt"));
     assert!(
         rooted,
-        "live_rbigint clone result must be cast to RBigInt, got ops: {}",
+        "live_rbigint clone result must be cast to rbigint::RBigInt, got ops: {}",
         graph
             .blocks
             .iter()
@@ -2289,7 +2289,7 @@ fn items_block_set_ref_call_is_one_array_write() {
     let mut writes = Vec::new();
     let mut object_items_casts = Vec::new();
     for op in graph.blocks.iter().flat_map(|block| &block.operations) {
-        if crate::model::cast_instance_root(&op.kind) == Some("[PyObject]") {
+        if crate::model::cast_instance_root(&op.kind) == Some("[pyobject::PyObject]") {
             if let Some(result) = op.result.as_ref() {
                 object_items_casts.push(result.clone());
             }
@@ -2901,6 +2901,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "new_display".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(Some("Argument".to_string())),
@@ -2969,6 +2970,7 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
                     "new".to_string(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr.clone(), args_arr]),
             result_ty: ValueType::Ref(Some("Arguments".to_string())),
@@ -2986,28 +2988,42 @@ fn extract_fmt_chain_recovers_pieces_and_args_cross_block() {
     assert!(extract_fmt_chain(&graph, &pieces_arr).is_none());
 }
 
-#[test]
-fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
-    use super::collapse_fmt_chains;
+fn single_arg_display_fmt_fixture(
+    ctx_input_root: Option<&str>,
+) -> (
+    crate::model::FunctionGraph,
+    crate::model::BlockId,
+    crate::model::BlockId,
+    crate::model::BlockId,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+    crate::flowspace::model::Variable,
+) {
     use crate::flowspace::model::Variable;
     use crate::model::{
         CallTarget, FieldDescriptor, FunctionGraph, Link, LinkArg, OpKind, SpaceOperation,
         ValueType,
     };
 
-    // Reconstruct the full `f(format!("hi{}", ctx))` shape charon
-    // lowers across three blocks: B0 builds `new_display(&ctx)` off the
-    // arg Tuple, Bp builds the args/pieces arrays + `Arguments::new`,
-    // Bf calls `alloc::fmt::format`, then returns the String.
     let mut graph = FunctionGraph::new("fmt_collapse");
     let b0 = graph.create_block();
     let bp = graph.create_block();
     let bf = graph.create_block();
     let bret = graph.create_block();
 
-    // ── B0: Argument::new_display(&ctx) via the arg Tuple ──
     let ctx = Variable::new();
     graph.block_mut(b0).inputargs = vec![ctx.clone()];
+    if let Some(root) = ctx_input_root {
+        graph.block_mut(b0).operations.push(SpaceOperation {
+            result: Some(ctx.clone()),
+            kind: OpKind::Input {
+                name: "ctx".to_string(),
+                ty: ValueType::Ref(Some(root.to_string())),
+                class_root: Some(root.to_string()),
+            },
+        });
+    }
     let tuple = Variable::new();
     graph.block_mut(b0).operations.push(SpaceOperation {
         result: Some(tuple.clone()),
@@ -3046,6 +3062,7 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3110,6 +3127,7 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3131,6 +3149,7 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3140,7 +3159,16 @@ fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
     graph.block_mut(bret).inputargs = vec![ret];
     graph.block_mut(bf).exits =
         vec![Link::from_variables(&graph, vec![formatted.clone()], bret, None).with_prevblock(bf)];
+    (graph, b0, bp, bf, ctx, arg_in, fmt_args_in, formatted)
+}
 
+#[test]
+fn collapse_fmt_chains_expands_single_arg_chain_to_str_concat() {
+    use super::collapse_fmt_chains;
+    use crate::model::{CallTarget, OpKind};
+
+    let (mut graph, b0, bp, bf, ctx, arg_in, fmt_args_in, formatted) =
+        single_arg_display_fmt_fixture(None);
     collapse_fmt_chains(&mut graph);
 
     // Bf's `alloc::fmt::format` is replaced by the orthodox
@@ -3264,6 +3292,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3327,6 +3356,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3347,6 +3377,7 @@ fn collapse_fmt_chains_expands_lower_hex_to_mod_pct_x() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3504,6 +3535,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3567,6 +3599,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3587,6 +3620,7 @@ fn collapse_fmt_chains_masks_signed_i8_hex_to_width() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3708,6 +3742,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3771,6 +3806,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3791,6 +3827,7 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -3845,6 +3882,177 @@ fn collapse_fmt_chains_takes_tuple_ctor_type_as_integer_proof() {
         )),
         "alloc::fmt::format must be consumed"
     );
+}
+
+#[test]
+fn collapse_fmt_chains_accepts_crate_stripped_string_root() {
+    use super::collapse_fmt_chains;
+    use crate::model::{CallTarget, OpKind};
+
+    let (mut graph, b0, bp, bf, ctx, arg_in, fmt_args_in, formatted) =
+        single_arg_display_fmt_fixture(Some("string::String"));
+    collapse_fmt_chains(&mut graph);
+
+    let bf_block = graph.blocks.iter().find(|b| b.id == bf).unwrap();
+    assert_eq!(
+        bf_block.operations.len(),
+        3,
+        "crate-stripped string::String interpolant must collapse format!; graph={}",
+        graph.dump()
+    );
+    match &bf_block.operations[0].kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => {
+            assert_eq!(segments, &vec!["__str_const".to_string(), "hi".to_string()]);
+        }
+        other => panic!("Bf op[0] not a __str_const: {other:?}"),
+    }
+    match &bf_block.operations[1].kind {
+        OpKind::UnaryOp { op, operand, .. } => {
+            assert_eq!(op, "str");
+            assert_eq!(operand.id(), fmt_args_in.id());
+        }
+        other => panic!("Bf op[1] not a str UnaryOp: {other:?}"),
+    }
+    match &bf_block.operations[2].kind {
+        OpKind::BinOp { op, .. } => assert_eq!(op, "add"),
+        other => panic!("Bf op[2] not an add BinOp: {other:?}"),
+    }
+    assert_eq!(
+        bf_block.operations[2].result.as_ref().unwrap().id(),
+        formatted.id()
+    );
+    let b0_block = graph.blocks.iter().find(|b| b.id == b0).unwrap();
+    assert!(
+        b0_block
+            .operations
+            .iter()
+            .all(|op| matches!(&op.kind, OpKind::Input { .. })),
+        "B0 chain ops not deleted; ops={:?}",
+        b0_block.operations
+    );
+    let bp_block = graph.blocks.iter().find(|b| b.id == bp).unwrap();
+    assert!(bp_block.operations.is_empty(), "Bp chain ops not deleted");
+    let b0_exit = &b0_block.exits[0];
+    assert_eq!(b0_exit.args[0].as_variable().unwrap().id(), ctx.id());
+    let bp_exit = &bp_block.exits[0];
+    assert_eq!(bp_exit.args[0].as_variable().unwrap().id(), arg_in.id());
+}
+
+#[test]
+fn wtf8_from_str_trait_impl_is_string_identity() {
+    assert!(super::wtf8_string_identity_segments(&[
+        "Wtf8Buf".to_string(),
+        "<impl core::convert::From<rustpython_wtf8::Wtf8Buf,&str>>".to_string(),
+        "from".to_string(),
+    ]));
+    assert!(super::wtf8_string_identity_segments(&[
+        "rustpython_wtf8".to_string(),
+        "Wtf8Buf".to_string(),
+        "<impl core::convert::From<rustpython_wtf8::Wtf8Buf,&str>>".to_string(),
+        "from".to_string(),
+    ]));
+    assert!(super::wtf8_string_identity_segments(&[
+        "Wtf8Buf".to_string(),
+        "from_string".to_string(),
+    ]));
+    assert!(super::wtf8_string_identity_segments(&[
+        "Wtf8".to_string(),
+        "new".to_string(),
+    ]));
+    assert!(!super::wtf8_string_identity_segments(&[
+        "Wtf8Buf".to_string(),
+        "<impl core::convert::From<rustpython_wtf8::Wtf8Buf,i32>>".to_string(),
+        "from".to_string(),
+    ]));
+    assert!(
+        !super::wtf8_string_identity_segments(&[
+            "other".to_string(),
+            "Wtf8".to_string(),
+            "new".to_string(),
+        ]),
+        "an unrelated Wtf8::new is not the rustpython_wtf8 identity wrap"
+    );
+    assert!(!super::wtf8_string_identity_segments(&[
+        "other".to_string(),
+        "Wtf8Buf".to_string(),
+        "from_string".to_string(),
+    ]));
+}
+
+#[test]
+fn class_identity_spelling_of_string_family_and_object_roots() {
+    let empty = std::collections::HashSet::new();
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::pyobject::PyObject", &empty),
+        super::W_ROOT_CLASS_ROOT
+    );
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::dictmultiobject::ObjectKey", &empty),
+        super::OBJECT_KEY_CLASS_ROOT
+    );
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::unicodeobject::Utf8Str", &empty),
+        "unicodeobject::Utf8Str"
+    );
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::unicodeobject::UnicodeValueStorage", &empty),
+        "unicodeobject::UnicodeValueStorage"
+    );
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::bytesobject::BytesBlock", &empty),
+        "bytesobject::BytesBlock"
+    );
+    assert_eq!(
+        super::class_identity_spelling(
+            "pyre_object::lowlevel_string::LowlevelStringHeader",
+            &empty
+        ),
+        "lowlevel_string::LowlevelStringHeader"
+    );
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::dictmultiobject::BytesKey", &empty),
+        "dictmultiobject::BytesKey"
+    );
+    assert_eq!(
+        super::class_identity_spelling("pyre_object::celldict::StrKey", &empty),
+        "celldict::StrKey"
+    );
+    assert_eq!(
+        super::class_identity_spelling("rustpython_wtf8::Wtf8", &empty),
+        "Wtf8"
+    );
+    assert_eq!(
+        super::class_identity_spelling("rustpython_wtf8::Wtf8Buf", &empty),
+        "Wtf8Buf"
+    );
+}
+
+#[test]
+fn str_family_class_roots_reject_lookalikes() {
+    for root in super::STR_FAMILY_CLASS_ROOTS {
+        assert!(
+            super::is_str_family_class_root(root),
+            "{root} is a declared string-family class root"
+        );
+    }
+    assert!(super::is_str_family_class_root("string::String"));
+    assert!(super::is_str_family_class_root("str"));
+    assert!(!super::is_str_family_class_root("other::Utf8Str"));
+    assert!(!super::is_str_family_class_root("other::Wtf8Buf"));
+    assert!(!super::is_str_family_class_root("other::BytesBlock"));
+    assert!(!super::is_str_length_field_class_root("other::Utf8Str"));
+    assert!(super::is_str_length_field_class_root(
+        "unicodeobject::Utf8Str"
+    ));
+    assert!(super::is_str_length_field_class_root(
+        "lowlevel_string::LowlevelStringHeader"
+    ));
+    assert!(!super::is_str_oopspec_class_root("other::Utf8Str"));
+    assert!(super::is_str_oopspec_class_root("unicodeobject::Utf8Str"));
+    assert!(super::is_str_oopspec_class_root("bytesobject::BytesBlock"));
 }
 
 #[test]
@@ -3912,6 +4120,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg_ref]),
             result_ty: ValueType::Ref(None),
@@ -3975,6 +4184,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![pieces_arr, args_arr]),
             result_ty: ValueType::Ref(None),
@@ -3995,6 +4205,7 @@ fn collapse_fmt_chains_quotes_debug_of_str() {
                     .map(|s| s.to_string())
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![fmt_args_in.clone()]),
             result_ty: ValueType::Ref(None),
@@ -4107,6 +4318,7 @@ fn collapse_fmt_chains_multi_expands_two_arg_chain() {
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
         fun_decl_id: None,
+        specialization: crate::parse::GraphSpecialization::Regular,
     };
 
     // ── B0: Tuple{x, y} + FieldRead __pos_0 + new_display(&x) ──
@@ -4387,6 +4599,7 @@ fn collapse_fmt_chains_multi_eliminates_cross_block_local_tuple() {
     let fpath = |segs: &[&str]| CallTarget::FunctionPath {
         segments: segs.iter().map(|s| s.to_string()).collect(),
         fun_decl_id: None,
+        specialization: crate::parse::GraphSpecialization::Regular,
     };
 
     // ── B0: Tuple{x, y} + both FieldWrites + FieldRead __pos_0 + new_display ──
@@ -5511,6 +5724,7 @@ fn w_module_dict_setitem_str_internal_calls_inherent_setitem_str() {
             CallTarget::FunctionPath {
                 segments,
                 fun_decl_id,
+                ..
             } if segments.last().map(String::as_str) == Some("setitem_str") => {
                 bindings.push((*fun_decl_id, segments.clone()))
             }
@@ -7086,8 +7300,8 @@ fn resolve_aggregate_adt_uses_dest_ty_generics_when_head_is_bare_id() {
     };
     let usize_owner = owner_tail(false);
     let i64_owner = owner_tail(true);
-    assert_eq!(usize_owner, "Option<usize>");
-    assert_eq!(i64_owner, "Option<i64>");
+    assert_eq!(usize_owner, "option::Option<usize>");
+    assert_eq!(i64_owner, "option::Option<i64>");
     assert_ne!(
         usize_owner, i64_owner,
         "a bare type_id head must not intern both instantiations as Option"
@@ -7097,7 +7311,7 @@ fn resolve_aggregate_adt_uses_dest_ty_generics_when_head_is_bare_id() {
         .expect("presence check without dest_ty still resolves the ADT");
     assert_eq!(
         bare_path.last().map(String::as_str),
-        Some("Option"),
+        Some("option::Option"),
         "without a dest_ty the presence check may keep the unsuffixed leaf"
     );
 }
@@ -7245,8 +7459,8 @@ fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
     };
     let i64_leaf = leaf_of(option_int_arg(true));
     let char_leaf = leaf_of(serde_json::json!({"Scalar": "Char"}));
-    assert_eq!(i64_leaf, "RangeInclusive<i64>");
-    assert_eq!(char_leaf, "RangeInclusive<char>");
+    assert_eq!(i64_leaf, "ops::range::RangeInclusive<i64>");
+    assert_eq!(char_leaf, "ops::range::RangeInclusive<char>");
     assert_ne!(
         i64_leaf, char_leaf,
         "a bare type_id head must not intern both instantiations as RangeInclusive"
@@ -7255,8 +7469,8 @@ fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
         .resolve_aggregate_adt(&kind, None)
         .expect("presence check without dest_ty still resolves the ADT");
     assert_eq!(
-        bare_leaf, "RangeInclusive",
-        "without a dest_ty the presence check may keep the unsuffixed leaf"
+        bare_leaf, "ops::range::RangeInclusive",
+        "without a dest_ty the presence check may keep the unsuffixed identity"
     );
     // Product `new` spells the Aggregate head as a TypeDeclRef whose
     // `types` are still `TypeVar`. That is nonempty, so a "has any
@@ -7279,10 +7493,13 @@ fn resolve_aggregate_adt_range_inclusive_uses_dest_ty_when_head_is_bare_id() {
             .expect("RangeInclusive constructor with TypeVar head");
         leaf
     };
-    assert_eq!(leaf_tvar(option_int_arg(true)), "RangeInclusive<i64>");
+    assert_eq!(
+        leaf_tvar(option_int_arg(true)),
+        "ops::range::RangeInclusive<i64>"
+    );
     assert_eq!(
         leaf_tvar(serde_json::json!({"Scalar": "Char"})),
-        "RangeInclusive<char>"
+        "ops::range::RangeInclusive<char>"
     );
 }
 

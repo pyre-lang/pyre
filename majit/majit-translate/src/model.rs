@@ -263,6 +263,12 @@ pub enum CallTarget {
         /// Caller's LLBC-local `FunDecl.def_id`. See [`Self::Method`].
         #[serde(skip, default)]
         fun_decl_id: Option<u64>,
+        /// `specialize.py default_specialize` cache key this call names.
+        /// `AccessDirect` is `(AccessDirect, None)`; `Regular` is every
+        /// other graph. Copied onto [`crate::parse::CallPath`] when the
+        /// target is reconstructed (`description.py FunctionDesc.cachedgraph`).
+        #[serde(default)]
+        specialization: crate::parse::GraphSpecialization,
     },
     /// Rust frontend adaptation for constructors that RPython's rtyper erases
     /// before jtransform. This variant must only be produced after frontend
@@ -438,6 +444,32 @@ impl CallTarget {
         Self::FunctionPath {
             segments: segments.into_iter().map(Into::into).collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
+        }
+    }
+
+    /// Direct call naming `path`, copying its `specialization`.
+    pub fn from_call_path(path: &crate::parse::CallPath) -> Self {
+        Self::FunctionPath {
+            segments: path.segments.clone(),
+            fun_decl_id: None,
+            specialization: path.specialization,
+        }
+    }
+
+    /// The `CallPath` a `FunctionPath` target names, with its
+    /// `specialization`; `None` for every other variant.
+    pub fn function_call_path(&self) -> Option<crate::parse::CallPath> {
+        match self {
+            CallTarget::FunctionPath {
+                segments,
+                specialization,
+                ..
+            } => Some(crate::parse::CallPath {
+                segments: segments.clone(),
+                specialization: *specialization,
+            }),
+            _ => None,
         }
     }
 
@@ -592,7 +624,19 @@ impl fmt::Display for CallTarget {
                 receiver_root: None,
                 ..
             } => f.write_str(name),
-            CallTarget::FunctionPath { segments, .. } => f.write_str(&segments.join("::")),
+            CallTarget::FunctionPath {
+                segments,
+                specialization,
+                ..
+            } => {
+                let key = segments.join("::");
+                match specialization {
+                    crate::parse::GraphSpecialization::Regular => f.write_str(&key),
+                    crate::parse::GraphSpecialization::AccessDirect => {
+                        write!(f, "{key}{}", crate::parse::ACCESS_DIRECT_ALT_SUFFIX)
+                    }
+                }
+            }
             CallTarget::SyntheticTransparentCtor {
                 name, owner_path, ..
             } => {
@@ -3545,7 +3589,7 @@ pub fn fold_constant_exitswitch(graph: &mut FunctionGraph) -> usize {
 /// with a secondary start represented by a no-predecessor block whose every
 /// inputarg is defined by its matching `OpKind::Input` parameter operation.
 /// A disconnected phi/branch block lacks that shape and is not a root.
-fn secondary_entry_roots(graph: &FunctionGraph) -> Vec<BlockId> {
+pub(crate) fn secondary_entry_roots(graph: &FunctionGraph) -> Vec<BlockId> {
     let with_predecessor: HashSet<BlockId> = graph
         .blocks
         .iter()
@@ -7906,14 +7950,14 @@ impl FuncEffects {
     }
 }
 
-/// Identity of a source funcobj: `(source_identity or owner_root, name)`.
+/// Identity of a source funcobj: `(source_identity or owner_root, name, specialization)`.
 ///
-/// `name` is the graph's `name_path()` — Charon's fully-qualified path for
-/// a free function (unique per source), `owner_root` the impl type for a
-/// method (so two impls' same-named methods, e.g. `PyFrame::push_value` vs
-/// `MIFrame::push_value`, stay distinct).  Every alias spelling of one
-/// source funcobj resolves to the same `GraphKey`.
-pub type GraphKey = (Option<String>, String);
+/// `name` is the graph's display name (`description.py FunctionDesc.cachedgraph`
+/// alt_name). `specialization` is the `specialize.py default_specialize`
+/// cache key: `AccessDirect` is `(AccessDirect, None)`, `Regular` is every
+/// other graph. Alias spellings of one source funcobj resolve to the same
+/// `GraphKey`.
+pub type GraphKey = (Option<String>, String, crate::parse::GraphSpecialization);
 
 /// A funcobj's flow graph, built on first demand
 /// (`description.py FunctionDesc.cachedgraph`). Clones share the one graph.
@@ -8196,6 +8240,11 @@ pub struct FunctionGraph {
     /// under alt_name `{name}__AccessDirect_None`. That copy is a distinct
     /// `FunctionGraph`; the regular graph is never stamped.
     pub access_directly: bool,
+    /// `specialize.py default_specialize` cache key this graph was built
+    /// under. `AccessDirect` is `(AccessDirect, None)`; `Regular` is every
+    /// other graph. The graph's `name` is display-only
+    /// (`description.py FunctionDesc.cachedgraph` alt_name).
+    pub specialization: crate::parse::GraphSpecialization,
     /// Formals whose binding still carries `access_directly`.
     /// `None` until `bindinputargs` first runs on the startblock.
     /// `Some(ids)` is the startblock binding after the annotator fixpoint
@@ -8347,6 +8396,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_container_root: graph.return_container_root.clone(),
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
+        specialization: graph.specialization,
         access_directly_inputs: graph
             .access_directly_inputs
             .as_ref()
@@ -8470,6 +8520,7 @@ impl FunctionGraph {
             fun_decl_id: None,
             hints: Vec::new(),
             access_directly: false,
+            specialization: crate::parse::GraphSpecialization::Regular,
             access_directly_inputs: None,
             fresh_virtualizable_inputs: None,
             call_result_flags: Vec::new(),
@@ -8496,6 +8547,7 @@ impl FunctionGraph {
                 .clone()
                 .or_else(|| self.owner_root.clone()),
             self.name.clone(),
+            self.specialization,
         )
     }
 
@@ -11328,6 +11380,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![destination.clone(), carried[0].clone()]),
                 result_ty: ValueType::Void,
@@ -11427,6 +11480,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![destination.clone(), aggregate]),
                 result_ty: ValueType::Void,
@@ -11519,6 +11573,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![destination, joined[0].clone()]),
                 result_ty: ValueType::Void,
@@ -11561,6 +11616,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination.clone(), source.clone()]),
                     result_ty: ValueType::Void,
@@ -11654,6 +11710,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination.clone(), source.clone()]),
                     result_ty: ValueType::Void,
@@ -11837,6 +11894,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination, source]),
                     result_ty: ValueType::Void,
@@ -11914,6 +11972,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["core".into(), "ptr".into(), "write".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![destination.clone(), aggregate]),
                     result_ty: ValueType::Void,
@@ -12447,6 +12506,7 @@ mod tests {
                             "get_instantiate".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![instantiate_arg]),
                     result_ty: ValueType::Ref(Some("object".into())),
@@ -12559,6 +12619,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -12745,6 +12806,7 @@ mod tests {
                             "new_uninit".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -12758,6 +12820,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "ptr".into(), "write".into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![uninit.clone(), agg.clone()]),
                 result_ty: ValueType::Void,
@@ -12771,6 +12834,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "assume_init".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![uninit.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -13039,6 +13103,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["boxed".into(), "Box".into(), "new".into()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -13146,6 +13211,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ComplexObject".into())),
@@ -13214,6 +13280,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("SomeOtherStruct".into())),
@@ -13260,6 +13327,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -13479,6 +13547,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -13612,6 +13681,7 @@ mod tests {
                         .map(|s| s.to_string())
                         .collect(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![gc_args[1].clone(), gc_args[0].clone()]),
                 result_ty: ValueType::Void,
@@ -13752,6 +13822,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -14018,6 +14089,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -14267,6 +14339,7 @@ mod tests {
                             "get_instantiate".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![w_class_cast]),
                     result_ty: ValueType::Ref(Some("object".into())),
@@ -14329,6 +14402,7 @@ mod tests {
                             "malloc_typed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_FloatObject".into())),
@@ -14472,6 +14546,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("Derived".into())),
@@ -14627,6 +14702,7 @@ mod tests {
                             "malloc".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_SetObject".into())),
@@ -14808,6 +14884,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_ListObject".into())),
@@ -14990,6 +15067,7 @@ mod tests {
                             "malloc_typed_managed".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![agg.clone()]),
                     result_ty: ValueType::Ref(Some("W_DictObject".into())),
@@ -15095,6 +15173,7 @@ mod tests {
                         target: CallTarget::FunctionPath {
                             segments: path.iter().map(|s| (*s).to_string()).collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(Some("object".into())),
@@ -15395,6 +15474,7 @@ mod tests {
                                         .map(|s| (*s).to_string())
                                         .collect(),
                                         fun_decl_id: None,
+                                        specialization: crate::parse::GraphSpecialization::Regular,
                                     },
                                     args: crate::model::call_args(vec![base]),
                                     result_ty: ValueType::Ref(Some("object".into())),
@@ -15439,6 +15519,7 @@ mod tests {
                                 .map(|s| (*s).to_string())
                                 .collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![agg]),
                         result_ty: ValueType::Ref(Some("W_IntObject".into())),
@@ -15697,6 +15778,7 @@ mod tests {
                     "get_instantiate".into(),
                 ],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg.clone()]),
             result_ty: ValueType::Ref(Some("object".into())),
@@ -15864,6 +15946,7 @@ mod tests {
             target: CallTarget::FunctionPath {
                 segments: vec!["boxed".into(), "Box".into(), "new_uninit".into()],
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(Some("Box".into())),

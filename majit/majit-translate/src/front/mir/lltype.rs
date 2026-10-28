@@ -2609,7 +2609,7 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
     .is_some()
         && let Some(root) = tyref_node(ty, llbc)
             .and_then(|node| strip_ty_wrappers(node, llbc))
-            .and_then(|node| adt_node_class_root_leaf(node, llbc, tombstoned))
+            .and_then(|node| adt_node_class_root_identity(node, llbc, tombstoned))
     {
         return ValueType::Ref(Some(root));
     }
@@ -3627,6 +3627,7 @@ pub(crate) fn unichr_call(arg: Variable) -> OpKind {
         target: CallTarget::FunctionPath {
             segments: vec![crate::runtime_names::shims::UNICHR.to_string()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![arg]),
         result_ty: ValueType::Int,
@@ -4552,6 +4553,121 @@ pub(in crate::front::mir) fn tyref_is_rust_heap_string(ty: &TyRef, llbc: &Llbc) 
         .is_some_and(|td| td.item_meta.name_path() == "alloc::string::String")
 }
 
+/// Class root of the Rust-heap `alloc::string::String` (crate-stripped
+/// identity `string::String`; the bare `String` spelling is still
+/// produced by synthesized roots).
+pub(in crate::front::mir) fn is_rust_heap_string_root(root: &str) -> bool {
+    matches!(root, "String" | "string::String")
+}
+
+/// Class identity of `pyre_object::pyobject::PyObject`, the `W_Root` port
+/// (`bookkeeper.py Bookkeeper.getdesc`).
+pub(crate) const W_ROOT_CLASS_ROOT: &str = "pyobject::PyObject";
+
+/// Class identity of `pyre_object::dictmultiobject::ObjectKey`.
+pub(crate) const OBJECT_KEY_CLASS_ROOT: &str = "dictmultiobject::ObjectKey";
+
+/// Exact class-root spellings of the rstr `STR` / WTF-8 string family.
+///
+/// `class_identity_spelling` of the declarations:
+/// - `pyre_object::unicodeobject::Utf8Str` → `unicodeobject::Utf8Str`
+/// - `pyre_object::unicodeobject::UnicodeValueStorage` (`type` alias;
+///   `resolve_adt_field` keeps the alias owner) →
+///   `unicodeobject::UnicodeValueStorage`
+/// - `pyre_object::bytesobject::BytesBlock` (`type BytesBlock = Utf8Str`,
+///   unpeeled owner) → `bytesobject::BytesBlock`
+/// - `pyre_object::dictmultiobject::BytesKey` → `dictmultiobject::BytesKey`
+/// - `pyre_object::celldict::StrKey` → `celldict::StrKey`
+/// - `rustpython_wtf8::Wtf8` / `Wtf8Buf` (crate-root) → `Wtf8` / `Wtf8Buf`
+///
+/// Bare leaves stay because [`charon_adt_to_ast_string`] still emits the
+/// TypeDecl leaf for field-type AST strings
+/// (`Bookkeeper.project_struct_field_type`).
+pub(crate) const STR_FAMILY_CLASS_ROOTS: &[&str] = &[
+    "unicodeobject::Utf8Str",
+    "unicodeobject::UnicodeValueStorage",
+    "bytesobject::BytesBlock",
+    "dictmultiobject::BytesKey",
+    "celldict::StrKey",
+    "Wtf8",
+    "Wtf8Buf",
+    // [`charon_adt_to_ast_string`] field-type leaves:
+    "Utf8Str",
+    "UnicodeValueStorage",
+    "BytesBlock",
+    "BytesKey",
+    "StrKey",
+];
+
+/// FieldRead `owner_root` of an rstr `STR` length word
+/// (`LLHelpers.ll_strlen`). Produced by `resolve_adt_field` /
+/// `class_identity_spelling` (aliases unpeeled).
+pub(crate) const STR_LENGTH_FIELD_CLASS_ROOTS: &[&str] = &[
+    "unicodeobject::Utf8Str",
+    "unicodeobject::UnicodeValueStorage",
+    "bytesobject::BytesBlock",
+    "lowlevel_string::LowlevelStringHeader",
+];
+
+/// InstanceRepr `GcStruct._name` of STR oopspec receivers
+/// (`jtransform.py Transformer._handle_stroruni_call`, `SoU.TO == rstr.STR`).
+/// `rpy_string` is the synthetic rstr `STR` name (`rstr.py` `GcStruct`) and
+/// is matched at the call site, not here.
+pub(crate) const STR_OOPSPEC_CLASS_ROOTS: &[&str] =
+    &["unicodeobject::Utf8Str", "bytesobject::BytesBlock"];
+
+pub(crate) fn is_str_family_class_root(root: &str) -> bool {
+    STR_FAMILY_CLASS_ROOTS.contains(&root) || is_rust_heap_string_root(root) || root == "str"
+}
+
+pub(crate) fn is_str_length_field_class_root(root: &str) -> bool {
+    STR_LENGTH_FIELD_CLASS_ROOTS.contains(&root)
+}
+
+pub(crate) fn is_str_oopspec_class_root(root: &str) -> bool {
+    STR_OOPSPEC_CLASS_ROOTS.contains(&root)
+}
+
+/// Crate-root `class_identity_spelling` of `rustpython_wtf8::Wtf8`, plus
+/// the crate-prefixed FunDecl `name_path` segments
+/// (`unspecialized_fun_segments`).
+fn is_declared_wtf8_owner(owner: &str) -> bool {
+    matches!(owner, "Wtf8" | "rustpython_wtf8::Wtf8")
+}
+
+/// Crate-root `class_identity_spelling` of `rustpython_wtf8::Wtf8Buf`, plus
+/// the crate-prefixed FunDecl `name_path` segments.
+fn is_declared_wtf8buf_owner(owner: &str) -> bool {
+    matches!(owner, "Wtf8Buf" | "rustpython_wtf8::Wtf8Buf")
+}
+
+/// `Wtf8::new` / `Wtf8Buf::from_string` / `From<&str> for Wtf8Buf` — the
+/// wrap of a string-family value into the WTF-8 buffer, an identity at
+/// the annotation level (`rstr.py` has one string type).
+pub(in crate::front::mir) fn wtf8_string_identity_segments(segments: &[String]) -> bool {
+    if segments.len() < 2 {
+        return false;
+    }
+    let last = segments[segments.len() - 1].as_str();
+    let owner = |end: usize| segments[..end].join("::");
+    if last == "from_string" && is_declared_wtf8buf_owner(&owner(segments.len() - 1)) {
+        return true;
+    }
+    if last == "new" && is_declared_wtf8_owner(&owner(segments.len() - 1)) {
+        return true;
+    }
+    if segments.len() >= 3
+        && last == "from"
+        && is_trait_impl_identity_segment(&segments[segments.len() - 2])
+    {
+        let impl_seg = segments[segments.len() - 2].as_str();
+        return impl_seg.contains("From<")
+            && impl_seg.contains("&str")
+            && is_declared_wtf8buf_owner(&owner(segments.len() - 2));
+    }
+    false
+}
+
 /// Identity-view family: rstr `STR` wrappers or a rust-heap `String`.
 ///
 /// `as_str` / `as_ref` / `as_bytes` / `to_string` / `deref` are identity
@@ -4732,12 +4848,14 @@ pub(in crate::front::mir) fn struct_copy_owner_keys(
 ) -> (String, majit_ir::descr::StructId) {
     let name_path = td.item_meta.name_path();
     let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
+    // Same closure exception as [`Lowering::resolve_adt_field`]: a crate-root
+    // or cross-crate-stripped closure would get the full path from
+    // [`tombstoned_owner_spelling`], while field reads keep the crate-stripped
+    // path.
     let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
         strip_crate_prefix(&name_path)
-    } else if tombstoned.contains(&owner_leaf) {
-        tombstoned_owner_spelling(&name_path, &owner_leaf, tombstoned)
     } else {
-        owner_leaf
+        class_identity_spelling(&name_path, tombstoned)
     };
     let owner_id =
         majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(&name_path, tombstoned));
@@ -4966,7 +5084,7 @@ pub(in crate::front::mir) fn tyref_input_class_root(
 /// Instantiation class of a split-eligible core enum used as a `Ref`
 /// parameter (`bookkeeper.py` `getuniqueclassdef(cls)`).
 ///
-/// [`adt_node_class_root_leaf`] paints split-eligible `Option` and
+/// [`adt_node_class_root_identity`] paints split-eligible `Option` and
 /// `Result` as values so a call result recasts to that class. Binary
 /// `ControlFlow` stays classdef-less as a *value*: painting it recasts
 /// `Try::branch` onto the exception link (`simplify.py` "raising
@@ -5013,11 +5131,10 @@ pub(in crate::front::mir) fn tyref_split_core_enum_param_root(
         return None;
     }
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
-    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
-    if tombstoned.contains(&leaf) {
-        leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
-    }
-    Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix))
+    let identity = class_identity_spelling(&name, tombstoned);
+    Some(majit_ir::descr::with_instantiation_suffix(
+        &identity, &suffix,
+    ))
 }
 
 /// `OpKind::Input.class_root` for a `Ref`-typed parameter.
@@ -5384,7 +5501,7 @@ pub(in crate::front::mir) fn nominal_adt_class_root(
 ) -> Option<String> {
     let tyref = TyRef::Other(ty.clone());
     let node = strip_ty_wrappers(tyref_node(&tyref, llbc)?, llbc)?.clone();
-    if let Some(root) = adt_node_class_root_leaf(&node, llbc, tombstoned) {
+    if let Some(root) = adt_node_class_root_identity(&node, llbc, tombstoned) {
         return Some(root);
     }
     let raw_pointee = node
@@ -5394,7 +5511,7 @@ pub(in crate::front::mir) fn nominal_adt_class_root(
         .first()?
         .clone();
     let pointee = strip_ty_wrappers(&raw_pointee, llbc)?.clone();
-    adt_node_class_root_leaf(&pointee, llbc, tombstoned)
+    adt_node_class_root_identity(&pointee, llbc, tombstoned)
 }
 
 /// Whether `decl` is a GC handle whose `Deref::Target` class applies.
@@ -5867,7 +5984,7 @@ pub(in crate::front::mir) fn adt_node_class_root_with(
             return adt_node_class_root_with(peeled, llbc, tombstoned);
         }
     }
-    adt_node_class_root_leaf(node, llbc, tombstoned)
+    adt_node_class_root_identity(node, llbc, tombstoned)
 }
 
 /// `true` when a generic argument is a pointer-shaped payload: a
@@ -5935,8 +6052,10 @@ pub(in crate::front::mir) fn adt_type_arg_is_pointer_like_depth(
     false
 }
 
-/// Nominal leaf of an ADT node. Does not apply the `Deref::Target` rule.
-pub(in crate::front::mir) fn adt_node_class_root_leaf(
+/// Class identity of an ADT node: the crate-stripped `module::Type`
+/// (`bookkeeper.py Bookkeeper.getdesc`), plus an instantiation suffix
+/// when the head splits. Does not apply the `Deref::Target` rule.
+pub(in crate::front::mir) fn adt_node_class_root_identity(
     node: &serde_json::Value,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -6042,28 +6161,15 @@ pub(in crate::front::mir) fn adt_node_class_root_leaf(
         // (`bookkeeper.py` `getuniqueclassdef(cls)`).
         return None;
     }
-    let mut leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
-    // `harden_duplicate_leaf_metadata` clears the origin of a leaf shared
-    // by two declarations (`eval::Code` and `module::struct::Code`). The
-    // bare token then canonicalises to itself and matches no field row, so
-    // the value is a classdef-less instance and `__discriminant` has
-    // nowhere to resolve (`rclass.py` `InstanceRepr.getfieldrepr`). Paint
-    // this declaration's crate-stripped path; that key still carries the
-    // rows, and `canonical_struct_name` leaves a `::` path unchanged.
-    // A crate-root declaration (`crate::Code`) strips to the leaf itself.
-    // The stripped spelling is the withdrawn token, so paint the full
-    // declaration path — the same spelling the constructor joins.
-    if tombstoned.contains(&leaf) {
-        leaf = tombstoned_owner_spelling(&name, &leaf, tombstoned);
-    }
+    let leaf = class_identity_spelling(&name, tombstoned);
     // A reference-payload workspace enum instantiation projects to a
-    // per-instantiation base class (`Result<Tuple>`) so its variant
+    // per-instantiation base class (`result::Result<Tuple>`) so its variant
     // payloads do not union across instantiations.  The discriminant
     // narrowing reads this base class name back to mint the matching
-    // `Result<Tuple>::Ok` variant subclass, so the suffix here and the
+    // `result::Result<Tuple>::Ok` variant subclass, so the suffix here and the
     // constructor / field-read sites must agree — they share
     // `adt_head_instantiation_suffix`.  Non-enum and primitive-payload
-    // heads return `None` and keep collapsing to the bare leaf.
+    // heads return `None` and keep the class identity.
     if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
@@ -6210,7 +6316,8 @@ pub(in crate::front::mir) fn raw_ptr_pointee_class_root_with(
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let raw = node.as_object()?.get("RawPtr")?.as_array()?;
-    adt_node_class_root_with(strip_ty_wrappers(raw.first()?, llbc)?, llbc, tombstoned)
+    let pointee = strip_ty_wrappers(raw.first()?, llbc)?;
+    adt_node_class_root_with(pointee, llbc, tombstoned)
 }
 
 /// The projected list or tuple root of a raw pointer onto a Rust container.
@@ -6990,7 +7097,7 @@ pub(in crate::front::mir) fn object_pointer_slice_list_root(
     let item = pointee.get("Slice")?.as_array()?.first()?;
     let item = strip_ty_indirections(item, llbc)?;
     let root = raw_ptr_pointee_class_root(item, llbc)
-        .or_else(|| adt_node_class_root_leaf(item, llbc, no_tombstoned_leaves()))?;
+        .or_else(|| adt_node_class_root_identity(item, llbc, no_tombstoned_leaves()))?;
     Some(format!("[{root}]"))
 }
 
@@ -7011,7 +7118,7 @@ pub(in crate::front::mir) fn object_pointer_gcarray_list_root(
     let item = node.get("Slice")?.as_array()?.first()?;
     let item = strip_ty_indirections(item, llbc)?;
     let root = raw_ptr_pointee_class_root(item, llbc)
-        .or_else(|| adt_node_class_root_leaf(item, llbc, no_tombstoned_leaves()))?;
+        .or_else(|| adt_node_class_root_identity(item, llbc, no_tombstoned_leaves()))?;
     Some(format!("[{root}]"))
 }
 
@@ -8861,8 +8968,7 @@ pub(crate) fn output_type_is_objectptr(ty: &TyRef, llbc: &Llbc) -> bool {
 pub(in crate::front::mir) fn json_ty_is_objectptr(node: &serde_json::Value, llbc: &Llbc) -> bool {
     strip_ty_wrappers(node, llbc)
         .and_then(|n| raw_ptr_pointee_class_root(n, llbc))
-        .as_deref()
-        == Some("PyObject")
+        .is_some_and(|root| root == W_ROOT_CLASS_ROOT)
 }
 
 /// Resolve a Charon [`TyRef`] to the Rust type STRING the
@@ -10537,7 +10643,7 @@ pub(in crate::front::mir) fn field_label_from_payload(payload: &serde_json::Valu
 ///
 /// Used by the `CallKind::Trait` arm of
 /// [`Lowering::call_target_segments`] to emit
-/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf] }`,
+/// `CallTarget::FunctionPath { segments: [trait_leaf, method_leaf], specialization: crate::parse::GraphSpecialization::Regular}`,
 /// matching the direct-path key
 /// `register_function_graph(direct_path, …)` at `lib.rs`
 /// (`extract_trait_impls`'s `<default methods of <Trait>>` branch).

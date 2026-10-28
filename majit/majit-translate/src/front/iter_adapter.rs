@@ -100,11 +100,11 @@ fn receiver_is_enumerate(root: &str) -> bool {
 }
 
 fn name_is_enumerate(name: &str) -> bool {
-    name.split('<').next() == Some("Enumerate")
+    majit_ir::descr::class_root_leaf(name).split('<').next() == Some("Enumerate")
 }
 
 fn enumerate_adapter_leaf(leaf: &str) -> bool {
-    leaf.split('<').next() == Some("Enumerate")
+    majit_ir::descr::class_root_leaf(leaf).split('<').next() == Some("Enumerate")
 }
 
 fn adapter_path_ends_with(segments: &[String], adapter: &str, leaf: &str) -> bool {
@@ -472,6 +472,7 @@ pub(crate) fn rewrite_enumerate_to_builtin(graph: &mut FunctionGraph, site: &Enu
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::ENUMERATE.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![site.container.clone()]),
                 result_ty: ValueType::Ref(None),
@@ -648,7 +649,7 @@ fn originates_from_range_ctor(graph: &FunctionGraph, var: &Variable) -> bool {
 /// this walk must see the same ctor or `map(it, f).collect()` leaves
 /// `ops::range::Range::map` as an unregistered FunctionPath.
 fn range_ctor_name(name: &str) -> bool {
-    name.split('<').next() == Some("Range")
+    majit_ir::descr::class_root_leaf(name).split('<').next() == Some("Range")
 }
 
 fn inner_is_list_or_range(graph: &FunctionGraph, inner: &Variable) -> bool {
@@ -1229,6 +1230,13 @@ mod tests {
     use crate::front::iter_next::{is_iter_op_segments, rewire_next_call_sites};
     use crate::model::{ExitCase, ExitSwitch, Link};
 
+    #[test]
+    fn range_ctor_name_accepts_crate_stripped_and_bare_range() {
+        assert!(range_ctor_name("ops::range::Range<usize>"));
+        assert!(range_ctor_name("Range<usize>"));
+        assert!(!range_ctor_name("ops::range::RangeInclusive<usize>"));
+    }
+
     fn enumerate_next_target() -> CallTarget {
         CallTarget::FunctionPath {
             segments: ["core", "iter", "adapters", "enumerate", "<Impl>", "next"]
@@ -1236,6 +1244,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1253,6 +1262,7 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1266,6 +1276,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1277,6 +1288,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1288,6 +1300,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1295,6 +1308,7 @@ mod tests {
         CallTarget::FunctionPath {
             segments: vec!["core".to_string(), "slice".to_string(), "iter".to_string()],
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1363,6 +1377,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -1593,6 +1608,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -1612,6 +1628,7 @@ mod tests {
                             "iter".to_string(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![container]),
                     result_ty: ValueType::Ref(None),
@@ -1844,6 +1861,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["foreign".to_string(), "chars".to_string()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -1895,6 +1913,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1905,6 +1924,7 @@ mod tests {
                 .map(|s| (*s).to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1937,6 +1957,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -2198,6 +2219,7 @@ mod tests {
                     target: CallTarget::FunctionPath {
                         segments: vec!["foreign".to_string(), "chars".to_string()],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),
@@ -2281,6 +2303,7 @@ mod tests {
                             "make".to_string(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: Vec::new(),
                     result_ty: ValueType::Ref(None),

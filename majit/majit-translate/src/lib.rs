@@ -139,7 +139,7 @@ pub use jtransform::{
 };
 pub use layout::{HeuristicLayoutProvider, LayoutProvider};
 pub use model::{Block, BlockId, CallTarget, FunctionGraph, OpKind, SpaceOperation, ValueType};
-pub use parse::CallPath;
+pub use parse::{CallPath, GraphSpecialization};
 pub use pipeline::{
     CompiledJitDriver, JitDriverSpec, PipelineConfig, PipelineResult, ProgramPipelineResult,
 };

@@ -390,7 +390,7 @@ impl<'a> Lowering<'a> {
             .next()
             .unwrap_or_default();
         if pointee == "PyObject" || pointee.ends_with("::PyObject") {
-            return Some(("pyobject::PyObject".to_string(), ValueType::Ref(None)));
+            return Some((W_ROOT_CLASS_ROOT.to_string(), ValueType::Ref(None)));
         }
         None
     }
@@ -402,14 +402,14 @@ impl<'a> Lowering<'a> {
     /// A bare field read annotates as a classdef-less instance, and
     /// `unionof` with the already-narrowed `PY_NULL` arm then drops the
     /// `PyObject` class. The read wants the same
-    /// `__cast_instance_intrinsic("PyObject")` narrow.
+    /// `__cast_instance_intrinsic` narrow onto [`W_ROOT_CLASS_ROOT`].
     pub(in crate::front::mir) fn enum_payload_is_nullable_instance_ptr(
         &self,
         place_ty: &TyRef,
     ) -> bool {
         if self
             .option_niche_null_cast(place_ty)
-            .is_some_and(|(root, _)| root == "pyobject::PyObject")
+            .is_some_and(|(root, _)| root == W_ROOT_CLASS_ROOT)
         {
             return true;
         }
@@ -418,8 +418,7 @@ impl<'a> Lowering<'a> {
             .and_then(|node| {
                 raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
             })
-            .as_deref()
-            == Some("PyObject")
+            .is_some_and(|root| root == W_ROOT_CLASS_ROOT)
     }
 
     /// Resolve a destination `Option` into its `(option_owner, some_owner,
@@ -1372,7 +1371,12 @@ impl<'a> Lowering<'a> {
                 result_ty,
             };
         };
-        if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+        if name != "branch"
+            || !receiver_root.as_deref().is_some_and(|root| {
+                majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root))
+                    == "Result"
+            })
+        {
             return OpKind::Call {
                 target,
                 args,

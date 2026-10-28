@@ -651,6 +651,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![sum]),
                     result_ty: ValueType::Ref(None),
@@ -927,6 +928,7 @@ impl<'a> Lowering<'a> {
                                         crate::runtime_names::shims::STRINGBUILDER_NEW.to_string(),
                                     ],
                                     fun_decl_id: None,
+                                    specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: Vec::new(),
                                 result_ty: ValueType::Ref(None),
@@ -1106,6 +1108,7 @@ impl<'a> Lowering<'a> {
             None => CallTarget::FunctionPath {
                 segments,
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
         };
         target = target.with_fun_decl_id(fd.def_id);
@@ -1500,7 +1503,7 @@ impl<'a> Lowering<'a> {
                     return self.move_plan(&fields[0].ty);
                 }
                 let name_path = td.item_meta.name_path();
-                let owner = name_path.rsplit("::").next().unwrap_or("").to_string();
+                let owner = class_identity_spelling(&name_path, self.tombstoned_leaves);
                 let owner_id =
                     majit_ir::descr::StructId::from_canonical(&strip_crate_prefix(&name_path));
                 let mut spans = Vec::with_capacity(fields.len());
@@ -1548,7 +1551,7 @@ impl<'a> Lowering<'a> {
             }
             TypeDeclKind::Enum(variants) => {
                 let name_path = td.item_meta.name_path();
-                let leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
+                let leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);
                 let canon = strip_crate_prefix(&name_path);
                 let base_id = majit_ir::descr::StructId::from_canonical(&canon);
                 // A union payload has no single kind (`rclass.py` never
@@ -2304,7 +2307,7 @@ impl<'a> Lowering<'a> {
                 (Some(result), OpKind::FieldRead { base, field, .. })
                     if result == chars
                         && field.name == "chars"
-                        && field.owner_root.as_deref() == Some("BytesBlock")
+                        && field.owner_root.as_deref() == Some("bytesobject::BytesBlock")
                         && field.taken_by_address =>
                 {
                     Some(base.clone())
@@ -2644,17 +2647,26 @@ impl<'a> Lowering<'a> {
         first_arg_ty: Option<&TyRef>,
         dest_ty: &TyRef,
     ) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        let leaf_owned: Option<String> = match &reg.kind {
+            CallKind::Fun(FunId::Regular { id }) => self.llbc.fn_by_id(*id).and_then(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .rsplit("::")
+                    .next()
+                    .map(str::to_string)
+            }),
+            CallKind::Trait(payload) => {
+                trait_payload_path_and_method(payload, self.llbc).map(|(_, method)| method)
+            }
+            _ => None,
+        };
+        let Some(leaf) = leaf_owned else {
             return false;
         };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let np = fd.item_meta.name_path();
-        let Some(leaf) = np.rsplit("::").next() else {
-            return false;
-        };
-        if !matches!(leaf, "as_ref" | "as_str" | "as_str_unchecked" | "borrow") {
+        if !matches!(
+            leaf.as_str(),
+            "as_ref" | "as_str" | "as_str_unchecked" | "borrow"
+        ) {
             return false;
         }
         if !first_arg_ty.is_some_and(|ty| tyref_is_string_family(ty, self.llbc)) {
@@ -2818,6 +2830,7 @@ impl<'a> Lowering<'a> {
                         crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING.to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header.clone()]),
                 result_ty: ValueType::Int,
@@ -2832,6 +2845,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__strlen".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![header]),
                 result_ty: ValueType::Int,
@@ -2861,6 +2875,7 @@ impl<'a> Lowering<'a> {
                             .to_string(),
                     ],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
                 result_ty: ValueType::Int,
@@ -2923,6 +2938,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__len".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![list]),
                 result_ty: ValueType::Int,
@@ -3122,6 +3138,7 @@ impl<'a> Lowering<'a> {
         let mut target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         };
         if let Some(fun_decl_id) = fun_decl_id {
             target = target.with_fun_decl_id(fun_decl_id);
@@ -4046,6 +4063,7 @@ impl<'a> Lowering<'a> {
         let target = CallTarget::FunctionPath {
             segments,
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
         .with_fun_decl_id(fun_decl_id);
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -7105,6 +7123,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["core".into(), "intrinsics".into(), leaf.into()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![lhs, rhs]),
                 result_ty,
@@ -7323,6 +7342,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["longlong2float".to_string(), leaf.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![operand]),
                 result_ty,

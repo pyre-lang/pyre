@@ -37,7 +37,7 @@ impl EmbeddedArtifacts {
     ) -> bincode::Result<Self> {
         let mut paths = vec![String::new(); pipeline.jitcodes.len()];
         for (path, jitcode) in &pipeline.jitcodes_by_path {
-            paths[jitcode.index()] = path.canonical_key();
+            paths[jitcode.index()] = path.display_name();
         }
         let reachable = reachable_symbolic_residual_table(&pipeline.jitcodes, &pipeline.descrs);
         let (index, bodies) = JitCodeIndex::encode(&pipeline.jitcodes, paths, reachable)?;

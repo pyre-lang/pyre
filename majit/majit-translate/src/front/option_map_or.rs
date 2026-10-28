@@ -592,6 +592,7 @@ mod tests {
                             "plus_one".into(),
                         ],
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,

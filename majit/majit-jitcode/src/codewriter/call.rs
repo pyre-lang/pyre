@@ -179,7 +179,11 @@ pub fn symbolic_fnaddr_paths_snapshot() -> Vec<(i64, String)> {
 }
 
 pub fn symbolic_fnaddr_for_path(path: &CallPath) -> i64 {
-    let symbolic = stable_symbolic_fnaddr(path);
+    // Hash segments only: `CallPath.specialization` is the
+    // `cachedgraph` key (`specialize.py default_specialize`) and is
+    // not part of the residual address. AccessDirect copies share the
+    // origin function (`get_jitcode` looks up the Regular path).
+    let symbolic = stable_symbolic_fnaddr(&path.segments);
     record_symbolic_fnaddr(symbolic, path.canonical_key());
     symbolic
 }

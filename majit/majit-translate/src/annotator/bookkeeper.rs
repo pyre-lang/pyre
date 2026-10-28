@@ -1628,10 +1628,13 @@ impl Bookkeeper {
         *self.trait_unique_impls.borrow_mut() = map;
     }
 
-    /// TODO: no upstream equivalent.  The full set of struct type-root
-    /// keys in the snapshot registry (`StructFieldRegistry.fields`).
-    /// The session-prologue inheritance-id pass
-    /// (`CallRegistry::ensure_session`) iterates these to eagerly
+    /// Registry keys that name a class to pre-mint.
+    ///
+    /// `bookkeeper.py` `Bookkeeper.getdesc` keys a class by the class object
+    /// and `getuniqueclassdef(cls)` is one `ClassDef` per class, so a
+    /// bare-leaf registry alias of a qualified declaration is a lookup
+    /// spelling, not a class to pre-mint. The session-prologue inheritance-id
+    /// pass (`CallRegistry::ensure_session`) iterates these to eagerly
     /// pre-register the build-time-closed `W_*` struct hierarchy before
     /// running [`crate::translator::rtyper::normalizecalls::assign_inheritance_ids`].
     /// Returns owned `String`s (not an iterator) so the registry borrow
@@ -1644,7 +1647,13 @@ impl Bookkeeper {
             .struct_fields
             .borrow()
             .as_ref()
-            .map(|reg| reg.fields.keys().cloned().collect())
+            .map(|reg| {
+                reg.fields
+                    .keys()
+                    .filter(|k| !is_bare_leaf_alias(k, &*reg.fields))
+                    .cloned()
+                    .collect()
+            })
             .unwrap_or_default();
         // `reg.fields` is a `HashMap`, so its `keys()` order varies
         // run-to-run.  This Vec drives `getuniqueclassdef_for_struct_root`
@@ -2860,47 +2869,6 @@ impl Bookkeeper {
         self.classdefs.borrow().clone()
     }
 
-    /// Redirect a bare-leaf `root` whose field alias was withdrawn by
-    /// `harden_duplicate_leaf_metadata` (a cross-namespace leaf collision —
-    /// e.g. a struct leaf colliding with an enum variant of the same name) to
-    /// the unique surviving *qualified* struct key that carries that leaf.
-    /// A withdrawn bare leaf has no `fields` entry, so `project_struct_rows`
-    /// finds nothing and the classdef stays attrs-empty (every field getattr
-    /// on the cast result then blocks). The qualified key survives hardening
-    /// (only the bare alias is removed), so resolving through it projects the
-    /// struct's rows. Returns `None` — leaving the current bare-leaf behaviour
-    /// — unless there is exactly one surviving non-enum-variant qualified key
-    /// with this leaf: a genuinely ambiguous leaf (>=2 real struct keys) stays
-    /// unresolved, and an unwithdrawn leaf is untouched.
-    fn redirect_withdrawn_struct_leaf(self: &Rc<Self>, root: &str) -> Option<String> {
-        // Only a bare leaf can be a withdrawal victim; a qualified or
-        // per-instantiation spelling already survives hardening.
-        if root.contains("::") || root.contains('<') {
-            return None;
-        }
-        let guard = self.struct_fields.borrow();
-        let reg = guard.as_ref()?;
-        if reg.fields.contains_key(root) {
-            return None;
-        }
-        let mut hit: Option<String> = None;
-        for k in reg.keys_with_last_segment(root) {
-            let Some((head, _leaf)) = k.rsplit_once("::") else {
-                continue;
-            };
-            // An `{Enum}::{Variant}` key's tail is a variant name, not a
-            // struct leaf — the enum base carries the `__discriminant` row.
-            if reg.is_enum_base(head) {
-                continue;
-            }
-            if hit.is_some() {
-                return None;
-            }
-            hit = Some(k);
-        }
-        hit
-    }
-
     /// `SomeInstance(classdef)` for a struct root already interned, present
     /// in the field registry, or harvested `_alloc_flavor_ = raw`. Unknown
     /// names stay unresolved so the classdef-less `Ref` fallback remains
@@ -2978,12 +2946,9 @@ impl Bookkeeper {
         root: &str,
     ) -> Result<Rc<RefCell<ClassDef>>, AnnotatorError> {
         let determinism_trace = crate::determinism_trace_enabled();
-        let trace_root = root;
         if determinism_trace {
-            eprintln!("[DTRACE-CLASS] struct_root root={trace_root}");
+            eprintln!("[DTRACE-CLASS] struct_root root={root}");
         }
-        let redirected = self.redirect_withdrawn_struct_leaf(root);
-        let root: &str = redirected.as_deref().unwrap_or(root);
         // Pass 1 — traverse the registry's struct-field graph from `root`,
         // registering an identity-keyed `ClassDef` in `descs` for every
         // reachable struct (via `intern_class_by_qualname` ->
@@ -3060,7 +3025,7 @@ impl Bookkeeper {
         }
         if determinism_trace {
             eprintln!(
-                "[DTRACE-CLASS] struct_graph root={trace_root} n={} structs={}",
+                "[DTRACE-CLASS] struct_graph root={root} n={} structs={}",
                 graph.len(),
                 graph.join(",")
             );
@@ -3286,14 +3251,11 @@ impl Bookkeeper {
         variant_name: &str,
     ) -> HostObject {
         let canon_root = majit_ir::descr::canonical_struct_name(enum_root);
-        // Field reads spell the crate-stripped template
-        // (`pyopcode::StepResult`).  A monomorphized or crate-qualified
-        // root (`pyre_interpreter::pyopcode::StepResult<*mut PyObject>`)
-        // subclasses that template so the variant unions with the field.
-        let template = {
-            let bare = canon_root.split('<').next().unwrap_or(&canon_root);
-            crate::front::mir::strip_crate_prefix(bare)
-        };
+        // Field reads intern the crate-stripped template
+        // (`pyopcode::StepResult`). `normalize_class_qualname` reduces a
+        // still-prefixed spelling when StructId proves the same declaration
+        // (`bookkeeper.py` `getuniqueclassdef(cls)` — one class per class).
+        let template = majit_ir::descr::strip_generic_args(&canon_root).into_owned();
         let template_host = self.intern_class_by_qualname(&template);
         let enum_host = if canon_root == template {
             template_host
@@ -3714,10 +3676,10 @@ impl Bookkeeper {
     /// shape [`Self::intern_class_by_qualname_with_bases`] uses for
     /// enum variants, so `ClassDef::commonbase` unions siblings to the
     /// header root and `cast_pointer`-style refinement connects the
-    /// `InstanceRepr`s.  The base is interned under its BARE LEAF —
-    /// the spelling `tyref_class_root` seeds params with — so the
-    /// subclass points at the same class Arc the rest of the session
-    /// uses.
+    /// `InstanceRepr`s.  The base is interned under the registered
+    /// header type (crate-stripped `module::Type`, the spelling
+    /// `tyref_class_root` seeds params with) so the subclass points at
+    /// the same class Arc the rest of the session uses.
     ///
     /// Each chain node's cache key is resolved through
     /// `canonical_struct_name`, so the bare and qualified spellings of
@@ -3736,7 +3698,7 @@ impl Bookkeeper {
     /// registry field-type strings strip references
     /// (`tyref_to_ast_string` renders `&T` as `T`), so a reference
     /// cycle (`A.next: &B`, `B.prev: &A`) is indistinguishable from
-    /// by-value embedding here — a revisited leaf ends the chain (a
+    /// by-value embedding here — a revisited identity ends the chain (a
     /// reference loop is linkage, not a header hierarchy), and a
     /// pathological registry chain must not exhaust the native stack
     /// (same O(reachable)-heap discipline as
@@ -3762,7 +3724,7 @@ impl Bookkeeper {
                 base_host = Some(existing.clone());
                 break;
             }
-            seen.insert(cur.rsplit("::").next().unwrap_or(&cur).to_string());
+            seen.insert(cur.clone());
             chain.push(cur.clone());
             let next = self.struct_fields.borrow().as_ref().and_then(|reg| {
                 // Constructor, crate-included, and crate-relative spellings
@@ -3853,16 +3815,11 @@ impl Bookkeeper {
                         }
                     }
                 }
-                // A generic enum instantiation (`Option<X>`, `Result<T,E>`) and
-                // a collapsed non-suffixed spelling of the same enum
-                // (`core.option.Option`, from a ctor whose ADT head lost its
-                // type argument) both denote ONE class — RPython has no
-                // generics, so every spelling of an enum is the same class.
-                // Subclass each under the bare enum leaf (`Option` / `Result`)
-                // so two sibling instantiations, and a collapsed value, share a
-                // base and `commonbase` to it at a phi merge instead of failing
-                // `mergeinputargs` with "no common base class".  The bare leaf
-                // is the discriminant-only root (its only row is
+                // A generic enum instantiation (`option::Option<X>`) subclasses
+                // the crate-stripped template (`option::Option`) so sibling
+                // instantiations share a base and `commonbase` at a phi merge
+                // (`bookkeeper.py` `getuniqueclassdef(cls)`). The template is
+                // the discriminant-only root (its only row is
                 // `__discriminant`), so it carries no payload attr the
                 // per-instantiation `__pos_N` writes could conflict on.
                 if lookup.contains('<') {
@@ -3891,13 +3848,6 @@ impl Bookkeeper {
                         || reg.enum_base_registry_key(stripped.as_ref()).is_some();
                     if is_enum && spelled != lookup && !seen.contains(spelled_leaf) {
                         return Some(spelled);
-                    }
-                }
-                if reg.is_enum_base(&lookup) {
-                    let stripped = majit_ir::descr::strip_generic_args(&lookup);
-                    let bare_leaf = stripped.rsplit("::").next().unwrap_or(&stripped);
-                    if bare_leaf != lookup.as_str() && !seen.contains(bare_leaf) {
-                        return Some(bare_leaf.to_string());
                     }
                 }
                 // A foreign generic struct whose type args include a
@@ -3929,18 +3879,10 @@ impl Bookkeeper {
                     && (stripped.ends_with("rordereddict_entries::Entry")
                         || stripped.as_ref() == "Entry");
                 if stripped.as_ref() != lookup.as_str() && is_entry {
-                    let bare = if reg.fields.contains_key(stripped.as_ref()) {
-                        Some(stripped.as_ref())
-                    } else if reg.fields.contains_key(template_leaf) {
-                        Some(template_leaf)
-                    } else {
-                        None
-                    };
-                    if let Some(bare) = bare {
-                        let bare_leaf = bare.rsplit("::").next().unwrap_or(bare);
-                        if !seen.contains(bare_leaf) {
-                            return Some(bare.to_string());
-                        }
+                    if reg.fields.contains_key(stripped.as_ref())
+                        && !seen.contains(stripped.as_ref())
+                    {
+                        return Some(stripped.into_owned());
                     }
                 }
                 // The registry publishes a full declaration path and a bare
@@ -3961,8 +3903,36 @@ impl Bookkeeper {
                 if first.name != "ob_header" && first.name != "base" {
                     return None;
                 }
-                let leaf = first.ty.rsplit("::").next().unwrap_or(&first.ty);
-                (reg.fields.contains_key(leaf) && !seen.contains(leaf)).then(|| leaf.to_string())
+                let parent = first
+                    .ty
+                    .trim_start_matches('&')
+                    .trim_start_matches("*mut ")
+                    .trim_start_matches("*const ")
+                    .trim();
+                let parent = majit_ir::descr::strip_generic_args(parent);
+                if seen.contains(parent.as_ref()) {
+                    return None;
+                }
+                if reg.fields.contains_key(parent.as_ref()) {
+                    return Some(parent.into_owned());
+                }
+                let leaf = parent.rsplit("::").next().unwrap_or(parent.as_ref());
+                if !reg.fields.contains_key(leaf) {
+                    return None;
+                }
+                let canon = majit_ir::descr::canonical_struct_name(leaf);
+                if !reg.fields.contains_key(&canon) {
+                    return None;
+                }
+                match (
+                    majit_ir::descr::struct_id_for_name(parent.as_ref()),
+                    majit_ir::descr::struct_id_for_name(&canon),
+                ) {
+                    (Some(parent_id), Some(canon_id)) if parent_id == canon_id => {
+                        Some(leaf.to_string())
+                    }
+                    _ => None,
+                }
             });
             match next {
                 Some(n) => cur = n,
@@ -4313,15 +4283,7 @@ impl Bookkeeper {
             // queries it with the slice, so the key cell is the same
             // `SomeString`. A nominal key instance cannot union with
             // that slice.
-            "String"
-            | "str"
-            | "Wtf8"
-            | "Wtf8Buf"
-            | "BytesBlock"
-            | "BytesKey"
-            | "StrKey"
-            | "Utf8Str"
-            | "UnicodeValueStorage" => {
+            _ if crate::front::mir::is_str_family_class_root(stripped) => {
                 return super::model::s_str0();
             }
             // `malachite_bigint::BigInt` is deliberately foreign and opaque
@@ -5651,6 +5613,39 @@ impl Default for Bookkeeper {
     }
 }
 
+fn same_struct_id(key: &str, other: &str) -> bool {
+    match (
+        majit_ir::descr::struct_id_for_name(key),
+        majit_ir::descr::struct_id_for_name(other),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => other.rsplit("::").next() == Some(key),
+    }
+}
+
+fn is_bare_leaf_alias(
+    key: &str,
+    fields: &std::collections::HashMap<String, Vec<crate::front::semantic::FieldRow>>,
+) -> bool {
+    if key.contains("::") || key.contains('<') {
+        return false;
+    }
+    let qualified: Vec<&String> = fields
+        .keys()
+        .filter(|other| other.contains("::") && same_struct_id(key, other))
+        .collect();
+    match qualified.as_slice() {
+        [] => false,
+        [one]
+            if crate::front::mir::strip_crate_prefix(one) == key
+                && one.matches("::").count() == 1 =>
+        {
+            false
+        }
+        _ => true,
+    }
+}
+
 /// One spelling rule for the class cache key, shared by
 /// [`Bookkeeper::intern_class_by_qualname`] and
 /// [`Bookkeeper::intern_class_by_qualname_with_bases`].
@@ -6844,6 +6839,63 @@ mod tests {
     }
 
     #[test]
+    fn struct_root_names_skips_a_bare_leaf_alias_of_two_declarations() {
+        use crate::front::StructFieldRegistry;
+
+        let dup_a = majit_ir::descr::StructId::from_canonical("a::Dup");
+        let dup_b = majit_ir::descr::StructId::from_canonical("b::Dup");
+        let class_object = majit_ir::descr::StructId::from_canonical("charon_corpus::ClassObject");
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("a::Dup".to_string(), Some(dup_a)),
+                ("b::Dup".to_string(), Some(dup_b)),
+                ("charon_corpus::ClassObject".to_string(), Some(class_object)),
+                ("ClassObject".to_string(), Some(class_object)),
+            ]));
+
+        let dup_bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "a::Dup".to_string(),
+            vec![("left_f".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "b::Dup".to_string(),
+            vec![("right_f".to_string(), "u64".to_string())],
+        );
+        reg.fields.insert(
+            "Dup".to_string(),
+            vec![("left_f".to_string(), "i64".to_string())],
+        );
+        dup_bk.set_struct_fields(Rc::new(reg));
+        assert_eq!(
+            dup_bk.struct_root_names(),
+            vec!["a::Dup".to_string(), "b::Dup".to_string()]
+        );
+
+        let crate_root_bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "charon_corpus::ClassObject".to_string(),
+            vec![("kind".to_string(), "i64".to_string())],
+        );
+        reg.fields.insert(
+            "ClassObject".to_string(),
+            vec![("kind".to_string(), "i64".to_string())],
+        );
+        crate_root_bk.set_struct_fields(Rc::new(reg));
+        let names = crate_root_bk.struct_root_names();
+        assert!(
+            names.iter().any(|n| n == "ClassObject"),
+            "crate-root identity keeps the leaf, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "charon_corpus::ClassObject"),
+            "crate-root qualified key is kept, got {names:?}"
+        );
+    }
+
+    #[test]
     fn range_inclusive_instantiations_keep_start_apart() {
         // Product prologue pre-mints the unsuffixed template, then
         // `new__spec_i64` / `new__spec_char` setattr `start`. Locating
@@ -7100,6 +7152,44 @@ mod tests {
                 result: LowLevelType::Signed,
             }),
             "carrier Result<i64, E> is Signed (`valuetype_to_lltype` of the payload)"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_qualified_utf8str_is_s_str0() {
+        let bk = bk();
+        assert_eq!(
+            bk.project_struct_field_type("unicodeobject::Utf8Str"),
+            crate::annotator::model::s_str0()
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_lookalike_utf8str_is_not_s_str0() {
+        let bk = bk();
+        assert_ne!(
+            bk.project_struct_field_type("other::Utf8Str"),
+            crate::annotator::model::s_str0(),
+            "an unrelated Utf8Str declaration is not the rstr STR family"
+        );
+        assert_ne!(
+            bk.project_struct_field_type("other::Wtf8Buf"),
+            crate::annotator::model::s_str0(),
+            "an unrelated Wtf8Buf declaration is not the rstr STR family"
+        );
+    }
+
+    #[test]
+    fn project_struct_field_type_buffer_string_variant_is_not_s_str0() {
+        let bk = bk();
+        assert_ne!(
+            bk.project_struct_field_type("buffer::Buffer::String"),
+            crate::annotator::model::s_str0(),
+            "Buffer::String is the enum variant class, not rust-heap String"
+        );
+        assert_eq!(
+            bk.project_struct_field_type("unicodeobject::Utf8Str"),
+            crate::annotator::model::s_str0()
         );
     }
 
@@ -7726,6 +7816,33 @@ mod tests {
     }
 
     #[test]
+    fn enum_instantiation_does_not_parent_to_a_bare_leaf_template() {
+        use crate::front::StructFieldRegistry;
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "option::Option".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let inst = bk.intern_class_by_qualname("option::Option<i64>");
+        let mut names = Vec::new();
+        let mut cur = Some(inst);
+        while let Some(host) = cur {
+            names.push(host.qualname().to_string());
+            cur = host.class_bases().and_then(|b| b.first()).cloned();
+        }
+        assert!(
+            names.iter().any(|n| n == "option::Option"),
+            "instantiation must parent to option::Option, got {names:?}"
+        );
+        assert!(
+            names.iter().all(|n| n != "Option"),
+            "must not mint a bare-leaf Option class, got {names:?}"
+        );
+    }
+
+    #[test]
     fn intern_keeps_foreign_generic_struct_instantiations_distinct() {
         // Crate-stripped intern names (`ops::range::RangeInclusive<u8>`)
         // must not collapse onto the template: `bookkeeper.py`
@@ -7950,6 +8067,15 @@ mod tests {
     fn generic_enum_variant_shares_a_base_with_the_unsuffixed_enum() {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::front::StructFieldRegistry;
+        let step = majit_ir::descr::StructId::from_canonical("pyopcode::StepResult");
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("pyopcode::StepResult".to_string(), Some(step)),
+                (
+                    "pyre_interpreter::pyopcode::StepResult".to_string(),
+                    Some(step),
+                ),
+            ]));
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
         // Only the crate-relative key is registered.  A bare `StepResult`
@@ -8136,6 +8262,15 @@ mod tests {
         use crate::annotator::model::{SomeInstance, SomeValue};
         use crate::flowspace::model::ConstValue;
         use crate::front::StructFieldRegistry;
+        let step = majit_ir::descr::StructId::from_canonical("pyopcode::StepResult");
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("pyopcode::StepResult".to_string(), Some(step)),
+                (
+                    "pyre_interpreter::pyopcode::StepResult".to_string(),
+                    Some(step),
+                ),
+            ]));
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(
@@ -8357,7 +8492,7 @@ mod tests {
         bk.pre_register_enum_variant_classes();
 
         let base = bk
-            .getuniqueclassdef_for_struct_root("Code")
+            .getuniqueclassdef_for_struct_root("module::struct::Code")
             .expect("Code base registers");
         assert!(
             base.borrow().attrs.contains_key("__discriminant"),
@@ -8369,16 +8504,16 @@ mod tests {
         );
 
         let int_v = bk
-            .getuniqueclassdef_for_enum_variant("Code", "Int")
+            .getuniqueclassdef_for_enum_variant("module::struct::Code", "Int")
             .expect("Code::Int registers");
         let float_v = bk
-            .getuniqueclassdef_for_enum_variant("Code", "FloatComplex")
+            .getuniqueclassdef_for_enum_variant("module::struct::Code", "FloatComplex")
             .expect("Code::FloatComplex registers");
         let double_v = bk
-            .getuniqueclassdef_for_enum_variant("Code", "DoubleComplex")
+            .getuniqueclassdef_for_enum_variant("module::struct::Code", "DoubleComplex")
             .expect("Code::DoubleComplex registers");
 
-        let interned_float = bk.intern_class_by_qualname("Code::FloatComplex");
+        let interned_float = bk.intern_class_by_qualname("module::struct::Code::FloatComplex");
         let interned_float_cd = bk
             .getuniqueclassdef(&interned_float)
             .expect("interned FloatComplex classdef");
@@ -11624,6 +11759,15 @@ mod tests {
         // StepResult chain.
         use crate::annotator::classdesc::ClassDef;
         use crate::front::StructFieldRegistry;
+        let step = majit_ir::descr::StructId::from_canonical("pyopcode::StepResult");
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("pyopcode::StepResult".to_string(), Some(step)),
+                (
+                    "pyre_interpreter::pyopcode::StepResult".to_string(),
+                    Some(step),
+                ),
+            ]));
         let bk = bk();
         let mut reg = StructFieldRegistry::default();
         reg.fields.insert(

@@ -156,6 +156,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__string_byte_getitem".to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
                 result_ty: ValueType::Int,
@@ -765,6 +766,7 @@ impl<'a> Lowering<'a> {
                                     kind,
                                 ),
                                 fun_decl_id: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: vec![LinkArg::from(arr), LinkArg::from(idx), value.clone()],
                             result_ty: ValueType::Void,
@@ -1939,6 +1941,7 @@ impl<'a> Lowering<'a> {
                                             .map(str::to_string)
                                             .collect(),
                                         fun_decl_id: None,
+                                        specialization: crate::parse::GraphSpecialization::Regular,
                                     },
                                     args: crate::model::call_args(vec![arg]),
                                     result_ty: ValueType::Unsigned,
@@ -2039,6 +2042,7 @@ impl<'a> Lowering<'a> {
                                         .map(str::to_string)
                                         .collect(),
                                     fun_decl_id: None,
+                                    specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Int,
@@ -2127,6 +2131,7 @@ impl<'a> Lowering<'a> {
                                         .map(str::to_string)
                                         .collect(),
                                     fun_decl_id: None,
+                                    specialization: crate::parse::GraphSpecialization::Regular,
                                 },
                                 args: crate::model::call_args(vec![arg]),
                                 result_ty: ValueType::Unsigned,
@@ -2447,6 +2452,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec!["__array_repeat".to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(args),
                         result_ty: ValueType::Ref(None),
@@ -2662,6 +2668,7 @@ impl<'a> Lowering<'a> {
                         target: CallTarget::FunctionPath {
                             segments: vec![len_leaf.to_string()],
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![base]),
                         result_ty: ValueType::Int,
@@ -2893,13 +2900,7 @@ impl<'a> Lowering<'a> {
                         // int/uint element ranges are recorded; the divert itself is
                         // consumer-gated in the post-pass, so a range read by a
                         // slice-index / field read keeps this ctor + FieldWrite path.
-                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor
-                                .ctor_name
-                                .split('<')
-                                .next()
-                                .unwrap_or(ctor.ctor_name.as_str())
-                                == "Range"
+                        if is_core_ops_range_adt_ctor(&ctor.owner_path, &ctor.ctor_name, "Range")
                             && arg_vars.len() == 2
                             && self.aggregate_head_is_int_range(&kind)
                         {
@@ -2921,13 +2922,7 @@ impl<'a> Lowering<'a> {
                                 },
                             );
                         }
-                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor
-                                .ctor_name
-                                .split('<')
-                                .next()
-                                .unwrap_or(ctor.ctor_name.as_str())
-                                == "RangeTo"
+                        if is_core_ops_range_adt_ctor(&ctor.owner_path, &ctor.ctor_name, "RangeTo")
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangeto_sites.push(
@@ -2937,14 +2932,11 @@ impl<'a> Lowering<'a> {
                                 },
                             );
                         }
-                        if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor
-                                .ctor_name
-                                .split('<')
-                                .next()
-                                .unwrap_or(ctor.ctor_name.as_str())
-                                == "RangeFrom"
-                            && arg_vars.len() == 1
+                        if is_core_ops_range_adt_ctor(
+                            &ctor.owner_path,
+                            &ctor.ctor_name,
+                            "RangeFrom",
+                        ) && arg_vars.len() == 1
                         {
                             self.slice_index_rangefrom_sites.push(
                                 crate::front::slice_index::SliceIndexRangeFromSite {
@@ -3624,6 +3616,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::STRINGBUILDER_BUILD.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![builder]),
                 result_ty: ValueType::Ref(None),
@@ -3669,6 +3662,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec![crate::runtime_names::shims::UNICHAR_AS_UTF8.to_string()],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![piece.clone()]),
                 result_ty: ValueType::Str,
@@ -4025,6 +4019,7 @@ impl<'a> Lowering<'a> {
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg.clone()]),
             result_ty: ValueType::Int,
@@ -4083,6 +4078,7 @@ impl<'a> Lowering<'a> {
                     .map(str::to_string)
                     .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![signed]),
             result_ty: ValueType::Unsigned,
@@ -4453,6 +4449,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: vec!["__str_const".to_string(), s],
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 // A `&str` / `&[u8]` literal lowers to `Ptr(STR)` (getkind
@@ -4496,6 +4493,7 @@ impl<'a> Lowering<'a> {
                     target: CallTarget::FunctionPath {
                         segments: synthetic,
                         fun_decl_id: None,
+                        specialization: crate::parse::GraphSpecialization::Regular,
                     },
                     args: crate::model::call_args(vec![]),
                     result_ty: ValueType::Int,
@@ -5352,36 +5350,44 @@ impl<'a> Lowering<'a> {
                     // ptr-identity-cast arm applies before its own field reads.
                     let narrow_root: Option<String> = match &inner.kind {
                         PlaceKind::Projection(pre, ProjectionElem::Atom(s)) if s == "Deref" => {
-                            let stripped = tyref_node(&pre.ty, self.llbc)
-                                .and_then(|n| strip_ty_wrappers(n, self.llbc));
-                            // `(*p).f` on a raw address is `getfield_raw` at the
-                            // host offset. A cast onto the gc shell is the Gc
-                            // pointee's narrow.
-                            if stripped.as_ref().is_some_and(|n| {
-                                raw_ptr_node_is_declared_raw(n, self.llbc, self.gc_struct_ids)
-                            }) {
+                            // A `*mut Utf8Str` is rstr `Ptr(STR)`
+                            // (`rpython/rtyper/lltypesystem/rstr.py` `STR`),
+                            // already painted `ValueType::Str`. It is not a
+                            // `SomeInstance` of a class (`LLHelpers.ll_strlen`).
+                            if tyref_raw_ptr_pointee_is_string_value(&pre.ty, self.llbc) {
                                 None
                             } else {
-                                stripped.and_then(|n| {
-                                    raw_ptr_pointee_class_root_with(
-                                        n,
-                                        self.llbc,
-                                        self.tombstoned_leaves,
-                                    )
-                                    .or_else(|| {
-                                        let root = adt_node_class_root_with(
+                                let stripped = tyref_node(&pre.ty, self.llbc)
+                                    .and_then(|n| strip_ty_wrappers(n, self.llbc));
+                                // `(*p).f` on a raw address is `getfield_raw` at the
+                                // host offset. A cast onto the gc shell is the Gc
+                                // pointee's narrow.
+                                if stripped.as_ref().is_some_and(|n| {
+                                    raw_ptr_node_is_declared_raw(n, self.llbc, self.gc_struct_ids)
+                                }) {
+                                    None
+                                } else {
+                                    stripped.and_then(|n| {
+                                        raw_ptr_pointee_class_root_with(
                                             n,
                                             self.llbc,
                                             self.tombstoned_leaves,
-                                        )?;
-                                        // `&ObjectKey` is the dict key the
-                                        // `eq` body reads `.hash` from. Other
-                                        // structs stay uncast: a blanket
-                                        // narrow paints `Tuple` onto values
-                                        // that are already tuples.
-                                        (root == "ObjectKey").then_some(root)
+                                        )
+                                        .or_else(|| {
+                                            let root = adt_node_class_root_with(
+                                                n,
+                                                self.llbc,
+                                                self.tombstoned_leaves,
+                                            )?;
+                                            // `&ObjectKey` is the dict key the
+                                            // `eq` body reads `.hash` from. Other
+                                            // structs stay uncast: a blanket
+                                            // narrow paints `Tuple` onto values
+                                            // that are already tuples.
+                                            (root == OBJECT_KEY_CLASS_ROOT).then_some(root)
+                                        })
                                     })
-                                })
+                                }
                             }
                         }
                         _ => None,
@@ -5401,9 +5407,9 @@ impl<'a> Lowering<'a> {
                     // reference-typed Result/Option shells classdef-less;
                     // the payload read casts to the variant class below.
                     // Carrier `Result<T, PyError>` is the exception transform.
-                    // `owner_root` is the variant leaf (`Result<String,E>::Ok`),
-                    // not the crate path. A leading `Result::` / `Result<` is
-                    // that class; `::Result` covers a qualified spelling.
+                    // `owner_root` is the class identity (`result::Result<String,E>::Ok`).
+                    // A leading `Result::` / `Result<` is that class; `::Result`
+                    // covers a qualified spelling.
                     let enum_payload_owner = owner_root.starts_with("Result::")
                         || owner_root.starts_with("Result<")
                         || owner_root.starts_with("Option::")
@@ -5597,7 +5603,7 @@ impl<'a> Lowering<'a> {
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
-                            kind: crate::model::cast_instance_call("PyObject", res),
+                            kind: crate::model::cast_instance_call(W_ROOT_CLASS_ROOT, res),
                         });
                         return Ok(narrowed);
                     }
@@ -5716,6 +5722,7 @@ impl<'a> Lowering<'a> {
                             target: CallTarget::FunctionPath {
                                 segments: vec!["__string_byte_getitem".to_string()],
                                 fun_decl_id: None,
+                                specialization: crate::parse::GraphSpecialization::Regular,
                             },
                             args: crate::model::call_args(vec![base, idx_var]),
                             result_ty: if copied_bytes {
@@ -6241,7 +6248,7 @@ impl<'a> Lowering<'a> {
                 if fmt_path_ends_with(&segments, &["pyobject", "PY_NULL"])
                     && tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves)
                         .as_deref()
-                        == Some("PyObject")
+                        == Some(W_ROOT_CLASS_ROOT)
                 {
                     let bb_id = self.emit_bb(mir_bb);
                     let raw = self.graph.push_null_mut_ptr(bb_id);
@@ -6250,7 +6257,7 @@ impl<'a> Lowering<'a> {
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
-                        kind: crate::model::cast_instance_call("PyObject", raw),
+                        kind: crate::model::cast_instance_call(W_ROOT_CLASS_ROOT, raw),
                     });
                     return Ok(res);
                 }
@@ -6884,9 +6891,27 @@ impl<'a> Lowering<'a> {
         }
         let name_path = td.item_meta.name_path();
         let head_adt = head.as_object();
-        let mut segments: Vec<String> = name_path.split("::").map(str::to_string).collect();
-        let type_leaf = segments.pop().unwrap_or_default();
-        let owner_path = segments;
+        let type_leaf = class_identity_spelling(&name_path, self.tombstoned_leaves);
+        // Crate prefix in front of the identity, so joining `owner_path` with
+        // the identity (plus suffix) still yields the full declaration path.
+        // A crate-root tombstone keeps the crate in the identity, so the
+        // prefix is empty.
+        let owner_path = if name_path == type_leaf {
+            Vec::new()
+        } else if let Some(prefix) = name_path
+            .strip_suffix(type_leaf.as_str())
+            .and_then(|p| p.strip_suffix("::"))
+        {
+            if prefix.is_empty() {
+                Vec::new()
+            } else {
+                prefix.split("::").map(str::to_string).collect()
+            }
+        } else {
+            let mut segs: Vec<String> = name_path.split("::").map(str::to_string).collect();
+            segs.pop();
+            segs
+        };
         match (&td.kind, variant_idx) {
             (TypeDeclKind::Struct(fields), None) | (TypeDeclKind::Struct(fields), Some(_)) => {
                 // Substitute dest_ty / head generics so a field whose
@@ -7136,13 +7161,13 @@ impl<'a> Lowering<'a> {
         // The full `name_path()` is in hand here, so mint the owning
         // type's object-identity token from the crate-stripped qualified
         // path (`module::Type` / `module::Enum::Variant`) — the same key
-        // the layout layer is registered under.  `owner_root` stays the
-        // bare leaf its non-layout consumers expect; `owner_id` carries
-        // the collision-free identity for the layout layer.
+        // the layout layer is registered under. `owner_id` carries the
+        // collision-free identity for the layout layer.
         let name_path = td.item_meta.name_path();
-        // `owner_root` is the annotation-side classdef key: a
-        // reference-payload workspace enum instantiation reads its field
-        // off the per-instantiation variant class (`Result<Tuple>::Ok`),
+        // `owner_root` is the annotation-side class identity (crate-stripped
+        // `module::Type`): a reference-payload workspace enum instantiation
+        // reads its field off the per-instantiation variant class
+        // (`option::Option<Tuple>::Some` / `result::Result<Tuple>::Ok`),
         // matching the receiver / constructor projection. `owner_id` is the
         // independent layout-side identity and preserves every concrete type
         // argument, including primitive payloads for which the annotator does
@@ -7150,20 +7175,18 @@ impl<'a> Lowering<'a> {
         let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
         // Duplicate-leaf hardening drops the shared `closure` /
         // `closure#N` alias from the field registry.  Field reads of a
-        // capture must key the full crate-stripped path the registry
-        // kept — the same spelling [`tyref_input_class_root`] uses for
-        // the env parameter.
-        // A tombstoned leaf uses the same spelling as
-        // [`adt_node_class_root_with`]: the crate-stripped path, or the
-        // full declaration path when stripping yields the leaf itself.
+        // capture must key the crate-stripped path the registry kept —
+        // the same spelling [`tyref_input_class_root`] uses for the env
+        // parameter.
+        // Closure leaves are tombstoned, so [`class_identity_spelling`]
+        // would call [`tombstoned_owner_spelling`]. That returns the full
+        // declaration path when stripping yields the leaf (a crate-root
+        // closure) or when the stripped path itself is tombstoned;
+        // [`strip_crate_prefix`] does not. Keep the crate-stripped path.
+        let owner_base = class_identity_spelling(&name_path, self.tombstoned_leaves);
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            let owner_base = if self.tombstoned_leaves.contains(&owner_leaf) {
-                tombstoned_owner_spelling(&name_path, &owner_leaf, self.tombstoned_leaves)
-            } else {
-                owner_leaf
-            };
             match adt_head_instantiation_suffix(head, self.llbc) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
                 None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
@@ -7557,6 +7580,7 @@ impl<'a> Lowering<'a> {
                                 .map(str::to_string)
                                 .collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![arg]),
                         result_ty: ValueType::Unsigned,
@@ -7576,6 +7600,7 @@ impl<'a> Lowering<'a> {
                                 .map(str::to_string)
                                 .collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![arg]),
                         result_ty: ValueType::Int,
@@ -8767,6 +8792,7 @@ pub(in crate::front::mir) fn push_direct_ptradd(
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![ptr, count]),
             result_ty: ValueType::Int,
@@ -8962,6 +8988,7 @@ pub(in crate::front::mir) fn push_cast_ptr_to_int(
                 .map(str::to_string)
                 .collect(),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![arg]),
             result_ty: ValueType::Int,
@@ -8995,6 +9022,7 @@ pub(in crate::front::mir) fn rarithmetic_mask(
                 .map(str::to_string)
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![arg]),
         result_ty,
@@ -9023,6 +9051,7 @@ pub(in crate::front::mir) fn push_ptr_to_unsigned_cast(
                 .map(str::to_string)
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         },
         args: crate::model::call_args(vec![signed]),
         result_ty: ValueType::Unsigned,

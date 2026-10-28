@@ -263,6 +263,23 @@ pub(crate) enum AggregateShape {
     Ctor(AggregateCtor),
 }
 
+/// Unsuffixed `core::ops::range::{leaf}` aggregate. Accepts both the
+/// historical `["core","ops","range"]` + `Range<T>` split and the class
+/// identity split `["core"]` + `ops::range::Range<T>`.
+pub(in crate::front::mir) fn is_core_ops_range_adt_ctor(
+    owner_path: &[String],
+    ctor_name: &str,
+    leaf: &str,
+) -> bool {
+    let joined = if owner_path.is_empty() {
+        ctor_name.to_string()
+    } else {
+        format!("{}::{ctor_name}", owner_path.join("::"))
+    };
+    let base = joined.split_once('<').map_or(joined.as_str(), |(b, _)| b);
+    base == format!("core::ops::range::{leaf}")
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AggregateCtor {
     pub(in crate::front::mir) target: CallTarget,
@@ -2000,7 +2017,12 @@ pub(in crate::front::mir) fn rewrite_result_branch_for_layouts(
     else {
         return kind;
     };
-    if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+    if name != "branch"
+        || !receiver_root.as_deref().is_some_and(|root| {
+            majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(root))
+                == "Result"
+        })
+    {
         return kind;
     }
     let Some(operand) = args.first().and_then(LinkArg::as_variable).cloned() else {
@@ -2037,7 +2059,13 @@ pub(in crate::front::mir) fn lower_result_branch_to_control_flow(graph: &mut Fun
             else {
                 continue;
             };
-            if name != "branch" || !receiver_root.as_deref().unwrap_or("").ends_with("Result") {
+            if name != "branch"
+                || !receiver_root.as_deref().is_some_and(|root| {
+                    majit_ir::descr::strip_instantiation_suffix(majit_ir::descr::class_root_leaf(
+                        root,
+                    )) == "Result"
+                })
+            {
                 continue;
             }
             let Some(operand) = args.first().and_then(LinkArg::as_variable).cloned() else {

@@ -1044,8 +1044,8 @@ fn range_inclusive_known_receiver_paints_instantiation_class() {
         }
     });
     assert_eq!(
-        super::adt_node_class_root_leaf(&node, &llbc, super::no_tombstoned_leaves()),
-        Some("RangeInclusive<i64>".to_string())
+        super::adt_node_class_root_identity(&node, &llbc, super::no_tombstoned_leaves()),
+        Some("ops::range::RangeInclusive<i64>".to_string())
     );
 }
 
@@ -1122,11 +1122,11 @@ fn foreign_generic_slot_instantiations_print_and_intern_distinct() {
     assert_eq!(printed_i64, "Slot<i64>");
     assert_eq!(printed_f64, "Slot<f64>");
     assert_eq!(
-        super::adt_node_class_root_leaf(&node_i64, &llbc, super::no_tombstoned_leaves()),
+        super::adt_node_class_root_identity(&node_i64, &llbc, super::no_tombstoned_leaves()),
         Some("Slot<i64>".to_string())
     );
     assert_eq!(
-        super::adt_node_class_root_leaf(&node_f64, &llbc, super::no_tombstoned_leaves()),
+        super::adt_node_class_root_identity(&node_f64, &llbc, super::no_tombstoned_leaves()),
         Some("Slot<f64>".to_string())
     );
     use crate::annotator::bookkeeper::Bookkeeper;
@@ -1243,7 +1243,7 @@ fn range_inclusive_self_after_subst_paints_instantiation_class() {
     let self_ty = &copied.locals.locals[1].ty;
     assert_eq!(
         super::tyref_ref_param_class_root(self_ty, &llbc, super::no_tombstoned_leaves(), None),
-        Some("RangeInclusive<i64>".to_string())
+        Some("ops::range::RangeInclusive<i64>".to_string())
     );
 }
 
@@ -3805,6 +3805,7 @@ fn first_call_binding(graph: &crate::model::FunctionGraph) -> (Option<u64>, Vec<
             CallTarget::FunctionPath {
                 segments,
                 fun_decl_id,
+                ..
             } => (*fun_decl_id, segments.clone()),
             other => panic!("expected a FunDecl call, got {other:?}"),
         };
@@ -5562,11 +5563,11 @@ fn option_integer_instantiations_paint_distinct_class_roots() {
     let i64_ty = super::tyref_to_value_type(&dest(true), &llbc);
     assert_eq!(
         usize_ty,
-        crate::model::ValueType::Ref(Some("Option<usize>".into()))
+        crate::model::ValueType::Ref(Some("option::Option<usize>".into()))
     );
     assert_eq!(
         i64_ty,
-        crate::model::ValueType::Ref(Some("Option<i64>".into()))
+        crate::model::ValueType::Ref(Some("option::Option<i64>".into()))
     );
     assert_ne!(usize_ty, i64_ty);
 }
@@ -5651,27 +5652,27 @@ fn result_integer_instantiations_paint_distinct_class_roots() {
     let usize_u8 = super::tyref_to_value_type(&usize_dest, &llbc);
     assert_eq!(
         i32_u8,
-        crate::model::ValueType::Ref(Some("Result<i32,u8>".into()))
+        crate::model::ValueType::Ref(Some("result::Result<i32,u8>".into()))
     );
     assert_eq!(
         usize_u8,
-        crate::model::ValueType::Ref(Some("Result<usize,u8>".into()))
+        crate::model::ValueType::Ref(Some("result::Result<usize,u8>".into()))
     );
     assert_ne!(i32_u8, usize_u8);
     assert_eq!(
         super::tyref_ref_param_class_root(&i32_dest, &llbc, super::no_tombstoned_leaves(), None),
-        Some("Result<i32,u8>".into())
+        Some("result::Result<i32,u8>".into())
     );
     assert_eq!(
         super::tyref_ref_param_class_root(&usize_dest, &llbc, super::no_tombstoned_leaves(), None),
-        Some("Result<usize,u8>".into())
+        Some("result::Result<usize,u8>".into())
     );
 }
 
 #[test]
 fn result_with_pointer_like_err_still_paints_class_root() {
     // Result keeps its tag even when `E` is pointer-like
-    // (`adt_node_class_root_leaf`). The parameter carries the same
+    // (`adt_node_class_root_identity`). The parameter carries the same
     // interned class (`bookkeeper.py` `getuniqueclassdef`).
     let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![]);
     let node = result_adt_node(0, option_int_arg(true), raw_mut_u8_arg());
@@ -5680,7 +5681,7 @@ fn result_with_pointer_like_err_still_paints_class_root() {
     match &painted {
         crate::model::ValueType::Ref(Some(root)) => {
             assert!(
-                root.starts_with("Result<") && root.contains("i64"),
+                root.starts_with("result::Result<") && root.contains("i64"),
                 "Result<i64, *mut u8> must intern as a Result class, got {root:?}"
             );
         }
@@ -5689,7 +5690,7 @@ fn result_with_pointer_like_err_still_paints_class_root() {
     let root = super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None);
     assert!(
         root.as_deref()
-            .is_some_and(|r| r.starts_with("Result<") && r.contains("i64")),
+            .is_some_and(|r| r.starts_with("result::Result<") && r.contains("i64")),
         "Result<i64, *mut u8> param must intern as a Result class, got {root:?}"
     );
 }
@@ -5734,24 +5735,24 @@ fn option_of_word_struct_interns_tagged_class() {
     let tomb = super::no_tombstoned_leaves();
     let node = option_adt_node(0, adt_node(1));
     let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
-    assert_eq!(root.as_deref(), Some("Option<WordHasher>"));
+    assert_eq!(root.as_deref(), Some("option::Option<WordHasher>"));
     let ty = TyRef::Other(node);
     assert_eq!(
         super::tyref_to_value_type(&ty, &llbc),
-        crate::model::ValueType::Ref(Some("Option<WordHasher>".into()))
+        crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
     );
     assert_eq!(
         super::tyref_ref_param_class_root(&ty, &llbc, &tomb, None),
-        Some("Option<WordHasher>".into())
+        Some("option::Option<WordHasher>".into())
     );
     let borrowed = TyRef::Other(option_shared_ref(option_adt_node(0, adt_node(1))));
     assert_eq!(
         super::tyref_to_value_type(&borrowed, &llbc),
-        crate::model::ValueType::Ref(Some("Option<WordHasher>".into()))
+        crate::model::ValueType::Ref(Some("option::Option<WordHasher>".into()))
     );
     assert_eq!(
         super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
-        Some("Option<WordHasher>".into())
+        Some("option::Option<WordHasher>".into())
     );
 }
 
@@ -5832,7 +5833,7 @@ fn option_with_extra_fn_ptr_arg_still_interns() {
     let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
     assert!(
         root.as_deref()
-            .is_some_and(|r| r.starts_with("Option<") && r.contains("WordHasher")),
+            .is_some_and(|r| r.starts_with("option::Option<") && r.contains("WordHasher")),
         "tagged Option with a leaked fn-ptr Instantiated arg must intern, got {root:?}"
     );
     let ty = TyRef::Other(node);
@@ -5902,7 +5903,7 @@ fn option_of_nested_hasher_map_interns_tagged_class() {
     let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
     assert!(
         root.as_deref()
-            .is_some_and(|r| r.starts_with("Option<") && r.contains("HashMap")),
+            .is_some_and(|r| r.starts_with("option::Option<") && r.contains("HashMap")),
         "tagged Option of HashMap<_,_,BuildHasherDefault<_>> must intern, got {root:?}"
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
@@ -5941,13 +5942,13 @@ fn option_instantiated_type_decl_interns_tagged_class() {
     let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
     assert_eq!(
         root.as_deref(),
-        Some("Option<WordHasher>"),
+        Some("option::Option<WordHasher>"),
         "Instantiated Option TypeDecl with empty use-site generics must intern, got {root:?}"
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
         super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
-        Some("Option<WordHasher>".into())
+        Some("option::Option<WordHasher>".into())
     );
 }
 
@@ -5980,13 +5981,13 @@ fn option_instantiated_dedup_skip_binder_interns_tagged_class() {
     let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
     assert_eq!(
         root.as_deref(),
-        Some("Option<WordHasher>"),
+        Some("option::Option<WordHasher>"),
         "Deduplicated Instantiated skip_binder must intern, got {root:?}"
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
     assert_eq!(
         super::tyref_ref_param_class_root(&borrowed, &llbc, &tomb, None),
-        Some("Option<WordHasher>".into())
+        Some("option::Option<WordHasher>".into())
     );
 }
 
@@ -6013,7 +6014,7 @@ fn option_of_dict_with_hasher_and_raw_ptr_interns_tagged_class() {
     let root = super::adt_node_class_root_with(&node, &llbc, &tomb);
     assert!(
         root.as_deref()
-            .is_some_and(|r| r.starts_with("Option<") && r.contains("RDict")),
+            .is_some_and(|r| r.starts_with("option::Option<") && r.contains("RDict")),
         "tagged Option of RDict<_,_,BuildHasherDefault<_>> must intern, got {root:?}"
     );
     let borrowed = TyRef::Other(option_shared_ref(node));
@@ -6030,16 +6031,16 @@ fn control_flow_value_and_param_share_instantiation_class() {
     let node = result_adt_node(0, option_int_arg(true), option_int_arg(true));
     assert_eq!(
         super::adt_node_class_root_with(&node, &llbc, super::no_tombstoned_leaves()),
-        Some("ControlFlow<i64,i64>".into())
+        Some("ops::control_flow::ControlFlow<i64,i64>".into())
     );
     let ty = TyRef::Other(node);
     assert_eq!(
         super::tyref_to_value_type(&ty, &llbc),
-        crate::model::ValueType::Ref(Some("ControlFlow<i64,i64>".into()))
+        crate::model::ValueType::Ref(Some("ops::control_flow::ControlFlow<i64,i64>".into()))
     );
     assert_eq!(
         super::tyref_ref_param_class_root(&ty, &llbc, super::no_tombstoned_leaves(), None),
-        Some("ControlFlow<i64,i64>".into())
+        Some("ops::control_flow::ControlFlow<i64,i64>".into())
     );
 }
 
@@ -6097,11 +6098,11 @@ fn control_flow_integer_instantiations_paint_distinct_class_roots() {
     let usize_u8 = super::tyref_to_value_type(&dest(usize_ty, u8_ty), &llbc);
     assert_eq!(
         i32_u8,
-        crate::model::ValueType::Ref(Some("ControlFlow<u8,i32>".into()))
+        crate::model::ValueType::Ref(Some("ops::control_flow::ControlFlow<u8,i32>".into()))
     );
     assert_eq!(
         usize_u8,
-        crate::model::ValueType::Ref(Some("ControlFlow<u8,usize>".into()))
+        crate::model::ValueType::Ref(Some("ops::control_flow::ControlFlow<u8,usize>".into()))
     );
     assert_ne!(i32_u8, usize_u8);
 }
@@ -6149,6 +6150,40 @@ fn opaque_struct_field_name_uses_harvested_declared_name() {
     assert_eq!(
         super::opaque_struct_field_name("error::PyError", 1, &reg),
         "__pos_1"
+    );
+}
+
+/// Two same-leaf structs intern as distinct class identities. The
+/// crate-stripped `module::Type` is the intern key
+/// (`bookkeeper.py` `Bookkeeper.getdesc`); the bare leaf is display-only.
+#[test]
+fn two_same_leaf_structs_paint_distinct_class_roots() {
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![
+            code_struct(0, &["fixture", "a", "Dup"]),
+            code_struct(1, &["fixture", "b", "Dup"]),
+        ],
+        vec![],
+    );
+    let tomb = super::no_tombstoned_leaves();
+    let a = TyRef::Other(adt_node(0));
+    let b = TyRef::Other(adt_node(1));
+    assert_eq!(
+        super::adt_node_class_root_with(&adt_node(0), &llbc, &tomb).as_deref(),
+        Some("a::Dup")
+    );
+    assert_eq!(
+        super::adt_node_class_root_with(&adt_node(1), &llbc, &tomb).as_deref(),
+        Some("b::Dup")
+    );
+    assert_eq!(
+        super::tyref_ref_param_class_root(&a, &llbc, &tomb, None).as_deref(),
+        Some("a::Dup")
+    );
+    assert_eq!(
+        super::tyref_ref_param_class_root(&b, &llbc, &tomb, None).as_deref(),
+        Some("b::Dup")
     );
 }
 
@@ -6529,7 +6564,7 @@ fn option_of_object_pointer_slice_is_nullable_list() {
     use crate::model::ValueType;
     let llbc = option_of_object_pointer_slice_llbc();
     let option_ty = TyRef::Other(option_adt_node(0, object_pointer_slice_node("Shared")));
-    let list_root = Some("[PyObject]".to_string());
+    let list_root = Some("[pyobject::PyObject]".to_string());
     assert_eq!(
         super::tyref_to_value_type(&option_ty, &llbc),
         ValueType::Ref(list_root.clone()),
@@ -6549,8 +6584,8 @@ fn option_of_object_pointer_slice_is_nullable_list() {
         assert_eq!(
             lowering.option_niche_null_cast(&option_ty),
             Some((
-                "[PyObject]".to_string(),
-                ValueType::Ref(Some("[PyObject]".into()))
+                "[pyobject::PyObject]".to_string(),
+                ValueType::Ref(Some("[pyobject::PyObject]".into()))
             )),
             "None is convert_const(None) on that ListRepr"
         );
@@ -6569,7 +6604,7 @@ fn option_of_bare_object_pointer_slice_is_nullable_list() {
     ));
     assert_eq!(
         super::tyref_to_value_type(&option_ty, &llbc),
-        ValueType::Ref(Some("[PyObject]".into())),
+        ValueType::Ref(Some("[pyobject::PyObject]".into())),
         "Charon Option<[PyObject]> paints as the nullable object list"
     );
     with_fixture_lowering(&llbc, |lowering| {

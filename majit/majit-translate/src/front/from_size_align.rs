@@ -190,7 +190,7 @@ pub(crate) fn is_layout_new(segments: &[String]) -> bool {
         .get(segments.len().wrapping_sub(2))
         .map(String::as_str)
     {
-        Some("Layout") => true,
+        Some(seg) if majit_ir::descr::class_root_leaf(seg) == "Layout" => true,
         Some("<Impl>") => {
             segments
                 .get(segments.len().wrapping_sub(3))
@@ -220,7 +220,13 @@ pub(crate) fn is_layout_from_size_align_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "from_size_align" && receiver_root.as_deref() == Some("Layout"),
+        } => {
+            name == "from_size_align"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Layout")
+        }
         _ => false,
     }
 }
@@ -236,7 +242,7 @@ fn is_layout_method_leaf(segments: &[String], leaf: &str) -> bool {
         .get(segments.len().wrapping_sub(2))
         .map(String::as_str)
     {
-        Some("Layout") => true,
+        Some(seg) if majit_ir::descr::class_root_leaf(seg) == "Layout" => true,
         Some("<Impl>") => {
             segments
                 .get(segments.len().wrapping_sub(3))
@@ -255,7 +261,13 @@ pub(crate) fn layout_accessor_field(target: &CallTarget) -> Option<&'static str>
             name,
             receiver_root,
             ..
-        } if receiver_root.as_deref() == Some("Layout") => name.as_str(),
+        } if receiver_root
+            .as_deref()
+            .map(majit_ir::descr::class_root_leaf)
+            == Some("Layout") =>
+        {
+            name.as_str()
+        }
         _ => return None,
     };
     let field = match leaf {
@@ -283,7 +295,7 @@ fn result_method_segments(segments: &[String], leaf: &str) -> bool {
         .get(segments.len().wrapping_sub(2))
         .map(String::as_str)
     {
-        Some("Result") => true,
+        Some(seg) if majit_ir::descr::class_root_leaf(seg) == "Result" => true,
         Some("<Impl>") => {
             segments
                 .get(segments.len().wrapping_sub(3))
@@ -300,7 +312,13 @@ fn is_result_ok_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "ok" && receiver_root.as_deref() == Some("Result"),
+        } => {
+            name == "ok"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Result")
+        }
         CallTarget::FunctionPath { segments, .. } => result_method_segments(segments, "ok"),
         _ => false,
     }
@@ -312,7 +330,13 @@ fn is_result_expect_target(target: &CallTarget) -> bool {
             name,
             receiver_root,
             ..
-        } => name == "expect" && receiver_root.as_deref() == Some("Result"),
+        } => {
+            name == "expect"
+                && receiver_root
+                    .as_deref()
+                    .map(majit_ir::descr::class_root_leaf)
+                    == Some("Result")
+        }
         CallTarget::FunctionPath { segments, .. } => result_method_segments(segments, "expect"),
         _ => false,
     }
@@ -1087,6 +1111,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1734,6 +1759,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1754,6 +1780,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 
@@ -1915,6 +1942,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 

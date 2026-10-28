@@ -696,6 +696,7 @@ impl<'a> Lowering<'a> {
                 target: CallTarget::FunctionPath {
                     segments: path.split("::").map(str::to_string).collect(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(args),
                 result_ty,
@@ -1222,6 +1223,7 @@ impl<'a> Lowering<'a> {
                         .map(str::to_string)
                         .collect(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![]),
                 result_ty: ValueType::Void,
@@ -3063,6 +3065,7 @@ impl<'a> Lowering<'a> {
                 let mut target = CallTarget::FunctionPath {
                     segments,
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 };
                 if let Some(id) = fun_decl_id {
                     target = target.with_fun_decl_id(id);

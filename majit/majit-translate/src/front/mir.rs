@@ -2977,7 +2977,7 @@ pub(crate) fn positional_field_type(ty: &str) -> String {
         && !ty.starts_with("Rc<")
         && !ty.starts_with("Vec<")
         && !ty.starts_with("Option<")
-        && ty != "String"
+        && !is_rust_heap_string_root(ty)
     {
         format!("&{ty}")
     } else {
@@ -3023,7 +3023,7 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
         // `Ref(None)` instance that walled `str ∪ Instance(classdef-less)`.
         // `Str` is register kind 'ref'/`GcRef` downstream, identical to `Ref`.
         // A Rust-heap `String` is a Vec-shaped header, not rstr `STR`.
-        "String" => ValueType::Ref(Some("String".into())),
+        s if is_rust_heap_string_root(s) => ValueType::Ref(Some(s.into())),
         "str"
         | "Wtf8"
         | "Wtf8Buf"
@@ -4583,6 +4583,27 @@ fn tombstoned_owner_spelling(
     }
 }
 
+/// Class identity of a type declaration: the crate-stripped
+/// `module::Type` (`bookkeeper.py Bookkeeper.getdesc` keys one class
+/// object per declaration; the bare leaf is display-only). A crate-root
+/// declaration strips to its leaf. A withdrawn duplicate leaf uses
+/// [`tombstoned_owner_spelling`].
+///
+/// `name_path` is always a full `item_meta.name_path()`. Never call this
+/// on an already crate-stripped string (`option::Option` would collapse
+/// to `Option`).
+pub(crate) fn class_identity_spelling(
+    name_path: &str,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    let leaf = name_path.rsplit("::").next().unwrap_or(name_path);
+    if tombstoned.contains(leaf) {
+        tombstoned_owner_spelling(name_path, leaf, tombstoned)
+    } else {
+        strip_crate_prefix(name_path)
+    }
+}
+
 /// Tombstones for one LLBC, the set [`LowerContext::new`] paints with.
 pub(crate) fn tombstoned_leaves_of(llbc: &Llbc) -> std::collections::HashSet<String> {
     DuplicateLeafFacts::discover(llbc).tombstoned_leaves()
@@ -5231,7 +5252,8 @@ pub(crate) use self::lltype::{
     charon_literal_to_ast_string, charon_type_value_to_ast_string,
     collect_foreign_opaque_method_externals, collect_policy_opaque_fn_stubs_from_llbc,
     fixed_array_index_identity, fnptr_indirect_enabled, host_rthread_threadlocalref_llop,
-    is_flattened_storage_leaf, items_block_accessor_returns_its_block, nonzero_option_zero,
+    is_flattened_storage_leaf, is_str_family_class_root, is_str_length_field_class_root,
+    is_str_oopspec_class_root, items_block_accessor_returns_its_block, nonzero_option_zero,
     output_type_is_objectptr, push_unichr, same_nominal_adt, strip_crate_prefix,
     type_decl_ref_adt_id, type_decl_ref_builtin, type_decl_ref_generics, tyref_is_fat_dyn,
     unichr_call,
@@ -6856,6 +6878,7 @@ pub(crate) fn emit_rust_vec_drop_if_allocated(
             target: CallTarget::FunctionPath {
                 segments: rust_vec_helper_segments(majit_ir::rvec::VecOp::Free, kind),
                 fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
             },
             args: crate::model::call_args(vec![header.clone()]),
             result_ty: ValueType::Void,

@@ -373,6 +373,7 @@ mod tests {
                 target: CallTarget::FunctionPath {
                     segments: is_ascii_segments(),
                     fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
                 },
                 args: crate::model::call_args(vec![slice]),
                 result_ty: ValueType::Bool,

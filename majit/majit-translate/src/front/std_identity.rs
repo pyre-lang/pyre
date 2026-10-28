@@ -497,6 +497,7 @@ mod tests {
         CallTarget::FunctionPath {
             segments: segments.iter().map(|s| s.to_string()).collect(),
             fun_decl_id: None,
+            specialization: crate::parse::GraphSpecialization::Regular,
         }
     }
 

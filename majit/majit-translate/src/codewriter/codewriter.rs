@@ -368,7 +368,7 @@ impl CodeWriter {
         callcontrol: &mut CallControl,
         path: &crate::parse::CallPath,
     ) -> Option<crate::translator::rtyper::flowspace_adapter::LegacyToTyped> {
-        let diag_label = path.canonical_key();
+        let diag_label = path.display_name();
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
             // When the two-phase prepass populated the cache, read the cached

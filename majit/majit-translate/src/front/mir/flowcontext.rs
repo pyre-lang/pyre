@@ -1373,6 +1373,7 @@ impl<'a> Lowering<'a> {
                             .map(str::to_string)
                             .collect(),
                             fun_decl_id: None,
+                            specialization: crate::parse::GraphSpecialization::Regular,
                         },
                         args: crate::model::call_args(vec![length]),
                         result_ty: ValueType::Unsigned,
