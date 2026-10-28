@@ -882,7 +882,10 @@ print(total)`;
     async function setup() {
       try {
         const { default: init, run_python } = await import("./pyre_wasm.js");
-        await init();
+        const wasm = await init();
+        const { jit_set_memory, jit_set_table } = await import("./jit_glue.js");
+        jit_set_memory(wasm.memory);
+        if (wasm.__indirect_function_table) { jit_set_table(wasm.__indirect_function_table); }
         runPython = run_python;
         runButton.disabled = false;
         setStatus("Ready", "ready");

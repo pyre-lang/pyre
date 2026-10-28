@@ -1,8 +1,14 @@
 /* @ts-self-types="./pyre_wasm.d.ts" */
-import { jit_compile_wasm, jit_execute_wasm } from './jit_glue.js';
+import { jit_compile_wasm, jit_execute_wasm, jit_free_wasm, jit_replace_wasm } from './jit_glue.js';
+import * as import1 from "./jit_glue.js"
+
 
 /**
- * Run a Python source string and return the output as a string.
+ * Browser / JS entry point: marshalled by wasm-bindgen.
+ *
+ * The browser has one output channel, so the fd-2 text (traceback, warnings)
+ * is appended to the returned string rather than handed over separately the
+ * way the C-ABI surface does it.
  * @param {string} source
  * @returns {string}
  */
@@ -10,29 +16,43 @@ export function run_python(source) {
     let deferred2_0;
     let deferred2_1;
     try {
-        const ptr0 = passStringToWasm0(source, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const ptr0 = passStringToWasm0(source, wasm.__wbindgen_malloc_command_export, wasm.__wbindgen_realloc_command_export);
         const len0 = WASM_VECTOR_LEN;
         const ret = wasm.run_python(ptr0, len0);
         deferred2_0 = ret[0];
         deferred2_1 = ret[1];
         return getStringFromWasm0(ret[0], ret[1]);
     } finally {
-        wasm.__wbindgen_free(deferred2_0, deferred2_1, 1);
+        wasm.__wbindgen_free_command_export(deferred2_0, deferred2_1, 1);
     }
 }
-
 function __wbg_get_imports() {
     const import0 = {
         __proto__: null,
-        __wbg_getRandomValues_3f44b700395062e5: function() { return handleError(function (arg0, arg1) {
+        __wbg_getRandomValues_cc7f052a444bb2ce: function() { return handleError(function (arg0, arg1) {
             globalThis.crypto.getRandomValues(getArrayU8FromWasm0(arg0, arg1));
         }, arguments); },
-        __wbg_jit_compile_wasm_d24919ba7e790e60: function(arg0, arg1) {
+        __wbg_jit_compile_wasm_280ffe2636b84a4d: function(arg0, arg1) {
             const ret = jit_compile_wasm(arg0 >>> 0, arg1 >>> 0);
             return ret;
         },
-        __wbg_jit_execute_wasm_33ec43d535b84b2e: function(arg0, arg1) {
+        __wbg_jit_execute_wasm_11d9a9762fee180d: function(arg0, arg1) {
             const ret = jit_execute_wasm(arg0 >>> 0, arg1 >>> 0);
+            return ret;
+        },
+        __wbg_jit_free_wasm_6ae2f046564f5bcf: function(arg0) {
+            jit_free_wasm(arg0 >>> 0);
+        },
+        __wbg_jit_replace_wasm_327c68f60254e559: function(arg0, arg1, arg2) {
+            const ret = jit_replace_wasm(arg0 >>> 0, arg1 >>> 0, arg2 >>> 0);
+            return ret;
+        },
+        __wbg_now_05cd18eb7b8c5e29: function() {
+            const ret = performance.now();
+            return ret;
+        },
+        __wbg_now_97eac67b0334e12a: function() {
+            const ret = Date.now();
             return ret;
         },
         __wbindgen_init_externref_table: function() {
@@ -48,11 +68,12 @@ function __wbg_get_imports() {
     return {
         __proto__: null,
         "./pyre_wasm_bg.js": import0,
+        "./jit_glue.js": import1,
     };
 }
 
 function addToExternrefTable0(obj) {
-    const idx = wasm.__externref_table_alloc();
+    const idx = wasm.__externref_table_alloc_command_export();
     wasm.__wbindgen_externrefs.set(idx, obj);
     return idx;
 }
@@ -63,8 +84,7 @@ function getArrayU8FromWasm0(ptr, len) {
 }
 
 function getStringFromWasm0(ptr, len) {
-    ptr = ptr >>> 0;
-    return decodeText(ptr, len);
+    return decodeText(ptr >>> 0, len);
 }
 
 let cachedUint8ArrayMemory0 = null;
@@ -80,7 +100,7 @@ function handleError(f, args) {
         return f.apply(this, args);
     } catch (e) {
         const idx = addToExternrefTable0(e);
-        wasm.__wbindgen_exn_store(idx);
+        wasm.__wbindgen_exn_store_command_export(idx);
     }
 }
 
@@ -150,8 +170,9 @@ if (!('encodeInto' in cachedTextEncoder)) {
 
 let WASM_VECTOR_LEN = 0;
 
-let wasmModule, wasm;
+let wasmModule, wasmInstance, wasm;
 function __wbg_finalize_init(instance, module) {
+    wasmInstance = instance;
     wasm = instance.exports;
     wasmModule = module;
     cachedUint8ArrayMemory0 = null;
@@ -161,11 +182,15 @@ function __wbg_finalize_init(instance, module) {
 
 async function __wbg_load(module, imports) {
     if (typeof Response === 'function' && module instanceof Response) {
+        if (!module.ok) {
+            throw new Error(`failed to fetch Wasm: ${module.status} ${module.statusText} fetching '${module.url}'`);
+        }
+
         if (typeof WebAssembly.instantiateStreaming === 'function') {
             try {
                 return await WebAssembly.instantiateStreaming(module, imports);
             } catch (e) {
-                const validResponse = module.ok && expectedResponseType(module.type);
+                const validResponse = expectedResponseType(module.type);
 
                 if (validResponse && module.headers.get('Content-Type') !== 'application/wasm') {
                     console.warn("`WebAssembly.instantiateStreaming` failed because your server does not serve Wasm with `application/wasm` MIME type. Falling back to `WebAssembly.instantiate` which is slower. Original error:\n", e);
