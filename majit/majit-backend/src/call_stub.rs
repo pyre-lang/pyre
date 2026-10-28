@@ -546,7 +546,7 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if wasm_residual_host_call(func, args, classes, 'v', false, 8).is_some() {
+    if wasm_residual_host_call(func, args, classes, 'v', false, 0).is_some() {
         return;
     }
     unsafe { (lookup_stub_v(classes))(func, args) }
