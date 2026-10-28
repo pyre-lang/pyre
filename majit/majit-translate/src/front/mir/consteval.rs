@@ -1372,61 +1372,6 @@ pub(in crate::front::mir) fn code_flags_const(segments: &[String]) -> Option<OpK
     Some(OpKind::ConstUInt(u64::from(bits)))
 }
 
-/// `bitflags` method on `rustpython_compiler_core::bytecode::CodeFlags`.
-///
-/// The impl body is outside the extracted crates, so the call would stay a
-/// residual `FunctionPath`. The owner test is the same crate and module
-/// [`code_flags_const`] uses, plus the `CodeFlags` type: a same-named method
-/// on any other type stays a call. `contains` / `intersects` / `bitor` are
-/// the integer operations the macro expands to; `bits` is the transparent
-/// `u32` word those ops already read. Every other method stays residual.
-pub(in crate::front::mir) fn code_flags_method(
-    llbc: &Llbc,
-    reg: &RegularCall,
-) -> Option<(&'static str, TyRef)> {
-    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-        return None;
-    };
-    let fd = llbc.fn_by_id(*id)?;
-    let segs = &fd.item_meta.name;
-    let last_idx = segs
-        .iter()
-        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
-    let leaf = match &segs[last_idx] {
-        NameSeg::Ident { ident: (s, _) } => s.as_str(),
-        _ => return None,
-    };
-    if last_idx == 0 {
-        return None;
-    }
-    let impl_payload = match &segs[last_idx - 1] {
-        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
-        _ => return None,
-    };
-    let owner_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
-    let owner = llbc.type_by_id(owner_id)?;
-    if owner.item_meta.name_path() != "rustpython_compiler_core::bytecode::CodeFlags" {
-        return None;
-    }
-    let leaf = match leaf {
-        "contains" => "contains",
-        "intersects" => "intersects",
-        "bitor" => "bitor",
-        "bits" => "bits",
-        _ => return None,
-    };
-    // `contains` / `intersects` / `bitor` take `other: Self`, the by-value
-    // `CodeFlags` a `*self` read also has. `bits` is `&self` only, so the
-    // same type is the pointee of the receiver.
-    let flags_ty = if leaf == "bits" {
-        let first = fd.signature.inputs.first()?;
-        ref_pointee_ty(first, llbc).or_else(|| pointer_pointee_ty(first, llbc))?
-    } else {
-        clone_tyref(fd.signature.inputs.get(1)?)
-    };
-    Some((leaf, flags_ty))
-}
-
 pub(in crate::front::mir) fn place_kind_label(k: &PlaceKind) -> &'static str {
     match k {
         PlaceKind::Local(_) => "Local",

@@ -3,14 +3,6 @@
 use super::*;
 
 impl<'a> Lowering<'a> {
-    /// Read the sole upstream field of
-    /// `rustpython_compiler_core::bytecode::Constants<C>`.
-    ///
-    /// The wrapper is a tuple struct around `Box<[C]>`; the anonymous field
-    /// is therefore `__pos_0` in the same ADT field model used by ordinary
-    /// MIR projections.  Keep the collision-free layout identity alongside
-    /// the bare `Constants` annotation owner, exactly as
-    /// [`Self::resolve_adt_field`] does for a source-level `.0` read.
     /// `w_obj._utf8` — narrow the `PyObjectRef` receiver to
     /// `W_UnicodeObject` and read its `value` field, the rstr `STR`
     /// payload.
@@ -43,19 +35,6 @@ impl<'a> Lowering<'a> {
             },
         });
         result
-    }
-
-    pub(in crate::front::mir) fn emit_constants_items_read(
-        &mut self,
-        _bb_id: BlockId,
-        base: Variable,
-    ) -> Variable {
-        // `constants` is `Constants<C>(Box<[C]>)`, a fat pointer already
-        // loaded as this field. A further `__pos_0` read treats the data
-        // word as a struct and `arraylen_gc`s the first constant.
-        // `<[C]>::len` is the metadata word of this field (`FatLen`).
-        self.fat_box_vars.push(base.clone());
-        base
     }
 
     /// `arr[i]` / `arr[i] = v` on a workspace fixed-array type —
@@ -2673,20 +2652,6 @@ impl<'a> Lowering<'a> {
             return false;
         }
         tyref_strips_to_str(dest_ty, self.llbc)
-    }
-
-    /// `w_str_get_wtf8(obj)` — `_utf8`.  Dest is the `value` getfield
-    /// of the receiver narrowed to `W_UnicodeObject`
-    /// ([`Self::emit_w_str_utf8_read`]), not a residual call and not an
-    /// alias that keeps the `PyObject` instance type.
-    pub(in crate::front::mir) fn is_w_str_get_wtf8_identity(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        fd.item_meta.name_path().rsplit("::").next() == Some("w_str_get_wtf8")
     }
 
     /// `utf8_payload_wtf8(*const UnicodeValueStorage) -> &Wtf8` — the STR

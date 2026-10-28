@@ -128,6 +128,13 @@ CHARON_ARGS = [
     "libc::_",
     "--include",
     "majit_jitcode::rffi::_",
+    # `rustpython_compiler_core::bytecode` items a crate reaches otherwise
+    # stay `opacity: Foreign` / `body: "Opaque"`, so the front end could
+    # only hand-lower calls into them. `item::_` translates the reached
+    # subitems with bodies, including the CO_FAST_* consts the interpreter
+    # reads.
+    "--include",
+    "rustpython_compiler_core::bytecode::_",
     *CHARON_CORE_INCLUDE,
 ]
 
@@ -184,19 +191,6 @@ def interpreter_charon_args(crate_dir: Path) -> list[str]:
         "crate::module",
         "--include",
         "crate::module::_",
-        # Charon has no const-only matcher: `--include PATH` translates that
-        # item and its subitems. These are the localsplus flag consts the
-        # interpreter reads (`bytecode.rs` `CO_FAST_*`). Naming each const
-        # translates its initializer and leaves the rest of
-        # `rustpython_compiler_core::bytecode` opaque.
-        "--include",
-        "rustpython_compiler_core::bytecode::CO_FAST_HIDDEN",
-        "--include",
-        "rustpython_compiler_core::bytecode::CO_FAST_LOCAL",
-        "--include",
-        "rustpython_compiler_core::bytecode::CO_FAST_CELL",
-        "--include",
-        "rustpython_compiler_core::bytecode::CO_FAST_FREE",
         "--start-from",
         "crate",
     ]

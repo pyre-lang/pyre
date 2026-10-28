@@ -6719,8 +6719,8 @@ impl PyFrame {
     /// `repr(transparent)` over that `u32`; `bits()` is the word.
     /// `pyframe.py` `_is_generator_or_coroutine` reads
     /// `self.getcode().co_flags`; `getcode` is
-    /// `hint(self.pycode, promote=True)`. `code_flags_method` lowers the
-    /// foreign `bitflags` body to a Deref of `&self`.
+    /// `hint(self.pycode, promote=True)`. The translated `bitflags` `bits`
+    /// body reads that word.
     #[inline]
     pub fn co_flags(&self) -> u32 {
         self.getcode().flags.bits()

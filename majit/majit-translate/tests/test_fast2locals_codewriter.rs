@@ -261,15 +261,42 @@ fn fast2locals_assembles() {
     let Some(graph) = lower_fast2locals() else {
         return;
     };
-    // `CodeFlags::bits` is opaque in the LLBC. Left residual it is an
-    // unresolvable FunctionPath (`jtransform.py Transformer.handle_residual_call`).
-    // `co_flags()` transmutes the transparent `u32` word instead, and
-    // `code_flags_method` inlines `bits` the same way.
-    assert!(
-        call_leafs(&graph).iter().all(|leaf| leaf != "bits"),
-        "CodeFlags::bits must not remain residual in fast2locals, got {:?}",
-        call_leafs(&graph)
-    );
+    // `co_flags()` reads the flags word. A `CodeFlags::bits` call must name a
+    // translated compiler-core body rather than remain an unresolvable path
+    // (`jtransform.py Transformer.handle_residual_call`).
+    let llbc = interpreter_llbc().expect("interpreter LLBC");
+    for op in graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+    {
+        let OpKind::Call { target, .. } = &op.kind else {
+            continue;
+        };
+        match target {
+            CallTarget::FunctionPath {
+                segments,
+                fun_decl_id,
+                ..
+            } if segments.last().map(String::as_str) == Some("bits") => {
+                let id = fun_decl_id.unwrap_or_else(|| {
+                    panic!("CodeFlags::bits FunctionPath has no fun_decl_id, segs={segments:?}")
+                });
+                let fd = llbc
+                    .fn_by_id(id)
+                    .unwrap_or_else(|| panic!("CodeFlags::bits fun_decl_id={id} missing"));
+                assert!(
+                    fd.has_unstructured_body(),
+                    "CodeFlags::bits FunDecl {} is Opaque",
+                    fd.item_meta.name_path()
+                );
+            }
+            CallTarget::Method { name, .. } if name == "bits" => {
+                panic!("CodeFlags::bits lowered as Method, got {target:?}");
+            }
+            _ => {}
+        }
+    }
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();

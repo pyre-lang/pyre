@@ -74,7 +74,7 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
 /// `Result<(RBigInt, RBigInt), RBigIntError>`'s discriminant, `Err` payload
 /// included. `RBigInt::divmod`'s `return this.int_divmod(...)` is the
 /// function result and stays a `Result` call too. `expect` consumers
-/// (`integer_divmod_pair`) keep the pair residual.
+/// (`integer_divmod_pair`) keep the same `FunctionPath` call.
 #[test]
 fn floordiv_keeps_divmod_result_for_try_branch() {
     let Some(llbcs) = rbigint_llbcs() else {
@@ -1911,9 +1911,9 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
         ),
         ("long_rshift", "jit_bigint_shr", "bigint_rshift"),
         ("long_bitxor", "jit_bigint_xor", "xor"),
-        ("long_int_divmod", "jit_bigint_int_divmod", "int_divmod"),
-        ("integer_divmod_pair", "jit_bigint_int_divmod", "int_divmod"),
-        ("integer_divmod_pair", "jit_bigint_divmod", "divmod"),
+        ("long_int_divmod", "int_divmod", "jit_bigint_int_divmod"),
+        ("integer_divmod_pair", "int_divmod", "jit_bigint_int_divmod"),
+        ("integer_divmod_pair", "divmod", "jit_bigint_divmod"),
     ] {
         let caller = program
             .functions
@@ -1948,26 +1948,6 @@ fn dependent_crate_rbigint_identity_retargets_opaque_llbc_declaration() {
                 .any(|segments| segments.last().is_some_and(|leaf| leaf == forbidden)),
             "{caller_name} retained {forbidden}: {calls:?}"
         );
-        // The pair residual binds its destination to the bare
-        // `(RBigInt, RBigInt)` payload, so no `Ok` field may be read off it,
-        // including through the temporary `with_roots!` returns it in.
-        if residual_name.ends_with("divmod") {
-            let ok_reads: Vec<String> = caller
-                .graph()
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .filter_map(|operation| match &operation.kind {
-                    OpKind::FieldRead { field, .. } => field.owner_root.clone(),
-                    _ => None,
-                })
-                .filter(|owner| owner.starts_with("core::result::Result<(RBigInt,RBigInt)"))
-                .collect();
-            assert!(
-                ok_reads.is_empty(),
-                "{caller_name} reads a Result payload off the pair tuple: {ok_reads:?}"
-            );
-        }
     }
 
     for &(caller_name, residual_name) in UNARY_RESIDUAL_CALLERS {

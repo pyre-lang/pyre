@@ -1338,25 +1338,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // RustPython compiler-core's `Constants<C>` is exactly
-                // `struct Constants<C>(Box<[C]>)`; its `Deref<Target=[C]>`
-                // returns `&self.0`.  Preserve that upstream owner/storage
-                // shape by reading the tuple field, not by pretending the
-                // wrapper itself is a list or introducing a parallel store.
-                //
-                // `Box<[C]>` and `[C]` share the lifted list representation,
-                // so the field value is already the dereferenced slice value.
-                // This is deliberately separate from the generic
-                // String/Vec identity arm above: `Constants` has a real
-                // wrapper field which must remain visible to layout and GC.
-                if args.len() == 1 && constants_call_leaf(&reg, self.llbc) == Some("deref") {
-                    let constants = self.emit_constants_items_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(constants));
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `<String as AsRef<str>>::as_ref` / `String::as_str` /
                 // `<String as Borrow<str>>::borrow` — a `&str` view of the
                 // same string, identity in the lifted value model, so alias
@@ -1382,28 +1363,6 @@ impl<'a> Lowering<'a> {
                         None => args[0].clone(),
                     };
                     self.alias_dest_to_arg0_inherit(dest_local, arg, &arg_locals);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // `w_str_get_wtf8(obj)` is `w_obj._utf8`: a getfield of the
-                // rstr `STR` payload off the `W_UnicodeObject`
-                // (`unicodeobject.py` `_immutable_fields_ = ['_utf8', ...]`).
-                // The receiver is a `PyObjectRef`, so narrow it to
-                // `W_UnicodeObject` before reading `value`; the read is
-                // typed `ValueType::Str`, so dest is the same `SomeString`
-                // payload a `ConstStr` materializes, and `strlen` /
-                // `strgetitem` / string equality all read one
-                // representation.  Mark dest a byte view so
-                // `as_bytes()[i]` / `len` still plant `strgetitem` /
-                // `strlen`.
-                if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
-                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(LocalValue::One(dest));
-                    if !self.string_byte_view_locals.contains(&dest_local) {
-                        self.string_byte_view_locals.push(dest_local);
-                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -1437,16 +1396,6 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_str_storage` is the same `_utf8` payload (`rstr.py` `STR`).
-                // Pin-free tuple eq compares two of these with `ll_streq`.
-                if args.len() == 1 && self.is_w_str_storage(&reg) {
-                    let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
-                    self.bind_str_source_to_dest(mir_bb, dest_local, dest);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 // `bytes_block_chars(block)` is `rstr.py` `ll_chars`: identity
                 // on the `STR` header. Mark dest a byte view so `len` /
                 // index plant `strlen` / `strgetitem`.
@@ -1457,9 +1406,13 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `w_bytes_data` / `w_bytes_block` read `W_BytesObject.data`,
-                // the `rstr.py` `STR` (`W_BytesObject._value`).
-                if args.len() == 1 && (self.is_w_bytes_data(&reg) || self.is_w_bytes_block(&reg)) {
+                // `w_bytes_data` returns the `&[u8]` view of
+                // `W_BytesObject.data`.  The `&[u8]` return type is painted
+                // as a u8 window (Int) rather than `Ptr(STR)`, so the read
+                // stays hand-lowered until that accessor returns the STR
+                // itself.  `w_bytes_block` (returns `*const BytesBlock`),
+                // `w_str_get_wtf8` and `w_str_storage` stay flowed.
+                if args.len() == 1 && self.is_w_bytes_data(&reg) {
                     let dest = self.emit_w_bytes_data_str_read(bb_id, args[0].clone());
                     self.bind_str_source_to_dest(mir_bb, dest_local, dest);
                     let target_bb = self.block_id[target];
@@ -2463,40 +2416,6 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.local_var[dest_local] = Some(LocalValue::One(res));
                     }
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // `impl Index<ConstIdx> for Constants<C>` is the literal
-                // upstream operation `&self.0[consti.as_usize()]`.
-                // `ConstIdx` is one of compiler-core's exact
-                // `#[repr(transparent)] u32` oparg wrappers and therefore
-                // already occupies RPython's integer register bank; only the
-                // real `Constants.0` field projection is needed here.
-                if args.len() == 2 && constants_call_leaf(&reg, self.llbc) == Some("index") {
-                    let items = self.emit_constants_items_read(bb_id, args[0].clone());
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayRead {
-                            base: items,
-                            index: args[1].clone(),
-                            item_ty: tyref_to_value_type_with(
-                                &call.dest.ty,
-                                self.llbc,
-                                self.tombstoned_leaves,
-                                self.gc_struct_ids,
-                                &self.raw_alloc_flavor_structs,
-                            ),
-                            array_type_id: None,
-                            nolength: false,
-                            pure: false,
-                        },
-                    });
-                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -5393,16 +5312,6 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
-                if self.try_lower_code_flags_method(
-                    mir_bb,
-                    &reg,
-                    &args,
-                    &arg_locals,
-                    dest_local,
-                    target,
-                )? {
-                    return Ok(());
-                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,
@@ -5460,18 +5369,6 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                if self.try_lower_rbigint_divmod_pair(
-                    mir_bb,
-                    &segments,
-                    &args,
-                    first_arg_ty.as_ref(),
-                    second_arg_ty.as_ref(),
-                    dest_local,
-                    &call.dest.ty,
-                    target,
-                )? {
-                    return Ok(());
-                }
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
@@ -5517,28 +5414,6 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if self.try_lower_num_from(
-                    mir_bb,
-                    &reg.kind,
-                    &segments,
-                    &args,
-                    dest_local,
-                    &call.dest.ty,
-                    target,
-                )? {
-                    return Ok(());
-                }
-                if self.try_lower_rbigint_toint(
-                    mir_bb,
-                    &reg.kind,
-                    &segments,
-                    &args,
-                    dest_local,
-                    &call.dest.ty,
-                    target,
-                )? {
-                    return Ok(());
-                }
-                if self.try_lower_bigint_i64_try_from(
                     mir_bb,
                     &reg.kind,
                     &segments,

@@ -1556,12 +1556,47 @@ fn unicode_storage_matches_real_object_llbc() {
     );
 }
 
+fn constants_accessor_fun_decl_id(kind: &OpKind, leaf: &str) -> Option<u64> {
+    use crate::model::CallTarget;
+    let OpKind::Call { target, .. } = kind else {
+        return None;
+    };
+    let matches = match target {
+        CallTarget::FunctionPath { segments, .. } => {
+            super::fmt_path_ends_with(segments, &["Constants", leaf])
+        }
+        CallTarget::Method {
+            name,
+            resolved_path,
+            receiver_root,
+            ..
+        } => {
+            name == leaf
+                && (receiver_root
+                    .as_deref()
+                    .is_some_and(|root| root.ends_with("Constants"))
+                    || resolved_path.as_ref().is_some_and(|path| {
+                        path.segments.iter().any(|segment| segment == "Constants")
+                    }))
+        }
+        _ => false,
+    };
+    if !matches {
+        return None;
+    }
+    Some(
+        target
+            .fun_decl_id()
+            .unwrap_or_else(|| panic!("Constants::{leaf} call has no fun_decl_id, got {target:?}")),
+    )
+}
+
 /// Anchor compiler-core's exact
 /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
 /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
 /// (a `co_consts_w` field read on the promoted code); it must not
-/// project the compiler `Constants` wrapper.  `code_getdocstring`
-/// still projects that wrapper for its slice view.
+/// FieldRead the compiler `Constants` wrapper.  `code_getdocstring`
+/// still projects that wrapper, through the translated `deref` body.
 ///
 /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
 /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -1710,15 +1745,18 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
         }),
         "getconstant_w indexes co_consts_w directly"
     );
-    assert!(!constant_ops.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.ends_with(&["Constants".to_string(), "index".to_string()])
-        )
-    }));
+    for op in &constant_ops {
+        if let Some(id) = constants_accessor_fun_decl_id(&op.kind, "index") {
+            let fd = llbc
+                .fn_by_id(id)
+                .unwrap_or_else(|| panic!("Constants::index fun_decl_id={id} missing"));
+            assert!(
+                fd.has_unstructured_body(),
+                "Constants::index FunDecl {} is Opaque",
+                fd.item_meta.name_path()
+            );
+        }
+    }
 
     let getdocstring =
         super::lower_function(&llbc, "code_getdocstring").expect("lower code_getdocstring");
@@ -1739,17 +1777,51 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
                 )
             })
             .count(),
-        1
+        0,
+        "code_getdocstring projects Constants through the translated deref body"
     );
-    assert!(!doc_ops.iter().any(|op| {
-        matches!(
-            &op.kind,
-            OpKind::Call {
-                target: CallTarget::FunctionPath { segments, .. },
-                ..
-            } if segments.ends_with(&["Constants".to_string(), "deref".to_string()])
-        )
-    }));
+    let mut deref_ids = Vec::new();
+    for op in &doc_ops {
+        if let Some(id) = constants_accessor_fun_decl_id(&op.kind, "deref") {
+            let fd = llbc
+                .fn_by_id(id)
+                .unwrap_or_else(|| panic!("Constants::deref fun_decl_id={id} missing"));
+            assert!(
+                fd.has_unstructured_body(),
+                "Constants::deref FunDecl {} is Opaque",
+                fd.item_meta.name_path()
+            );
+            deref_ids.push(id);
+        }
+    }
+    assert!(
+        !deref_ids.is_empty(),
+        "code_getdocstring must call translated Constants::deref"
+    );
+    let context = super::LowerContext::new(&llbc);
+    let mut deref_field_reads = 0usize;
+    for id in deref_ids {
+        let fd = llbc.fn_by_id(id).expect("Constants::deref FunDecl");
+        let deref_graph = super::lower_fun_decl(&context, fd)
+            .unwrap_or_else(|e| panic!("lower Constants::deref: {e:?}"));
+        deref_field_reads += deref_graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == "__pos_0"
+                            && field.owner_root.as_deref().is_some_and(|root| root.ends_with("Constants"))
+                )
+            })
+            .count();
+    }
+    assert!(
+        deref_field_reads >= 1,
+        "translated Constants::deref reads Constants.__pos_0"
+    );
 
     let load_const = super::lower_function(&llbc, "load_const_value")
         .expect("lower rbigint-consuming load_const_value");
@@ -1781,7 +1853,6 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
     // survive, and the existing GC reference must flow to
     // `w_long_from_raw`.
     let mut boxed_handlers = 0usize;
-    let context = super::LowerContext::new(&llbc);
     for fd in llbc.iter_local_fns().filter(|fd| {
         fd.item_meta.name_path().ends_with("::bigint_constant") && fd.unstructured().is_some()
     }) {
@@ -1848,7 +1919,7 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             ])
         )
     }));
-    assert!(!load_ops.iter().any(|op| {
+    assert!(load_ops.iter().any(|op| {
         matches!(
             &op.kind,
             OpKind::Call {
@@ -1857,24 +1928,18 @@ fn constants_wrapper_access_matches_real_interpreter_llbc() {
             } if segments.last().map(String::as_str) == Some("toint")
         )
     }));
-    for residual in ["jit_bigint_to_i64_value_or_zero", "jit_bigint_to_i64_fits"] {
-        assert_eq!(
-            load_ops
-                .iter()
-                .filter(|op| {
-                    matches!(
-                        &op.kind,
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath { segments, .. },
-                            ..
-                        } if segments.last().map(String::as_str) == Some(residual)
-                    )
-                })
-                .count(),
-            1,
-            "{residual} is called exactly once"
-        );
-    }
+    assert!(!load_ops.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments
+                .last()
+                .map(String::as_str)
+                .is_some_and(|leaf| leaf.starts_with("jit_bigint_to_i64_"))
+        )
+    }));
     assert_eq!(
             load_ops
                 .iter()

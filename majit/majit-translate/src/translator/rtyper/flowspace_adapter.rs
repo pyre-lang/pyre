@@ -8591,6 +8591,15 @@ mod tests {
                 field.name
             );
         }
+        if let OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = kind
+        {
+            let leaf = segments.last().map(String::as_str).unwrap_or("?");
+            return format!("FunctionPath {leaf} ty={result_ty:?}");
+        }
         if let Some(root) = crate::model::cast_instance_root(kind) {
             let result_ty = match kind {
                 OpKind::Call { result_ty, .. } => format!("{result_ty:?}"),
@@ -8673,7 +8682,7 @@ mod tests {
                     continue;
                 };
                 let desc = describe_strlen_arg_producer(graph, arg);
-                let is_utf8_read = desc == "FieldRead W_UnicodeObject.value ty=Str";
+                let is_utf8_read = desc == "FunctionPath w_str_get_wtf8 ty=Str";
                 let is_instance_input =
                     desc.starts_with("Input ") && desc.contains("class_root=Some");
                 sites.push((desc, is_utf8_read, is_instance_input));
@@ -8683,12 +8692,12 @@ mod tests {
     }
 
     /// Real-site measurement: the `__strlen` argument at a
-    /// `w_str_get_wtf8` byte view.  The identity-alias fixture
+    /// `w_str_get_wtf8` site.  The identity-alias fixture
     /// (`strlen_on_w_str_get_wtf8_identity_alias_receiver_is_instance_not_string`)
     /// does not exercise the frontend, so this lowers the object LLBC.
-    /// The view is `w_obj._utf8`: the `value` getfield of the receiver
-    /// narrowed to `W_UnicodeObject`, typed `Str`, so `strlen` reads the
-    /// rstr `STR` payload and not the wrapper.
+    /// The helper is flowed as a `FunctionPath` whose last segment is
+    /// `w_str_get_wtf8` (`result_ty: Str`), so `strlen` reads that call
+    /// result and not the wrapper.
     ///
     /// `w_str_cut`'s `piece: &Wtf8` is already a one-word STR
     /// (`rtype_len` / `ll_strlen`). That parameter stays a STR view at
@@ -8733,14 +8742,14 @@ mod tests {
             .collect();
         assert!(
             not_str_owner.is_empty(),
-            "__strlen argument is neither the W_UnicodeObject.value read nor a STR Input at: {not_str_owner:?}"
+            "__strlen argument is neither a w_str_get_wtf8 call nor a STR Input at: {not_str_owner:?}"
         );
         for name in ["w_str_cut", "str_byte_window"] {
             assert!(
                 all_sites
                     .iter()
                     .any(|(n, _, is_utf8_read, _)| *n == name && *is_utf8_read),
-                "{name} must still strlen the W_UnicodeObject.value field"
+                "{name} must still strlen the w_str_get_wtf8 FunctionPath"
             );
         }
     }

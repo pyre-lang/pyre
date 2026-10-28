@@ -638,8 +638,8 @@ fn minus_one_end_matches(graph: &FunctionGraph, end: &Variable, slice: &Variable
 /// `true` when `kind` is a residual range-index call over a Rust slice,
 /// a `Vec` receiver, or the WTF-8 string view used for Python unicode —
 /// the `&s[range]` residual whose `range` operand this pass folds.
-/// The scalar `Vec`/`Constants` integer index is intercepted earlier in
-/// `lower_call` (`is_vec_index_regular` / `constants_call_leaf`), so only the
+/// The scalar `Vec` integer index is intercepted earlier in
+/// `lower_call` (`is_vec_index_regular`), so only the
 /// range-indexed residual reaches here.
 fn is_slice_range_index_call(kind: &OpKind) -> bool {
     matches!(

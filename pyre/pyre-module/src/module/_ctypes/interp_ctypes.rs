@@ -550,10 +550,7 @@ pub(super) enum LookupSymbolError {
     Load(String),
     #[cfg(windows)]
     Load,
-    #[cfg(unix)]
     Memory(majit_rlib::rffi::MemoryError),
-    #[cfg(windows)]
-    Memory,
 }
 
 #[cfg(all(unix, feature = "host_env"))]
@@ -580,7 +577,7 @@ pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, Looku
         return Err(LookupSymbolError::Load);
     }
     majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol)
-        .map_err(|_| LookupSymbolError::Memory)?
+        .map_err(LookupSymbolError::Memory)?
         .map(|address| address as usize)
         .map_err(|_| LookupSymbolError::Load)
 }

@@ -3122,66 +3122,102 @@ fn a_closure_indexes_its_captured_slice_through_the_pair() {
     );
 }
 
-/// `CodeFlags::{contains,intersects,bitor,bits}` on the real interpreter bodies
-/// lower to integer ops. The external `bitflags` methods stay opaque in the
-/// LLBC, so a residual call would name an unresolvable `CodeFlags` path.
+fn path_skips_impl_segments(segments: &[String]) -> Vec<&str> {
+    segments
+        .iter()
+        .map(String::as_str)
+        .filter(|s| !(s.starts_with("<impl ") && s.ends_with('>')))
+        .collect()
+}
+
+fn path_ends_with_code_flags_method(segments: &[String], leaf: &str) -> bool {
+    let segs = path_skips_impl_segments(segments);
+    let n = segs.len();
+    n >= 2 && segs[n - 2] == "CodeFlags" && segs[n - 1] == leaf
+}
+
+fn path_ends_with_internal_bitflags_contains(segments: &[String]) -> bool {
+    let segs = path_skips_impl_segments(segments);
+    let n = segs.len();
+    n >= 2 && segs[n - 2] == "InternalBitFlags" && segs[n - 1] == "contains"
+}
+
+fn method_names_code_flags(receiver_root: Option<&str>, resolved_path: Option<&[String]>) -> bool {
+    receiver_root.is_some_and(|root| root.ends_with("CodeFlags"))
+        || resolved_path.is_some_and(|segs| segs.iter().any(|s| s == "CodeFlags"))
+}
+
+/// Interpreter callers of `CodeFlags::{contains,intersects,bitor,bits}`
+/// lower to `FunctionPath` calls whose `fun_decl_id` names a translated
+/// compiler-core body. `contains` reads the flag word and
+/// `InternalBitFlags::contains` does the `bitand`.
 #[test]
-fn code_flags_methods_lower_to_integer_ops() {
+fn code_flags_methods_call_translated_bodies() {
+    use majit_translate::front::mir::lower_fun_decl;
     use majit_translate::model::{CallTarget, OpKind};
 
     let llbc = load_llbc(INTERPRETER_LLBC);
-    let tails: &[&[&str]] = &[
-        &["CodeFlags", "contains"],
-        &["CodeFlags", "intersects"],
-        &["CodeFlags", "bitor"],
-        &["CodeFlags", "bits"],
-    ];
+    let leaves: &[&str] = &["contains", "intersects", "bitor", "bits"];
+    let mut contains_fun_decl_id = None;
     for name in [
         "fill_user_function_args",
         "pyre_interpreter::pyframe::code_flags_make_generator",
         "fast2locals",
     ] {
         let graph = lower_named(llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
-        let calls: Vec<Vec<String>> = graph
+        for op in graph
             .blocks
             .iter()
             .flat_map(|block| block.operations.iter())
-            .filter_map(|op| match &op.kind {
-                OpKind::Call {
-                    target: CallTarget::FunctionPath { segments, .. },
-                    ..
-                } => Some(segments.clone()),
-                OpKind::Call {
-                    target:
-                        CallTarget::Method {
-                            name,
-                            receiver_root,
-                            resolved_path,
-                            ..
-                        },
+        {
+            let OpKind::Call { target, .. } = &op.kind else {
+                continue;
+            };
+            match target {
+                CallTarget::Method {
+                    name: method,
+                    receiver_root,
+                    resolved_path,
                     ..
                 } => {
-                    let mut segments = receiver_root
-                        .as_ref()
-                        .map(|root| vec![root.clone()])
-                        .unwrap_or_default();
-                    if let Some(path) = resolved_path {
-                        segments = path.segments.clone();
+                    if leaves.contains(&method.as_str())
+                        && method_names_code_flags(
+                            receiver_root.as_deref(),
+                            resolved_path.as_ref().map(|path| path.segments.as_slice()),
+                        )
+                    {
+                        panic!("{name}: CodeFlags::{method} lowered as Method, got {target:?}");
                     }
-                    segments.push(name.clone());
-                    Some(segments)
                 }
-                _ => None,
-            })
-            .collect();
-        for tail in tails {
-            assert!(
-                !calls.iter().any(|segments| {
-                    segments.len() >= tail.len()
-                        && segments[segments.len() - tail.len()..] == tail[..]
-                }),
-                "{name}: residual {tail:?} remains in {calls:?}"
-            );
+                CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id,
+                    ..
+                } => {
+                    let Some(leaf) = leaves
+                        .iter()
+                        .copied()
+                        .find(|leaf| path_ends_with_code_flags_method(segments, leaf))
+                    else {
+                        continue;
+                    };
+                    let id = fun_decl_id.unwrap_or_else(|| {
+                        panic!("{name}: CodeFlags::{leaf} FunctionPath has no fun_decl_id, segs={segments:?}")
+                    });
+                    let fd = llbc.fn_by_id(id).unwrap_or_else(|| {
+                        panic!("{name}: CodeFlags::{leaf} fun_decl_id={id} missing")
+                    });
+                    assert!(
+                        fd.has_unstructured_body(),
+                        "{name}: CodeFlags::{leaf} FunDecl {} is Opaque",
+                        fd.item_meta.name_path()
+                    );
+                    if leaf == "contains" {
+                        contains_fun_decl_id = Some(id);
+                    }
+                }
+                _ => {}
+            }
         }
         // The `*self` word is an integer, not the address of the flags field.
         let ops: Vec<_> = graph
@@ -3213,6 +3249,111 @@ fn code_flags_methods_lower_to_integer_ops() {
                 }
             }
         }
+    }
+
+    let contains_id = contains_fun_decl_id
+        .expect("fill_user_function_args must call CodeFlags::contains with a fun_decl_id");
+    let contains_fd = llbc
+        .iter_fun_decls()
+        .find(|fd| {
+            fd.def_id == contains_id
+                && fd.has_unstructured_body()
+                && fd.item_meta.name_path().ends_with("::<Impl>::contains")
+                && fd
+                    .item_meta
+                    .name_path()
+                    .contains("rustpython_compiler_core::bytecode")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "CodeFlags impl contains FunDecl {contains_id} ({})",
+                llbc.fn_by_id(contains_id)
+                    .map(|fd| fd.item_meta.name_path())
+                    .unwrap_or_else(|| "<missing>".to_string())
+            )
+        });
+    let context = lower_context_for(llbc);
+    let contains_graph = lower_fun_decl(context, contains_fd)
+        .unwrap_or_else(|e| panic!("lower CodeFlags::contains: {e}"));
+    let contains_ops: Vec<_> = contains_graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .collect();
+    fn graph_has_bitand(ops: &[&majit_translate::model::SpaceOperation]) -> bool {
+        ops.iter()
+            .any(|op| matches!(&op.kind, OpKind::BinOp { op: label, .. } if label == "bitand"))
+    }
+    fn assert_no_residual_bits(ops: &[&majit_translate::model::SpaceOperation], who: &str) {
+        for op in ops {
+            let OpKind::Call {
+                target:
+                    CallTarget::FunctionPath {
+                        segments,
+                        fun_decl_id,
+                        ..
+                    },
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if path_skips_impl_segments(segments).last() != Some(&"bits") {
+                continue;
+            }
+            assert!(
+                fun_decl_id.is_some(),
+                "{who} bits call lacks fun_decl_id, segs={segments:?}"
+            );
+        }
+    }
+    assert_no_residual_bits(&contains_ops, "CodeFlags::contains");
+    if !graph_has_bitand(&contains_ops) {
+        assert!(
+            contains_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if path_ends_with_internal_bitflags_contains(segments)
+            )),
+            "CodeFlags::contains must bitand or call InternalBitFlags::contains, got {}",
+            contains_graph.dump()
+        );
+        let inner_fd = llbc
+            .iter_fun_decls()
+            .find(|fd| {
+                fd.has_unstructured_body()
+                    && fd.def_id != contains_id
+                    && fd.item_meta.name_path().ends_with("::<Impl>::contains")
+                    && fd
+                        .item_meta
+                        .name_path()
+                        .contains("rustpython_compiler_core::bytecode::_::")
+            })
+            .expect("InternalBitFlags impl contains");
+        let inner_graph = lower_fun_decl(context, inner_fd)
+            .unwrap_or_else(|e| panic!("lower InternalBitFlags::contains: {e}"));
+        let inner_ops: Vec<_> = inner_graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        assert!(
+            inner_ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Input { class_root: Some(root), .. }
+                    if root.contains("InternalBitFlags")
+            )),
+            "sibling contains FunDecl must be InternalBitFlags, got {}",
+            inner_graph.dump()
+        );
+        assert!(
+            graph_has_bitand(&inner_ops),
+            "InternalBitFlags::contains must contain a bitand, got {}",
+            inner_graph.dump()
+        );
+        assert_no_residual_bits(&inner_ops, "InternalBitFlags::contains");
     }
 }
 
