@@ -1441,6 +1441,44 @@ pub(crate) fn prepare_force_quasi_immutable_abort<Sym: WalkSym>(
     ctx.session.borrow_mut().abort_in_subwalk = ctx.fbw_mode.inline_subwalk;
 }
 
+/// Whether the blackhole may stop inside this codeless level instead of
+/// finishing it.
+///
+/// `blackhole.py bhimpl_inline_call_*` calls `jitcode.fnaddr` and every
+/// `bhimpl_residual_call_*` target is a linked address, so an upstream
+/// blackhole never stops inside a frame. Pyre byte-interprets an
+/// `inline_call_*` whose callee has only a symbolic address, and a symbolic
+/// residual reached that way aborts the frame (`reject_unresolved_call`). The
+/// abort hands the root's stamped coordinate to the interpreter, not this
+/// level's, so the statement in flight below the root is dropped. A
+/// Python-code level cannot reach such a body: the flattener emits
+/// `inline_call_*` only for a fully bound callee (`fully_bound_callee_body`).
+/// A transparent helper frame is entered through the indirect call instead and
+/// was never vetted, so its body is read here, from the positions the level can
+/// resume at: `pc`, or the operation in flight when the abort came from inside
+/// it. An `OperatorTail` opens with an `inline_call_*` that only names the
+/// return register and never runs.
+pub(crate) fn codeless_level_may_stop_blackhole(frame: &majit_metainterp::MIFrame) -> bool {
+    let code = &frame.jitcode.code;
+    let starts = [frame.last_opcode_position, frame.pc]
+        .into_iter()
+        .map(|pc| crate::jitcode_runtime::reachable_starts_from(code, pc))
+        .try_fold(Vec::new(), |mut all, starts| {
+            all.extend(starts?);
+            Some(all)
+        });
+    match starts {
+        Some(mut starts) => {
+            starts.sort_unstable();
+            starts.dedup();
+            frame
+                .jitcode
+                .blackhole_may_reject_unresolved_call_at(&starts)
+        }
+        None => frame.jitcode.blackhole_may_reject_unresolved_call(),
+    }
+}
+
 /// Read-only counterpart of every adopter gate that can reject a latched
 /// multi-frame image.  `ABORT_TOO_LONG` runs after the opcode's effects, so it
 /// may publish the image only when the later handoff cannot fall back to entry
@@ -1500,7 +1538,22 @@ fn multi_frame_blackhole_preflight<Sym: WalkSym>(
             // callee return in this level. `convert_and_run_from_pyjitpl`
             // copies every framestack level, including one without a
             // virtualizable.
-            latchdbg!("origin={origin} pf-codeless-continuation index={index}");
+            //
+            // The blackhole must also be able to finish this level.
+            // Declining leaves `helper_too_long_decision` to latch at the
+            // enclosing CALL or to keep executing.
+            if codeless_level_may_stop_blackhole(frame) {
+                latchdbg!(
+                    "origin={origin} pf-codeless-symbolic-residual index={index} jitcode={}",
+                    frame.jitcode.name()
+                );
+                return false;
+            }
+            latchdbg!(
+                "origin={origin} pf-codeless-continuation index={index} jitcode={} pc={}",
+                frame.jitcode.name(),
+                frame.pc
+            );
             continue;
         }
         let Some(frame_ptr) = frame.ref_value_for_blackhole(frame_reg as usize) else {

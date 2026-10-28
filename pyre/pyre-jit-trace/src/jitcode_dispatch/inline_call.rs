@@ -19811,6 +19811,10 @@ struct SubWalkExchange<'a, Sym: WalkSym> {
     ancestor_frames: *const SubWalkFrame<'a, Sym>,
     ancestor_len: usize,
     active_caller_pc: usize,
+    /// Whether the active frame published a helper level
+    /// ([`SubWalkFrame::_inline_frame`]), whose `parents` already hold its
+    /// caller.
+    active_published_level: bool,
 }
 
 struct SubWalkDriver<'a, Sym: WalkSym> {
@@ -19842,6 +19846,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 ancestor_frames: std::ptr::null(),
                 ancestor_len: 0,
                 active_caller_pc: 0,
+                active_published_level: false,
             },
         };
         driver.push_frame(root);
@@ -19917,6 +19922,7 @@ impl<'a, Sym: WalkSym> SubWalkDriver<'a, Sym> {
                 self.exchange.ancestor_frames = ancestors.as_ptr();
                 self.exchange.ancestor_len = ancestors.len();
                 self.exchange.active_caller_pc = frame.caller_pc;
+                self.exchange.active_published_level = frame._inline_frame.is_some();
                 self.exchange.active_frame_id = frame.id;
                 self.exchange.completed = std::mem::take(&mut frame.replay_log);
                 self.exchange.completed_cursor = 0;
@@ -20177,7 +20183,12 @@ pub(crate) fn splice_active_driver_ancestors<Sym: WalkSym>(trace_ctx: &TraceCtx)
         }
         let ancestors =
             unsafe { std::slice::from_raw_parts(exchange.ancestor_frames, exchange.ancestor_len) };
-        splice_ancestor_helper_slice(trace_ctx, ancestors, exchange.active_caller_pc)
+        splice_ancestor_helper_slice(
+            trace_ctx,
+            ancestors,
+            exchange.active_caller_pc,
+            exchange.active_published_level,
+        )
     })
 }
 
@@ -20185,11 +20196,23 @@ fn splice_ancestor_helper_slice<Sym: WalkSym>(
     trace_ctx: &TraceCtx,
     ancestors: &[SubWalkFrame<'_, Sym>],
     innermost_caller_pc: usize,
+    innermost_published_level: bool,
 ) -> bool {
     let mut helpers = Vec::new();
     for i in 0..ancestors.len() {
         let frame = &ancestors[i];
         if !frame.fbw_mode.transparent_helper_subwalk {
+            continue;
+        }
+        // A child that published its helper level (`push_frame`) put this
+        // paused frame on `session.framestack` as that level's parent, and
+        // `build_multi_frame_miframe` already copied it. A second copy would
+        // run the helper's tail twice.
+        let child_published_level = ancestors
+            .get(i + 1)
+            .map(|child| child._inline_frame.is_some())
+            .unwrap_or(innermost_published_level);
+        if child_published_level {
             continue;
         }
         let Some(index) = frame
@@ -20225,6 +20248,11 @@ fn splice_ancestor_helper_slice<Sym: WalkSym>(
         ) else {
             return false;
         };
+        // Same capability `multi_frame_blackhole_preflight` asks of the
+        // levels it saw; a refusal fails the splice.
+        if super::residual_call::codeless_level_may_stop_blackhole(&miframe) {
+            return false;
+        }
         helpers.push(miframe);
     }
     splice_helper_frames_before_innermost(helpers)
@@ -20331,6 +20359,7 @@ mod subwalk_checkpoint_tests {
             ancestor_frames: std::ptr::null(),
             ancestor_len: 0,
             active_caller_pc: 0,
+            active_published_level: false,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {
@@ -20395,6 +20424,7 @@ mod subwalk_checkpoint_tests {
             ancestor_frames: std::ptr::null(),
             ancestor_len: 0,
             active_caller_pc: 0,
+            active_published_level: false,
         };
         let _driver = SubWalkDriverGuard::install(&mut exchange);
         let position = majit_metainterp::recorder::TracePosition {

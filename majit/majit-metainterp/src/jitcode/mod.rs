@@ -696,6 +696,9 @@ pub struct JitCode {
     /// read. An empty memo still scans, which is the path `JitCodeBuilder`
     /// bodies take.
     reachable_symbolic_residuals: std::sync::OnceLock<ReachableSymbolicResiduals>,
+    /// [`JitCode::blackhole_may_reject_unresolved_call`], memoized on the
+    /// JitCode it describes for the reason `reachable_symbolic_residuals` is.
+    blackhole_may_reject_unresolved_call: std::sync::OnceLock<bool>,
 }
 
 /// The static residual-call refusal facts reachable from one JitCode.
@@ -727,6 +730,7 @@ impl JitCode {
             exec: JitCodeExecState::default(),
             uses_global_descr_pool: false,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
+            blackhole_may_reject_unresolved_call: std::sync::OnceLock::new(),
         }
     }
 
@@ -757,6 +761,7 @@ impl JitCode {
             },
             uses_global_descr_pool: true,
             reachable_symbolic_residuals: std::sync::OnceLock::new(),
+            blackhole_may_reject_unresolved_call: std::sync::OnceLock::new(),
         }
     }
 
@@ -818,6 +823,7 @@ impl Clone for JitCode {
             exec: self.exec.clone(),
             uses_global_descr_pool: self.uses_global_descr_pool,
             reachable_symbolic_residuals: self.reachable_symbolic_residuals.clone(),
+            blackhole_may_reject_unresolved_call: self.blackhole_may_reject_unresolved_call.clone(),
         }
     }
 }
@@ -848,6 +854,32 @@ impl JitCode {
             .unwrap_or_else(|_| panic!("reachable symbolic residuals already installed"));
         self
     }
+
+    /// Whether a blackhole running this body can stop on a residual call it
+    /// cannot make (`reject_unresolved_call`).
+    ///
+    /// `blackhole.py bhimpl_inline_call_*` calls `jitcode.fnaddr`, and only a
+    /// callee without a callable address is byte-interpreted instead
+    /// (`interpret_unresolved_inline_call`), so this follows exactly those
+    /// `inline_call*` edges. Unlike [`Self::reachable_symbolic_residuals`] it
+    /// also reads a funcptr held in a working register, through the constants
+    /// the body moves into that register
+    /// (`int_register_constant_sources`). That read is flow-insensitive, so
+    /// the answer may be `true` for a body that cannot stop, never `false` for
+    /// one that can through a constant funcptr.
+    pub fn blackhole_may_reject_unresolved_call(&self) -> bool {
+        *self
+            .blackhole_may_reject_unresolved_call
+            .get_or_init(|| compute_blackhole_may_reject_unresolved_call(self, None))
+    }
+
+    /// [`Self::blackhole_may_reject_unresolved_call`] for a frame that resumes
+    /// inside this body: only the instruction starts in `starts`, the ones
+    /// reachable from the resume position, are read here. Callees are entered
+    /// at their start, so they keep the whole-body answer.
+    pub fn blackhole_may_reject_unresolved_call_at(&self, starts: &[usize]) -> bool {
+        compute_blackhole_may_reject_unresolved_call(self, Some(starts))
+    }
 }
 
 /// Uncached form of [`JitCode::reachable_symbolic_residuals`].
@@ -857,40 +889,40 @@ impl JitCode {
 /// [`JitCode::with_reachable_symbolic_residuals`] before the first read; this
 /// function still walks the body, so a test can compare the installed answer
 /// with a fresh scan.
+fn is_residual_call(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        insns::BC_RESIDUAL_CALL_R_V
+            | insns::BC_RESIDUAL_CALL_IR_V
+            | insns::BC_RESIDUAL_CALL_IRF_V
+            | insns::BC_RESIDUAL_CALL_R_I
+            | insns::BC_RESIDUAL_CALL_IR_I
+            | insns::BC_RESIDUAL_CALL_IRF_I
+            | insns::BC_RESIDUAL_CALL_R_R
+            | insns::BC_RESIDUAL_CALL_IR_R
+            | insns::BC_RESIDUAL_CALL_IRF_R
+            | insns::BC_RESIDUAL_CALL_IRF_F
+    )
+}
+
+fn is_inline_call(opcode: u8) -> bool {
+    matches!(
+        opcode,
+        insns::BC_INLINE_CALL
+            | insns::BC_INLINE_CALL_R_I
+            | insns::BC_INLINE_CALL_R_R
+            | insns::BC_INLINE_CALL_R_V
+            | insns::BC_INLINE_CALL_IR_I
+            | insns::BC_INLINE_CALL_IR_R
+            | insns::BC_INLINE_CALL_IR_V
+            | insns::BC_INLINE_CALL_IRF_I
+            | insns::BC_INLINE_CALL_IRF_R
+            | insns::BC_INLINE_CALL_IRF_F
+            | insns::BC_INLINE_CALL_IRF_V
+    )
+}
+
 pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolicResiduals {
-    fn is_residual_call(opcode: u8) -> bool {
-        matches!(
-            opcode,
-            insns::BC_RESIDUAL_CALL_R_V
-                | insns::BC_RESIDUAL_CALL_IR_V
-                | insns::BC_RESIDUAL_CALL_IRF_V
-                | insns::BC_RESIDUAL_CALL_R_I
-                | insns::BC_RESIDUAL_CALL_IR_I
-                | insns::BC_RESIDUAL_CALL_IRF_I
-                | insns::BC_RESIDUAL_CALL_R_R
-                | insns::BC_RESIDUAL_CALL_IR_R
-                | insns::BC_RESIDUAL_CALL_IRF_R
-                | insns::BC_RESIDUAL_CALL_IRF_F
-        )
-    }
-
-    fn is_inline_call(opcode: u8) -> bool {
-        matches!(
-            opcode,
-            insns::BC_INLINE_CALL
-                | insns::BC_INLINE_CALL_R_I
-                | insns::BC_INLINE_CALL_R_R
-                | insns::BC_INLINE_CALL_R_V
-                | insns::BC_INLINE_CALL_IR_I
-                | insns::BC_INLINE_CALL_IR_R
-                | insns::BC_INLINE_CALL_IR_V
-                | insns::BC_INLINE_CALL_IRF_I
-                | insns::BC_INLINE_CALL_IRF_R
-                | insns::BC_INLINE_CALL_IRF_F
-                | insns::BC_INLINE_CALL_IRF_V
-        )
-    }
-
     fn visit(
         jitcode: &JitCode,
         visited: &mut std::collections::BTreeSet<usize>,
@@ -951,6 +983,102 @@ pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolic
     ReachableSymbolicResiduals {
         targets: targets.into_iter().collect(),
         visited_jitcodes: visited.len(),
+    }
+}
+
+/// Uncached form of [`JitCode::blackhole_may_reject_unresolved_call`]. With
+/// `root_starts`, only those instruction starts of `root` are read.
+pub fn compute_blackhole_may_reject_unresolved_call(
+    root: &JitCode,
+    root_starts: Option<&[usize]>,
+) -> bool {
+    use majit_jitcode::codewriter::call::{
+        int_register_constant_sources, is_callable_fnaddr, is_symbolic_fnaddr,
+    };
+
+    let mut visited = std::collections::BTreeSet::new();
+    let mut stack: Vec<std::sync::Arc<JitCode>> = Vec::new();
+    let mut current: Option<&JitCode> = Some(root);
+    // A partial root is entered again from its start if it calls itself.
+    if root_starts.is_none() {
+        visited.insert(root as *const JitCode as usize);
+    }
+    let mut first = true;
+    loop {
+        let owned;
+        let jitcode = match current.take() {
+            Some(jitcode) => jitcode,
+            None => match stack.pop() {
+                Some(next) => {
+                    owned = next;
+                    owned.as_ref()
+                }
+                None => return false,
+            },
+        };
+        // A body without instruction starts cannot be decoded safely; its
+        // residuals keep the per-instruction refusal as their backstop.
+        let Some(starts) = jitcode.startpoints.as_ref() else {
+            continue;
+        };
+        let read: Vec<usize> = match root_starts {
+            Some(root_starts) if first => root_starts.to_vec(),
+            _ => starts.iter().copied().collect(),
+        };
+        first = false;
+        let num_regs_i = jitcode.num_regs_i();
+        let register_sources = int_register_constant_sources(
+            &jitcode.code,
+            starts.iter().copied(),
+            num_regs_i,
+            &jitcode.constants_i,
+        );
+        for &pc in &read {
+            let Some(&opcode) = jitcode.code.get(pc) else {
+                continue;
+            };
+            if is_residual_call(opcode) {
+                let Some(&funcptr_reg) = jitcode.code.get(pc + 1) else {
+                    continue;
+                };
+                let funcptr_reg = funcptr_reg as usize;
+                let unresolved = if funcptr_reg < num_regs_i {
+                    register_sources[funcptr_reg]
+                        .iter()
+                        .any(|&target| is_symbolic_fnaddr(target))
+                } else {
+                    jitcode
+                        .constants_i
+                        .get(funcptr_reg - num_regs_i)
+                        .is_some_and(|&target| is_symbolic_fnaddr(target))
+                };
+                if unresolved {
+                    return true;
+                }
+                continue;
+            }
+            if !is_inline_call(opcode) {
+                continue;
+            }
+            let Some((&lo, &hi)) = jitcode.code.get(pc + 1).zip(jitcode.code.get(pc + 2)) else {
+                continue;
+            };
+            let descr_index = u16::from_le_bytes([lo, hi]) as usize;
+            let Some(callee) = jitcode
+                .descr_at(descr_index)
+                .and_then(RuntimeBhDescr::as_jitcode_owned)
+            else {
+                // `interpret_unresolved_inline_call` refuses a callee it cannot
+                // resolve (`reject_unresolved_inline_call`).
+                return true;
+            };
+            if is_callable_fnaddr(callee.fnaddr) {
+                continue;
+            }
+            if visited.insert(callee.as_ref() as *const JitCode as usize) {
+                stack.push(callee);
+            }
+        }
     }
 }
 
@@ -1549,6 +1677,59 @@ mod tests {
         assert_eq!(
             JitCode::from_canonical(core).exec.jit_merge_point_offset,
             Some(3)
+        );
+    }
+
+    /// A residual funcptr held in a working register is read through the
+    /// constant moved into it; a constant funcptr is read directly.
+    #[test]
+    fn blackhole_unresolved_call_reads_register_and_constant_funcptrs() {
+        use majit_jitcode::insns::{BC_MOVE_I, BC_RESIDUAL_CALL_R_V};
+        let symbolic = majit_jitcode::codewriter::call::symbolic_fnaddr_for_segments([
+            "blackhole_unresolved_call_test_target",
+        ]);
+        let real = 0x1234_5678i64;
+        let body_from = |funcptr_operand: u8, constants_i: Vec<i64>, starts: Option<&[usize]>| {
+            let core = BuildJitCode::new("helper");
+            core.set_body(BuildJitCodeBody {
+                c_num_regs_i: 1,
+                // r0 <- constants_i[0]; residual_call_r_v funcptr, [], descr 0
+                code: vec![
+                    BC_MOVE_I,
+                    1,
+                    0,
+                    BC_RESIDUAL_CALL_R_V,
+                    funcptr_operand,
+                    0,
+                    0,
+                    0,
+                ],
+                constants_i,
+                startpoints: Some([0, 3].into_iter().collect()),
+                ..BuildJitCodeBody::default()
+            });
+            compute_blackhole_may_reject_unresolved_call(&JitCode::from_canonical(core), starts)
+        };
+        let body = |funcptr_operand: u8, constants_i: Vec<i64>| {
+            body_from(funcptr_operand, constants_i, None)
+        };
+        assert!(
+            body(0, vec![symbolic]),
+            "register funcptr holding a symbolic hash"
+        );
+        assert!(
+            !body(0, vec![real]),
+            "register funcptr holding a host address"
+        );
+        assert!(body(1, vec![symbolic]), "constant symbolic funcptr");
+        assert!(!body(1, vec![real]), "constant host funcptr");
+        assert!(
+            !body_from(0, vec![symbolic], Some(&[0])),
+            "the residual is not among the starts read"
+        );
+        assert!(
+            body_from(0, vec![symbolic], Some(&[3])),
+            "a partial read still sees moves outside the starts read"
         );
     }
 
