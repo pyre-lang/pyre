@@ -4552,7 +4552,10 @@ fn recvfrom_socket(
 #[cfg(any(unix, windows))]
 fn unpack_inet_addr(
     storage: &rffi::sockaddr_storage,
+    #[cfg(unix)]
     addrlen: rffi::SockLen,
+    #[cfg(windows)]
+    _addrlen: rffi::SockLen,
 ) -> pyre_object::PyObjectRef {
     let family = storage.ss_family as libc::c_int;
     if family == rffi::AF_INET {
@@ -5261,12 +5264,9 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         if pyre_object::is_bytes(init_roots.get(init_base + 4)) {
                             // Copied out before the interpreter is released: the borrow
                             // would not survive a collection running in another thread.
-                            let data = unsafe {
-                                pyre_object::bytesobject::w_bytes_data(
-                                    init_roots.get(init_base + 4),
-                                )
-                            }
-                            .to_vec();
+                            let data =
+                                pyre_object::bytesobject::w_bytes_data(init_roots.get(init_base + 4))
+                                    .to_vec();
                             let size = rustpython_host_env::socket::protocol_info_size();
                             if data.len() != size {
                                 return Err(pyre_interpreter::PyError::value_error(format!(

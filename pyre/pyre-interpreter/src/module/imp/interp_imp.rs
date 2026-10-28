@@ -324,7 +324,7 @@ impl ImportRLock {
     /// Registered upstream as the `child` fork hook
     /// (`pypy/module/imp/moduledef.py:45`, driven by
     /// `pypy/module/posix/interp_posix.py`) and never exposed to Python.
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     fn reinit_lock(&self) {
         if self.lockcounter.load(Ordering::Relaxed) > 1 {
             // importing.py:216-224 — the old lock object is abandoned rather
@@ -390,7 +390,7 @@ fn release_lock() -> Result<(), crate::PyError> {
 /// `interp_imp.py reinit_lock`.  Deliberately absent from the `_imp`
 /// namespace: `moduledef.py:26` exposes only `lock_held`, `acquire_lock` and
 /// `release_lock`.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 fn reinit_lock() {
     getimportlock().reinit_lock();
 }
@@ -399,19 +399,19 @@ fn reinit_lock() {
 /// exact before/parent/child trio with the process fork-hook lists.  Keep the
 /// gateways private to the interpreter: `_imp` exposes only the three public
 /// lock operations above.
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn before_fork() {
     acquire_lock();
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn after_fork_parent() -> Result<(), crate::PyError> {
     // moduledef.py registers `interp_imp.release_lock`, whose gateway passes
     // `silent_after_fork=False`; only native importhook cleanup uses `True`.
     getimportlock().release_lock(false)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+#[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) fn after_fork_child() {
     reinit_lock();
 }

@@ -202,10 +202,6 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
                             &err,
                         )
                     }
-                    #[cfg(windows)]
-                    LookupSymbolError::LibraryNotFound | LookupSymbolError::LibraryClosed => {
-                        pyre_interpreter::PyError::os_error(format!("dlsym({name})"))
-                    }
                 })?;
                 Ok(pyre_object::w_int_new(addr as i64))
             },
@@ -550,10 +546,14 @@ fn register_host_ctypes(ns: pyre_object::PyObjectRef) {
 pub(super) enum LookupSymbolError {
     #[cfg(windows)]
     LibraryNotFound,
-    #[cfg(windows)]
-    LibraryClosed,
+    #[cfg(unix)]
     Load(String),
+    #[cfg(windows)]
+    Load,
+    #[cfg(unix)]
     Memory(majit_rlib::rffi::MemoryError),
+    #[cfg(windows)]
+    Memory,
 }
 
 #[cfg(all(unix, feature = "host_env"))]
@@ -577,19 +577,12 @@ pub(super) fn lookup_symbol(handle: usize, symbol: &[u8]) -> Result<usize, Looku
     // `GetProcAddress` names the export in the module's own narrow spelling,
     // and an embedded NUL would silently truncate the name it looks for.
     if symbol.contains(&0) {
-        return Err(LookupSymbolError::Load(
-            "symbol name contains a null byte".to_string(),
-        ));
+        return Err(LookupSymbolError::Load);
     }
     majit_rlib::rdynload::dlsym(handle as majit_rlib::rdynload::DLLHANDLE, symbol)
-        .map_err(LookupSymbolError::Memory)?
+        .map_err(|_| LookupSymbolError::Memory)?
         .map(|address| address as usize)
-        .map_err(|name| {
-            LookupSymbolError::Load(format!(
-                "symbol '{}' not found",
-                String::from_utf8_lossy(&name)
-            ))
-        })
+        .map_err(|_| LookupSymbolError::Load)
 }
 
 // ──────────────────────────────────────────────────────────────────────
