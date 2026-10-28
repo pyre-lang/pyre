@@ -4889,7 +4889,11 @@ impl<'a> Lowering<'a> {
     /// the ordinary `Fun` call so argument conversion runs on the named
     /// function's own inputs. A closure ADT, an arity mismatch, a const
     /// non-unit tuple, or unreadable generics declines and the trait
-    /// call stays as it is.
+    /// call stays as it is. Calling a function object is typed as a direct
+    /// call of the function's graph, with the arguments rearranged against
+    /// that graph's own signature — `rpbc.py` `FunctionReprBase.call`
+    /// (reached from `rtype_simple_call` / `rtype_call_args`) passing
+    /// the hop through `callparse.py` `callparse` and `getrresult`.
     pub(in crate::front::mir) fn fn_item_call_once_direct_call(
         &self,
         call: &CallPayload,
