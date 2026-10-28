@@ -614,7 +614,12 @@ fn resolve_from_tuple(t: PyObjectRef) -> Result<usize, pyre_interpreter::PyError
         if matches!(e, super::interp_ctypes::LookupSymbolError::LibraryNotFound) {
             return pyre_interpreter::PyError::value_error("library not found");
         }
-        let _ = e;
+        if let super::interp_ctypes::LookupSymbolError::Memory(err) = e {
+            return pyre_interpreter::error::get_converted_unexpected_exception(
+                pyre_object::PY_NULL,
+                &err,
+            );
+        }
         // A symbol name arrives as bytes, so it is decoded the way a name the
         // host handed us is: `format!` would fold a byte with no UTF-8
         // spelling to U+FFFD and report a symbol nobody asked for.

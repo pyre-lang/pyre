@@ -1690,7 +1690,7 @@ pub fn print_output_bytes(bytes: &[u8]) {
         return;
     }
     #[cfg(all(unix, feature = "sandbox"))]
-    let _ = majit_rlib::rposix::write(1, bytes);
+    let _ = crate::host_seam::write_sandbox_fd(1, bytes);
     #[cfg(not(all(unix, feature = "sandbox")))]
     {
         use std::io::Write;
@@ -1713,7 +1713,7 @@ pub fn print_output(s: &str) {
     // output through ll_os_write(1,…) for the controller to relay; a
     // raw `print!` would corrupt the protocol stream.
     #[cfg(all(unix, feature = "sandbox"))]
-    let _ = majit_rlib::rposix::write(1, s.as_bytes());
+    let _ = crate::host_seam::write_sandbox_fd(1, s.as_bytes());
     #[cfg(not(all(unix, feature = "sandbox")))]
     print!("{s}");
     crate::host_seam::flush_stdout_when_unbuffered();

@@ -5741,18 +5741,31 @@ pub fn get_converted_unexpected_exception(
     };
     let addr = error as *const dyn std::error::Error as *const () as usize;
     let repr = format!("<{name} object at 0x{addr:x}>");
-    // `debug_print_traceback`: dump the internal traceback to stderr. Under
-    // sandbox that is `writeall_not_sandboxed` on fd 2, the same un-sandboxed
-    // write `not_implemented_stub` uses.
-    let traceback = std::backtrace::Backtrace::force_capture();
+    // `debug_print_traceback` / `pypy_debug_traceback_print`: dump the traceback
+    // recorded at the raise (`debug_traceback.h` `PYPY_DEBUG_RECORD_TRACEBACK`
+    // / `pypy_debug_tracebacks`) without interrupting the program. Take it so a
+    // later error never reprints it; `force_capture` only if none was recorded.
+    // `rsandbox` (and the process-global slot) is unix-only; other targets
+    // have no recorded raise to take.
+    let traceback = {
+        #[cfg(unix)]
+        {
+            majit_rlib::rsandbox::take_recorded_traceback()
+                .unwrap_or_else(std::backtrace::Backtrace::force_capture)
+        }
+        #[cfg(not(unix))]
+        {
+            std::backtrace::Backtrace::force_capture()
+        }
+    };
+    let dump = format!("{traceback}\n");
     #[cfg(all(unix, feature = "sandbox"))]
     {
-        let dump = format!("{traceback}\n");
         let _ = majit_rlib::rsandbox::writeall_not_sandboxed(2, dump.as_bytes());
     }
     #[cfg(not(all(unix, feature = "sandbox")))]
     {
-        eprintln!("{traceback}");
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), dump.as_bytes());
     }
     PyError::new(
         crate::PyErrorKind::SystemError,
@@ -6325,7 +6338,19 @@ pub fn strerror(errno: i32) -> Result<Wtf8Buf, ()> {
 fn strerror_bytes(errno: i32) -> Result<Vec<u8>, ()> {
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
     {
-        majit_rlib::rposix::strerror(errno)
+        match majit_rlib::rposix::strerror(errno) {
+            Ok(inner) => inner,
+            Err(e) => {
+                #[cfg(all(unix, feature = "sandbox"))]
+                {
+                    majit_rlib::rsandbox::reraise(e);
+                }
+                #[cfg(not(all(unix, feature = "sandbox")))]
+                {
+                    std::panic::panic_any(e);
+                }
+            }
+        }
     }
     #[cfg(not(all(unix, feature = "host_env", not(feature = "sandbox"))))]
     {

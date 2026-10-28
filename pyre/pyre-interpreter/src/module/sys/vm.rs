@@ -1525,7 +1525,9 @@ fn sys_unraisablehook(args: &[PyObjectRef]) -> crate::PyResult {
     } else if unsafe { pyre_object::is_str(w_err_msg) } {
         Some(unsafe { pyre_object::w_str_get_wtf8(w_err_msg) }.to_wtf8_buf())
     } else {
-        Some(pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?)
+        Some(
+            pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value, w_err_msg => unsafe { crate::display::py_str_wtf8(w_err_msg) })?,
+        )
     };
     let mut w_object = pyre_object::with_roots!(w_hookargs, w_tb, w_type, w_value => crate::baseobjspace::getattr_str(w_hookargs, "object"))?;
     // `vm.py unraisablehook`: `space.text_w(space.getattr(w_hookargs,
@@ -2253,7 +2255,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
         let lazy_imports_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_int_new(
-            crate::importing::lazy_imports_config() as i64,
+            crate::importing::lazy_imports_config() as i64
         ));
         let mut fields = pyre_object::gc_roots::RootedItems::new();
         // `initconfig.c PYCONFIG_SPEC` declares `parser_debug` BOOL
@@ -4593,8 +4595,14 @@ fn locale_asks_for_surrogateescape() -> bool {
             // `initstdio` installs the locale the environment names before
             // reading it back, so what is tested is the locale the C library
             // took rather than the variables that asked for it.
-            let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
-            let effective = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None).ok();
+            if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
+                std::panic::panic_any(e);
+            }
+            let effective = match majit_rlib::rlocale::setlocale(libc::LC_CTYPE, None) {
+                Ok(Ok(bytes)) => Some(bytes),
+                Ok(Err(_)) => None,
+                Err(e) => std::panic::panic_any(e),
+            };
             // `app_main.py initstdio`'s `is_c_locale` tuple names C, POSIX,
             // C.UTF-8, C.utf8 and UTF-8, the same set `initconfig.c
             // config_get_stdio_errors` reaches through `_Py_IsLocaleCoercionTarget`
@@ -5050,9 +5058,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                         })?;
                     }
                     #[cfg(feature = "sandbox")]
-                    majit_rlib::rposix::write(2, &bytes).map_err(|errno| {
-                        crate::PyError::os_error_with_errno(errno, "")
-                    })?;
+                    crate::host_seam::write_sandbox_fd(2, &bytes)
+                        .map_err(|e| {
+                            crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            )
+                        })?
+                        .map_err(|errno| crate::PyError::os_error_with_errno(errno, ""))?;
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));
             }
@@ -5078,9 +5091,14 @@ fn make_std_stream(name: &'static str, fd: i32) -> PyObjectRef {
                         })?;
                     }
                     #[cfg(feature = "sandbox")]
-                    majit_rlib::rposix::write(1, &bytes).map_err(|errno| {
-                        crate::PyError::os_error_with_errno(errno, "")
-                    })?;
+                    crate::host_seam::write_sandbox_fd(1, &bytes)
+                        .map_err(|e| {
+                            crate::error::get_converted_unexpected_exception(
+                                pyre_object::PY_NULL,
+                                &e,
+                            )
+                        })?
+                        .map_err(|errno| crate::PyError::os_error_with_errno(errno, ""))?;
                     crate::host_seam::flush_stdout_when_unbuffered();
                 }
                 return Ok(w_int_new(unsafe { w_str_len(s_obj) } as i64));

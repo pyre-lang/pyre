@@ -7,6 +7,15 @@
 #[cfg(feature = "sandbox")]
 use crate::host_seam::sys as libc;
 
+#[cfg(all(
+    any(unix, windows),
+    feature = "host_env",
+    not(feature = "sandbox")
+))]
+fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> crate::PyError {
+    crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+}
+
 /// Raise `_locale.Error` with the supplied message.  Mirrors
 /// `interp_locale.py make_error`.
 /// The NUL-terminated buffer a collation call is made with: wide where the
@@ -127,8 +136,18 @@ pub(crate) fn locale_encoding() -> String {
         // (read at v3.15.0) answers "utf-8" for a NULL or empty CODESET,
         // which macOS returns when the `LC_CTYPE` locale is not supported.
         // `_getencoding` carries no JIT hint.
-        Some(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
-        _ => "utf-8".to_string(),
+        Ok(Some(bytes)) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
+        Ok(_) => "utf-8".to_string(),
+        Err(e) => {
+            #[cfg(all(unix, feature = "sandbox"))]
+            {
+                majit_rlib::rsandbox::reraise(e);
+            }
+            #[cfg(not(all(unix, feature = "sandbox")))]
+            {
+                std::panic::panic_any(e);
+            }
+        }
     }
 }
 
@@ -450,7 +469,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         crate::make_builtin_function_with_arity(
             "_getdefaultlocale",
             |_| {
-                let (language, encoding) = majit_rlib::rlocale::getdefaultlocale();
+                let (language, encoding) =
+                    majit_rlib::rlocale::getdefaultlocale().map_err(map_memory_error)?;
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 let locale = match language {
                     Some(language) => {
@@ -482,7 +502,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
-                    let lc = majit_rlib::rlocale::localeconv_data();
+                    let lc = majit_rlib::rlocale::localeconv_data().map_err(map_memory_error)?;
                     // `_w_copy_grouping` (`interp_locale.py`): every byte
                     // of the C grouping string up to its NUL is one group size
                     // (a `CHAR_MAX` element stays `127`), then a trailing `0`
@@ -602,15 +622,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     return Err(locale_error("unsupported locale setting"));
                 }
                 match majit_rlib::rlocale::setlocale(cat, c_locale.as_deref()) {
-                    Ok(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
-                        &bytes,
-                    ))),
-                    Err(majit_rlib::rlocale::LocaleError::InvalidCategory) => {
+                    Ok(Ok(bytes)) => Ok(pyre_object::w_str_new_managed(
+                        &String::from_utf8_lossy(&bytes),
+                    )),
+                    Ok(Err(majit_rlib::rlocale::LocaleError::InvalidCategory)) => {
                         Err(locale_error("invalid locale category"))
                     }
-                    Err(majit_rlib::rlocale::LocaleError::Unsupported) => {
+                    Ok(Err(majit_rlib::rlocale::LocaleError::Unsupported)) => {
                         Err(locale_error("unsupported locale setting"))
                     }
+                    Err(e) => Err(map_memory_error(e)),
                 }
             }
             #[cfg(not(all(any(unix, windows), feature = "host_env")))]
@@ -657,12 +678,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     }
                     if item == libc::CODESET as i64
                         && let Some(bytes) = majit_rlib::rlocale::nl_langinfo_codeset()
+                            .map_err(map_memory_error)?
                     {
                         return Ok(crate::typedef::charp2uni(&bytes));
                     }
                     // `interp_locale.py nl_langinfo` — a null host result is
                     // the unsupported case. Decode via utf-8 + surrogateescape.
-                    let Some(bytes) = majit_rlib::rlocale::nl_langinfo(item as _) else {
+                    let Some(bytes) = majit_rlib::rlocale::nl_langinfo(item as _)
+                        .map_err(map_memory_error)?
+                    else {
                         return Err(crate::PyError::value_error("unsupported langinfo constant"));
                     };
                     Ok(crate::typedef::charp2uni(&bytes))
@@ -710,19 +734,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     #[cfg(unix)]
                     let ord = {
                         let w1 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c1.as_bytes()), -1)
-                            .map_err(|e| {
-                                crate::error::get_converted_unexpected_exception(
-                                    pyre_object::PY_NULL,
-                                    &e,
-                                )
-                            })?;
+                            .map_err(map_memory_error)?;
                         let w2 = majit_rlib::rffi::scoped_utf82wcharp::new(Some(c2.as_bytes()), -1)
-                            .map_err(|e| {
-                                crate::error::get_converted_unexpected_exception(
-                                    pyre_object::PY_NULL,
-                                    &e,
-                                )
-                            })?;
+                            .map_err(map_memory_error)?;
                         (unsafe { ll::_wcscoll(w1.buf, w2.buf) }) as i64
                     };
                     Ok(pyre_object::w_int_new(ord))
@@ -801,7 +815,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             ll::_strxfrm(buf.as_mut_ptr().cast(), c.as_ptr().cast_mut().cast(), n2)
                         };
                     }
-                    let out = unsafe { majit_rlib::rffi::charp2str(buf.as_mut_ptr().cast()) };
+                    let out = unsafe { majit_rlib::rffi::charp2str(buf.as_mut_ptr().cast()) }
+                        .map_err(map_memory_error)?;
                     // `interp_locale.py` returns `space.newtext(val)` —
                     // a plain utf-8 decode (lossy), matching `setlocale`;
                     // unlike `localeconv`/`nl_langinfo` it does not apply

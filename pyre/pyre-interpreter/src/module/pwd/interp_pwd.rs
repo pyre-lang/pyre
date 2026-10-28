@@ -110,15 +110,26 @@ mod ll {
     );
 }
 
+fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> pyre_interpreter::PyError {
+    pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+}
+
 /// `interp_pwd.py make_struct_passwd`. String fields are copied with
 /// `charp2str` immediately: `getpwent` (and `getpwuid` / `getpwnam`) may
 /// return a pointer into a static buffer.
-fn make_struct_passwd(pw: *mut libc::passwd) -> pyre_object::PyObjectRef {
-    let name = unsafe { majit_rlib::rffi::charp2str((*pw).pw_name.cast()) };
-    let passwd = unsafe { majit_rlib::rffi::charp2str((*pw).pw_passwd.cast()) };
-    let gecos = unsafe { majit_rlib::rffi::charp2str((*pw).pw_gecos.cast()) };
-    let dir = unsafe { majit_rlib::rffi::charp2str((*pw).pw_dir.cast()) };
-    let shell = unsafe { majit_rlib::rffi::charp2str((*pw).pw_shell.cast()) };
+fn make_struct_passwd(
+    pw: *mut libc::passwd,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let name =
+        unsafe { majit_rlib::rffi::charp2str((*pw).pw_name.cast()) }.map_err(map_memory_error)?;
+    let passwd =
+        unsafe { majit_rlib::rffi::charp2str((*pw).pw_passwd.cast()) }.map_err(map_memory_error)?;
+    let gecos =
+        unsafe { majit_rlib::rffi::charp2str((*pw).pw_gecos.cast()) }.map_err(map_memory_error)?;
+    let dir =
+        unsafe { majit_rlib::rffi::charp2str((*pw).pw_dir.cast()) }.map_err(map_memory_error)?;
+    let shell =
+        unsafe { majit_rlib::rffi::charp2str((*pw).pw_shell.cast()) }.map_err(map_memory_error)?;
     let uid = unsafe { (*pw).pw_uid } as i64;
     let gid = unsafe { (*pw).pw_gid } as i64;
     let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -139,7 +150,10 @@ fn make_struct_passwd(pw: *mut libc::passwd) -> pyre_object::PyObjectRef {
     fields.push(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
         &shell,
     )));
-    pyre_interpreter::_structseq::new_instance(struct_passwd_type(), fields.take())
+    Ok(pyre_interpreter::_structseq::new_instance(
+        struct_passwd_type(),
+        fields.take(),
+    ))
 }
 
 /// `getpwall`'s `try`/`finally`: `c_endpwent` runs on every exit.
@@ -206,7 +220,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         uid as i64
                     )))
                 } else {
-                    Ok(make_struct_passwd(pw))
+                    make_struct_passwd(pw)
                 }
             },
             1,
@@ -241,7 +255,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         name
                     )))
                 } else {
-                    Ok(make_struct_passwd(pw))
+                    make_struct_passwd(pw)
                 }
             },
             1,
@@ -263,7 +277,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     if pw.is_null() {
                         break;
                     }
-                    items.push(make_struct_passwd(pw));
+                    items.push(make_struct_passwd(pw)?);
                 }
                 Ok(pyre_object::w_list_new(items.take()))
             },

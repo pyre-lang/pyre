@@ -1618,12 +1618,17 @@ mod win_nt {
     }
 }
 
+#[cfg(unix)]
+fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> crate::PyError {
+    crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+}
+
 /// A fresh dict holding the current process environment.
 ///
 /// PyPy equivalent: posix.State.startup → `_convertenviron`, which copies the
 /// environment into `posix.environ` at interpreter startup. os.py seeds
 /// `environ` from it at import time and re-reads it from `reload_environ()`.
-fn create_environ() -> pyre_object::PyObjectRef {
+fn create_environ() -> Result<pyre_object::PyObjectRef, crate::PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
     let dict_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
@@ -1659,7 +1664,9 @@ fn create_environ() -> pyre_object::PyObjectRef {
         // `_convertenviron` walks `os.environ.items()`, routed to
         // `rposix_environ.envitems_llimpl`. Under sandbox that wrapper is
         // the `ll_os.ll_os_envitems` trampoline.
-        for (key, value) in majit_rlib::rposix_environ::envitems_llimpl() {
+        for (key, value) in
+            majit_rlib::rposix_environ::envitems_llimpl().map_err(map_memory_error)?
+        {
             store(
                 dict_slot,
                 || pyre_object::w_bytes_from_bytes(&key),
@@ -1694,7 +1701,7 @@ fn create_environ() -> pyre_object::PyObjectRef {
             );
         }
     }
-    pyre_object::gc_roots::shadow_stack_get(dict_slot)
+    Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
 }
 
 /// Convert `path` then `attribute` in `interp_posix.py` unwrap order.
@@ -1829,11 +1836,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     let _root_scope = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(ns);
-    crate::__pyre_put_new!(ns_slot, "environ", create_environ());
+    crate::__pyre_put_new!(ns_slot, "environ", create_environ()?);
     crate::__pyre_put_new!(
         ns_slot,
         "_create_environ",
-        crate::make_builtin_function_with_arity("_create_environ", |_args| Ok(create_environ()), 0,)
+        crate::make_builtin_function_with_arity("_create_environ", |_args| create_environ(), 0,)
     );
 
     // ── posix.putenv(name, value) / posix.unsetenv(name) ──
@@ -3732,9 +3739,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let code = crate::baseobjspace::c_int_w(args[0])?;
                 #[cfg(unix)]
                 {
-                    let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
-                        crate::PyError::value_error("strerror() argument out of range")
-                    })?;
+                    let msg = match majit_rlib::rposix::strerror(code) {
+                        Ok(Ok(msg)) => msg,
+                        Ok(Err(())) => {
+                            return Err(crate::PyError::value_error(
+                                "strerror() argument out of range",
+                            ));
+                        }
+                        Err(e) => return Err(map_memory_error(e)),
+                    };
                     Ok(crate::typedef::charp2uni(&msg))
                 }
                 #[cfg(not(unix))]
@@ -3776,14 +3789,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // instead of data.
                 let n = n_signed.min(crate::builtins::PY_READ_MAX) as usize;
                 #[cfg(unix)]
-                let buf = {
+                {
                     // interp_posix.py `read`: `rposix.read` sits inside
                     // the `eintr_retry=True` loop, so an interrupted read runs
                     // the pending signal handlers and is re-issued rather than
-                    // surfacing as `InterruptedError`.
-                    loop {
+                    // surfacing as `InterruptedError`. `space.newbytes(s)` wraps
+                    // the STR (`w_bytes_from_block`) with no copy.
+                    let llobj = loop {
                         match majit_rlib::rposix::read(fd, n as i64) {
-                            Ok(Ok(buf)) => break buf,
+                            Ok(Ok(llobj)) => break llobj,
                             Ok(Err(errno)) => crate::builtins::eintr_retry_with(
                                 std::io::Error::from_raw_os_error(errno),
                                 |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
@@ -3795,10 +3809,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 ));
                             }
                         }
-                    }
-                };
+                    };
+                    Ok(pyre_object::bytesobject::w_bytes_from_block(
+                        llobj.0 as *const _,
+                    ))
+                }
                 #[cfg(not(unix))]
-                let buf = {
+                {
                     let mut buf: Vec<u8> = Vec::new();
                     buf.try_reserve_exact(n)
                         .map_err(|_| crate::PyError::memory_error(""))?;
@@ -3810,15 +3827,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         if ret >= 0 {
                             // Only the prefix the call reports was written.
                             unsafe { buf.set_len(ret as usize) };
-                            break buf;
+                            break;
                         }
                         crate::builtins::eintr_retry_with(
                             std::io::Error::from_raw_os_error(errno),
                             |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
                         )?;
                     }
-                };
-                Ok(pyre_object::w_bytes_from_bytes(&buf))
+                    Ok(pyre_object::w_bytes_from_bytes(&buf))
+                }
             },
             2,
         )
@@ -3890,8 +3907,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 };
                 #[cfg(feature = "sandbox")]
                 let result = {
-                    let data = match majit_rlib::rposix::read(fd, target.len() as i64) {
-                        Ok(Ok(data)) => data,
+                    let llobj = match majit_rlib::rposix::read(fd, target.len() as i64) {
+                        Ok(Ok(llobj)) => llobj,
                         Ok(Err(errno)) => return Err(errno_err(errno, "")),
                         Err(e) => {
                             return Err(crate::error::get_converted_unexpected_exception(
@@ -3899,6 +3916,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 &e,
                             ));
                         }
+                    };
+                    let data = unsafe {
+                        majit_rlib::lltypesystem::rstr::str_as_bytes(llobj.0 as *const majit_rlib::lltypesystem::rstr::STR)
                     };
                     let length = data.len().min(target.len());
                     target[..length].copy_from_slice(&data[..length]);
@@ -3924,29 +3944,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 let mut w_data = args[1];
                 let fd = pyre_object::with_roots!(w_fd, w_data => crate::baseobjspace::c_int_w(w_fd))?
                     as libc::c_int;
-                // CPython `os_write_impl` receives a `Py_buffer`: text is not
-                // accepted, while every contiguous readable exporter is.
-                let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }
-                    .map_err(|_| crate::PyError::type_error("write() arg 2 must be bytes-like"))?;
+                // interp_posix.py `write`: `getarg_w('s*', w_data).as_str()`.
+                // A `bytes` object is its `BytesBlock` (old-gen); any other
+                // buffer is copied once into a STR. `w_data` stays on
+                // `gc_roots` for the syscall.
                 #[cfg(unix)]
                 let ret = {
-                    // interp_posix.py `write`: `rposix.write` sits inside
-                    // the `eintr_retry=True` loop, so an interrupted write runs
-                    // the pending signal handlers and is re-issued rather than
-                    // surfacing as `InterruptedError`.
-                    let count = data.len().min(i32::MAX as usize);
+                    let roots = pyre_object::gc_roots::push_roots();
+                    w_data = roots.pin_root(w_data);
+                    let llobj = unsafe { crate::builtins::file_write_as_str(w_data) }?;
+                    let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                    let llobj = crate::builtins::py_write_max_str(llobj)?;
+                    let llobj = majit_ir::GcRef(roots.pin_root(llobj.0 as PyObjectRef) as usize);
+                    // `rposix.write` sits inside the `eintr_retry=True` loop,
+                    // so an interrupted write runs the pending signal handlers
+                    // and is re-issued rather than surfacing as
+                    // `InterruptedError`.
                     loop {
-                        match majit_rlib::rposix::write(fd, &data[..count]) {
-                            Ok(ret) => break ret,
-                            Err(errno) => crate::builtins::eintr_retry_with(
+                        match majit_rlib::rposix::write(fd, llobj) {
+                            Ok(Ok(ret)) => break ret,
+                            Ok(Err(errno)) => crate::builtins::eintr_retry_with(
                                 std::io::Error::from_raw_os_error(errno),
                                 |e| errno_err(e.raw_os_error().unwrap_or(0), ""),
                             )?,
+                            Err(e) => {
+                                return Err(crate::error::get_converted_unexpected_exception(
+                                    pyre_object::PY_NULL,
+                                    &e,
+                                ));
+                            }
                         }
                     }
                 };
                 #[cfg(not(unix))]
                 let ret = {
+                    let data = unsafe { crate::builtins::file_write_buffer_bytes(w_data) }?;
                     loop {
                         let (ret, errno) = crate::builtins::crt_write_once(fd, &data);
                         if ret >= 0 {
@@ -5268,17 +5300,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     /// `interp_posix.listdir` dups first (`rposix.dup(..., inheritable=False)`),
     /// then `rposix.fdlistdir` takes the duplicate.
     #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
-    fn fdlistdir(fd: i32) -> Result<Vec<Vec<u8>>, i32> {
+    fn fdlistdir(fd: i32) -> Result<Result<Vec<Vec<u8>>, i32>, majit_rlib::rffi::MemoryError> {
         let dup = unsafe { majit_rlib::rposix::c_dup_noninheritable(fd) };
         if dup < 0 {
-            return Err(majit_rlib::rposix::get_saved_errno());
+            return Ok(Err(majit_rlib::rposix::get_saved_errno()));
         }
         majit_rlib::rposix::fdlistdir(dup)
     }
 
     /// `rposix.listdir`.
     #[cfg(unix)]
-    fn path_listdir(path: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
+    fn path_listdir(
+        path: &[u8],
+    ) -> Result<Result<Vec<Vec<u8>>, i32>, majit_rlib::rffi::MemoryError> {
         majit_rlib::rposix::listdir(path)
     }
 
@@ -5312,9 +5346,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // names the failure. `c_dup_noninheritable` / `c_fdopendir`
                     // release the GIL (`rposix.dup` / `c_fdopendir`).
                     let mut w_path = resolved.w_path();
-                    let names =
-                        pyre_object::with_roots!(w_path, w_arg => fdlistdir(resolved.as_fd))
-                            .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+                    let names = match pyre_object::with_roots!(w_path, w_arg => {
+                        fdlistdir(resolved.as_fd)
+                    }) {
+                        Ok(Ok(names)) => names,
+                        Ok(Err(errno)) => {
+                            return Err(errno_err_with_filename(errno, w_path));
+                        }
+                        Err(e) => return Err(map_memory_error(e)),
+                    };
                     // Each name is freshly allocated and the next one allocates
                     // again, so they are pinned as they arrive.
                     let mut items = pyre_object::gc_roots::RootedItems::new();
@@ -5329,8 +5369,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 #[cfg(unix)]
                 {
                     let mut w_path = w_path();
-                    let names = pyre_object::with_roots!(w_path, w_arg => path_listdir(path))
-                        .map_err(|errno| errno_err_with_filename(errno, w_path))?;
+                    let names = match pyre_object::with_roots!(w_path, w_arg => {
+                        path_listdir(path)
+                    }) {
+                        Ok(Ok(names)) => names,
+                        Ok(Err(errno)) => {
+                            return Err(errno_err_with_filename(errno, w_path));
+                        }
+                        Err(e) => return Err(map_memory_error(e)),
+                    };
                     let mut items = pyre_object::gc_roots::RootedItems::new();
                     for n in &names {
                         items.push(fs_name_obj(bytes_mode, n));
@@ -5477,7 +5524,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     feature = "host_env",
                     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
                 ))]
-                let codeset = majit_rlib::rlocale::nl_langinfo_codeset();
+                let codeset =
+                    majit_rlib::rlocale::nl_langinfo_codeset().map_err(map_memory_error)?;
                 // host_env owns nl_langinfo; without it there is no locale to ask.
                 #[cfg(not(all(
                     unix,
@@ -7557,7 +7605,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
     // `space.fsdecode(getcwdb(space))`. `rposix.getcwd` returns those bytes.
     #[cfg(unix)]
     fn getcwdb_bytes() -> Result<Vec<u8>, crate::PyError> {
-        majit_rlib::rposix::getcwd().map_err(|errno| errno_err(errno, ""))
+        match majit_rlib::rposix::getcwd() {
+            Ok(Ok(bytes)) => Ok(bytes),
+            Ok(Err(errno)) => Err(errno_err(errno, "")),
+            Err(e) => Err(map_memory_error(e)),
+        }
     }
     // os.getcwd() — PyPy: posixmodule.c posix_getcwd.
     crate::__pyre_put_new!(
@@ -7876,9 +7928,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             ));
                         }
                     };
-                    let msg = majit_rlib::rposix::strerror(code).map_err(|()| {
-                        crate::PyError::value_error("strerror() argument out of range")
-                    })?;
+                    let msg = match majit_rlib::rposix::strerror(code) {
+                        Ok(Ok(msg)) => msg,
+                        Ok(Err(())) => {
+                            return Err(crate::PyError::value_error(
+                                "strerror() argument out of range",
+                            ));
+                        }
+                        Err(e) => return Err(map_memory_error(e)),
+                    };
                     Ok(crate::typedef::charp2uni(&msg))
                 },
                 1,
@@ -8037,8 +8095,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                         crate::baseobjspace::c_int_w(w_fd))?;
                     let data = pyre_object::with_roots!(w_offset => unsafe {
                         crate::builtins::file_write_buffer_bytes(w_data)
-                    })
-                    .map_err(|_| crate::PyError::type_error("pwrite() arg 2 must be bytes-like"))?;
+                    })?;
                     let offset = crate::baseobjspace::int_w(w_offset)? as libc::off_t;
                     // `rposix.c_pwrite` releases the GIL and saves errno.
                     let written = loop {
@@ -12984,7 +13041,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // shares the keepalive mutex with `putenv_llimpl`.
                 let entries = if unsafe { pyre_object::is_none(mapping) } {
                     pyre_object::with_roots!(mapping => {
-                        majit_rlib::rposix_environ::envitems_llimpl()
+                        majit_rlib::rposix_environ::envitems_llimpl().map_err(map_memory_error)?
                     })
                     .into_iter()
                     .map(|(key, value)| {
@@ -14140,45 +14197,57 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 // them can raise, so the order is observable: `path` reports
                 // before `mode`, `mode` before `dir_fd`, and both before either
                 // flag's `__bool__` is called at all.
+                // [3.15-spec] path converted first ↔ interp_posix.py access unwrap_spec
+                // converts mode/dir_fd/flags before the body converts path — observable:
+                // which exception wins and whether __fspath__ runs; evidence: measured
+                // v3.15.0 (~/Projects/cpython-3150/python.exe): os.access(P(), 'x'),
+                // os.access(P(), 0, dir_fd='bad') and os.access(P(), 0, effective_ids=True)
+                // with a raising P.__fspath__ all print the __fspath__ call then its
+                // ZeroDivisionError; posixmodule.c os_access Argument Clinic converts
+                // path first.
+                // Path/mode stay in one bracket with the kw-only pins (`rename_impl`).
+                // Each converter (`__fspath__`, `c_int_w`, `dir_fd`, `__bool__`) can
+                // collect, so later arguments are read back from their slots.
                 let roots = pyre_object::gc_roots::push_roots();
                 let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let path = crate::gateway::fsencode_path_named_w(
+                let pos_base = roots.publish(&[
                     bound[0].expect("path is required"),
-                    "access",
-                    "path",
-                );
+                    bound[1].expect("mode is required"),
+                ]);
+                if kw_n > 0 {
+                    roots.normalize(kw_base, kw_n + 2);
+                } else {
+                    roots.normalize(pos_base, 2);
+                }
+                let path =
+                    crate::gateway::fsencode_path_named_w(roots.get(pos_base), "access", "path");
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
                 let path = path?;
                 // interp_posix.py `@unwrap_spec(mode=c_int, ...)`.
-                let roots = pyre_object::gc_roots::push_roots();
-                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
-                let mode = crate::baseobjspace::c_int_w(bound[1].expect("mode is required"));
+                let mode = crate::baseobjspace::c_int_w(roots.get(pos_base + 1));
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
-                drop(roots);
                 let mode = mode?;
                 // interp_posix.py `access` types `dir_fd` as
                 // `DirFD(rposix.HAVE_FACCESSAT)`, so a host with no `faccessat`
                 // turns the descriptor away instead of resolving the name
                 // against the working directory as though none had been given.
-                let roots = pyre_object::gc_roots::push_roots();
-                let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                 let dir_fd = dir_fd_kwarg(kwargs.first().copied().flatten(), HAVE_FACCESSAT);
                 kwargs = reload_bound_kwonly(kw_base, kw_n);
-                drop(roots);
                 let dir_fd = dir_fd?;
                 let effective_ids = match bound_kwonly_named(&kwargs, kwonly, "effective_ids") {
                     Some(v) => {
-                        let roots = pyre_object::gc_roots::push_roots();
-                        let (kw_base, kw_n) = pin_bound_kwonly(&kwargs);
                         let r = crate::baseobjspace::is_true(v);
                         kwargs = reload_bound_kwonly(kw_base, kw_n);
-                        drop(roots);
                         r?
                     }
                     None => false,
                 };
                 let follow_symlinks = match bound_kwonly_named(&kwargs, kwonly, "follow_symlinks") {
-                    Some(v) => crate::baseobjspace::is_true(v)?,
+                    Some(v) => {
+                        let r = crate::baseobjspace::is_true(v);
+                        kwargs = reload_bound_kwonly(kw_base, kw_n);
+                        r?
+                    }
                     None => true,
                 };
                 // interp_posix.py `access` — the two flag modifiers have no other

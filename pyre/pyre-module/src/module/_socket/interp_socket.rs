@@ -2956,8 +2956,14 @@ fn socket_io_err(e: std::io::Error) -> pyre_interpreter::PyError {
             #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
             {
                 match majit_rlib::rposix::strerror(code) {
-                    Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                    Err(()) => format!("Unknown error {code}"),
+                    Ok(Ok(bytes)) => String::from_utf8_lossy(&bytes).into_owned(),
+                    Ok(Err(())) => format!("Unknown error {code}"),
+                    Err(e) => {
+                        return pyre_interpreter::error::get_converted_unexpected_exception(
+                            pyre_object::PY_NULL,
+                            &e,
+                        );
+                    }
                 }
             }
             #[cfg(not(all(feature = "host_env", not(feature = "sandbox"))))]

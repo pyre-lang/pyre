@@ -18,6 +18,12 @@ pub fn stub(fnname: &str) -> crate::PyError {
     }
     #[cfg(not(feature = "sandbox"))]
     {
+        // `rsandbox.py not_implemented_stub`: write `msg + '\n'` to fd 2 then
+        // `raise RuntimeError(msg)`. This build has no `writeall_not_sandboxed`.
+        {
+            use std::io::Write;
+            let _ = writeln!(std::io::stderr(), "{msg}");
+        }
         crate::PyError::runtime_error(msg)
     }
 }

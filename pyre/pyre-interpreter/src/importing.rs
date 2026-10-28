@@ -93,8 +93,11 @@ pub mod host {
 
         /// `rposix.listdir`.
         pub fn listdir(path: &Path) -> std::io::Result<Vec<Vec<u8>>> {
-            majit_rlib::rposix::listdir(path.as_os_str().as_bytes())
-                .map_err(std::io::Error::from_raw_os_error)
+            match majit_rlib::rposix::listdir(path.as_os_str().as_bytes()) {
+                Ok(Ok(names)) => Ok(names),
+                Ok(Err(errno)) => Err(std::io::Error::from_raw_os_error(errno)),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e)),
+            }
         }
     }
 
@@ -106,10 +109,11 @@ pub mod host {
         pub fn current_dir() -> std::io::Result<std::path::PathBuf> {
             use std::os::unix::ffi::OsStringExt;
             match majit_rlib::rposix::getcwd() {
-                Ok(bytes) => Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
+                Ok(Ok(bytes)) => Ok(std::path::PathBuf::from(std::ffi::OsString::from_vec(
                     bytes,
                 ))),
-                Err(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+                Ok(Err(errno)) => Err(std::io::Error::from_raw_os_error(errno)),
+                Err(e) => Err(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e)),
             }
         }
 
@@ -123,6 +127,16 @@ pub mod host {
                     use std::os::unix::ffi::OsStringExt;
                     std::env::VarError::NotUnicode(std::ffi::OsString::from_vec(e.into_bytes()))
                 }),
+                Err(e) => {
+                    #[cfg(all(unix, feature = "sandbox"))]
+                    {
+                        majit_rlib::rsandbox::reraise(e);
+                    }
+                    #[cfg(not(all(unix, feature = "sandbox")))]
+                    {
+                        std::panic::panic_any(e);
+                    }
+                }
             }
         }
 
@@ -462,19 +476,6 @@ impl SourceProvider for HostFsProvider {
 #[cfg(all(feature = "host_env", feature = "sandbox"))]
 struct SeamSourceProvider;
 
-/// `importing.py _readall` `finally: os.close(fd)`.
-#[cfg(all(feature = "host_env", feature = "sandbox"))]
-struct ReadallClose {
-    fd: i32,
-}
-
-#[cfg(all(feature = "host_env", feature = "sandbox"))]
-impl Drop for ReadallClose {
-    fn drop(&mut self) {
-        let _ = majit_rlib::rposix::close(self.fd);
-    }
-}
-
 #[cfg(all(feature = "host_env", feature = "sandbox"))]
 impl SeamSourceProvider {
     fn stat_mode(path: &Path) -> Option<u32> {
@@ -496,28 +497,44 @@ impl SourceProvider for SeamSourceProvider {
     fn read_to_bytes(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         use std::os::unix::ffi::OsStrExt;
         let bytes = path.as_os_str().as_bytes();
-        let fd = loop {
-            match majit_rlib::rposix::open(bytes, libc::O_RDONLY | libc::O_CLOEXEC, 0) {
-                Ok(fd) => break fd,
-                Err(err) if err == libc::EINTR => continue,
-                Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
-            }
+        // `importing.py _readall`: `os.open(filename, os.O_RDONLY, 0400)`.
+        let fd = match majit_rlib::rposix::open(bytes, libc::O_RDONLY, 0o400) {
+            Ok(fd) => fd,
+            Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
         };
-        let _close = ReadallClose { fd };
-        let mut data = Vec::new();
-        loop {
-            match majit_rlib::rposix::read(fd, 65536) {
-                Ok(Ok(chunk)) if chunk.is_empty() => break,
-                Ok(Ok(chunk)) => {
-                    data.extend_from_slice(&chunk);
-                    continue;
+        // `finally: os.close(fd)` must run after the read loop, never while a
+        // read's sandbox exception is still unwinding (`catch_unwind` stops
+        // that unwind first). A close errno replaces any pending result; a
+        // close that itself unwinds just propagates.
+        let read_caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut result = Vec::new();
+            loop {
+                match majit_rlib::rposix::read(fd, 8192) {
+                    Ok(Ok(llobj)) => {
+                        let chunk = unsafe {
+                            majit_rlib::lltypesystem::rstr::str_as_bytes(
+                                llobj.0 as *const majit_rlib::lltypesystem::rstr::STR,
+                            )
+                        };
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        result.extend_from_slice(chunk);
+                    }
+                    Ok(Err(err)) => return Err(std::io::Error::from_raw_os_error(err)),
+                    Err(e) => majit_rlib::rsandbox::reraise(e),
                 }
-                Ok(Err(err)) if err == libc::EINTR => continue,
-                Ok(Err(err)) => return Err(std::io::Error::from_raw_os_error(err)),
-                Err(e) => majit_rlib::rsandbox::reraise(e),
             }
+            Ok(result)
+        }));
+        match majit_rlib::rposix::close(fd) {
+            Ok(()) => {}
+            Err(err) => return Err(std::io::Error::from_raw_os_error(err)),
         }
-        Ok(data)
+        match read_caught {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 }
 
@@ -4526,7 +4543,7 @@ fn ensure_stdlib_path() {
         // not ours to write; `rposix.write` is that build's stderr.  It is
         // also the only build that has it, so the ordinary one keeps `eprint!`.
         #[cfg(feature = "sandbox")]
-        let _ = majit_rlib::rposix::write(2, warning.as_bytes());
+        let _ = crate::host_seam::write_sandbox_fd(2, warning.as_bytes());
         #[cfg(not(feature = "sandbox"))]
         eprint!("{warning}");
     }

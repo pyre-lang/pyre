@@ -11,6 +11,10 @@ use super::fficurses;
 /// The cache is interpreter-owned, so the flag is process-wide.
 static SETUPTERM_CALLED: AtomicBool = AtomicBool::new(false);
 
+fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> pyre_interpreter::PyError {
+    pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+}
+
 /// `curses_error`: `OperationError` of `_minimal_curses.error`.
 fn curses_error(message: &str) -> pyre_interpreter::PyError {
     let cls = pyre_interpreter::builtins::lookup_exc_class("_minimal_curses.error")
@@ -113,7 +117,7 @@ pub(super) fn tigetstr(capname: &str) -> Result<PyObjectRef, pyre_interpreter::P
         if ll_result.is_null() {
             None
         } else {
-            Some(unsafe { charp2str(ll_result) })
+            Some(unsafe { charp2str(ll_result) }.map_err(map_memory_error)?)
         }
     };
     match copied {
@@ -182,7 +186,7 @@ pub(super) fn tparm(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interprete
         if ll_result.is_null() {
             None
         } else {
-            Some(unsafe { charp2str(ll_result) })
+            Some(unsafe { charp2str(ll_result) }.map_err(map_memory_error)?)
         }
     };
     match copied {

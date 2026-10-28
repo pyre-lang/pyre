@@ -179,9 +179,9 @@ crate::rffi::llexternal!(
     any(all(unix, not(target_arch = "wasm32")), windows),
     feature = "host_env"
 ))]
-unsafe fn charp_to_bytes(ptr: *mut core::ffi::c_char) -> Vec<u8> {
+unsafe fn charp_to_bytes(ptr: *mut core::ffi::c_char) -> Result<Vec<u8>, crate::rffi::MemoryError> {
     if ptr.is_null() {
-        Vec::new()
+        Ok(Vec::new())
     } else {
         unsafe { crate::rffi::charp2str(ptr.cast()) }
     }
@@ -191,22 +191,22 @@ unsafe fn charp_to_bytes(ptr: *mut core::ffi::c_char) -> Vec<u8> {
     any(all(unix, not(target_arch = "wasm32")), windows),
     feature = "host_env"
 ))]
-fn localeconv_from_lconv(lp: *mut lconv) -> LocaleConv {
+fn localeconv_from_lconv(lp: *mut lconv) -> Result<LocaleConv, crate::rffi::MemoryError> {
     // `rlocale.localeconv` reads the `lconv` pointer `localeconv()` returns.
     // Numeric fields are `rffi.UCHAR`.
     assert!(!lp.is_null());
     unsafe {
-        LocaleConv {
-            decimal_point: charp_to_bytes((*lp).decimal_point),
-            thousands_sep: charp_to_bytes((*lp).thousands_sep),
-            grouping: charp_to_bytes((*lp).grouping),
-            int_curr_symbol: charp_to_bytes((*lp).int_curr_symbol),
-            currency_symbol: charp_to_bytes((*lp).currency_symbol),
-            mon_decimal_point: charp_to_bytes((*lp).mon_decimal_point),
-            mon_thousands_sep: charp_to_bytes((*lp).mon_thousands_sep),
-            mon_grouping: charp_to_bytes((*lp).mon_grouping),
-            positive_sign: charp_to_bytes((*lp).positive_sign),
-            negative_sign: charp_to_bytes((*lp).negative_sign),
+        Ok(LocaleConv {
+            decimal_point: charp_to_bytes((*lp).decimal_point)?,
+            thousands_sep: charp_to_bytes((*lp).thousands_sep)?,
+            grouping: charp_to_bytes((*lp).grouping)?,
+            int_curr_symbol: charp_to_bytes((*lp).int_curr_symbol)?,
+            currency_symbol: charp_to_bytes((*lp).currency_symbol)?,
+            mon_decimal_point: charp_to_bytes((*lp).mon_decimal_point)?,
+            mon_thousands_sep: charp_to_bytes((*lp).mon_thousands_sep)?,
+            mon_grouping: charp_to_bytes((*lp).mon_grouping)?,
+            positive_sign: charp_to_bytes((*lp).positive_sign)?,
+            negative_sign: charp_to_bytes((*lp).negative_sign)?,
             int_frac_digits: (*lp).int_frac_digits as u8,
             frac_digits: (*lp).frac_digits as u8,
             p_cs_precedes: (*lp).p_cs_precedes as u8,
@@ -215,7 +215,7 @@ fn localeconv_from_lconv(lp: *mut lconv) -> LocaleConv {
             n_sep_by_space: (*lp).n_sep_by_space as u8,
             p_sign_posn: (*lp).p_sign_posn as u8,
             n_sign_posn: (*lp).n_sign_posn as u8,
-        }
+        })
     }
 }
 
@@ -225,7 +225,7 @@ fn localeconv_from_lconv(lp: *mut lconv) -> LocaleConv {
 /// reports. Without `host_env` the C locale stands in (`b"."`, empty
 /// separator, empty grouping). `rlocale.py` marks `localeconv`
 /// `sandboxsafe`, so a `host_env` build reads the host even under sandbox.
-pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+pub fn numeric_formatting() -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), crate::rffi::MemoryError> {
     #[cfg(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
         feature = "host_env"
@@ -234,31 +234,34 @@ pub fn numeric_formatting() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         // `numeric_formatting_impl` reads only these three `lconv` fields.
         let lp = unsafe { localeconv() };
         if lp.is_null() {
-            return (b".".to_vec(), Vec::new(), Vec::new());
+            return Ok((b".".to_vec(), Vec::new(), Vec::new()));
         }
         unsafe {
-            (
-                charp_to_bytes((*lp).decimal_point),
-                charp_to_bytes((*lp).thousands_sep),
-                charp_to_bytes((*lp).grouping),
-            )
+            Ok((
+                charp_to_bytes((*lp).decimal_point)?,
+                charp_to_bytes((*lp).thousands_sep)?,
+                charp_to_bytes((*lp).grouping)?,
+            ))
         }
     }
     #[cfg(not(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
         feature = "host_env"
     )))]
-    (b".".to_vec(), Vec::new(), Vec::new())
+    Ok((b".".to_vec(), Vec::new(), Vec::new()))
 }
 
 /// `rlocale.py setlocale`. A category outside `LC_MIN..=LC_MAX` is
 /// [`LocaleError::InvalidCategory`] (the MSVC runtime's invalid-parameter
 /// handler would end the process on one); a null host result is
 /// [`LocaleError::Unsupported`].
-pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u8>, LocaleError> {
+pub fn setlocale(
+    category: i32,
+    locale: Option<&std::ffi::CStr>,
+) -> Result<Result<Vec<u8>, LocaleError>, crate::rffi::MemoryError> {
     #[cfg(windows)]
     if !(LC_MIN..=LC_MAX).contains(&category) {
-        return Err(LocaleError::InvalidCategory);
+        return Ok(Err(LocaleError::InvalidCategory));
     }
     #[cfg(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
@@ -270,9 +273,9 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
             Some(locale) => unsafe { _setlocale(category, locale.as_ptr().cast_mut().cast()) },
         };
         if ptr.is_null() {
-            return Err(LocaleError::Unsupported);
+            return Ok(Err(LocaleError::Unsupported));
         }
-        Ok(unsafe { crate::rffi::charp2str(ptr) })
+        Ok(Ok(unsafe { crate::rffi::charp2str(ptr)? }))
     }
     #[cfg(not(all(
         any(all(unix, not(target_arch = "wasm32")), windows),
@@ -280,7 +283,7 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
     )))]
     {
         let _ = (category, locale);
-        Ok(b"C".to_vec())
+        Ok(Ok(b"C".to_vec()))
     }
 }
 
@@ -289,7 +292,7 @@ pub fn setlocale(category: i32, locale: Option<&std::ffi::CStr>) -> Result<Vec<u
     any(all(unix, not(target_arch = "wasm32")), windows),
     feature = "host_env"
 ))]
-pub fn localeconv_data() -> LocaleConv {
+pub fn localeconv_data() -> Result<LocaleConv, crate::rffi::MemoryError> {
     localeconv_from_lconv(unsafe { localeconv() })
 }
 
@@ -300,7 +303,7 @@ pub fn localeconv_data() -> LocaleConv {
     feature = "host_env",
     not(any(target_os = "android", target_os = "redox"))
 ))]
-pub fn nl_langinfo_codeset() -> Option<Vec<u8>> {
+pub fn nl_langinfo_codeset() -> Result<Option<Vec<u8>>, crate::rffi::MemoryError> {
     nl_langinfo(libc::CODESET)
 }
 
@@ -311,12 +314,12 @@ pub fn nl_langinfo_codeset() -> Option<Vec<u8>> {
     feature = "host_env",
     not(any(target_os = "android", target_os = "redox"))
 ))]
-pub fn nl_langinfo(item: libc::nl_item) -> Option<Vec<u8>> {
+pub fn nl_langinfo(item: libc::nl_item) -> Result<Option<Vec<u8>>, crate::rffi::MemoryError> {
     let ptr = unsafe { _nl_langinfo(item as INT) };
     if ptr.is_null() {
-        None
+        Ok(None)
     } else {
-        Some(unsafe { crate::rffi::charp2str(ptr) })
+        Ok(Some(unsafe { crate::rffi::charp2str(ptr)? }))
     }
 }
 
@@ -367,7 +370,7 @@ crate::rffi::llexternal!(
 /// `rlocale.py getdefaultlocale` — `(language, encoding)`; `language` is
 /// `None` when no locale name can be built.
 #[cfg(all(windows, feature = "host_env"))]
-pub fn getdefaultlocale() -> (Option<Vec<u8>>, Vec<u8>) {
+pub fn getdefaultlocale() -> Result<(Option<Vec<u8>>, Vec<u8>), crate::rffi::MemoryError> {
     let encoding = format!("cp{}", unsafe { GetACP() }).into_bytes();
 
     const BUFSIZE: usize = 50;
@@ -388,8 +391,8 @@ pub fn getdefaultlocale() -> (Option<Vec<u8>>, Vec<u8>) {
                 BUFSIZE as INT,
             ) != 0
     } {
-        let lang = unsafe { crate::rffi::charp2str(buf_lang.as_mut_ptr()) };
-        let country = unsafe { crate::rffi::charp2str(buf_country.as_mut_ptr()) };
+        let lang = unsafe { crate::rffi::charp2str(buf_lang.as_mut_ptr())? };
+        let country = unsafe { crate::rffi::charp2str(buf_country.as_mut_ptr())? };
         Some([&lang[..], b"_", &country[..]].concat())
     } else if unsafe {
         // If we end up here, this windows version didn't know about
@@ -402,13 +405,13 @@ pub fn getdefaultlocale() -> (Option<Vec<u8>>, Vec<u8>) {
             BUFSIZE as INT,
         ) != 0
     } {
-        let lang = unsafe { crate::rffi::charp2str(buf_lang.as_mut_ptr()) };
+        let lang = unsafe { crate::rffi::charp2str(buf_lang.as_mut_ptr())? };
         Some([&b"0x"[..], &lang[..]].concat())
     } else {
         None
     };
 
-    (language, encoding)
+    Ok((language, encoding))
 }
 
 /// `rlocale.py isalpha`.
@@ -460,7 +463,7 @@ mod tests {
     )))]
     #[test]
     fn numeric_formatting_stands_in_for_the_c_locale() {
-        let (decimal, sep, grouping) = super::numeric_formatting();
+        let (decimal, sep, grouping) = super::numeric_formatting().unwrap();
         assert_eq!(decimal, b".");
         assert!(sep.is_empty());
         assert!(grouping.is_empty());
@@ -469,15 +472,17 @@ mod tests {
     #[cfg(all(windows, feature = "host_env"))]
     #[test]
     fn windows_lconv_getdefaultlocale_and_category_range() {
-        let (language, encoding) = super::getdefaultlocale();
+        let (language, encoding) = super::getdefaultlocale().unwrap();
         assert!(encoding.starts_with(b"cp"));
         assert!(language.is_some_and(|name| !name.is_empty()));
         // The process starts in the "C" locale.
-        let lc = super::localeconv_data();
+        let lc = super::localeconv_data().unwrap();
         assert_eq!(lc.decimal_point, b".");
-        assert_eq!(super::numeric_formatting().0, b".");
+        assert_eq!(super::numeric_formatting().unwrap().0, b".");
         assert_eq!(
-            super::setlocale(super::LC_MAX + 1, None).unwrap_err(),
+            super::setlocale(super::LC_MAX + 1, None)
+                .unwrap()
+                .unwrap_err(),
             super::LocaleError::InvalidCategory
         );
     }

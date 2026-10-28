@@ -138,10 +138,10 @@ impl std::fmt::Display for DLOpenError {
 
 /// `rdynload.dlerror`. Raw bytes: `charp2str` does not decode.
 #[cfg(unix)]
-pub fn dlerror() -> Vec<u8> {
+pub fn dlerror() -> Result<Vec<u8>, crate::rffi::MemoryError> {
     let res = unsafe { c_dlerror() };
     if res.is_null() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     unsafe { rffi::charp2str(res) }
 }
@@ -245,7 +245,7 @@ pub fn dlopen(
     let ll_libname = rffi::scoped_str2charp::new(name)?;
     let res = unsafe { c_dlopen(ll_libname.buf, mode) };
     if res.is_null() {
-        let err = dlerror();
+        let err = dlerror()?;
         #[cfg(target_os = "linux")]
         {
             if bytes_contains(&err, b"invalid ELF header") {

@@ -182,13 +182,13 @@ crate::rffi::llexternal!(
 );
 
 /// `rsignal.strsignal`.
-pub fn strsignal(signum: INT) -> Option<String> {
+pub fn strsignal(signum: INT) -> Result<Option<String>, crate::rffi::MemoryError> {
     let res = unsafe { c_strsignal(signum) };
     if res.is_null() {
-        return None;
+        return Ok(None);
     }
-    let bytes = unsafe { crate::rffi::charp2str(res) };
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    let bytes = unsafe { crate::rffi::charp2str(res)? };
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 #[cfg(test)]

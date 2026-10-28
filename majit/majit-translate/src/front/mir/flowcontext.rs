@@ -663,7 +663,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
     let ret_is_u8_list = locals
         .locals
         .first()
-        .is_some_and(|ret| tyref_is_u8_list(&ret.ty, llbc));
+        .is_some_and(|ret| tyref_returns_u8_list(&ret.ty, llbc));
     for (i, (local, slot)) in locals
         .locals
         .iter()
@@ -855,7 +855,7 @@ pub(in crate::front::mir) fn pygraph_initial_block(
             }
             Some(_) => (ValueType::Unsigned, None),
             None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, ret_is_u8_list, llbc) => {
-                // `rffi.charpsize2str(cp, size) -> Vec<u8>`: cp is CCHARP.
+                // `rffi.charpsize2str(cp, size) -> Result<Vec<u8>, MemoryError>`: cp is CCHARP.
                 // Same bank as a window data word (`getkind` of a raw Ptr).
                 (ValueType::Unsigned, Some("CCHARP".to_string()))
             }
@@ -981,7 +981,7 @@ impl<'a> Lowering<'a> {
             .locals
             .locals
             .first()
-            .is_some_and(|ret| tyref_is_u8_list(&ret.ty, llbc));
+            .is_some_and(|ret| tyref_returns_u8_list(&ret.ty, llbc));
         for (i, (local, slot)) in body
             .locals
             .locals
@@ -1158,7 +1158,7 @@ impl<'a> Lowering<'a> {
                     (ValueType::Str, None)
                 }
                 None if tyref_raw_u8_ptr_param_is_ccharp(&local.ty, ret_is_u8_list, llbc) => {
-                    // `rffi.charpsize2str(cp, size) -> Vec<u8>`: cp is CCHARP.
+                    // `rffi.charpsize2str(cp, size) -> Result<Vec<u8>, MemoryError>`: cp is CCHARP.
                     // Same bank as a window data word (`getkind` of a raw Ptr).
                     (ValueType::Unsigned, Some("CCHARP".to_string()))
                 }

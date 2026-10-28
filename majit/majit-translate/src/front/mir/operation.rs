@@ -285,11 +285,18 @@ impl<'a> Lowering<'a> {
         let bb_id = self.emit_bb(mir_bb);
         let base = self.interior_header_base(bb_id, &alias)?;
         let index = self.realias_operand(Some(alias.index_local), alias.index_var);
+        let owner_declared_gc = container_declared_gc(
+            &inner.ty,
+            self.llbc,
+            self.gc_struct_ids,
+            self.immutable_fields,
+        );
         let item_ty = adt_field_read_value_type(
             place_ty,
             field_ty,
             container_is_enum,
             owner_is_closure_env,
+            owner_declared_gc,
             self.llbc,
             self.tombstoned_leaves,
             self.gc_struct_ids,
@@ -5551,6 +5558,7 @@ impl<'a> Lowering<'a> {
                             &field_ty,
                             container_is_enum,
                             owner_is_closure_env,
+                            owner_declared_gc,
                             self.llbc,
                             self.tombstoned_leaves,
                             self.gc_struct_ids,

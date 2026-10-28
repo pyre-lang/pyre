@@ -431,9 +431,16 @@ pub(super) fn cdata_in_dll(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_int
             arg_roots.get(arg_base + 1),
         ));
     }
-    let address = super::interp_ctypes::lookup_symbol(handle, name.as_bytes()).map_err(|_| {
-        pyre_interpreter::PyError::value_error(format!("symbol '{name}' not found"))
-    })?;
+    let address =
+        super::interp_ctypes::lookup_symbol(handle, name.as_bytes()).map_err(|e| match e {
+            super::interp_ctypes::LookupSymbolError::Memory(err) => {
+                pyre_interpreter::error::get_converted_unexpected_exception(
+                    pyre_object::PY_NULL,
+                    &err,
+                )
+            }
+            _ => pyre_interpreter::PyError::value_error(format!("symbol '{name}' not found")),
+        })?;
     Ok(make_at_address(
         arg_roots.get(arg_base),
         address,

@@ -193,7 +193,9 @@ fn is_set_nonempty(name: &str) -> bool {
 fn set_locale_from_env() {
     #[cfg(all(any(unix, windows), feature = "host_env", not(feature = "sandbox")))]
     if LAUNCH_ENV.lock().is_none() {
-        let _ = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c""));
+        if let Err(e) = majit_rlib::rlocale::setlocale(libc::LC_CTYPE, Some(c"")) {
+            std::panic::panic_any(e);
+        }
     }
 }
 

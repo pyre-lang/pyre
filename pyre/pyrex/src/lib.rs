@@ -554,17 +554,22 @@ fn sys_path_cwd() -> std::path::PathBuf {
         let got = {
             #[cfg(feature = "sandbox")]
             {
-                majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd())
-                    .unwrap_or_else(Err)
+                match majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd()) {
+                    Ok(Ok(Ok(bytes))) => Ok(bytes),
+                    _ => Err(()),
+                }
             }
             #[cfg(not(feature = "sandbox"))]
             {
-                majit_rlib::rposix::getcwd()
+                match majit_rlib::rposix::getcwd() {
+                    Ok(Ok(bytes)) => Ok(bytes),
+                    _ => Err(()),
+                }
             }
         };
         match got {
             Ok(bytes) => std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)),
-            Err(_) => Path::new(".").to_path_buf(),
+            Err(()) => Path::new(".").to_path_buf(),
         }
     }
     #[cfg(not(unix))]
@@ -639,8 +644,17 @@ fn read_stdin_source() -> std::io::Result<String> {
         let mut data = Vec::new();
         loop {
             match majit_rlib::rposix::read(0, 65536) {
-                Ok(Ok(chunk)) if chunk.is_empty() => break,
-                Ok(Ok(chunk)) => data.extend_from_slice(&chunk),
+                Ok(Ok(llobj)) => {
+                    let chunk = unsafe {
+                        majit_rlib::lltypesystem::rstr::str_as_bytes(
+                            llobj.0 as *const majit_rlib::lltypesystem::rstr::STR,
+                        )
+                    };
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    data.extend_from_slice(chunk);
+                }
                 Ok(Err(errno)) => return Err(std::io::Error::from_raw_os_error(errno)),
                 Err(e) => majit_rlib::rsandbox::reraise(e),
             }

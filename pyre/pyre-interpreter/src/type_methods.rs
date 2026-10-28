@@ -3238,16 +3238,22 @@ fn pad_to_width(
 /// `String`.  Upstream holds them as the bytes `charp2str` returned, RPython
 /// strings being byte strings; a separator that is not valid UTF-8 is the one
 /// input on which the two disagree.
-fn get_locale(ty: char, thousands_sep: Option<char>) -> (String, String, Vec<u8>) {
+fn get_locale(
+    ty: char,
+    thousands_sep: Option<char>,
+) -> Result<(String, String, Vec<u8>), crate::PyError> {
     if ty == 'n' {
-        let (dec, sep, grouping) = crate::module::_locale::rlocale::numeric_formatting();
-        return (
+        let (dec, sep, grouping) =
+            crate::module::_locale::rlocale::numeric_formatting().map_err(|e| {
+                crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+            })?;
+        return Ok((
             String::from_utf8_lossy(&dec).into_owned(),
             String::from_utf8_lossy(&sep).into_owned(),
             grouping,
-        );
+        ));
     }
-    match thousands_sep {
+    Ok(match thousands_sep {
         Some(separator) => {
             let group = if matches!(ty, 'b' | 'o' | 'x' | 'X') {
                 4
@@ -3257,7 +3263,7 @@ fn get_locale(ty: char, thousands_sep: Option<char>) -> (String, String, Vec<u8>
             (".".to_string(), separator.to_string(), vec![group])
         }
         None => (".".to_string(), String::new(), vec![0xFF]),
-    }
+    })
 }
 
 /// `newformat.py Formatter._fill_digits`.  The separator is appended
@@ -3417,14 +3423,20 @@ mod group_digits_tests {
     #[test]
     fn get_locale_sizes_the_group_by_presentation_code() {
         for ty in ['b', 'o', 'x', 'X'] {
-            assert_eq!(get_locale(ty, Some('_')), (".".into(), "_".into(), vec![4]));
+            assert_eq!(
+                get_locale(ty, Some('_')).unwrap(),
+                (".".into(), "_".into(), vec![4])
+            );
         }
         for ty in ['\0', 'd'] {
-            assert_eq!(get_locale(ty, Some(',')), (".".into(), ",".into(), vec![3]));
+            assert_eq!(
+                get_locale(ty, Some(',')).unwrap(),
+                (".".into(), ",".into(), vec![3])
+            );
         }
         // No separator asked for: nothing is separated.
         assert_eq!(
-            get_locale('d', None),
+            get_locale('d', None).unwrap(),
             (".".into(), String::new(), vec![0xFF])
         );
     }
@@ -3509,7 +3521,7 @@ fn format_rbigint(num: &BigInt, spec: &Wtf8, type_name: &str) -> Result<Wtf8Buf,
         }
     };
     let sign_prefix = format!("{sign}{prefix}");
-    let (_loc_dec, loc_thousands, loc_grouping) = get_locale(p.ty, p.grouping);
+    let (_loc_dec, loc_thousands, loc_grouping) = get_locale(p.ty, p.grouping)?;
     // `_calc_num_width:695-704`: the digits are separated only when there is a
     // separator to put between them, and the width a `0=` spec still owes after
     // the sign and the base prefix travels in as `n_min_width` so the zero fill
@@ -4449,7 +4461,7 @@ fn format_finite_float(v: f64, spec: &Wtf8) -> Result<Wtf8Buf, crate::PyError> {
         // integer digit run is separated on its own; the fraction and any
         // exponent are the remainder `_parse_number` splits off, and neither is
         // ever separated.
-        let (loc_dec, loc_thousands, loc_grouping) = get_locale('n', None);
+        let (loc_dec, loc_thousands, loc_grouping) = get_locale('n', None)?;
         let unpadded_spec = float_engine_spec_with_width(&p, None);
         let rendered = rustpython_common::format::FormatSpec::parse(&unpadded_spec)
             .map_err(|e| format_spec_err(e, spec, "float", false))?

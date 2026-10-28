@@ -68,9 +68,17 @@ mod ll {
 /// return a pointer into a static buffer. `gr_mem` is a NULL-terminated
 /// `char**` walked into a list of strings. Each C string is `os.fsdecode`
 /// (`_group_from_gstruct`), via `fsdecode_filename_bytes`.
-fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
-    let name = unsafe { majit_rlib::rffi::charp2str((*g).gr_name.cast()) };
-    let passwd = unsafe { majit_rlib::rffi::charp2str((*g).gr_passwd.cast()) };
+fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> pyre_interpreter::PyError {
+    pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+}
+
+fn make_struct_group(
+    g: *mut libc::group,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let name =
+        unsafe { majit_rlib::rffi::charp2str((*g).gr_name.cast()) }.map_err(map_memory_error)?;
+    let passwd =
+        unsafe { majit_rlib::rffi::charp2str((*g).gr_passwd.cast()) }.map_err(map_memory_error)?;
     let gid = unsafe { (*g).gr_gid } as i64;
     let mut member_bytes = Vec::new();
     unsafe {
@@ -80,7 +88,8 @@ fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
             if member.is_null() {
                 break;
             }
-            member_bytes.push(majit_rlib::rffi::charp2str(member.cast()));
+            member_bytes
+                .push(majit_rlib::rffi::charp2str(member.cast()).map_err(map_memory_error)?);
             p = p.add(1);
         }
     }
@@ -98,7 +107,10 @@ fn make_struct_group(g: *mut libc::group) -> pyre_object::PyObjectRef {
     fields.push(pyre_interpreter::gateway::fsdecode_filename_bytes(&passwd));
     fields.push(pyre_object::w_int_new(gid));
     fields.push(holder.get(mem_slot));
-    pyre_interpreter::_structseq::new_instance(struct_group_type(), fields.take())
+    Ok(pyre_interpreter::_structseq::new_instance(
+        struct_group_type(),
+        fields.take(),
+    ))
 }
 
 /// `getgrall`'s `try`/`finally`: `c_endgrent` runs on every exit.
@@ -163,7 +175,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         gid
                     )))
                 } else {
-                    Ok(make_struct_group(g))
+                    make_struct_group(g)
                 }
             },
             1,
@@ -210,7 +222,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                         String::from_utf8_lossy(&name_b)
                     )))
                 } else {
-                    Ok(make_struct_group(g))
+                    make_struct_group(g)
                 }
             },
             1,
@@ -233,7 +245,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     if g.is_null() {
                         break;
                     }
-                    items.push(make_struct_group(g));
+                    items.push(make_struct_group(g)?);
                 }
                 Ok(pyre_object::w_list_new(items.take()))
             },

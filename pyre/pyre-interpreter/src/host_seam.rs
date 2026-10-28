@@ -200,6 +200,18 @@ pub fn getenv(name: &[u8]) -> Result<Option<Vec<u8>>, majit_rlib::rffi::MemoryEr
 // protocol: route through `ll_os_write(1|2,…)` and let the controller relay it.
 // Best-effort — a failed relay is dropped, matching a closed real stream.
 
+/// `ll_os.ll_os_write` for a Rust `&[u8]` that is not already a STR: pack
+/// into a `BytesBlock` (`alloc_bytes_block`, old-gen or immortal) and call
+/// `rposix.write`.
+#[cfg(feature = "sandbox")]
+pub(crate) fn write_sandbox_fd(
+    fd: i32,
+    bytes: &[u8],
+) -> Result<Result<i64, i32>, majit_rlib::rffi::MemoryError> {
+    let block = pyre_object::bytesobject::alloc_bytes_block(bytes);
+    majit_rlib::rposix::write(fd, majit_ir::GcRef(block as usize))
+}
+
 /// Emit bytes to the interpreter's stdout (fd 1).
 ///
 /// `dont_look_inside` for the same reason `ll_os_write` is an external: the
@@ -220,7 +232,7 @@ pub fn emit_stdout(bytes: &[u8]) {
     }
     #[cfg(feature = "sandbox")]
     {
-        let _ = majit_rlib::rposix::write(1, bytes);
+        let _ = write_sandbox_fd(1, bytes);
     }
     flush_stdout_when_unbuffered();
 }
@@ -260,7 +272,7 @@ pub fn emit_stderr(bytes: &[u8]) {
     }
     #[cfg(feature = "sandbox")]
     {
-        let _ = majit_rlib::rposix::write(2, bytes);
+        let _ = write_sandbox_fd(2, bytes);
     }
 }
 

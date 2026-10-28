@@ -1149,7 +1149,9 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
                     #[cfg(unix)]
-                    let text = majit_rlib::rsignal::strsignal(signum);
+                    let text = majit_rlib::rsignal::strsignal(signum).map_err(|e| {
+                        crate::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
+                    })?;
                     #[cfg(windows)]
                     let text = rustpython_host_env::signal::strsignal(signum);
                     #[cfg(not(any(unix, windows)))]

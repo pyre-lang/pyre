@@ -359,28 +359,28 @@ mod tests {
     #[test]
     fn str2charp_round_trip_and_embedded_nul() {
         let owned = str2charp(b"hello", true).unwrap();
-        assert_eq!(unsafe { charp2str(owned) }, b"hello");
+        assert_eq!(unsafe { charp2str(owned) }.unwrap(), b"hello");
         unsafe { free_charp(owned, true) };
 
         let untracked = str2charp(b"x", false).unwrap();
-        assert_eq!(unsafe { charp2str(untracked) }, b"x");
+        assert_eq!(unsafe { charp2str(untracked) }.unwrap(), b"x");
         unsafe { free_charp(untracked, false) };
 
         // The copy keeps the interior NUL; `charp2str` stops, `charpsize2str` does not.
         let raw = str2charp(b"ab\0cd", true).unwrap();
-        assert_eq!(unsafe { charp2str(raw) }, b"ab");
-        assert_eq!(unsafe { charpsize2str(raw, 5) }, b"ab\0cd");
-        assert_eq!(unsafe { charp2strn(raw, 4) }, b"ab");
-        assert_eq!(unsafe { charp2strn(raw, 1) }, b"a");
+        assert_eq!(unsafe { charp2str(raw) }.unwrap(), b"ab");
+        assert_eq!(unsafe { charpsize2str(raw, 5) }.unwrap(), b"ab\0cd");
+        assert_eq!(unsafe { charp2strn(raw, 4) }.unwrap(), b"ab");
+        assert_eq!(unsafe { charp2strn(raw, 1) }.unwrap(), b"a");
         let whole = str2charp(b"abcdef", true).unwrap();
-        assert_eq!(unsafe { charp2strn(whole, 3) }, b"abc");
-        assert_eq!(unsafe { charp2strn(whole, 100) }, b"abcdef");
+        assert_eq!(unsafe { charp2strn(whole, 3) }.unwrap(), b"abc");
+        assert_eq!(unsafe { charp2strn(whole, 100) }.unwrap(), b"abcdef");
         unsafe { free_charp(raw, true) };
         unsafe { free_charp(whole, true) };
 
         let cp = str2constcharp(b"hi", true).unwrap();
-        assert_eq!(unsafe { constcharp2str(cp) }, b"hi");
-        assert_eq!(unsafe { constcharpsize2str(cp, 2) }, b"hi");
+        assert_eq!(unsafe { constcharp2str(cp) }.unwrap(), b"hi");
+        assert_eq!(unsafe { constcharpsize2str(cp, 2) }.unwrap(), b"hi");
         unsafe { free_charp(cast::<CCHARP>(cp), true) };
     }
 
@@ -391,22 +391,23 @@ mod tests {
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0xFF, 8);
             assert_eq!(str2chararray(b"hello", buf, 3), 3);
-            assert_eq!(charpsize2str(buf, 4), b"hel\xFF");
+            assert_eq!(charpsize2str(buf, 4).unwrap(), b"hel\xFF");
             str2rawmem(b"abcdef", buf, 2, 4);
-            assert_eq!(charpsize2str(buf, 4), b"cdef");
+            assert_eq!(charpsize2str(buf, 4).unwrap(), b"cdef");
             keep_buffer_alive_until_here(buf, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 8);
         }
     }
 
     #[test]
     fn liststr2charpp_round_trip() {
         let pp = liststr2charpp(&[b"one", b"two", b""]).unwrap();
-        let got = unsafe { charpp2liststr(pp) };
+        let got = unsafe { charpp2liststr(pp) }.unwrap();
         assert_eq!(got, vec![b"one".to_vec(), b"two".to_vec(), b"".to_vec()]);
         unsafe { free_charpp(pp) };
 
         let empty = liststr2charpp(&[]).unwrap();
-        assert!(unsafe { charpp2liststr(empty) }.is_empty());
+        assert!(unsafe { charpp2liststr(empty) }.unwrap().is_empty());
         unsafe { free_charpp(empty) };
     }
 
@@ -415,31 +416,57 @@ mod tests {
         let (raw, gc, case) = alloc_buffer(8).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(raw), 0x41, 8);
-            assert_eq!(str_from_buffer(raw, gc, case, 8, 3).unwrap(), b"AAA");
+            let s = str_from_buffer(raw, gc, case, 8, 3).unwrap();
+            assert_eq!(
+                crate::lltypesystem::rstr::str_as_bytes(
+                    s.0 as *const crate::lltypesystem::rstr::STR
+                ),
+                b"AAA"
+            );
+            keep_buffer_alive_until_here(raw, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(s, 3);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 8);
         }
 
         let staged = scoped_alloc_buffer::new(8).unwrap();
         assert_eq!(staged.size, 8);
         assert_eq!(staged.case_num, 0);
         unsafe { c_memset(cast::<VOIDP>(staged.raw), 0x42, 8) };
-        assert_eq!(staged.str(2).unwrap(), b"BB");
+        let s = staged.str(2).unwrap();
+        unsafe {
+            assert_eq!(
+                crate::lltypesystem::rstr::str_as_bytes(
+                    s.0 as *const crate::lltypesystem::rstr::STR
+                ),
+                b"BB"
+            );
+            crate::lltypesystem::rstr::free_immortal_str(s, 2);
+        }
 
-        let view = scoped_view_charp::new(b"ab\0c").unwrap();
-        assert_eq!(view.flag, 0x06);
-        assert_eq!(unsafe { charp2str(view.buf) }, b"ab");
-        assert_eq!(unsafe { charpsize2str(view.buf, 4) }, b"ab\0c");
+        // No collector: `rgc.can_move` is false, so the pointer is inside
+        // the immortal STR (`\x04`) and `rgc.pin` is never asked.
+        let view_str = crate::lltypesystem::rstr::alloc_immortal_str(b"ab\0c");
+        assert!(!majit_gc::can_move(view_str));
+        assert!(!majit_gc::pin(view_str));
+        let view = scoped_view_charp::new(view_str).unwrap();
+        assert_eq!(view.flag, 0x04);
+        assert_eq!(unsafe { charp2str(view.buf) }.unwrap(), b"ab");
+        assert_eq!(unsafe { charpsize2str(view.buf, 4) }.unwrap(), b"ab\0c");
         drop(view);
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(view_str, 4) };
 
-        let moving = scoped_nonmovingbuffer::new(b"xyz").unwrap();
-        assert_eq!(moving.flag, 0x06);
-        assert_eq!(unsafe { charpsize2str(moving.buf, 3) }, b"xyz");
+        let moving_str = crate::lltypesystem::rstr::alloc_immortal_str(b"xyz");
+        let moving = scoped_nonmovingbuffer::new(moving_str).unwrap();
+        assert_eq!(moving.flag, 0x04);
+        assert_eq!(unsafe { charpsize2str(moving.buf, 3) }.unwrap(), b"xyz");
         drop(moving);
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(moving_str, 3) };
 
         let none = scoped_str2charp::new(None).unwrap();
         assert!(none.buf.is_null());
         drop(none);
         let some = scoped_str2charp::new(Some(b"zz")).unwrap();
-        assert_eq!(unsafe { charp2str(some.buf) }, b"zz");
+        assert_eq!(unsafe { charp2str(some.buf) }.unwrap(), b"zz");
         drop(some);
     }
 
@@ -488,8 +515,9 @@ mod tests {
             *base = 1;
             *ptradd(base, 2) = 3;
             assert_eq!(ptradd(ptradd(base, 2), -2), base);
-            assert_eq!(charpsize2str(base, 4), vec![1, 0, 3, 0]);
+            assert_eq!(charpsize2str(base, 4).unwrap(), vec![1, 0, 3, 0]);
             keep_buffer_alive_until_here(base, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 4);
         }
     }
 
@@ -542,12 +570,13 @@ mod tests {
         let (buf, gc, case) = alloc_buffer(8).unwrap();
         unsafe {
             c_memset(cast::<VOIDP>(buf), 0x11, 8);
-            assert_eq!(charpsize2str(buf, 8), vec![0x11; 8]);
+            assert_eq!(charpsize2str(buf, 8).unwrap(), vec![0x11; 8]);
             let src = str2charp(b"abcd", true).unwrap();
             c_memcpy(cast::<VOIDP>(buf), cast::<CONST_VOIDP>(src), 4);
-            assert_eq!(charpsize2str(buf, 8), b"abcd\x11\x11\x11\x11");
+            assert_eq!(charpsize2str(buf, 8).unwrap(), b"abcd\x11\x11\x11\x11");
             free_charp(src, true);
             keep_buffer_alive_until_here(buf, gc, case);
+            crate::lltypesystem::rstr::free_immortal_str(gc, 8);
         }
     }
 

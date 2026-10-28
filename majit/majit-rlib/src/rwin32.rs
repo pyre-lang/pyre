@@ -494,7 +494,7 @@ pub fn build_winerror_to_errno() -> (&'static [(i64, i64)], i64) {
 }
 
 /// `rwin32.FormatError` — a bit like strerror.
-pub fn FormatError(code: i64) -> Vec<u8> {
+pub fn FormatError(code: i64) -> Result<Vec<u8>, crate::rffi::MemoryError> {
     llimpl_FormatError(code)
 }
 
@@ -505,7 +505,7 @@ pub fn FormatErrorW(code: i64) -> (Vec<u8>, usize) {
 
 /// `rwin32.llimpl_FormatError` — return a message corresponding to the
 /// given Windows error code.
-fn llimpl_FormatError(code: i64) -> Vec<u8> {
+fn llimpl_FormatError(code: i64) -> Result<Vec<u8>, crate::rffi::MemoryError> {
     let mut buf: CCHARP = core::ptr::null_mut();
     let msglen = unsafe {
         FormatMessage(
@@ -534,10 +534,10 @@ fn llimpl_FormatError(code: i64) -> Vec<u8> {
     let result = if buflen <= 0 {
         format!("Windows Error {code}").into_bytes()
     } else {
-        unsafe { rffi::charpsize2str(s_buf, buflen as usize) }
+        unsafe { rffi::charpsize2str(s_buf, buflen as usize)? }
     };
     unsafe { LocalFree(buf.cast()) };
-    result
+    Ok(result)
 }
 
 /// `rwin32.llimpl_FormatErrorW` — return a utf8-encoded msg and its length.
@@ -628,23 +628,26 @@ winexternal!(
 /// service_pack_major, service_pack_minor, suite_mask, product_type)`.
 #[allow(clippy::type_complexity)]
 #[majit_macros::dont_look_inside]
-pub fn GetVersionEx() -> Result<(i64, i64, i64, i64, Vec<u8>, i64, i64, i64, i64), WindowsError> {
+pub fn GetVersionEx() -> Result<
+    Result<(i64, i64, i64, i64, Vec<u8>, i64, i64, i64, i64), WindowsError>,
+    crate::rffi::MemoryError,
+> {
     let mut info: OSVERSIONINFOEX = unsafe { core::mem::zeroed() };
     info.dwOSVersionInfoSize = core::mem::size_of::<OSVERSIONINFOEX>() as UINT;
     if unsafe { _GetVersionEx(&raw mut info) } == 0 {
-        return Err(lastSavedWindowsError("Windows Error"));
+        return Ok(Err(lastSavedWindowsError("Windows Error")));
     }
-    Ok((
+    Ok(Ok((
         info.dwMajorVersion as i64,
         info.dwMinorVersion as i64,
         info.dwBuildNumber as i64,
         info.dwPlatformId as i64,
-        unsafe { rffi::charp2str(info.szCSDVersion.as_mut_ptr()) },
+        unsafe { rffi::charp2str(info.szCSDVersion.as_mut_ptr()) }?,
         info.wServicePackMajor as i64,
         info.wServicePackMinor as i64,
         info.wSuiteMask as i64,
         info.wProductType as i64,
-    ))
+    )))
 }
 
 winexternal!(
@@ -1017,7 +1020,7 @@ mod tests {
     #[test]
     fn format_error_strips_trailing_dot_and_newline() {
         // ERROR_FILE_NOT_FOUND
-        let msg = super::FormatError(2);
+        let msg = super::FormatError(2).unwrap();
         assert!(!msg.is_empty());
         assert!(!msg.ends_with(b"."));
         assert!(!msg.ends_with(b"\n"));

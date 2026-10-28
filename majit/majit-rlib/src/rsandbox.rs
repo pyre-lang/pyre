@@ -7,6 +7,7 @@
 //! (`std::panic::panic_any`), matching `rsandbox.py` `reraise_error`.
 
 use std::os::raw::c_void;
+use std::sync::Mutex;
 
 use crate::rmarshal::{
     IntFlavor, Loader, MarshalValue, NeedMore, StatResult, dump_string, dump_tuple, load_bool,
@@ -86,6 +87,25 @@ impl SandboxError {
 
 pub type SandboxResult<T> = Result<T, SandboxError>;
 
+/// Process-global last-raised sandbox traceback (`debug_traceback.h`
+/// `pypy_debug_tracebacks` / `PYPY_DEBUG_RECORD_TRACEBACK`).
+static RECORDED_TRACEBACK: Mutex<Option<std::backtrace::Backtrace>> = Mutex::new(None);
+
+fn record_debug_traceback() {
+    if let Ok(mut slot) = RECORDED_TRACEBACK.lock() {
+        *slot = Some(std::backtrace::Backtrace::force_capture());
+    }
+}
+
+/// `debug_traceback.h` `pypy_debug_traceback_print` / `debug_print_traceback`:
+/// take the traceback recorded at the raise so a later error never reprints it.
+pub fn take_recorded_traceback() -> Option<std::backtrace::Backtrace> {
+    RECORDED_TRACEBACK
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
 /// Catch an `OSError` escaping a non-`Result` trampoline, matching an interp
 /// caller of `except OSError as e: raise wrap_oserror(...)`.
 ///
@@ -121,8 +141,11 @@ impl From<crate::rffi::MemoryError> for SandboxError {
 /// Re-raise an RPython exception that a typed result carried out of a trampoline,
 /// for a caller whose upstream does not catch it: it unwinds to the
 /// `BuiltinCode.handle_exception` boundary (`catch_sandbox_stub`).
-#[cfg(feature = "sandbox")]
+///
+/// `debug_traceback.h` `PYPY_DEBUG_RECORD_TRACEBACK` then `panic_any`, matching
+/// `rsandbox.py` `reraise_error`.
 pub fn reraise(err: impl Into<SandboxError>) -> ! {
+    record_debug_traceback();
     std::panic::panic_any(err.into())
 }
 
@@ -211,7 +234,7 @@ pub trait SandboxLoad: Sized {
     fn load<N: NeedMore>(loader: &mut Loader<N>) -> SandboxResult<Self>;
 
     fn from_error(err: SandboxError) -> Self {
-        std::panic::panic_any(err)
+        reraise(err)
     }
 }
 
@@ -314,7 +337,7 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, i32> {
     fn from_error(err: SandboxError) -> Self {
         match err {
             SandboxError::Os(errno) => Err(errno),
-            other => std::panic::panic_any(other),
+            other => reraise(other),
         }
     }
 }
@@ -343,7 +366,7 @@ impl<T: SandboxLoad> SandboxLoad for Result<T, ()> {
     fn from_error(err: SandboxError) -> Self {
         match err {
             SandboxError::Value => Err(()),
-            other => std::panic::panic_any(other),
+            other => reraise(other),
         }
     }
 }
@@ -668,13 +691,15 @@ mod tests {
                 &[MarshalValue::Int(3), MarshalValue::Int(16)]
             )
         );
+        let hi = crate::lltypesystem::rstr::alloc_immortal_str(b"hi");
         assert_eq!(
-            crate::rposix::write_sandbox_request_bytes(1, b"hi"),
+            crate::rposix::write_sandbox_request_bytes(1, hi),
             encode_request(
                 "ll_os.ll_os_write",
                 &[MarshalValue::Int(1), MarshalValue::Str(b"hi".to_vec())]
             )
         );
+        unsafe { crate::lltypesystem::rstr::free_immortal_str(hi, 2) };
         assert_eq!(
             crate::rposix::getcwd_sandbox_request_bytes(),
             encode_request("ll_os.ll_os_getcwd", &[])
@@ -743,11 +768,11 @@ mod tests {
     #[test]
     fn catch_os_error_maps_os_and_resumes_any_other_payload() {
         assert_eq!(
-            catch_os_error(|| -> i32 { std::panic::panic_any(SandboxError::Os(libc::ENOENT)) }),
+            catch_os_error(|| -> i32 { reraise(SandboxError::Os(libc::ENOENT)) }),
             Err(libc::ENOENT)
         );
         let resumed = std::panic::catch_unwind(|| {
-            let _ = catch_os_error(|| -> i32 { std::panic::panic_any(SandboxError::Value) });
+            let _ = catch_os_error(|| -> i32 { reraise(SandboxError::Value) });
         });
         let payload = resumed.expect_err("non-Os SandboxError resumes");
         assert_eq!(

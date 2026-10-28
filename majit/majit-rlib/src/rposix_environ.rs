@@ -112,7 +112,7 @@ fn byname() -> std::sync::MutexGuard<'static, EnvKeepalive> {
 }
 
 /// `rposix_environ.envkeys_llimpl`.
-pub fn envkeys_llimpl() -> Vec<Vec<u8>> {
+pub fn envkeys_llimpl() -> Result<Vec<Vec<u8>>, rffi::MemoryError> {
     // The GIL covers this walk in RPython. Hold the keepalive mutex
     // so a 3.14t `putenv_llimpl` cannot free a string this copy still
     // reads. No null guard: `envkeys_llimpl` has none.
@@ -122,37 +122,37 @@ pub fn envkeys_llimpl() -> Vec<Vec<u8>> {
     let mut i = 0usize;
     unsafe {
         while !(*environ.add(i)).is_null() {
-            let name_value = rffi::charp2str(*environ.add(i));
+            let name_value = rffi::charp2str(*environ.add(i))?;
             if let Some(p) = name_value.iter().position(|&c| c == b'=') {
                 result.push(name_value[..p].to_vec());
             }
             i += 1;
         }
     }
-    result
+    Ok(result)
 }
 
 /// `rposix_environ.envitems_llimpl` (Unix `make_env_impls` arm).
 /// `register_external(..., export_name='ll_os.ll_os_envitems')`.
 #[majit_macros::replace_os_function("envitems")]
-pub fn envitems_llimpl() -> Vec<(Vec<u8>, Vec<u8>)> {
+pub fn envitems_llimpl() -> Result<Vec<(Vec<u8>, Vec<u8>)>, rffi::MemoryError> {
     let _keepalive = byname();
     let environ = os_get_environ();
     let mut result = Vec::new();
     if environ.is_null() {
-        return result;
+        return Ok(result);
     }
     let mut i = 0usize;
     unsafe {
         while !(*environ.add(i)).is_null() {
-            let name_value = rffi::charp2str(*environ.add(i));
+            let name_value = rffi::charp2str(*environ.add(i))?;
             if let Some(p) = name_value.iter().position(|&c| c == b'=') {
                 result.push((name_value[..p].to_vec(), name_value[p + 1..].to_vec()));
             }
             i += 1;
         }
     }
-    result
+    Ok(result)
 }
 
 /// `rposix_environ.getenv_llimpl`.
@@ -166,7 +166,7 @@ pub fn getenv_llimpl(name: &[u8]) -> Result<Option<Vec<u8>>, rffi::MemoryError> 
     if l_result.is_null() {
         Ok(None)
     } else {
-        Ok(Some(unsafe { rffi::charp2str(l_result) }))
+        Ok(Some(unsafe { rffi::charp2str(l_result)? }))
     }
 }
 
@@ -242,7 +242,7 @@ mod tests {
             );
             let got = os_getenv(l_name);
             assert!(!got.is_null());
-            assert_eq!(rffi::charp2str(got), b"pyre-rffi");
+            assert_eq!(rffi::charp2str(got).unwrap(), b"pyre-rffi");
             let err = os_unsetenv(l_name);
             assert_eq!(
                 err,

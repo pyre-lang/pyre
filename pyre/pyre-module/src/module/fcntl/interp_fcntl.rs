@@ -358,29 +358,41 @@ fn fcntl(
                 }
                 Err(e) => return Err(e),
             };
-            // `fcntl_fcntl_impl` stages a heap copy at the argument's
-            // own length when it exceeds the 1024-byte floor.
-            let src = majit_rlib::rffi::scoped_str2charp::new(Some(data)).map_err(|e| {
-                pyre_interpreter::error::get_converted_unexpected_exception(
-                    pyre_object::PY_NULL,
-                    &e,
-                )
-            })?;
-            let total = ARG_BUFSZ.max(data.len()) + ARG_GUARD.len();
-            let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(|e| {
-                pyre_interpreter::error::get_converted_unexpected_exception(
-                    pyre_object::PY_NULL,
-                    &e,
-                )
-            })?;
-            unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
+            // [3.15-spec] stack guard at `len` when `len <= FCNTL_BUFSZ`, else
+            // heap `len+1` with a trailing-NUL check ↔ interp_fcntl.py fcntl
+            // (no guard; stages every writable buffer) — a write past the
+            // argument raises SystemError with the stack/memory-corruption
+            // texts; evidence: v3.15.0 fcntlmodule.c fcntl_fcntl_impl
+            let src = majit_rlib::rffi::scoped_str2charp::new(Some(data)).map_err(map_memory_error)?;
+            let stack = data.len() <= FCNTL_BUFSZ;
+            let total = if stack {
+                FCNTL_BUFSZ + ARG_GUARD.len()
+            } else {
+                data.len() + 1
+            };
+            let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total)
+                .map_err(map_memory_error)?;
+            if stack {
+                unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
+            } else {
+                unsafe { fill_trailing_nul(staged.raw, src.buf, data.len(), total) };
+            }
             loop {
                 let rv = unsafe { ll::fcntl_str(fd, cmd, staged.raw) };
                 if rv < 0 {
                     raise_error_maybe("fcntl")?;
                 } else {
-                    guard_intact(staged.raw, data.len())?;
-                    let out = unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) };
+                    let overflow_msg = if stack {
+                        guard_overwritten(staged.raw, data.len()).then_some(FCNTL_STACK_CORRUPTION)
+                    } else {
+                        trailing_nul_overwritten(staged.raw, data.len())
+                            .then_some(FCNTL_MEMORY_CORRUPTION)
+                    };
+                    if let Some(msg) = overflow_msg {
+                        return Err(pyre_interpreter::PyError::system_error(msg));
+                    }
+                    let out = unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) }
+                        .map_err(map_memory_error)?;
                     return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
                 }
             }
@@ -646,23 +658,65 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     Ok(())
 }
 
-/// Staging floor for the fcntl/ioctl string-buffer path (`fcntl_fcntl_impl`).
-/// A longer argument is staged at its own length plus the overflow guard.
+/// Staging floor for the fcntl string-buffer path (`fcntl_fcntl_impl`
+/// `FCNTL_BUFSZ`). A longer argument takes the heap `len+1` path.
 #[cfg(all(unix, feature = "host_env"))]
-const ARG_BUFSZ: usize = 1024;
+const FCNTL_BUFSZ: usize = 1024;
 
-/// The `guard` both impls write after the staged argument.  A request
+/// Staging floor for the ioctl string-buffer path (`fcntl_ioctl_impl`
+/// `IOCTL_BUFSZ`). A longer *mutable* buffer is passed directly; a longer
+/// read-only argument takes the heap `len+1` path.
+#[cfg(all(unix, feature = "host_env"))]
+const IOCTL_BUFSZ: usize = 1024;
+
+/// The `guard` both impls write after a stack-staged argument. A request
 /// whose payload is longer than the argument the caller supplied overwrites
 /// it, and that is the only way the overrun can be seen at all — so the bytes
 /// are the module's, verbatim, starting with the NUL the staged copy is
 /// terminated by.
 ///
-/// [3.14-spec] guard at `len` ↔ interp_fcntl.py `ioctl` (no guard; stages
-/// `max(IOCTL_BUFSZ, len)` and returns `len` bytes) — a write past the
-/// argument raises SystemError "buffer overflow"; evidence: fcntlmodule.c
-/// `fcntl_ioctl_impl` / `fcntl_fcntl_impl` `memcmp(buf + len, guard, GUARDSZ)`.
+/// [3.15-spec] guard at `len` plus the 3.15 SystemError texts ↔
+/// interp_fcntl.py fcntl/ioctl (no guard; stages every writable buffer) —
+/// a write past the argument raises SystemError with the stack/memory
+/// corruption messages; evidence: v3.15.0 fcntlmodule.c fcntl_fcntl_impl /
+/// fcntl_ioctl_impl
 #[cfg(all(unix, feature = "host_env"))]
 const ARG_GUARD: [u8; 8] = [0x00, 0xfa, 0x69, 0xc4, 0x67, 0xa3, 0x6c, 0x58];
+
+#[cfg(all(unix, feature = "host_env"))]
+const FCNTL_STACK_CORRUPTION: &str = concat!(
+    "Possible stack corruption in fcntl() due to ",
+    "buffer overflow. Provide an argument of sufficient size as ",
+    "determined by the operation.",
+);
+
+#[cfg(all(unix, feature = "host_env"))]
+const FCNTL_MEMORY_CORRUPTION: &str = concat!(
+    "Memory corruption in fcntl() due to ",
+    "buffer overflow. Provide an argument of sufficient size as ",
+    "determined by the operation.",
+);
+
+#[cfg(all(unix, feature = "host_env"))]
+const IOCTL_STACK_CORRUPTION_MUTABLE: &str = concat!(
+    "Possible stack corruption in ioctl() due to ",
+    "buffer overflow. Provide a writable buffer argument of ",
+    "sufficient size as determined by the operation.",
+);
+
+#[cfg(all(unix, feature = "host_env"))]
+const IOCTL_STACK_CORRUPTION: &str = concat!(
+    "Possible stack corruption in ioctl() due to ",
+    "buffer overflow. Provide an argument of sufficient size as ",
+    "determined by the operation.",
+);
+
+#[cfg(all(unix, feature = "host_env"))]
+const IOCTL_MEMORY_CORRUPTION: &str = concat!(
+    "Memory corruption in ioctl() due to ",
+    "buffer overflow. Provide an argument of sufficient size as ",
+    "determined by the operation.",
+);
 
 /// `str2charp` freed on every exit, including the syscall's error path.
 #[cfg(all(unix, feature = "host_env"))]
@@ -694,6 +748,28 @@ unsafe fn fill_guarded(
             ARG_GUARD.len(),
         );
     }
+}
+
+/// Zero `total` bytes then copy `len` bytes, leaving the trailing NUL the heap
+/// path checks (`ptr[len] != 0`).
+#[cfg(all(unix, feature = "host_env"))]
+unsafe fn fill_trailing_nul(
+    dst: majit_rlib::rffi::CCHARP,
+    src: majit_rlib::rffi::CCHARP,
+    len: usize,
+    total: usize,
+) {
+    use majit_rlib::rffi::{CONST_VOIDP, VOIDP, c_memcpy, c_memset, cast};
+    debug_assert!(total >= len + 1);
+    unsafe {
+        c_memset(cast::<VOIDP>(dst), 0, total);
+        c_memcpy(cast::<VOIDP>(dst), cast::<CONST_VOIDP>(src), len);
+    }
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+fn map_memory_error(e: majit_rlib::rffi::MemoryError) -> pyre_interpreter::PyError {
+    pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
 }
 
 /// The third argument as `PyArg_Parse(arg, "s*")` reads it: any readable
@@ -733,89 +809,101 @@ fn ioctl_ptr(
 }
 
 #[cfg(all(unix, feature = "host_env"))]
-fn guard_intact(
-    buf: majit_rlib::rffi::CCHARP,
-    len: usize,
-) -> Result<(), pyre_interpreter::PyError> {
-    let intact = unsafe {
+fn guard_overwritten(buf: majit_rlib::rffi::CCHARP, len: usize) -> bool {
+    unsafe {
         let got = std::slice::from_raw_parts(buf.add(len).cast::<u8>(), ARG_GUARD.len());
-        got == ARG_GUARD
-    };
-    if intact {
-        Ok(())
-    } else {
-        Err(pyre_interpreter::PyError::system_error("buffer overflow"))
+        got != ARG_GUARD
     }
 }
 
-/// `str2charp` + `scoped_alloc_buffer(max(ARG_BUFSZ, len))` with the guard
-/// after the argument, `c_memcpy`, `charpsize2str`. `free_charp` runs on drop.
-/// Syscall failure is the OSError; a guard mismatch is reported by the caller
-/// so a mutable buffer can be written back first.
+#[cfg(all(unix, feature = "host_env"))]
+fn trailing_nul_overwritten(buf: majit_rlib::rffi::CCHARP, len: usize) -> bool {
+    unsafe { *buf.add(len) != 0 }
+}
+
+/// `str2charp` + `scoped_alloc_buffer` with either the 8-byte guard (stack
+/// path) or a trailing NUL (heap path), `c_memcpy`, `charpsize2str`.
+/// `free_charp` runs on drop. Syscall failure is the OSError; overflow is
+/// reported by the caller so a mutable buffer can be written back first.
 #[cfg(all(unix, feature = "host_env"))]
 fn stage_ioctl(
     fd: i32,
     request: majit_rlib::rffi::UINT,
     arg: &[u8],
+    stack: bool,
 ) -> Result<(i32, Vec<u8>, bool), pyre_interpreter::PyError> {
-    let ll_arg = FreeCharp(majit_rlib::rffi::str2charp(arg, true).map_err(|e| {
-        pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
-    })?);
-    let total = ARG_BUFSZ.max(arg.len()) + ARG_GUARD.len();
-    let buf = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(|e| {
-        pyre_interpreter::error::get_converted_unexpected_exception(pyre_object::PY_NULL, &e)
-    })?;
-    unsafe { fill_guarded(buf.raw, ll_arg.0, arg.len(), total) };
+    let ll_arg = FreeCharp(majit_rlib::rffi::str2charp(arg, true).map_err(map_memory_error)?);
+    let total = if stack {
+        IOCTL_BUFSZ + ARG_GUARD.len()
+    } else {
+        arg.len() + 1
+    };
+    let buf = majit_rlib::rffi::scoped_alloc_buffer::new(total).map_err(map_memory_error)?;
+    if stack {
+        unsafe { fill_guarded(buf.raw, ll_arg.0, arg.len(), total) };
+    } else {
+        unsafe { fill_trailing_nul(buf.raw, ll_arg.0, arg.len(), total) };
+    }
     let rv = unsafe { ll::ioctl_str(fd, request, buf.raw) };
     if rv < 0 {
         return Err(raise_error_always("ioctl"));
     }
-    let bytes = unsafe { majit_rlib::rffi::charpsize2str(buf.raw, arg.len()) };
-    let overflow = guard_intact(buf.raw, arg.len()).is_err();
+    let bytes =
+        unsafe { majit_rlib::rffi::charpsize2str(buf.raw, arg.len()) }.map_err(map_memory_error)?;
+    let overflow = if stack {
+        guard_overwritten(buf.raw, arg.len())
+    } else {
+        trailing_nul_overwritten(buf.raw, arg.len())
+    };
     Ok((rv, bytes, overflow))
 }
 
 /// The writable-exporter arm: the kernel's answer lands back in the caller's
-/// own storage and the call returns the syscall's value.  An argument longer
-/// than the staging buffer is handed over directly, so there is no guard to
-/// check and no length to refuse.
+/// own storage and the call returns the syscall's value.
+///
+/// [3.15-spec] mutable ioctl buffer longer than IOCTL_BUFSZ passed directly ↔
+/// interp_fcntl.py ioctl (no guard; stages every writable buffer) — no
+/// staging and no guard check; evidence: v3.15.0 fcntlmodule.c fcntl_ioctl_impl
 #[cfg(all(unix, feature = "host_env"))]
 fn ioctl_mutable(
     fd: i32,
     request: majit_rlib::rffi::UINT,
     arg: &mut [u8],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    if arg.len() > ARG_BUFSZ {
+    if arg.len() > IOCTL_BUFSZ {
         let ret = ioctl_ptr(fd, request, arg.as_mut_ptr())?;
         return Ok(pyre_object::w_int_new(ret as i64));
     }
-    let (ret, bytes, overflow) = stage_ioctl(fd, request, arg)?;
+    let (ret, bytes, overflow) = stage_ioctl(fd, request, arg, true)?;
     // Write-back happens before the guard is consulted: a detected overrun
     // still leaves the caller's bytes updated.
     arg.copy_from_slice(&bytes);
     if overflow {
-        return Err(pyre_interpreter::PyError::system_error("buffer overflow"));
+        return Err(pyre_interpreter::PyError::system_error(
+            IOCTL_STACK_CORRUPTION_MUTABLE,
+        ));
     }
     Ok(pyre_object::w_int_new(ret as i64))
 }
 
 /// The read-only arm: the answer is the staged copy, returned as bytes of the
-/// argument's own length.  This one does refuse an over-long argument, because
-/// the kernel can only be given the staging buffer.
+/// argument's own length. A buffer longer than `IOCTL_BUFSZ` takes the heap
+/// path (`fcntl_ioctl_impl` `PyBytesWriter_Create(len)`).
 #[cfg(all(unix, feature = "host_env"))]
 fn ioctl_readonly(
     fd: i32,
     request: majit_rlib::rffi::UINT,
     arg: &[u8],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
-    if arg.len() > ARG_BUFSZ {
-        return Err(pyre_interpreter::PyError::value_error(
-            "ioctl argument 3 is too long",
-        ));
-    }
-    let (_ret, bytes, overflow) = stage_ioctl(fd, request, arg)?;
+    let stack = arg.len() <= IOCTL_BUFSZ;
+    let (_ret, bytes, overflow) = stage_ioctl(fd, request, arg, stack)?;
     if overflow {
-        return Err(pyre_interpreter::PyError::system_error("buffer overflow"));
+        let msg = if stack {
+            IOCTL_STACK_CORRUPTION
+        } else {
+            IOCTL_MEMORY_CORRUPTION
+        };
+        return Err(pyre_interpreter::PyError::system_error(msg));
     }
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
 }

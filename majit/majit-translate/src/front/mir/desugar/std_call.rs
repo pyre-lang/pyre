@@ -3083,7 +3083,9 @@ impl<'a> Lowering<'a> {
     }
 
     /// `rffi.charpsize2str` / `charp2str`: a raw `*mut u8` argument of a
-    /// function that returns a byte list is `CCHARP`. Stamp the actual so
+    /// function that returns a byte list or a `Result` whose `Ok` payload is one
+    /// is `CCHARP`, using the same predicate the callee's Input uses
+    /// (`tyref_raw_u8_ptr_param_is_ccharp`). Stamp the actual so
     /// `getcalldescr` sees Int-kind, matching the unique graph Input.
     pub(in crate::front::mir) fn coerce_ccharp_byte_list_call_args(
         &mut self,
@@ -3097,11 +3099,12 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return args;
         };
-        if !tyref_is_u8_list(&fd.signature.output, self.llbc) {
+        let ret_is_u8_list = tyref_returns_u8_list(&fd.signature.output, self.llbc);
+        if !ret_is_u8_list {
             return args;
         }
         for (i, ty) in fd.signature.inputs.iter().enumerate() {
-            if i < args.len() && tyref_is_raw_u8_ptr(ty, self.llbc) {
+            if i < args.len() && tyref_raw_u8_ptr_param_is_ccharp(ty, ret_is_u8_list, self.llbc) {
                 let coerced = self.ensure_window_ccharp(mir_bb, args[i].clone());
                 stamp_as_ccharp(&coerced);
                 args[i] = coerced;

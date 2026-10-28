@@ -5224,6 +5224,7 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
             &ref_u8,
             false,
             false,
+            None,
             &llbc,
             no_tombstoned_leaves(),
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
@@ -5238,6 +5239,7 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
             &ref_usize,
             false,
             true,
+            None,
             &llbc,
             no_tombstoned_leaves(),
             &super::harvest_declared_gc_facts(&llbc).gc_struct_ids(),
@@ -5274,6 +5276,97 @@ fn adt_field_read_peels_shared_borrow_of_usize_to_unsigned() {
         ),
         ValueType::Unsigned,
         "FORCE-attr rows for a closure-env capture match the Int-banked getfield"
+    );
+}
+
+fn raw_mut_u8() -> TyRef {
+    fixture_ty(serde_json::json!({
+        "RawPtr": [
+            {"Scalar": {"Integer": {"Unsigned": "U8"}}},
+            "Mut"
+        ]
+    }))
+}
+
+fn raw_mut_i8() -> TyRef {
+    fixture_ty(serde_json::json!({
+        "RawPtr": [
+            {"Scalar": {"Integer": {"Signed": "I8"}}},
+            "Mut"
+        ]
+    }))
+}
+
+#[test]
+fn adt_field_read_raw_owner_byte_ptr_is_int() {
+    // `history.py` `getkind` of a raw `Ptr` is `'int'`. A GC owner's
+    // `*mut u8` stays the erased GCREF; a raw owner banks the same
+    // spelling as the address word (`fat_part_value_type`,
+    // `field_spelling_lltype`).
+    let llbc = llbc_with_ordinary_and_closure_env();
+    let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+    let tomb = no_tombstoned_leaves();
+    let raw_u8 = raw_mut_u8();
+    let raw_i8 = raw_mut_i8();
+    assert_eq!(
+        adt_field_read_value_type(
+            &raw_u8,
+            &raw_u8,
+            false,
+            false,
+            Some(true),
+            &llbc,
+            tomb,
+            &gc_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        ValueType::Ref(None),
+        "a GC owner's *mut u8 stays the erased GCREF"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &raw_u8,
+            &raw_u8,
+            false,
+            false,
+            None,
+            &llbc,
+            tomb,
+            &gc_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        ValueType::Ref(None),
+        "an unknown owner keeps the *mut u8 GCREF spelling"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &raw_u8,
+            &raw_u8,
+            false,
+            false,
+            Some(false),
+            &llbc,
+            tomb,
+            &gc_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        ValueType::Int,
+        "a raw owner's *mut u8 is the address word"
+    );
+    assert_eq!(
+        adt_field_read_value_type(
+            &raw_i8,
+            &raw_i8,
+            false,
+            false,
+            Some(false),
+            &llbc,
+            tomb,
+            &gc_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        ValueType::Int,
+        "a raw owner's *mut i8 is the address word"
     );
 }
 
