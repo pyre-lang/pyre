@@ -2748,7 +2748,11 @@ fn emit_jump_absolute_tick(
         // terminator's own `-live-`.  A fresh block's head `-live-` is the
         // jump's frame-state variables — the same set the slow/hot arms
         // already use — so the resume marker and the guard agree.
-        let mut tick_state = current_state.clone();
+        // Each block gets fresh Variables (`framestate.py FrameState.copy`).
+        let mut tick_state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            current_state.copy(&mut fresh)
+        };
         tick_state.next_offset = py_pc;
         tick_state.blocklist = frame_blocks_for_offset(code, py_pc);
         let tick_block = SpamBlockRef::new(graph.new_block(Vec::new()), Some(tick_state.clone()));
@@ -2828,30 +2832,47 @@ fn emit_jump_absolute_tick(
         tick_block.block().borrow_mut().exitswitch =
             Some(super::flow::ExitSwitch::Value(armed.into()));
 
-        let mut arm_state = tick_state.clone();
-        arm_state.next_offset = py_pc;
-        arm_state.blocklist = frame_blocks_for_offset(code, py_pc);
-        let slow = SpamBlockRef::new(graph.new_block(Vec::new()), Some(arm_state.clone()));
+        let mut slow_state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            tick_state.copy(&mut fresh)
+        };
+        slow_state.next_offset = py_pc;
+        slow_state.blocklist = frame_blocks_for_offset(code, py_pc);
+        let mut hot_state = {
+            let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+            tick_state.copy(&mut fresh)
+        };
+        hot_state.next_offset = py_pc;
+        hot_state.blocklist = frame_blocks_for_offset(code, py_pc);
+        let slow = SpamBlockRef::new(graph.new_block(Vec::new()), Some(slow_state.clone()));
         all_walker_blocks.push(slow.clone());
-        let slow_inputs = arm_state.getvariables();
-        slow.block().borrow_mut().inputargs = slow_inputs.clone();
+        slow.block().borrow_mut().inputargs = slow_state.getvariables();
 
-        let hot = SpamBlockRef::new(graph.new_block(Vec::new()), Some(arm_state.clone()));
+        let hot = SpamBlockRef::new(graph.new_block(Vec::new()), Some(hot_state.clone()));
         all_walker_blocks.push(hot.clone());
-        let hot_inputs = arm_state.getvariables();
-        hot.block().borrow_mut().inputargs = hot_inputs.clone();
+        hot.block().borrow_mut().inputargs = hot_state.getvariables();
 
         // flatten.py Bool 2-exit: `make_link(linktrue)` then `linkfalse`.
         // goto_if_not jumps when the condition is 0, so linkfalse is the
         // unarmed (hot) arm and linktrue is the armed residual.
         append_exit(
             &tick_block.block(),
-            super::flow::Link::new(slow_inputs, Some(slow.block()), None).into_ref(),
+            super::flow::Link::new(
+                tick_state.getoutputargs(&slow_state),
+                Some(slow.block()),
+                None,
+            )
+            .into_ref(),
         );
         set_last_bool_exitcase(&tick_block.block(), true);
         append_exit(
             &tick_block.block(),
-            super::flow::Link::new(hot_inputs.clone(), Some(hot.block()), None).into_ref(),
+            super::flow::Link::new(
+                tick_state.getoutputargs(&hot_state),
+                Some(hot.block()),
+                None,
+            )
+            .into_ref(),
         );
         set_last_bool_exitcase(&tick_block.block(), false);
 
@@ -2878,7 +2899,7 @@ fn emit_jump_absolute_tick(
                 graph,
                 &slow.block(),
                 &site.landing,
-                &arm_state,
+                &slow_state,
                 site,
                 unwind_memo,
                 depth_at_pc,
@@ -2886,7 +2907,12 @@ fn emit_jump_absolute_tick(
         }
         append_exit(
             &slow.block(),
-            super::flow::Link::new(hot_inputs, Some(hot.block()), None).into_ref(),
+            super::flow::Link::new(
+                slow_state.getoutputargs(&hot_state),
+                Some(hot.block()),
+                None,
+            )
+            .into_ref(),
         );
         restore_canraise_exit_order(&slow.block());
         hot
@@ -2919,13 +2945,14 @@ fn emit_jump_absolute_tick(
     } else {
         header_block
     };
+    let goto_is_new_block = emit_header || eb_addr != 0;
     let _ = mergeblock(
         code,
         graph,
         joinpoints,
         &goto_block,
         &{
-            let mut branch_state = if emit_header {
+            let mut branch_state = if goto_is_new_block {
                 goto_block
                     .framestate()
                     .unwrap_or_else(|| current_state.clone())
