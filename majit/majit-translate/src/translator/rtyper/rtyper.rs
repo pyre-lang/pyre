@@ -2498,6 +2498,12 @@ impl RPythonTyper {
             // to the result builder repr's `ll_new` helper graph.
             "newstringbuilder" => super::lltypesystem::rbuilder::rtype_newstringbuilder(hop),
             "newrustvec" => super::rrustvec::rtype_newrustvec(hop),
+            // `ll_copy` (`rlist.py`) of a `FixedSizeListRepr` self into a
+            // raw `Vec`: `gendirectcall` of
+            // `ll_vec_copy_from_fixed_list_{segment}`. Any other self stays
+            // a `direct_call` of `to_vec`. `Signed` and `Unsigned` do not
+            // share the helper.
+            "ll_vec_copy_from_slice" => super::rrustvec::rtype_ll_vec_copy_from_slice(hop),
             // rtuple.py — `pairtype(TupleRepr, Repr).rtype_contains`.
             "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
             // `same_as` (rtyper.py:478-481) is RPython's internal

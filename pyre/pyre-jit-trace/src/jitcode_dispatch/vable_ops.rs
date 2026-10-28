@@ -657,6 +657,58 @@ impl VableStoreRoot {
     }
 }
 
+/// A `Ref` whose OpRef is `NONE` has no box. `_opimpl_getarrayitem_vable`
+/// returns the box, so that raw copy is not a shadow entry.
+fn ref_copy_without_box(value: OpRef, live: Value) -> bool {
+    value.is_none() && matches!(live, Value::Ref(_))
+}
+
+/// `publish_fresh_recipe_ref`: a real Ref is stamped on its box before any
+/// shadow copy. Constants and `NONE` have no recorder slot; null and
+/// `GcRef::NO_CONCRETE` are not objects.
+fn stamp_real_ref_on_box(ctx: &mut TraceCtx, value: OpRef, live: Value) {
+    if let Value::Ref(gc) = live
+        && !value.is_none()
+        && !value.is_constant()
+        && !gc.is_null()
+        && gc != majit_ir::GcRef::NO_CONCRETE
+    {
+        ctx.try_set_opref_concrete(value, live);
+    }
+}
+
+/// Word published after `vable_setarrayitem_checked` / `store_live_frame_array_slot`.
+///
+/// A Ref's root is the [`VableStoreRoot`] pin, which a collection updates in
+/// place. Int and Float are not addresses; the captured copy is the value.
+fn live_after_vable_store(store_root: &VableStoreRoot, value_bank: char, captured: Value) -> Value {
+    if value_bank == 'r' {
+        store_root.live(captured)
+    } else {
+        captured
+    }
+}
+
+/// Non-fold shadow publish. The box is stamped first. A `NONE` Ref is not
+/// written: there is no box to forward, and clearing the slot would drop a
+/// fold entry the root walker has already updated.
+fn publish_nonfold_slot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    frame_reg: u16,
+    slot: i64,
+    value: OpRef,
+    live: Value,
+) {
+    stamp_real_ref_on_box(ctx.trace_ctx, value, live);
+    // The `borrow_mut` temporary has to live for the whole shadow update.
+    if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
+        shadow.set_opref(slot, value);
+        if !ref_copy_without_box(value, live) {
+            shadow.set_concrete(frame_reg, slot, live);
+        }
+    }
+}
+
 /// `frame` when this walk is a generator resume writing its OWN suspended
 /// frame — the one case where a walk-time store lands on a frame the walk did
 /// not create.
@@ -1476,21 +1528,25 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
             LiveFrameSlot::Present(live) => live,
             LiveFrameSlot::Null => Value::Ref(majit_ir::GcRef(0)),
             LiveFrameSlot::Unavailable => {
-                // Prefer re-resolving the slot's SSA OpRef through the op-table (a
-                // GC-forwarded, rooted value channel) over the raw concrete copy the
-                // shadow holds: `CalleeLocalsShadow.concrete` is not visited by the
-                // trace-ref walker, so a Ref copy dangles if a minor collection moved a
-                // nursery object across the may-force residual. The op-table concrete IS
-                // forwarded. Fall back to the stored copy when the OpRef carries no live
-                // concrete (ints/floats are value copies of immutable payloads and are
-                // always safe). Only consult the OpRef when a frame-matched `concrete`
-                // entry exists, so the per-frame isolation the `frame_reg` filter gives
-                // `concrete` also bounds the OpRef re-resolution.
+                // `_opimpl_getarrayitem_vable` returns
+                // `metainterp.virtualizable_boxes[index]`. The box owns the
+                // value; a moving GC updates it because the box stays
+                // reachable. A `Ref` is therefore taken only from
+                // `concrete_of_opref(slot_opref)`. `entry.value` is a raw
+                // copy and is returned only for `Int` and `Float`. A `Ref`
+                // with no box concrete is `Void`. The OpRef is consulted
+                // only when a frame-matched `concrete` entry exists, so the
+                // `frame_reg` filter still bounds the lookup.
                 entry
                     .and_then(|_| {
                         slot_opref.and_then(|opref| ctx.trace_ctx.concrete_of_opref(opref))
                     })
-                    .or_else(|| entry.map(|entry| entry.value))
+                    .or_else(|| {
+                        entry.and_then(|entry| match entry.value {
+                            value @ (Value::Int(_) | Value::Float(_)) => Some(value),
+                            _ => None,
+                        })
+                    })
                     .unwrap_or(Value::Void)
             }
         }
@@ -1672,6 +1728,12 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
             } else {
                 captured
             };
+            // Stamp the box before the shadow copy, and before
+            // `store_live_frame_array_slot`. A non-standard vable falls
+            // through and publishes again after those collecting calls; the
+            // box already carries this word, so that arm re-reads the pin
+            // instead of putting the pre-call copy back.
+            stamp_real_ref_on_box(ctx.trace_ctx, value, concrete);
             if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(fold_frame_reg, slot, concrete);
@@ -1805,6 +1867,8 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
     let captured =
         vable_effective_value_concrete(code, op, 2, ctx, value_bank, encoded_value, value)
             .unwrap_or(Value::Void);
+    // Pre-call word passed into the recording call. The shadow is published
+    // from a later [`VableStoreRoot::live`] read: this local is not a root.
     let concrete = if value_bank == 'r' {
         store_root.live(captured)
     } else {
@@ -1840,19 +1904,18 @@ pub(crate) fn setarrayitem_vable_via_metainterp<Sym: WalkSym>(
                 value,
             });
         }
-        crate::state::store_live_frame_array_slot(frame, index_value as usize, concrete);
-        // Keep the inline concrete-locals shadow current so a later read of this
-        // slot (after a may-force op clears the heapcache) recovers the concrete.
-        // Seed BOTH maps: the read fallback prefers re-resolving the slot's OpRef
-        // through the (GC-forwarded) op-table over the raw `concrete` copy, so the
-        // OpRef must track the stored value on every write — otherwise a re-stored
-        // slot would re-resolve a stale OpRef while `concrete` held the fresh value.
-        // Only this level's own frame: a store to a foreign vable must not bind
-        // in `locals()` through this shadow.
-        if let Some(shadow) = ctx.frame_state.borrow_mut().callee_shadow.as_mut() {
-            shadow.set_opref(index_value, value);
-            shadow.set_concrete(code[op.pc + 1] as u16, index_value, concrete);
-        }
+        // Re-read after `vable_setarrayitem_checked`. The array store may
+        // itself collect, so the shadow reads the pin again below.
+        crate::state::store_live_frame_array_slot(
+            frame,
+            index_value as usize,
+            live_after_vable_store(&store_root, value_bank, concrete),
+        );
+        // Only this level's own frame: a store to a foreign vable must not
+        // bind in `locals()` through this shadow. The published word is the
+        // pin after both calls. A `NONE` Ref has no box and is not stored.
+        let live = live_after_vable_store(&store_root, value_bank, concrete);
+        publish_nonfold_slot(ctx, code[op.pc + 1] as u16, index_value, value, live);
     }
     let _ = _write;
     // A Ref stored to the operand-stack region of the vable array is an
@@ -1963,4 +2026,481 @@ pub(crate) fn arraylen_vable_via_metainterp<Sym: WalkSym>(
     let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
     write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+#[cfg(test)]
+mod callee_ref_owner_tests {
+    use super::*;
+
+    fn no_subs(_idx: usize) -> Option<SubJitCodeBody> {
+        None
+    }
+
+    fn shadow_slot<Sym: WalkSym>(wc: &WalkContext<'_, '_, Sym>, slot: i64) -> Option<Value> {
+        wc.frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(|shadow| shadow.concrete.get(&slot).map(|entry| entry.value))
+    }
+
+    fn shadow_op<Sym: WalkSym>(wc: &WalkContext<'_, '_, Sym>, slot: i64) -> Option<OpRef> {
+        wc.frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(|shadow| shadow.opref.get(&slot).copied())
+    }
+
+    fn with_ctx<R>(
+        tc: &mut TraceCtx,
+        shadow: Option<CalleeLocalsShadow>,
+        regs_r: &[OpRef],
+        regs_i: &[OpRef],
+        concrete_r: Vec<ConcreteValue>,
+        raw_pool: &[majit_metainterp::jitcode::RuntimeBhDescr],
+        body: impl FnOnce(&mut WalkContext<'_, '_, crate::state::PyreSym>) -> R,
+    ) -> R {
+        let session = std::cell::RefCell::new(WalkSession::default());
+        let regs_r = RegisterBank::new(regs_r.iter().copied());
+        let regs_i = RegisterBank::new(regs_i.iter().copied());
+        let regs_f = RegisterBank::default();
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut concrete_i = [];
+        let mut wc = WalkContext {
+            frame_state: WalkFrameState::new(WalkFrameStateData {
+                callee_shadow: shadow,
+                concrete_registers_r: concrete_r,
+                outer_active_boxes: Vec::new(),
+                vstack_boxes: Vec::new(),
+                vstack_last_ref: OpRef::NONE,
+                vstack_reorder_saved: None,
+                ..Default::default()
+            }),
+            inline_callee_consts: None,
+            fbw_mode: FbwWalkMode::default(),
+            session: &session,
+            registers_r: &regs_r,
+            registers_i: &regs_i,
+            registers_f: &regs_f,
+            concrete_registers_i: &mut concrete_i,
+            descr_refs: &descr_pool,
+            raw_descrs: RawDescrPool::PerFn(raw_pool),
+            is_authoritative_executor: false,
+            trace_ctx: tc,
+            is_top_level: true,
+            sub_jitcode_lookup: &no_subs,
+            entry_py_pc: EntryPyPc::Py(0),
+            outer_resume_marker_jit_pc: None,
+            outer_jitcode_index: 0,
+            pending_guard_snapshot_error: None,
+            vstack_depth: 0,
+            vstack_cur_pypc: 0,
+            vstack_valid: false,
+            vstack_reorder_ceiling: u32::MAX,
+            vstack_handler_landing_py: None,
+            live_before_jit_pc: usize::MAX,
+            live_after_jit_pc: usize::MAX,
+        };
+        body(&mut wc)
+    }
+
+    fn array_pool(
+        info: &majit_metainterp::virtualizable::VirtualizableInfo,
+    ) -> Vec<majit_metainterp::jitcode::RuntimeBhDescr> {
+        let bh_array = majit_jitcode::jitcode::BhDescr::from_array_descr(
+            info.array_descrs[0]
+                .as_array_descr()
+                .expect("the fixture's array descr"),
+        );
+        vec![
+            majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(
+                majit_jitcode::jitcode::BhDescr::VableArray { index: 0 },
+            )),
+            majit_metainterp::jitcode::RuntimeBhDescr::Descr(Box::new(bh_array)),
+        ]
+    }
+
+    fn install_portal(
+        tc: &mut TraceCtx,
+    ) -> std::sync::Arc<majit_metainterp::virtualizable::VirtualizableInfo> {
+        let info = crate::frame_layout::build_pyframe_virtualizable_info();
+        let array_len = 3;
+        let slot_count = info.num_static_extra_boxes + array_len;
+        let standard = tc.const_ref(1);
+        let hole = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+        let initial_boxes = vec![hole; slot_count];
+        tc.install_virtualizable_info(info.clone());
+        tc.init_virtualizable_boxes(
+            &info,
+            standard,
+            Value::Ref(majit_ir::GcRef(1)),
+            &initial_boxes,
+            &[],
+            &[array_len],
+        );
+        info
+    }
+
+    fn one_local_frame() -> (pyre_interpreter::pyframe::FrameBox, usize) {
+        let function =
+            pyre_interpreter::compile_exec("def f(x):\n    return x\n").expect("compile");
+        let code = function
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                pyre_interpreter::ConstantData::Code { code } if code.obj_name.as_str() == "f" => {
+                    Some((**code).clone())
+                }
+                _ => None,
+            })
+            .expect("function code");
+        let mut frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+        (frame, frame_ptr)
+    }
+
+    /// `read_retired_callee_local` and `null_live_vable_slot_reads_null_not_the_shadow`
+    /// still seed `OpRef::const_ptr` of the same address as the shadow. Their
+    /// assert is satisfied by `inline_const_to_value` and does not observe a
+    /// box-less `Ref` copy. This test is that case: the shadow holds `Ref(X)`
+    /// and the slot box has no concrete.
+    #[test]
+    fn unavailable_ref_comes_only_from_the_box() {
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let info = install_portal(&mut tc);
+        let raw_pool = array_pool(&info);
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(2)));
+        let index = tc.const_int(0);
+        let slot_box = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+        assert!(
+            !slot_box.is_constant() && !slot_box.is_none(),
+            "the slot box must be a real OpRef"
+        );
+        assert_eq!(tc.concrete_of_opref(slot_box), None);
+        let stale = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
+        let mut shadow = CalleeLocalsShadow {
+            fold_frame_reg: u16::MAX,
+            concrete_frame: 0,
+            frame_box: vable,
+            frame_materialized: true,
+            ..Default::default()
+        };
+        shadow.set_opref(0, slot_box);
+        shadow.set_concrete(0, 0, stale);
+        // `ridd>r`: r-reg(0) + i-reg(1) + fdescr(0) + adescr(1) + dst(2).
+        let code: [u8; 8] = [0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x02];
+        let op = DecodedOp {
+            key: "getarrayitem_vable_r/ridd>r",
+            opname: "getarrayitem_vable_r",
+            argcodes: "ridd>r",
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let regs_r = [vable, OpRef::NONE, OpRef::NONE];
+        let regs_i = [index, index, OpRef::NONE];
+        let read = with_ctx(
+            &mut tc,
+            Some(shadow),
+            &regs_r,
+            &regs_i,
+            vec![ConcreteValue::Null; 3],
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    getarrayitem_vable_via_metainterp(&code, &op, wc, 'r').map(|(out, _)| out);
+                let dst = wc.registers_r.get(2);
+                let concrete = dst.and_then(|opref| wc.trace_ctx.concrete_of_opref(opref));
+                let kept = shadow_slot(wc, 0);
+                (outcome, concrete, kept)
+            },
+        );
+        assert_eq!(read.0, Ok(DispatchOutcome::Continue));
+        assert_eq!(
+            read.1, None,
+            "a Ref copy is not the value when the box has no concrete"
+        );
+        assert_eq!(read.2, Some(stale), "the read does not rewrite the shadow");
+
+        let forwarded = Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(true) as usize));
+        tc.set_opref_concrete(slot_box, forwarded);
+        let read = with_ctx(
+            &mut tc,
+            {
+                let mut shadow = CalleeLocalsShadow {
+                    fold_frame_reg: u16::MAX,
+                    concrete_frame: 0,
+                    frame_box: vable,
+                    frame_materialized: true,
+                    ..Default::default()
+                };
+                shadow.set_opref(0, slot_box);
+                shadow.set_concrete(0, 0, stale);
+                Some(shadow)
+            },
+            &regs_r,
+            &regs_i,
+            vec![ConcreteValue::Null; 3],
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    getarrayitem_vable_via_metainterp(&code, &op, wc, 'r').map(|(out, _)| out);
+                let concrete = wc
+                    .registers_r
+                    .get(2)
+                    .and_then(|opref| wc.trace_ctx.concrete_of_opref(opref));
+                (outcome, concrete, shadow_slot(wc, 0))
+            },
+        );
+        assert_eq!(read.0, Ok(DispatchOutcome::Continue));
+        assert_eq!(read.1, Some(forwarded));
+        assert_eq!(read.2, Some(stale));
+
+        // Int copies are not addresses. An unstamped slot box still returns
+        // the shadow integer.
+        let mut shadow = CalleeLocalsShadow {
+            fold_frame_reg: u16::MAX,
+            concrete_frame: 0,
+            frame_box: vable,
+            frame_materialized: true,
+            ..Default::default()
+        };
+        shadow.set_opref(0, slot_box);
+        shadow.set_concrete(0, 0, Value::Int(42));
+        // The previous stamp would answer the box first. Clear it by using a
+        // fresh unstamped hole.
+        let int_box = tc.record_op(majit_ir::OpCode::NewWithVtable, &[]);
+        assert_eq!(tc.concrete_of_opref(int_box), None);
+        shadow.set_opref(0, int_box);
+        let read = with_ctx(
+            &mut tc,
+            Some(shadow),
+            &regs_r,
+            &regs_i,
+            vec![ConcreteValue::Null; 3],
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    getarrayitem_vable_via_metainterp(&code, &op, wc, 'i').map(|(out, _)| out);
+                let concrete = wc
+                    .registers_i
+                    .get(2)
+                    .and_then(|opref| wc.trace_ctx.concrete_of_opref(opref));
+                (outcome, concrete)
+            },
+        );
+        assert_eq!(read.0, Ok(DispatchOutcome::Continue));
+        assert_eq!(read.1, Some(Value::Int(42)));
+    }
+
+    #[test]
+    fn fold_setarrayitem_stamps_the_unstamped_box() {
+        let (_frame, frame_ptr) = one_local_frame();
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let info = install_portal(&mut tc);
+        let standard = tc
+            .standard_virtualizable_box()
+            .expect("init_virtualizable_boxes pushes the identity");
+        let raw_pool = array_pool(&info);
+        let value = OpRef::input_arg_ref(1);
+        assert_eq!(tc.concrete_of_opref(value), None);
+        let none = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
+        let index = tc.const_int(0);
+        let shadow = CalleeLocalsShadow {
+            fold_frame_reg: 0,
+            concrete_frame: frame_ptr,
+            frame_box: standard,
+            frame_materialized: false,
+            ..Default::default()
+        };
+        // `riXdd`: opcode, vable r0, index i1, value r2, fdescr 0, adescr 1.
+        let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+        let op = DecodedOp {
+            key: "setarrayitem_vable_r/rirdd",
+            opname: "setarrayitem_vable_r",
+            argcodes: "rirdd",
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let regs_r = [standard, OpRef::NONE, value];
+        let regs_i = [index, index];
+        let mut concrete_r = vec![ConcreteValue::Null; 3];
+        concrete_r[2] = ConcreteValue::Ref(pyre_object::w_none());
+        with_ctx(
+            &mut tc,
+            Some(shadow),
+            &regs_r,
+            &regs_i,
+            concrete_r,
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    setarrayitem_vable_via_metainterp(&code, &op, wc, 'r').map(|(out, _)| out);
+                assert_eq!(outcome, Ok(DispatchOutcome::Continue));
+                assert_eq!(shadow_slot(wc, 0), Some(none));
+                assert_eq!(shadow_op(wc, 0), Some(value));
+            },
+        );
+        assert_eq!(
+            tc.concrete_of_opref(value),
+            Some(none),
+            "the fold arm stamps the box before set_concrete"
+        );
+    }
+
+    #[test]
+    fn nonfold_setarrayitem_stamps_the_box_with_the_live_ref() {
+        let (_frame, frame_ptr) = one_local_frame();
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let info = install_portal(&mut tc);
+        let raw_pool = array_pool(&info);
+        let vable = OpRef::input_arg_ref(0);
+        let value = OpRef::input_arg_ref(1);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(frame_ptr)));
+        assert_eq!(tc.concrete_of_opref(value), None);
+        let none = Value::Ref(majit_ir::GcRef(pyre_object::w_none() as usize));
+        let index = tc.const_int(0);
+        let shadow = CalleeLocalsShadow {
+            fold_frame_reg: u16::MAX,
+            concrete_frame: frame_ptr,
+            frame_box: vable,
+            frame_materialized: false,
+            ..Default::default()
+        };
+        let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+        let op = DecodedOp {
+            key: "setarrayitem_vable_r/rirdd",
+            opname: "setarrayitem_vable_r",
+            argcodes: "rirdd",
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let regs_r = [vable, OpRef::NONE, value];
+        let regs_i = [index, index];
+        let mut concrete_r = vec![ConcreteValue::Null; 3];
+        concrete_r[2] = ConcreteValue::Ref(pyre_object::w_none());
+        with_ctx(
+            &mut tc,
+            Some(shadow),
+            &regs_r,
+            &regs_i,
+            concrete_r,
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    setarrayitem_vable_via_metainterp(&code, &op, wc, 'r').map(|(out, _)| out);
+                assert_eq!(outcome, Ok(DispatchOutcome::Continue), "{outcome:?}");
+                assert_eq!(shadow_slot(wc, 0), Some(none));
+                assert_eq!(shadow_op(wc, 0), Some(value));
+            },
+        );
+        assert_eq!(tc.concrete_of_opref(value), Some(none));
+        assert_eq!(
+            crate::state::concrete_stack_value(frame_ptr, 0).map(|raw| raw as usize),
+            Some(pyre_object::w_none() as usize)
+        );
+    }
+
+    #[test]
+    fn nonfold_setarrayitem_keeps_an_int_copy() {
+        let (_frame, frame_ptr) = one_local_frame();
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
+        let info = install_portal(&mut tc);
+        let raw_pool = array_pool(&info);
+        let vable = OpRef::input_arg_ref(0);
+        tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(frame_ptr)));
+        let index = tc.const_int(0);
+        let stored = tc.const_int(11);
+        let shadow = CalleeLocalsShadow {
+            fold_frame_reg: u16::MAX,
+            concrete_frame: frame_ptr,
+            frame_box: vable,
+            frame_materialized: false,
+            ..Default::default()
+        };
+        let code: [u8; 8] = [0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00];
+        let op = DecodedOp {
+            key: "setarrayitem_vable_i/riidd",
+            opname: "setarrayitem_vable_i",
+            argcodes: "riidd",
+            pc: 0,
+            next_pc: code.len(),
+        };
+        let regs_r = [vable];
+        let regs_i = [index, index, stored];
+        with_ctx(
+            &mut tc,
+            Some(shadow),
+            &regs_r,
+            &regs_i,
+            vec![ConcreteValue::Null; 1],
+            &raw_pool,
+            |wc| {
+                let outcome =
+                    setarrayitem_vable_via_metainterp(&code, &op, wc, 'i').map(|(out, _)| out);
+                assert_eq!(outcome, Ok(DispatchOutcome::Continue), "{outcome:?}");
+                assert_eq!(shadow_slot(wc, 0), Some(Value::Int(11)));
+                assert_eq!(shadow_op(wc, 0), Some(stored));
+            },
+        );
+    }
+
+    /// No existing harness moves a `VableStoreRoot` pin inside
+    /// `vable_setarrayitem_checked` or `store_live_frame_array_slot`.
+    /// `TraceCtx::for_test_types` records into a host buffer, and `set_ref`'s
+    /// write barrier is not a collection point (`call_pure_r_all_const_folded_const_is_the_forwarded_box`).
+    /// The collector updates the pin in place. This test does that update,
+    /// then publishes through `live_after_vable_store` and
+    /// `publish_nonfold_slot`, which is the non-fold writer's post-call commit.
+    #[test]
+    fn publish_nonfold_slot_uses_the_reread_pin_and_skips_a_ref_without_a_box() {
+        let from = pyre_object::w_none();
+        let to = pyre_object::w_bool_from(true);
+        let from_v = Value::Ref(majit_ir::GcRef(from as usize));
+        let to_v = Value::Ref(majit_ir::GcRef(to as usize));
+        let root = VableStoreRoot::capture(from_v);
+        let pre = root.live(from_v);
+        assert_eq!(pre, from_v);
+        let slot = root.slot.expect("a real Ref is pinned");
+        pyre_object::gc_roots::shadow_stack_set(slot, to);
+        let live = live_after_vable_store(&root, 'r', pre);
+        assert_eq!(live, to_v);
+        assert_ne!(live, pre);
+        assert_eq!(
+            live_after_vable_store(&root, 'i', Value::Int(4)),
+            Value::Int(4)
+        );
+
+        let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+        let value = OpRef::input_arg_ref(1);
+        tc.set_opref_concrete(value, from_v);
+        let mut shadow = CalleeLocalsShadow::default();
+        shadow.set_opref(0, OpRef::input_arg_ref(0));
+        shadow.set_concrete(7, 0, Value::Int(5));
+        let raw_pool: Vec<majit_metainterp::jitcode::RuntimeBhDescr> = Vec::new();
+        with_ctx(
+            &mut tc,
+            Some(shadow),
+            &[],
+            &[],
+            Vec::new(),
+            &raw_pool,
+            |wc| {
+                publish_nonfold_slot(wc, 3, 1, value, live);
+                assert_eq!(shadow_slot(wc, 1), Some(to_v));
+                assert_eq!(shadow_op(wc, 1), Some(value));
+                // `NONE` + `Ref` has no box. Do not store it, and do not
+                // clear the integer already in the slot.
+                publish_nonfold_slot(wc, 3, 0, OpRef::NONE, from_v);
+                assert_eq!(shadow_op(wc, 0), None);
+                assert_eq!(shadow_slot(wc, 0), Some(Value::Int(5)));
+                publish_nonfold_slot(wc, 3, 2, OpRef::NONE, Value::Int(9));
+                assert_eq!(shadow_slot(wc, 2), Some(Value::Int(9)));
+                publish_nonfold_slot(wc, 3, 2, OpRef::NONE, Value::Float(1.5));
+                assert_eq!(shadow_slot(wc, 2), Some(Value::Float(1.5)));
+            },
+        );
+        assert_eq!(tc.concrete_of_opref(value), Some(to_v));
+    }
 }

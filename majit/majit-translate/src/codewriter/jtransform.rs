@@ -4091,6 +4091,13 @@ impl<'a> Transformer<'a> {
             {
                 rewritten
             }
+            // `getfield(header, "ptr")` (`ll_copy` reads `new_lst.ptr`).
+            // A FieldRead of `"ptr"` on the raw Vec header has no parent
+            // SizeDescr (`get_field_descr`); `getfield_gc` of that descr
+            // trips `ensure_ptr_info_arg0`. The word is `VEC_PTR_WORD`.
+            OpKind::FieldRead { field, .. } if is_rust_vec_header_ptr_read(field) => {
+                self.rewrite_rust_vec_header_ptr_read(op, graph)
+            }
             OpKind::FieldRead { field, ty, .. } => {
                 let rewritten = self.rewrite_op_getfield(op, field, ty, graph_name, graph);
                 self.promote_dyn_vtable_word(op, field, ty, graph, graph_name, rewritten)
@@ -7948,6 +7955,25 @@ impl<'a> Transformer<'a> {
             panic!("rust vec header len write value is not an int: {value:?}")
         };
         raw_list_header_store(graph, &mut ops, &addr, offset, word, stored);
+        RewriteResult::Replace(ops)
+    }
+
+    /// `raw_load_i(header, VEC_PTR_WORD)` (`rvec.rs` `vec_header_word`).
+    /// `rewrite_op_raw_load` is not re-run on `Replace` ops, so the base
+    /// is coerced here (`cast_ptr_to_int`). `get_field_descr` has no
+    /// parent SizeDescr for this field (`ensure_ptr_info_arg0`).
+    fn rewrite_rust_vec_header_ptr_read(
+        &mut self,
+        op: &SpaceOperation,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        let OpKind::FieldRead { base, .. } = &op.kind else {
+            unreachable!("rewrite_rust_vec_header_ptr_read on non-FieldRead");
+        };
+        let word = crate::layout::target_word_size();
+        let offset = majit_ir::rvec::vec_word_offset(majit_ir::rvec::VEC_PTR_WORD, word);
+        let (addr, mut ops) = self.coerce_operand_to_int(graph, base);
+        raw_list_header_load(graph, &mut ops, &addr, offset, word, op.result.clone());
         RewriteResult::Replace(ops)
     }
 
@@ -14503,6 +14529,20 @@ fn is_rust_vec_header_len_write(field: &FieldDescriptor) -> bool {
         field.owner_root.as_deref(),
         Some("alloc::vec::Vec" | "RustVec" | "rust_vec")
     )
+}
+
+/// `new_lst.ptr` (`ll_copy` / `ll_items` of a raw `Vec`). The owner is
+/// the raw header, not an inline `Vec` field (`get_field_descr` would
+/// find a parent SizeDescr for those). The word is `VEC_PTR_WORD`.
+fn is_rust_vec_header_ptr_read(field: &FieldDescriptor) -> bool {
+    if field.inline_vec || field.vec_part.is_some() {
+        return false;
+    }
+    field.name == "ptr"
+        && matches!(
+            field.owner_root.as_deref(),
+            Some("alloc::vec::Vec" | "RustVec" | "rust_vec")
+        )
 }
 
 fn tuple_pos_field_index(name: &str) -> Option<usize> {

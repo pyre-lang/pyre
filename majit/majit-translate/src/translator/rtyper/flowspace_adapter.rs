@@ -3882,13 +3882,15 @@ pub fn translate_op(
                                 .to_string(),
                         ));
                     }
-                    // A one-word `<[T]>::to_vec` reads the header
-                    // `stamp_rust_vec_header` wrote and selects that item
-                    // lowleveltype's `project_rust_vec` row
-                    // (`to_vec_registry_key`). `rlist.py` `ll_copy`
-                    // specializes per LIST type; `llannotation.py`
+                    // A one-word `<[T]>::to_vec` is `ll_copy` (`rlist.py`).
+                    // The rtyper emits `ll_vec_copy_from_slice`. A
+                    // `FixedSizeListRepr` self `gendirectcall`s
+                    // `ll_vec_copy_from_fixed_list_{segment}`; any other
+                    // self stays a `direct_call` of `to_vec`.
                     // `lltype_to_annotation` keeps `Signed` and `Unsigned`
-                    // distinct. Every other call leaves the path unkeyed.
+                    // distinct. A stamp with no segment, and an unstamped
+                    // result, still resolve through `to_vec_registry_key`
+                    // and the untyped `GCREF` row.
                     let stamped_to_vec =
                         if crate::translator::rtyper::call_registry::is_alloc_slice_to_vec(segments)
                         {
@@ -3896,6 +3898,24 @@ pub fn translate_op(
                         } else {
                             None
                         };
+                    if let Some(header) = stamped_to_vec.as_ref()
+                        && let Some(item) =
+                            crate::translator::rtyper::rrustvec::rust_vec_item_lltype(header)
+                        && crate::translator::rtyper::rrustvec::rust_vec_item_key_segment(item)
+                            .is_some()
+                    {
+                        let item_const = Hlvalue::Constant(Constant::new(
+                            ConstValue::LowLevelType(Box::new(item.clone())),
+                        ));
+                        let mut args = Vec::with_capacity(arg_hls.len() + 1);
+                        args.push(item_const);
+                        args.extend(arg_hls);
+                        return Ok(vec![FlowspaceOp::new(
+                            "ll_vec_copy_from_slice",
+                            args,
+                            result,
+                        )]);
+                    }
                     let key = crate::translator::rtyper::call_registry::saturating_arith_registry_key(
                         segments,
                         result_ty,

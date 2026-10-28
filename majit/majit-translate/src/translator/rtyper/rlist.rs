@@ -25,6 +25,7 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::backendopt::constfold::WE_ARE_JITTED_TAG_ID;
 use crate::translator::rtyper::error::TyperError;
+use crate::translator::rtyper::lltypesystem::llmemory::{itemoffsetof, sizeof};
 use crate::translator::rtyper::lltypesystem::lltype::{
     Array, FuncType, LowLevelType, Ptr, PtrTarget, Struct, functionptr,
 };
@@ -33,7 +34,10 @@ use crate::translator::rtyper::lltypesystem::rstr::{
     jit_isconstant_intrinsic_funcptr, jit_isvirtual_intrinsic_funcptr, sub_helper_funcptr_constant,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState, inputconst_from_lltype};
-use crate::translator::rtyper::rrustvec::{RUST_VEC_HINT, vec_item_kind_of};
+use crate::translator::rtyper::rrustvec::{
+    RUST_VEC_HINT, rust_vec_item_key_segment, rust_vec_item_lltype, rust_vec_lltype,
+    rust_vec_ptr_lltype, vec_item_kind_of,
+};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, SliceKind,
     constant_with_lltype, exception_args, functionptr_const, helper_pygraph_from_graph,
@@ -2608,7 +2612,7 @@ pub(crate) fn items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType
 
 /// The `ptr` field of a [`ListLayout::RustVec`] header: a raw nolength
 /// `Array(ITEM)`, not a GC list items array.
-fn rust_vec_items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
+pub(crate) fn rust_vec_items_array_ptr_lltype(item_lltype: &LowLevelType) -> LowLevelType {
     LowLevelType::Ptr(Box::new(Ptr {
         TO: PtrTarget::Array(Array::with_hints(
             item_lltype.clone(),
@@ -6223,6 +6227,386 @@ fn build_ll_copy_helper_graph(
         vec!["l".to_string()],
         func,
     ))
+}
+
+/// `functionptr` constant whose `_name` is the single-segment leaf
+/// `lower_graph` splits on `::`. A full `vec_helper_path` stays on
+/// [`rust_vec_newhint_funcptr`].
+fn named_helper_funcptr(
+    name: &str,
+    args: Vec<LowLevelType>,
+    result: LowLevelType,
+) -> Result<Constant, TyperError> {
+    let fptr = functionptr(
+        FuncType { args, result },
+        name,
+        None,
+        Some(name.to_string()),
+    );
+    let fptr_type = LowLevelType::Ptr(Box::new(fptr._TYPE.clone()));
+    inputconst_from_lltype(&fptr_type, &ConstValue::LLPtr(Box::new(fptr)))
+}
+
+/// `ll_fixed_length` (`lltypesystem/rlist.py`) as a named funcptr.
+/// The body is [`build_ll_fixed_length_helper_graph`]; this constant
+/// does not register that graph.
+fn ll_fixed_length_funcptr(ptr_ll: &LowLevelType) -> Result<Constant, TyperError> {
+    named_helper_funcptr(
+        "ll_fixed_length",
+        vec![ptr_ll.clone()],
+        LowLevelType::Signed,
+    )
+}
+
+/// `lltype.typeOf(ptr).TO` for a pointer to an array.
+fn ptr_array_lltype(ptr_ll: &LowLevelType) -> Result<LowLevelType, TyperError> {
+    let LowLevelType::Ptr(ptr) = ptr_ll else {
+        return Err(TyperError::message(format!(
+            "get_raw_buf: {ptr_ll:?} is not a Ptr"
+        )));
+    };
+    let PtrTarget::Array(arr) = &ptr.TO else {
+        return Err(TyperError::message(format!(
+            "get_raw_buf: {}.TO is not an Array",
+            ptr_ll.short_name()
+        )));
+    };
+    Ok(LowLevelType::Array(Box::new(arr.clone())))
+}
+
+/// `get_raw_buf` (`rrawarray.py`), `_always_inline_`:
+///
+/// ```python
+/// ofs = llmemory.itemoffsetof(lltype.typeOf(ptr).TO, 0)
+/// return llmemory.cast_ptr_to_adr(ptr) + ofs
+/// ```
+///
+/// Same `cast_ptr_to_adr` + `adr_add` of `itemoffsetof` as
+/// `build_copy_string_to_raw_helper_graph`.
+fn emit_get_raw_buf(
+    block: &BlockRef,
+    ptr: &Variable,
+    array_ty: &LowLevelType,
+    adr_name: &str,
+    buf_name: &str,
+) -> Result<Variable, TyperError> {
+    let ofs = itemoffsetof(array_ty, 0).map_err(TyperError::message)?;
+    let adr = variable_with_lltype(adr_name, LowLevelType::Address);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "cast_ptr_to_adr",
+        vec![Hlvalue::Variable(ptr.clone())],
+        Hlvalue::Variable(adr.clone()),
+    ));
+    let buf = variable_with_lltype(buf_name, LowLevelType::Address);
+    block.borrow_mut().operations.push(SpaceOperation::new(
+        "adr_add",
+        vec![
+            Hlvalue::Variable(adr),
+            constant_with_lltype(ConstValue::AddressOffset(ofs), LowLevelType::Signed),
+        ],
+        Hlvalue::Variable(buf.clone()),
+    ));
+    Ok(buf)
+}
+
+/// `ll_copy_list_to_raw_array` (`rrawarray.py`). `@jit.dont_look_inside`:
+/// the JIT must not inline the GC-address `raw_memcopy`.
+///
+/// ```python
+/// def ll_copy_list_to_raw_array(ll_list, dst_ptr):
+///     ITEM = lltype.typeOf(dst_ptr).TO.OF
+///     size = llmemory.sizeof(ITEM) * ll_list.ll_length()
+///     src_adr = get_raw_buf(ll_list.ll_items())
+///     dst_adr = get_raw_buf(dst_ptr)
+///     llmemory.raw_memcopy(src_adr, dst_adr, size)
+/// ```
+///
+/// A `FixedSizeListRepr` value is its items array, so `ll_items()` is
+/// `l` and `ll_length` is `ll_fixed_length`. `int_mul` takes
+/// `sizeof(ITEM)` then the length, as `build_copy_string_to_raw_helper_graph`
+/// does. No keepalive: MiniMark `must_split_gc_address_space()` is false.
+pub(crate) fn build_ll_copy_list_to_raw_array_helper_graph(
+    name: &str,
+    item: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let src_ptr_ll = items_array_ptr_lltype(item);
+    let dst_ptr_ll = rust_vec_items_array_ptr_lltype(item);
+    let src_array = ptr_array_lltype(&src_ptr_ll)?;
+    let dst_array = ptr_array_lltype(&dst_ptr_ll)?;
+    let l_arg = variable_with_lltype("l", src_ptr_ll.clone());
+    let dst_arg = variable_with_lltype("dst_ptr", dst_ptr_ll);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(l_arg.clone()),
+        Hlvalue::Variable(dst_arg.clone()),
+    ]);
+    let return_var = variable_with_lltype("result", LowLevelType::Void);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let c_len = ll_fixed_length_funcptr(&src_ptr_ll)?;
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(c_len), Hlvalue::Variable(l_arg.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let size = sizeof(item, None).map_err(TyperError::message)?;
+    let nbytes = variable_with_lltype("nbytes", LowLevelType::Signed);
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "int_mul",
+        vec![
+            constant_with_lltype(size, LowLevelType::Signed),
+            Hlvalue::Variable(length),
+        ],
+        Hlvalue::Variable(nbytes.clone()),
+    ));
+    let src_buf = emit_get_raw_buf(&startblock, &l_arg, &src_array, "src_adr", "src_buf")?;
+    let dst_buf = emit_get_raw_buf(&startblock, &dst_arg, &dst_array, "dst_adr", "dst_buf")?;
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "raw_memcopy",
+        vec![
+            Hlvalue::Variable(src_buf),
+            Hlvalue::Variable(dst_buf),
+            Hlvalue::Variable(nbytes),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::None,
+                LowLevelType::Void,
+            ))],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let mut func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    // `rrawarray.py` `ll_copy_list_to_raw_array`: `@jit.dont_look_inside`.
+    func._jit_look_inside_ = Some(false);
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string(), "dst_ptr".to_string()],
+        func,
+    ))
+}
+
+/// One `ll_copy_list_to_raw_array_{segment}` graph per item lowleveltype.
+///
+/// `Signed` and `Unsigned` stay distinct (`rust_vec_item_key_segment`).
+/// Both still memcpy a word; the native leaf they residualize to is
+/// shared. Memoised by [`RPythonTyper::lowlevel_helper_function_with_builder`].
+pub(crate) fn ll_copy_list_to_raw_array_helper(
+    rtyper: &RPythonTyper,
+    item: &LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let segment = rust_vec_item_key_segment(item).ok_or_else(|| {
+        TyperError::message(format!(
+            "ll_copy_list_to_raw_array: item lltype {} has no key segment",
+            item.short_name()
+        ))
+    })?;
+    let name = format!("ll_copy_list_to_raw_array_{segment}");
+    let item_for_builder = item.clone();
+    let name_for_builder = name.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![
+            items_array_ptr_lltype(item),
+            rust_vec_items_array_ptr_lltype(item),
+        ],
+        LowLevelType::Void,
+        move |_rtyper, _args, _result| {
+            build_ll_copy_list_to_raw_array_helper_graph(&name_for_builder, &item_for_builder)
+        },
+    )
+}
+
+/// `ll_copy` (`rlist.py`) of a `FixedSizeListRepr` into a raw `Vec`.
+/// No oopspec: the JIT inlines this graph. The item copy is
+/// `ll_copy_list_to_raw_array`, which stays residual.
+///
+/// ```python
+/// def ll_copy(RESLIST, l):
+///     length = l.ll_length()
+///     new_lst = RESLIST.ll_newlist(length)
+///     ll_arraycopy(l, new_lst, 0, 0, length)
+///     return new_lst
+/// ```
+///
+/// `RESLIST.ll_newlist` on a raw `Vec` is `VecOp::NewHint`
+/// (`ll_vec_newlist_hint_*`). `NewHint` leaves `len = 0` until
+/// [`emit_rustvec_len_store`]. `l.ll_length()` is `ll_fixed_length`.
+///
+/// `item` is both the source array item and the result header item.
+pub(crate) fn build_ll_vec_copy_from_fixed_list_helper_graph(
+    name: &str,
+    item: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let result_ll = rust_vec_lltype(item);
+    build_ll_vec_copy_from_fixed_list_into_graph(name, item, &result_ll)
+}
+
+/// Same as [`build_ll_vec_copy_from_fixed_list_helper_graph`], but the
+/// result header may be a different one-word item than the source list.
+///
+/// `externalvsinternal(..., gcref=True)` stores a GC pointer list as
+/// `GCREF`. `RustVecRepr` keeps the external pointer (`OBJECTPTR` for
+/// `SomeRustVec::for_kind(Ref)`). `ll_copy_list_to_raw_array` still
+/// `raw_memcopy`s that one word. The segment is the source item's
+/// (`ll_copy_list_to_raw_array_{segment}`); `result_ll` is the header
+/// `translate_hl_to_ll` expects.
+pub(crate) fn build_ll_vec_copy_from_fixed_list_into_graph(
+    name: &str,
+    src_item: &LowLevelType,
+    result_ll: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    let segment = rust_vec_item_key_segment(src_item).ok_or_else(|| {
+        TyperError::message(format!(
+            "ll_vec_copy_from_fixed_list: item lltype {} has no key segment",
+            src_item.short_name()
+        ))
+    })?;
+    let dst_item = rust_vec_item_lltype(result_ll).ok_or_else(|| {
+        TyperError::message(
+            "ll_vec_copy_from_fixed_list: result is not a RustVec header".to_string(),
+        )
+    })?;
+    if vec_item_kind_of(dst_item).is_none() {
+        return Err(TyperError::message(format!(
+            "ll_vec_copy_from_fixed_list: header item {} is not one word",
+            dst_item.short_name()
+        )));
+    }
+    let dst_ptr_ll = rust_vec_ptr_lltype(result_ll).ok_or_else(|| {
+        TyperError::message(
+            "ll_vec_copy_from_fixed_list: RustVec header has no ptr field".to_string(),
+        )
+    })?;
+    let src_ptr_ll = items_array_ptr_lltype(src_item);
+    let l_arg = variable_with_lltype("l", src_ptr_ll.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(l_arg.clone())]);
+    let return_var = variable_with_lltype("result", result_ll.clone());
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let length = variable_with_lltype("length", LowLevelType::Signed);
+    let c_len = ll_fixed_length_funcptr(&src_ptr_ll)?;
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![Hlvalue::Constant(c_len), Hlvalue::Variable(l_arg.clone())],
+        Hlvalue::Variable(length.clone()),
+    ));
+    let new_lst = variable_with_lltype("new_lst", result_ll.clone());
+    let c_newhint = rust_vec_newhint_funcptr(dst_item, result_ll)?;
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(c_newhint),
+            Hlvalue::Variable(length.clone()),
+        ],
+        Hlvalue::Variable(new_lst.clone()),
+    ));
+    let dst_ptr = variable_with_lltype("dst_ptr", dst_ptr_ll.clone());
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "getfield",
+        vec![Hlvalue::Variable(new_lst.clone()), void_field_const("ptr")],
+        Hlvalue::Variable(dst_ptr.clone()),
+    ));
+    let copy_name = format!("ll_copy_list_to_raw_array_{segment}");
+    let c_copy = named_helper_funcptr(
+        &copy_name,
+        vec![src_ptr_ll, dst_ptr_ll.clone()],
+        LowLevelType::Void,
+    )?;
+    startblock.borrow_mut().operations.push(SpaceOperation::new(
+        "direct_call",
+        vec![
+            Hlvalue::Constant(c_copy),
+            Hlvalue::Variable(l_arg),
+            Hlvalue::Variable(dst_ptr),
+        ],
+        Hlvalue::Variable(variable_with_lltype("v", LowLevelType::Void)),
+    ));
+    emit_rustvec_len_store(&startblock, ListLayout::RustVec, &new_lst, &length);
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(new_lst)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["l".to_string()],
+        func,
+    ))
+}
+
+/// One `ll_vec_copy_from_fixed_list_{segment}` graph per item lowleveltype.
+///
+/// The callee graphs (`ll_fixed_length`, `ll_copy_list_to_raw_array_{segment}`)
+/// are named funcptrs, so this builder does not register them.
+/// Memoised by [`RPythonTyper::lowlevel_helper_function_with_builder`].
+pub(crate) fn ll_vec_copy_from_fixed_list_helper(
+    rtyper: &RPythonTyper,
+    item: &LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let result_ll = rust_vec_lltype(item);
+    ll_vec_copy_from_fixed_list_into(rtyper, item, &result_ll)
+}
+
+/// [`ll_vec_copy_from_fixed_list_helper`] whose result is `result_ll`.
+///
+/// The name stays `ll_vec_copy_from_fixed_list_{segment}` of the source
+/// item. The memo key is `(name, args, result)`, so a `GCREF` list copied
+/// into an `OBJECTPTR` header does not reuse the equal-item graph.
+pub(crate) fn ll_vec_copy_from_fixed_list_into(
+    rtyper: &RPythonTyper,
+    src_item: &LowLevelType,
+    result_ll: &LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let segment = rust_vec_item_key_segment(src_item).ok_or_else(|| {
+        TyperError::message(format!(
+            "ll_vec_copy_from_fixed_list: item lltype {} has no key segment",
+            src_item.short_name()
+        ))
+    })?;
+    let name = format!("ll_vec_copy_from_fixed_list_{segment}");
+    let src_for_builder = src_item.clone();
+    let result_for_builder = result_ll.clone();
+    let name_for_builder = name.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name,
+        vec![items_array_ptr_lltype(src_item)],
+        result_ll.clone(),
+        move |_rtyper, _args, _result| {
+            build_ll_vec_copy_from_fixed_list_into_graph(
+                &name_for_builder,
+                &src_for_builder,
+                &result_for_builder,
+            )
+        },
+    )
 }
 
 /// Emit `new_lst = RESLIST.ll_newlist(newlength)` then
@@ -10347,7 +10731,7 @@ mod tests {
     use crate::translator::rtyper::pairtype::ReprClassId;
     use crate::translator::rtyper::rint::{IntegerRepr, signed_repr, unsigned_repr};
     use crate::translator::rtyper::rmodel::{inputconst, rtyper_makerepr};
-    use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+    use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelFunction, LowLevelOpList};
 
     fn fresh_rtyper() -> Rc<RPythonTyper> {
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -14499,5 +14883,304 @@ mod tests {
         assert_eq!(n("int_lt"), 0);
         assert_eq!(n("int_add"), 0);
         let _keep = ann;
+    }
+
+    fn field_name_at(op: &SpaceOperation, idx: usize) -> String {
+        let Hlvalue::Constant(c) = &op.args[idx] else {
+            panic!("field operand is not a constant");
+        };
+        let ConstValue::ByteStr(bytes) = &c.value else {
+            panic!("field operand is not a ByteStr: {:?}", c.value);
+        };
+        String::from_utf8_lossy(bytes).into_owned()
+    }
+
+    fn direct_callee_name(op: &SpaceOperation) -> String {
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        let Hlvalue::Constant(c) = &op.args[0] else {
+            panic!("direct_call callee is not a constant");
+        };
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("direct_call callee is not an LLPtr");
+        };
+        match ptr._obj0_value() {
+            Ok(Some(_ptr_obj::Func(func))) => func._name.clone(),
+            other => panic!("direct_call callee is not a Func: {other:?}"),
+        }
+    }
+
+    fn op_names(func: &LowLevelFunction) -> Vec<String> {
+        let start = func
+            .graph
+            .as_ref()
+            .expect("helper graph")
+            .graph
+            .borrow()
+            .startblock
+            .clone();
+        start
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect()
+    }
+
+    fn jit_look_inside(func: &LowLevelFunction) -> Option<bool> {
+        func.graph
+            .as_ref()
+            .expect("helper graph")
+            .graph
+            .borrow()
+            .func
+            .as_ref()
+            .expect("GraphFunc")
+            ._jit_look_inside_
+    }
+
+    /// `ll_copy` (`rlist.py`) of a `FixedSizeListRepr` into a raw `Vec`,
+    /// and `ll_copy_list_to_raw_array` (`rrawarray.py`) which that copy
+    /// calls. The outer graph is inlined (no `_jit_look_inside_`). The
+    /// copy graph is `@jit.dont_look_inside`. `Signed` and `Unsigned`
+    /// stay distinct even though both call `ll_vec_newlist_hint_i`.
+    /// Named funcptrs do not register the callees, so four outer graphs
+    /// then four copy graphs is eight translator graphs.
+    #[test]
+    fn ll_vec_copy_from_fixed_list_inlines_and_raw_copy_stays_residual() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+
+        let py = build_ll_vec_copy_from_fixed_list_helper_graph(
+            "ll_vec_copy_from_fixed_list_Signed",
+            &LowLevelType::Signed,
+        )
+        .expect("signed fixed-list helper");
+        let start = py.graph.borrow().startblock.clone();
+        let start = start.borrow();
+        let names: Vec<&str> = start
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "direct_call",
+                "direct_call",
+                "getfield",
+                "direct_call",
+                "setfield",
+            ]
+        );
+        assert!(!names.contains(&"raw_memcopy"));
+        assert_eq!(direct_callee_name(&start.operations[0]), "ll_fixed_length");
+        let hint = direct_callee_name(&start.operations[1]);
+        assert!(
+            hint.contains("ll_vec_newlist_hint_i"),
+            "Signed newlist_hint callee: {hint}"
+        );
+        assert_eq!(field_name_at(&start.operations[2], 1), "ptr");
+        assert_eq!(
+            direct_callee_name(&start.operations[3]),
+            "ll_copy_list_to_raw_array_Signed"
+        );
+        assert_eq!(field_name_at(&start.operations[4], 1), "len");
+        assert_eq!(py.func._jit_look_inside_, None);
+        drop(start);
+
+        let copy = build_ll_copy_list_to_raw_array_helper_graph(
+            "ll_copy_list_to_raw_array_Signed",
+            &LowLevelType::Signed,
+        )
+        .expect("signed raw-copy helper");
+        let copy_start = copy.graph.borrow().startblock.clone();
+        let copy_start = copy_start.borrow();
+        let copy_names: Vec<&str> = copy_start
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            copy_names,
+            [
+                "direct_call",
+                "int_mul",
+                "cast_ptr_to_adr",
+                "adr_add",
+                "cast_ptr_to_adr",
+                "adr_add",
+                "raw_memcopy",
+            ]
+        );
+        assert!(!copy_names.contains(&"setfield"));
+        assert_eq!(
+            direct_callee_name(&copy_start.operations[0]),
+            "ll_fixed_length"
+        );
+        let Hlvalue::Constant(size) = &copy_start.operations[1].args[0] else {
+            panic!("int_mul sizeof is not a constant");
+        };
+        assert!(
+            matches!(size.value, ConstValue::AddressOffset(_)),
+            "sizeof stays an AddressOffset, got {:?}",
+            size.value
+        );
+        assert_eq!(size.concretetype.as_ref(), Some(&LowLevelType::Signed));
+        assert!(
+            matches!(copy_start.operations[1].args[1], Hlvalue::Variable(_)),
+            "int_mul length is the ll_fixed_length result"
+        );
+        assert_eq!(copy.func._jit_look_inside_, Some(false));
+        drop(copy_start);
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let before = ann.translator.graphs.borrow().len();
+        let items = [
+            LowLevelType::Signed,
+            LowLevelType::Unsigned,
+            LowLevelType::Float,
+            (*GCREF).clone(),
+        ];
+        let mut outers = Vec::new();
+        for item in &items {
+            outers.push(
+                ll_vec_copy_from_fixed_list_helper(&rtyper, item).expect("fixed-list helper"),
+            );
+        }
+        assert_eq!(ann.translator.graphs.borrow().len(), before + 4);
+        let mut copies = Vec::new();
+        for item in &items {
+            copies.push(ll_copy_list_to_raw_array_helper(&rtyper, item).expect("raw-copy helper"));
+        }
+        assert_eq!(ann.translator.graphs.borrow().len(), before + 8);
+        for func in &outers {
+            assert_eq!(jit_look_inside(func), None, "{}", func.name);
+            assert!(!op_names(func).iter().any(|name| name == "raw_memcopy"));
+        }
+        for func in &copies {
+            assert_eq!(jit_look_inside(func), Some(false), "{}", func.name);
+            assert!(!op_names(func).iter().any(|name| name == "setfield"));
+            assert_eq!(func.result, LowLevelType::Void);
+        }
+        assert_ne!(outers[0].name, outers[1].name);
+        assert_ne!(outers[0].result, outers[1].result);
+        assert_ne!(outers[0].graph_key(), outers[1].graph_key());
+        assert_ne!(copies[0].name, copies[1].name);
+        assert_ne!(copies[0].args, copies[1].args);
+        assert_ne!(copies[0].graph_key(), copies[1].graph_key());
+        for (func, suffix) in outers.iter().chain(copies.iter()).zip([
+            "_Signed",
+            "_Unsigned",
+            "_Float",
+            "_GCREF",
+            "_Signed",
+            "_Unsigned",
+            "_Float",
+            "_GCREF",
+        ]) {
+            assert!(func.name.ends_with(suffix), "{}", func.name);
+        }
+        let unsigned_hint = {
+            let body = outers[1]
+                .graph
+                .as_ref()
+                .expect("unsigned graph")
+                .graph
+                .borrow()
+                .startblock
+                .clone();
+            direct_callee_name(&body.borrow().operations[1])
+        };
+        assert!(
+            unsigned_hint.contains("ll_vec_newlist_hint_i"),
+            "Unsigned shares the int newlist_hint leaf: {unsigned_hint}"
+        );
+        let float_hint = {
+            let body = outers[2]
+                .graph
+                .as_ref()
+                .expect("float graph")
+                .graph
+                .borrow()
+                .startblock
+                .clone();
+            direct_callee_name(&body.borrow().operations[1])
+        };
+        assert!(
+            float_hint.contains("ll_vec_newlist_hint_f"),
+            "Float newlist_hint callee: {float_hint}"
+        );
+        let gcref_hint = {
+            let body = outers[3]
+                .graph
+                .as_ref()
+                .expect("gcref graph")
+                .graph
+                .borrow()
+                .startblock
+                .clone();
+            direct_callee_name(&body.borrow().operations[1])
+        };
+        assert!(
+            gcref_hint.contains("ll_vec_newlist_hint_r"),
+            "GCREF newlist_hint callee: {gcref_hint}"
+        );
+        let again_outer = ll_vec_copy_from_fixed_list_helper(&rtyper, &LowLevelType::Signed)
+            .expect("Signed outer memo");
+        let again_copy = ll_copy_list_to_raw_array_helper(&rtyper, &LowLevelType::Signed)
+            .expect("Signed copy memo");
+        assert_eq!(outers[0].graph_key(), again_outer.graph_key());
+        assert_eq!(copies[0].graph_key(), again_copy.graph_key());
+        assert_eq!(ann.translator.graphs.borrow().len(), before + 8);
+        let _keep = ann;
+    }
+
+    /// A `GCREF` source copied into an `OBJECTPTR` header is its own
+    /// graph: same segment name, different result lowleveltype.
+    #[test]
+    fn ll_vec_copy_from_fixed_list_into_external_header_is_a_distinct_graph() {
+        use crate::translator::rtyper::lltypesystem::lltype::GCREF;
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let header = rust_vec_lltype(&*OBJECTPTR);
+        let py = build_ll_vec_copy_from_fixed_list_into_graph(
+            "ll_vec_copy_from_fixed_list_GCREF",
+            &*GCREF,
+            &header,
+        )
+        .expect("external header helper");
+        let start = py.graph.borrow().startblock.clone();
+        let start = start.borrow();
+        assert_eq!(
+            direct_callee_name(&start.operations[3]),
+            "ll_copy_list_to_raw_array_GCREF"
+        );
+        let hint = direct_callee_name(&start.operations[1]);
+        assert!(
+            hint.contains("ll_vec_newlist_hint_r"),
+            "external GC pointer uses the ref newlist leaf: {hint}"
+        );
+        let Hlvalue::Variable(result) = &py.graph.borrow().getreturnvar() else {
+            panic!("result must be a Variable");
+        };
+        assert_eq!(result.concretetype().as_ref(), Some(&header));
+        drop(start);
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let equal = ll_vec_copy_from_fixed_list_helper(&rtyper, &*GCREF).expect("equal GCREF");
+        let into = ll_vec_copy_from_fixed_list_into(&rtyper, &*GCREF, &header).expect("into");
+        assert_eq!(equal.name, into.name);
+        assert_ne!(equal.result, into.result);
+        assert_ne!(equal.graph_key(), into.graph_key());
+        assert_eq!(into.result, header);
+        let again = ll_vec_copy_from_fixed_list_into(&rtyper, &*GCREF, &header).expect("memo");
+        assert_eq!(into.graph_key(), again.graph_key());
     }
 }

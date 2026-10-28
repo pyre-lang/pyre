@@ -4148,57 +4148,13 @@ pub(crate) fn register_foreign_stdlib_externals(registry: &CallRegistry) {
         registry,
         &["alloc", "slice", "<Impl>", "to_vec"],
         &["self"],
-        crate::translator::rtyper::lltypesystem::lltype::GCREF.clone(),
+        (*crate::translator::rtyper::lltypesystem::lltype::GCREF).clone(),
     );
-    // A one-word destination is `RustVecRepr` (`rrustvec.rs
-    // rust_vec_lltype`). `rtype_bltn_list` / `ll_copy` produce the list
-    // the field holds; the raw header's annotation is
-    // `Bookkeeper::project_rust_vec`. `to_vec_registry_key` picks the
-    // row from the header `stamp_rust_vec_header` wrote.
-    register_one_word_slice_to_vec_externals(registry);
-}
-
-/// One `register_external` row per item lowleveltype of a one-word `Vec`.
-///
-/// `rlist.py` `ll_copy` specializes per LIST type, i.e. per item
-/// lowleveltype. `llannotation.py` `lltype_to_annotation` keeps `Signed`
-/// and `Unsigned` distinct, so each spelling has its own
-/// `project_rust_vec` shell: `Vec<isize>`, `Vec<usize>`, `Vec<f64>`,
-/// `Vec<*mut u8>`. The key is `to_vec_registry_key` of `rust_vec_lltype`
-/// of that same item.
-fn register_one_word_slice_to_vec_externals(registry: &CallRegistry) {
-    use crate::translator::rtyper::call_registry::to_vec_registry_key;
-    use crate::translator::rtyper::lltypesystem::lltype::{GCREF, LowLevelType};
-    use crate::translator::rtyper::rrustvec::rust_vec_lltype;
-
-    let bare = ["alloc", "slice", "<Impl>", "to_vec"]
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    let rows = [
-        ("Vec<isize>", LowLevelType::Signed),
-        ("Vec<usize>", LowLevelType::Unsigned),
-        ("Vec<f64>", LowLevelType::Float),
-        ("Vec<*mut u8>", GCREF.clone()),
-    ];
-    for (spelling, item) in rows {
-        let header = rust_vec_lltype(&item);
-        let key = to_vec_registry_key(&bare, Some(&header))
-            .expect("a one-word Vec header selects a to_vec registry row");
-        let shell = registry
-            .bookkeeper()
-            .project_rust_vec(spelling)
-            .unwrap_or_else(|| {
-                panic!("one-word Vec spelling {spelling} must project to SomeRustVec")
-            });
-        if registry.lookup(&key).is_some() {
-            continue;
-        }
-        let signature = Signature::new(vec!["self".to_string()], None, None);
-        let stub_pygraph =
-            build_stub_pygraph_with_result_shell("to_vec".to_string(), signature.clone(), shell);
-        registry.register_callee(key, signature, stub_pygraph);
-    }
+    // A one-word destination is `ll_copy` (`rlist.py`). The rtyper emits
+    // `ll_vec_copy_from_slice`. A `FixedSizeListRepr` self `gendirectcall`s
+    // `ll_vec_copy_from_fixed_list_{segment}`; any other self stays a
+    // `direct_call` of `to_vec`. The untyped `GCREF` row above stays the
+    // fallback when the result is not that header.
 }
 
 /// Register every `f64_method_llexternal` name as `["ll_math", name]`.
@@ -12972,6 +12928,153 @@ mod tests {
         (graph, result)
     }
 
+    /// `(ptr, len)` is the slice view `ll_copy` (`rlist.py`) receives.
+    /// Both are start-block inputargs so `setup_block_entry` stamps
+    /// concretetype before `gendirectcall`'s exact-type check.
+    fn slice_to_vec_ptr_len_call_graph(
+        item: &LowLevelType,
+        spelling: &str,
+    ) -> (LegacyGraph, crate::flowspace::model::Variable) {
+        use crate::translator::rtyper::llannotation::lltype_to_annotation;
+        use crate::translator::rtyper::rlist::rust_vec_items_array_ptr_lltype;
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+
+        let mut graph = LegacyGraph::new("slice_to_vec_ptr_len");
+        graph.return_container_root = Some(spelling.to_string());
+        let vars = mint_vars(&mut graph, 4);
+        let ptr = vars[1].clone();
+        let len = vars[2].clone();
+        let result = vars[3].clone();
+        result.set_concretetype(Some(rust_vec_lltype(item)));
+        *ptr.annotation.borrow_mut() = Some(std::rc::Rc::new(lltype_to_annotation(
+            rust_vec_items_array_ptr_lltype(item),
+        )));
+        setbinding(&len, ValueType::Int);
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1, 2]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path([
+                        "alloc", "slice", "<Impl>", "to_vec",
+                    ]),
+                    args: crate::model::call_args(vec![ptr, len]),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![result.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        (graph, result)
+    }
+
+    /// `self` is a non-resized `SomeList` (`FixedSizeListRepr`). No
+    /// `OpKind::Input` and no `setbinding`: `derive_subject_inputcells`
+    /// reads the published annotation. `ListDef::new`, not
+    /// `Bookkeeper::newlist`: `getlistdef` caches on the position key,
+    /// so a second `newlist` would union `Signed` with `Unsigned`.
+    fn slice_to_vec_fixed_list_call_graph(
+        unsigned: bool,
+        spelling: &str,
+    ) -> (LegacyGraph, crate::flowspace::model::Variable) {
+        use crate::annotator::model::{ListDef, SomeInteger, SomeList, SomeValue};
+        use crate::translator::rtyper::rrustvec::rust_vec_lltype;
+
+        let item = if unsigned {
+            LowLevelType::Unsigned
+        } else {
+            LowLevelType::Signed
+        };
+        let s_list = SomeList::new(ListDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::new(false, unsigned)),
+            false,
+            false,
+        ));
+        assert!(
+            !s_list.listdef.listitem_rc().borrow().resized,
+            "fixed list is not resized"
+        );
+        let mut graph = LegacyGraph::new("slice_to_vec_fixed_list");
+        graph.return_container_root = Some(spelling.to_string());
+        let vars = mint_vars(&mut graph, 3);
+        let result = vars[2].clone();
+        result.set_concretetype(Some(rust_vec_lltype(&item)));
+        *vars[1].annotation.borrow_mut() = Some(std::rc::Rc::new(SomeValue::List(s_list)));
+        let startblock = Block {
+            id: graph.startblock,
+            inputargs: block_inputargs(&vars, &[1]),
+            operations: vec![crate::model::SpaceOperation {
+                result: Some(result.clone()),
+                kind: crate::model::OpKind::Call {
+                    target: crate::model::CallTarget::function_path([
+                        "alloc", "slice", "<Impl>", "to_vec",
+                    ]),
+                    args: crate::model::call_args(vec![vars[1].clone()]),
+                    result_ty: ValueType::Int,
+                },
+            }],
+            exitswitch: None,
+            exits: vec![link_to_returnblock(
+                vec![LinkArg::Value(result.clone())],
+                graph.returnblock,
+            )],
+            framestate: None,
+            dead: false,
+        };
+        let returnblock = Block {
+            id: graph.returnblock,
+            inputargs: vec![result.clone()],
+            operations: vec![],
+            exitswitch: None,
+            exits: vec![],
+            framestate: None,
+            dead: false,
+        };
+        graph.blocks = vec![startblock, returnblock];
+        (graph, result)
+    }
+
+    fn direct_call_names(graph: &crate::flowspace::model::GraphRef) -> Vec<String> {
+        use crate::translator::rtyper::lltypesystem::lltype::_ptr_obj;
+        let blocks = graph.borrow().iterblocks();
+        let mut names = Vec::new();
+        for block in blocks {
+            let b = block.borrow();
+            for op in &b.operations {
+                if op.opname != "direct_call" {
+                    continue;
+                }
+                let Hlvalue::Constant(c) = &op.args[0] else {
+                    continue;
+                };
+                let ConstValue::LLPtr(ptr) = &c.value else {
+                    continue;
+                };
+                if let Ok(Some(_ptr_obj::Func(func))) = ptr._obj0_value() {
+                    names.push(func._name.clone());
+                }
+            }
+        }
+        names
+    }
+
     fn somevalue_of(
         value_to_var: &LegacyToTyped,
         result: &crate::flowspace::model::Variable,
@@ -13015,11 +13118,13 @@ mod tests {
     }
 
     /// `<[T]>::to_vec` into a one-word `Vec<T>` is born `SomeRustVec`
-    /// (`Bookkeeper::project_rust_vec` / `extfunc.py register_external`).
-    /// The row is the item lowleveltype: `rlist.py` `ll_copy` specializes
+    /// (`Bookkeeper::project_rust_vec`). `rlist.py` `ll_copy` specializes
     /// per LIST type, and `llannotation.py` `lltype_to_annotation` keeps
-    /// `Signed` and `Unsigned` distinct. A call whose result is not that
-    /// header keeps the `GCREF` row.
+    /// `Signed` and `Unsigned` distinct. A one-arg self that is not a
+    /// fixed list stays a residual `direct_call` of `to_vec`. A
+    /// `FixedSizeListRepr` self is `ll_vec_copy_from_fixed_list_{segment}`.
+    /// `(ptr, len)` is no longer a success path. A call whose result is
+    /// not that header keeps the `GCREF` row.
     #[test]
     fn slice_to_vec_of_one_word_vec_annotates_rustvec() {
         let _lock = anchor_lock();
@@ -13039,7 +13144,7 @@ mod tests {
             .map(str::to_string)
             .collect::<Vec<_>>();
         let bare = FunctionPathKey::from_segments(bare_segs.iter().cloned());
-        let gcref_shell = lltype_to_annotation(GCREF.clone());
+        let gcref_shell = lltype_to_annotation((*GCREF).clone());
         assert_eq!(
             stub_link_result(&registry.lookup(&bare).expect("untyped to_vec row")),
             gcref_shell,
@@ -13052,17 +13157,38 @@ mod tests {
             ("Vec<isize>", LowLevelType::Signed),
             ("Vec<usize>", LowLevelType::Unsigned),
             ("Vec<f64>", LowLevelType::Float),
-            ("Vec<*mut u8>", GCREF.clone()),
+            ("Vec<*mut u8>", (*GCREF).clone()),
         ] {
             let header = rust_vec_lltype(&item);
             let key = to_vec_registry_key(&bare_segs, Some(&header)).expect("item key");
-            let shell = stub_link_result(&registry.lookup(&key).expect("item row"));
+            assert!(
+                registry.lookup(&key).is_none(),
+                "{spelling} is rtyped, not an external row"
+            );
+            let (graph, result) = slice_to_vec_call_graph(Some(header), Some(spelling));
+            let (flow, map, _, _, _) = super::drive_subject(&graph, &registry, true)
+                .unwrap_or_else(|err| panic!("{spelling} annotates: {err}"));
+            let shell = somevalue_of(&map, &result);
             let expected = registry
                 .bookkeeper()
                 .project_rust_vec(spelling)
                 .unwrap_or_else(|| panic!("{spelling} projects"));
             assert_eq!(shell, expected, "{spelling}");
             assert_ne!(key, bare);
+            if matches!(&item, LowLevelType::Signed) {
+                let names = direct_call_names(&flow);
+                assert!(
+                    names.iter().any(|name| name == "to_vec"),
+                    "one-arg to_vec stays a residual direct_call, got {names:?}"
+                );
+                assert!(
+                    names.iter().all(|name| {
+                        !name.contains("ll_vec_copy_from_fixed_list")
+                            && !name.contains("ll_vec_copy_from_slice")
+                    }),
+                    "one-arg Ref self is not ll_copy: {names:?}"
+                );
+            }
             if matches!(&item, LowLevelType::Signed | LowLevelType::Unsigned) {
                 let unsigned = matches!(&item, LowLevelType::Unsigned);
                 let SomeValue::RustVec(vec) = &shell else {
@@ -13085,13 +13211,57 @@ mod tests {
             unsigned_key.expect("Unsigned to_vec row"),
             "Signed and Unsigned item lowleveltypes do not share a to_vec row"
         );
+        for (spelling, unsigned, helper) in [
+            ("Vec<isize>", false, "ll_vec_copy_from_fixed_list_Signed"),
+            ("Vec<usize>", true, "ll_vec_copy_from_fixed_list_Unsigned"),
+        ] {
+            let (graph, result) = slice_to_vec_fixed_list_call_graph(unsigned, spelling);
+            let (flow, map, _, _, _) = super::drive_subject(&graph, &registry, true)
+                .unwrap_or_else(|err| panic!("{spelling} fixed list rtypes: {err}"));
+            let names = direct_call_names(&flow);
+            assert!(
+                names.iter().any(|name| name == helper),
+                "{spelling} direct_call is {helper}, got {names:?}"
+            );
+            assert!(
+                names.iter().all(|name| !name.contains("to_vec")),
+                "{spelling} must not call the to_vec stub: {names:?}"
+            );
+            assert_eq!(
+                somevalue_of(&map, &result),
+                registry
+                    .bookkeeper()
+                    .project_rust_vec(spelling)
+                    .unwrap_or_else(|| panic!("{spelling} projects")),
+                "{spelling} fixed list"
+            );
+        }
+        for (spelling, item) in [
+            ("Vec<isize>", LowLevelType::Signed),
+            ("Vec<usize>", LowLevelType::Unsigned),
+        ] {
+            let (graph, _result) = slice_to_vec_ptr_len_call_graph(&item, spelling);
+            match super::drive_subject(&graph, &registry, true) {
+                Ok((flow, _, _, _, _)) => panic!(
+                    "{spelling} (ptr, len) must not rtype, got {:?}",
+                    direct_call_names(&flow)
+                ),
+                Err(err) => {
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("expected (item, self)"),
+                        "{spelling} (ptr, len) rtype error: {msg}"
+                    );
+                }
+            }
+        }
         assert!(
             to_vec_registry_key(&bare_segs, Some(&rust_vec_lltype(&LowLevelType::Bool))).is_none(),
             "an item lowleveltype with no segment keeps the bare path"
         );
 
         let (graph, result) =
-            slice_to_vec_call_graph(Some(rust_vec_lltype(&GCREF.clone())), Some("Vec<*mut u8>"));
+            slice_to_vec_call_graph(Some(rust_vec_lltype(&*GCREF)), Some("Vec<*mut u8>"));
         let (map, _) =
             specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
                 .expect("one-word to_vec annotates");
