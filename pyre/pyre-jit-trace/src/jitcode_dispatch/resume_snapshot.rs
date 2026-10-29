@@ -3358,7 +3358,9 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
     scope: &GuardCaptureScope,
     parent_frames: Vec<InlineParentFrame>,
 ) -> Result<Vec<InlineParentFrame>, DispatchError> {
-    let innermost = helper_innermost_resume_frame(ctx, op_pc, after_residual_call, scope)?;
+    let live_after_jit_pc = ctx.live_after_jit_pc;
+    let innermost =
+        helper_innermost_resume_frame(ctx, op_pc, after_residual_call, scope, live_after_jit_pc)?;
     let ancestors = unpublished_ancestor_helper_resume_frames(ctx, op_pc)?;
     let mut frames = if parent_frames.first().is_some_and(python_resume_frame) {
         parent_frames
@@ -3384,31 +3386,31 @@ fn looked_inside_helper_resume_frames<Sym: WalkSym>(
     Ok(frames)
 }
 
-/// Resume of a guard at `op_pc` inside a numbered helper chain:
-/// `parent_frames` plus the innermost helper section at the guard.
-///
-/// `capture_resumedata` numbers every `MIFrame` (`resume.py`
-/// `ResumeDataLoopMemo.number`). The blackhole runs each helper section
-/// from its resume pc to its return, and `reject_unresolved_call` bails
-/// at a residual it cannot resolve. CALL-entry collapse
-/// ([`HelperCallEntry`]) re-runs the call: it is used when a section has
-/// no resume marker, or when a marked section can reach such a residual
-/// ([`helper_resume_reaches_blocker`]). Collapse is refused once a
-/// heap-writing residual or a journaled live-heap effect has executed
-/// since the level was entered, and so is a blocker section then (the
-/// guard is refused).
-fn numbered_helper_guard_resume<Sym: WalkSym>(
+/// Assemble the numbered helper frames at `op_pc` and whether they are
+/// runnable: `capture_resumedata` can number the helper section at this
+/// guard, so the blackhole resumes inside the helper rather than at the
+/// CALL that entered it.
+fn numbered_helper_runnable_frames<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
     scope: &GuardCaptureScope,
     mut parent_frames: Vec<InlineParentFrame>,
-) -> Result<NumberedHelperGuard, DispatchError> {
+    live_after_jit_pc: usize,
+) -> Result<
+    (
+        Vec<InlineParentFrame>,
+        bool, /* runnable */
+        bool, /* python_chain_complete */
+    ),
+    DispatchError,
+> {
     parent_frames.push(helper_innermost_resume_frame(
         ctx,
         op_pc,
         after_residual_call,
         scope,
+        live_after_jit_pc,
     )?);
     // `capture_resumedata` numbers every frame on `framestack`. A Python
     // inline level below the helper levels that holds no paused-caller image
@@ -3436,68 +3438,118 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     // `python_chain_complete` false (straight-line inline). Exception
     // resume still has to number this helper; CALL-collapse is what
     // lets `check_truediv`'s `except OverflowError` steal the residual.
+    // Reported as runnable so numbered_helper_guard_resume takes NumberedHelperGuard::Frames.
     if after_residual_call {
-        return Ok(NumberedHelperGuard::Frames(parent_frames));
+        return Ok((parent_frames, true, python_chain_complete));
     }
     // Helper-section markers only — not the portal parent's. A helper
     // whose resume can reach a blackhole blocker collapses to CALL-entry
     // unless a heap write already ran, in which case the guard is refused.
-    let helper_level_count = {
-        let session = ctx.session.borrow();
-        session
-            .framestack
-            .iter()
-            .rev()
-            .take_while(|frame| frame.is_helper_level())
-            .count()
-    };
+    let (sections_have_markers, any_blocker) =
+        numbered_helper_sections_blocker_free(ctx, &parent_frames);
+    Ok((
+        parent_frames,
+        python_chain_complete && sections_have_markers && !any_blocker,
+        python_chain_complete,
+    ))
+}
+
+/// Marker and blocker facts for every helper section in `parent_frames`.
+///
+/// The innermost is last, numbered at its resume pc. Its remaining-body
+/// scan, and the whole-body callee summaries
+/// [`helper_resume_reaches_blocker`] consults, cover every helper that
+/// remaining body can still enter. A later plain guard runs this same
+/// scan (`numbered_helper_runnable_frames` with `after_residual_call=false`).
+fn numbered_helper_sections_blocker_free<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    parent_frames: &[InlineParentFrame],
+) -> (bool /* markers */, bool /* any_blocker */) {
+    let session = ctx.session.borrow();
+    let helper_level_count = session
+        .framestack
+        .iter()
+        .rev()
+        .take_while(|frame| frame.is_helper_level())
+        .count();
     let split = parent_frames.len().saturating_sub(helper_level_count);
-    let (sections_have_markers, any_blocker) = {
-        let session = ctx.session.borrow();
-        let levels: Vec<&InlineFrame> = session
-            .framestack
-            .iter()
-            .rev()
-            .take_while(|frame| frame.is_helper_level())
-            .collect();
-        let mut sections_have_markers = true;
-        let mut any_blocker = false;
-        // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
-        for frame in &parent_frames[..split] {
-            if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
-                continue;
-            }
-            match frame.resume_marker_jit_pc {
-                Some(pc) => {
-                    if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None) {
-                        any_blocker = true;
-                    }
-                }
-                None => {
-                    sections_have_markers = false;
+    let levels: Vec<&InlineFrame> = session
+        .framestack
+        .iter()
+        .rev()
+        .take_while(|frame| frame.is_helper_level())
+        .collect();
+    let mut sections_have_markers = true;
+    let mut any_blocker = false;
+    // Transparent-helper ancestors below the trailing helper levels also run their continuation in the blackhole (`blackhole.py` `_resume_mainloop` runs every recorded frame), so they are checked like the trailing sections.
+    for frame in &parent_frames[..split] {
+        if !crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32) {
+            continue;
+        }
+        match frame.resume_marker_jit_pc {
+            Some(pc) => {
+                if helper_resume_reaches_blocker(frame.jitcode_index as usize, pc, None) {
                     any_blocker = true;
                 }
             }
+            None => {
+                sections_have_markers = false;
+                any_blocker = true;
+            }
         }
-        for (frame, level) in parent_frames[split..].iter().zip(levels.iter().rev()) {
-            match frame.resume_marker_jit_pc {
-                Some(pc) => {
-                    if helper_resume_reaches_blocker(
-                        frame.jitcode_index as usize,
-                        pc,
-                        level.helper_entry_array_len,
-                    ) {
-                        any_blocker = true;
-                    }
-                }
-                None => {
-                    sections_have_markers = false;
+    }
+    for (frame, level) in parent_frames[split..].iter().zip(levels.iter().rev()) {
+        match frame.resume_marker_jit_pc {
+            Some(pc) => {
+                if helper_resume_reaches_blocker(
+                    frame.jitcode_index as usize,
+                    pc,
+                    level.helper_entry_array_len,
+                ) {
                     any_blocker = true;
                 }
             }
+            None => {
+                sections_have_markers = false;
+                any_blocker = true;
+            }
         }
-        (sections_have_markers, any_blocker)
-    };
+    }
+    (sections_have_markers, any_blocker)
+}
+
+/// Resume of a guard at `op_pc` inside a numbered helper chain:
+/// `parent_frames` plus the innermost helper section at the guard.
+///
+/// `capture_resumedata` numbers every `MIFrame` (`resume.py`
+/// `ResumeDataLoopMemo.number`). The blackhole runs each helper section
+/// from its resume pc to its return, and `reject_unresolved_call` bails
+/// at a residual it cannot resolve. CALL-entry collapse
+/// ([`HelperCallEntry`]) re-runs the call: it is used when a section has
+/// no resume marker, or when a marked section can reach such a residual
+/// ([`helper_resume_reaches_blocker`]). Collapse is refused once a
+/// heap-writing residual or a journaled live-heap effect has executed
+/// since the level was entered, and so is a blocker section then (the
+/// guard is refused).
+fn numbered_helper_guard_resume<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: &GuardCaptureScope,
+    parent_frames: Vec<InlineParentFrame>,
+) -> Result<NumberedHelperGuard, DispatchError> {
+    let live_after_jit_pc = ctx.live_after_jit_pc;
+    let (parent_frames, runnable, python_chain_complete) = numbered_helper_runnable_frames(
+        ctx,
+        op_pc,
+        after_residual_call,
+        scope,
+        parent_frames,
+        live_after_jit_pc,
+    )?;
+    if after_residual_call {
+        return Ok(NumberedHelperGuard::Frames(parent_frames));
+    }
     let refused = DispatchError::OrthodoxSubWalkTraceUnsupported {
         pc: op_pc,
         symbolic: 0,
@@ -3518,9 +3570,9 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
         let journal_delta = fbw_journaled_effect_delta_since(outer.entry_journal_mark);
         (heap_moved, journal_delta, outer_index)
     };
-    if python_chain_complete && sections_have_markers && !any_blocker {
+    if runnable {
         if fbw_debug_abort_enabled() {
-            eprintln!("[numbered-helper-guard] frames op_pc={op_pc} blocker={any_blocker}");
+            eprintln!("[numbered-helper-guard] frames op_pc={op_pc}");
         }
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
@@ -3541,8 +3593,8 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     }
     if fbw_debug_abort_enabled() {
         eprintln!(
-            "[numbered-helper-guard] collapse op_pc={op_pc} markers={sections_have_markers} \
-             blocker={any_blocker} python_chain={python_chain_complete}"
+            "[numbered-helper-guard] collapse op_pc={op_pc} runnable={runnable} \
+             python_chain={python_chain_complete}"
         );
     }
     if !python_chain_complete {
@@ -3566,6 +3618,85 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     }
 }
 
+/// True when a may-force residual at `op_pc` inside a numbered transparent
+/// helper will have its post-call `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`
+/// take [`NumberedHelperGuard::Frames`] through the `runnable` condition,
+/// and every helper section those later guards would number is
+/// blocker-free ([`numbered_helper_sections_blocker_free`]).
+///
+/// The decline in `try_execute_residual_call_via_executor_inner` is a
+/// pre-check: it must agree with the capture that follows the recorded call
+/// (`capture_resumedata` on the helper `MIFrame`), or the callback runs
+/// twice. A later plain guard (`after_residual_call=false`) runs
+/// [`helper_resume_reaches_blocker`] on every numbered section; refusing
+/// it after the callback has executed rewinds that Python code
+/// (`hash_w_hooked` / `eq_w_hooked`). Admission therefore requires the
+/// same scan now. The innermost section is the helper at `post_call_pc`;
+/// its remaining-body scan, and the whole-body callee summaries
+/// [`helper_resume_reaches_blocker`] consults, cover every helper the
+/// remaining body can still enter.
+///
+/// `post_call_pc` is the residual's next jitcode pc — the same value
+/// the later `ctx.live_after_jit_pc = op.next_pc` assigns before those
+/// guards are captured — so this numbers the helper section at the
+/// post-call `-live-` (`do_residual_call` captures with `MIFrame.pc`
+/// already there). Any `Err` is false. Reads the walk; does not write the
+/// trace or session.
+pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    post_call_pc: usize,
+) -> bool {
+    if !(ctx.fbw_mode.inline_subwalk && ctx.fbw_mode.transparent_helper_subwalk) {
+        return false;
+    }
+    if ctx.session.borrow().helper_chain() != HelperChain::Numbered {
+        return false;
+    }
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
+        return false;
+    }
+    let parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    if parent_frames.is_empty() {
+        return false;
+    }
+    // Same Python-portal check `walker_capture_transparent_helper_snapshot`
+    // makes on the outermost numbered section.
+    if !parent_frames.first().is_some_and(python_resume_frame) {
+        return false;
+    }
+    // Scope `walker_capture_snapshot_for_last_guard` builds for the
+    // `GUARD_NOT_FORCED` after a recorded `CALL_MAY_FORCE_*`: default, then
+    // `residual_call_catch_resume` because that guard opcode is in the
+    // after-residual family (`walker_capture_snapshot_for_last_guard_scoped`).
+    let scope = GuardCaptureScope {
+        residual_call_catch_resume: true,
+        ..GuardCaptureScope::default()
+    };
+    match numbered_helper_runnable_frames(
+        ctx,
+        op_pc,
+        /*after_residual_call=*/ true,
+        &scope,
+        parent_frames,
+        post_call_pc,
+    ) {
+        Ok((frames, runnable, _)) => {
+            let (sections_have_markers, any_blocker) =
+                numbered_helper_sections_blocker_free(ctx, &frames);
+            runnable && sections_have_markers && !any_blocker
+        }
+        Err(_) => false,
+    }
+}
+
 /// Innermost helper section at the guard's own jitcode coordinate.
 ///
 /// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else
@@ -3577,6 +3708,7 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     op_pc: usize,
     after_residual_call: bool,
     scope: &GuardCaptureScope,
+    live_after_jit_pc: usize,
 ) -> Result<InlineParentFrame, DispatchError> {
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
@@ -3592,11 +3724,11 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     } else if after_residual_call {
         after_residual_guard_marker(&pjc, op_pc, None)
             .or_else(|| {
-                (ctx.live_after_jit_pc != usize::MAX
+                (live_after_jit_pc != usize::MAX
                     && pjc
                         .jitcode
-                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
-                .then_some(ctx.live_after_jit_pc)
+                        .can_decode_live_vars(live_after_jit_pc, crate::state::op_live()))
+                .then_some(live_after_jit_pc)
             })
             .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?
     } else {

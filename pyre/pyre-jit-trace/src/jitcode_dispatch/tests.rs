@@ -24823,7 +24823,7 @@ fn residual_call_refused_up_front_probe(
     let session = std::cell::RefCell::new(WalkSession::default());
     let regs_i: Vec<OpRef> = Vec::new();
     let regs_r: Vec<OpRef> = Vec::new();
-    let wc = WalkContext {
+    let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
             callee_shadow: None,
             concrete_registers_r: ([]).to_vec(),
@@ -24854,7 +24854,14 @@ fn residual_call_refused_up_front_probe(
         live_before_jit_pc: usize::MAX,
         live_after_jit_pc: usize::MAX,
     };
-    residual_call_refused_up_front(&wc, opcode, &allboxes, call_descr)
+    residual_call_refused_up_front(
+        &mut wc,
+        opcode,
+        &allboxes,
+        call_descr,
+        usize::MAX,
+        usize::MAX,
+    )
 }
 
 #[test]
@@ -24885,6 +24892,204 @@ fn residual_call_refused_up_front_declines_may_force_not_can_raise_in_transparen
     assert!(
         matches!(may_force, Some(("may-force-in-transparent-helper", _, 0))),
         "CallMayForce inside a transparent helper stays declined: {may_force:?}"
+    );
+}
+
+fn numbered_helper_parent(jitcode_index: u32, resume_pc: usize) -> InlineParentFrame {
+    InlineParentFrame {
+        jitcode_index,
+        call_jitcode_pc: Some(resume_pc),
+        resume_pc: Some(resume_pc),
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+        resume_marker_jit_pc: Some(resume_pc),
+        boxes: Vec::new(),
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+        result_slot: CallResultSlot::Unknown,
+    }
+}
+
+fn numbered_helper_level(parents: Vec<InlineParentFrame>) -> InlineFrame {
+    InlineFrame {
+        is_portal: false,
+        w_code: 0,
+        is_being_profiled: false,
+        recursion_greenkey: false,
+        call_id: 0,
+        debug_merge_point_py_pc: None,
+        parents,
+        entry_executed_effects: 0,
+        entry_heap_writing_effects: 0,
+        entry_journal_mark: fbw_effect_journal_mark(),
+        helper_resume: HelperResume::Section,
+        helper_call_entry: HelperCallEntry::Unavailable,
+        helper_entry_array_len: None,
+        entry_trace_index: 0,
+        live: None,
+    }
+}
+
+fn install_live_only_helper_jitcode() -> u32 {
+    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    let live = crate::state::op_live();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("may_force_numbered_helper_live");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![live, (live_off & 0xff) as u8, (live_off >> 8) as u8],
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let payload = std::sync::Arc::new(crate::PyJitCode::from_core_degenerate(
+        std::sync::Arc::new(runtime_jc),
+        std::ptr::null(),
+        false,
+    ));
+    crate::state::install_codeless_jitcode(payload) as u32
+}
+
+fn install_python_resume_jitcode() -> u32 {
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()).unwrap() as *const ();
+    let raw_code = unsafe { w_code_get_ptr(w_code as pyre_object::PyObjectRef) };
+    let live_off = crate::state::intern_liveness(&[], &[], &[]).expect("empty live window");
+    let live = crate::state::op_live();
+    let runtime_jc = majit_metainterp::jitcode::JitCode::new("may_force_python_resume");
+    runtime_jc.set_body(majit_jitcode::jitcode::JitCodeBody {
+        code: vec![live, (live_off & 0xff) as u8, (live_off >> 8) as u8],
+        startpoints: Some([0_usize].into_iter().collect()),
+        ..Default::default()
+    });
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    unsafe { (*installed).index as u32 }
+}
+
+fn residual_call_refused_up_front_numbered_may_force(
+    session: &std::cell::RefCell<WalkSession>,
+    helper_index: u32,
+    post_call_pc: usize,
+) -> Option<(&'static str, i64, i64)> {
+    let mut tc = fresh_trace_ctx();
+    let addr = pyre_interpreter::residual_word_addr!(2, add2_for_walker_test,) as i64;
+    let funcbox = tc.const_int(addr);
+    let allboxes = [funcbox];
+    let descr = make_call_descr(90, vec![], Type::Int, majit_ir::ExtraEffect::RandomEffects);
+    let call_descr = descr.as_call_descr().expect("CallDescr");
+    let regs_i: Vec<OpRef> = Vec::new();
+    let regs_r: Vec<OpRef> = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        fbw_mode: FbwWalkMode {
+            inline_subwalk: true,
+            transparent_helper_subwalk: true,
+            transparent_helper_jitcode_index: Some(helper_index as usize),
+            ..test_fbw_mode()
+        },
+        session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: true,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    residual_call_refused_up_front(
+        &mut wc,
+        majit_ir::OpCode::CallMayForceI,
+        &allboxes,
+        call_descr,
+        post_call_pc,
+        post_call_pc,
+    )
+}
+
+/// `helper_may_force_resumes_in_frame` admits a numbered chain only when
+/// every section a later plain guard would number is blocker-free
+/// (`numbered_helper_sections_blocker_free`). An ancestor whose remaining
+/// body reaches a blocker (`helper_resume_reaches_blocker`) is refused
+/// before `execute_varargs`, so the callback cannot run twice.
+#[test]
+fn residual_call_refused_up_front_declines_may_force_when_numbered_ancestor_reaches_blocker() {
+    let _ = test_outer_resume_jitcode_index();
+    let python_index = install_python_resume_jitcode();
+    let helper_index = install_live_only_helper_jitcode();
+    let live_pc = 0;
+    assert!(
+        crate::state::pyjitcode_for_jitcode_index(python_index as i32)
+            .is_some_and(|pjc| !pjc.code_ptr.is_null()),
+        "python parent must satisfy python_resume_frame"
+    );
+    let helper_pjc = crate::state::pyjitcode_for_jitcode_index(helper_index as i32)
+        .expect("live-only helper payload");
+    assert!(
+        helper_pjc
+            .jitcode
+            .can_decode_live_vars(live_pc, crate::state::op_live()),
+        "innermost post_call_pc must decode -live-"
+    );
+    assert!(
+        !super::inline_call::helper_resume_reaches_blocker(helper_index as usize, live_pc, None),
+        "live-only helper remaining body must be blocker-free"
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(vec![numbered_helper_parent(
+            python_index,
+            live_pc,
+        )]));
+    assert_eq!(
+        session.borrow().helper_chain(),
+        HelperChain::Numbered,
+        "one Section helper with a parent is a numbered chain"
+    );
+    let admitted =
+        residual_call_refused_up_front_numbered_may_force(&session, helper_index, live_pc);
+    assert_eq!(
+        admitted, None,
+        "a blocker-free numbered chain still records the may-force residual: {admitted:?}"
+    );
+
+    const ANCESTOR_BLOCKER_JITCODE: u32 = 0x7FFF_FFFE;
+    session
+        .borrow_mut()
+        .framestack
+        .push(numbered_helper_level(vec![numbered_helper_parent(
+            ANCESTOR_BLOCKER_JITCODE,
+            live_pc,
+        )]));
+    let refused =
+        residual_call_refused_up_front_numbered_may_force(&session, helper_index, live_pc);
+    assert!(
+        matches!(refused, Some(("may-force-in-transparent-helper", _, 0))),
+        "an ancestor helper_resume_reaches_blocker refuses the residual up front: {refused:?}"
     );
 }
 
