@@ -15,7 +15,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::dictmultiobject::DictStrategy;
-use crate::pyobject::PyObjectRef;
+use crate::pyobject::{PY_NULL, PyObjectRef};
 
 /// `kwargsdict.py KwargsDictStrategy`.
 ///
@@ -327,14 +327,14 @@ impl DictStrategy for KwargsDictStrategy {
     /// `kwargsdict.py getitem` — `is_correct_type` →
     /// `getitem_correct` / `_getitem_correct_indirection`, else
     /// `_never_equal_to` short-circuit or promote.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            return kwargs_getitem_correct_indirection(w_dict, w_key);
+            return kwargs_getitem_correct_indirection(w_dict, w_key).unwrap_or(PY_NULL);
         }
         // `kwargsdict.py _never_equal_to` returns False — no
         // short-circuit; always promote and retry.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `kwargsdict.py setdefault` — keep an exact unicode key on the
@@ -349,7 +349,8 @@ impl DictStrategy for KwargsDictStrategy {
         w_default: PyObjectRef,
     ) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            if let Some(w_result) = self.getitem(w_dict, w_key) {
+            let w_result = self.getitem(w_dict, w_key);
+            if !w_result.is_null() {
                 return w_result;
             }
             self.setitem(w_dict, w_key, w_default);
@@ -423,12 +424,12 @@ impl DictStrategy for KwargsDictStrategy {
 
     /// Value-iterator twin of [`Self::nth_item`], matching
     /// `kwargsdict.py itervalues`' direct values-list cursor.
-    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
         let values_w = &kwargs_storage(w_dict).1;
         if index < values_w.len() {
-            Some(kwargs_at(values_w, index))
+            kwargs_at(values_w, index)
         } else {
-            None
+            PY_NULL
         }
     }
 
@@ -585,12 +586,12 @@ mod tests {
                 assert_eq!(crate::w_str_get_wtf8(w_key), key);
                 assert_eq!(crate::w_int_get_value(w_value), value);
                 assert_eq!(
-                    crate::w_int_get_value(strategy.nth_value(w_dict, index).unwrap()),
+                    crate::w_int_get_value(strategy.nth_value(w_dict, index)),
                     value
                 );
             }
             assert!(strategy.nth_item(w_dict, 3).is_none());
-            assert!(strategy.nth_value(w_dict, 3).is_none());
+            assert!(strategy.nth_value(w_dict, 3).is_null());
 
             let reversed = strategy.getiterreversed(w_dict);
             let keys: Vec<_> = reversed
@@ -615,10 +616,7 @@ mod tests {
             let (w_key, w_value) = strategy.nth_item(w_dict, 0).unwrap();
             assert_eq!(crate::w_str_get_wtf8(w_key), "a");
             assert_eq!(crate::w_int_get_value(w_value), 9);
-            assert_eq!(
-                crate::w_int_get_value(strategy.nth_value(w_dict, 1).unwrap()),
-                2
-            );
+            assert_eq!(crate::w_int_get_value(strategy.nth_value(w_dict, 1)), 2);
         }
     }
 

@@ -6097,9 +6097,9 @@ pub fn finditem_str_named(
         // `sys.modules` read.  Under the JIT the compiled loop has already
         // pinned the dict identity; the interpreter keeps the locked wrapper.
         if majit_metainterp::jit::we_are_jitted() {
-            return Ok(unsafe {
+            return Ok(pyre_object::dictmultiobject::nullable_to_option(unsafe {
                 pyre_object::dictmultiobject::w_dict_get_strategy(obj).getitem_str(obj, key)
-            });
+            }));
         }
         return finditem_str_shortcut_interp(obj, key, pycode, nameindex);
     }

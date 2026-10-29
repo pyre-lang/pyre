@@ -13,7 +13,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use crate::dictmultiobject::DictStrategy;
-use crate::pyobject::PyObjectRef;
+use crate::pyobject::{PY_NULL, PyObjectRef};
 
 /// `identitydict.py IdentityDictStrategy` key type — identity
 /// comparison + identity hash.  Stored in
@@ -325,14 +325,14 @@ impl DictStrategy for IdentityDictStrategy {
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem` —
     /// O(1) identity-keyed lookup.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            return w_dict_lookup_identity_strategy(w_dict, w_key);
+            return w_dict_lookup_identity_strategy(w_dict, w_key).unwrap_or(PY_NULL);
         }
         // `identitydict.py _never_equal_to` → always False, so
         // mismatched keys always promote and retry.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py setitem` — identity-keyed insert;
@@ -413,8 +413,11 @@ impl DictStrategy for IdentityDictStrategy {
             .map(|(k, &v)| (k.0, v))
     }
 
-    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-        identity_storage(w_dict).get_slot(index).map(|(_, &v)| v)
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match identity_storage(w_dict).get_slot(index) {
+            Some((_, &v)) => v,
+            None => PY_NULL,
+        }
     }
 
     /// A delete leaves a tombstone rather than closing the hole, so the

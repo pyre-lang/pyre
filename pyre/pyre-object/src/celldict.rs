@@ -1358,14 +1358,14 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// Body in `w_module_dict_lookup_inner` to avoid recursing
     /// through `w_dict_lookup` (which dispatches back through
     /// the strategy slot after Phase C-3 wire-in).
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_module_dict_lookup_inner(w_dict, w_key)
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
+        crate::dictmultiobject::w_module_dict_lookup_inner(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `celldict.py getitem_str` — str fast path matches
     /// `w_module_dict_getitem_str` and its cell-cache behavior.
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_module_dict_getitem_str(w_dict, key)
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
+        crate::dictmultiobject::w_module_dict_getitem_str(w_dict, key).unwrap_or(PY_NULL)
     }
 
     /// `celldict.py setitem` + `_setitem_str_cell_known` — str
@@ -1435,8 +1435,8 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
 
     /// A `values()` view needs no name at all, so it skips the wrap entirely
     /// (`dictmultiobject.py AbstractTypedStrategy.getitem`).
-    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_module_dict_nth_value_inner(w_dict, index)
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        crate::dictmultiobject::w_module_dict_nth_value_inner(w_dict, index).unwrap_or(PY_NULL)
     }
 
     /// Both storage halves tombstone their deletes, so neither numbers its

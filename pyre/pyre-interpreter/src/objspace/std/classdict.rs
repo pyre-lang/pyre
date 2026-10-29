@@ -48,11 +48,11 @@ impl DictStrategy for ClassDictStrategySlot {
         std::ptr::null_mut()
     }
 
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         CLASS_DICT_METHODS.getitem(w_dict, w_key)
     }
 
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         CLASS_DICT_METHODS.getitem_str(w_dict, key)
     }
 
@@ -114,7 +114,7 @@ unsafe fn unerase(w_dict: PyObjectRef) -> PyObjectRef {
 }
 
 impl ClassDictMethods {
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if pyre_object::is_str(w_key) {
             return self.getitem_wtf8(w_dict, pyre_object::w_str_get_wtf8(w_key));
         }
@@ -123,20 +123,24 @@ impl ClassDictMethods {
         // keys; the live dict_w still has to answer a key it already stored.
         let ns = type_namespace(unerase(w_dict));
         if ns.is_null() {
-            return None;
+            return PY_NULL;
         }
-        let w_value = pyre_object::w_dict_lookup(ns, w_key)?;
-        Some(pyre_object::celldict::unwrap_cell(w_value))
+        let Some(w_value) = pyre_object::w_dict_lookup(ns, w_key) else {
+            return PY_NULL;
+        };
+        pyre_object::celldict::unwrap_cell(w_value)
     }
 
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_wtf8(w_dict, Wtf8::new(key))
     }
 
-    unsafe fn getitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8) -> Option<PyObjectRef> {
+    unsafe fn getitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8) -> PyObjectRef {
         let w_type = unerase(w_dict);
-        let w_value = crate::type_dict_lookup_wtf8(w_type, key)?;
-        Some(pyre_object::celldict::unwrap_cell(w_value))
+        let Some(w_value) = crate::type_dict_lookup_wtf8(w_type, key) else {
+            return PY_NULL;
+        };
+        pyre_object::celldict::unwrap_cell(w_value)
     }
 
     unsafe fn setitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef, w_value: PyObjectRef) {
@@ -509,7 +513,7 @@ mod tests {
                 pyre_object::w_dict_get_strategy(w_dict).strategy_kind(),
                 StrategyKind::Class
             );
-            assert!(CLASS_DICT_SLOT.getitem_str(w_dict, "append").is_some());
+            assert!(!CLASS_DICT_SLOT.getitem_str(w_dict, "append").is_null());
             let before = pyre_object::w_type_get_version_tag(list_type);
             CLASS_DICT_SLOT.setitem_str(w_dict, "append", pyre_object::w_int_new(1));
             assert!(crate::call::take_call_error().is_some());
@@ -535,7 +539,7 @@ mod tests {
             assert!(crate::call::take_call_error().is_none());
             assert_eq!(
                 CLASS_DICT_SLOT.getitem_str(w_dict, "attr"),
-                Some(crate::type_dict_lookup(w_type, "attr").unwrap())
+                crate::type_dict_lookup(w_type, "attr").unwrap()
             );
             assert_ne!(pyre_object::w_type_get_version_tag(w_type), before);
         }
@@ -556,18 +560,16 @@ mod tests {
             CLASS_DICT_SLOT.setitem(w_dict, w_name, pyre_object::w_int_new(1));
             assert!(crate::call::take_call_error().is_none());
             assert_eq!(
-                CLASS_DICT_SLOT
-                    .getitem(w_dict, w_name)
-                    .map(|value| pyre_object::w_int_get_value(value)),
-                Some(1)
+                pyre_object::w_int_get_value(CLASS_DICT_SLOT.getitem(w_dict, w_name)),
+                1
             );
             let ns = type_namespace(w_type);
             pyre_object::w_dict_store(ns, pyre_object::w_int_new(1), pyre_object::w_int_new(2));
             assert_eq!(
-                CLASS_DICT_SLOT
-                    .getitem(w_dict, pyre_object::w_int_new(1))
-                    .map(|value| pyre_object::w_int_get_value(value)),
-                Some(2)
+                pyre_object::w_int_get_value(
+                    CLASS_DICT_SLOT.getitem(w_dict, pyre_object::w_int_new(1))
+                ),
+                2
             );
         }
     }

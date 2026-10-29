@@ -2491,7 +2491,8 @@ pub unsafe fn w_dict_lookup_str_keyed(
     if strategy.strategy_kind() != StrategyKind::Unicode {
         return None;
     }
-    Some(strategy.getitem(obj, key).unwrap_or(default))
+    let w = strategy.getitem(obj, key);
+    Some(if w.is_null() { default } else { w })
 }
 
 /// Key-set mutation state captured by dict iterators.
@@ -2937,7 +2938,7 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// — `w_dict.get_strategy().getitem(w_dict, w_key)`.
 pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
-    w_dict_get_strategy(obj).getitem(obj, key)
+    nullable_to_option(w_dict_get_strategy(obj).getitem(obj, key))
 }
 
 /// True when a regular dict is still on EmptyDictStrategy or
@@ -3018,7 +3019,7 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
-            return Ok(strategy.getitem(obj, key));
+            return Ok(nullable_to_option(strategy.getitem(obj, key)));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
@@ -3026,13 +3027,13 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
-            return Ok(strategy.getitem(obj, key));
+            return Ok(nullable_to_option(strategy.getitem(obj, key)));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    let result = strategy.getitem(obj, key);
+    let result = nullable_to_option(strategy.getitem(obj, key));
     if take_dict_key_error() {
         return Err(DictKeyError);
     }
@@ -4120,7 +4121,7 @@ pub unsafe fn w_dict_getitem_str_hashed(
     hash: i64,
 ) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_get_strategy(obj).getitem_str_hashed(obj, key, hash)
+    nullable_to_option(w_dict_get_strategy(obj).getitem_str_hashed(obj, key, hash))
 }
 
 /// Error-propagating sibling of [`w_dict_getitem_str`], the str-keyed
@@ -5201,7 +5202,7 @@ pub unsafe fn w_dict_prev_item(
 /// `obj` must be a valid `W_DictObject` PyObjectRef.
 pub unsafe fn w_dict_nth_value(obj: PyObjectRef, index: usize) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj);
-    w_dict_get_strategy(obj).nth_value(obj, index)
+    nullable_to_option(w_dict_get_strategy(obj).nth_value(obj, index))
 }
 
 /// Return the key in slot `index` together with the hash stored in an exact
@@ -6690,18 +6691,19 @@ pub trait DictStrategy {
     /// freshly-allocated erased storage for this strategy.  Required.
     fn get_empty_storage(&self) -> GCREF;
 
-    /// `dictmultiobject.py getitem` — required.
+    /// `dictmultiobject.py getitem` — required. Returns `PY_NULL` on a miss.
     ///
     /// # Safety
     /// `w_dict` and `w_key` must be valid PyObjectRef.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef>;
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef;
 
     /// `dictmultiobject.py getitem_str` — default falls
     /// through to `getitem(w_dict, space.newtext(key))`.
+    /// Returns `PY_NULL` on a miss.
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         let w_key = crate::w_str_new(key);
         self.getitem(w_dict, w_key)
     }
@@ -6712,15 +6714,11 @@ pub trait DictStrategy {
     /// string object the caller borrowed `key` from; zero means it holds none.
     /// Only the strategies backed by that table override this — the default
     /// discards the digest and re-hashes.
+    /// Returns `PY_NULL` on a miss.
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
-    unsafe fn getitem_str_hashed(
-        &self,
-        w_dict: PyObjectRef,
-        key: &str,
-        hash: i64,
-    ) -> Option<PyObjectRef> {
+    unsafe fn getitem_str_hashed(&self, w_dict: PyObjectRef, key: &str, hash: i64) -> PyObjectRef {
         let _ = hash;
         self.getitem_str(w_dict, key)
     }
@@ -6787,7 +6785,8 @@ pub trait DictStrategy {
         // store, which allocates again.  Slot them and read back at each use.
         let roots = crate::gc_roots::push_roots();
         let dict_slot = roots.publish(&[w_dict, w_key, w_value]);
-        if let Some(w_result) = self.getitem(w_dict, w_key) {
+        let w_result = self.getitem(w_dict, w_key);
+        if !w_result.is_null() {
             return w_result;
         }
         self.setitem(
@@ -6845,11 +6844,15 @@ pub trait DictStrategy {
     /// Read the value at iteration position `index` without requiring a
     /// separately materialised key
     /// (`dictmultiobject.py AbstractTypedStrategy.getitem`).
+    /// Returns `PY_NULL` on a miss.
     ///
     /// # Safety
     /// `w_dict` must be a valid PyObjectRef.
-    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
-        self.nth_item(w_dict, index).map(|(_, value)| value)
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
+        match self.nth_item(w_dict, index) {
+            Some((_, value)) => value,
+            None => PY_NULL,
+        }
     }
 
     /// The first live slot at or after `from` — `_ll_dictnext`'s scan,
@@ -6900,8 +6903,8 @@ pub trait DictStrategy {
         let roots = crate::gc_roots::push_roots();
         let dict_slot = roots.publish(&[w_dict, w_key, w_default.unwrap_or(std::ptr::null_mut())]);
         let value_slot = dict_slot + 3;
-        let w_item = self.getitem(w_dict, w_key);
-        if let Some(val) = w_item {
+        let val = self.getitem(w_dict, w_key);
+        if !val.is_null() {
             let _ = roots.pin_root(val);
             if !self.delitem(roots.get(dict_slot), roots.get(dict_slot + 1)) {
                 return Err(DictPopError);
@@ -7082,6 +7085,12 @@ pub trait DictStrategy {
         visitor(slot);
         entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
+}
+
+/// Convert a dict-strategy miss (`PY_NULL`) back to `Option`.
+#[inline]
+pub fn nullable_to_option(w: PyObjectRef) -> Option<PyObjectRef> {
+    if w.is_null() { None } else { Some(w) }
 }
 
 /// The one-word strategy slot a dict stores, holding the trait object that
@@ -7471,7 +7480,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     ) {
     }
 
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         EMPTY_DICT_STRATEGY.getitem(w_dict, w_key)
     }
 
@@ -7587,7 +7596,7 @@ impl DictStrategy for EmptyDictStrategy {
         install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
     }
 
-    unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         // `dictmultiobject.py EmptyDictStrategy.getitem`:
         //   # in case the key is unhashable, try to hash it
         //   self.space.hash(w_key)
@@ -7601,7 +7610,7 @@ impl DictStrategy for EmptyDictStrategy {
         // routed through a future Result-aware variant.  Tracked in
         // MEMORY as the "hash hook error propagation" epic.
         let _ = crate::dict_eq_hook::try_hash_w(w_key);
-        None
+        PY_NULL
     }
 
     // dictmultiobject.py setdefault
@@ -7780,23 +7789,19 @@ impl DictStrategy for ObjectDictStrategy {
     /// (w_dict.dstorage).get(w_key)`. Body in
     /// `w_dict_lookup_object_strategy` to avoid recursing through
     /// `w_dict_lookup`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key)
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
+        crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py ObjectDictStrategy.getitem_str` —
     /// upstream just delegates to `getitem` after wrapping the key.
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }
 
-    unsafe fn getitem_str_hashed(
-        &self,
-        w_dict: PyObjectRef,
-        key: &str,
-        hash: i64,
-    ) -> Option<PyObjectRef> {
+    unsafe fn getitem_str_hashed(&self, w_dict: PyObjectRef, key: &str, hash: i64) -> PyObjectRef {
         crate::dictmultiobject::w_dict_getitem_str_object_strategy_hashed(w_dict, key, hash)
+            .unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py setitem_str` — `ObjectDictStrategy`
@@ -7964,18 +7969,19 @@ impl DictStrategy for BytesDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if crate::is_bytes(w_key) {
-            return crate::dictmultiobject::w_dict_lookup_bytes_strategy(w_dict, w_key);
+            return crate::dictmultiobject::w_dict_lookup_bytes_strategy(w_dict, w_key)
+                .unwrap_or(PY_NULL);
         }
         // `:1099-1100 _never_equal_to(space.type(w_key))` —
         // `_never_equal_to_string` (`:21-31`) for str-keyed strategies.
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
-            return None;
+            return PY_NULL;
         }
         // `:1101-1103` switch + re-dispatch.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.setitem`.
@@ -8065,11 +8071,12 @@ impl DictStrategy for BytesDictStrategy {
         Some((w_key, value))
     }
 
-    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
         lock_dict_refs!(_dict_guard, w_dict);
-        crate::dictmultiobject::w_dict_bytes_storage(w_dict)
-            .get_slot(index)
-            .map(|(_, &value)| value)
+        match crate::dictmultiobject::w_dict_bytes_storage(w_dict).get_slot(index) {
+            Some((_, &value)) => value,
+            None => PY_NULL,
+        }
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
@@ -8178,15 +8185,16 @@ impl DictStrategy for UnicodeDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if crate::is_exact_type(w_key, &crate::STR_TYPE) {
-            return crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key);
+            return crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key)
+                .unwrap_or(PY_NULL);
         }
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
-            return None;
+            return PY_NULL;
         }
         crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py setitem_str` override — wraps the
@@ -8236,17 +8244,13 @@ impl DictStrategy for UnicodeDictStrategy {
     }
 
     /// `dictmultiobject.py getitem_str` override.
-    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
+    unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> PyObjectRef {
         self.getitem_str_hashed(w_dict, key, 0)
     }
 
-    unsafe fn getitem_str_hashed(
-        &self,
-        w_dict: PyObjectRef,
-        key: &str,
-        hash: i64,
-    ) -> Option<PyObjectRef> {
+    unsafe fn getitem_str_hashed(&self, w_dict: PyObjectRef, key: &str, hash: i64) -> PyObjectRef {
         crate::dictmultiobject::w_dict_getitem_str_object_strategy_hashed(w_dict, key, hash)
+            .unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.setitem`.
@@ -8447,15 +8451,16 @@ impl DictStrategy for IntDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            return crate::dictmultiobject::w_dict_lookup_int_strategy(w_dict, w_key);
+            return crate::dictmultiobject::w_dict_lookup_int_strategy(w_dict, w_key)
+                .unwrap_or(PY_NULL);
         }
         if Self::never_equal_to(w_key) {
-            return None;
+            return PY_NULL;
         }
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::w_dict_lookup(w_dict, w_key).unwrap_or(PY_NULL)
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.setitem`.
@@ -8544,11 +8549,12 @@ impl DictStrategy for IntDictStrategy {
         Some((w_key, value))
     }
 
-    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> Option<PyObjectRef> {
+    unsafe fn nth_value(&self, w_dict: PyObjectRef, index: usize) -> PyObjectRef {
         lock_dict_refs!(_dict_guard, w_dict);
-        crate::dictmultiobject::w_dict_int_storage(w_dict)
-            .get_slot(index)
-            .map(|(_, &value)| value)
+        match crate::dictmultiobject::w_dict_int_storage(w_dict).get_slot(index) {
+            Some((_, &value)) => value,
+            None => PY_NULL,
+        }
     }
 
     unsafe fn clear(&self, w_dict: PyObjectRef) {
