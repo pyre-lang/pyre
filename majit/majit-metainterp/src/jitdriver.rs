@@ -4568,48 +4568,6 @@ impl<S: JitState> JitDriver<S> {
                                     fail_index,
                                     &live_arg_boxes,
                                 ),
-                                // compile.py:269-270: a cross-loop CUT keeps its cut prefix
-                                // in `target_tokens[0]`, where a loop closed at its own
-                                // header keeps its PREAMBLE — the peeled iteration that
-                                // re-derives the specialized label's invariants from the
-                                // loop's entry state, which is what makes `jump_to_preamble`
-                                // (unroll.py:238-242) sound as the no-matching-label
-                                // fallback. The cut prefix's invariants instead hold only
-                                // after the guards preceding the cut point have run.
-                                // `ResumeFromInterpDescr.get_resumestorage()` is None, so an
-                                // entry bridge carries no runtime values, `generate_guards`
-                                // rejects every specialized label, and the JUMP always
-                                // reaches that slot; on cel's
-                                // `batch_chain_eager_fold_traps` the unproven index bound
-                                // became an out-of-bounds store and a SIGSEGV on the reload.
-                                //
-                                // Scoped to this arm alone. A `ResumeGuardDescr` has resume
-                                // storage, so a specialized label can match and the fallback
-                                // need not be reached — and declining the guard origin too
-                                // makes `pi/pi.jinseo` compute wrong digits from
-                                // byte 865, same length, no crash. That was
-                                // measured at threshold 50, and `MAJIT_THRESHOLD`
-                                // is NOT read anywhere — the threshold reaches the
-                                // driver only as the `JitDriver::new(threshold)`
-                                // argument, so reproducing this means changing the
-                                // caller, not setting a variable.
-                                //
-                                // What the widened arm produces, at the op level: the
-                                // declined close returns here, the walk runs on and closes a
-                                // second time one interpreter instruction later, and the bridge it
-                                // compiles carries that instruction's pop (`IntAdd -1`, two
-                                // `GcLoadR`, two `GcStore`) ahead of a `Jump` into a
-                                // four-input label, where the close that was declined jumped
-                                // into a three-input one.  So the cost is not the lost close
-                                // but the resumed walk: declining and then giving the trace
-                                // up outright reproduces the un-compiled output exactly.
-                                None if self.meta.is_cross_loop_cut_key_on_driver(
-                                    self.index().unwrap_or(0),
-                                    target_key,
-                                ) =>
-                                {
-                                    crate::pyjitpl::BridgeCompileResult::Declined
-                                }
                                 None => match self.compile_trace_entry_data() {
                                     Some((original_green_key, entry_meta)) => {
                                         let outcome = self.meta.compile_trace_from_interp(
@@ -6932,13 +6890,6 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return DoorLookup::Handled(None);
         }
-        // Cross-loop-cut decline and single-pass label handoff must stay
-        // ahead of the counter (`back_edge_internal` cites why). Empty
-        // tables are O(1) and allocation-free: check emptiness first so a
-        // never-compiled loop does not hash into them.
-        if !self.meta.cut_compiled_keys.is_empty() {
-            return DoorLookup::Occupied;
-        }
         let jd_no = self.index().unwrap_or(0);
         let door = match self.meta.warm_state_ref_for_driver(jd_no) {
             Some(warm) => warm.door_cell(green_key_hash, greenargs),
@@ -7048,43 +6999,7 @@ impl<S: JitState> JitDriver<S> {
             );
         }
 
-        // Same decline as the `None if is_cross_loop_cut_key(target_key)` arm
-        // of the CloseLoop bridge path above, on the sibling route: that arm
-        // refuses an ENTRY BRIDGE into a cross-loop cut's key because the cut
-        // artifact's entry invariants hold only after the guards preceding the
-        // cut point have run, and a `ResumeFromInterpDescr` carries no runtime
-        // values to prove them; on cel's `batch_chain_eager_fold_traps` the
-        // unproven index bound became an out-of-bounds store. A direct
-        // interpreter back edge proves no more than that entry bridge does and
-        // can therefore execute the same invalid store. This route was hidden
-        // while the key the interpreter entered by and the
-        // key `compile_loop` filed the cut under could not be equal while
-        // `can_enter_jit!` read its position green at the back edge instead of
-        // at the target; closing that made this route reachable.
-        //
-        // What the entry would execute, from the cut trace's own head on that
-        // fixture: `IntAdd(v5, 1)` / `IntMul` / `RawLoadI` and a later
-        // `RawStore`, with no bound guard on either — the guard was in the ops
-        // `cut_trace_from` discarded, and `PreambleCompileData` re-optimizes
-        // from scratch, so nothing re-derives it. Scoped to the generic case
-        // for that reason: the cutting trace's own closing JUMP and the
-        // single-pass label handoff pass an explicit dispatch key and arrive
-        // with the discarded prefix already run. Refusing before
-        // `has_compiled_loop` leaves the merge point to arm tracing normally
-        // rather than re-entering an artifact whose entry contract is unmet.
         let dispatch_key = dispatch_key.or(single_pass_dispatch_key);
-        // `cut_compiled_keys` is empty until a cross-loop cut installs a
-        // loop; check that first so a never-compiled back edge does not
-        // hash-probe the set. The decline itself stays ahead of the
-        // counter: a cut key must not tick into `bound_reached` either.
-        if dispatch_key.is_none()
-            && !self.meta.cut_compiled_keys.is_empty()
-            && self
-                .meta
-                .is_cross_loop_cut_key_on_driver(self.index().unwrap_or(0), green_key)
-        {
-            return None;
-        }
         // `warmstate.py maybe_compile_and_run`: a cell whose token was
         // `attached by compile_tmp_callback()` is NOT entered — upstream falls
         // straight to `jitcounter.tick(hash, increment_threshold)` and, on
@@ -8962,9 +8877,6 @@ impl<S: JitState> JitDriver<S> {
         if self.meta.is_tracing() {
             return BackEdgeWarmth::Full;
         }
-        if !self.meta.cut_compiled_keys.is_empty() {
-            return BackEdgeWarmth::Full;
-        }
         let jd_no = self.index().unwrap_or(0);
         if let Some(cell) = self
             .meta
@@ -10670,8 +10582,7 @@ impl<S: JitState> JitDriver<S> {
     /// `func_execute_token`. When `vinfo is not None` the only per-entry
     /// touch is `vinfo.clear_vable_token(args[index_of_virtualizable])`;
     /// `index_of_virtualizable` is the value `make_virtualizable_infos`
-    /// stored on the driver. A pending label or a cross-loop cut falls
-    /// back to [`Self::back_edge_resolved`].
+    /// stored on the driver.
     #[inline(never)]
     fn enter_compiled_function_entry<G: majit_ir::GreenSpec>(
         &mut self,
@@ -10690,10 +10601,6 @@ impl<S: JitState> JitDriver<S> {
         };
         if !state.can_trace() {
             return self.enter_compiled_cannot_trace();
-        }
-        if !self.meta.cut_compiled_keys.is_empty() {
-            return self
-                .enter_compiled_pending_label_or_cut(cell_key, token, target_pc, state, env);
         }
         let mut scratch = self.take_entry_scratch_raw();
         // `warmstate.py maybe_compile_and_run` unspecializes reds to words and
@@ -10762,24 +10669,6 @@ impl<S: JitState> JitDriver<S> {
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
             hook(cell_key, target_pc);
         }
-    }
-
-    /// Pending label or cross-loop cut: `maybe_compile_and_run` cannot enter
-    /// the raw token, so the call goes through `back_edge_resolved`.
-    #[cold]
-    #[inline(never)]
-    fn enter_compiled_pending_label_or_cut(
-        &mut self,
-        cell_key: u64,
-        token: std::sync::Arc<majit_backend::JitCellToken>,
-        target_pc: usize,
-        state: &mut S,
-        env: &S::Env,
-    ) -> SteadyCompiledEntry {
-        SteadyCompiledEntry::Done(
-            self.back_edge_resolved(cell_key, token, None, target_pc, state, env, || {})
-                .and_then(|resume| self.resume_pc_recycling(resume)),
-        )
     }
 
     /// Typed reds: `fill_entry_raw_reds` declined, so `execute_assembler`'s
@@ -17356,11 +17245,6 @@ mod cross_loop_cut_close_tests {
         }
         driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
         assert!(driver.has_compiled_loop(key), "inner loop must compile");
-        assert_eq!(
-            driver.meta.is_cross_loop_cut_key(key),
-            cut,
-            "the cut mark must follow the key compile_loop stored under",
-        );
     }
 
     /// Start an interp-origin trace (pyjitpl.py:2905 `ResumeFromInterpDescr`)
@@ -17406,34 +17290,8 @@ mod cross_loop_cut_close_tests {
         });
     }
 
-    /// A cross-loop cut leaves no PREAMBLE in `target_tokens[0]` — that
-    /// slot holds the cut prefix, whose entry invariants only the cutting trace
-    /// has proven. `jump_to_preamble` (unroll.py) is the fallback
-    /// whenever no specialized label matches, and an interp-origin entry bridge
-    /// always reaches it, so a cut target would be entered with the specialized
-    /// label's bounds unestablished.
-    #[test]
-    fn interp_origin_close_declines_a_cross_loop_cut_target() {
-        let mut driver = cut_close_driver();
-        let inner_key = gk(7031);
-        compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
-
-        start_outer_trace(&mut driver, 7032);
-        close_jumping_into(&mut driver, inner_key.get_uhash());
-
-        // pyjitpl.py: `compile_trace` returned without raising, so
-        // the trace is NOT given up — the walk keeps recording.
-        // Upstream retries compile_trace on the next header visit
-        // (`if not self.partial_trace`); do not latch the decline.
-        assert!(
-            driver.is_tracing(),
-            "a cut target must not be entered by an entry bridge",
-        );
-    }
-
-    /// The control the decline is measured against: the same close into a loop
-    /// compiled at its own header does take the JUMP, and a successful
-    /// `compile_trace` ends the trace (pyjitpl.py
+    /// A close into a loop compiled at its own header takes the JUMP, and a
+    /// successful `compile_trace` ends the trace (`pyjitpl.py`
     /// `raise_if_successful`).
     #[test]
     fn interp_origin_close_takes_a_non_cut_target() {
@@ -17511,7 +17369,10 @@ mod cross_loop_cut_close_tests {
         observed
     }
 
-    /// Where a declined close re-enters the walk.
+    /// Closing into a key that owns no compiled target declines
+    /// (`has_compiled_targets` miss; `result` stays
+    /// `BridgeCompileResult::Declined`). Where that declined close re-enters
+    /// the walk.
     ///
     /// pyjitpl.py:1571/1574 `saved_pc`: upstream consults one merge point per
     /// `opimpl_jit_merge_point` call, so the position that entered the call and
@@ -17527,7 +17388,10 @@ mod cross_loop_cut_close_tests {
     fn a_declined_close_hands_over_the_pc_that_declined() {
         let mut driver = cut_close_driver();
         let inner_key = gk(7081);
-        compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
+        assert!(
+            !driver.has_compiled_loop(inner_key.get_uhash()),
+            "the close declines because this key owns no compiled target",
+        );
 
         // Deliberately unrelated to the trace's own header, which is what a
         // close reached deeper in the walk than its entry looks like.
@@ -17563,15 +17427,19 @@ mod cross_loop_cut_close_tests {
         );
     }
 
-    /// …and a close that names no pc leaves the seed alone, rather than
-    /// pointing the walk at 0.  The pc is the merge point's green
+    /// The same uncompiled-target decline, with no `close_green_pc`: a close
+    /// that names no pc leaves the seed alone, rather than pointing the walk
+    /// at 0.  The pc is the merge point's green
     /// (pyjitpl.py:3005), so a driver whose merge point yields none has
     /// nothing to correct and keeps the pc it was called with.
     #[test]
     fn a_declined_close_without_a_pc_hands_over_nothing() {
         let mut driver = cut_close_driver();
         let inner_key = gk(7091);
-        compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
+        assert!(
+            !driver.has_compiled_loop(inner_key.get_uhash()),
+            "the close declines because this key owns no compiled target",
+        );
 
         start_outer_trace(&mut driver, 7092);
         let seen = close_jumping_into_observing_resume(&mut driver, inner_key.get_uhash(), None);
@@ -17585,21 +17453,6 @@ mod cross_loop_cut_close_tests {
             seen.iter().all(Option::is_none),
             "with no pc published there is nothing to re-seed from, and the \
              walk keeps the pc its caller passed",
-        );
-    }
-
-    /// Retiring the loop retires the cut mark with it, so a later loop compiled
-    /// at the same key is not judged by its predecessor.
-    #[test]
-    fn retiring_a_cut_loop_forgets_its_cut_mark() {
-        let mut driver = cut_close_driver();
-        let inner_key = gk(7041);
-        compile_inner_loop(&mut driver, inner_key.get_uhash(), /* cut */ true);
-
-        driver.meta.remove_compiled_loop(inner_key.get_uhash());
-        assert!(
-            !driver.meta.is_cross_loop_cut_key(inner_key.get_uhash()),
-            "the cut mark must not outlive the loop it describes",
         );
     }
 
