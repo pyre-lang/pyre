@@ -380,11 +380,10 @@ pub fn generate_trace_fn(
     let (identity_i_scalars, identity_r_scalars, identity_f_scalars) =
         dispatch_lowerer_config.identity_scalar_red_kind_counts();
 
-    // Slice X-D production wire-up: the identity `label_at` closure
-    // and the `jitcell_token_arc_for_number` resolver are constructed
-    // by `generate_merge_wrapper` and passed into `__trace_*` as a
-    // `ClosureRuntimeWithResolver`.  Both closures need to live at the
-    // merge wrapper layer because the resolver borrows
+    // The identity `label_at` closure is constructed by
+    // `generate_merge_wrapper` and passed into `__trace_*` as a
+    // `ClosureRuntimeWithResolver`.  The recursive-call seams live at
+    // the merge wrapper layer because they borrow
     // `MetaInterp::compiled_loops` / `warm_state` via the
     // `with_trace_ctx_and_token_resolver` split-borrow helper.
     // (Legacy identity closure `|pc| pc` retained at the
@@ -513,12 +512,10 @@ pub fn generate_trace_fn(
             pc: usize,
             #(#portal_green_param_decls)*
             #(#carried_param_decls)*
-            // Slice X-D production wire-up: caller passes a
-            // `ClosureRuntimeWithResolver` carrying both `label_at` and
-            // the warmstate-backed `jitcell_token_arc_for_number`
-            // callback so BC_CALL_ASSEMBLER_* dispatch resolves to the
-            // production `Arc<JitCellToken>` instead of the synth-Arc
-            // `_by_number_typed` fallback.
+            // Caller passes a `ClosureRuntimeWithResolver` carrying
+            // `label_at` and the recursive-call seams. CALL_ASSEMBLER
+            // descrs carry a `Weak<JitCellToken>`; the token number is
+            // log-only.
             __runtime: &__R,
             // Dispatch JitCode singleton cloned from JitDriver by the
             // caller before the mutable borrow. `None` only when
