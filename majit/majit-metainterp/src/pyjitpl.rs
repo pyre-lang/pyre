@@ -2194,15 +2194,6 @@ fn densify_root_loop_inputargs(
 }
 
 pub(crate) struct CompiledEntry<M> {
-    /// `Weak<JitCellToken>` so this compiled-loop index does not keep
-    /// tokens alive after `MemoryManager.alive_loops` prunes them
-    /// (memmgr.py).  Readers call `live_token()`
-    /// for the upgrade-or-panic shape (most call sites assume the entry is
-    /// alive); eviction paths use `token.upgrade()` directly to tolerate
-    /// `None`.  `BaseJitCell::loop_token` is a `Weak` too
-    /// (`warmstate.py`), so between them these two hold no ownership and
-    /// `alive_loops` is the sole long-lived strong owner (`memmgr.py`).
-    pub(crate) token: std::sync::Weak<JitCellToken>,
     /// Shared, never copied. `warmstate.py` `execute_assembler` is handed the
     /// `loop_token` OBJECT and keeps it across the run — it passes the same one
     /// to `func_execute_token` and then to `keep_loop_alive` — rather than
@@ -2255,18 +2246,6 @@ pub(crate) struct CompiledEntry<M> {
 }
 
 impl<M> CompiledEntry<M> {
-    /// Upgrade the `token` Weak to a strong `Arc<JitCellToken>`.
-    /// Returns `None` when the strong owner (`MemoryManager.alive_loops`)
-    /// has already dropped it — `memmgr.py` parity means alive_loops
-    /// pruning can run between trace insertions, so a `compiled_loops`
-    /// entry that has not yet been swept can race with eviction.
-    /// Callers MUST handle the dead-token case explicitly (return
-    /// `None`, skip iteration, fall back to non-JIT, etc.) rather than
-    /// crashing the runtime on a legitimate eviction.
-    pub(crate) fn live_token(&self) -> Option<std::sync::Arc<JitCellToken>> {
-        self.token.upgrade()
-    }
-
     /// The state a replacement entry must inherit from the entry it displaces.
     /// See `CarriedFields`.
     pub(crate) fn carried_fields(&self) -> CarriedFields {
@@ -4406,7 +4385,7 @@ impl<M: Clone> MetaInterp<M> {
 
     fn backend_fail_descr_layout(
         &self,
-        compiled: &CompiledEntry<M>,
+        green_key: u64,
         trace_id: u64,
         fail_index: u32,
     ) -> Option<majit_backend::FailDescrLayout> {
@@ -4420,7 +4399,12 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.fail_index == fail_index)
                 })
         };
-        compiled.live_token().as_deref().and_then(lookup)
+        // descr=None test path: the cell is this green key's current loop
+        // (`warmstate.py BaseJitCell.get_procedure_token`).
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        self.get_procedure_token_on_driver(jd_no, green_key)
+            .as_deref()
+            .and_then(lookup)
     }
 
     fn compiled_exit_layout_from_backend(
@@ -4432,7 +4416,7 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<CompiledExitLayout> {
         let frontend_exit_types = Self::trace_for_exit(compiled, trace_id)
             .and_then(|(_, trace)| Self::infer_exit_types_from_trace(trace, fail_index));
-        self.backend_fail_descr_layout(compiled, trace_id, fail_index)
+        self.backend_fail_descr_layout(owning_key, trace_id, fail_index)
             .map(|layout| {
                 // `ResumeGuardDescr.get_resumestorage`: the payload is the
                 // descr's own; the layout only names the descr.
@@ -8884,7 +8868,7 @@ impl<M: Clone> MetaInterp<M> {
         // `retraced_count = sys.maxint`, and the one reader of that value is
         // `unroll.py UnrollOptimizer.optimize_bridge if cell_token.retraced_count < limit` — it stops the
         // cell from RETRACING and nothing else. Upstream never lets it decide
-        // whether a loop may be compiled: `pyjitpl.py:3185-3189` gives up on a
+        // whether a loop may be compiled: `pyjitpl.py compile_loop` gives up on a
         // key that already has compiled targets, which the
         // `has_compiled_targets` arm above already answers, and that give-up is
         // an ordinary `SwitchToBlackhole(ABORT_BAD_LOOP)` whose abort is
@@ -8892,22 +8876,19 @@ impl<M: Clone> MetaInterp<M> {
         //
         // Reading it a second time here as "never compile this key again" is
         // reachable and wrong. `has_compiled_targets` asks the WARMSTATE cell
-        // for its procedure token while `live_token()` upgrades the
-        // `compiled_loops` entry's own `Weak`, so the two disagree exactly when
-        // the cell has lost its token — an invalidated or reclaimed loop, which
-        // is the state upstream expects a fresh compile from. A guard-heavy
-        // loop that reached that state was being answered with
-        // `abort_tracing(green_key, permanent = true)`, i.e. `DONT_TRACE_HERE`
-        // forever, where the ordinary abort path escalates only after
-        // `MAX_TRACE_ABORT_COUNT` aborts.
+        // for its procedure token (`warmstate.py BaseJitCell.get_procedure_token`),
+        // so an invalidated or reclaimed loop is the state upstream expects a
+        // fresh compile from. A guard-heavy loop that reached that state was
+        // being answered with `abort_tracing(green_key, permanent = true)`,
+        // i.e. `DONT_TRACE_HERE` forever, where the ordinary abort path
+        // escalates only after `MAX_TRACE_ABORT_COUNT` aborts.
         //
         // Carrying the count forward is wrong for the same reason. That token
         // is the one the cell no longer offers; the loop this compile builds
-        // gets a fresh `JitCellToken` (`compile.py:220` and `:266` both call
-        // `make_jitcell_token`), whose count starts at zero. Only
-        // `compile_retrace` reuses a token, and it reuses the live one
-        // (`compile.py compile_retrace get_procedure_token`), so that is where a retrace
-        // budget legitimately persists.
+        // gets a fresh `JitCellToken` (`compile.py make_jitcell_token`), whose
+        // count starts at zero. Only `compile_retrace` reuses a token, and it
+        // reuses the live one (`compile.py compile_retrace get_procedure_token`),
+        // so that is where a retrace budget legitimately persists.
 
         self.force_finish_trace = false;
         // Park the recorder where `walk_active_trace_refs` still sees it.
@@ -10125,7 +10106,6 @@ impl<M: Clone> MetaInterp<M> {
                     compiling_jd,
                     green_key,
                     CompiledEntry {
-                        token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
@@ -10919,10 +10899,8 @@ impl<M: Clone> MetaInterp<M> {
             let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
             // compile.py `compile_retrace` `loop_jitcell_token = metainterp.get_procedure_token(greenkey)`
             // — the warmstate cell, which rejects an invalidated token.
-            // `compiled.live_token()` upgrades the side-table Weak without
-            // that filter and disagrees exactly when the cell has lost
-            // its token. The merge point carries the greens; resolve the
-            // cell key after the token is found, before optimize/backend.
+            // The merge point carries the greens; resolve the cell key after
+            // the token is found, before optimize/backend.
             let Some(token) = self.get_procedure_token_for_key(&green_key_typed) else {
                 return false;
             };
@@ -11167,11 +11145,7 @@ impl<M: Clone> MetaInterp<M> {
         // loop. Both arms seed those candidates. `record_loop_or_bridge`
         // keeps a foreign JUMP target alive on the token this compile
         // installs (`record_jump_to`).
-        let prior_front_target_tokens = self
-            .compiled_entry(green_key)
-            .and_then(|compiled| compiled.live_token())
-            .map(|live| crate::history::target_tokens_of(&live))
-            .unwrap_or_default();
+        let prior_front_target_tokens = crate::history::target_tokens_of(&loop_jitcell_token);
         let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         let retrace_limit = self.warm_state_for_driver(compiling_jd).retrace_limit();
         let max_retrace_guards = self
@@ -11661,7 +11635,6 @@ impl<M: Clone> MetaInterp<M> {
                     compiling_jd,
                     green_key,
                     CompiledEntry {
-                        token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
@@ -11904,26 +11877,25 @@ impl<M: Clone> MetaInterp<M> {
                         inputargs.len()
                     );
                 }
+                // `unroll.py finalize_short_preamble` appends the
+                // newly minted TargetToken to `jitcelltoken.target_tokens`
+                // — the SAME list `unroll.py UnrollOptimizer.optimize_bridge`
+                // scans when a later trace looks for a label to jump onto.
+                // majit keeps that scan list on the loop's token, so the
+                // token has to land there whichever way the artifact is
+                // installed; otherwise no later bridge can ever reach this
+                // retrace's label and each one grows another guard-attached
+                // retrace.
+                if !unroll_opt.target_tokens.is_empty() {
+                    loop_jitcell_token.set_target_tokens(
+                        unroll_opt
+                            .target_tokens
+                            .iter()
+                            .map(|target| target.as_jump_target_descr())
+                            .collect(),
+                    );
+                }
                 if let Some(compiled) = self.compiled_entry_mut(green_key) {
-                    // `unroll.py finalize_short_preamble` appends the
-                    // newly minted TargetToken to `jitcelltoken.target_tokens`
-                    // — the SAME list `unroll.py:198/239/277` scans when a
-                    // later trace looks for a label to jump onto. majit keeps
-                    // that scan list on the loop's token, so the token has to
-                    // land there whichever way the artifact is installed;
-                    // otherwise no later bridge can ever reach this retrace's
-                    // label and each one grows another guard-attached retrace.
-                    if !unroll_opt.target_tokens.is_empty() {
-                        if let Some(live) = compiled.live_token() {
-                            live.set_target_tokens(
-                                unroll_opt
-                                    .target_tokens
-                                    .iter()
-                                    .map(|target| target.as_jump_target_descr())
-                                    .collect(),
-                            );
-                        }
-                    }
                     // `compile.py send_bridge_to_backend`: the bridge is
                     // handed to the CPU and nothing is indexed in the
                     // frontend — its guards answer later failures off
@@ -12764,7 +12736,6 @@ impl<M: Clone> MetaInterp<M> {
                         compiling_jd,
                         green_key,
                         CompiledEntry {
-                            token: Arc::downgrade(&token),
                             meta: Arc::new(meta),
                             root_trace_id: trace_id,
                             loop_header_pc: carried_loop_header_pc,
@@ -12832,9 +12803,11 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Compiles the trace with simple optimizer (no preamble peeling),
     /// prepends a LABEL (via the token's `target_tokens`) for bridge attachment.
-    /// Returns the resolved cell key on success (caller must call
-    /// attach_procedure_to_interp), None on failure.
-    pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
+    /// Returns the resolved cell key and the minted `JitCellToken` on success
+    /// (`compile.py` returns `target_token`; the caller reads
+    /// `target_token.targeting_jitcell_token` and passes it to
+    /// `attach_procedure_to_interp`). None on failure.
+    pub fn compile_simple_loop(&mut self, meta: M) -> Option<(u64, Arc<JitCellToken>)> {
         // Segmented loops optimize here without `compile_loop`.
         // `gctypelayout.py encode_type_shapes_now` closes at translation.
         majit_gc::ensure_type_registry_closed();
@@ -13241,7 +13214,6 @@ impl<M: Clone> MetaInterp<M> {
                     compiling_jd,
                     green_key,
                     CompiledEntry {
-                        token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
@@ -13270,9 +13242,9 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref hook) = self.hooks.on_compile_loop {
                     hook(green_key, num_ops_before, num_ops_after, &opcodes_after);
                 }
-                // compile.py:249: return target_token
+                // compile.py compile_simple_loop: return target_token
                 self.compile_snapshot_refs.clear();
-                Some(green_key)
+                Some((green_key, token))
             }
             Err(e) => {
                 self.stats.loops_aborted += 1;
@@ -14712,23 +14684,22 @@ impl<M: Clone> MetaInterp<M> {
     /// one line — `next_generation()` alone — because long-lived
     /// references outside `alive_loops` are weakrefs, so pruning
     /// `alive_loops` can trigger `LoopToken.__del__` (`memmgr.py`).
-    /// `BaseJitCell.loop_token` and `compiled_loops` token handles are
-    /// already `Weak`. The remaining extra drop is the `CompiledEntry`
-    /// metadata (`traces`, layouts) that lives in the green-key map
-    /// rather than on the token / `CompiledLoopToken`. Shrink to
-    /// `next_generation()` only once that metadata is owned the way
-    /// `model.py LoopToken.__del__` → `cpu.free_loop_and_bridges`
-    /// owns it.
+    /// `BaseJitCell.loop_token` is already `Weak`. The remaining extra
+    /// drop is the `CompiledEntry` metadata (`traces`, layouts) that
+    /// lives in the green-key map rather than on the token /
+    /// `CompiledLoopToken`. Shrink to `next_generation()` only once that
+    /// metadata is owned the way `model.py LoopToken.__del__` →
+    /// `cpu.free_loop_and_bridges` owns it.
     ///
     /// The eviction dispatch matches by **token-object identity**
-    /// (`Arc::ptr_eq`) — mirroring `memmgr.py`'s `del
-    /// self.alive_loops[looptoken]` which keys on the looptoken
-    /// itself.  Eviction of a predecessor is `alive_loops` drop +
-    /// `JitCellToken::drop` → `free_loop_and_bridges`; the
+    /// (`Arc::ptr_eq` against `get_procedure_token_on_driver`) — mirroring
+    /// `memmgr.py`'s `del self.alive_loops[looptoken]` which keys on the
+    /// looptoken itself.  Eviction of a predecessor is `alive_loops` drop
+    /// + `JitCellToken::drop` → `free_loop_and_bridges`; the
     /// `compiled_loops` row stays until the current token is evicted.
-    /// When the current token itself ages out, the whole
-    /// `compiled_loops` entry is dropped (RPython's
-    /// `LoopToken.__del__` analog).
+    /// When the current token itself ages out, or the cell no longer
+    /// returns any token, the whole `compiled_loops` entry is dropped
+    /// (RPython's `LoopToken.__del__` analog).
     /// `memmgr.py` `release_all_loops` via `jit_hooks.stats_memmgr_release_all`
     /// on the one `warmrunnerdesc.memory_manager`, which every
     /// `jitdriver_sd.warmstate` shares.
@@ -14755,15 +14726,15 @@ impl<M: Clone> MetaInterp<M> {
             let jd_no = token
                 .outermost_jitdriver_index
                 .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
-            let Some(entry) = self.compiled_loops.get_mut(&(jd_no, gk)) else {
+            if !self.compiled_loops.contains_key(&(jd_no, gk)) {
                 continue;
+            }
+            let current = self.get_procedure_token_on_driver(jd_no, gk);
+            let drop_row = match current.as_ref() {
+                None => true,
+                Some(cell_tok) => std::sync::Arc::ptr_eq(cell_tok, &token),
             };
-            if entry
-                .token
-                .upgrade()
-                .map(|t| std::sync::Arc::ptr_eq(&t, &token))
-                .unwrap_or(false)
-            {
+            if drop_row {
                 // Current eviction is the `LoopToken.__del__` analog
                 // (`memmgr.py`): the whole green_key's loop disappears.
                 self.compiled_loops.swap_remove(&(jd_no, gk));
@@ -14896,8 +14867,8 @@ impl<M: Clone> MetaInterp<M> {
     /// to directly call JIT code for another function. The caller needs
     /// the target's JitCellToken to set up the call.
     ///
-    /// Owned: the warm cell holds a `Weak` (`warmstate.py:188`), so the caller
-    /// has to hold the `Arc` for as long as it reads through it.
+    /// Owned: the warm cell holds a `Weak` (`warmstate.py BaseJitCell.loop_token`),
+    /// so the caller has to hold the `Arc` for as long as it reads through it.
     ///
     /// Production pypyjit lookup is driver 0.
     pub fn get_loop_token(&self, green_key: u64) -> Option<Arc<JitCellToken>> {
@@ -15819,10 +15790,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `warmstate.py` `maybe_compile_and_run` reads the token off the cell
     /// (`procedure_token = cell.get_procedure_token()`); pyre routes through
     /// `WarmEnterState::get_procedure_token`, which upgrades the cell's weak
-    /// handle. The `Arc` handed back here and the one
-    /// `compiled_loops[gk].token` upgrades to are the same object, and neither
-    /// slot owns it: both are `Weak`, so `alive_loops` is the sole long-lived
-    /// strong owner.
+    /// handle (`warmstate.py BaseJitCell.wref_procedure_token`). The cell
+    /// does not own the token: `alive_loops` is the sole long-lived strong
+    /// owner.
     ///
     /// Cells with no compiled entry (key not yet compiled, or already
     /// evicted) silently no-op — RPython's `keep_loop_alive` is likewise
@@ -16009,6 +15979,7 @@ impl<M: Clone> MetaInterp<M> {
             self.jitlog_trace_aborted();
             return false;
         }
+        let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
         // `compile.py ResumeFromInterpDescr.compile_and_attach` files the
         // token on the interpreter greenkey. Resolve those greens to the
         // cell key before optimize/backend (`warmstate.py`
@@ -16019,7 +15990,6 @@ impl<M: Clone> MetaInterp<M> {
                 .as_ref()
                 .or(self.compile_tracing.as_ref())
                 .and_then(|ctx| ctx.green_key_values().cloned());
-            let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
             match typed.as_ref() {
                 Some(key) => self.cell_key_for_typed(compiling_jd, key),
                 None => original_green_key,
@@ -16029,19 +15999,16 @@ impl<M: Clone> MetaInterp<M> {
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py decode_box).
-        let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
-            let compiled = self.compiled_entry(green_key).unwrap();
-            let Some(tok) = compiled.live_token() else {
-                crate::mc_diag_bump(35); // compile_entry_bridge: target token dead
-                self.jitlog_trace_aborted();
-                return false;
-            };
-            (
-                tok.get_retraced_count(),
-                tok.inputarg_types().len(),
-                compiled.next_global_opref,
-            )
+        let Some(tok) = self.get_procedure_token_on_driver(compiling_jd, green_key) else {
+            crate::mc_diag_bump(35); // compile_entry_bridge: target token dead
+            self.jitlog_trace_aborted();
+            return false;
         };
+        let (retraced_count, loop_num_inputs, parent_next_global_opref) = (
+            tok.get_retraced_count(),
+            tok.inputarg_types().len(),
+            self.compiled_entry(green_key).unwrap().next_global_opref,
+        );
         // Box identity: stage bridge_inputarg_base based
         // on the parent loop's recorded next_global_opref. See
         // Optimizer::optimize_bridge docstring for the RPython identity
@@ -16170,9 +16137,7 @@ impl<M: Clone> MetaInterp<M> {
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py decode_box).
-        let retrace_limit = self
-            .warm_state_for_driver(self.active_jitdriver_sd.unwrap_or(0))
-            .retrace_limit();
+        let retrace_limit = self.warm_state_for_driver(compiling_jd).retrace_limit();
         // compile.py compile_trace → CompileData.optimize_trace:
         // log_trace(MARK_TRACE) and logger_noopt before optimize_bridge.
         crate::rjitlog::write_trace(
@@ -16186,12 +16151,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut retraced_count = retraced_count;
         let bridge_optimize_result = {
             // `unroll.py for target_token in jitcelltoken.target_tokens`
-            let scan_target_tokens = self
-                .compiled_entry(green_key)
-                .unwrap()
-                .live_token()
-                .map(|live| crate::history::target_tokens_of(&live))
-                .unwrap_or_default();
+            let scan_target_tokens = crate::history::target_tokens_of(&tok);
             optimizer.optimize_bridge(
                 bridge_ops,
                 &mut constants,
@@ -16236,13 +16196,8 @@ impl<M: Clone> MetaInterp<M> {
         // RPython-orthodox: unroll.py replay uses Const args directly;
         // no cross-trace constant pool merge step.
         if retrace_requested {
-            if let Some(tok) = self
-                .compiled_entry(green_key)
-                .and_then(|compiled| compiled.live_token())
-            {
-                // unroll.py already incremented the count inside optimize_bridge.
-                tok.set_retraced_count(retraced_count);
-            }
+            // unroll.py already incremented the count inside optimize_bridge.
+            tok.set_retraced_count(retraced_count);
             crate::mc_diag_bump(37); // compile_entry_bridge: optimizer asked for a retrace
             if let Some(es) = optimizer.exported_loop_state.take() {
                 let renamed_inputargs: Vec<InputArgRc> = es
@@ -16486,12 +16441,10 @@ impl<M: Clone> MetaInterp<M> {
                 // `compile_loop`. The count read at the top of this function is
                 // the one `unroll.py optimize_bridge` charges, and it stays on the
                 // token it was read from.
-                let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
                 self.insert_compiled_loop_on_driver(
                     compiling_jd,
                     original_green_key,
                     CompiledEntry {
-                        token: Arc::downgrade(&token),
                         meta: Arc::new(meta),
                         root_trace_id: trace_id,
                         loop_header_pc: carried_loop_header_pc,
@@ -16717,19 +16670,17 @@ impl<M: Clone> MetaInterp<M> {
         // new target_token specializations when existing body token doesn't
         // match. Without this, bridges fall back to preamble (causing
         // infinite guard failure loops on preamble guards).
-        let retrace_limit = self
-            .warm_state_for_driver(self.active_jitdriver_sd.unwrap_or(0))
-            .retrace_limit();
+        let compiling_jd = self.active_jitdriver_sd.unwrap_or(0);
+        let retrace_limit = self.warm_state_for_driver(compiling_jd).retrace_limit();
         // bridgeopt.py deserialize_optimizer_knowledge:
         // Retrieve guard's rd_numb + frontend_boxes for deserialization.
         use crate::optimizeopt::optimizer::PendingBridgeRd;
-        // `unroll.py:213-215 if cell_token.retraced_count < limit:
+        // `unroll.py optimize_bridge if cell_token.retraced_count < limit:
         // cell_token.retraced_count += 1` — the retrace budget is charged to
         // the jitcell being entered, so a cross-loop close reads (and below,
         // bumps) the target's counter rather than the origin's.
         let mut retraced_count = self
-            .compiled_entry(cell_token_key)
-            .and_then(|compiled| compiled.live_token())
+            .get_procedure_token_on_driver(compiling_jd, cell_token_key)
             .map_or(0, |tok| tok.get_retraced_count());
         let (loop_num_inputs, parent_next_global_opref, pending_bridge_rd): (
             usize,
@@ -16822,12 +16773,10 @@ impl<M: Clone> MetaInterp<M> {
                     cpu: self.cpu.clone(),
                 }
             });
-            let Some(tok) = compiled.live_token() else {
-                self.jitlog_trace_aborted();
-                return false;
-            };
             (
-                tok.inputarg_types().len(),
+                // Parent inputarg_types belong to the failing guard's loop
+                // (`rd_loop_token` / `descr_owning_jct`).
+                source_jct.inputarg_types().len(),
                 compiled.next_global_opref,
                 pending,
             )
@@ -17000,8 +16949,7 @@ impl<M: Clone> MetaInterp<M> {
         // `unroll.py for target_token in jitcelltoken.target_tokens` scans
         // the tokens of the loop the JUMP enters.
         let scan_target_tokens = self
-            .compiled_entry(cell_token_key)
-            .and_then(|compiled| compiled.live_token())
+            .get_procedure_token_on_driver(compiling_jd, cell_token_key)
             .map(|live| crate::history::target_tokens_of(&live))
             .unwrap_or_default();
         if crate::majit_log_enabled() {
@@ -17110,10 +17058,7 @@ impl<M: Clone> MetaInterp<M> {
             // Save partial trace + exported state so the next loop-header's
             // compile_loop → compile_retrace can produce a new specialization.
             // unroll.py increment already ran inside optimize_bridge.
-            if let Some(tok) = self
-                .compiled_entry(cell_token_key)
-                .and_then(|compiled| compiled.live_token())
-            {
+            if let Some(tok) = self.get_procedure_token_on_driver(compiling_jd, cell_token_key) {
                 tok.set_retraced_count(retraced_count);
             }
             let exported = optimizer.exported_loop_state.take();
@@ -25465,7 +25410,6 @@ mod metainterp_static_data_tests {
             idx1,
             key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -27898,7 +27842,6 @@ mod metainterp_static_data_tests {
             idx1,
             key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -27960,7 +27903,6 @@ mod metainterp_static_data_tests {
         meta.insert_compiled_loop(
             key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -28015,7 +27957,6 @@ mod metainterp_static_data_tests {
             idx1,
             key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -28080,7 +28021,6 @@ mod metainterp_static_data_tests {
             idx1,
             key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -28196,7 +28136,6 @@ mod metainterp_static_data_tests {
             idx1,
             key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -30590,7 +30529,6 @@ mod metainterp_static_data_tests {
             idx,
             portal_cell_key,
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -30675,7 +30613,6 @@ mod metainterp_static_data_tests {
             idx,
             portal_cell_key,
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -32263,7 +32200,6 @@ mod tests {
         meta.insert_compiled_loop(
             7,
             CompiledEntry {
-                token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces,
@@ -32329,7 +32265,6 @@ mod tests {
         meta.insert_compiled_loop(
             8,
             CompiledEntry {
-                token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -32376,7 +32311,6 @@ mod tests {
         meta.insert_compiled_loop(
             8,
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&jumper),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -32425,7 +32359,6 @@ mod tests {
         meta.insert_compiled_loop(
             8,
             CompiledEntry {
-                token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -32531,7 +32464,6 @@ mod tests {
         meta.insert_compiled_loop(
             7,
             CompiledEntry {
-                token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces,
@@ -32962,7 +32894,6 @@ mod tests {
         meta.insert_compiled_loop(
             green_key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
@@ -33111,7 +33042,6 @@ mod tests {
         meta.insert_compiled_loop(
             green_key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
@@ -33157,7 +33087,7 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let (trace_id, fail_index, descr, old_token) = {
+        let (trace_id, fail_index, descr) = {
             let entry = meta
                 .compiled_entry(green_key.get_uhash())
                 .expect("compiled entry");
@@ -33169,9 +33099,11 @@ mod tests {
                 .get(&fail_index)
                 .and_then(|layout| layout.descr.clone())
                 .expect("fail descr");
-            let old_token = entry.live_token().expect("live token");
-            (trace_id, fail_index, descr, old_token)
+            (trace_id, fail_index, descr)
         };
+        let old_token = meta
+            .get_procedure_token(green_key.get_uhash())
+            .expect("live token");
 
         let mut writer = crate::resumecode::Writer::new(4);
         writer.append_int(0); // items_resume_section (patched below)
@@ -33188,16 +33120,16 @@ mod tests {
         fd.set_rd_pendingfields(Some(vec![]));
 
         let _fresh_token_keepalive = {
-            let map_key = (meta.active_jitdriver_sd.unwrap_or(0), green_key.get_uhash());
-            let entry = meta
-                .compiled_loops
-                .get_mut(&map_key)
-                .expect("compiled entry");
+            let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
             let mut fresh_token = JitCellToken::new(9003);
             fresh_token.green_key = std::cell::Cell::new(green_key.get_uhash());
             let fresh_arc = std::sync::Arc::new(fresh_token);
-            let _old_weak =
-                std::mem::replace(&mut entry.token, std::sync::Arc::downgrade(&fresh_arc));
+            meta.warm_state_for_driver(compiling_jd)
+                .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&fresh_arc));
+            let entry = meta
+                .compiled_loops
+                .get_mut(&(compiling_jd, green_key.get_uhash()))
+                .expect("compiled entry");
             entry
                 .traces
                 .get_mut(&trace_id)
@@ -33382,7 +33314,6 @@ mod tests {
             compiling_jd,
             hash,
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token_arc),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: trace_id,
                 traces,
@@ -33440,7 +33371,7 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let (trace_id, fail_index, descr, old_token, source_op_index) = {
+        let (trace_id, fail_index, descr, source_op_index) = {
             let entry = meta
                 .compiled_entry(green_key.get_uhash())
                 .expect("compiled entry");
@@ -33452,15 +33383,11 @@ mod tests {
                 .get(&fail_index)
                 .expect("stored exit layout");
             let descr = layout.descr.clone().expect("fail descr");
-            let old_token = entry.live_token().expect("live token");
-            (
-                trace_id,
-                fail_index,
-                descr,
-                old_token,
-                layout.source_op_index,
-            )
+            (trace_id, fail_index, descr, layout.source_op_index)
         };
+        let old_token = meta
+            .get_procedure_token(green_key.get_uhash())
+            .expect("live token");
         let fd = descr.as_fail_descr().expect("resume guard");
         fd.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
         if let Some(idx) = source_op_index {
@@ -33469,14 +33396,15 @@ mod tests {
         let expected = crate::compile::exit_layout_for_descr(&descr);
 
         let _fresh_token_keepalive = {
-            let entry = meta
-                .compiled_entry_mut(green_key.get_uhash())
-                .expect("compiled entry");
+            let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
             let mut fresh_token = JitCellToken::new(9002);
             fresh_token.green_key = std::cell::Cell::new(green_key.get_uhash());
             let fresh_arc = std::sync::Arc::new(fresh_token);
-            let _old_weak =
-                std::mem::replace(&mut entry.token, std::sync::Arc::downgrade(&fresh_arc));
+            meta.warm_state_for_driver(compiling_jd)
+                .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&fresh_arc));
+            let entry = meta
+                .compiled_entry_mut(green_key.get_uhash())
+                .expect("compiled entry");
             entry
                 .traces
                 .get_mut(&trace_id)
@@ -33556,7 +33484,7 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let (trace_id, fail_index, descr_arc, _source_token) = {
+        let (trace_id, fail_index, descr_arc) = {
             let entry = meta
                 .compiled_entry(green_key.get_uhash())
                 .expect("compiled entry");
@@ -33568,13 +33496,16 @@ mod tests {
                 .get(&fail_index)
                 .and_then(|layout| layout.descr.clone())
                 .expect("test fixture guard should carry a ResumeGuardDescr");
-            let source_token = entry.token.upgrade().expect("live source token");
-            descr_arc
-                .as_fail_descr()
-                .unwrap()
-                .set_rd_loop_token_clt(source_token.compiled_loop_token_expect());
-            (trace_id, fail_index, descr_arc, source_token)
+            (trace_id, fail_index, descr_arc)
         };
+        let source_token = meta
+            .get_procedure_token(green_key.get_uhash())
+            .expect("live source token");
+        descr_arc
+            .as_fail_descr()
+            .unwrap()
+            .set_rd_loop_token_clt(source_token.compiled_loop_token_expect());
+        let _keep_source = source_token;
         assert!(meta.take_compiled_loop(green_key.get_uhash()).is_some());
         assert!(meta.get_compiled_meta(green_key.get_uhash()).is_none());
         assert!(majit_backend::descr_owning_jct(descr_arc.as_fail_descr().unwrap()).is_some());
@@ -34315,7 +34246,6 @@ mod tests {
         meta.insert_compiled_loop(
             green_key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 0,
                 traces: crate::FxIndexMap::default(),
@@ -34874,10 +34804,9 @@ mod tests {
     ///
     /// The state under test is the one `compile_loop` actually reaches: past
     /// the `has_compiled_targets` give-up, which needs `target_tokens`
-    /// empty, while the entry's own `Weak` still upgrades. The seeded token
-    /// carries the `unroll.py disable_retracing_if_max_retrace_guards`
-    /// sentinel, which is the value whose transfer costs the replacement loop
-    /// every later retrace.
+    /// empty. The seeded token carries the
+    /// `unroll.py disable_retracing_if_max_retrace_guards` sentinel, which is
+    /// the value whose transfer costs the replacement loop every later retrace.
     #[test]
     fn a_replacement_loop_does_not_inherit_the_retrace_count() {
         let mut meta = MetaInterp::<()>::new(1);
@@ -34897,14 +34826,13 @@ mod tests {
             ctx.set_fail_args(g, &[sum]);
         }
 
-        // Held for the whole test so the entry's `Weak` upgrades; an entry
-        // whose token is already gone reads as absent and proves nothing.
+        // Held for the whole test so ptr_eq against the replacement token is
+        // meaningful; an already-dropped token proves nothing.
         let stale = std::sync::Arc::new(JitCellToken::new(3));
         stale.set_retraced_count(u32::MAX);
         meta.insert_compiled_loop(
             green_key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 101,
                 traces: crate::FxIndexMap::default(),
@@ -34920,8 +34848,7 @@ mod tests {
         meta.compile_loop(&[OpRef::input_arg_int(0)], ());
 
         let fresh = meta
-            .compiled_entry(green_key.get_uhash())
-            .and_then(|c| c.live_token())
+            .get_procedure_token(green_key.get_uhash())
             .expect("the compile installed a live token");
         assert_eq!(
             fresh.get_retraced_count(),
@@ -35031,7 +34958,6 @@ mod tests {
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&old_token),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
@@ -35099,7 +35025,6 @@ mod tests {
         meta.insert_compiled_loop(
             green_key.get_uhash(),
             CompiledEntry {
-                token: std::sync::Arc::downgrade(&stale),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 102,
                 traces: crate::FxIndexMap::default(),
@@ -35111,8 +35036,7 @@ mod tests {
         let _ = meta.finish_and_compile(&[OpRef::input_arg_int(0)], vec![Type::Int], (), false);
 
         let fresh = meta
-            .compiled_entry(green_key.get_uhash())
-            .and_then(|c| c.live_token())
+            .get_procedure_token(green_key.get_uhash())
             .expect("the compile installed a live token");
         assert!(
             !std::sync::Arc::ptr_eq(&fresh, &stale),
@@ -35157,8 +35081,7 @@ mod tests {
         // entry bridge replaces still owns its labels when
         // `ResumeFromInterpDescr.compile_and_attach` mints the fresh token.
         let stale = meta
-            .compiled_entry(green_key.get_uhash())
-            .and_then(|entry| entry.live_token())
+            .get_procedure_token(green_key.get_uhash())
             .expect("the target loop installed a live token");
         let jump_descr = crate::history::target_tokens_of(&stale)
             .into_iter()
@@ -35204,8 +35127,7 @@ mod tests {
         ));
 
         let fresh = meta
-            .compiled_entry(original_green_key.get_uhash())
-            .and_then(|entry| entry.live_token())
+            .get_procedure_token(original_green_key.get_uhash())
             .expect("the entry bridge installed a live token");
         assert!(
             !std::sync::Arc::ptr_eq(&fresh, &stale),
@@ -35275,8 +35197,7 @@ mod tests {
             let CompileOutcome::Compiled { green_key: key, .. } = outcome else {
                 panic!("compile_loop must produce a loop, got {outcome:?}");
             };
-            meta.compiled_entry(key)
-                .and_then(|entry| entry.live_token())
+            meta.get_procedure_token(key)
                 .expect("compiled loop has a live token")
                 .number()
         }
@@ -36898,7 +36819,6 @@ mod bridge_cell_token_tests {
         meta.insert_compiled_loop(
             green_key,
             CompiledEntry {
-                token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
                 root_trace_id: green_key,
                 traces: crate::FxIndexMap::default(),
@@ -36949,7 +36869,6 @@ mod loop_side_table_tests {
 
     fn compiled_entry(root_trace_id: u64) -> CompiledEntry<()> {
         CompiledEntry {
-            token: std::sync::Weak::new(),
             meta: std::sync::Arc::new(()),
             root_trace_id,
             traces: crate::FxIndexMap::default(),
@@ -37236,18 +37155,20 @@ mod loop_side_table_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(41);
 
-        let mut token = majit_backend::JitCellToken::new(41);
-        token.outermost_jitdriver_index = Some(jd1);
+        let token = make_jitcell_token(Some(jd1));
+        token.set_compiled(Box::new(()));
         token.green_key.set(green_key.get_uhash());
-        let token = std::sync::Arc::new(token);
 
         meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        let mut jd1_entry = compiled_entry(2);
-        jd1_entry.token = std::sync::Arc::downgrade(&token);
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), jd1_entry);
+        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
         meta.warm_state_for_driver(jd1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = meta
+            .warm_state_for_driver(jd1)
+            .ensure_cell_for_key(&green_key);
+        meta.warm_state_for_driver(jd1)
+            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&token));
         meta.warm_state_for_driver(jd1)
             .memory_manager
             .set_max_age(1, 1);
@@ -37312,19 +37233,21 @@ mod loop_side_table_tests {
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(41);
 
-        let mut token = majit_backend::JitCellToken::new(41);
-        token.outermost_jitdriver_index = Some(jd1);
+        let token = make_jitcell_token(Some(jd1));
+        token.set_compiled(Box::new(()));
         token.green_key.set(green_key.get_uhash());
-        let token = std::sync::Arc::new(token);
 
         meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        let mut jd1_entry = compiled_entry(2);
-        jd1_entry.token = std::sync::Arc::downgrade(&token);
-        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), jd1_entry);
+        meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
 
         meta.warm_state_for_driver(jd1)
             .memory_manager
             .keep_loop_alive(&token);
+        let _ = meta
+            .warm_state_for_driver(jd1)
+            .ensure_cell_for_key(&green_key);
+        meta.warm_state_for_driver(jd1)
+            .attach_procedure_to_interp_for_key(&green_key, std::sync::Arc::clone(&token));
         meta.warm_state_for_driver(jd1)
             .memory_manager
             .set_max_age(1, 1);
