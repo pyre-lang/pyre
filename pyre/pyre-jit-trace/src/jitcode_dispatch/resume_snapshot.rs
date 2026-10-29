@@ -335,21 +335,41 @@ fn inline_snapshot_has_complete_parent_chain(n_parents: usize, n_callees: usize)
 /// callee coordinate instead of collapsing to the caller's CALL boundary.
 ///
 /// The multi-frame snapshot below fires only when the paused-caller chain
-/// covers the full inline depth — one parent per active inlined callee.  A
-/// shorter chain falls through to the single-frame collapse, whose resume
-/// re-executes the entire call, so a guard emitted under it re-runs every side
-/// effect the inline region sequenced before it.  A fold that must not be
-/// re-run consults this before emitting its guards.
+/// covers the full inline depth — one parent per active inlined callee.
+/// `capture_resumedata` (`pyjitpl.py` / `resume.py`) snapshots every
+/// `MIFrame` on `framestack`, so an admitted Python inline records its
+/// caller (`perform_call` / `newframe`) and the chain is complete by
+/// construction.  `walk_generator_resume` is the remaining helper-shaped
+/// path: its body is portal-shaped, and pushing that level as a Python
+/// `InlineFrame` either `compile_tmp_callback`s a second loop
+/// (`opimpl_jit_merge_point`'s inlined CALL_ASSEMBLER cut) or walks the
+/// eval-loop `goto`s through to a miscompiled `FOR_ITER` item.  Until that merge
+/// point is `should_unroll_one_iteration` (`interp_jit.py`), this path
+/// keeps the empty-parents collapse.  A shorter chain falls through to
+/// the single-frame collapse, whose resume re-executes the entire call.
 pub(crate) fn walker_inline_guard_resumes_in_callee<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
 ) -> bool {
+    if !ctx.fbw_mode.inline_subwalk {
+        return false;
+    }
     let session = ctx.session.borrow();
     let n_parents = session
         .framestack
         .iter()
         .filter(|frame| !frame.parents.is_empty())
         .count();
-    inline_snapshot_has_complete_parent_chain(n_parents, session.inline_depth())
+    let n_callees = session.inline_depth();
+    let complete = inline_snapshot_has_complete_parent_chain(n_parents, n_callees);
+    debug_assert!(
+        session
+            .last_inline()
+            .is_none_or(|frame| frame.parents.is_empty() || complete),
+        "inlined level has parents but the chain is incomplete \
+         (n_parents={n_parents} n_callees={n_callees}); every admitted \
+         inline records its caller (`pyjitpl.py` `capture_resumedata`)"
+    );
+    complete
 }
 
 /// `capture_resumedata(after_residual_call=True)` (`pyjitpl.py`) reads
@@ -412,6 +432,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // the live walk register banks at that pc. `snapshot_sym.jitcode()` is
     // the eval-loop portal and does not own this offset.
     let full_body_sym = ctx.fbw_mode.snapshot_sym;
+    if let Some((instance, init_result, caller)) = scope.constructor_assembler {
+        return walker_capture_constructor_assembler_guard(
+            ctx,
+            op_pc,
+            instance,
+            init_result,
+            caller,
+            scope.guard_stamp,
+        );
+    }
     if let Some(result) = scope.finished_callee_result {
         return walker_capture_finished_callee_snapshot(ctx, op_pc, result);
     }
@@ -425,10 +455,10 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // #68 multi-frame inline guard: a guard emitted inside an inlined callee
     // sub-walk with paused caller frames on the walk framestack resumes
     // BOTH the callee (at its own pc) and the caller(s) (at the CALL return
-    // point), instead of collapsing to the caller boundary (re-execute).  Only
-    // the forward-branch inline path
-    // populates the chain; straight-line callees keep the empty chain + the
-    // single-frame collapse below.
+    // point), instead of collapsing to the caller boundary (re-execute).
+    // Every admitted Python inline records its caller (`perform_call` /
+    // `newframe`); an empty chain is the collapse fallback for a level that
+    // has no parent snapshot.
     if inline_subwalk {
         let parent_frames = {
             let session = ctx.session.borrow();
@@ -462,7 +492,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 ctx,
                 op_pc,
                 after_residual_call,
-                scope,
+                &scope,
                 parent_frames,
             )? {
                 NumberedHelperGuard::Frames(frames) => {
@@ -3164,7 +3194,7 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    scope: GuardCaptureScope,
+    scope: &GuardCaptureScope,
     mut parent_frames: Vec<InlineParentFrame>,
 ) -> Result<NumberedHelperGuard, DispatchError> {
     parent_frames.push(helper_innermost_resume_frame(
@@ -3264,7 +3294,7 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
-    scope: GuardCaptureScope,
+    scope: &GuardCaptureScope,
 ) -> Result<InlineParentFrame, DispatchError> {
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
@@ -3569,6 +3599,59 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
             ),
     }
     Ok(())
+}
+
+/// Snapshot a constructor `CALL_ASSEMBLER`'s after-call guards through
+/// `descr_call`'s tail (`crate::ctor_continuation`).
+///
+/// `typeobject.py descr_call` stays on `MetaInterp.framestack` during
+/// `get_and_call_args`, so `capture_resumedata` (`pyjitpl.py`) resumes in
+/// that level: `make_result_of_lastop` has written `__init__`'s return,
+/// the None check runs, then `w_newobject` is returned. The walker's
+/// assembler call is recorded after `finishframe` popped `__init__`; these
+/// guards must still name that tail, and the Python caller
+/// `do_recursive_call` records from (`framestack[-1]` after `finishframe`).
+fn walker_capture_constructor_assembler_guard<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    instance: OpRef,
+    init_result: OpRef,
+    caller: Option<InlineParentFrame>,
+    guard_stamp: GuardStampTarget,
+) -> Result<(), DispatchError> {
+    let mut parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    if parent_frames.last().is_some_and(|frame| {
+        crate::ctor_continuation::is_installed_level(frame.jitcode_index as i32)
+    }) {
+        parent_frames.pop();
+    }
+    // `capture_resumedata` walks every `MetaInterp.framestack` entry.
+    // `walker_capture_transparent_helper_snapshot` takes the same
+    // outermost-first chain as the operator tail: enclosing paused
+    // parents, then the immediate caller, then `descr_call`'s tail.
+    // The caller is the rooted `InlineParentFrame` taken before
+    // `InlineFrameGuard` dropped `__init__`; flattening `.parents` alone
+    // omits that current session frame.
+    if let Some(mut caller) = caller {
+        refresh_paused_parent_blackhole(&mut caller);
+        parent_frames.push(caller);
+    }
+    let mut tail = super::ctor_continuation_parent_frame(instance)
+        .ok_or(DispatchError::callee_inline_unsupported(op_pc))?;
+    if let CallResultSlot::At(idx) = tail.result_slot
+        && idx < tail.boxes.len()
+    {
+        tail.boxes[idx] = init_result;
+    }
+    parent_frames.push(tail);
+    walker_capture_transparent_helper_snapshot(ctx, op_pc, parent_frames, guard_stamp)
 }
 
 /// A post-return guard on an inlined operator dunder's result.

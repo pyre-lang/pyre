@@ -1306,6 +1306,9 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         target_pc,
         w_code,
         is_being_profiled,
+        false,
+        None,
+        None,
     ) {
         Ok(Some(recorded)) => {
             record_carrier_leave_portal_frame(ctx);
@@ -2346,11 +2349,14 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // unwinds, as `walk` does for TraceTooLong. Its pc is not a pc in
             // this carrier: rebuilding here drops the intervening frames and
             // resumes this frame with a different opcode's operand stack.
+            // Relatching from this reconstructed parent at `error.stop_pc()`
+            // pairs the nested pc with the parent's seed banks — the CALL
+            // callable dest-written on the inner frame is then an int leftover.
             // `pyjitpl.py handle_guard_failure` converts the whole live stack
             // through `run_blackhole_interp_to_cancel_tracing` without replay.
-            let accepted = if matches!(error, DispatchError::TraceTooLong { .. })
-                && abort_blackhole_latched()
-            {
+            let keep_inner_too_long =
+                matches!(error, DispatchError::TraceTooLong { .. }) && abort_blackhole_latched();
+            let accepted = if keep_inner_too_long {
                 false
             } else {
                 latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361")
@@ -2359,7 +2365,10 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // (`InlineConcreteFrameGuard` is not installed on this walk).
             // `virtualizable.py write_boxes` publishes that region before the
             // blackhole reads the live frame. The image stays latched either way.
-            if accepted {
+            // Skip the write when we kept the inner too-long image: this
+            // reconstructed parent's seed locals are the same mismatch the
+            // relatch would have published.
+            if accepted && !keep_inner_too_long {
                 let _ = flush_callee_locals_region(
                     &sub_wc.frame_state,
                     concrete_callee_frame as *mut pyre_interpreter::PyFrame,

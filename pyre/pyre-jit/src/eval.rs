@@ -20,6 +20,7 @@ use pyre_interpreter::{locals_w, locals_w_mut};
 use pyre_object::gc_roots;
 use std::cell::{Cell, RefCell, UnsafeCell};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use majit_backend::Backend;
@@ -7540,9 +7541,16 @@ pub fn residual_call(
 #[majit_macros::dont_look_inside]
 pub fn releaseall(_space: pyre_object::PyObjectRef) {
     let _ = _space;
-    let (driver, _) = driver_pair();
-    // memmgr.py release_all_loops parity.
-    driver.mark_all_loops_for_release();
+    release_all_loops_via_driver();
+}
+
+/// interp_jit.py `releaseall` → jit_hooks.stats_memmgr_release_all →
+/// memmgr.py `release_all_loops`. A call before the driver exists is a
+/// no-op (`existing_driver_pair`).
+fn release_all_loops_via_driver() {
+    if let Some((driver, _)) = existing_driver_pair() {
+        driver.mark_all_loops_for_release();
+    }
 }
 
 fn init_callbacks() {
@@ -7735,9 +7743,8 @@ fn set_jit_param_enable_opts_via_warmstate(value: &str) {
 /// sites, closing and compiling the drain loop. This remains opt-in with
 /// `PYRE_JD1=1`. `maybe_compile_and_run` skips only the cell that carries
 /// `JC_TRACING` for those greens (`warmstate.py`), so a jd1 session does
-/// not suppress jd0 compiled-loop entry. Starting a second MetaInterp
-/// while one session occupies `tracing` is still refused — pyre has one
-/// MetaInterp object. It also follows the
+/// not suppress jd0 compiled-loop entry. A nested attempt parks the outer
+/// MetaInterp fields (`warmstate.py` `bound_reached`). It also follows the
 /// master JIT off-switches (`PYRE_NO_JIT`, `PYRE_JIT=0`) so "no JIT" means no
 /// jd1.
 ///
@@ -7905,8 +7912,6 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
     let per_frame = pyre_jit_trace::state::per_frame_vables_from_framestack(&meta.framestack);
     let ec =
         pyre_interpreter::call::getexecutioncontext() as *mut pyre_interpreter::PyExecutionContext;
-    let saved_root =
-        majit_gc::shadow_stack::push(majit_ir::GcRef(unsafe { (*ec).topframeref } as usize));
     let set_topframeref = |frame_ptr: i64| {
         if frame_ptr != 0 {
             unsafe {
@@ -7924,8 +7929,9 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
             })
             .collect::<Vec<_>>(),
     );
-    let finish_level = |frame_ptr: i64| {
-        pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
+    let portal_frame = per_frame.first().map(|&(p, _)| p).unwrap_or(0);
+    let finish_level = |frame_ptr: i64, exit: majit_metainterp::blackhole::LevelExit| {
+        crate::call_jit::finish_blackhole_level(frame_ptr, portal_frame, ec, exit);
         if frame_ptr != 0 {
             level_recursion.borrow_mut().pop();
         }
@@ -7935,12 +7941,13 @@ pub(crate) fn run_blackhole_interp_to_cancel_tracing(
         &mut builder,
         Some(per_frame.as_slice()),
         Some(&set_topframeref as &dyn Fn(i64)),
-        Some(&finish_level as &dyn Fn(i64)),
+        Some(&finish_level as &dyn Fn(i64, majit_metainterp::blackhole::LevelExit)),
     );
-    unsafe {
-        (*ec).topframeref = majit_gc::shadow_stack::get(saved_root).0 as *mut PyFrame;
-    }
-    majit_gc::shadow_stack::pop_to(saved_root);
+    // `executioncontext.py leave` already stored `frame.f_backref`.
+    // `topframeref` is a GC-traced EC field; re-read the live chain.
+    // `pyjitpl.py run_blackhole_interp_to_cancel_tracing` keeps no
+    // pre-drive local.
+    crate::call_jit::reload_live_topframeref_after_blackhole_drive(ec);
     outcome
 }
 
@@ -7958,11 +7965,16 @@ fn drive_portal_metatrace(
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
-    // `is_tracing` misses the recorder `with_trace_ctx_and_framestack` parked
-    // in `compile_tracing`. `compile_and_run_once` is not re-entrant.
-    if driver.meta_interp_mut().trace_attempt_in_progress() {
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A live session on another key or driver may still
+    // `bound_reached` a nested MetaInterp.
+    if driver.cell_is_tracing(green_key) {
         return None;
     }
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
+    let mut driver = NestedTraceGuard::enter(driver);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical =
         pyre_jit_trace::jitcode_runtime::portal_jitcode().expect("jd0 portal jitcode must resolve");
@@ -7996,10 +8008,12 @@ fn drive_portal_metatrace(
     publish_kind0_descrs_before_trace();
     install_build_time_liveness_before_trace(driver.meta_interp_mut());
     driver.force_start_tracing(green_key, None, loop_header_pc, &mut jit_state, env);
-    let meta = driver.meta_interp_mut();
-    if !meta.is_tracing() {
+    if !driver.is_tracing() {
         return None;
     }
+    let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
+    let meta = driver.meta_interp_mut();
     let args = {
         let ctx = meta.trace_ctx().unwrap();
         [
@@ -8155,9 +8169,9 @@ fn unpack_merge_point_jit(
     // `bhimpl_jit_merge_point` (ContinueRunningNormally / recursive portal
     // runner) and never this hook. A residual that reaches the interpreted
     // portal goes through `ll_portal_runner` / this insert, which may start
-    // a trace — the same as PyPy. Same-green reentry is `JC_TRACING` /
-    // `meta.is_tracing()` inside `drive_unpack_iterable_trace`, not a
-    // blackhole-running flag (none exists upstream).
+    // a trace — the same as PyPy. Same-green reentry is `JC_TRACING`
+    // inside `drive_unpack_iterable_trace`, not a blackhole-running flag
+    // (none exists upstream).
     if greenkey.is_null() || w_iterator.is_null() || items.is_null() {
         return;
     }
@@ -8226,15 +8240,7 @@ fn genentry_merge_point_jit(
     if w_gen.is_null() || pycode.is_null() {
         return None;
     }
-    let tracing = {
-        let (driver, _) = driver_pair();
-        // Parked recorder (`compile_tracing`) still belongs to the caller.
-        // `compile_and_run_once` / `force_start_tracing` must not re-enter.
-        driver.meta_interp().trace_attempt_in_progress()
-    };
-    if tracing {
-        return None;
-    }
+
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
         pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
     ) else {
@@ -8249,6 +8255,16 @@ fn genentry_merge_point_jit(
     // `BaseJitCell.jitdriver_sd`). The red frame's `last_instr`
     // distinguishes yields.
     let green_key = genentry_resolved_cell_key(pycode);
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A live session on another key or driver may still
+    // `bound_reached` a nested MetaInterp.
+    {
+        let (driver, _) = driver_pair();
+        let jd_no = pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX;
+        if driver.cell_is_tracing_on_driver(jd_no, green_key) {
+            return None;
+        }
+    }
     // warmstate.py `maybe_compile_and_run(increment_threshold, *args)` on
     // `generatorentry_driver`'s `jitdriver_sd.warmstate`: a compiled cell
     // is `EnterJitAssembler` on every call, a `JC_TEMPORARY` cell keeps
@@ -8297,10 +8313,11 @@ fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
 }
 
 /// Enter the `generatorentry` portal. The registered main jitcode is
-/// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. A session that is already
-/// tracing is the caller's; this returns without nesting. The machine
-/// walk from `jit_merge_point` runs `generator_send_ex_body` through the
-/// generator frame to the yield, which finishes with the yielded value.
+/// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. `JC_TRACING` on
+/// this cell returns without nesting; a live session on another key parks
+/// via [`NestedTraceGuard`] and may `bound_reached`. The machine walk from
+/// `jit_merge_point` runs `generator_send_ex_body` through the generator
+/// frame to the yield, which finishes with the yielded value.
 ///
 /// `send_ex` has no back edge. `CloseLoop` is kept so a merge-point
 /// `goto` still compiles. `RunCompiled` enters the assembler here
@@ -8340,25 +8357,32 @@ fn drive_generatorentry_trace(
         pyre_jit_trace::state::install_build_time_jitcode_at(index, payload);
     }
 
-    let tracing = {
-        let (driver, _) = driver_pair();
-        driver.meta_interp().trace_attempt_in_progress()
-    };
-    if tracing {
+    let (driver, _) = driver_pair();
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A sibling jitdriver may `bound_reached` a nested
+    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
+    // `force_start_tracing` elects (`descriptor.index`).
+    let jd_no = jitcode
+        .jitdriver_sd()
+        .unwrap_or(pyre_jit_trace::genentry_state::GENERATORENTRY_JD_INDEX);
+    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
         if dbg {
-            eprintln!("[jd2] bail: meta.trace_attempt_in_progress()");
+            eprintln!("[jd2] bail: cell JC_TRACING");
         }
         return None;
     }
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
+    let mut driver = NestedTraceGuard::enter(driver);
 
     let live_values = pyre_jit_trace::genentry_state::genentry_live_values(w_gen, w_arg);
     let gk = pyre_jit_trace::genentry_state::genentry_green_key(pycode);
     let action = {
-        let (driver, _) = driver_pair();
         let meta = driver.meta_interp_mut();
         let mut descriptor =
             pyre_jit_trace::genentry_state::GenEntryJitState::generatorentry_driver_descriptor();
-        descriptor.index = jitcode.jitdriver_sd();
+        descriptor.index = Some(jd_no);
         // greenargs are `JitCell(*greenargs)` of `_green_args_spec`
         // (`pycode`); `(0, 0)` is the no-raw-pair sentinel.
         // `force_start_tracing` keeps passing `Some((&gk.values, &gk.types))`
@@ -8382,16 +8406,28 @@ fn drive_generatorentry_trace(
         };
         eprintln!("[jd2] force_start_tracing -> {name}");
     }
+    if matches!(action, BackEdgeAction::StartedTracing) {
+        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+        driver.arm_close_on_drop(starting_tracing_key);
+    } else {
+        // `warmstate.py maybe_compile_and_run` EnterJitAssembler arm: no
+        // nested MetaInterp. Restore now so the compiled enter below sees
+        // the outer attempt. `compile_and_run_once` returns here and Drop
+        // restores; jd2 still has that arm in this function.
+        driver.restore_parked_outer();
+    }
     // `maybe_compile_and_run` raises `EnterJitAssembler` once the cell
     // has a real procedure token. Run that loop and resume its guards
     // before the portal body.
     if matches!(action, BackEdgeAction::RunCompiled) {
+        // NestedTraceGuard still holds the driver; drop it before the
+        // compiled runner re-acquires `driver_pair()`.
+        drop(driver);
         return run_compiled_generatorentry(green_key, &live_values, dbg);
     }
     if !matches!(action, BackEdgeAction::StartedTracing) {
         return None;
     }
-    let (driver, _) = driver_pair();
     let meta = driver.meta_interp_mut();
     // `JitDriver::force_start_tracing` opens the frontend envelope that
     // `compile_finish_from_active_session` drains. `MetaInterp::force_start_tracing`
@@ -8948,15 +8984,23 @@ fn drive_unpack_iterable_trace(
     }
 
     let (driver, _) = driver_pair();
-    let meta = driver.meta_interp_mut();
-    // The shared `MetaInterp` holds exactly one attempt. `is_tracing` misses
-    // the recorder while `with_trace_ctx_and_framestack` parks it.
-    if meta.trace_attempt_in_progress() {
+    // warmstate.py maybe_compile_and_run: `cell.flags & JC_TRACING` skips
+    // this key only. A sibling jitdriver may `bound_reached` a nested
+    // MetaInterp. The cell is `jitdriver_sd.warmstate` for the descriptor
+    // `force_start_tracing` elects (`descriptor.index`).
+    let jd_no = jitcode
+        .jitdriver_sd()
+        .unwrap_or(pyre_jit_trace::unpack_state::UNPACKITERABLE_JD_INDEX);
+    if driver.cell_is_tracing_on_driver(jd_no, green_key) {
         if dbg {
-            eprintln!("[jd1] bail: meta.trace_attempt_in_progress()");
+            eprintln!("[jd1] bail: cell JC_TRACING");
         }
         return;
     }
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
+    let mut driver = NestedTraceGuard::enter(driver);
 
     // Extracted merge-point reds: root_base, items_slot, RootScope cell.
     let live_values = pyre_jit_trace::unpack_state::jd1_live_values_at(portal_root_base);
@@ -8973,7 +9017,7 @@ fn drive_unpack_iterable_trace(
     // than as an error.
     let mut descriptor =
         pyre_jit_trace::unpack_state::UnpackJitState::unpackiterable_driver_descriptor();
-    descriptor.index = jitcode.jitdriver_sd();
+    descriptor.index = Some(jd_no);
 
     // The `(code_ptr, pc)` pair `green_key` was hashed from, not `(0, 0)`: a
     // zero `code_ptr` is the sentinel for "no raw pair available". Passing
@@ -8982,8 +9026,8 @@ fn drive_unpack_iterable_trace(
     // (`warmstate.py bound_reached`). `green_key` is `make_green_key` at
     // `(greenkey_raw, 0)` (above), so the pair reconstructs the identical hash.
     publish_kind0_descrs_before_trace();
-    install_build_time_liveness_before_trace(meta);
-    let action = meta.force_start_tracing(
+    install_build_time_liveness_before_trace(driver.meta_interp_mut());
+    let action = driver.meta_interp_mut().force_start_tracing(
         green_key,
         (greenkey_raw as usize, 0),
         None,
@@ -8999,6 +9043,17 @@ fn drive_unpack_iterable_trace(
         };
         eprintln!("[jd1] force_start_tracing -> {name}");
     }
+    if matches!(action, BackEdgeAction::StartedTracing) {
+        let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+        driver.arm_close_on_drop(starting_tracing_key);
+    } else {
+        // `warmstate.py maybe_compile_and_run` EnterJitAssembler arm: no
+        // nested MetaInterp. Restore now so the compiled enter below sees
+        // the outer attempt. `compile_and_run_once` returns here and Drop
+        // restores; jd1 still has that arm in this function.
+        driver.restore_parked_outer();
+    }
+    let meta = driver.meta_interp_mut();
     // Live-path enter (on by default; see `jd1_enter_enabled`): on RunCompiled,
     // run the compiled drain loop with the shared `(w_iterator, items)` reds so
     // it drains `items` in compiled code (residual `next`/`append` executed on
@@ -10158,12 +10213,10 @@ fn eval_with_jit_inner(
     // bridge trace's symbolic state.
     //
     // Declines before `install_current_frame`, like every decline above it.
-    // Both that helper and `ExecutionContext::enter` link the frame into the
-    // `topframeref`/`f_backref` chain, and `execute_frame_plain` reaches
-    // `enter` through `eval_frame_plain_with_resume`.  Linking twice makes the
-    // second `enter` read the `topframeref` the first one just set to this
-    // same frame, so `f_backref` ends up naming the frame itself and
-    // `walk_pyframe_roots` — which has no cycle guard — never terminates.
+    // A resume-rebuilt frame never reaches this door: guard-failure resume,
+    // CALL_ASSEMBLER force, and the blackhole recursive portal call
+    // `continue_entered_frame` (`blackhole.py` `_resume_mainloop`,
+    // `resume_in_blackhole`, `bhimpl_jit_merge_point`).
     {
         let (drv, _) = driver_pair();
         if drv.is_bridge_tracing() {
@@ -10180,8 +10233,9 @@ fn eval_with_jit_inner(
     //   return portal_ptr(*args)
     //
     // maybe_compile_and_run = try_function_entry_jit: checks for compiled
-    // code (dispatch) or threshold (start tracing). Internally guards on
-    // JC_TRACING (driver.is_tracing()) to avoid re-entry during tracing.
+    // code (dispatch) or threshold (start tracing). Only the cell with
+    // JC_TRACING returns early (`warmstate.py`); a nested attempt parks
+    // the outer MetaInterp.
     //
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
@@ -10203,6 +10257,114 @@ enum PortalLeaveOwner {
     /// portal and records the matching leave after it returns.  This helper
     /// owns only the hook bracket that pyre's higher portal boundary skipped.
     CompiledTrace,
+}
+
+/// Root a pending `PyError` handle across a collecting hook.
+///
+/// `execute_frame` keeps `OperationError` in an RPython local; the GC
+/// transform inserts the root.  `PyError::pin` / `reload` are the Rust
+/// handle protocol and do not exist upstream — residualize them the
+/// `register_external` way so the portal graphs do not getattr `value`
+/// off the interned `PyErrorObject`.
+#[majit_macros::dont_look_inside]
+fn pin_pending_pyerror(
+    result: &mut PyResult,
+    roots: &pyre_object::gc_roots::RootScope,
+) -> Option<usize> {
+    match result {
+        Err(err) => Some(err.pin(roots)),
+        Ok(_) => None,
+    }
+}
+
+#[majit_macros::dont_look_inside]
+fn reload_pending_pyerror(
+    result: &mut PyResult,
+    roots: &pyre_object::gc_roots::RootScope,
+    slot: usize,
+) {
+    if let Err(err) = result {
+        err.reload(roots, slot);
+    }
+}
+
+/// `execute_frame`'s outer `finally`: `leave(self, w_exitvalue, got_exception)`
+/// for [`PortalLeaveOwner::ExecutionContext`].
+///
+/// `leave` may run the profile callback (`executioncontext.py` `leave`);
+/// pin the exit value the way `eval_frame_plain_with_resume` pins the
+/// body's Ok across that hook.
+fn portal_leave_execution_context(
+    frame_root: &mut FrameRoot,
+    ec: *mut PyExecutionContext,
+    w_exitvalue: pyre_object::PyObjectRef,
+    got_exception: bool,
+) -> PyResult {
+    let roots = pyre_object::gc_roots::push_roots();
+    let exit = roots.pin_root(w_exitvalue);
+    unsafe { (*ec).leave(frame_root.frame() as *mut PyFrame, exit, got_exception) }
+}
+
+/// Inner `finally` then outer `finally` of `execute_frame` for a frame whose
+/// enter already ran: `return_trace`, then `ExecutionContext.leave`.
+///
+/// A mid-body resume sits inside the inner `try`, so it still owes both
+/// hooks. Each raising hook replaces the pending result, in that order.
+/// The body error stays a caller local; this graph only sequences the
+/// two hooks (`pyframe.py` `execute_frame`).
+///
+/// `return_trace` can collect and move the exit value. Re-read the rooted
+/// slot after it so the `leave` argument is the forwarded word, matching
+/// `execute_frame`'s `w_exitvalue` local.
+fn portal_return_trace_then_leave(
+    frame_root: &mut FrameRoot,
+    ec: *mut PyExecutionContext,
+    mut w_exitvalue: pyre_object::PyObjectRef,
+    mut got_exception: bool,
+) -> PyResult {
+    // Inner `finally` then outer `finally` of `execute_frame`, inlined so
+    // this graph is one function with two raising hooks — not a tail
+    // `Result` call of one helper from another (`simplify.py` "raising
+    // operation result cannot flow into exception link").
+    let roots = pyre_object::gc_roots::push_roots();
+    let exit_slot = roots.base();
+    let exit = roots.pin_root(w_exitvalue);
+    let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
+    match trace {
+        Err(err) => {
+            got_exception = true;
+            w_exitvalue = roots.get(exit_slot);
+            // `execute_frame` keeps the pending OperationError live across
+            // the outer `finally`; `shadowstack.py` `push_roots` roots it
+            // across `ExecutionContext.leave`.
+            let mut pending = Err(err);
+            let slot = pin_pending_pyerror(&mut pending, &roots);
+            let leave_result = unsafe {
+                (*ec).leave(
+                    frame_root.frame() as *mut PyFrame,
+                    w_exitvalue,
+                    got_exception,
+                )
+            };
+            if let Some(base) = slot {
+                reload_pending_pyerror(&mut pending, &roots, base);
+            }
+            match leave_result {
+                Err(leave_err) => Err(leave_err),
+                Ok(_) => pending,
+            }
+        }
+        Ok(live) => {
+            w_exitvalue = live;
+            unsafe {
+                (*ec).leave(
+                    frame_root.frame() as *mut PyFrame,
+                    w_exitvalue,
+                    got_exception,
+                )
+            }
+        }
+    }
 }
 
 /// `pyframe.py execute_frame`'s hook bracket around [`portal_runner_dispatch`],
@@ -10287,7 +10449,8 @@ fn portal_activation_bracketed(
         None
     };
     let pins = resume_pins.or(local_pins.as_ref());
-    let outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
+    let mut entered_inner = false;
+    let mut outer_result = match unsafe { (*ec).call_trace(frame_root.frame() as *mut PyFrame) } {
         Err(err) => Err(err),
         Ok(()) => {
             pyre_interpreter::reload_resume_args_opt!(pins, &mut resume);
@@ -10299,7 +10462,8 @@ fn portal_activation_bracketed(
             // again finishes the resumption itself and this frame never runs —
             // but it still owes `return_trace` and the leave below, so the
             // value is assigned rather than returned.
-            let result = match resume {
+            entered_inner = true;
+            match resume {
                 Some(resume) => pyre_interpreter::eval::prepare_frame_resume_for_dispatch(
                     frame_root.frame(),
                     resume,
@@ -10309,37 +10473,80 @@ fn portal_activation_bracketed(
                     None => portal_runner_dispatch(frame_root),
                 }),
                 None => portal_runner_dispatch(frame_root),
-            };
-            if let Ok(value) = &result {
-                w_exitvalue = *value;
-            }
-            let mut result = result;
-            // `return_trace` runs application Python while the exit value and
-            // the pending exception are still owed to `leave`.
-            let return_trace_result = {
-                let roots = pyre_object::gc_roots::push_roots();
-                let exit_slot = roots.base();
-                let exit = roots.pin_root(w_exitvalue);
-                let err_slot = match &mut result {
-                    Err(err) => Some(err.pin(&roots)),
-                    Ok(_) => None,
-                };
-                let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, exit) };
-                w_exitvalue = roots.get(exit_slot);
-                if let (Err(err), Some(base)) = (&mut result, err_slot) {
-                    err.reload(&roots, base);
-                }
-                trace
-            };
-            match return_trace_result {
-                Err(err) => Err(err),
-                Ok(live) => {
-                    w_exitvalue = live;
-                    result.map(|_| live)
-                }
             }
         }
     };
+    // `execute_frame` inner `finally` then outer `finally`.  A `call_trace`
+    // that raised never entered the inner `try`, so only `leave` still owes.
+    // [`continue_entered_frame`] shares the entered-inner tail.
+    if matches!(leave_owner, PortalLeaveOwner::ExecutionContext) {
+        if let Ok(value) = &outer_result {
+            w_exitvalue = *value;
+        }
+        let got_exception = outer_result.is_err();
+        let roots = pyre_object::gc_roots::push_roots();
+        let exit_slot = roots.base();
+        w_exitvalue = roots.pin_root(w_exitvalue);
+        if let Ok(value) = &mut outer_result {
+            *value = w_exitvalue;
+        }
+        let err_slot = pin_pending_pyerror(&mut outer_result, &roots);
+        let hook = if entered_inner {
+            portal_return_trace_then_leave(frame_root, ec, w_exitvalue, got_exception)
+        } else {
+            portal_leave_execution_context(frame_root, ec, w_exitvalue, got_exception)
+        };
+        w_exitvalue = roots.get(exit_slot);
+        if let Ok(value) = &mut outer_result {
+            *value = w_exitvalue;
+        }
+        if let Some(base) = err_slot {
+            reload_pending_pyerror(&mut outer_result, &roots, base);
+        }
+        // `execute_frame`: a raising hook replaces the pending result;
+        // otherwise the live exit value is the body's Ok.
+        return match hook {
+            Err(err) => Err(err),
+            Ok(live) => match outer_result {
+                Ok(_) => Ok(live),
+                Err(err) => Err(err),
+            },
+        };
+    }
+    if entered_inner {
+        if let Ok(value) = &outer_result {
+            w_exitvalue = *value;
+        }
+        // `return_trace` runs application Python while the exit value and
+        // the pending exception are still owed to the leave hook.
+        let roots = pyre_object::gc_roots::push_roots();
+        let exit_slot = roots.base();
+        w_exitvalue = roots.pin_root(w_exitvalue);
+        if let Ok(value) = &mut outer_result {
+            *value = w_exitvalue;
+        }
+        let err_slot = pin_pending_pyerror(&mut outer_result, &roots);
+        // `execute_frame`'s inner `finally` is `return_trace(self, w_exitvalue)`.
+        // The callback is application Python, so the exit value rides the
+        // root slot above for its duration and is re-read after.
+        let trace = unsafe { (*ec).return_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) };
+        w_exitvalue = roots.get(exit_slot);
+        if let Ok(value) = &mut outer_result {
+            *value = w_exitvalue;
+        }
+        if let Some(base) = err_slot {
+            reload_pending_pyerror(&mut outer_result, &roots, base);
+        }
+        match trace {
+            Err(err) => outer_result = Err(err),
+            Ok(live) => {
+                w_exitvalue = live;
+                if outer_result.is_ok() {
+                    outer_result = Ok(live);
+                }
+            }
+        }
+    }
     // `setprofile`'s `return` comes from `ExecutionContext.leave`, not from
     // `return_trace`.  A normal portal activation owns that complete finally:
     // topframeref restore, caller escape propagation, force_vref and
@@ -10347,25 +10554,23 @@ fn portal_activation_bracketed(
     // one exception: its trace records enter/leave around CALL_ASSEMBLER, so
     // this helper supplies the otherwise-skipped hook only and must not close
     // the trace-owned chain a second time.
-    let mut outer_result = outer_result;
     let mut leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
+        let exit_slot = roots.base();
+        w_exitvalue = roots.pin_root(w_exitvalue);
+        if let Ok(value) = &mut outer_result {
+            *value = w_exitvalue;
+        }
         let err_slot = match &mut outer_result {
             Err(err) => Some(err.pin(&roots)),
             Ok(_) => None,
         };
-        let left = match leave_owner {
-            PortalLeaveOwner::ExecutionContext => unsafe {
-                (*ec).leave(
-                    frame_root.frame() as *mut PyFrame,
-                    w_exitvalue,
-                    outer_result.is_err(),
-                )
-            },
-            PortalLeaveOwner::CompiledTrace => unsafe {
-                (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue)
-            },
-        };
+        let left =
+            unsafe { (*ec).leaveframe_trace(frame_root.frame() as *mut PyFrame, w_exitvalue) };
+        w_exitvalue = roots.get(exit_slot);
+        if let Ok(value) = &mut outer_result {
+            *value = w_exitvalue;
+        }
         if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
             err.reload(&roots, base);
         }
@@ -10401,7 +10606,7 @@ fn portal_activation_bracketed(
 /// Called from handle_jitexception_in_portal (via portal_runner callback)
 /// when ContinueRunningNormally is raised at a recursive portal level.
 /// Extracts the red_ref values (frame locals as PyObjectRef pointers)
-/// and calls the portal function (eval_with_jit) with those values.
+/// and continues `portal_ptr` = `dispatch` with the pending `leave`.
 ///
 /// Returns Ok((return_type, value)) or Err(JitException) if the portal
 /// itself raises a JitException (warmspot.py loop back).
@@ -10487,7 +10692,10 @@ pub(crate) fn pyre_portal_runner(
     if !ec.is_null() {
         pyre_interpreter::call::set_last_exec_ctx(ec);
     }
-    let result = portal_body_result(frame);
+    // Recursive-portal CRN (`blackhole.py` `_handle_jitexception_in_portal`):
+    // this level's enter already ran; `portal_ptr` is `dispatch` and
+    // `execute_frame`'s `finally: leave` still owes.
+    let result = continue_entered_frame(frame);
     pyre_interpreter::call::set_last_exec_ctx(saved_ctx);
     match result {
         Ok(result) => Ok((BhReturnType::Ref, result as i64)),
@@ -10539,18 +10747,12 @@ fn generatorentry_ll_portal_runner(
     // `ll_portal_runner` calls `maybe_compile_and_run` before `portal_ptr`.
     // `send_ex` only reaches its own merge-point hook when `we_are_jitted`
     // is set, and this runner is a normal call out of `CALL_ASSEMBLER`.
-    // A trace already in progress belongs to the caller.
-    let tracing = {
-        let (driver, _) = driver_pair();
-        // A parked attempt still belongs to the caller (`compile_and_run_once`
-        // is not re-entrant). `is_tracing` is false for that window.
-        driver.meta_interp().trace_attempt_in_progress()
-    };
+    // `maybe_compile_and_run` skips only this cell's `JC_TRACING`.
+
     // The portal's reds and green stay live across `maybe_compile_and_run`,
     // which can trace, compile or run the loop.
-    if !tracing
-        && let Some(result) = pyre_object::with_roots!(pycode, w_gen, w_arg =>
-            genentry_merge_point_jit(w_gen, w_arg, pycode))
+    if let Some(result) = pyre_object::with_roots!(pycode, w_gen, w_arg =>
+        genentry_merge_point_jit(w_gen, w_arg, pycode))
     {
         return result;
     }
@@ -10948,6 +11150,70 @@ pub(crate) fn portal_traced_activation_result(frame: &mut PyFrame) -> PyResult {
     frame_root.frame().fix_array_ptrs();
     let _frame_guard = pyre_interpreter::eval::install_current_frame_tls_only(frame_root.frame());
     portal_activation_bracketed(&mut frame_root, None, None, PortalLeaveOwner::CompiledTrace)
+}
+
+/// `blackhole.py bhimpl_jit_merge_point` recursive-portal arm: `portal_ptr`
+/// after an already-open `execute_frame` enter.
+///
+/// Resume rebuilt the chain from the virtualrefs; `walker_ec_enter` recorded
+/// the enter.  Re-linking here (`install_current_frame`) stores the current
+/// top into this ancestor's `f_backref` and closes a cycle.  Blackhole does
+/// not replay the trace's `leave`, so this door still runs
+/// `ExecutionContext.leave` — `execute_frame`'s `finally` after `portal_ptr`
+/// returns.
+pub(crate) fn portal_blackhole_recursive_result(frame: &mut PyFrame) -> PyResult {
+    continue_entered_frame(frame)
+}
+
+/// Continue a frame whose `execute_frame` enter (and `call_trace`) already ran.
+///
+/// `resume.py` `rebuild_from_resumedata` restores the chain from the
+/// virtualrefs; `blackhole.py` `_resume_mainloop` continues the portal /
+/// callee jitcode from the resume pc. `portal_ptr` is `PyFrame.dispatch`
+/// (`warmspot.py` `handle_jitexception` ContinueRunningNormally arm),
+/// inside the still-open enter/leave. A resumed frame sits in
+/// `execute_frame`'s inner `try`, so on the way out it still owes
+/// `return_trace` (the inner `finally`, including the exceptional path
+/// with `w_exitvalue` still None) and then `leave` (the outer `finally`).
+/// Dispatch from the resume pc through `eval_loop_jit`, then that shared
+/// tail. A JIT-less `eval_loop` would skip `jit_merge_point` and
+/// run `PUSH_EXC_INFO` against an unforced virtualizable stack.
+pub(crate) fn continue_entered_frame(frame: &mut PyFrame) -> PyResult {
+    let mut frame_root = FrameRoot::new(frame);
+    frame_root.frame().fix_array_ptrs();
+    let _frame_guard = pyre_interpreter::eval::install_current_frame_tls_only(frame_root.frame());
+    let ec = pyre_interpreter::call::getexecutioncontext() as *mut PyExecutionContext;
+    let mut body_result = portal_body_result(frame_root.frame());
+    if ec.is_null() {
+        return body_result;
+    }
+    let mut w_exitvalue = match &body_result {
+        Ok(v) => *v,
+        Err(_) => w_none(),
+    };
+    let got_exception = body_result.is_err();
+    let roots = pyre_object::gc_roots::push_roots();
+    let exit_slot = roots.base();
+    w_exitvalue = roots.pin_root(w_exitvalue);
+    if let Ok(value) = &mut body_result {
+        *value = w_exitvalue;
+    }
+    let err_slot = pin_pending_pyerror(&mut body_result, &roots);
+    let hook = portal_return_trace_then_leave(&mut frame_root, ec, w_exitvalue, got_exception);
+    w_exitvalue = roots.get(exit_slot);
+    if let Ok(value) = &mut body_result {
+        *value = w_exitvalue;
+    }
+    if let Some(base) = err_slot {
+        reload_pending_pyerror(&mut body_result, &roots, base);
+    }
+    match hook {
+        Err(err) => Err(err),
+        Ok(live) => match body_result {
+            Ok(_) => Ok(live),
+            Err(err) => Err(err),
+        },
+    }
 }
 
 /// warmspot.py ll_portal_runner:
@@ -11762,12 +12028,6 @@ fn maybe_compile_and_run(
             if !backedge_frame_may_trace(frame, loop_header_pc) {
                 return None;
             }
-            if driver
-                .meta_interp()
-                .is_tracing_key((frame.pycode as usize, loop_header_pc))
-            {
-                return None;
-            }
             bound_reached(frame, green_key, loop_header_pc, driver, info, env)
         }
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
@@ -12037,26 +12297,6 @@ fn handle_fail(
                 true,
             )
         };
-        if matches!(
-            &resolution,
-            crate::call_jit::BridgeResolution::ResumeBlackhole
-        ) {
-            let (driver, _) = driver_pair();
-            if !driver
-                .meta_interp_mut()
-                .last_quasi_immutable_deps
-                .is_empty()
-            {
-                majit_metainterp::mc_diag_bump(77);
-            }
-        }
-        // compile.py record_loop_or_bridge registers dependencies
-        // for every compiled bridge, independent of its next resolution.
-        if let Some((green_key, _, _)) =
-            crate::call_jit::bridge_source_identity_from_descr(descr_arc)
-        {
-            register_quasi_immutable_deps(green_key);
-        }
         match resolution {
             crate::call_jit::BridgeResolution::CompiledContinue => {
                 // compile.py:708: bridge compiled → ContinueRunningNormally.
@@ -12753,6 +12993,107 @@ enum CompileOnceStart {
     FunctionEntry,
 }
 
+/// `warmstate.py` `bound_reached` constructs a fresh `MetaInterp` per
+/// attempt; the outer MetaInterp stays another object on the stack.
+/// pyre reuses one driver, so this guard parks the outer attempt on that
+/// object and restores through the same `&mut JitDriver` the nested
+/// attempt already holds. Python-portal `compile_and_run_once`, jd0
+/// `drive_portal_metatrace`, jd1 `drive_unpack_iterable_trace`, and jd2
+/// `drive_generatorentry_trace` all start their attempt under this guard.
+struct NestedTraceGuard<'a> {
+    driver: &'a mut JitDriver<PyreJitState>,
+    parked: bool,
+    /// `warmstate.py bound_reached` `finally: cell.flags &= ~JC_TRACING`
+    /// plus dropping the throwaway MetaInterp. Armed once this attempt
+    /// has started tracing so every exit (compile, abort, exception,
+    /// unfinished walk) reaches `close_bound_reached_attempt`. The pair
+    /// is the cell captured at entry and that driver's `jitdriver_sd.index`.
+    close_attempt: Option<(u64, usize)>,
+}
+
+/// `warmstate.py bound_reached` builds a fresh `MetaInterp`; pyre reuses
+/// one driver, so a nested attempt parks the outer walk on that object.
+/// The park touches `JitDriver` / `MetaInterp` methods that live in
+/// unextracted `majit-metainterp` (no ClassDef, no CallRegistry graph) —
+/// the `register_external` analog of those foreign bodies.
+#[majit_macros::dont_look_inside]
+pub(crate) fn park_nested_trace_if_tracing(driver: &mut JitDriver<PyreJitState>) -> bool {
+    // `is_tracing()` is only History in the `tracing` slot.
+    // `with_trace_ctx_and_framestack` moves that History into
+    // `compile_tracing` for the walk, and `profiler_tracing_active` is
+    // the `pyjitpl.py compile_and_run_once` / `handle_guard_failure`
+    // `start_tracing` scope. A residual `can_enter_jit` in that window
+    // still `bound_reached`s a nested MetaInterp (`warmstate.py`).
+    if !driver.has_live_metainterp_attempt() {
+        return false;
+    }
+    // The before-residual write is `flush_live_virtualizable_before_residual_call`,
+    // the same moment `pyjitpl.py vable_and_vrefs_before_residual_call` arms
+    // the token. `virtualizable.py force_now` only clears the token. After
+    // the residual, changed fields are reloaded (`vable_after_residual_call`
+    // / `load_fields_from_virtualizable`).
+    pyre_jit_trace::jitcode_dispatch::park_walk_tls();
+    pyre_jit_trace::trace::park_walk_end();
+    driver.park_nested_trace();
+    true
+}
+
+impl<'a> NestedTraceGuard<'a> {
+    fn enter(driver: &'a mut JitDriver<PyreJitState>) -> Self {
+        let parked = park_nested_trace_if_tracing(driver);
+        Self {
+            driver,
+            parked,
+            close_attempt: None,
+        }
+    }
+
+    fn arm_close_on_drop(&mut self, starting_tracing_key: u64) {
+        let jd_no = self
+            .driver
+            .starting_jitdriver_sd()
+            .unwrap_or(self.driver.index().unwrap_or(0));
+        self.close_attempt = Some((starting_tracing_key, jd_no));
+    }
+
+    /// Restore a parked outer attempt without closing this one.
+    /// `compile_and_run_once` returns when tracing did not start and Drop
+    /// restores; jd1 still has `maybe_compile_and_run`'s EnterJitAssembler
+    /// arm in the same function, so it restores before that arm runs.
+    fn restore_parked_outer(&mut self) {
+        if !self.parked {
+            return;
+        }
+        self.driver.restore_nested_trace();
+        pyre_jit_trace::trace::restore_walk_end();
+        pyre_jit_trace::jitcode_dispatch::restore_walk_tls();
+        self.parked = false;
+    }
+}
+
+impl Deref for NestedTraceGuard<'_> {
+    type Target = JitDriver<PyreJitState>;
+    fn deref(&self) -> &Self::Target {
+        self.driver
+    }
+}
+
+impl DerefMut for NestedTraceGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.driver
+    }
+}
+
+impl Drop for NestedTraceGuard<'_> {
+    fn drop(&mut self) {
+        if let Some((key, jd_no)) = self.close_attempt.take() {
+            self.driver
+                .close_bound_reached_attempt_on_driver(jd_no, key);
+        }
+        self.restore_parked_outer();
+    }
+}
+
 /// RPython pyjitpl.py `_compile_and_run_once`.
 ///
 /// This is the single synchronous portal-trace walker for function-entry and
@@ -12769,6 +13110,10 @@ fn compile_and_run_once(
     info: &majit_metainterp::virtualizable::VirtualizableInfo,
     env: &PyreEnv,
 ) -> Option<LoopResult> {
+    // warmstate.py bound_reached: a nested MetaInterp run parks the outer
+    // attempt (history, framestack, heapcache, portal_call_depth, WalkSession
+    // journals, driver sym). Walker sub-walks do not enter here.
+    let mut driver = NestedTraceGuard::enter(driver);
     let mut frame_root = FrameRoot::new(frame);
     let code = unsafe { &*pyre_interpreter::pyframe_get_pycode(frame_root.frame()) };
     majit_metainterp::mc_diag_bump(match start {
@@ -12798,10 +13143,24 @@ fn compile_and_run_once(
     // A body that stopped lowering at an `abort_permanent` carries no entry for
     // the greens behind the abort, so the hot loop header has none.  There is
     // no coordinate to start the walk from; interpret instead.
-    if pjc.merge_entry_for(target_pc).is_none() {
+    //
+    // Function-entry is the live `next_instr` of `interp_jit.py` `dispatch`.
+    // `warmstate.py` `maybe_compile_and_run` (`increment_function_threshold`)
+    // starts `pyjitpl.py` `compile_and_run_once` there, and a resumed
+    // generator enters at that pc (`generator.py` `resume_execute_frame` →
+    // `pyframe.py` `execute_frame`). That pc is neither 0 nor a loop header,
+    // so `merge_entry_by_green` misses. Resolve the same at-or-after `-live-`
+    // the inlined generator resume already uses (`derive_resume_marker`);
+    // bump 21 only when that also fails. Do not publish resume pcs into
+    // `merge_entry_by_green` — the inlined FOR_ITER path must not see them.
+    let entry = match start {
+        CompileOnceStart::BackEdge => pjc.merge_entry_for(target_pc),
+        CompileOnceStart::FunctionEntry => pjc.function_entry_for(target_pc),
+    };
+    let Some(entry) = entry else {
         majit_metainterp::mc_diag_bump(21);
         return None;
-    }
+    };
 
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     publish_kind0_descrs_before_trace();
@@ -12830,12 +13189,14 @@ fn compile_and_run_once(
         if interpret {
             let boxes = portal_original_boxes(meta, frame_root.frame(), target_pc, &portal);
             meta.seed_root_portal_frame(portal, &boxes);
+            meta.seat_root_portal_at(entry);
         } else {
-            meta.rebuild_portal_framestack_from_resume(portal, &[]);
+            meta.rebuild_portal_framestack_from_resume(portal, &[entry as i32]);
         }
     }
 
     let starting_tracing_key = driver.starting_green_key().unwrap_or(green_key);
+    driver.arm_close_on_drop(starting_tracing_key);
     let mut propagated_exception = None;
     // pyjitpl.py `_compile_and_run_once`. Default arm is `trace_bytecode`.
     // `PYRE_PORTAL_INTERPRET=1` walks the seeded portal with `interpret`.
@@ -12961,9 +13322,6 @@ fn compile_and_run_once(
         );
     }
     if tracing_finished {
-        // warmstate.py `finally`: the starting cell owns JC_TRACING
-        // even when a cross-loop cut attaches the token to another key.
-        driver.abort_entry_tracing(starting_tracing_key);
         // compile.py record_loop_or_bridge: register every compiled
         // loop/bridge's quasi_immutable_deps against its token. The
         // `!had_compiled` extra gate dropped deps on a replace compile,
@@ -13093,10 +13451,7 @@ fn bound_reached(
         .set_last_instr_from_next_instr(loop_header_pc);
     let mut jit_state = build_jit_state(frame_root.frame(), info);
     // warmstate.py JC_TRACING
-    if driver
-        .meta_interp()
-        .is_tracing_key((frame_root.frame().pycode as usize, loop_header_pc))
-    {
+    if driver.cell_is_tracing(green_key) {
         return None;
     }
     // `warmstate.py maybe_compile_and_run` reads `procedure_token =
@@ -13104,14 +13459,13 @@ fn bound_reached(
     // object. Read it once here too: the decision below and the run further
     // down used to walk the cell chain separately for the same answer.
     let procedure_token = driver.runnable_procedure_token(green_key);
-    // `maybe_compile_and_run` only skips this cell's `JC_TRACING`. A different
-    // cell reaches here and, upstream, `bound_reached` builds a fresh
-    // `MetaInterp` for `compile_and_run_once` (`profiler.start_tracing`).
-    // This process shares one. `is_tracing` is false while
-    // `with_trace_ctx_and_framestack` parks the recorder, so decline on
-    // `trace_attempt_in_progress` instead of opening a second scope. A
-    // procedure token still runs (`EnterJitAssembler`).
-    if procedure_token.is_none() && !driver.trace_attempt_in_progress() {
+    // `maybe_compile_and_run` only skips this cell's `JC_TRACING`. A
+    // different cell reaches here and, upstream, `bound_reached` builds a
+    // fresh `MetaInterp` for `compile_and_run_once`. This process shares
+    // one; `NestedTraceGuard` parks the outer attempt inside
+    // `compile_and_run_once`. Declining on `trace_attempt_in_progress` here
+    // would block that nested start (`warmstate.py` `bound_reached`).
+    if procedure_token.is_none() {
         return compile_and_run_once(
             frame_root.frame(),
             green_key,
@@ -13311,18 +13665,6 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
-    // `maybe_compile_and_run` tests `cell.flags & JC_TRACING` on the cell the
-    // chain walk found and returns there, BEFORE `cell.get_procedure_token()`.
-    // Asking the door first read the token and its compiled meta for a cell
-    // this then declines anyway, and ticked the counter for a call upstream
-    // never counts.
-    if pair.0.meta_interp().is_tracing_key((
-        frame_root.frame().pycode as usize,
-        frame_root.frame().next_instr(),
-    )) {
-        return None;
-    }
-
     // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
     // token, and only when it is absent ask the counter. A bare
     // `compile_tmp_callback` token (a token, but no `compiled_loops` meta) is
@@ -13504,12 +13846,11 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         );
     }
 
-    // Same shared-MetaInterp decline as `bound_reached`. The `RunCompiled`
-    // arm above already returned, so this only skips `compile_and_run_once`.
-    if driver.trace_attempt_in_progress() {
-        return None;
-    }
-
+    // Nested `compile_and_run_once` parks the outer attempt
+    // (`warmstate.py` `bound_reached` constructs a new MetaInterp). The
+    // `RunCompiled` arm above already returned; do not skip the start on
+    // `trace_attempt_in_progress` here — that flag is still true until
+    // `NestedTraceGuard` parks inside `compile_and_run_once`.
     // warmstate.py:467 jitcounter.tick(hash, increment_threshold). The
     // fast path above already fired the counter for this entry, so go
     // straight to bound_reached without re-ticking.
@@ -16110,10 +16451,10 @@ pub(crate) fn build_jit_state(
     frame: &PyFrame,
     virtualizable_info: &majit_metainterp::virtualizable::VirtualizableInfo,
 ) -> PyreJitState {
-    let mut jit_state = PyreJitState {
-        frame: frame as *const PyFrame as usize,
-        execution_context: pyre_interpreter::call::getexecutioncontext() as usize,
-    };
+    let mut jit_state = PyreJitState::new(
+        frame as *const PyFrame as usize,
+        pyre_interpreter::call::getexecutioncontext() as usize,
+    );
     assert!(
         jit_state.sync_from_virtualizable(virtualizable_info),
         "build_jit_state: frame must be a valid PyFrame with readable fields"
@@ -16883,6 +17224,241 @@ mod tests {
         );
         assert_eq!(blackhole.op_rvmprof_code, staticdata.op_rvmprof_code as u8);
         builder.release_interp(blackhole);
+    }
+
+    /// Nested jd0/jd1/jd2 doors park via `NestedTraceGuard` the same way
+    /// `compile_and_run_once` does (`warmstate.py bound_reached` builds a
+    /// fresh MetaInterp). A sibling start must restore the outer attempt.
+    #[test]
+    fn nested_trace_guard_restores_outer_after_sibling_door_start() {
+        use majit_metainterp::BackEdgeAction;
+
+        // Tests run in parallel so bootstrap the GIL here.
+        init_gc_subsystem();
+        let outer_key = pyre_jit_trace::driver::make_green_key_typed(
+            0x4E53_5447_0000_0001 as *const (),
+            0,
+            false,
+        );
+        let inner_key = pyre_jit_trace::driver::make_green_key_typed(
+            0x4E53_5447_0000_0002 as *const (),
+            0,
+            false,
+        );
+        let outer = outer_key.get_uhash();
+        let inner = inner_key.get_uhash();
+
+        struct CloseKeys {
+            outer: u64,
+            inner: u64,
+        }
+        impl Drop for CloseKeys {
+            fn drop(&mut self) {
+                let (driver, _) = driver_pair();
+                if let Some(k) = driver.starting_green_key() {
+                    driver.close_bound_reached_attempt(k);
+                }
+                driver.close_bound_reached_attempt(self.outer);
+                driver.close_bound_reached_attempt(self.inner);
+            }
+        }
+        let _cleanup = CloseKeys { outer, inner };
+
+        let (driver, _) = driver_pair();
+        if let Some(k) = driver.starting_green_key() {
+            driver.close_bound_reached_attempt(k);
+        }
+        publish_kind0_descrs_before_trace();
+        install_build_time_liveness_before_trace(driver.meta_interp_mut());
+
+        let outer_action = driver.meta_interp_mut().force_start_tracing(
+            outer,
+            (0, 0),
+            Some((&outer_key.values, &outer_key.types)),
+            None,
+            &[],
+        );
+        assert!(
+            matches!(outer_action, BackEdgeAction::StartedTracing),
+            "outer door start did not begin tracing"
+        );
+        assert!(driver.is_tracing());
+        assert!(driver.cell_is_tracing(outer));
+        assert!(!driver.cell_is_tracing(inner));
+        driver.meta_interp_mut().last_exc_value = 0xA000;
+        driver.meta_interp_mut().portal_call_depth = 3;
+
+        {
+            let mut driver = NestedTraceGuard::enter(driver);
+            assert!(
+                !driver.is_tracing(),
+                "NestedTraceGuard parks the outer MetaInterp.tracing slot"
+            );
+            assert!(
+                driver.cell_is_tracing(outer),
+                "park keeps the outer cell JC_TRACING"
+            );
+            let inner_action = driver.meta_interp_mut().force_start_tracing(
+                inner,
+                (0, 0),
+                Some((&inner_key.values, &inner_key.types)),
+                None,
+                &[],
+            );
+            assert!(
+                matches!(inner_action, BackEdgeAction::StartedTracing),
+                "nested door start did not begin tracing"
+            );
+            assert!(driver.is_tracing());
+            assert!(driver.cell_is_tracing(inner));
+            driver.meta_interp_mut().last_exc_value = 0xDEAD;
+            driver.meta_interp_mut().portal_call_depth = 9;
+            let starting = driver.starting_green_key().unwrap_or(inner);
+            driver.arm_close_on_drop(starting);
+        }
+
+        assert!(
+            driver.is_tracing(),
+            "outer trace must be restored after the nested door returns"
+        );
+        assert!(driver.cell_is_tracing(outer));
+        assert!(
+            !driver.cell_is_tracing(inner),
+            "inner close_bound_reached_attempt clears JC_TRACING"
+        );
+        assert_eq!(driver.meta_interp().last_exc_value, 0xA000);
+        assert_eq!(driver.meta_interp().portal_call_depth, 3);
+    }
+
+    /// Residual wrote a new `debugdata` onto the live frame while the outer
+    /// History still holds the pre-residual boxes. Park must not write those
+    /// boxes back: `virtualizable.py force_now` only clears the token, and
+    /// `vable_after_residual_call` reloads `load_fields_from_virtualizable`.
+    #[test]
+    fn nested_park_does_not_overwrite_residual_debugdata() {
+        use majit_ir::{GcRef, Value};
+        use majit_metainterp::BackEdgeAction;
+        use pyre_interpreter::{FrameDebugData, compile_exec, locals_w};
+
+        init_gc_subsystem();
+        let module = compile_exec("def f(a, b):\n    c = a\n    return c\n")
+            .expect("test code should compile");
+        let code = function_code_from_module(&module, "f");
+        let mut frame = PyFrame::new(code);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let array_len = locals_w!(frame).as_slice().len();
+        let nlocals = frame.nlocals();
+        assert!(
+            nlocals > 0 && array_len > nlocals,
+            "the fixture needs locals and stack slots so write_boxes walks the full array"
+        );
+
+        let old_debugdata = Box::into_raw(Box::new(FrameDebugData::default()));
+        let new_debugdata = Box::into_raw(Box::new(FrameDebugData::default()));
+        struct FreeDebugdata {
+            old: *mut FrameDebugData,
+            new: *mut FrameDebugData,
+        }
+        impl Drop for FreeDebugdata {
+            fn drop(&mut self) {
+                unsafe {
+                    drop(Box::from_raw(self.old));
+                    drop(Box::from_raw(self.new));
+                }
+            }
+        }
+        let _free = FreeDebugdata {
+            old: old_debugdata,
+            new: new_debugdata,
+        };
+        frame.debugdata = new_debugdata;
+
+        let outer_key = pyre_jit_trace::driver::make_green_key_typed(
+            0x4E53_4444_0000_0001 as *const (),
+            0,
+            false,
+        );
+        let outer = outer_key.get_uhash();
+        struct CloseKey(u64);
+        impl Drop for CloseKey {
+            fn drop(&mut self) {
+                let (driver, _) = driver_pair();
+                if let Some(k) = driver.starting_green_key() {
+                    driver.close_bound_reached_attempt(k);
+                }
+                driver.close_bound_reached_attempt(self.0);
+            }
+        }
+        let _cleanup = CloseKey(outer);
+
+        let (driver, _) = driver_pair();
+        if let Some(k) = driver.starting_green_key() {
+            driver.close_bound_reached_attempt(k);
+        }
+        publish_kind0_descrs_before_trace();
+        install_build_time_liveness_before_trace(driver.meta_interp_mut());
+
+        let outer_action = driver.meta_interp_mut().force_start_tracing(
+            outer,
+            (0, 0),
+            Some((&outer_key.values, &outer_key.types)),
+            None,
+            &[],
+        );
+        assert!(
+            matches!(outer_action, BackEdgeAction::StartedTracing),
+            "outer door start did not begin tracing"
+        );
+
+        {
+            let ctx = driver
+                .meta_interp_mut()
+                .live_history_mut()
+                .expect("force_start_tracing installs History");
+            let info = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
+            let static_count = info.num_static_extra_boxes;
+            let pycode = frame.pycode as usize;
+            let mut boxes = Vec::with_capacity(static_count + array_len);
+            let mut values = Vec::with_capacity(static_count + array_len);
+            boxes.push(ctx.const_int(frame.last_instr as i64));
+            values.push(Value::Int(frame.last_instr as i64));
+            boxes.push(ctx.const_ref(pycode as i64));
+            values.push(Value::Ref(GcRef(pycode)));
+            boxes.push(ctx.const_int(frame.valuestackdepth as i64));
+            values.push(Value::Int(frame.valuestackdepth as i64));
+            boxes.push(ctx.const_ref(old_debugdata as i64));
+            values.push(Value::Ref(GcRef(old_debugdata as usize)));
+            assert_eq!(boxes.len(), static_count, "PyFrame static field order");
+            for &slot in locals_w!(frame).as_slice() {
+                boxes.push(ctx.const_ref(slot as i64));
+                values.push(Value::Ref(GcRef(slot as usize)));
+            }
+            let vable = ctx.const_ref(frame_ptr as i64);
+            ctx.install_virtualizable_info(info.clone());
+            ctx.init_virtualizable_boxes(
+                &info,
+                vable,
+                Value::Ref(GcRef(frame_ptr)),
+                &boxes,
+                &values,
+                &[array_len],
+            );
+            assert_eq!(
+                ctx.standard_virtualizable_ptr(),
+                Some(frame_ptr),
+                "the live frame is the standard virtualizable identity"
+            );
+        }
+
+        {
+            let _guard = NestedTraceGuard::enter(driver);
+            assert_eq!(
+                frame.debugdata, new_debugdata,
+                "park must not write the recorder's pre-residual debugdata over the live frame"
+            );
+        }
+        frame.debugdata = std::ptr::null_mut();
     }
 
     #[allow(dead_code)]

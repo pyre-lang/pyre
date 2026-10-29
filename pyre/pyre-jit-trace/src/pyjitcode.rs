@@ -119,11 +119,15 @@ pub struct PyJitCodeMetadata {
     /// Trace-entry green py_pc → JitCode byte offset where tracing enters
     /// for that green. This is the restriction of resume-marker resolution to
     /// function entry and loop headers, built at codewrite time, not a general
-    /// py_pc → jitcode inverse. At portal entry `pyjitpl.py:1567-1573` sets
-    /// the live frame PC to the `jit_merge_point` origin before handling the
-    /// loop header; pyre's whole-function JitCode has one corresponding entry
-    /// per materialized trace-entry green. Sorted ascending by green py_pc for
-    /// binary search; empty for skeleton / fixture metadata.
+    /// py_pc → jitcode inverse. A header's entry is the header block head
+    /// (`-live-` / `jit_merge_point`, `interp_jit.py` `dispatch`), never a
+    /// back-edge `loop_header` (`jtransform.py
+    /// handle_jit_marker__loop_header`). At portal entry
+    /// `opimpl_jit_merge_point` (`pyjitpl.py`) sets the live frame PC to the
+    /// `jit_merge_point` origin before handling the loop header; pyre's
+    /// whole-function JitCode has one corresponding entry per materialized
+    /// trace-entry green. Sorted ascending by green py_pc for binary search;
+    /// empty for skeleton / fixture metadata.
     pub merge_entry_by_green: Vec<(u32, u32)>,
     /// Predecessor-keyed jitcode-pc twin of `pcdep_color_slots`.
     /// Each entry `(off, colors)` maps a JitCode byte offset to the pcdep
@@ -523,6 +527,14 @@ pub fn portal_red_pre_regalloc_slots(nlocals: usize, max_stackdepth: usize) -> (
 ///
 /// `None` when the tables are empty or
 /// no at-or-after py emitted a real op.
+pub fn derive_first_op(first_op_by_py_pc: &[usize], py_pc: usize) -> Option<usize> {
+    first_op_by_py_pc
+        .get(py_pc..)?
+        .iter()
+        .copied()
+        .find(|&v| v != usize::MAX)
+}
+
 pub fn derive_resume_marker(
     first_op_by_py_pc: &[usize],
     block_head_py_by_jit_pc: &[(usize, u32)],
@@ -533,11 +545,7 @@ pub fn derive_resume_marker(
     }
     // Real-op offset for `py_pc`, else the first at-or-after py that emitted an
     // op (trivia / next-op forward-carry).
-    let first_val = first_op_by_py_pc
-        .get(py_pc..)?
-        .iter()
-        .copied()
-        .find(|&v| v != usize::MAX)?;
+    let first_val = derive_first_op(first_op_by_py_pc, py_pc)?;
     let search = block_head_py_by_jit_pc.binary_search_by_key(&first_val, |&(off, _)| off);
     let idx = match search {
         Ok(i) => i,
@@ -689,6 +697,75 @@ impl PyJitCode {
             .binary_search_by_key(&(py_pc as u32), |&(py, _)| py)
             .ok()
             .map(|i| table[i].1 as usize)
+    }
+
+    /// JitCode `-live-` offset a walk of this body enters at to resume at
+    /// `py_pc`.
+    ///
+    /// `merge_entry_for` cannot answer a generator resume coordinate:
+    /// `merge_entry_by_green` is `find_loop_header_pcs` plus function entry.
+    /// Widening that table would start inlined FOR_ITER portal traces at the
+    /// yield's `abort_permanent`. The shipped per-Python-PC tables already
+    /// carry what `derive_resume_marker` reads.
+    pub fn resume_marker_offset(&self, py_pc: usize) -> Option<usize> {
+        let metadata = &self.metadata;
+        if metadata.block_head_py_by_jit_pc.is_empty() {
+            return None;
+        }
+        let first_op_by_py_pc = self.first_op_by_py_pc()?;
+        if py_pc >= first_op_by_py_pc.len() {
+            return None;
+        }
+        derive_resume_marker(&first_op_by_py_pc, &metadata.block_head_py_by_jit_pc, py_pc)
+    }
+
+    /// First emitted non-`-live-` JitCode offset at-or-after `py_pc`.
+    ///
+    /// This is the ordinary bytecode entry `pc_first_insn_pos` records
+    /// (`flatten.py` `serialize_op`). A handler's generic `last_exc_value`
+    /// landing uses offset `-1`, so the first insn of that py_pc is the
+    /// bytecode that reads the exception from the frame
+    /// (`PUSH_EXC_INFO` `getarrayitem_vable_r`).
+    pub fn first_op_offset(&self, py_pc: usize) -> Option<usize> {
+        let first_op_by_py_pc = self.first_op_by_py_pc()?;
+        if py_pc >= first_op_by_py_pc.len() {
+            return None;
+        }
+        derive_first_op(&first_op_by_py_pc, py_pc)
+    }
+
+    fn first_op_by_py_pc(&self) -> Option<Vec<usize>> {
+        let metadata = &self.metadata;
+        let n_py = metadata.n_py_instrs as usize;
+        if metadata.py_exact_by_jit_pc.is_empty() || n_py == 0 {
+            return None;
+        }
+        let mut first_op_by_py_pc = vec![usize::MAX; n_py];
+        for &(off, py) in &metadata.py_exact_by_jit_pc {
+            if let Some(slot) = first_op_by_py_pc.get_mut(py as usize) {
+                *slot = (*slot).min(off as usize);
+            }
+        }
+        Some(first_op_by_py_pc)
+    }
+
+    /// Portal FunctionEntry walk start: `merge_entry_by_green`, else the
+    /// first emitted op of that py_pc (trivia-forward when the pc itself
+    /// emitted none).
+    ///
+    /// `warmstate.py` `maybe_compile_and_run` (`increment_function_threshold`)
+    /// starts `pyjitpl.py` `compile_and_run_once` at the live `next_instr`
+    /// (`interp_jit.py` `dispatch`). A resumed generator enters at that pc
+    /// (`generator.py` `resume_execute_frame` → `pyframe.py` `execute_frame`),
+    /// which is neither pc 0 nor a loop header. `execute_frame` runs
+    /// `handle_operation_error` before `dispatch`, so a handler pc already
+    /// has the exception on the valuestack; the walk must start at that
+    /// bytecode's first insn, not the block-head `-live-` that precedes the
+    /// generic `last_exc_value` landing (`flatten.py` `generate_last_exc`
+    /// only appears on an exception link raised inside the same trace).
+    pub fn function_entry_for(&self, py_pc: usize) -> Option<usize> {
+        self.merge_entry_for(py_pc)
+            .or_else(|| self.first_op_offset(py_pc))
     }
 
     /// Predecessor index into a jitcode-pc twin — the entry

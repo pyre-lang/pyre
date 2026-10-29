@@ -2011,6 +2011,40 @@ impl TraceCtx {
             .map(|pair| pair[0].0)
     }
 
+    /// Concrete vref of a live `[virtualbox, vrefbox]` pair for `object_ptr`.
+    ///
+    /// `stop_tracking_virtualref` replaces the vref entry with `CONST_NULL`,
+    /// so a stopped pair does not match.
+    pub fn virtualref_ptr_for_object_ptr(&self, object_ptr: usize) -> Option<usize> {
+        if object_ptr == 0 {
+            return None;
+        }
+        self.virtualref_boxes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .rev()
+            .find(|pair| self.virtualref_entry_ptr(pair[0]) == object_ptr)
+            .map(|pair| self.virtualref_entry_ptr(pair[1]))
+            .filter(|&vref_ptr| vref_ptr != 0)
+    }
+
+    /// `virtualref.py force_virtual` TOKEN_TRACING_RESCALL arm for an inlined
+    /// object. `vrefs_after_residual_call` then `stop_tracking_virtualref`.
+    ///
+    /// The portal virtualizable is `virtualizable_boxes[-1]`; forcing a vref
+    /// of an inlined frame is not `vable_after_residual_call`.
+    pub fn force_virtualref_of_object_during_tracing(&self, object_ptr: usize) {
+        let Some(vref_ptr) = self.virtualref_ptr_for_object_ptr(object_ptr) else {
+            return;
+        };
+        let _ = unsafe {
+            self.metainterp_sd
+                .virtualref_info
+                .force_virtual(vref_ptr as *mut u8, |_| {})
+        };
+    }
+
     /// `pyjitpl.py rebuild_state_after_failure`'s
     /// `self.virtualref_boxes = virtualref_boxes`.  A bridge resumes into its
     /// parent's still-open `virtual_ref` scopes, so the pairs the parent guard

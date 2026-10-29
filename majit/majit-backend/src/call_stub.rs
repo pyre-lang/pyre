@@ -521,7 +521,8 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 
 /// `llmodel.py bh_call_r`. The target returns one pointer word; a missing
 /// value is the null word. Shares `dispatch_word_stub` with `bh_call_i`.
-/// A wasm32 table type that is a real `i32` is host-reflected.
+/// The published target's wasm type is that word. A callee with no single
+/// wasm function type stays on the host hook.
 ///
 /// # Safety
 /// `func` must match `classes` and return one pointer word.

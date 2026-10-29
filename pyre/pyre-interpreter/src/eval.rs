@@ -2649,7 +2649,7 @@ pub(crate) fn eval_frame_plain_with_resume(
         if let Some(value) = prepare_frame_resume_for_dispatch(frame, resume)? {
             return Ok(value);
         }
-        return eval_loop(frame, ec);
+        return eval_loop(frame, ec, /* relink */ true);
     }
     let execution_context = unsafe { &mut *ec };
     // executioncontext.py / threadlocals.py parity: the current
@@ -2699,7 +2699,7 @@ pub(crate) fn eval_frame_plain_with_resume(
                 return Ok(value);
             }
             let frame = unsafe { &mut *frame_anchor.live() };
-            let result = eval_loop(frame, ec)?;
+            let result = eval_loop(frame, ec, /* relink */ true)?;
             Ok(result)
         })();
         let mut w_exitvalue = match &inner_result {
@@ -2778,10 +2778,10 @@ pub(crate) fn eval_frame_plain_with_resume(
 /// Resume interpretation after compiled code guard failure.
 pub fn eval_loop_for_force(frame: &mut PyFrame) -> PyResult {
     let ec = crate::call::getexecutioncontext() as *mut crate::PyExecutionContext;
-    eval_loop(frame, ec)
+    eval_loop(frame, ec, /* relink */ false)
 }
 
-fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResult {
+fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext, relink: bool) -> PyResult {
     // Bump the monotonic frame eval-loop entry odometer: a user Python frame
     // is about to run bytecode.  The FBW FOR_ITER Option-C guard snapshots
     // this around a residual call to detect a body effect that ran through
@@ -2803,7 +2803,11 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
         // `has_bytecode_counter` the ticker never wraps (`decrement_ticker`).
         crate::executioncontext::enable_gc_bytecode_counter();
     }
-    let _current_frame_guard = if ec.is_null() {
+    // A force/resume continues a frame whose `enter` already ran
+    // (`blackhole.py` `_resume_mainloop`, `resume.py` `force_from_resumedata`).
+    // Relinking from the live `topframeref` would store the current top into
+    // `f_backref` (`install_current_frame` / `ExecutionContext.enter`).
+    let _current_frame_guard = if relink && ec.is_null() {
         install_current_frame(frame)
     } else {
         install_current_frame_tls_only(frame)

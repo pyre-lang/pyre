@@ -202,7 +202,13 @@ pub(crate) fn classify_vstack_opcode(
         | Instruction::JumpForward { .. }
         | Instruction::JumpBackward { .. }
         | Instruction::JumpBackwardNoInterrupt { .. }
-        | Instruction::ReturnValue => VstackOpClass::PopOnlyOrSideStore,
+        | Instruction::ReturnValue
+        // YIELD_VALUE is net 0 (`liveness` `(d, d)`): the opcode leaves the
+        // yielded TOS in place and the portal pops it after the marker.
+        // A FunctionEntry that seeds on the yield pc takes its first
+        // boundary out of that opcode; modeling it keeps the mirror live
+        // so the following `LOAD_SMALL_INT` can publish the yielded const.
+        | Instruction::YieldValue { .. } => VstackOpClass::PopOnlyOrSideStore,
 
         // LOAD_GLOBAL: pyre pushes the global and then, for `namei & 1`, the
         // NULL call sentinel. A guard emitted while lowering the following
@@ -357,6 +363,30 @@ fn loadconst_operand_ref<Sym: WalkSym>(
         return OpRef::NONE;
     }
     ctx.trace_ctx.const_ref(w_const as i64)
+}
+
+/// Grow `boxes` to `new_depth` and write `tos` at the new top.
+///
+/// `tos == NONE` is a real write: the pushed Ref is not known yet (an
+/// int-bank temporary, a const box produced only later at the vable
+/// store) and must replace whatever `last_ref` would otherwise carry
+/// over from the previous opcode.
+fn vstack_mirror_push_tos(boxes: &mut Vec<OpRef>, new_depth: usize, tos: OpRef) {
+    boxes.resize(new_depth, OpRef::NONE);
+    if new_depth > 0 {
+        boxes[new_depth - 1] = tos;
+    }
+}
+
+/// The TOS box a [`VstackOpClass::ResultToTos`] opcode publishes.
+///
+/// A const-producing opcode (`LOAD_SMALL_INT` / `LOAD_CONST` / prebuilt
+/// `LOAD_COMMON_CONSTANT`) never keeps `last_ref`: that ref belongs to
+/// the previous opcode (a FOR_ITER item, a generator-send `None`). When
+/// the const box is not known yet it is [`OpRef::NONE`] — the int-bank
+/// hole `portal_yield_frame_exit` falls through from.
+fn vstack_result_to_tos_box(last_ref: OpRef, const_result: bool, from_const: OpRef) -> OpRef {
+    if const_result { from_const } else { last_ref }
 }
 
 /// Apply pyre's two-push method-form `LOAD_GLOBAL` stack shape.  The callable
@@ -651,35 +681,34 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
                 .resize(new_depth, OpRef::NONE);
         }
         VstackOpClass::ResultToTos => {
-            ctx.frame_state
-                .borrow_mut()
-                .vstack_boxes
-                .resize(new_depth, OpRef::NONE);
-            if new_depth > 0 {
-                // `NONE` means the result was produced in an unboxed bank;
-                // leave an intentional hole so the capture overlay around
-                // stack_sync omits the slot and resume rematerializes it.
-                let mut top = ctx.frame_state.borrow().vstack_last_ref;
-                // `LOAD_CONST` / `LOAD_SMALL_INT` / a prebuilt
-                // `LOAD_COMMON_CONSTANT` push that constant. A `ref_copy`
-                // renaming does not stamp `vstack_last_ref`, so the previous
-                // opcode's ref (the `None` a generator send pushed) would
-                // otherwise become this TOS and the yield would finish with
-                // it.
-                let const_result = matches!(
-                    instr,
-                    pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
-                        | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
-                        | pyre_interpreter::bytecode::Instruction::LoadCommonConstant { .. }
-                );
-                if top == OpRef::NONE || const_result {
-                    let from_const = loadconst_operand_ref(ctx, code, &instr, op_arg);
-                    if !from_const.is_none() {
-                        top = from_const;
-                    }
-                }
-                ctx.frame_state.borrow_mut().vstack_boxes[new_depth - 1] = top;
-            }
+            // `NONE` means the result was produced in an unboxed bank;
+            // leave an intentional hole so the capture overlay around
+            // stack_sync omits the slot and resume rematerializes it.
+            let last_ref = ctx.frame_state.borrow().vstack_last_ref;
+            // `LOAD_CONST` / `LOAD_SMALL_INT` / a prebuilt
+            // `LOAD_COMMON_CONSTANT` push that constant. A `ref_copy`
+            // renaming does not stamp `vstack_last_ref`, so the previous
+            // opcode's ref (the `None` a generator send pushed, a FOR_ITER
+            // item `STORE_FAST` just popped) would otherwise become this
+            // TOS. When the const box is not known yet the slot is NONE,
+            // never that leftover.
+            let const_result = matches!(
+                instr,
+                pyre_interpreter::bytecode::Instruction::LoadSmallInt { .. }
+                    | pyre_interpreter::bytecode::Instruction::LoadConst { .. }
+                    | pyre_interpreter::bytecode::Instruction::LoadCommonConstant { .. }
+            );
+            let from_const = if last_ref == OpRef::NONE || const_result {
+                loadconst_operand_ref(ctx, code, &instr, op_arg)
+            } else {
+                OpRef::NONE
+            };
+            let top = vstack_result_to_tos_box(last_ref, const_result, from_const);
+            vstack_mirror_push_tos(
+                &mut ctx.frame_state.borrow_mut().vstack_boxes,
+                new_depth,
+                top,
+            );
         }
         VstackOpClass::LoadGlobalMethod => {
             // `opcode_load_global`: push the callable, then NULL.  The
@@ -1745,4 +1774,69 @@ fn vstack_enter_exception_handler_callee<Sym: WalkSym>(
     ctx.vstack_depth = handler_depth;
     ctx.frame_state.borrow_mut().vstack_last_ref = OpRef::NONE;
     ctx.vstack_handler_landing_py = (floor_py != handler_py).then_some(floor_py);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::GcRef;
+
+    fn box_at(word: usize) -> OpRef {
+        OpRef::const_ptr(GcRef(word))
+    }
+
+    /// `sum(1 for _ in early)`: FOR_ITER pushes the item, STORE_FAST pops it,
+    /// LOAD_SMALL_INT pushes an int-bank 1 whose Ref is not known yet. The
+    /// mirror TOS must be NONE, not the popped item — otherwise
+    /// `portal_yield_frame_exit` finishes with that item.
+    #[test]
+    fn for_iter_item_does_not_survive_store_fast_then_load_small_int() {
+        let iter = box_at(0x1110);
+        let item = box_at(0x2220);
+        let mut boxes = vec![iter];
+
+        // FOR_ITER continue: push the item (known Ref).
+        vstack_mirror_push_tos(
+            &mut boxes,
+            2,
+            vstack_result_to_tos_box(item, false, OpRef::NONE),
+        );
+        assert_eq!(boxes[1], item);
+
+        // STORE_FAST _: pop the item.
+        boxes.truncate(1);
+
+        // LOAD_SMALL_INT: int-bank push. `last_ref` still names the item (a
+        // pop does not stamp a new one); the const box is produced only
+        // later at the vable store.
+        vstack_mirror_push_tos(
+            &mut boxes,
+            2,
+            vstack_result_to_tos_box(item, true, OpRef::NONE),
+        );
+        assert_eq!(
+            boxes.get(1).copied().unwrap_or(OpRef::NONE),
+            OpRef::NONE,
+            "int-bank LOAD_SMALL_INT TOS must be NONE, not the popped FOR_ITER item",
+        );
+        assert_ne!(
+            boxes.get(1).copied().unwrap_or(OpRef::NONE),
+            item,
+            "the popped FOR_ITER item must not remain as TOS",
+        );
+    }
+
+    /// A FunctionEntry that seeds on the yield pc takes its first boundary
+    /// out of `YIELD_VALUE`. Left Unmodeled that latch kills the mirror,
+    /// and `portal_yield_frame_exit` then finishes with a stale
+    /// `vstack_last_ref` (the FOR_ITER item).
+    #[test]
+    fn yield_value_is_pop_only_or_side_store() {
+        use pyre_interpreter::bytecode::{Arg, Instruction};
+        let instr = Instruction::YieldValue { arg: Arg::marker() };
+        assert_eq!(
+            classify_vstack_opcode(&instr, pyre_interpreter::OpArg::NULL),
+            VstackOpClass::PopOnlyOrSideStore,
+        );
+    }
 }

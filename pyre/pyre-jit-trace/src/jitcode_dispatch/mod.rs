@@ -606,8 +606,9 @@ pub struct InlineFrame {
     /// to each run.
     pub debug_merge_point_py_pc: Option<u32>,
     /// Paused levels sitting between this callee and the next one out,
-    /// OUTERMOST-FIRST; empty preserves the straight-line single-frame
-    /// collapse while retaining the callee level.
+    /// OUTERMOST-FIRST. Empty collapses this level to the caller's CALL
+    /// (`walker_inline_guard_resumes_in_callee`). Admitted Python inlines
+    /// record a parent (`pyjitpl.py` `perform_call` / `newframe`).
     ///
     /// Usually one — the caller paused at its CALL.  A constructor adds a
     /// second: `typeobject.py descr_call` runs between the caller and
@@ -2649,6 +2650,40 @@ fn inline_shadow_matches(shadow: &CalleeLocalsShadow, obj: OpRef, concrete: usiz
 }
 
 impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
+    /// Jitcode this walk is currently decoding (`MIFrame.jitcode`).
+    ///
+    /// A helper keeps `transparent_helper_jitcode_index`; an inlined
+    /// Python callee keeps `inline_callee_consts.jitcode_index`; a
+    /// top-level per-function walk stamps `WalkSession::recording_jitcode_index`.
+    /// `snapshot_sym.jitcode()` is the eval-loop portal and is only the
+    /// last fallback (`resume_snapshot.rs` `walked_snapshot_jitcode`).
+    pub(crate) fn walk_jitcode_index(&self) -> Option<usize> {
+        if let Some(index) = self.fbw_mode.transparent_helper_jitcode_index {
+            return Some(index);
+        }
+        if let Some(consts) = self.inline_callee_consts
+            && consts.jitcode_index >= 0
+        {
+            return Some(consts.jitcode_index as usize);
+        }
+        let rec = self.session.borrow().recording_jitcode_index;
+        if rec >= 0 {
+            return Some(rec as usize);
+        }
+        if self.fbw_mode.snapshot_sym.is_null() {
+            return None;
+        }
+        unsafe {
+            let jc = (*self.fbw_mode.snapshot_sym).jitcode();
+            if jc.is_null() {
+                None
+            } else {
+                let idx = (*jc).index;
+                (idx >= 0).then_some(idx as usize)
+            }
+        }
+    }
+
     /// The frame on this trace — portal virtualizable or any inline level —
     /// whose box or concrete address is `obj` / `concrete`.
     pub(crate) fn receiver_trace_locals(
@@ -3286,43 +3321,6 @@ fn surface_carrier_or_inline_subloop(
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
         if carrier_resume { op_pc } else { op_next_pc },
     )
-}
-
-/// Consume a back-edge `jit_merge_point` in an inlined frame.
-///
-/// `opimpl_jit_merge_point` runs `if seen_loop_header_for_jdindex < 0: if
-/// portal_call_depth: return` *before* the inlined `do_recursive_call(
-/// assembler_call=True)`. Fall-through onto a loop header is not a crossing;
-/// only `jump_absolute`'s `loop_header` (`can_enter_jit`) is. Reset the flag
-/// here the way that method does before `finishframe` + `do_recursive_call`.
-fn surface_inline_subloop_after_back_edge(
-    ctx: &mut TraceCtx,
-    token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
-    target_pc: usize,
-    carrier_resume: bool,
-    op_pc: usize,
-    op_next_pc: usize,
-    no_loop_header: bool,
-) -> Option<(DispatchOutcome, usize)> {
-    // `opimpl_jit_merge_point`: `if not jitdriver_sd.no_loop_header` is
-    // the only gate that waits for an explicit `loop_header`. With
-    // `no_loop_header` the handler stamps `seen_loop_header_for_jdindex`
-    // itself and proceeds to `do_recursive_call(..., assembler_call=True)`.
-    if ctx.seen_loop_header_for_jdindex < 0 && !carrier_resume && !no_loop_header {
-        return None;
-    }
-    if token.is_none() && !carrier_resume {
-        return None;
-    }
-    ctx.seen_loop_header_for_jdindex = -1;
-    ctx.seen_loop_header_jit_pc = None;
-    Some(surface_carrier_or_inline_subloop(
-        token,
-        target_pc,
-        carrier_resume,
-        op_pc,
-        op_next_pc,
-    ))
 }
 
 fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
@@ -4446,6 +4444,51 @@ pub(crate) fn opref_concrete(ctx_value: Option<majit_ir::Value>) -> crate::state
     }
 }
 
+fn concrete_bits(value: crate::state::ConcreteValue) -> i64 {
+    match value {
+        crate::state::ConcreteValue::Int(n) => n,
+        crate::state::ConcreteValue::Bool(b) => i64::from(b),
+        crate::state::ConcreteValue::Ref(p) => p as i64,
+        crate::state::ConcreteValue::Float(n) => n.to_bits() as i64,
+        crate::state::ConcreteValue::Null => 0,
+    }
+}
+
+/// `pyjitpl.py` `_opimpl_recursive_call`: `allboxes = greenboxes + redboxes`
+/// packed the way `MIFrame.setup_call` distributes by kind.
+fn recursive_call_argboxes(
+    int_args: &[OpRef],
+    int_concretes: &[crate::state::ConcreteValue],
+    ref_args: &[OpRef],
+    ref_concretes: &[crate::state::ConcreteValue],
+    float_args: &[OpRef],
+    float_concretes: &[crate::state::ConcreteValue],
+) -> Vec<(majit_metainterp::JitArgKind, OpRef, i64)> {
+    let mut boxes = Vec::with_capacity(int_args.len() + ref_args.len() + float_args.len());
+    for (op, concrete) in int_args.iter().zip(int_concretes) {
+        boxes.push((
+            majit_metainterp::JitArgKind::Int,
+            *op,
+            concrete_bits(*concrete),
+        ));
+    }
+    for (op, concrete) in ref_args.iter().zip(ref_concretes) {
+        boxes.push((
+            majit_metainterp::JitArgKind::Ref,
+            *op,
+            concrete_bits(*concrete),
+        ));
+    }
+    for (op, concrete) in float_args.iter().zip(float_concretes) {
+        boxes.push((
+            majit_metainterp::JitArgKind::Float,
+            *op,
+            concrete_bits(*concrete),
+        ));
+    }
+    boxes
+}
+
 fn portal_mainjitcode_index(jd_index: usize) -> Option<usize> {
     let key = match jd_index {
         0 => {
@@ -4596,10 +4639,24 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     .iter()
                     .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
                     .collect();
-                // `pyjitpl.py newframe`: portal_call_depth, call_ids, ENTER_PORTAL_FRAME.
+                let float_concretes: Vec<crate::state::ConcreteValue> = float_args
+                    .iter()
+                    .map(|op| opref_concrete(ctx.trace_ctx.concrete_of_opref(*op)))
+                    .collect();
+                // pyjitpl.py `_opimpl_recursive_call`: `perform_call(portal_code, allboxes, greenkey=greenboxes)`.
                 let subwalk_jd = crate::state::note_inline_subwalk_start(
                     (green_key.get_uhash(), green_key.clone()),
                     Some(index),
+                    &recursive_call_argboxes(
+                        &int_args,
+                        &int_concretes,
+                        &ref_args,
+                        &ref_concretes,
+                        &float_args,
+                        &float_concretes,
+                    ),
+                    ctx.walk_jitcode_index(),
+                    op.next_pc,
                 );
                 let walked = match inline_call::run_sub_jitcode_walk(
                     ctx,
@@ -5069,12 +5126,12 @@ pub fn step<Sym: WalkSym>(
     if ctx.is_top_level {
         ctx.session.borrow_mut().recording_opcode_position = op.pc;
     }
-    // Per-CodeObject portal JitCodes contain the lowered Python opcode body,
-    // but not the dispatch loop's `jit_merge_point` marker that preceded that
-    // body in `interp_jit.py`. Restore `MIFrame.debug_merge_point` at the
-    // exact Python-opcode emission boundary before executing the body. A
-    // JitCode that really carries `jit_merge_point` records its marker in that
-    // handler below instead, so it is not doubled here.
+    // Per-CodeObject portal JitCodes carry `jit_merge_point` at loop
+    // headers (`interp_jit.py` `dispatch`). Restore
+    // `MIFrame.debug_merge_point` at the exact Python-opcode emission
+    // boundary before executing the body. A JitCode that really carries
+    // `jit_merge_point` records its marker in that handler below instead,
+    // so it is not doubled here.
     // `-live-` is codewriter resume metadata, not an interpreter opcode.
     // Consume it first so the marker on the following real op captures this
     // opcode's own live anchor rather than the preceding one's.
@@ -5252,11 +5309,6 @@ pub fn walk<Sym: WalkSym>(
                             ..
                         } | DispatchError::AbortPermanentMarkerReached { .. }
                     );
-                // Kept in lockstep with the epilogue's own gate: an abort that
-                // reports a MISSING value cannot be converted, because the
-                // image it would hand the blackhole is the one that just
-                // failed to resolve ([`DispatchError::leaves_complete_image`]).
-                //
                 // A translated builtin gateway is not an MIFrame.  Let its
                 // error unwind to the enclosing Python walk, where the same
                 // latch is built from that frame's own register banks.  If we
@@ -5267,15 +5319,18 @@ pub fn walk<Sym: WalkSym>(
                 // Trace-length is not deferred: `_interpret` checks it on the
                 // helper MIFrame itself, and the post-step arm below does too.
                 //
-                // A seeded inline whose abort is a modeling gap rather than a
-                // missing value latches even when the root allow-list has not
-                // named the class: `run_blackhole_interp_to_cancel_tracing`
-                // (`pyjitpl.py`) converts whatever `framestack` is live.
-                if coordinate_belongs_to_this_frame
-                    && (error.leaves_complete_image()
-                        || (frames_materialized && error.can_convert_seeded_inline()))
-                    && !carrier_owned
-                    && !abort_blackhole_latched()
+                // A missing-value abort in a transparent helper does not
+                // punch a hole in the enclosing Python frame.
+                // `fill_abort_miframe_register_banks` is the completeness
+                // check (`blackhole.py _copy_data_from_miframe` copies live
+                // boxes; the latch declines when a box has no concrete).
+                // Gating on the helper's error class skipped that latch
+                // (`GotoIfNotValueNotConcrete` is not in
+                // `leaves_complete_image`), so convert copied
+                // MetaInterp.framestack at the loop-header pc.
+                // `run_blackhole_interp_to_cancel_tracing` (`pyjitpl.py`)
+                // converts whatever `framestack` is live.
+                if coordinate_belongs_to_this_frame && !carrier_owned && !abort_blackhole_latched()
                 {
                     // The image belongs to THIS WalkContext's MIFrame, so its
                     // resume coordinate must be this frame's opcode boundary.
@@ -8286,7 +8341,7 @@ fn sync_intermediate_merge_point_last_instr(ctx: &mut TraceCtx, merge_pc: usize)
 /// Call-scoped inputs for one guard-snapshot capture — the explicit-parameter
 /// port of `capture_resumedata`'s keyword arguments (pyjitpl.py),
 /// alongside the already-explicit `after_residual_call`.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(crate) struct GuardCaptureScope {
     /// Request that a residual call's after-call guard route its resume
     /// through the call's OWN post-call `catch_exception` instead of the
@@ -8335,6 +8390,17 @@ pub(crate) struct GuardCaptureScope {
     /// `do_recursive_call`). The guard captures the paused callers alone,
     /// the innermost holding this box in its result slot.
     pub finished_callee_result: Option<OpRef>,
+
+    /// Constructor `CALL_ASSEMBLER`: snapshot `descr_call`'s tail
+    /// (`ctor_continuation`) with `(instance, __init__ result, immediate
+    /// caller)` so deopt at `GUARD_NOT_FORCED` / the assembler's exception
+    /// guard resumes in `typeobject.py descr_call` with the Python caller
+    /// still numbered. `pyjitpl.py` `opimpl_jit_merge_point` `finishframe`
+    /// pops `__init__`, then `do_recursive_call(assembler_call=True)`
+    /// records from `framestack[-1]`, the real caller. The caller is the
+    /// rooted `InlineParentFrame` taken before `InlineFrameGuard` drops,
+    /// matching the operator-tail path.
+    pub constructor_assembler: Option<(OpRef, OpRef, Option<InlineParentFrame>)>,
 
     /// Select which already-recorded guard op receives the resume position.
     /// Needed whenever the guard being captured is not the last thing recorded:
@@ -8595,13 +8661,20 @@ enum ParentResumeCoord {
 /// (`try_walker_inline_type_call`), so the level has to be spelled out; the
 /// jitcode it names is `crate::ctor_continuation`'s.
 ///
-/// `boxes` is the instance alone: that is the tail's whole live state, and its
-/// `ref_return` is what fills the caller's pending call-result slot on the way
-/// out. `blackhole` is `None` because the level owns no register banks to
-/// force, and `call_stack_overrides` is empty because it has no operand stack.
+/// `boxes` is the instance then `__init__`'s result: the resume `-live-`
+/// names both so a post-return guard (`CALL_ASSEMBLER` `GUARD_NOT_FORCED`)
+/// can carry `w_result`, matching `get_list_of_active_boxes` with
+/// `after_residual_call=True` (`pyjitpl.py`). An in-dunder snapshot still
+/// seeds a placeholder that `_setup_return_value_r` (`blackhole.py`)
+/// overwrites. `ref_return` of the instance fills the caller's pending
+/// call-result slot on the way out. `blackhole` is `None` because the
+/// level owns no register banks to force, and `call_stack_overrides` is
+/// empty because it has no operand stack.
 pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlineParentFrame> {
     let jitcode_index = crate::ctor_continuation::jitcode_index()?;
     let resume_pc = crate::ctor_continuation::resume_pc()?;
+    let boxes = vec![instance, OpRef::const_ptr(majit_ir::GcRef::NULL)];
+    let result_slot = call_result_slot(jitcode_index as u32, resume_pc, boxes.len());
     Some(InlineParentFrame {
         jitcode_index: jitcode_index as u32,
         call_jitcode_pc: None,
@@ -8614,15 +8687,13 @@ pub(crate) fn ctor_continuation_parent_frame(instance: OpRef) -> Option<InlinePa
         // a frame, which is the existing spelling for "no Python coordinate".
         resume_coord: ParentResumeCoord::Backxlat(resume_pc),
         resume_marker_jit_pc: Some(resume_pc),
-        boxes: vec![instance],
+        boxes,
         registers_r: None,
         registers_i: None,
         registers_f: None,
         frame_state: None,
         caller_py_pc: None,
-        // `__init__`'s result register is pending, not live, at the resume
-        // pc, so `boxes` has no place for a finished `__init__`'s result.
-        result_slot: CallResultSlot::Unknown,
+        result_slot,
     })
 }
 
@@ -9474,6 +9545,33 @@ struct FbwNamespaceStore {
     written: Option<pyre_object::PyObjectRef>,
 }
 
+impl FbwNamespaceStore {
+    /// Forward every GC pointer this entry still owns.
+    ///
+    /// Rollback compares `written` by identity (`fbw_namespace_store_journal_rollback`).
+    /// A nested collect that skips it leaves a stale pointer that looks like a
+    /// concurrent replacement.  Shared by the live extra-area walker and
+    /// `walk_parked_walk_tls_stack` so the field lists cannot diverge —
+    /// RPython traces every GC field of a TLS-held object (`rthread.py`
+    /// `_trace_tlref` walks the same slot on every thread; `framework.py`
+    /// `BaseRootWalker.walk_roots` then forwards each collected root).
+    fn visit_gc_refs(&mut self, visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        fbw_state::visit_pyobject_ref(&mut self.namespace, visitor);
+        fbw_state::visit_pyobject_ref(&mut self.name, visitor);
+        fbw_state::visit_pyobject_ref(&mut self.displaced, visitor);
+        if let Some(written) = self.written.as_mut() {
+            fbw_state::visit_pyobject_ref(written, visitor);
+        }
+    }
+}
+
+/// Extra-area cells for the store-journal walker.
+///
+/// Frame-address journals (`exit_last_instr_undo`, `frame_vsd_undo`,
+/// `locals_mirror_undo.frame`, `generator_yield_tos.frame`,
+/// `unflushed_escaped_callee`, `escape_flush_undo.frame`) are visited by
+/// [`fbw_state::visit_journalled_frame_roots`], the same helper
+/// [`fbw_state::walk_parked_walk_tls_stack`] calls.
 struct FbwStoreJournalRootArea {
     stores: *const std::cell::RefCell<Vec<[pyre_object::PyObjectRef; 3]>>,
     list_effects: *const std::cell::RefCell<Vec<FbwListEffect>>,
@@ -9488,8 +9586,13 @@ struct FbwStoreJournalRootArea {
     abort_resume: *const std::cell::RefCell<Option<InlineAbortCarrier>>,
     escape_flush_undo: *const std::cell::RefCell<Option<EscapeFlushUndo>>,
     locals_mirror_undo: *const std::cell::RefCell<Vec<FbwLocalsMirrorUndo>>,
+    exit_last_instr_undo: *const std::cell::RefCell<Vec<(usize, isize)>>,
+    frame_vsd_undo: *const std::cell::RefCell<Vec<(usize, usize)>>,
+    generator_yield_tos: *const std::cell::Cell<Option<GeneratorStackStore>>,
+    unflushed_escaped_callee: *const std::cell::Cell<usize>,
     single_frame_blackhole: *const std::cell::RefCell<Option<LatchedSingleFrameBlackhole>>,
     multi_frame_blackhole: *const std::cell::RefCell<Option<LatchedMultiFrameBlackhole>>,
+    parked_stack: *const std::cell::RefCell<Vec<fbw_state::ParkedWalkTls>>,
 }
 
 thread_local! {
@@ -9506,8 +9609,13 @@ thread_local! {
         abort_resume: FBW_ABORT_CALL_RESUME.with(|value| value as *const _),
         escape_flush_undo: escape_flush_undo_cell_ptr(),
         locals_mirror_undo: locals_mirror_undo_cell_ptr(),
+        exit_last_instr_undo: exit_last_instr_undo_cell_ptr(),
+        frame_vsd_undo: frame_vsd_undo_cell_ptr(),
+        generator_yield_tos: generator_yield_tos_cell_ptr(),
+        unflushed_escaped_callee: unflushed_escaped_callee_cell_ptr(),
         single_frame_blackhole: single_frame_blackhole_cell_ptr(),
         multi_frame_blackhole: multi_frame_blackhole_cell_ptr(),
+        parked_stack: fbw_state::parked_walk_tls_stack_cell_ptr(),
     };
 }
 
@@ -9852,24 +9960,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
     // rollback reads the dict and the name back to put it there — forward all
     // three.  A null `displaced` is the unbound case and names no object.
     // `written` is the object a `STORE_SUBSCR` rollback compares by identity;
-    // it has to move with the dict entry or the comparison misses.
+    // it has to move with the dict entry or the comparison misses.  The parked
+    // walker uses the same helper (`FbwNamespaceStore::visit_gc_refs`).
     let namespace_stores = unsafe { &mut *(*area.namespace_stores).as_ptr() };
     for entry in namespace_stores.iter_mut() {
-        for slot in [
-            &mut entry.namespace as *mut pyre_object::PyObjectRef,
-            &mut entry.name as *mut pyre_object::PyObjectRef,
-            &mut entry.displaced as *mut pyre_object::PyObjectRef,
-        ] {
-            if unsafe { *slot }.is_null() {
-                continue;
-            }
-            visitor(unsafe { &mut *slot.cast() });
-        }
-        if let Some(written) = entry.written.as_mut() {
-            if !written.is_null() {
-                visitor(unsafe { &mut *(written as *mut pyre_object::PyObjectRef).cast() });
-            }
-        }
+        entry.visit_gc_refs(visitor);
     }
     // The displaced `sys_exc_value` entries are exception objects that may be
     // nursery-resident and no longer referenced elsewhere once the eager store
@@ -9899,33 +9994,24 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         // `usize` body pc and the bool flag are plain scalars.
         visitor(unsafe { &mut *(&mut entry.item as *mut pyre_object::PyObjectRef).cast() });
     }
-    // The escape-flush undo snapshot stays armed from force time until the
-    // abort epilogue consumes it, and its slots can be the ONLY reference to
-    // pre-walk locals the flush displaced (the live-frame slots now hold
-    // walk-end values) — forward each so a minor collection on the abort
-    // unwind cannot move/free what `restore_escape_flush_undo` writes back.
+    // Same field list as `walk_parked_walk_tls_stack`: frame-address words
+    // plus the slots / yield value those journals already forwarded
+    // (`fbw_state::visit_journalled_frame_roots`).
     let escape_undo = unsafe { &mut *(*area.escape_flush_undo).as_ptr() };
-    if let Some(undo) = escape_undo.as_mut() {
-        for slot in undo.slots.iter_mut() {
-            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-        }
-        // The post-flush image is compared against the live slots, so it has to
-        // be forwarded on the same window: a stale address would read as "the
-        // residual wrote this" for every moved value and suppress the undo.
-        for slot in undo.flush_image.iter_mut() {
-            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-        }
-    }
-    // The `f_locals` fold's pre-mirror images are armed the same way and live
-    // just as long — until the walk's commit or rollback leg consumes them —
-    // and the live-frame slots they shadow now hold the mirrored values, so
-    // each displaced entry needs forwarding too.
     let locals_mirror = unsafe { &mut *(*area.locals_mirror_undo).as_ptr() };
-    for entry in locals_mirror.iter_mut() {
-        for slot in entry.slots.iter_mut() {
-            visitor(unsafe { &mut *(slot as *mut pyre_object::PyObjectRef).cast() });
-        }
-    }
+    let exit_last_instr = unsafe { &mut *(*area.exit_last_instr_undo).as_ptr() };
+    let frame_vsd = unsafe { &mut *(*area.frame_vsd_undo).as_ptr() };
+    let generator_yield = unsafe { &mut *(*area.generator_yield_tos).as_ptr() };
+    let unflushed = unsafe { &mut *(*area.unflushed_escaped_callee).as_ptr() };
+    fbw_state::visit_journalled_frame_roots(
+        exit_last_instr,
+        frame_vsd,
+        locals_mirror,
+        generator_yield,
+        unflushed,
+        escape_undo,
+        visitor,
+    );
     // The vable-force and trace-too-long MIFrame images survive the dispatch
     // unwind in TLS. Their Option<i64> Ref banks are not otherwise visible to
     // the collector, so forward every populated color until the walk-end
@@ -10026,6 +10112,7 @@ pub unsafe fn fbw_store_journal_root_walker_area(
             }
         }
     }
+    fbw_state::walk_parked_walk_tls_stack(area.parked_stack, visitor);
 }
 
 /// #73: classification of a Python opcode's effect on the walk-level
@@ -10368,12 +10455,6 @@ fn record_python_debug_merge_point<Sym: WalkSym>(
     {
         return create_segmented_trace(ctx, jit_pc, py_pc as usize, true);
     }
-    // `opimpl_loop_header` (`pyjitpl.py`) only stamps
-    // `seen_loop_header_for_jdindex`. The close is `opimpl_jit_merge_point`
-    // on the `jit_merge_point` emitted at the loop-header block
-    // (`handle_jit_marker__jit_merge_point`, `jtransform.py`). This
-    // synthesized boundary records `DEBUG_MERGE_POINT` and the segmenting
-    // check above.
     Ok(None)
 }
 
@@ -11716,7 +11797,8 @@ fn walker_unbox_long<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().class_now_known(obj);
     }
     let obj_concrete = walker_concrete_ref_object(ctx, obj);
-    let fits_fn = pyre_object::longobject::jit_w_long_fits_int as *const ();
+    let fits_fn =
+        pyre_interpreter::residual_word_addr!(1, pyre_object::longobject::jit_w_long_fits_int);
     let fits = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallI,
         fits_fn,
@@ -11731,7 +11813,8 @@ fn walker_unbox_long<Sym: WalkSym>(
             .set_opref_concrete(fits, majit_ir::Value::Int(fits_concrete));
     }
     walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[fits])?;
-    let toint_fn = pyre_object::longobject::jit_w_long_toint as *const ();
+    let toint_fn =
+        pyre_interpreter::residual_word_addr!(1, pyre_object::longobject::jit_w_long_toint);
     let raw = ctx.trace_ctx.call_typed_with_effect(
         OpCode::CallI,
         toint_fn,
@@ -13970,6 +14053,364 @@ pub(crate) fn ec_hook_installed() -> bool {
     !ec.is_null() && unsafe { !(*ec).w_tracefunc.is_null() || (*ec).profilefunc.is_some() }
 }
 
+/// Which portal reds were taken from `snapshot_sym` and must be written back.
+#[derive(Clone, Copy, Default)]
+struct SymRedWriteback {
+    frame: bool,
+    ec: bool,
+}
+
+/// Resume markers `DispatchOutcome::CloseLoop` carries out of `reached_loop_header`.
+#[derive(Clone, Copy, Default)]
+struct LoopHeaderMarkers {
+    loop_header_marker_jit_pc: Option<usize>,
+    back_edge_pc: Option<usize>,
+    back_edge_marker_jit_pc: Option<usize>,
+}
+
+/// Arguments of `reached_loop_header` (`pyjitpl.py`).
+///
+/// Greens stay on the green key. `reds` plus `virtualizable_boxes[:-1]` are
+/// the live jump args, the same vector the explicit `jit_merge_point` arm
+/// and a per-code header both close with.
+struct ReachedLoopHeader {
+    code_ptr: *const (),
+    next_instr: usize,
+    is_being_profiled: bool,
+    reds: Vec<OpRef>,
+    /// Register indices of the int/ref/float red lists, in that order.
+    red_i_regs: Vec<usize>,
+    red_r_regs: Vec<usize>,
+    red_f_regs: Vec<usize>,
+    sym_reds: SymRedWriteback,
+    /// JitCode pc of the guard snapshot. The Python `next_instr` green names
+    /// a different `-live-` marker.
+    snapshot_jit_pc: usize,
+    markers: LoopHeaderMarkers,
+}
+
+/// `reached_loop_header` (`pyjitpl.py`).
+///
+/// `heapcache.reset`, then `remove_consts_and_duplicates` over the reds and
+/// `virtualizable_boxes[:-1]`, then one `GUARD_FUTURE_CONDITION`, then
+/// `compile_trace` when a compiled target already exists, then the
+/// `current_merge_points` scan. `Ok(None)` registers this visit and keeps
+/// tracing. `Some` is `CompileTracePending` or `CloseLoop`.
+fn reached_loop_header<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    header: ReachedLoopHeader,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    let ReachedLoopHeader {
+        code_ptr,
+        next_instr,
+        is_being_profiled,
+        reds,
+        red_i_regs,
+        red_r_regs,
+        red_f_regs,
+        sym_reds,
+        snapshot_jit_pc,
+        markers,
+    } = header;
+    if std::env::var("PYRE_DIAG_51C").is_ok() {
+        eprintln!("[51c-redclose] pc={snapshot_jit_pc} reds={reds:?}");
+    }
+    // pyjitpl.py `self.heapcache.reset()` before the reds are deduplicated.
+    // pyjitpl.py self.heapcache.reset()
+    // The walker's cached sys_exc_value box is a heap-field cache too
+    // and is dropped with it. The prepared SAVE_EXCEPTION box is a
+    // pre-cut producer: `reached_loop_header` keeps only
+    // `live_arg_boxes`, so consume it with the seed.
+    ctx.trace_ctx.heap_cache_mut().reset();
+    ctx.trace_ctx.consume_bridge_exception_resume();
+    {
+        let mut state = ctx.frame_state.borrow_mut();
+        state.current_exception_seed = None;
+        state.current_exception_seed_concrete = pyre_object::PY_NULL;
+    }
+    ctx.fbw_mode.current_exception_seed_from_walk_store = false;
+    // `close_loop_args_at` syncs the merge-point vable `last_instr` before
+    // the jump args are built. The scalar is `merge_pc - 1`: a resume into
+    // the target loop re-enters at the header. Without it the compile_trace
+    // JUMP carries the last guard's `last_instr` (fannkuch resumes at the
+    // wrong bytecode and never reaches its exit).
+    // A crossed `compile_trace` walk keeps the origin frame's
+    // `virtualizable_boxes`. Dest LABEL arity is dest's
+    // `locals_cells_stack_w` length (`virtualizable.py get_array_length`).
+    // Re-derive dest boxes with recorded GETFIELD_GC / GETARRAYITEM_GC
+    // (`initialize_virtualizable` `read_boxes` as IR,
+    // `patch_new_loop_to_load_virtualizable_fields`) so the JUMP args are
+    // boxes, not constants, and match dest. Re-sync replaces the cache,
+    // including last_instr; pin dest's slot after that write.
+    if let Some(&frame) = reds.first() {
+        ctx.trace_ctx.gen_load_from_other_virtualizable(frame);
+    }
+    sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
+    // Array index `>= valuestackdepth` is the dead stack tail
+    // (`pyframe.py popvalue_maybe_none`). majit's fill is generic
+    // (`virtualizable.py VirtualizableInfo`); supply the boundary
+    // from the concrete frame, falling back to the symbolic mirror
+    // the same way `close_loop_args_at` does.
+    let dead_array_tail_from = (!ctx.fbw_mode.snapshot_sym.is_null()).then(|| {
+        let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
+        crate::state::concrete_stack_depth(sym.tracing_vable_frame_addr())
+            .unwrap_or_else(|| sym.valuestackdepth())
+    });
+    ctx.trace_ctx
+        .fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
+    let red_len = reds.len();
+    let mut live_args = append_virtualizable_boxes(ctx.trace_ctx, reds);
+    let before = live_args.clone();
+    // One `duplicates` set across reds and `virtualizable_boxes[:-1]`.
+    // Untyped boxes stay as they are (`remove_consts_and_duplicates_untyped`).
+    ctx.trace_ctx
+        .remove_consts_and_duplicates_untyped(&mut live_args);
+    // `put_back_list_of_boxes3`: deduped reds go back to the registers.
+    // Harmless on the close path; the continue path traces the new identity.
+    put_back_list_of_boxes3(ctx, &red_i_regs, &red_r_regs, &red_f_regs, &live_args);
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if !sym_ptr.is_null() && (sym_reds.frame || sym_reds.ec) {
+        // The walk owns this sym for the attempt. Publishing the deduped
+        // portal reds is `put_back_list_of_boxes3` for `frame` and `ec`.
+        let sym = unsafe { &mut *(sym_ptr as *mut Sym) };
+        if sym_reds.frame {
+            if let Some(&frame) = live_args.first() {
+                sym.set_frame(frame);
+            }
+        }
+        if sym_reds.ec {
+            if let Some(&ec) = live_args.get(1) {
+                sym.set_execution_context(ec);
+            }
+        }
+    }
+    // `remove_consts_and_duplicates` mutates `virtualizable_boxes` in place.
+    for i in red_len..live_args.len() {
+        if before[i] != live_args[i] {
+            ctx.trace_ctx
+                .set_virtualizable_box_at(i - red_len, live_args[i]);
+        }
+    }
+    if std::env::var("PYRE_DIAG_51C").is_ok() {
+        for (idx, &arg) in live_args.iter().enumerate() {
+            eprintln!(
+                "[51c-redclose]   live_arg[{idx}] {arg:?} concrete={:?}",
+                ctx.trace_ctx.concrete_of_opref(arg)
+            );
+        }
+    }
+    // pyjitpl.py `reached_loop_header`: one `GUARD_FUTURE_CONDITION` before
+    // `get_procedure_token` / `compile_trace` and before the merge-point scan,
+    // including the visit that only registers and keeps tracing. The snapshot
+    // coordinate is the JitCode pc the walk is standing on. `next_instr` is
+    // the Python green and names a different `-live-` marker.
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardFutureCondition, &[], 0);
+    if ctx.is_authoritative_executor {
+        walker_capture_snapshot_for_last_guard(ctx, snapshot_jit_pc)?;
+    }
+    // pyjitpl.py `assert len(self.virtualref_boxes) == 0`.
+    debug_assert_eq!(
+        ctx.trace_ctx.virtualref_boxes_len(),
+        0,
+        "missing virtual_ref_finish()? reached_loop_header with open virtualrefs"
+    );
+    let key = crate::driver::make_green_key(code_ptr, next_instr, is_being_profiled);
+    if ctx.is_top_level && ctx.is_authoritative_executor {
+        let (driver, _) = crate::driver::driver_pair();
+        let has_partial = driver.meta_interp().partial_trace().is_some();
+        let bridge_origin = driver
+            .meta_interp()
+            .bridge_info()
+            .map(|b| (b.trace_id, b.fail_index));
+        let has_targets = driver.meta_interp().has_compiled_targets(key);
+        // pyjitpl.py `if not self.partial_trace` is the only compile_trace gate.
+        if !has_partial && has_targets {
+            let outcome = match bridge_origin {
+                Some(_) => driver
+                    .meta_interp_mut()
+                    .compile_trace(key, &live_args, bridge_origin),
+                None => match driver.compile_trace_entry_data() {
+                    Some((original_green_key, mut entry_meta)) => {
+                        // `compile_trace_entry_data` clones metadata whose
+                        // `namespace_dependent` is finalized only after the
+                        // walk returns. Fold in the live flag so an entry
+                        // bridge compiled mid-walk keeps the namespace gate.
+                        entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
+                        driver.meta_interp_mut().compile_trace_from_interp(
+                            key,
+                            &live_args,
+                            original_green_key,
+                            entry_meta,
+                        )
+                    }
+                    // No `ResumeFromInterpDescr` payload: `compile_trace` with
+                    // a `None` origin answers `Cancelled` after cloning the
+                    // trace. Decline here instead.
+                    None => majit_metainterp::CompileOutcome::Cancelled,
+                },
+            };
+            match driver.meta_interp().classify_compile_outcome(outcome) {
+                majit_metainterp::BridgeCompileResult::Compiled => {
+                    if majit_metainterp::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][walker-reached-loop-header] compile_trace success: \
+                             key={key} pc={next_instr} bridge={bridge_origin:?}"
+                        );
+                    }
+                    driver.note_compile_trace_success();
+                    return Ok(Some(DispatchOutcome::CompileTracePending {
+                        loop_header_pc: next_instr,
+                    }));
+                }
+                // `raise_if_successful` does not raise on None. The merge-point
+                // scan below is `reached_loop_header` after `compile_trace`
+                // returns. The next header visit retries.
+                majit_metainterp::BridgeCompileResult::RetraceNeeded
+                | majit_metainterp::BridgeCompileResult::Declined
+                | majit_metainterp::BridgeCompileResult::Failed => {}
+            }
+            majit_metainterp::mc_diag_bump(27);
+        }
+    }
+    let live_typed = crate::driver::make_green_key_typed(code_ptr, next_instr, is_being_profiled);
+    // `has_merge_point_same_greenkey` asserts every registered merge point
+    // shares this length (`assert len(original_boxes) == len(live_arg_boxes)`).
+    if ctx
+        .trace_ctx
+        .has_merge_point_same_greenkey(&live_typed, live_args.len())
+    {
+        return Ok(Some(DispatchOutcome::CloseLoop {
+            jump_args: live_args,
+            loop_header_pc: next_instr,
+            loop_header_marker_jit_pc: markers.loop_header_marker_jit_pc,
+            back_edge_pc: markers.back_edge_pc,
+            back_edge_marker_jit_pc: markers.back_edge_marker_jit_pc,
+            merge_point_registers_r: ctx.registers_r.to_vec(),
+        }));
+    }
+    let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
+        .iter()
+        .map(|opref| {
+            let ty = ctx.trace_ctx.get_opref_type(*opref).unwrap_or_else(|| {
+                panic!(
+                    "jit_merge_point live arg {opref:?} has no type; a Box always carries its type"
+                )
+            });
+            majit_metainterp::GreenBox::new(*opref, ty)
+        })
+        .collect();
+    ctx.trace_ctx
+        .add_merge_point_with_key(key, live_typed, green_boxes, next_instr);
+    Ok(None)
+}
+
+/// `warmstate.py get_assembler_token` for the portal greens.
+///
+/// No procedure token yet goes through `compile_tmp_callback`
+/// (`get_or_make_portal_assembler_token_arc`). `None` is the no-driver or
+/// failed-callback case; the caller still records the call.
+pub(crate) fn portal_assembler_token(
+    code_ptr: *const (),
+    next_instr: usize,
+    is_being_profiled: bool,
+) -> Option<std::sync::Arc<majit_backend::JitCellToken>> {
+    let key = crate::driver::make_green_key_typed(code_ptr, next_instr, is_being_profiled);
+    let (driver, _) = crate::driver::try_driver_pair()?;
+    let greenboxes = [
+        Value::Int(next_instr as i64),
+        Value::Int(is_being_profiled as i64),
+        Value::Ref(majit_ir::GcRef(code_ptr as usize)),
+    ];
+    let red_types = [Type::Ref, Type::Ref];
+    driver.get_or_make_portal_assembler_token_arc(&key, &greenboxes, &red_types)
+}
+
+/// `opimpl_jit_merge_point` inlined branch (`pyjitpl.py`):
+/// `should_unroll_one_iteration` (`interp_jit.py`) plus
+/// `MIFrame.unroll_iterations`. True means follow one more iteration.
+///
+/// Decrements the top MIFrame only when `portal_call_depth > 0`. The root
+/// frame is also born at 1, so a depth-0 crossing must not consume it.
+fn inlined_should_unroll_one_iteration(code: &pyre_interpreter::CodeObject) -> bool {
+    // ITERABLE_COROUTINE and ASYNC_GENERATOR are deliberately not
+    // tested: the hook selects only the two bits `should_unroll_one_iteration`
+    // (`eval.rs` / `interp_jit.py`) selects.
+    if !code
+        .flags
+        .intersects(pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR)
+    {
+        return false;
+    }
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return false;
+    };
+    let meta = driver.meta_interp_mut();
+    if meta.portal_call_depth <= 0 {
+        return false;
+    }
+    let Some(frame) = meta.framestack.frames.last_mut() else {
+        return false;
+    };
+    if frame.unroll_iterations == 0 {
+        return false;
+    }
+    frame.unroll_iterations -= 1;
+    true
+}
+
+/// `opimpl_jit_merge_point`: stamp cleared, `should_unroll_one_iteration`
+/// (`interp_jit.py`) / `MIFrame.unroll_iterations`, then
+/// `do_recursive_call(assembler_call=True)`.
+///
+/// Order matches the inlined (`portal_call_depth > 0`) arm: clear
+/// `seen_loop_header_for_jdindex` first, then the unroll test, then
+/// `get_assembler_token` (`warmstate.py`). An iteration that keeps
+/// unrolling must not `compile_tmp_callback`. `None` still residualizes
+/// the portal runner (`inlined_loop_header_call_assembler`).
+fn inlined_merge_point_recursive_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    callee_code: usize,
+    next_instr: usize,
+    is_being_profiled: bool,
+    carrier_resume: bool,
+    op: &DecodedOp,
+) -> Option<(DispatchOutcome, usize)> {
+    ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+    let _ = ctx.trace_ctx.seen_loop_header_jit_pc.take();
+    if let Some(pjc) = crate::state::pyjitcode_for_code(callee_code as *const ()) {
+        if !pjc.code_ptr.is_null() && inlined_should_unroll_one_iteration(unsafe { &*pjc.code_ptr })
+        {
+            return Some((DispatchOutcome::Continue, op.next_pc));
+        }
+    }
+    match inlined_loop_header_call_assembler(
+        callee_code as *const (),
+        next_instr,
+        is_being_profiled,
+    ) {
+        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => Some(
+            surface_carrier_or_inline_subloop(token, target_pc, carrier_resume, op.pc, op.next_pc),
+        ),
+        outcome => Some((outcome, op.next_pc)),
+    }
+}
+
+/// After a `loop_header` stamp, inlined `opimpl_jit_merge_point` always
+/// `do_recursive_call(assembler_call=True)`. `get_assembler_token`
+/// (`warmstate.py`) `compile_tmp_callback`s when the cell has no loop;
+/// `None` still residualizes the portal runner.
+pub(crate) fn inlined_loop_header_call_assembler(
+    code_ptr: *const (),
+    header_py: usize,
+    is_being_profiled: bool,
+) -> DispatchOutcome {
+    DispatchOutcome::SubLoopCalleeCallAssembler {
+        token: portal_assembler_token(code_ptr, header_py, is_being_profiled),
+        target_pc: header_py,
+    }
+}
+
 /// The global trace function `executioncontext.py gettrace` reads —
 /// `jit.promote(self.w_tracefunc)` — pinned NULL at the portal merge point.
 ///
@@ -14451,6 +14892,9 @@ fn handle<Sym: WalkSym>(
             // target`. The 2-byte LE label was resolved by
             // `assembler.fix_labels` to a direct pc; pyre + RPython
             // agree that goto records nothing (pure control flow).
+            // An inlined loop's CALL_ASSEMBLER cut is
+            // `MIFrame.opimpl_jit_merge_point` (`pyjitpl.py`) after
+            // `opimpl_loop_header` stamps `seen_loop_header_for_jdindex`.
             let target = read_label(code, op, 0);
             Ok((DispatchOutcome::Continue, target))
         }
@@ -17046,17 +17490,16 @@ fn handle<Sym: WalkSym>(
             // A transparent helper walk is NOT such a portal frame: it is a
             // Rust helper body descended into, and `framestack.last()` there
             // describes the helper's own entry (or, for a root helper walk that
-            // pushes none, an unrelated caller). The arm is reachable from one:
-            // `_unpackiterable_unknown_length` is a second jit driver and the
-            // only helper jitcode in the build that carries a
-            // `jit_merge_point` -- 2 of 2939 do, and the other is the portal
-            // `eval_loop_jit` itself. So exclude it explicitly rather than
-            // relying on the token lookup to miss.
-            //
-            // No corpus program reaches the arm this way today: over the 491
-            // synthetic fixtures the print below never fires while its control
-            // in `inline_call.rs` does, on one fixture and one helper. The
-            // exclusion is the invariant, not a repair of an observed answer.
+            // pushes none, an unrelated caller). The CALL_ASSEMBLER arm is
+            // reachable from one: `_unpackiterable_unknown_length` is a
+            // second jit driver and carries its own `jit_merge_point`.
+            // Every per-code Python body now also carries
+            // `jit_merge_point` (`interp_jit.py` `dispatch`), and a
+            // generator-resume helper walk of that body reaches this
+            // handler too. Exclude helpers from CALL_ASSEMBLER (wrong
+            // `w_code`) and, below, from `reached_loop_header` (wrong
+            // reds): `opimpl_jit_merge_point` with
+            // `portal_call_depth > 0` never closes the root loop.
             if fbw_debug_abort_enabled() && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
             {
                 eprintln!(
@@ -17071,9 +17514,54 @@ fn handle<Sym: WalkSym>(
                         .map(|frame| frame.w_code),
                 );
             }
+            // pyjitpl.py `_handle_guard_failure` pre-arms the flag when the
+            // source guard is a `ResumeAtPositionDescr` — the descr
+            // `inline_short_preamble` stamps onto the guards it replays
+            // (unroll.py OptUnroll.inline_short_preamble). Those guards sit at
+            // the target loop's entry, so the bridge grown from one has to
+            // close at its very first merge point rather than record another
+            // iteration first. Arming here rather than at the bridge setup
+            // keeps the flag equal to the `jdindex` the assert below compares
+            // against, and runs before the recursive arm so a pre-armed
+            // inlined header still takes `do_recursive_call`.
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
+            {
+                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
+                ctx.trace_ctx.seen_loop_header_jit_pc = None;
+            }
+            // pyjitpl.py `opimpl_jit_merge_point`:
+            //     if seen_loop_header_for_jdindex < 0:
+            //         if not jitdriver_sd.no_loop_header:
+            //             if self.metainterp.portal_call_depth:
+            //                 return
+            // An inlined callee's first merge point (fall-through into a
+            // `while`, or dispatch top) keeps tracing so the body records.
+            // `finishframe` + `do_recursive_call(assembler_call=True)` waits
+            // for a `loop_header` stamp. Cutting here residualizes that body
+            // (`f_locals` as a may-force call) and aborts `ABORT_ESCAPE`.
+            // `no_loop_header` drivers skip this return: the auto-stamp
+            // below treats the first merge point as the header, then the
+            // recursive arm CALL_ASSEMBLERs (`pyjitpl.py`, and
+            // `pyjitpl/dispatch.rs` `inline_depth() > 0 && seen < 0 &&
+            // !no_loop_header`).
+            let no_loop_header = ctx
+                .trace_ctx
+                .metainterp_sd()
+                .jitdrivers_sd
+                .get(jdindex)
+                .map(|jd| jd.no_loop_header)
+                .unwrap_or(false);
+            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && !ctx.is_top_level
+                && !no_loop_header
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
             // `opimpl_jit_merge_point` (`pyjitpl.py`), the `else` taken when
-            // `metainterp.portal_call_depth` is non-zero: this header is not
-            // the traced loop's own close. Finish the callee and
+            // `metainterp.portal_call_depth` is non-zero and a loop_header has
+            // already stamped the flag: this header is not the traced loop's
+            // own close. Finish the callee and
             // `do_recursive_call(..., assembler_call=True)`. A frame rebuilt
             // by `rebuild_from_resumedata` is an ordinary MIFrame, so a bridge
             // that resumes inside a callee and later reaches that callee's
@@ -17082,21 +17570,12 @@ fn handle<Sym: WalkSym>(
             // (`direct_assembler_call`); no token records the portal runner
             // (`direct_call_may_force`) instead of walking the loop body.
             // Nested inlines inherit `carrier_resume` and are consumed by
-            // `try_walker_inline_resolved_user_call`. A missing token there
-            // residualizes the original CALL.
+            // `try_walker_inline_resolved_user_call`. A missing token is
+            // retried through `get_or_make_portal_assembler_token_arc`
+            // (`compile_tmp_callback`). Still none records
+            // `direct_call_may_force`; a recorder that returns before any op
+            // leaves the original CALL.
             let carrier_resume = ctx.fbw_mode.carrier_resume;
-            // `opimpl_jit_merge_point` (`pyjitpl.py`): looked up once and
-            // shared by both inlined CALL_ASSEMBLER arms, the after-back-edge
-            // helper, and the auto-stamp below. `no_loop_header` stamps
-            // `seen_loop_header_for_jdindex` itself instead of waiting for
-            // an explicit `loop_header`.
-            let no_loop_header = ctx
-                .trace_ctx
-                .metainterp_sd()
-                .jitdrivers_sd
-                .get(jdindex)
-                .map(|jd| jd.no_loop_header)
-                .unwrap_or(false);
             let callee_code = (!ctx.is_top_level
                 && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
             .then(|| {
@@ -17108,47 +17587,29 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
-                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                    || carrier_resume
-                    || no_loop_header
-                {
-                    let callee_key = crate::driver::make_green_key_typed(
-                        callee_code as *const (),
-                        next_instr,
-                        is_being_profiled,
-                    );
-                    let (driver, _) = crate::driver::driver_pair();
-                    let greenboxes = [
-                        Value::Int(next_instr as i64),
-                        Value::Int(is_being_profiled as i64),
-                        Value::Ref(majit_ir::GcRef(callee_code)),
-                    ];
-                    let red_types = [Type::Ref, Type::Ref];
-                    let token = driver.get_or_make_portal_assembler_token_arc(
-                        &callee_key,
-                        &greenboxes,
-                        &red_types,
-                    );
-                    if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                        ctx.trace_ctx,
-                        token,
-                        next_instr,
-                        carrier_resume,
-                        op.pc,
-                        op.next_pc,
-                        no_loop_header,
-                    ) {
-                        return Ok(outcome);
-                    }
-                } else {
-                    // Fall-through onto a loop header in an inlined frame:
-                    // `opimpl_jit_merge_point` `if not jitdriver_sd.no_loop_header:
-                    // if portal_call_depth: return`. Continue here so an
-                    // unresolved callee pycode green does not abort the walk;
-                    // the body records until the first backward jump stamps
-                    // `loop_header`.
-                    return Ok((DispatchOutcome::Continue, op.next_pc));
+                if let Some(outcome) = inlined_merge_point_recursive_call(
+                    ctx,
+                    callee_code,
+                    next_instr,
+                    is_being_profiled,
+                    carrier_resume,
+                    op,
+                ) {
+                    return Ok(outcome);
                 }
+            }
+            // `opimpl_jit_merge_point` (`pyjitpl.py`):
+            // `portal_call_depth > 0` never `reached_loop_header`. A
+            // transparent helper has no Python framestack entry for
+            // CALL_ASSEMBLER; falling through would close the root
+            // loop against the helper's reds (a for-iter item in the
+            // frame slot, then `capture_frame_locals` on that word).
+            // Clear the stamp the inlined arm clears, then keep
+            // recording.
+            if !ctx.is_top_level {
+                ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
+                let _ = ctx.trace_ctx.seen_loop_header_jit_pc.take();
+                return Ok((DispatchOutcome::Continue, op.next_pc));
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
                 Some(Value::Ref(gcref)) if gcref.0 != 0 => gcref.0 as *const (),
@@ -17172,40 +17633,15 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
-                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
-                            || carrier_resume
-                            || no_loop_header
-                        {
-                            let callee_key = crate::driver::make_green_key_typed(
-                                callee_code as *const (),
-                                next_instr,
-                                is_being_profiled,
-                            );
-                            let (driver, _) = crate::driver::driver_pair();
-                            let greenboxes = [
-                                Value::Int(next_instr as i64),
-                                Value::Int(is_being_profiled as i64),
-                                Value::Ref(majit_ir::GcRef(callee_code)),
-                            ];
-                            let red_types = [Type::Ref, Type::Ref];
-                            let token = driver.get_or_make_portal_assembler_token_arc(
-                                &callee_key,
-                                &greenboxes,
-                                &red_types,
-                            );
-                            if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                                ctx.trace_ctx,
-                                token,
-                                next_instr,
-                                carrier_resume,
-                                op.pc,
-                                op.next_pc,
-                                no_loop_header,
-                            ) {
-                                return Ok(outcome);
-                            }
-                        } else {
-                            return Ok((DispatchOutcome::Continue, op.next_pc));
+                        if let Some(outcome) = inlined_merge_point_recursive_call(
+                            ctx,
+                            callee_code,
+                            next_instr,
+                            is_being_profiled,
+                            carrier_resume,
+                            op,
+                        ) {
+                            return Ok(outcome);
                         }
                     }
                     top_level_live_code(ctx)
@@ -17227,27 +17663,14 @@ fn handle<Sym: WalkSym>(
             // loop-header + close protocol (`pyjitpl/dispatch.rs`).
             // The `c` form's jdindex is the leading literal byte; the `i`
             // form was resolved through its Int-bank operand above.
-            // pyjitpl.py `_handle_guard_failure` pre-arms the flag
-            // when the source guard is a `ResumeAtPositionDescr` — the descr
-            // `inline_short_preamble` stamps onto the guards it replays
-            // (`unroll.py` `OptUnroll._jump_to_existing_trace`). Those guards
-            // sit at the target loop's entry, so the bridge grown from one has
-            // to close at its very first merge point rather than record another
-            // iteration first. Arming here rather than at the bridge setup
-            // keeps the flag equal to the `jdindex` the assert below compares
-            // against.
-            if ctx.trace_ctx.seen_loop_header_for_jdindex < 0
-                && std::mem::take(&mut ctx.trace_ctx.bridge_resume_at_position)
-            {
-                ctx.trace_ctx.seen_loop_header_for_jdindex = jdindex as i32;
-                ctx.trace_ctx.seen_loop_header_jit_pc = None;
-            }
             if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
                 // pyjitpl.py `if not any_operation: return`.
                 if ctx.trace_ctx.num_ops() == 0 {
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // pyjitpl.py `if not jitdriver_sd.no_loop_header:`
+                // (`no_loop_header` hoisted above, same as
+                // `pyjitpl/dispatch.rs`).
                 if !no_loop_header {
                     // pyjitpl.py `if self.metainterp.portal_call_depth:
                     // return` — nested portal call waits for an explicit
@@ -17287,385 +17710,77 @@ fn handle<Sym: WalkSym>(
             ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
             let back_edge_jit_pc = ctx.trace_ctx.seen_loop_header_jit_pc.take();
 
-            // pyjitpl.py self.heapcache.reset()
-            // The walker's cached sys_exc_value box is a heap-field cache too
-            // and is dropped with it. The prepared SAVE_EXCEPTION box is a
-            // pre-cut producer: `reached_loop_header` keeps only
-            // `live_arg_boxes`, so consume it with the seed.
-            ctx.trace_ctx.heap_cache_mut().reset();
-            ctx.trace_ctx.consume_bridge_exception_resume();
-            {
-                let mut state = ctx.frame_state.borrow_mut();
-                state.current_exception_seed = None;
-                state.current_exception_seed_concrete = pyre_object::PY_NULL;
-            }
-            ctx.fbw_mode.current_exception_seed_from_walk_store = false;
-
-            // `close_loop_args_at` (trace_opcode.rs) runs the merge-point
-            // vable `last_instr` sync BEFORE building the jump args: the
-            // scalar is overridden to `merge_pc - 1` (a resume into the
-            // target loop must re-enter at the header opcode). The walker
-            // must do the same before `append_virtualizable_boxes` below —
-            // otherwise the compile_trace arm's JUMP into the existing loop
-            // carries the LAST GUARD's published `last_instr` (e.g. 104
-            // instead of header-1=86 on fannkuch), resuming the interpreter
-            // at the wrong bytecode (fannkuch permutation state never
-            // reaches its exit condition → non-crashing infinite loop).
-            sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
-
-            // Reds = the live loop args, in bytecode bank order
-            // [int.., ref.., float..]. For pyre's portal jitdriver the
-            // reds are `[frame, ec]` (both Ref → rr), matching the
-            // reds-only LABEL inputargs after
-            // `patch_new_loop_to_load_virtualizable_fields`.
-            let mut live_args: Vec<OpRef> = Vec::with_capacity(ri.len() + rr.len() + rf.len());
-            live_args.extend(ri.iter().copied());
-            live_args.extend(rr.iter().copied());
-            live_args.extend(rf.iter().copied());
-            // The loop-close path (`run_perfn_walk` CloseLoop post-processing,
-            // trace.rs) rebuilds the jump args via `close_loop_args_at`, which
-            // sources the reds from `sym.frame` / `sym.execution_context` — not
-            // from the walk register file read above (the register slot may
-            // hold a const-folded alias of the same value). The merge-point
-            // registration must use the SAME box identities: `history.cut`
-            // (cross-loop cut, pyjitpl.py) takes the registered
-            // green_boxes as the new loop's inputargs, and a close-side red
-            // absent from them escapes into an extra appended inputarg —
-            // producing an entry layout `patch_new_loop_to_load_virtualizable_
-            // fields` cannot reduce, so every interpreter entry aborts
-            // (`extend_compiled_live_values` count mismatch).
+            let mut reds = Vec::with_capacity(ri.len() + rr.len() + rf.len());
+            reds.extend(ri.iter().copied());
+            reds.extend(rr.iter().copied());
+            reds.extend(rf.iter().copied());
+            // The loop-close path rebuilds jump args from `sym.frame` /
+            // `sym.execution_context`. Register the same boxes: `history.cut`
+            // takes the registered green boxes as the new loop's inputargs,
+            // and a close-side red absent from them becomes an extra inputarg
+            // `patch_new_loop_to_load_virtualizable_fields` cannot reduce.
+            let mut sym_reds = SymRedWriteback::default();
             {
                 let sym_ptr = ctx.fbw_mode.snapshot_sym;
                 if !sym_ptr.is_null() && ri.is_empty() && rf.is_empty() && rr.len() == 2 {
                     let sym = unsafe { &*sym_ptr };
-                    live_args[0] = sym.frame();
+                    reds[0] = sym.frame();
+                    sym_reds.frame = true;
                     if !sym.execution_context().is_none() {
-                        live_args[1] = sym.execution_context();
+                        reds[1] = sym.execution_context();
+                        sym_reds.ec = true;
                     }
                 }
             }
-            // A crossed `compile_trace` walk keeps the origin frame's
-            // `virtualizable_boxes`. Dest LABEL arity is dest's
-            // `locals_cells_stack_w` length (`virtualizable.py
-            // get_array_length`). Re-derive dest boxes with recorded
-            // GETFIELD_GC / GETARRAYITEM_GC (`initialize_virtualizable`
-            // `read_boxes` as IR, `patch_new_loop_to_load_virtualizable_fields`)
-            // so the JUMP args are boxes, not constants, and match dest.
-            if let Some(&frame) = live_args.first() {
-                ctx.trace_ctx.gen_load_from_other_virtualizable(frame);
-                // Re-sync replaces the cache, including last_instr. Pin
-                // dest's slot to merge_pc-1 after that write.
-                sync_intermediate_merge_point_last_instr(ctx.trace_ctx, next_instr);
-            }
-            // Array index `>= valuestackdepth` is the dead stack tail
-            // (`pyframe.py popvalue_maybe_none`). majit's fill is generic
-            // (`virtualizable.py VirtualizableInfo`); supply the boundary
-            // from the concrete frame, falling back to the symbolic mirror
-            // the same way `close_loop_args_at` does.
-            let dead_array_tail_from = (!ctx.fbw_mode.snapshot_sym.is_null()).then(|| {
-                let sym = unsafe { &*ctx.fbw_mode.snapshot_sym };
-                crate::state::concrete_stack_depth(sym.tracing_vable_frame_addr())
-                    .unwrap_or_else(|| sym.valuestackdepth())
-            });
-            ctx.trace_ctx
-                .fill_virtualizable_boxes_to_declared_layout(dead_array_tail_from);
-            live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
-
-            // pyjitpl.py remove_consts_and_duplicates over the
-            // reds + virtualizable_boxes[:-1]: every live arg must be a
-            // distinct non-const box before it is registered as a merge
-            // point or matched for loop closure. A const or duplicate is
-            // replaced with a fresh `same_as` op, written back into the
-            // virtualizable shadow so subsequent reads/snapshots use the
-            // new identity (the in-place boxes[i] mutation upstream).
-            // Without this, the registered green_boxes carry the SAME
-            // OpRef at two positions and `cut_trace_from`'s remap maps
-            // both to the LAST position — every body/snapshot reference
-            // to the duplicated box then reads the wrong loop-carried
-            // slot (e.g. a local aliased by a dead stack entry reads the
-            // entry's NULL at every deopt).
-            {
-                use std::collections::HashSet;
-                let mut duplicates: HashSet<OpRef> = HashSet::new();
-                for i in 0..live_args.len() {
-                    let opref = live_args[i];
-                    if opref.is_constant() || !duplicates.insert(opref) {
-                        let tp = ctx
-                            .trace_ctx
-                            .get_opref_type(opref)
-                            .unwrap_or(majit_ir::Type::Ref);
-                        let new_opref = ctx.trace_ctx.record_same_as(opref, tp);
-                        live_args[i] = new_opref;
-                        // live_args = [frame, ec, vable_boxes[0..len-1]];
-                        // frame/ec are first-occurrence runtime boxes and
-                        // never wrap, so only the vable payload mirrors
-                        // back (virtualizable_boxes[i] = op upstream).
-                        if i >= 2 {
-                            ctx.trace_ctx.set_virtualizable_box_at(i - 2, new_opref);
-                        }
-                    }
-                }
-            }
-
-            if std::env::var("PYRE_DIAG_51C").is_ok() {
-                eprintln!(
-                    "[51c-redclose] pc={} ri_regs={:?} rr_regs={:?} rf_regs={:?}",
-                    op.pc, ri, rr, rf
-                );
-                for (idx, &arg) in live_args.iter().enumerate() {
-                    eprintln!(
-                        "[51c-redclose]   live_arg[{idx}] {arg:?} concrete={:?}",
-                        ctx.trace_ctx.concrete_of_opref(arg)
-                    );
-                }
-            }
-
-            // pyjitpl.py compile_trace attempt (retired trait
-            // mirror `close_loop_args`): when the
-            // crossed green key already has compiled targets and no
-            // retrace is in progress, close the trace-so-far as a bridge
-            // (guard origin) / entry bridge (interp origin,
-            // `compile_trace_from_interp`) ending in a JUMP into the
-            // existing loop.  Without this a func-entry trace that walks
-            // the prologue and reaches the already-hot inner loop header
-            // falls through to compile_loop → has_compiled_targets →
-            // SwitchToBlackhole(ABORT_BAD_LOOP), so every portal call
-            // re-runs the prologue interpreted and re-aborts a trace —
-            // overhead scaling with call count.
-            if ctx.is_top_level && ctx.is_authoritative_executor {
-                let (driver, _) = crate::driver::driver_pair();
-                let has_partial = driver.meta_interp().partial_trace().is_some();
-                let bridge_origin = driver
-                    .meta_interp()
-                    .bridge_info()
-                    .map(|b| (b.trace_id, b.fail_index));
-                let has_targets = driver.meta_interp().has_compiled_targets(key);
-                // pyjitpl.py `if not self.partial_trace:` is the only
-                // compile_trace gate. Upstream retries on every header visit.
-                if !has_partial && has_targets {
-                    // pyjitpl.py reached_loop_header:
-                    //
-                    //     # generate a dummy guard just before the JUMP so
-                    //     # that unroll can use it when it's creating
-                    //     # artificial guards.
-                    //     self.generate_guard(rop.GUARD_FUTURE_CONDITION)
-                    //
-                    // Upstream emits it once in `reached_loop_header`, ahead
-                    // of BOTH the `get_procedure_token` / `compile_trace`
-                    // pair that closes into an ALREADY compiled loop
-                    // and the merge-point scan that closes a
-                    // loop of the trace's own. pyre splits those two
-                    // outcomes across different returns and had the guard on
-                    // only one of them: the own-loop leg gets it from
-                    // `close_loop_args_at`, which runs off
-                    // `DispatchOutcome::CloseLoop`, while this leg returns
-                    // `CompileTracePending` and never reached it. So every
-                    // bridge arrived at the optimizer carrying no
-                    // GUARD_FUTURE_CONDITION — measured across
-                    // `pyre/bench/synth`: 672 bridge compilations, 0 with
-                    // one. `Optimizer.patchguardop` was left to a stand-in
-                    // synthesized from one of the bridge's own body guards,
-                    // whose resume coordinate is mid-trace where upstream's
-                    // is the merge point's, and a bridge with no such guard
-                    // got none at all.
-                    //
-                    // `_jump_to_existing_trace` dereferences that
-                    // patchguardop for the extra virtual-state guards
-                    // (`unroll.py` `_jump_to_existing_trace`) and hands it to
-                    // `inline_short_preamble`, which stamps it onto every
-                    // replayed short-preamble guard.
-                    //
-                    // Emitted on this leg only, so the own-loop leg is not
-                    // double-guarded. The capture coordinate is the
-                    // `jit_merge_point` op's OWN JitCode pc — the walk is
-                    // standing on the loop header, so "where we are" and
-                    // "where the synthesized JUMP goes" are the same
-                    // program point. `next_instr` is the green Python pc
-                    // (`make_green_key` above); feeding it to a parameter
-                    // read as a JitCode offset resolves an unrelated
-                    // `-live-` marker, and the snapshot then describes a
-                    // program point the walk registers hold nothing for.
-                    ctx.trace_ctx
-                        .record_guard(OpCode::GuardFutureCondition, &[], 0);
-                    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-                    let outcome = match bridge_origin {
-                        // Guard-origin: existing bridge path.
-                        Some(_) => {
-                            driver
-                                .meta_interp_mut()
-                                .compile_trace(key, &live_args, bridge_origin)
-                        }
-                        // pyjitpl.py interp-origin: a
-                        // function-entry trace (ResumeFromInterpDescr)
-                        // closes as an entry bridge jumping into the
-                        // already-compiled hot loop (compile.py);
-                        // a trace rooted at a *loop header* falls back to
-                        // the plain bridge shape.
-                        None => match driver.compile_trace_entry_data() {
-                            Some((original_green_key, mut entry_meta)) => {
-                                // `compile_trace_entry_data` clones the active
-                                // trace metadata, whose `namespace_dependent` is
-                                // only finalized by `finish_trace_namespace_dependency`
-                                // after the walk returns. An entry bridge is
-                                // compiled mid-walk, before that finalize, so a
-                                // trace that has already read a module global
-                                // would otherwise install the bridge with a stale
-                                // `namespace_dependent = false` and let it be
-                                // re-entered after later namespace growth. Fold in
-                                // the live per-trace flag so the bridge keeps the
-                                // conservative namespace gate.
-                                entry_meta.namespace_dependent |= ctx.trace_ctx.reads_module_global;
-                                driver.meta_interp_mut().compile_trace_from_interp(
-                                    key,
-                                    &live_args,
-                                    original_green_key,
-                                    entry_meta,
-                                )
-                            }
-                            // compile.py compile_trace — an interp-origin close is a
-                            // `ResumeFromInterpDescr` entry bridge, and with no
-                            // entry data there is no original green key to attach
-                            // it to. `compile_trace(key, args, None)` cannot serve
-                            // that state: its `None`-origin arm demands the
-                            // entry-bridge payload and answers `Cancelled` for
-                            // every input, after deep-cloning the whole
-                            // trace-so-far and lowering its snapshot pool. Decline
-                            // here instead, so the give-up reads as one.
-                            // `compile_trace_entry_data` reads
-                            // `trace_ctx().root_green_key()` and `trace_meta()`,
-                            // and every `JitDriver` trace start installs both
-                            // halves, so this is unreachable from a jd0 walk; only
-                            // `MetaInterp::force_start_tracing` opens a tracer with
-                            // no session envelope.
-                            None => majit_metainterp::CompileOutcome::Cancelled,
-                        },
-                    };
-                    // pyjitpl.py `classify_compile_outcome` is the shared
-                    // reading of a close's outcome; the sibling close in
-                    // `JitDriver::merge_point` already goes through it.
-                    match driver.meta_interp().classify_compile_outcome(outcome) {
-                        majit_metainterp::BridgeCompileResult::Compiled => {
-                            if majit_metainterp::majit_log_enabled() {
-                                eprintln!(
-                                    "[jit][walker-reached-loop-header] compile_trace success: \
-                                 key={} pc={} bridge={:?}",
-                                    key, next_instr, bridge_origin
-                                );
-                            }
-                            // pyjitpl.py raise_if_successful() — the
-                            // successful compile_trace ends tracing; surface
-                            // the dedicated outcome so the driver maps it to
-                            // `TraceAction::CompileTrace` (no further compile
-                            // or abort on this session).
-                            driver.note_compile_trace_success();
-                            return Ok((
-                                DispatchOutcome::CompileTracePending {
-                                    loop_header_pc: next_instr,
-                                },
-                                op.next_pc,
-                            ));
-                        }
-                        // pyjitpl.py raise_if_successful does not raise
-                        // on None. Fall through to the merge-point scan;
-                        // the next header visit retries compile_trace.
-                        majit_metainterp::BridgeCompileResult::RetraceNeeded
-                        | majit_metainterp::BridgeCompileResult::Declined
-                        | majit_metainterp::BridgeCompileResult::Failed => {}
-                    }
-                    // The jump did not take (`compile.compile_trace` returns
-                    // None when none of the existing loop tokens match). Fall
-                    // through to the merge-point scan below, exactly as
-                    // `reached_loop_header` does after its own
-                    // `self.compile_trace(...)` call returns (pyjitpl.py):
-                    // the scan closes at the first same-greenkey merge point, and
-                    // `compile_loop` gives that trace up at its own
-                    // `has_compiled_targets` (pyjitpl.py); a first visit
-                    // registers a merge point (pyjitpl.py) and keeps
-                    // tracing.
-                    majit_metainterp::mc_diag_bump(27);
-                }
-            }
-
-            // pyjitpl.py: a matching merge point (same green key
-            // + red-bank shape) closes the loop; first visit registers and
-            // continues to unroll.
-            let live_typed =
-                crate::driver::make_green_key_typed(code_ptr, next_instr, is_being_profiled);
-            if ctx
-                .trace_ctx
-                .has_merge_point_same_greenkey(&live_typed, live_args.len())
-            {
-                // The matched merge point need not be the one tracing started
-                // from: `reached_loop_header` scans every registered merge
-                // point in reverse and closes at the first same_greenkey hit,
-                // whichever loop that is, and `compile_loop` re-derives the
-                // green key from the merge point it closed at.
-                let (loop_header_marker_jit_pc, back_edge_pc, back_edge_marker_jit_pc) = {
-                    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-                    if sym_ptr.is_null() {
+            let (loop_header_marker_jit_pc, back_edge_pc, back_edge_marker_jit_pc) = {
+                let sym_ptr = ctx.fbw_mode.snapshot_sym;
+                if sym_ptr.is_null() {
+                    (None, None, None)
+                } else {
+                    let sym = unsafe { &*sym_ptr };
+                    if sym.jitcode().is_null() {
                         (None, None, None)
                     } else {
-                        let sym = unsafe { &*sym_ptr };
-                        if sym.jitcode().is_null() {
-                            (None, None, None)
-                        } else {
-                            let payload = unsafe { &(&*sym.jitcode()).payload };
-                            let back_edge_pc = back_edge_jit_pc.map(|jit_pc| {
-                                crate::py_coord::containing_py_pc_for_jitcode_pc(
-                                    &payload.metadata,
-                                    jit_pc,
-                                ) as usize
-                            });
-                            (
-                                payload.resume_marker_for_jitcode_pc(op.pc),
-                                back_edge_pc,
-                                back_edge_jit_pc.and_then(|jit_pc| {
-                                    payload.resume_marker_for_jitcode_pc(jit_pc)
-                                }),
-                            )
-                        }
+                        let payload = unsafe { &(&*sym.jitcode()).payload };
+                        let back_edge_pc = back_edge_jit_pc.map(|jit_pc| {
+                            crate::py_coord::containing_py_pc_for_jitcode_pc(
+                                &payload.metadata,
+                                jit_pc,
+                            ) as usize
+                        });
+                        (
+                            payload.resume_marker_for_jitcode_pc(op.pc),
+                            back_edge_pc,
+                            back_edge_jit_pc
+                                .and_then(|jit_pc| payload.resume_marker_for_jitcode_pc(jit_pc)),
+                        )
                     }
-                };
-                Ok((
-                    DispatchOutcome::CloseLoop {
-                        jump_args: live_args,
-                        loop_header_pc: next_instr,
+                }
+            };
+            match reached_loop_header(
+                ctx,
+                ReachedLoopHeader {
+                    code_ptr,
+                    next_instr,
+                    is_being_profiled,
+                    reds,
+                    red_i_regs,
+                    red_r_regs: red_r_regs.clone(),
+                    red_f_regs,
+                    sym_reds,
+                    snapshot_jit_pc: op.pc,
+                    markers: LoopHeaderMarkers {
                         loop_header_marker_jit_pc,
                         back_edge_pc,
                         back_edge_marker_jit_pc,
-                        merge_point_registers_r: ctx.registers_r.to_vec(),
                     },
-                    op.next_pc,
-                ))
-            } else {
-                // This merge point registers (does not close) — no already
-                // registered merge point carries this green key and red-bank
-                // shape, so this is the first arrival at the loop whose header
-                // is `next_instr`.  The intermediate merge-point
-                // vable→heap writeback (#62 / #67-remaining) already ran
-                // above, before the live-args build, mirroring
-                // `close_loop_args_at`'s ordering.
-                let green_boxes: Vec<majit_metainterp::GreenBox> = live_args
-                    .iter()
-                    .map(|opref| {
-                        let ty = ctx.trace_ctx.get_opref_type(*opref).unwrap_or_else(|| {
-                            panic!(
-                                "jit_merge_point live arg {opref:?} has no type in \
-                                 OptContext; RPython Box always carries its type"
-                            )
-                        });
-                        majit_metainterp::GreenBox::new(*opref, ty)
-                    })
-                    .collect();
-                ctx.trace_ctx
-                    .add_merge_point_with_key(key, live_typed, green_boxes, next_instr);
-                // pyjitpl.py put_back_list_of_boxes3: reached_loop_header
-                // did not close. Subsequent snapshots and ops must see
-                // the SAME_AS boxes in the red registers they were read
-                // from, not the Consts they wrapped.
-                put_back_list_of_boxes3(ctx, &red_i_regs, &red_r_regs, &red_f_regs, &live_args);
-                put_back_virtualizable_mapped_colors(ctx, op.pc, op.next_pc, &red_r_regs);
-                Ok((DispatchOutcome::Continue, op.next_pc))
+                },
+            )? {
+                Some(outcome) => Ok((outcome, op.next_pc)),
+                None => {
+                    put_back_virtualizable_mapped_colors(ctx, op.pc, op.next_pc, &red_r_regs);
+                    Ok((DispatchOutcome::Continue, op.next_pc))
+                }
             }
         }
         key if key.starts_with("recursive_call_") => dispatch_recursive_call(code, op, ctx),

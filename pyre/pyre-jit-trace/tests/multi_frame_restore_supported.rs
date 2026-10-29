@@ -12,10 +12,7 @@ use pyre_jit_trace::state::PyreJitState;
 
 #[test]
 fn pyre_jit_state_supports_multi_frame_restore() {
-    let state = PyreJitState {
-        frame: 0,
-        execution_context: 0,
-    };
+    let state = PyreJitState::new(0, 0);
     assert!(
         state.supports_multi_frame_restore(),
         "PyreJitState must override JitState::supports_multi_frame_restore \

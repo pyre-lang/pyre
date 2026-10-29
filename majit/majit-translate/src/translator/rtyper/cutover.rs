@@ -2314,6 +2314,32 @@ fn seed_declared_funcptr_type(graph: &LegacyGraph, entry: &FunctionEntry) {
     }
 }
 
+/// Prefill a residual cachedgraph for a handle method with no upstream
+/// graph.
+///
+/// `executioncontext.py` `ExecutionContext.enter` / `leave` /
+/// `return_trace` are ordinary annotated bodies; they are not
+/// `register_external` (`extfunc.py`) and carry no
+/// `@jit.dont_look_inside`.  A raw-storage receiver does not make those
+/// methods external.
+///
+/// `PyError::pin` / `reload` getattr the tuple field `value` off a
+/// `PyErrorObject` classdef (the handle was interned as the object).
+/// RPython's GC transform roots `OperationError` locals; these handle
+/// methods do not exist upstream.
+fn annotator_residual_raw_method(key: &FunctionPathKey) -> bool {
+    let segs = key.segments();
+    let [.., owner, method] = segs else {
+        return false;
+    };
+    if matches!(method.as_str(), "pin" | "reload")
+        && (owner == "PyError" || (owner == "<Impl>" && segs.iter().any(|s| s == "error")))
+    {
+        return true;
+    }
+    false
+}
+
 /// Give the registry entry of a funcobj the lowered body its default
 /// graph is built from (Pass 2 of
 /// [`populate_call_registry_from_call_graphs`]).
@@ -2349,7 +2375,8 @@ fn install_source_graph(
         return;
     }
     let residualize = graph.hints.iter().any(|h| h == "dont_look_inside")
-        || graph.hints.iter().any(|h| h == "elidable");
+        || graph.hints.iter().any(|h| h == "elidable")
+        || annotator_residual_raw_method(key);
     if residualize {
         // The materialisers' raw `*mut PyObject` return is only their
         // residual-call ABI.  Their FunctionDesc carries the orthodox
