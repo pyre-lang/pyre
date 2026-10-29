@@ -272,6 +272,14 @@ extern "C" fn bh_w_type_is_cpython_immutabletype(w_type: i64) -> i64 {
     }
 }
 
+/// `w_type_get_flag_map_or_seq` returns `u8`. Residual calls read a whole word, so
+/// zero-extend it (`descr.py CallDescr.create_call_stub`).
+extern "C" fn bh_w_type_get_flag_map_or_seq(w_type: i64) -> i64 {
+    i64::from(unsafe {
+        pyre_object::w_type_get_flag_map_or_seq(w_type as usize as pyre_object::PyObjectRef)
+    })
+}
+
 /// `try_gc_owns_object` returns `bool`. Same widening as
 /// [`bh_w_type_issubtype`]: `descr.py CallDescr.create_call_stub` calls
 /// with the actual RESULT type then casts to Signed, and a raw `-> bool`
@@ -2448,6 +2456,13 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::typeobject::w_type_is_cpython_immutabletype",
         "pyre_object::w_type_is_cpython_immutabletype",
         bh_w_type_is_cpython_immutabletype,
+    );
+    // `flag_map_or_seq` read for `is_iterable` / mapping checks; one-byte result widened.
+    cpa1!(
+        &mut entries,
+        "pyre_object::typeobject::w_type_get_flag_map_or_seq",
+        "pyre_object::w_type_get_flag_map_or_seq",
+        bh_w_type_get_flag_map_or_seq,
     );
     // `lookup_exc_class_for_kind` reads the process-global `EXC_CLASS_BY_KIND`
     // registry the tracer cannot model; its residual call rides a C-ABI
@@ -7449,6 +7464,20 @@ mod tests {
                 "{path} must widen the bool before the residual reads a word",
             );
         }
+        let flag: extern "C" fn(i64) -> i64 = super::bh_w_type_get_flag_map_or_seq;
+        for path in [
+            "pyre_object::typeobject::w_type_get_flag_map_or_seq",
+            "pyre_object::w_type_get_flag_map_or_seq",
+        ] {
+            assert_eq!(
+                entries
+                    .iter()
+                    .find(|(name, _)| *name == path)
+                    .map(|(_, addr)| *addr),
+                Some(flag as *const () as usize as i64),
+                "{path} must widen the u8 before the residual reads a word",
+            );
+        }
     }
 
     #[test]
@@ -8161,6 +8190,14 @@ mod tests {
         assert_eq!(
             bindings["pyre_object::typeobject::w_type_is_cpython_immutabletype"],
             super::bh_w_type_is_cpython_immutabletype as *const () as usize as i64,
+        );
+        assert_eq!(
+            bindings["pyre_object::typeobject::w_type_get_flag_map_or_seq"],
+            super::bh_w_type_get_flag_map_or_seq as *const () as usize as i64,
+        );
+        assert_eq!(
+            bindings["pyre_object::w_type_get_flag_map_or_seq"],
+            super::bh_w_type_get_flag_map_or_seq as *const () as usize as i64,
         );
         assert_eq!(
             bindings["bytecode::oparg::LoadAttr::name_idx"],

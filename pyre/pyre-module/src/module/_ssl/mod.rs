@@ -2747,6 +2747,30 @@ mod ssl_socket_methods {
             w_tuple_new(fields.take())
         }
 
+        /// `_ssl__SSLSocket_group_impl`. `SSL_get0_group_name` needs OpenSSL 3.2;
+        /// `OPENSSL_VERSION_NUMBER` is `0x30000000`, so this raises.
+        fn group(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::not_implemented(
+                "Getting selected group requires OpenSSL 3.2 or later.",
+            ))
+        }
+
+        /// `_ssl__SSLSocket_client_sigalg_impl` (`ssl_socket_signame_impl`). `SSL_get0_signature_name`
+        /// needs OpenSSL 3.5; `OPENSSL_VERSION_NUMBER` is `0x30000000`, so this raises.
+        fn client_sigalg(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::not_implemented(
+                "Getting sig algorithms requires OpenSSL 3.5 or later.",
+            ))
+        }
+
+        /// `_ssl__SSLSocket_server_sigalg_impl` (`ssl_socket_signame_impl`). `SSL_get0_signature_name`
+        /// needs OpenSSL 3.5; `OPENSSL_VERSION_NUMBER` is `0x30000000`, so this raises.
+        fn server_sigalg(&self) -> Result<PyObjectRef, pyre_interpreter::PyError> {
+            Err(pyre_interpreter::PyError::not_implemented(
+                "Getting sig algorithms requires OpenSSL 3.5 or later.",
+            ))
+        }
+
         fn getpeercert(
             &self,
             #[default(false)] binary_form: bool,

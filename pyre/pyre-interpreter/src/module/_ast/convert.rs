@@ -4998,6 +4998,21 @@ mod tests {
     }
 
     #[test]
+    fn compile_unpacking_dict_comp_ast() {
+        let _ec = boot();
+        let tree = parse_exec("{**d for d in x}");
+        compile_ast(tree);
+        super::preprocess_object_to_object(
+            parse_exec("{**d for d in x}"),
+            "",
+            crate::compile::Mode::Exec,
+            crate::compile::CompileOpts::default(),
+            true,
+        )
+        .unwrap_or_else(|err| panic!("PyCF_ONLY_AST unpacking dictcomp: {err:?}"));
+    }
+
+    #[test]
     fn tstring_debug_line_continuation_str_drops_marker() {
         let _ec = boot();
         let tree = parse_exec("t\"\"\"Value: {value =\\\n}\"\"\"");

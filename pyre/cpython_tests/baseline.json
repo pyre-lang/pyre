@@ -58,8 +58,7 @@
       "reason": "CPython Parser/asdl internals"
     },
     "test.test_ast": {
-      "dynasm": "FAIL",
-      "reason": "test_replace_non_str_kwarg (gh-144169): the call protocol rejects a non-str ** key (argument.py _do_combine_starstarargs_wrapped) before ast_type_replace formats it with %R"
+      "dynasm": "PASS"
     },
     "test.test_asyncgen": {
       "dynasm": "PASS"
