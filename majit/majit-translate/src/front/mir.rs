@@ -5334,7 +5334,8 @@ pub use self::gcroot::{
     scope_owner_identity,
 };
 pub(crate) use self::gcroot::{
-    ROOT_SCOPE_CLOSE, RootStackAnalyzer, is_root_scope_drop_glue_call, is_rust_vec_free_call,
+    ROOT_SCOPE_CLOSE, RootStackAnalyzer, harvest_root_stack_touching_paths_with,
+    harvest_scope_owning_identities_with, is_root_scope_drop_glue_call, is_rust_vec_free_call,
     is_shadow_stack_bracket_close, is_slice_buffer_free_call,
 };
 pub(crate) use self::lltype::{

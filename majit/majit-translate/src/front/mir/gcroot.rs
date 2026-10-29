@@ -1463,10 +1463,15 @@ pub struct RootStackState {
     >,
     /// Every impl body a trait method call may reach, built on first use.
     pub(in crate::front::mir) trait_methods: std::cell::OnceCell<TraitMethodBodies>,
-    /// `FunDecl` id -> whether that body opens a bracket and returns its
-    /// guard inside the result, as `DictOperationGuard::new` does.
-    pub(in crate::front::mir) scope_constructors:
-        std::cell::RefCell<std::collections::HashMap<u64, bool>>,
+    /// `GraphAnalyzer._analyzed_calls` for [`RootStackAnalyzer::fn_returns_owned_scope`]:
+    /// `FunDecl` id -> whether that body opens a bracket and returns its guard inside the result, as
+    /// `DictOperationGuard::new` does.
+    pub(in crate::front::mir) scope_constructors: std::cell::RefCell<
+        crate::tool::algo::unionfind::UnionFind<
+            u64,
+            crate::translator::backendopt::graphanalyze::Dependency<bool>,
+        >,
+    >,
 }
 
 /// The impl bodies behind each trait method of one artefact.
@@ -1503,7 +1508,11 @@ impl RootStackState {
                 |_: &u64| crate::translator::backendopt::graphanalyze::Dependency::new(false),
             )),
             trait_methods: std::cell::OnceCell::new(),
-            scope_constructors: std::cell::RefCell::new(std::collections::HashMap::new()),
+            scope_constructors: std::cell::RefCell::new(
+                crate::tool::algo::unionfind::UnionFind::new(|_: &u64| {
+                    crate::translator::backendopt::graphanalyze::Dependency::new(false)
+                }),
+            ),
         }
     }
 }
@@ -1527,19 +1536,27 @@ impl<'a> RootStackAnalyzer<'a> {
     /// result. A declaration with no body answers from the flag the link
     /// step set on that `FunDecl` when its identity matched a defining crate.
     pub(in crate::front::mir) fn fn_returns_owned_scope(&self, id: u64) -> bool {
-        if let Some(&known) = self.state.scope_constructors.borrow().get(&id) {
-            return known;
+        self.fn_returns_owned_scope_in(id, &mut RootStackTracker::new())
+    }
+
+    /// `analyze_direct_call` for the owned-scope question: `seen` merges a recursive cycle of
+    /// constructors into one result, so the answer does not depend on which member is asked first.
+    fn fn_returns_owned_scope_in(&self, id: u64, seen: &mut RootStackTracker) -> bool {
+        if !seen.enter(id, &mut self.state.scope_constructors.borrow_mut()) {
+            return seen.get_cached_result(id, &mut self.state.scope_constructors.borrow_mut());
         }
-        // A cycle does not return a scope through itself. A direct
-        // `push_roots` in this body is still seen below.
-        self.state.scope_constructors.borrow_mut().insert(id, false);
-        let answer = match self.llbc.fn_by_id(id) {
+        let result = match self.llbc.fn_by_id(id) {
             Some(fd) => match fd.unstructured() {
                 Some(body) => body_returns_owned_scope(
                     self.llbc,
                     &body,
                     &|reg| regular_call_name_path(reg, self.llbc),
-                    &|reg| self.call_returns_owned_scope(reg),
+                    &mut |reg| match &reg.kind {
+                        CallKind::Fun(FunId::Regular { id }) => {
+                            self.fn_returns_owned_scope_in(*id, seen)
+                        }
+                        _ => false,
+                    },
                 ),
                 None => fd
                     .returns_owned_scope
@@ -1547,11 +1564,8 @@ impl<'a> RootStackAnalyzer<'a> {
             },
             None => false,
         };
-        self.state
-            .scope_constructors
-            .borrow_mut()
-            .insert(id, answer);
-        answer
+        seen.leave_with(id, result, &mut self.state.scope_constructors.borrow_mut());
+        result
     }
 
     /// Whether a statically resolved call can change the root stack.
@@ -2034,57 +2048,17 @@ pub(in crate::front::mir) fn owned_root_scopes(
 /// it returns: the guard, through any plain moves, enters an aggregate that
 /// becomes `_0`, directly or through one moved local.  Such a constructor's pins belong to
 /// the bracket its caller now holds.
+///
+/// Only a call whose result can reach `_0` is asked, so each call the recursive
+/// query follows contributes its callee's answer to this body's answer — the
+/// premise `DependencyTracker` (`graphanalyze.py`) relies on when it merges a cycle.
 pub(in crate::front::mir) fn body_returns_owned_scope(
     llbc: &Llbc,
     body: &Unstructured,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
-    returns_owned: &impl Fn(&RegularCall) -> bool,
+    returns_owned: &mut impl FnMut(&RegularCall) -> bool,
 ) -> bool {
-    let guards: bit_set::BitSet = body
-        .body
-        .iter()
-        .filter_map(|bb| match bb.term_ref(llbc) {
-            Ok(TermKind::Call { call, .. }) => match (&call.func, &call.dest.kind) {
-                (CallFunc::Regular(reg), PlaceKind::Local(dest))
-                    if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path))
-                        || returns_owned(reg) =>
-                {
-                    Some(*dest as usize)
-                }
-                _ => None,
-            },
-            _ => None,
-        })
-        .collect();
-    if guards.is_empty() {
-        return false;
-    }
-    // Follow plain moves of a guard (`_21 = move _3`) to the local that
-    // enters the aggregate.
-    let mut guards = guards;
     let forward_blocks = forward_reachable_mask(llbc, body);
-    loop {
-        let before = guards.count();
-        for (bb_idx, bb) in body.body.iter().enumerate() {
-            if !forward_blocks[bb_idx] {
-                continue;
-            }
-            for stmt in &bb.statements {
-                if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
-                    stmt.stmt_kind_ref()
-                    && let (PlaceKind::Local(dest), PlaceKind::Local(from)) =
-                        (&place.kind, &src.kind)
-                    && guards.contains(*from as usize)
-                {
-                    guards.insert(*dest as usize);
-                }
-            }
-        }
-        if guards.count() == before {
-            break;
-        }
-    }
-    let mut holders = bit_set::BitSet::new();
     let mut moved_into_result = bit_set::BitSet::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         if !forward_blocks[bb_idx] {
@@ -2097,25 +2071,82 @@ pub(in crate::front::mir) fn body_returns_owned_scope(
             let PlaceKind::Local(dest) = place.kind else {
                 continue;
             };
-            match value {
-                Rvalue::Aggregate(_, operands)
-                    if operands.iter().any(|op| {
-                        matches!(op, Operand::Move(src)
-                            if matches!(src.kind, PlaceKind::Local(g) if guards.contains(g as usize)))
-                    }) =>
-                {
-                    holders.insert(dest as usize);
-                }
-                Rvalue::Use(Operand::Move(src), _) if dest == 0 => {
-                    if let PlaceKind::Local(h) = src.kind {
-                        moved_into_result.insert(h as usize);
-                    }
-                }
-                _ => {}
+            if dest == 0
+                && let Rvalue::Use(Operand::Move(src), _) = value
+                && let PlaceKind::Local(h) = src.kind
+            {
+                moved_into_result.insert(h as usize);
             }
         }
     }
-    holders.contains(0) || holders.iter().any(|h| moved_into_result.contains(h))
+    let mut reaching = bit_set::BitSet::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        if !forward_blocks[bb_idx] {
+            continue;
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = place.kind else {
+                continue;
+            };
+            let Rvalue::Aggregate(_, operands) = value else {
+                continue;
+            };
+            if dest != 0 && !moved_into_result.contains(dest as usize) {
+                continue;
+            }
+            for op in operands {
+                if let Operand::Move(src) = op
+                    && let PlaceKind::Local(m) = src.kind
+                {
+                    reaching.insert(m as usize);
+                }
+            }
+        }
+    }
+    // Follow plain moves backward (`_21 = move _3`): a local that reaches `_0`
+    // through a move also reaches it from the move's source.
+    loop {
+        let before = reaching.count();
+        for (bb_idx, bb) in body.body.iter().enumerate() {
+            if !forward_blocks[bb_idx] {
+                continue;
+            }
+            for stmt in &bb.statements {
+                if let Ok(StmtKind::Assign(place, Rvalue::Use(Operand::Move(src), _))) =
+                    stmt.stmt_kind_ref()
+                    && let (PlaceKind::Local(dest), PlaceKind::Local(from)) =
+                        (&place.kind, &src.kind)
+                    && reaching.contains(*dest as usize)
+                {
+                    reaching.insert(*from as usize);
+                }
+            }
+        }
+        if reaching.count() == before {
+            break;
+        }
+    }
+    if reaching.is_empty() {
+        return false;
+    }
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let (CallFunc::Regular(reg), PlaceKind::Local(dest)) = (&call.func, &call.dest.kind) else {
+            continue;
+        };
+        if !reaching.contains(*dest as usize) {
+            continue;
+        }
+        if name_of(reg).is_some_and(|path| gc_root_scope_open_path(&path)) || returns_owned(reg) {
+            return true;
+        }
+    }
+    false
 }
 
 impl OwnedRootScopes {
@@ -4148,8 +4179,15 @@ pub(in crate::front::mir) fn strip_identity_crate_prefix(identity: &str) -> Stri
 /// impl's `Self` ADT, and the signature, instantiation, and span separate
 /// two constructors that still share that ADT and leaf.
 pub fn harvest_scope_owning_identities(llbc: &Llbc) -> Vec<String> {
-    let root_state = RootStackState::new(llbc);
-    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    harvest_scope_owning_identities_with(llbc, &RootStackState::new(llbc))
+}
+
+/// [`harvest_scope_owning_identities`] with a caller-owned [`RootStackState`].
+pub(crate) fn harvest_scope_owning_identities_with(
+    llbc: &Llbc,
+    root_state: &RootStackState,
+) -> Vec<String> {
+    let analyzer = RootStackAnalyzer::new(llbc, root_state);
     let mut identities: Vec<String> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some() && analyzer.fn_returns_owned_scope(fd.def_id))
@@ -4815,8 +4853,15 @@ pub fn fn_returns_owned_scope(llbc: &Llbc, id: u64) -> bool {
 }
 
 pub fn harvest_root_stack_touching_paths(llbc: &Llbc) -> Vec<String> {
-    let root_state = RootStackState::new(llbc);
-    let analyzer = RootStackAnalyzer::new(llbc, &root_state);
+    harvest_root_stack_touching_paths_with(llbc, &RootStackState::new(llbc))
+}
+
+/// [`harvest_root_stack_touching_paths`] with a caller-owned [`RootStackState`].
+pub(crate) fn harvest_root_stack_touching_paths_with(
+    llbc: &Llbc,
+    root_state: &RootStackState,
+) -> Vec<String> {
+    let analyzer = RootStackAnalyzer::new(llbc, root_state);
     let mut touching: Vec<String> = llbc
         .iter_local_fns()
         .filter(|fd| fd.body.is_some() && analyzer.fn_touches_root_stack(fd.def_id))

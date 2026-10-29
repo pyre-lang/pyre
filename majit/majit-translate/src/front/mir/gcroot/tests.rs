@@ -3143,6 +3143,191 @@ fn root_stack_analysis_does_not_merge_a_cycle_closed_inside_a_bracket() {
     );
 }
 
+/// `b` either opens a bracket or calls `a`; `a` calls `b`; both move the
+/// call's result into an aggregate that becomes `_0`. A provisional `false`
+/// cache made the answer depend on which member was asked first.
+#[test]
+fn recursive_scope_constructors_answer_independent_of_query_order() {
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let ret_ty = owned_vec_unit_ty();
+    let span = owned_vec_span();
+    let item_meta = |path: &[&str], is_local: bool| {
+        serde_json::json!({
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": is_local
+        })
+    };
+    let call = |fun_id: u64,
+                args: Vec<serde_json::Value>,
+                dest: u64,
+                dest_ty: &serde_json::Value,
+                target: u64| {
+        serde_json::json!({"Call": {
+            "call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": fun_id},
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }},
+                "args": args,
+                "dest": owned_vec_place(dest, dest_ty)
+            },
+            "target": target,
+            "on_unwind": 99
+        }})
+    };
+    let aggregate_ret = |from: u64| {
+        serde_json::json!({
+            "span": span,
+            "kind": {"Assign": [
+                owned_vec_place(0, &ret_ty),
+                {"Aggregate": ["Tuple", [{"Move": owned_vec_place(from, &ret_ty)}]]}
+            ]}
+        })
+    };
+    let fun = |def_id: u64,
+               path: &[&str],
+               is_local: bool,
+               inputs: Vec<serde_json::Value>,
+               body: Option<serde_json::Value>| {
+        serde_json::json!({
+            "def_id": def_id,
+            "item_meta": item_meta(path, is_local),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": inputs,
+                "output": ret_ty
+            },
+            "body": match body {
+                Some(b) => serde_json::json!({"Unstructured": b}),
+                None => serde_json::json!("Missing"),
+            }
+        })
+    };
+    let unstructured =
+        |arg_count: u64, locals: Vec<serde_json::Value>, blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "span": span,
+                "locals": {"arg_count": arg_count, "locals": locals},
+                "body": blocks
+            })
+        };
+    //   bb0: switch _1 { bb1, bb2 }
+    //   bb1: _2 = t::a()                -> bb3
+    //   bb2: _2 = push_roots()          -> bb3
+    //   bb3: _0 = Aggregate(Tuple, [move _2]); return
+    let b_body = unstructured(
+        1,
+        vec![
+            owned_vec_local(0, &ret_ty),
+            owned_vec_local(1, &bool_ty),
+            owned_vec_local(2, &ret_ty),
+        ],
+        vec![
+            owned_vec_block(
+                vec![],
+                serde_json::json!({"Switch": {
+                    "discr": {"Copy": owned_vec_place(1, &bool_ty)},
+                    "targets": {"If": [1, 2]}
+                }}),
+            ),
+            owned_vec_block(vec![], call(1, vec![], 2, &ret_ty, 3)),
+            owned_vec_block(vec![], call(0, vec![], 2, &ret_ty, 3)),
+            owned_vec_block(vec![aggregate_ret(2)], serde_json::json!("Return")),
+        ],
+    );
+    //   bb0: _1 = t::b(<const>)         -> bb1
+    //   bb1: _0 = Aggregate(Tuple, [move _1]); return
+    let a_body = unstructured(
+        0,
+        vec![owned_vec_local(0, &ret_ty), owned_vec_local(1, &ret_ty)],
+        vec![
+            owned_vec_block(
+                vec![],
+                call(2, vec![serde_json::json!({"Const": null})], 1, &ret_ty, 1),
+            ),
+            owned_vec_block(vec![aggregate_ret(1)], serde_json::json!("Return")),
+        ],
+    );
+    let funs = vec![
+        fun(
+            0,
+            &["pyre_object", "gc_roots", "push_roots"],
+            false,
+            vec![],
+            None,
+        ),
+        fun(1, &["t", "a"], true, vec![], Some(a_body)),
+        fun(2, &["t", "b"], true, vec![bool_ty], Some(b_body)),
+    ];
+    let llbc = llbc_with_types("t", vec![], funs.clone());
+    let a = llbc.local_fn("a").expect("t::a").def_id;
+    let b = llbc.local_fn("b").expect("t::b").def_id;
+
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    assert!(
+        analyzer.fn_returns_owned_scope(b),
+        "b opens a bracket on one arm and returns it in `_0`"
+    );
+    assert!(
+        analyzer.fn_returns_owned_scope(a),
+        "a returns b's scope in `_0` even when b is asked first"
+    );
+
+    let state = super::RootStackState::new(&llbc);
+    let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+    assert!(
+        analyzer.fn_returns_owned_scope(a),
+        "a returns b's scope in `_0`"
+    );
+    assert!(
+        analyzer.fn_returns_owned_scope(b),
+        "b still opens a bracket when a is asked first"
+    );
+
+    // A discarded call result must not join the caller into the callee's
+    // recursive dependency component: only b returns a scope in this case.
+    let mut discarded = funs.clone();
+    discarded[1]["body"]["Unstructured"]["body"][1]["statements"][0] = serde_json::json!({
+        "span": span,
+        "kind": {"Assign": [owned_vec_place(0, &ret_ty), {"Aggregate": ["Tuple", []]}]}
+    });
+    let llbc = llbc_with_types("t", vec![], discarded);
+    for order in [[a, b], [b, a]] {
+        let state = super::RootStackState::new(&llbc);
+        let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+        for id in order {
+            assert_eq!(analyzer.fn_returns_owned_scope(id), id == b);
+        }
+    }
+
+    // A cycle without an opener stays at the lattice's bottom result.
+    let mut closed_cycle = funs;
+    closed_cycle[2]["body"]["Unstructured"]["body"][2]["terminator"]["kind"] =
+        call(1, vec![], 2, &ret_ty, 3);
+    let llbc = llbc_with_types("t", vec![], closed_cycle);
+    for order in [[a, b], [b, a]] {
+        let state = super::RootStackState::new(&llbc);
+        let analyzer = super::RootStackAnalyzer::new(&llbc, &state);
+        for id in order {
+            assert!(!analyzer.fn_returns_owned_scope(id));
+        }
+    }
+}
+
 #[test]
 fn root_stack_analysis_charges_no_unknown_body_in_an_artefact_below_the_api() {
     use majit_charon_reader::ullbc::RegularCall;

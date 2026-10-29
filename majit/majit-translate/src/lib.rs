@@ -302,8 +302,13 @@ fn build_semantic_program_via_active_frontend(
                 // this crate's bodies are walked, so a call into one of
                 // them reads the defining crate's constructor.
                 front::mir::mark_foreign_scope_owners(&llbc, &scope_owning_identities);
-                root_stack_touching.extend(front::mir::harvest_root_stack_touching_paths(&llbc));
-                for identity in front::mir::harvest_scope_owning_identities(&llbc) {
+                let root_state = front::mir::RootStackState::new(&llbc);
+                root_stack_touching.extend(front::mir::harvest_root_stack_touching_paths_with(
+                    &llbc,
+                    &root_state,
+                ));
+                for identity in front::mir::harvest_scope_owning_identities_with(&llbc, &root_state)
+                {
                     if let Err(index) = scope_owning_identities.binary_search(&identity) {
                         scope_owning_identities.insert(index, identity);
                     }

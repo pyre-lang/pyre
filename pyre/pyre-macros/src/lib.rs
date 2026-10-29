@@ -3457,13 +3457,13 @@ fn expand_pyre_methods(
                             <#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::CPYTHON_IMMUTABLETYPE,
                         );
                     }
+                    #set_type_mapping_flags
                     ::pyre_object::pyobject::set_instantiate(
                         unsafe {
                             &*<#self_ty as ::pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
                         },
                         tp,
                     );
-                    #set_type_mapping_flags
                     #set_type_text_signature
                     tp as usize
                 }) as ::pyre_object::PyObjectRef

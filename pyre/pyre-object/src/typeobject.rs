@@ -311,7 +311,9 @@ pub struct W_TypeObject {
     /// startup (`objspace.py StdObjSpace.initialize`), inherited in
     /// `setup_user_defined_type`; read by `ismapping_w` / `issequence_w` and
     /// `descroperation.py` `is_iterable` / `iter`.
-    pub flag_map_or_seq: std::sync::atomic::AtomicU8,
+    /// Written only during construction, before the type is published, so
+    /// readers need no atomic.
+    pub flag_map_or_seq: u8,
     /// typeobject.py `compares_by_identity_status?` —
     /// `UNKNOWN=0`, `COMPARES_BY_IDENTITY=1`,
     /// `OVERRIDES_EQ_CMP_OR_HASH=2`.  Cached result of
@@ -646,7 +648,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         hasuserdel: false,
         flag_sequence_bug_compat: false,
         flag_patma_collection: std::sync::atomic::AtomicU8::new(b'X'),
-        flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
+        flag_map_or_seq: b'?',
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
         // typeobject.py:251-260: terminator installed by the interpreter's
@@ -713,12 +715,7 @@ pub unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
     if w_self.is_null() || bases.is_null() || !is_type(w_self) {
         return;
     }
-    let self_ref = &*(w_self as *const W_TypeObject);
-    if self_ref
-        .flag_map_or_seq
-        .load(std::sync::atomic::Ordering::Acquire)
-        != b'?'
-    {
+    if (*(w_self as *const W_TypeObject)).flag_map_or_seq != b'?' {
         return;
     }
     let n = crate::w_tuple_len(bases);
@@ -729,14 +726,9 @@ pub unsafe fn inherit_flag_map_or_seq(w_self: PyObjectRef, bases: PyObjectRef) {
         if w_base.is_null() || !is_type(w_base) {
             continue;
         }
-        let base_ref = &*(w_base as *const W_TypeObject);
-        let base_flag = base_ref
-            .flag_map_or_seq
-            .load(std::sync::atomic::Ordering::Acquire);
+        let base_flag = (*(w_base as *const W_TypeObject)).flag_map_or_seq;
         if base_flag != b'?' {
-            self_ref
-                .flag_map_or_seq
-                .store(base_flag, std::sync::atomic::Ordering::Release);
+            (*(w_self as *mut W_TypeObject)).flag_map_or_seq = base_flag;
             return;
         }
     }
@@ -807,7 +799,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         // typeobject.py default; built-in dict/list/tuple
         // override via `w_type_set_flag_map_or_seq` at typedef
         // registration time (see `typedef.rs`).
-        flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
+        flag_map_or_seq: b'?',
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
         // typeobject.py:251-260: terminator installed by the interpreter's
@@ -916,13 +908,15 @@ pub unsafe fn w_type_get_flag_map_or_seq(w_type: PyObjectRef) -> u8 {
     if w_type.is_null() || !is_type(w_type) {
         return b'?';
     }
-    let t = &*(w_type as *const W_TypeObject);
-    t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire)
+    (*(w_type as *const W_TypeObject)).flag_map_or_seq
 }
 
 /// typeobject.py — `flag_map_or_seq` setter.  Used by
 /// `init_typeobjects` to mark dict / list / tuple W_TypeObjects at
 /// registration time (objspace.py:104-108).
+/// The caller must call it before the type object is published (before
+/// `set_instantiate` caches it for allocators and before any other thread can
+/// reach it).
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -930,9 +924,7 @@ pub unsafe fn w_type_set_flag_map_or_seq(w_type: PyObjectRef, flag: u8) {
     if w_type.is_null() || !is_type(w_type) {
         return;
     }
-    let t = &*(w_type as *const W_TypeObject);
-    t.flag_map_or_seq
-        .store(flag, std::sync::atomic::Ordering::Release);
+    (*(w_type as *mut W_TypeObject)).flag_map_or_seq = flag;
 }
 
 /// typeobject.py — `flag_patma_collection` read.  `b'X'` for a null or

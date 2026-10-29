@@ -1851,14 +1851,6 @@ pub fn init_typeobjects() {
             unsafe { pyre_object::w_type_set_text_signature(w_typeobject, signature) };
         }
 
-        // rclass.py:739-743 parity — cache W_TypeObject on each PyType
-        // so allocators can set w_class at allocation time (like RPython's
-        // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).
-        for (&pytype_addr, &w_typeobject_addr) in &reg {
-            let tp = unsafe { &*(pytype_addr as *const PyType) };
-            let w_typeobject = w_typeobject_addr as PyObjectRef;
-            pyre_object::pyobject::set_instantiate(tp, w_typeobject);
-        }
         // `objspace.py StdObjSpace.initialize` / `dictproxyobject.py
         // _set_flag_map_or_seq`: dict and mappingproxy are 'M', list and tuple
         // 'S'.  `frozendict` is a dict.  Heap types inherit it in
@@ -1877,6 +1869,14 @@ pub fn init_typeobjects() {
             unsafe {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
             }
+        }
+        // rclass.py InstanceRepr.new_instance — cache W_TypeObject on each PyType
+        // so allocators can set w_class at allocation time (like RPython's
+        // `self.setfield(vptr, '__class__', ctypeptr, llops)` in new_instance).
+        for (&pytype_addr, &w_typeobject_addr) in &reg {
+            let tp = unsafe { &*(pytype_addr as *const PyType) };
+            let w_typeobject = w_typeobject_addr as PyObjectRef;
+            pyre_object::pyobject::set_instantiate(tp, w_typeobject);
         }
         // [3.15-spec] `flag_patma_collection` for the built-ins whose type
         // object carries `Py_TPFLAGS_MAPPING` / `Py_TPFLAGS_SEQUENCE` statically
