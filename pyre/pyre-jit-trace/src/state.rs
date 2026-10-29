@@ -11155,17 +11155,14 @@ impl JitState for PyreJitState {
     }
 
     fn is_compatible(&self, meta: &Self::Meta) -> bool {
-        // warmstate.py:503-511: RPython enters assembler unconditionally
+        // warmstate.py: RPython enters assembler unconditionally
         // when procedure_token exists. No next_instr check —
         // the compiled code's preamble handles entry from any PC.
-        // Shape checks ensure the frame layout matches.  Namespace length is
-        // load-bearing only for traces that read module globals: pure-compute
-        // and builtin-only loops do not depend on later top-level binds, while
-        // module-global reads still need this conservative gate because
-        // same-key value rebinds are not value-guarded yet.
+        // The local-count check keeps the frame layout matching.  A frame
+        // whose globals differ from the ones the trace read is told apart by
+        // the trace itself: its `debugdata` guard fails, and a rebind of a
+        // folded global fails `GUARD_NOT_INVALIDATED`.
         self.local_count() == meta.num_locals
-            && (!meta.namespace_dependent
-                || self.namespace_len().is_some_and(|len| len == meta.ns_len))
     }
 
     fn mint_bridge_array_descr(
@@ -14251,16 +14248,16 @@ mod tests {
     }
 
     #[test]
-    fn is_compatible_enforces_namespace_length_when_namespace_dependent() {
-        // A trace that read a module global keeps the conservative length gate,
-        // since same-key value rebinds are not value-guarded: a namespace-length
-        // mismatch must refuse re-entry.
+    fn is_compatible_ignores_namespace_length_when_namespace_dependent() {
+        // A trace that read a module global is still compatible when the live
+        // globals dict has a different length: correctness against a different
+        // dict comes from guards inside the trace, not from this gate.
         let state = empty_state();
         let mut meta = empty_meta();
         meta.num_locals = state.local_count();
         meta.namespace_dependent = true;
         meta.ns_len = state.namespace_len().unwrap_or(0) + 5;
-        assert!(!<PyreJitState as JitState>::is_compatible(&state, &meta));
+        assert!(<PyreJitState as JitState>::is_compatible(&state, &meta));
     }
 
     #[test]
