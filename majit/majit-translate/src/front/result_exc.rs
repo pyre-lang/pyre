@@ -9004,10 +9004,14 @@ fn catch_and_rewrap_with(
         // `from_exc_object`.
         let payload_dead = err_payload_is_dead(graph, &orig, r);
         if payload_dead {
-            // Nothing reads a dead payload, so the shell is the discriminant
-            // ctor alone and the collapse below does not run.
+            // Discriminant-only Err shell: `Err(_)` does not bind the
+            // caught word (writing it into `Err.__pos_0` would union
+            // that class with the carrier). The exception value is
+            // still the collapse payload so the except link can skip
+            // the match (`descr_pow` `except OverflowError:`).
+            let v_err = e_exc_value_in;
             let shell = push_shell_ctor(graph, e_id, "Err", suffix);
-            (Some(shell), None)
+            (Some(shell), Some(v_err))
         } else {
             match kind {
                 CatchRewrapKind::ErrorCarrier => {
@@ -10163,7 +10167,7 @@ fn arm_shell_vars_from_args(
 /// Drop the `Ok`/`Err` shells [`catch_and_rewrap`] just built when the
 /// match they feed only reads `__pos_0` and forwards that payload.
 /// An arm that does not receive the shell is a discarded payload
-/// (`Ok(_)`); there is no `__pos_0` to collapse on that edge.
+/// (`Ok(_)` / `Err(_)`); there is no `__pos_0` to collapse on that edge.
 ///
 /// `getindex_w` is `try: int_w(...) except OperationError`. The rebuilt
 /// shell plus the discriminant switch is that `try` spelled as a `Result`.
@@ -10328,7 +10332,17 @@ fn collapse_rebuilt_shell_match(
     let ok_payload_is_void = ok_payload.concretetype()
         == Some(crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void);
     let ok_build = shell_build_ops(graph, normal, ok_shell, ok_payload_is_void)?;
-    let err_build = shell_build_ops(graph, handler, err_shell, false)?;
+    // `Err(_)` / `except OverflowError:` does not bind the caught word, so
+    // the rebuilt Err shell is the discriminant ctor alone (`push_shell_ctor`).
+    // `shell_build_ops` already deletes that shape as a Void payload.
+    let err_shell_is_unit = !graph.blocks[handler].operations.iter().any(|op| {
+        matches!(
+            &op.kind,
+            OpKind::FieldWrite { base, field, .. }
+                if base == err_shell && field.name == "__pos_0"
+        )
+    });
+    let err_build = shell_build_ops(graph, handler, err_shell, err_shell_is_unit)?;
     // Every check has run. The edits below do not fail.
     apply_remove_identical_inputargs(graph, m, &merge);
     let n_exit = single_exit(graph, normal).expect("normal still has one exit");
@@ -10754,6 +10768,7 @@ fn project_arm_args(
 
 /// Op indices of the `Ok`/`Err` ctor and its `__pos_0` write. No edit.
 /// A Void payload has no field, so its shell is the ctor alone.
+/// A discarded `Err(_)` rebuild is the same shape: discriminant ctor, no store.
 pub(crate) fn shell_build_ops(
     graph: &FunctionGraph,
     block: usize,
@@ -17855,6 +17870,23 @@ mod rebuilt_shell_collapse_tests {
         );
     }
 
+    /// `Err(_)` rebuilds the discriminant ctor alone. Collapse must still
+    /// retarget the exception edge onto the Err arm (`descr_pow`
+    /// `except OverflowError:` does not bind the caught word).
+    #[test]
+    fn discarded_err_wildcard_still_drops_the_rebuilt_shells() {
+        let mut fix = fixture();
+        fix.graph.blocks[fix.handler].operations.retain(
+            |op| !matches!(&op.kind, OpKind::FieldWrite { field, .. } if field.name == "__pos_0"),
+        );
+        fix.graph.blocks[fix.err_arm].operations.clear();
+        fix.graph.set_return(BlockId(fix.err_arm), None);
+        collapse(&mut fix).expect("Err(_) ctor-only rebuild collapses");
+        assert_eq!(shell_ctors(&fix.graph), 0, "Ok and Err shells are removed");
+        assert_eq!(fix.graph.blocks[fix.normal].exits[0].target.0, fix.ok_arm);
+        assert_eq!(fix.graph.blocks[fix.handler].exits[0].target.0, fix.err_arm);
+    }
+
     /// `with_roots!(x => int_w(x))` restore hops sit between the rebuilt
     /// shells and the match (`getindex_w`). Both edges share that chain
     /// until the collapse splits it.
@@ -18395,6 +18427,107 @@ mod rebuilt_shell_collapse_tests {
                 .contains(&graph.name),
             );
         }
+    }
+
+    /// `match r { Ok(v) => v, Err(_) => … }` is `descr_pow`'s
+    /// `try: _pow except OverflowError: return _pow_ovf2long`. The
+    /// rebuilt shells collapse so the exception link lands on the Err
+    /// arm, not on a discriminant switch.
+    #[test]
+    fn catch_and_rewrap_collapses_wildcard_err_to_the_err_arm() {
+        let mut graph = FunctionGraph::new("rewrap_wildcard_err");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (m, m_args) = graph.create_block_with_arg_vars(1);
+        let shell_in = m_args[0].clone();
+        let disc = graph
+            .push_op_var(
+                m,
+                OpKind::FieldRead {
+                    base: shell_in.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::result::Result<i64,PyError>".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+        let (ok_arm, ok_args) = graph.create_block_with_arg_vars(1);
+        let v = graph
+            .push_op_var(
+                ok_arm,
+                OpKind::FieldRead {
+                    base: ok_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::result::Result<i64,PyError>::Ok".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("ok read");
+        graph.set_return(ok_arm, Some(v));
+        let (err_arm, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(err_arm, None);
+        graph.block_mut(m).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(m).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in.clone())],
+                ok_arm,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(shell_in)],
+                err_arm,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(a, m, vec![r.clone()]);
+        catch_and_rewrap(&mut graph, a.0, &r, "<i64,PyError>", &ValueType::Int).expect("rewrap");
+        assert!(
+            matches!(
+                graph.blocks[a.0].exitswitch,
+                Some(ExitSwitch::LastException)
+            ),
+            "the call is LastException"
+        );
+        assert_eq!(shell_ctors(&graph), 0, "the rebuilt shells collapse");
+        let [n, e] = graph.blocks[a.0].exits.as_slice() else {
+            panic!("normal and exception exits");
+        };
+        let follow = |start: usize| {
+            let body = &graph.blocks[start];
+            if body.operations.is_empty() && body.exits.len() == 1 {
+                body.exits[0].target.0
+            } else {
+                start
+            }
+        };
+        assert_eq!(
+            follow(n.target.0),
+            ok_arm.0,
+            "normal edge reaches the Ok arm"
+        );
+        assert_eq!(
+            follow(e.target.0),
+            err_arm.0,
+            "exception edge reaches the Err arm"
+        );
     }
 
     /// A MutRef.value FieldRead after a raising call is a `pop_roots`

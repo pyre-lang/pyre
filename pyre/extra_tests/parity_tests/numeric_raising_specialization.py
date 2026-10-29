@@ -379,4 +379,28 @@ assert list(range(-sys.maxsize - 1, sys.maxsize, sys.maxsize)) == [
     sys.maxsize - 1,
 ]
 
+
+# Mixed fit-then-overflow `int ** int`: a trace compiled on an i64-fitting
+# exponent must promote through long (`descr_pow` except OverflowError /
+# `pow_ovf2long`), not raise `OverflowError: integer overflow` at `**`.
+def two_fit_then_ovf(rounds):
+    n = 0
+    for i in range(rounds):
+        d = 20 + (i % 80)
+        n += (2 ** d).bit_length()
+    return n
+
+
+def ten_fit_then_ovf(rounds):
+    n = 0
+    for i in range(rounds):
+        e = 1 + (i % 60)
+        n += (10 ** e).bit_length()
+    return n
+
+
+assert two_fit_then_ovf(1) == (2 ** 20).bit_length()
+assert two_fit_then_ovf(2000) == 121000
+assert ten_fit_then_ovf(2000) == 202304
+
 print("OK")

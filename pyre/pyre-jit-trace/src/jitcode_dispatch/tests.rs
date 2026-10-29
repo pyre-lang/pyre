@@ -1642,6 +1642,36 @@ fn catch_exception(target: usize) -> Vec<u8> {
     ]
 }
 
+/// A look_inside_iff wrapper catch is `reraise`. That is
+/// `finishframe_exception` propagating, not `descr_pow`'s except arm.
+#[test]
+fn a_reraise_catch_is_not_a_helper_handler() {
+    let mut code = live();
+    let reraise_at = code.len() + 4;
+    code.extend(catch_exception(reraise_at));
+    assert_eq!(code.len(), reraise_at);
+    code.push(
+        *insns_opname_to_byte()
+            .get("reraise/")
+            .expect("`reraise/` must be in insns table"),
+    );
+    let target = super::find_catch_for_exc_resume(&code, 0).expect("catch sits after live");
+    assert_eq!(target, reraise_at);
+    assert!(
+        super::catch_body_is_reraise(&code, target),
+        "wrapper catch is reraise"
+    );
+    let mut handled = live();
+    let handler = handled.len() + 4;
+    handled.extend(catch_exception(handler));
+    handled.extend(void_return());
+    let target = super::find_catch_for_exc_resume(&handled, 0).expect("handler catch");
+    assert!(
+        !super::catch_body_is_reraise(&handled, target),
+        "a void-return except arm is a handler"
+    );
+}
+
 /// A raise caught in this frame is not a frame exit.  `finishframe_lookahead_at`
 /// skips the `live/` and takes the `catch_exception/L` behind it, so the handler
 /// runs forward over bytes no fallthrough reaches — treating the raise as
@@ -6771,6 +6801,105 @@ fn with_hint_walk_context<R>(
     regs_r.copy_from_slice(&wc.registers_r.to_vec());
     concrete_r.copy_from_slice(&wc.frame_state.borrow().concrete_registers_r);
     result
+}
+
+/// A portal helper's success-path guards resume at the CALL (`entry_py_pc`).
+/// `pyjitpl.py capture_resumedata` numbers only the `MIFrame`s already on
+/// `metainterp.framestack`; a residual call does not push one. Numbering a
+/// call-entry section here made FBW walk the helper during the Python loop
+/// body and drop FOR_ITER items (`reversed_disabled`).
+#[test]
+fn portal_helper_call_result_does_not_number_a_call_entry_section() {
+    use pyre_interpreter::{compile_exec, w_code_get_ptr, w_code_new};
+
+    let code = compile_exec("None").expect("test code should compile");
+    let w_code = w_code_new(Box::into_raw(Box::new(code)) as *const ()) as *const ();
+    let raw_code = unsafe {
+        w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const pyre_interpreter::CodeObject
+    };
+    let mut builder = majit_metainterp::JitCodeBuilder::default();
+    let live_patch = builder.live_placeholder();
+    builder.patch_live_offset(live_patch, 0);
+    let mut insns = indexmap::IndexMap::new();
+    insns.insert(
+        "live/".to_string(),
+        majit_metainterp::jitcode::insns::BC_LIVE,
+    );
+    crate::assembler::publish_state(&insns, &[0, 0, 0], 3, 1);
+    let mut pyjit = crate::PyJitCode::skeleton(raw_code);
+    pyjit.jitcode = std::sync::Arc::new(builder.finish());
+    pyjit.metadata.is_drained = true;
+    pyjit.metadata.forward_py_pc_marker_by_jit_pc = vec![(0, 0)];
+    let installed = crate::state::install_jitcode_for(w_code, std::sync::Arc::new(pyjit))
+        as *const crate::state::JitCode;
+    assert!(!installed.is_null());
+    let jitcode_index = unsafe { (*installed).index } as u32;
+
+    let mut tc = fresh_trace_ctx();
+    let mut regs_r: [OpRef; 0] = [];
+    let mut concrete_r: [ConcreteValue; 0] = [];
+    let mut regs_i: [OpRef; 0] = [];
+    let mut concrete_i: [ConcreteValue; 0] = [];
+    let mut regs_f: [OpRef; 0] = [];
+    let descr_pool: [DescrRef; 0] = [];
+    with_hint_walk_context(
+        &mut tc,
+        &mut regs_r,
+        &mut concrete_r,
+        &mut regs_i,
+        &mut concrete_i,
+        &mut regs_f,
+        &descr_pool,
+        |wc| {
+            assert!(
+                !wc.fbw_mode.inline_subwalk,
+                "fixture premise: root portal walk"
+            );
+            // `compute_inline_caller_frame` cannot pause past the call
+            // (`w_code == 0` has no nested PyCode), but
+            // `compute_inline_helper_call_entry_frame` would return this
+            // Python parent. The removed portal numbering used that
+            // fallback to push a section.
+            wc.session.borrow_mut().framestack.push(InlineFrame {
+                is_portal: false,
+                w_code: 0,
+                recursion_greenkey: false,
+                call_id: 0,
+                debug_merge_point_py_pc: None,
+                parents: vec![InlineParentFrame {
+                    jitcode_index,
+                    call_jitcode_pc: None,
+                    call_pc: Some(0),
+                    resume_pc: Some(0),
+                    call_stack_overrides: Vec::new(),
+                    blackhole: None,
+                    resume_coord: ParentResumeCoord::Backxlat(0),
+                    resume_marker_jit_pc: Some(0),
+                    boxes: Vec::new(),
+                    registers_r: None,
+                    registers_i: None,
+                    registers_f: None,
+                    frame_state: None,
+                    caller_py_pc: None,
+                    result_slot: CallResultSlot::Unknown,
+                }],
+                entry_executed_effects: 0,
+                entry_heap_writing_effects: 0,
+                entry_journal_mark: fbw_effect_journal_mark(),
+                helper_resume: HelperResume::Section,
+                helper_call_entry: HelperCallEntry::Unavailable,
+                helper_entry_array_len: None,
+                entry_trace_index: 0,
+                live: None,
+            });
+            let level = helper_subwalk_level(wc, 0, HelperReturn::CallResult)
+                .expect("portal helper CallResult is Ok");
+            assert!(
+                level.is_none(),
+                "capture_resumedata numbers only framestack MIFrames; a portal helper stays at the CALL"
+            );
+        },
+    );
 }
 
 #[test]

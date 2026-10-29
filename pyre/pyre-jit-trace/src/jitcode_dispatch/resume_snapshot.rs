@@ -612,7 +612,7 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 op_pc,
                 after_residual_call,
                 &scope,
-                parent_frames,
+                parent_frames.clone(),
             )? {
                 NumberedHelperGuard::Frames(frames) => {
                     return walker_capture_transparent_helper_snapshot(
@@ -622,7 +622,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         scope.guard_stamp,
                     );
                 }
-                // Fall through to the root portal's CALL boundary below.
+                // Fall through: an exception-guard residual may still keep
+                // the helper sections below when a `catch_exception` exists.
                 NumberedHelperGuard::CallerBoundary => {}
             }
         } else if walker_inline_guard_resumes_in_callee(ctx) {
@@ -645,6 +646,28 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 scope,
                 guard_stamp,
             );
+        }
+        // `GUARD_NO_EXCEPTION` failure is `blackhole.py
+        // handle_exception_in_frame`: skip `-live-`, jump to
+        // `catch_exception`. A collapsed helper otherwise publishes a
+        // single-frame snapshot at the Python CALL (`BINARY_POWER`), so a
+        // leftover residual exception surfaces there instead of
+        // `descr_pow`'s `except OverflowError: return _pow_ovf2long`.
+        if after_residual_call && ctx.fbw_mode.transparent_helper_subwalk {
+            if let Ok(frames) = exception_guard_helper_resume_frames(
+                ctx,
+                op_pc,
+                after_residual_call,
+                &scope,
+                parent_frames,
+            ) {
+                return walker_capture_transparent_helper_snapshot(
+                    ctx,
+                    op_pc,
+                    frames,
+                    scope.guard_stamp,
+                );
+            }
         }
     }
     let session = ctx.session;
@@ -3291,6 +3314,8 @@ pub(crate) fn helper_subwalk_level<Sym: WalkSym>(
     }
     if !ctx.fbw_mode.inline_subwalk {
         // The root portal resumes at its CALL boundary (`entry_py_pc`).
+        // `pyjitpl.py capture_resumedata` numbers only the frames already
+        // on `metainterp.framestack`; a residual helper does not push one.
         return Ok(None);
     }
     compute_inline_helper_call_entry_frame(ctx, call_jit_pc).map(|caller| {
@@ -3310,6 +3335,55 @@ enum NumberedHelperGuard {
     Frames(Vec<InlineParentFrame>),
     /// The root portal's CALL boundary.
     CallerBoundary,
+}
+
+/// Whether this helper section's resume `-live-` is followed by
+/// `catch_exception` (`blackhole.py handle_exception_in_frame`).
+fn helper_resume_has_catch(frame: &InlineParentFrame) -> bool {
+    crate::state::jitcode_is_transparent_helper(frame.jitcode_index as i32)
+        && helper_section_catch_target(
+            frame.jitcode_index as i32,
+            frame.resume_marker_jit_pc.map(|pc| pc as i32).unwrap_or(-1),
+        )
+        .is_some()
+}
+
+fn python_resume_frame(frame: &InlineParentFrame) -> bool {
+    crate::state::pyjitcode_for_jitcode_index(frame.jitcode_index as i32)
+        .is_some_and(|pjc| !pjc.code_ptr.is_null())
+}
+
+/// Helper sections for a `GUARD_NO_EXCEPTION` whose jitcode has
+/// `catch_exception` after the residual. Outermost is a Python frame so
+/// the virtualizable stays on the portal (`consume_vable_info`).
+fn exception_guard_helper_resume_frames<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: &GuardCaptureScope,
+    mut parent_frames: Vec<InlineParentFrame>,
+) -> Result<Vec<InlineParentFrame>, DispatchError> {
+    let innermost = helper_innermost_resume_frame(ctx, op_pc, after_residual_call, scope)?;
+    let has_catch =
+        parent_frames.iter().any(helper_resume_has_catch) || helper_resume_has_catch(&innermost);
+    if !has_catch {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    }
+    if parent_frames.first().is_some_and(python_resume_frame) {
+        parent_frames.push(innermost);
+        return Ok(parent_frames);
+    }
+    let call_jit_pc = match ctx.entry_py_pc {
+        EntryPyPc::Jit(pc) => pc,
+        EntryPyPc::Py(_) => return Err(DispatchError::callee_inline_unsupported(op_pc)),
+    };
+    let python = compute_inline_caller_frame(ctx, call_jit_pc)
+        .or_else(|_| compute_inline_helper_call_entry_frame(ctx, call_jit_pc))
+        .map_err(|_| DispatchError::callee_inline_unsupported(op_pc))?;
+    let mut frames = vec![python];
+    frames.extend(parent_frames);
+    frames.push(innermost);
+    Ok(frames)
 }
 
 /// Resume of a guard at `op_pc` inside a numbered helper chain:
@@ -3362,6 +3436,20 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
             .filter(|frame| !frame.is_portal)
             .all(|frame| !frame.parents.is_empty())
     };
+    // `GUARD_NO_EXCEPTION` failure does not run the helper from the
+    // resume `-live-` to its return. `blackhole.py
+    // handle_exception_in_frame` skips that `-live-` and jumps to
+    // `catch_exception`. `helper_resume_reaches_blocker` walks the
+    // success path and treats the except arm (`descr_pow` `except
+    // OverflowError: return _pow_ovf2long`) as a residual blocker,
+    // collapsing the snapshot to the Python CALL. Keep the helper
+    // sections so the jump lands in that except arm.
+    if after_residual_call
+        && python_chain_complete
+        && parent_frames.iter().any(helper_resume_has_catch)
+    {
+        return Ok(NumberedHelperGuard::Frames(parent_frames));
+    }
     let runnable = python_chain_complete && {
         let session = ctx.session.borrow();
         // The trailing helper levels own the last sections: level `j`'s is

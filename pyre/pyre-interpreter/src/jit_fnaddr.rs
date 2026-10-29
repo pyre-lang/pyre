@@ -4386,8 +4386,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // residual when capacity is not constant. Bind the word-ABI
     // `__majit_call_target_*` adapter (`dont_look_inside` / `getfunctionptr`
     // residual entry), not the raw Rust `unsafe fn` — residual CondCall
-    // passes one i64 per slot. The dispatch wrapper's jitted branch
-    // residual-calls `<name>_trampoline`, which is published the same way.
+    // passes one i64 per slot.
     cpa3!(
         &mut entries,
         "pyre_object::listobject::ll_list_obj_resize_hint_really",
@@ -4411,30 +4410,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::listobject::ll_list_ascii_resize_hint_really",
         "pyre_object::ll_list_ascii_resize_hint_really",
         pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really,
-    );
-    cpa3!(
-        &mut entries,
-        "pyre_object::listobject::ll_list_obj_resize_hint_really_trampoline",
-        "pyre_object::ll_list_obj_resize_hint_really_trampoline",
-        pyre_object::listobject::__majit_call_target_ll_list_obj_resize_hint_really_trampoline,
-    );
-    cpa3!(
-        &mut entries,
-        "pyre_object::listobject::ll_list_int_resize_hint_really_trampoline",
-        "pyre_object::ll_list_int_resize_hint_really_trampoline",
-        pyre_object::listobject::__majit_call_target_ll_list_int_resize_hint_really_trampoline,
-    );
-    cpa3!(
-        &mut entries,
-        "pyre_object::listobject::ll_list_float_resize_hint_really_trampoline",
-        "pyre_object::ll_list_float_resize_hint_really_trampoline",
-        pyre_object::listobject::__majit_call_target_ll_list_float_resize_hint_really_trampoline,
-    );
-    cpa3!(
-        &mut entries,
-        "pyre_object::listobject::ll_list_ascii_resize_hint_really_trampoline",
-        "pyre_object::ll_list_ascii_resize_hint_really_trampoline",
-        pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really_trampoline,
     );
     cpa3!(
         &mut entries,
@@ -6445,11 +6420,12 @@ fn intern_fnaddr_path(s: String) -> &'static str {
 
 /// Fold the macro-published trampoline slice into the hand-listed table.
 ///
-/// On native targets a hand-listed path wins. On wasm32 the trampoline from
-/// `emit_helper_call_target_fn` replaces that address, unless the hand-listed
-/// address is in `abi_unsound_arguments`: the trampoline's wasm type is the
-/// descr FUNC (`descr.py` `CallDescr.create_call_stub`), and a raw fn is not.
-/// Duplicate registry rows for the same path must agree on arity. Each row is
+/// An occupied slot takes the trampoline from `emit_helper_call_target_fn`,
+/// unless the hand-listed address is in `abi_unsound_arguments`. That
+/// trampoline is the descr-word entry (`descr.py` `CallDescr.create_call_stub`):
+/// a Bool `FUNC.RESULT` is widened to a full `Signed` word before `bh_call_i`
+/// reads it. A raw `extern "C" fn() -> bool` is not that ABI. Duplicate
+/// registry rows for the same path must agree on arity. Each row is
 /// published as the full `module_path!()::name` and, when the function is
 /// nested and `{crate}::{leaf}` is unique among full paths, that short alias.
 /// `register_macro_helper_trace_fnaddr` then adds the crate-stripped and
@@ -6461,7 +6437,6 @@ fn intern_fnaddr_path(s: String) -> &'static str {
 /// through the `{crate}::{leaf}` unique-short-alias rule: inventing
 /// `crate::leaf` next to `crate::Type::leaf` shares the trampoline with
 /// a spelling the uniqueness census cannot pair.
-#[cfg_attr(not(target_arch = "wasm32"), allow(unused_variables))]
 fn merge_macro_helper_fnaddrs(
     entries: &mut Vec<(&'static str, i64)>,
     abi_unsound_arguments: &[i64],
@@ -6523,7 +6498,6 @@ fn merge_macro_helper_fnaddrs(
                 }
             }
             if occupied.contains(path) {
-                #[cfg(target_arch = "wasm32")]
                 if let Some(slot) = entries
                     .iter_mut()
                     .find(|(entry_path, _)| *entry_path == path)
@@ -6538,12 +6512,10 @@ fn merge_macro_helper_fnaddrs(
         }
     }
 
-    // Type-qualified reloc keys for inherent `&self` trampolines. Native
-    // occupied hand-listed rows keep their address (pre-existing
-    // `PyFrame::pop` spellings). On wasm32 the defining-crate trampoline
-    // replaces that slot, matching the free-function pass: a cross-crate
-    // `fn as *const ()` is a different table entry. A `{crate}::{leaf}`
-    // short alias is not derived.
+    // Type-qualified reloc keys for inherent `&self` trampolines. An occupied
+    // slot takes the defining-crate trampoline, matching the free-function
+    // pass, unless the hand-listed address is in `abi_unsound_arguments`.
+    // A `{crate}::{leaf}` short alias is not derived.
     majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
         let addr = desc.get() as i64;
         if addr == 0 || !desc.is_impl_method() {
@@ -6564,7 +6536,6 @@ fn merge_macro_helper_fnaddrs(
                 }
             }
             if occupied.contains(path) {
-                #[cfg(target_arch = "wasm32")]
                 if let Some(slot) = entries
                     .iter_mut()
                     .find(|(entry_path, _)| *entry_path == path)
@@ -6578,6 +6549,76 @@ fn merge_macro_helper_fnaddrs(
             occupied.insert(path);
         }
     });
+}
+
+/// Paths [`merge_macro_helper_fnaddrs`] binds to a macro descr-word adapter,
+/// including unique `{crate}::{leaf}` short aliases and impl-method keys.
+fn helper_adapter_by_path() -> &'static std::collections::HashMap<String, i64> {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::OnceLock;
+    static MAP: OnceLock<HashMap<String, i64>> = OnceLock::new();
+    MAP.get_or_init(|| {
+        let mut map = HashMap::new();
+        let mut free_rows: Vec<(&str, i64)> = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let addr = desc.get() as i64;
+            if addr == 0 || desc.is_impl_method() {
+                return;
+            }
+            free_rows.push((desc.path, addr));
+        });
+        let mut short_alias_owners: HashMap<String, HashSet<&str>> = HashMap::new();
+        for (path, _) in &free_rows {
+            if let Some((crate_seg, rest)) = path.split_once("::") {
+                let leaf = rest.rsplit("::").next().unwrap_or(rest);
+                if rest != leaf {
+                    short_alias_owners
+                        .entry(format!("{crate_seg}::{leaf}"))
+                        .or_default()
+                        .insert(*path);
+                }
+            }
+        }
+        let unique_short_aliases: HashSet<String> = short_alias_owners
+            .into_iter()
+            .filter(|(_, owners)| owners.len() == 1)
+            .map(|(alias, _)| alias)
+            .collect();
+        for (full_path, addr) in &free_rows {
+            map.insert((*full_path).to_string(), *addr);
+            if let Some((crate_seg, rest)) = full_path.split_once("::") {
+                let leaf = rest.rsplit("::").next().unwrap_or(rest);
+                if rest != leaf {
+                    let short = format!("{crate_seg}::{leaf}");
+                    if unique_short_aliases.contains(&short) {
+                        map.insert(short, *addr);
+                    }
+                }
+            }
+        }
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let addr = desc.get() as i64;
+            if addr == 0 || !desc.is_impl_method() {
+                return;
+            }
+            for path in desc.impl_method_fnaddr_paths() {
+                map.insert(path, addr);
+            }
+        });
+        map
+    })
+}
+
+/// Occupied-slot address after merge: the descr-word adapter, unless the
+/// hand-listed address is an unsound-argument residual.
+pub fn occupied_published_addr(path: &str, fallback: i64) -> i64 {
+    if is_abi_unsound_argument_residual(fallback as usize) {
+        return fallback;
+    }
+    helper_adapter_by_path()
+        .get(path)
+        .copied()
+        .unwrap_or(fallback)
 }
 
 /// Build-time addresses of the prebuilt static `PyType` singletons that
@@ -7454,7 +7495,7 @@ mod tests {
         is_list_write_barrier, is_pyframe_operand_stack_accessor,
         is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
         jit_trace_fnaddrs, module_dict_getdictvalue_no_unwrapping_pure_word,
-        object_dict_getitem_str_hashed_word, object_dict_getitem_str_word,
+        object_dict_getitem_str_hashed_word, object_dict_getitem_str_word, occupied_published_addr,
         pyframe_load_global_value_word, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
         shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
         unicode_dict_getitem_str_hashed_word, unicode_dict_getitem_str_word,
@@ -7463,6 +7504,14 @@ mod tests {
         w_list_pop_end_inner_word, w_list_pop_end_word, w_module_dict_lookup_object_entries_word,
     };
     use std::collections::HashMap;
+
+    fn assert_occupied_binding(bindings: &HashMap<&'static str, i64>, path: &str, fallback: i64) {
+        assert_eq!(
+            bindings.get(path).copied(),
+            Some(occupied_published_addr(path, fallback)),
+            "missing {path}"
+        );
+    }
 
     /// The exemption is keyed on the registered path, so a rename or a typo in
     /// the pattern silently drops the helper out of the set and the
@@ -7626,8 +7675,10 @@ mod tests {
     fn jit_trace_fnaddrs_contains_root_and_module_aliases() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
 
-        let make_fn =
-            crate::runtime_ops::jit_make_function_from_globals as *const () as usize as i64;
+        let make_fn = occupied_published_addr(
+            "pyre_interpreter::runtime_ops::jit_make_function_from_globals",
+            crate::runtime_ops::jit_make_function_from_globals as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::runtime_ops::jit_make_function_from_globals"],
             make_fn
@@ -7637,7 +7688,10 @@ mod tests {
             make_fn
         );
 
-        let list_append = pyre_object::jit_list_append as *const () as usize as i64;
+        let list_append = occupied_published_addr(
+            "pyre_object::listobject::jit_list_append",
+            pyre_object::jit_list_append as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::listobject::jit_list_append"],
             list_append
@@ -7648,7 +7702,10 @@ mod tests {
             pyre_object::PyObjectRef,
         ) -> *mut pyre_object::rutf8::Utf8IndexStorage =
             pyre_object::unicodeobject::w_str_compute_index_storage;
-        let compute_index_addr = compute_index as *const () as usize as i64;
+        let compute_index_addr = occupied_published_addr(
+            "pyre_object::unicodeobject::w_str_compute_index_storage",
+            compute_index as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::unicodeobject::w_str_compute_index_storage"],
             compute_index_addr
@@ -7755,6 +7812,88 @@ mod tests {
     }
 
     #[test]
+    fn merge_macro_helper_fnaddrs_binds_occupied_slots_to_the_descr_word_adapter() {
+        use std::collections::HashSet;
+
+        let bindings: HashMap<&str, i64> = jit_trace_fnaddrs().into_iter().collect();
+
+        let mut free_rows: Vec<(&str, i64)> = Vec::new();
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let addr = desc.get() as i64;
+            if addr == 0 || desc.is_impl_method() {
+                return;
+            }
+            free_rows.push((desc.path, addr));
+        });
+
+        let mut short_alias_owners: HashMap<String, HashSet<&str>> = HashMap::new();
+        for (path, _) in &free_rows {
+            if let Some((crate_seg, rest)) = path.split_once("::") {
+                let leaf = rest.rsplit("::").next().unwrap_or(rest);
+                if rest != leaf {
+                    short_alias_owners
+                        .entry(format!("{crate_seg}::{leaf}"))
+                        .or_default()
+                        .insert(*path);
+                }
+            }
+        }
+        let unique_short_aliases: HashSet<String> = short_alias_owners
+            .into_iter()
+            .filter(|(_, owners)| owners.len() == 1)
+            .map(|(alias, _)| alias)
+            .collect();
+
+        let mut mismatches: Vec<String> = Vec::new();
+        for (full_path, addr) in &free_rows {
+            let mut paths: Vec<String> = vec![(*full_path).to_string()];
+            if let Some((crate_seg, rest)) = full_path.split_once("::") {
+                let leaf = rest.rsplit("::").next().unwrap_or(rest);
+                if rest != leaf {
+                    let short = format!("{crate_seg}::{leaf}");
+                    if unique_short_aliases.contains(&short) {
+                        paths.push(short);
+                    }
+                }
+            }
+            for path in paths {
+                let Some(&published) = bindings.get(path.as_str()) else {
+                    continue;
+                };
+                if is_abi_unsound_argument_residual(published as usize) {
+                    continue;
+                }
+                if published != *addr {
+                    mismatches.push(path);
+                }
+            }
+        }
+
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            let addr = desc.get() as i64;
+            if addr == 0 || !desc.is_impl_method() {
+                return;
+            }
+            for path in desc.impl_method_fnaddr_paths() {
+                let Some(&published) = bindings.get(path.as_str()) else {
+                    continue;
+                };
+                if is_abi_unsound_argument_residual(published as usize) {
+                    continue;
+                }
+                if published != addr {
+                    mismatches.push(path);
+                }
+            }
+        });
+
+        assert!(
+            mismatches.is_empty(),
+            "occupied macro helper rows must publish the descr-word adapter: {mismatches:?}"
+        );
+    }
+
+    #[test]
     fn merge_macro_helper_fnaddrs_omits_ambiguous_crate_leaf_alias() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         assert!(
@@ -7797,15 +7936,16 @@ mod tests {
             ),
         ];
         for (module_path, root_path, func) in rows {
-            let expected = *func as *const () as usize as i64;
+            let fallback = *func as *const () as usize as i64;
+            let expected = occupied_published_addr(module_path, fallback);
             assert_eq!(
-                bindings.get(module_path),
-                Some(&expected),
+                bindings.get(module_path).copied(),
+                Some(expected),
                 "missing {module_path}"
             );
             assert_eq!(
-                bindings.get(root_path),
-                Some(&expected),
+                bindings.get(root_path).copied(),
+                Some(occupied_published_addr(root_path, fallback)),
                 "missing {root_path}"
             );
         }
@@ -8097,7 +8237,11 @@ mod tests {
                 dict_entries_key_obj_at_word as *const () as usize as i64,
             ),
         ] {
-            assert_eq!(bindings.get(path), Some(&expected), "missing {path}");
+            assert_eq!(
+                bindings.get(path).copied(),
+                Some(occupied_published_addr(path, expected)),
+                "missing {path}"
+            );
         }
         let raw_lookup =
             pyre_object::dictmultiobject::w_dict_lookup_int_strategy as *const () as usize as i64;
@@ -8124,7 +8268,10 @@ mod tests {
                     .iter()
                     .find(|(name, _)| *name == path)
                     .map(|(_, addr)| *addr),
-                Some(target as *const () as usize as i64),
+                Some(occupied_published_addr(
+                    path,
+                    target as *const () as usize as i64
+                )),
                 "{path} must widen the bool before the residual reads a word",
             );
         }
@@ -8138,7 +8285,10 @@ mod tests {
                     .iter()
                     .find(|(name, _)| *name == path)
                     .map(|(_, addr)| *addr),
-                Some(flag as *const () as usize as i64),
+                Some(occupied_published_addr(
+                    path,
+                    flag as *const () as usize as i64
+                )),
                 "{path} must widen the u8 before the residual reads a word",
             );
         }
@@ -8160,7 +8310,10 @@ mod tests {
                 .map(|(_, addr)| *addr);
             assert_eq!(
                 bound,
-                Some(target as *const () as usize as i64),
+                Some(occupied_published_addr(
+                    path,
+                    target as *const () as usize as i64
+                )),
                 "{path} must widen the bool before the residual reads a word",
             );
             assert_ne!(
@@ -8349,14 +8502,18 @@ mod tests {
     /// what its own assertion catches.
     /// `(crate, libc symbol)` for an `llexternal` funcptr path.
     ///
-    /// The registered leaf is `__rffi_fp_<binding>`. A binding is either
-    /// the libc symbol (`dup`) or `c_` plus that symbol (`c_dup`). Each
-    /// declaration is an `extern "C"` symbol, so `rposix`, `rmmap`, and
-    /// `_rsocket_rffi` publish one address for `dup`.
+    /// The registered leaf is `__rffi_fp_<binding>` or `ccall_<binding>`.
+    /// A binding is either the libc symbol (`dup`) or `c_` plus that
+    /// symbol (`c_dup`). `__rffi_fp_*` is the funcptr spelling; `ccall_*`
+    /// is the descr-word adapter (`CallDescr.create_call_stub`) for the
+    /// same `extern "C"` symbol. `rposix`, `rmmap`, and `_rsocket_rffi`
+    /// therefore publish one address for `dup`.
     fn rffi_extern_symbol(path: &str) -> Option<(&str, &str)> {
         let (crate_seg, rest) = path.split_once("::")?;
         let leaf = rest.rsplit_once("::").map(|(_, leaf)| leaf).unwrap_or(rest);
-        let mut name = leaf.strip_prefix("__rffi_fp_")?;
+        let mut name = leaf
+            .strip_prefix("__rffi_fp_")
+            .or_else(|| leaf.strip_prefix("ccall_"))?;
         if let Some(stripped) = name.strip_prefix("c_") {
             name = stripped;
         }
@@ -8711,6 +8868,28 @@ mod tests {
             "majit_rlib::rposix::__rffi_fp_c_close",
             "majit_rlib::_rsocket_rffi::posix::__rffi_fp_socketclose_no_errno",
         ));
+        // Occupied merge publishes the descr-word `ccall_*` adapter on the
+        // same address as `__rffi_fp_*` of one libc symbol.
+        assert!(are_alias_spellings(
+            "majit_rlib::__rffi_fp_c_tzset",
+            "majit_rlib::ccall_c_tzset",
+        ));
+        assert!(are_alias_spellings(
+            "majit_rlib::rtime::__rffi_fp_c_tzset",
+            "majit_rlib::rtime::ccall_c_tzset",
+        ));
+        assert!(are_alias_spellings(
+            "majit_rlib::__rffi_fp_c_tzset",
+            "majit_rlib::rtime::ccall_c_tzset",
+        ));
+        assert!(!are_alias_spellings(
+            "majit_rlib::__rffi_fp_c_tzset",
+            "majit_rlib::ccall_c_gmtime",
+        ));
+        assert!(!are_alias_spellings(
+            "majit_rlib::rposix::ccall_c_dup",
+            "majit_rlib::rposix::__rffi_fp_c_dup2",
+        ));
     }
 
     #[test]
@@ -8936,25 +9115,29 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_w_code_get_w_globals() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let globals = crate::pycode::w_code_get_w_globals as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::pycode::w_code_get_w_globals"],
-            globals,
+        assert_occupied_binding(
+            &bindings,
+            "pyre_interpreter::pycode::w_code_get_w_globals",
+            crate::pycode::w_code_get_w_globals as *const () as usize as i64,
         );
-        assert_eq!(
-            bindings["pyre_object::typeobject::w_type_is_cpython_immutabletype"],
+        assert_occupied_binding(
+            &bindings,
+            "pyre_object::typeobject::w_type_is_cpython_immutabletype",
             super::bh_w_type_is_cpython_immutabletype as *const () as usize as i64,
         );
-        assert_eq!(
-            bindings["pyre_object::typeobject::w_type_get_flag_map_or_seq"],
+        assert_occupied_binding(
+            &bindings,
+            "pyre_object::typeobject::w_type_get_flag_map_or_seq",
             super::bh_w_type_get_flag_map_or_seq as *const () as usize as i64,
         );
-        assert_eq!(
-            bindings["pyre_object::w_type_get_flag_map_or_seq"],
+        assert_occupied_binding(
+            &bindings,
+            "pyre_object::w_type_get_flag_map_or_seq",
             super::bh_w_type_get_flag_map_or_seq as *const () as usize as i64,
         );
-        assert_eq!(
-            bindings["bytecode::oparg::LoadAttr::name_idx"],
+        assert_occupied_binding(
+            &bindings,
+            "bytecode::oparg::LoadAttr::name_idx",
             super::bh_load_attr_name_idx as *const () as usize as i64,
         );
     }
@@ -8974,41 +9157,55 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_str_and_bytes_contains_helpers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let str_contains =
-            pyre_object::unicodeobject::jit_str_contains as *const () as usize as i64;
+        let str_contains = occupied_published_addr(
+            "pyre_object::unicodeobject::jit_str_contains",
+            pyre_object::unicodeobject::jit_str_contains as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::unicodeobject::jit_str_contains"],
             str_contains
         );
         assert_eq!(bindings["pyre_object::jit_str_contains"], str_contains);
-        let startswith =
-            pyre_object::unicodeobject::jit_str_startswith as *const () as usize as i64;
+        let startswith = occupied_published_addr(
+            "pyre_object::unicodeobject::jit_str_startswith",
+            pyre_object::unicodeobject::jit_str_startswith as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::unicodeobject::jit_str_startswith"],
             startswith
         );
         assert_eq!(bindings["pyre_object::jit_str_startswith"], startswith);
-        let endswith = pyre_object::unicodeobject::jit_str_endswith as *const () as usize as i64;
+        let endswith = occupied_published_addr(
+            "pyre_object::unicodeobject::jit_str_endswith",
+            pyre_object::unicodeobject::jit_str_endswith as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::unicodeobject::jit_str_endswith"],
             endswith
         );
         assert_eq!(bindings["pyre_object::jit_str_endswith"], endswith);
-        let bytes_contains =
-            pyre_object::bytesobject::jit_bytes_contains as *const () as usize as i64;
+        let bytes_contains = occupied_published_addr(
+            "pyre_object::bytesobject::jit_bytes_contains",
+            pyre_object::bytesobject::jit_bytes_contains as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::bytesobject::jit_bytes_contains"],
             bytes_contains
         );
         assert_eq!(bindings["pyre_object::jit_bytes_contains"], bytes_contains);
-        let bytes_byte =
-            pyre_object::bytesobject::jit_bytes_contains_byte as *const () as usize as i64;
+        let bytes_byte = occupied_published_addr(
+            "pyre_object::bytesobject::jit_bytes_contains_byte",
+            pyre_object::bytesobject::jit_bytes_contains_byte as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::bytesobject::jit_bytes_contains_byte"],
             bytes_byte
         );
         assert_eq!(bindings["pyre_object::jit_bytes_contains_byte"], bytes_byte);
-        let list_int = crate::listobject::jit_list_contains_int as *const () as usize as i64;
+        let list_int = occupied_published_addr(
+            "pyre_interpreter::listobject::jit_list_contains_int",
+            crate::listobject::jit_list_contains_int as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::listobject::jit_list_contains_int"],
             list_int
@@ -9017,13 +9214,19 @@ mod tests {
             bindings["pyre_interpreter::jit_list_contains_int"],
             list_int
         );
-        let set_int = pyre_object::setobject::jit_int_set_has_key as *const () as usize as i64;
+        let set_int = occupied_published_addr(
+            "pyre_object::setobject::jit_int_set_has_key",
+            pyre_object::setobject::jit_int_set_has_key as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::setobject::jit_int_set_has_key"],
             set_int
         );
         assert_eq!(bindings["pyre_object::jit_int_set_has_key"], set_int);
-        let set_add_int = pyre_object::setobject::jit_int_set_add as *const () as usize as i64;
+        let set_add_int = occupied_published_addr(
+            "pyre_object::setobject::jit_int_set_add",
+            pyre_object::setobject::jit_int_set_add as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::setobject::jit_int_set_add"],
             set_add_int
@@ -9201,7 +9404,10 @@ mod tests {
 
         let clear_references: fn(&mut crate::pyframe::PyFrame) =
             crate::pyframe::PyFrame::clear_references;
-        let clear_references = clear_references as *const () as usize as i64;
+        let clear_references = occupied_published_addr(
+            "pyre_interpreter::pyframe::PyFrame::clear_references",
+            clear_references as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::pyframe::PyFrame::clear_references"],
             clear_references
@@ -9212,7 +9418,10 @@ mod tests {
         );
 
         let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
-        let get_exc = get_exc as *const () as usize as i64;
+        let get_exc = occupied_published_addr(
+            "pyre_interpreter::eval::get_current_exception",
+            get_exc as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::eval::get_current_exception"],
             get_exc
@@ -9220,7 +9429,10 @@ mod tests {
         assert_eq!(bindings["pyre_interpreter::get_current_exception"], get_exc);
 
         let get_sys_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_sys_exception;
-        let get_sys_exc = get_sys_exc as *const () as usize as i64;
+        let get_sys_exc = occupied_published_addr(
+            "pyre_interpreter::eval::get_sys_exception",
+            get_sys_exc as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::eval::get_sys_exception"],
             get_sys_exc
@@ -9231,7 +9443,10 @@ mod tests {
             &crate::executioncontext::ExecutionContext,
         ) -> pyre_object::PyObjectRef =
             crate::executioncontext::ExecutionContext::_get_topmost_exception;
-        let get_topmost_exception = get_topmost_exception as *const () as usize as i64;
+        let get_topmost_exception = occupied_published_addr(
+            "pyre_interpreter::executioncontext::ExecutionContext::_get_topmost_exception",
+            get_topmost_exception as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::executioncontext::ExecutionContext::_get_topmost_exception"],
             get_topmost_exception,
@@ -9242,7 +9457,10 @@ mod tests {
         );
 
         let set_exc: fn(pyre_object::PyObjectRef) = crate::eval::set_current_exception;
-        let set_exc = set_exc as *const () as usize as i64;
+        let set_exc = occupied_published_addr(
+            "pyre_interpreter::eval::set_current_exception",
+            set_exc as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::eval::set_current_exception"],
             set_exc
@@ -9253,7 +9471,10 @@ mod tests {
             crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
             crate::bytecode::OpArg,
         ) -> usize = crate::pyopcode::var_nums_to_first_index;
-        let first = first as *const () as usize as i64;
+        let first = occupied_published_addr(
+            "pyre_interpreter::pyopcode::var_nums_to_first_index",
+            first as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::pyopcode::var_nums_to_first_index"],
             first
@@ -9264,7 +9485,10 @@ mod tests {
             crate::bytecode::Arg<crate::bytecode::oparg::VarNums>,
             crate::bytecode::OpArg,
         ) -> usize = crate::pyopcode::var_nums_to_second_index;
-        let second = second as *const () as usize as i64;
+        let second = occupied_published_addr(
+            "pyre_interpreter::pyopcode::var_nums_to_second_index",
+            second as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::pyopcode::var_nums_to_second_index"],
             second
@@ -9284,15 +9508,20 @@ mod tests {
     fn jit_trace_fnaddrs_covers_interp_gc_safepoint_readers() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
 
-        let collect_enabled = pyre_object::gc_interp::collect_enabled as *const () as usize as i64;
+        let collect_enabled = occupied_published_addr(
+            "pyre_object::gc_interp::collect_enabled",
+            pyre_object::gc_interp::collect_enabled as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::gc_interp::collect_enabled"],
             collect_enabled
         );
         assert_eq!(bindings["pyre_object::collect_enabled"], collect_enabled);
 
-        let at_outermost =
-            pyre_object::gc_interp::at_outermost_activation as *const () as usize as i64;
+        let at_outermost = occupied_published_addr(
+            "pyre_object::gc_interp::at_outermost_activation",
+            pyre_object::gc_interp::at_outermost_activation as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::gc_interp::at_outermost_activation"],
             at_outermost
@@ -9302,8 +9531,10 @@ mod tests {
             at_outermost
         );
 
-        let collect_oldgen =
-            pyre_object::gc_hook::try_gc_collect_oldgen as *const () as usize as i64;
+        let collect_oldgen = occupied_published_addr(
+            "pyre_object::gc_hook::try_gc_collect_oldgen",
+            pyre_object::gc_hook::try_gc_collect_oldgen as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::gc_hook::try_gc_collect_oldgen"],
             collect_oldgen
@@ -9313,34 +9544,47 @@ mod tests {
             collect_oldgen
         );
 
-        let itemsblock =
-            pyre_object::object_array::itemsblock_gc_enabled as *const () as usize as i64;
+        let itemsblock = occupied_published_addr(
+            "pyre_object::object_array::itemsblock_gc_enabled",
+            pyre_object::object_array::itemsblock_gc_enabled as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::object_array::itemsblock_gc_enabled"],
             itemsblock
         );
         assert_eq!(bindings["pyre_object::itemsblock_gc_enabled"], itemsblock);
 
-        let bump = crate::call::bump_frame_entry_count as *const () as usize as i64;
+        let bump = occupied_published_addr(
+            "pyre_interpreter::call::bump_frame_entry_count",
+            crate::call::bump_frame_entry_count as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::call::bump_frame_entry_count"],
             bump
         );
 
-        let py_recursion_depth = crate::call::py_recursion_depth as *const () as usize as i64;
+        let py_recursion_depth = occupied_published_addr(
+            "pyre_interpreter::call::py_recursion_depth",
+            crate::call::py_recursion_depth as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::call::py_recursion_depth"],
             py_recursion_depth
         );
 
-        let recursion_limit =
-            crate::module::sys::state::recursion_limit as *const () as usize as i64;
+        let recursion_limit = occupied_published_addr(
+            "pyre_interpreter::module::sys::state::recursion_limit",
+            crate::module::sys::state::recursion_limit as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_interpreter::module::sys::state::recursion_limit"],
             recursion_limit
         );
 
-        let safepoint = pyre_object::gc_interp::safepoint as *const () as usize as i64;
+        let safepoint = occupied_published_addr(
+            "pyre_object::gc_interp::safepoint",
+            pyre_object::gc_interp::safepoint as *const () as usize as i64,
+        );
         assert_eq!(bindings["pyre_object::gc_interp::safepoint"], safepoint);
         assert_eq!(bindings["pyre_object::safepoint"], safepoint);
     }
@@ -9351,7 +9595,10 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_may_ignore_finalizer() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::executioncontext::may_ignore_finalizer as *const () as usize as i64;
+        let expected = occupied_published_addr(
+            "pyre_interpreter::executioncontext::may_ignore_finalizer",
+            crate::executioncontext::may_ignore_finalizer as *const () as usize as i64,
+        );
 
         assert_eq!(
             bindings["pyre_interpreter::executioncontext::may_ignore_finalizer"],
@@ -9368,7 +9615,10 @@ mod tests {
     fn jit_trace_fnaddrs_covers_w_float_gc_alloc_word_abi() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
         let expected: extern "C" fn(f64) -> i64 = pyre_object::floatobject::w_float_gc_alloc_word;
-        let expected = expected as *const () as usize as i64;
+        let expected = occupied_published_addr(
+            "pyre_object::floatobject::w_float_gc_alloc",
+            expected as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::floatobject::w_float_gc_alloc"],
             expected
@@ -9387,7 +9637,10 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_jit_w_bytes_from_u8() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = pyre_object::bytesobject::jit_w_bytes_from_u8 as *const () as usize as i64;
+        let expected = occupied_published_addr(
+            "pyre_object::bytesobject::jit_w_bytes_from_u8",
+            pyre_object::bytesobject::jit_w_bytes_from_u8 as *const () as usize as i64,
+        );
         assert_eq!(
             bindings["pyre_object::bytesobject::jit_w_bytes_from_u8"],
             expected
@@ -9400,7 +9653,10 @@ mod tests {
     #[test]
     fn jit_trace_fnaddrs_covers_register_finalizer() {
         let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
-        let expected = crate::executioncontext::register_finalizer as *const () as usize as i64;
+        let expected = occupied_published_addr(
+            "pyre_interpreter::executioncontext::register_finalizer",
+            crate::executioncontext::register_finalizer as *const () as usize as i64,
+        );
 
         assert_eq!(
             bindings["pyre_interpreter::executioncontext::register_finalizer"],
