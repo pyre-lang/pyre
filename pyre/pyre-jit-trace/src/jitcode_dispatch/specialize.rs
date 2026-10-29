@@ -10578,10 +10578,15 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     // The store the body recorded, for a walk that could not execute it.
     let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
     // A kept store has no undo entry, so the cursor snapshot is the only way
-    // back for a bridge walk that aborts with its delivery refused; it is taken
-    // from the pre-walk pair whichever side moved the cursor.
+    // back for a walk that aborts with its delivery refused; it is taken from
+    // the pre-walk pair whichever side moved the cursor.  A root walk needs it
+    // as much as a bridge: its non-commit epilogue leaves the snapshot to the
+    // delivery site, whose header refusal restores it so the resume
+    // re-consumes the item.  Without it that refusal restores nothing and the
+    // iteration is lost.  A root walk has no delivery for an exhausting step,
+    // so it snapshots only a consume.
     let cursor_moved = !cursor_unchanged || (replay && (item.is_some() || exhausted));
-    let journaled = cursor_moved && ctx.trace_ctx.is_bridge_trace;
+    let journaled = cursor_moved && (ctx.trace_ctx.is_bridge_trace || item.is_some());
     if journaled {
         fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
     }
@@ -16456,7 +16461,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
         let saved = crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx);
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
+        crate::trace_opcode::mirror_vable_static_to_boxes(
             ctx.trace_ctx,
             "last_instr",
             li_op,
