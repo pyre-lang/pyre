@@ -7104,7 +7104,6 @@ impl<S: JitState> JitDriver<S> {
                     );
                 }
             }
-
         }
 
         // Re-enter the dispatch loop at `target_pc` so the trace HEADS where its
@@ -8361,12 +8360,12 @@ impl<S: JitState> JitDriver<S> {
             return None;
         }
 
-        // Same `warmstate.py:471-478` gate as `back_edge_internal`: a cell
-        // holding only a `compile_tmp_callback` token has no `compiled_loops`
-        // meta, and upstream counts it normally instead of entering it. Without
-        // the meta the runner below can only return `Abort`, which stops this
-        // route from ever reaching `maybe_start_tracing` — i.e. the counter
-        // stops ticking and the real loop is never traced.
+        // Same `warmstate.py maybe_compile_and_run` JC_TEMPORARY gate as
+        // `back_edge_internal`: a cell holding only a `compile_tmp_callback`
+        // token is counted normally instead of entered. Entering it would
+        // Abort in the runner below and stop this route from reaching
+        // `maybe_start_tracing` — the counter would stop ticking and the
+        // real loop would never be traced.
         if self.has_runnable_compiled_loop(green_key) {
             let confirm_reds = self.confirm_enter_jit_reds(state, env, target_pc);
             let confirm_types = self.confirm_enter_jit_green_types(greenargs);
@@ -9764,38 +9763,31 @@ impl<S: JitState> JitDriver<S> {
     }
 
     /// Whether the warm-entry runner can actually execute the code at this
-    /// green key. Stronger than `has_compiled_loop`: it also requires a
-    /// frontend `compiled_loops` meta (`get_compiled_meta`).
+    /// green key. Stronger than `has_compiled_loop`: the token must be this
+    /// driver's (`history.py JitCellToken.outermost_jitdriver_sd`) and not a
+    /// `compile_tmp_callback` stub (`JC_TEMPORARY`).
     ///
     /// `has_compiled_loop` is true whenever the cell's procedure token has a
     /// compiled backend body (`warmstate.py` gates entry on code
     /// presence). That includes a `compile_tmp_callback` token
-    /// (`compile.py:1101-1150`): a CALL_ASSEMBLER fallback stub with a real
-    /// body but NO frontend meta, since MetaInterp never inserts it into
-    /// `compiled_loops`. RPython's `execute_assembler` can enter such a token
-    /// directly — the stub bounces control back to the interpreter
-    /// (ContinueRunningNormally). Pyre's warm-entry runner instead needs the
-    /// `compiled_loops` meta to interpret guard-failure exit layouts, so
-    /// entering a bare tmp callback here has no meta and aborts.
+    /// (`compile.py compile_tmp_callback`): a CALL_ASSEMBLER fallback stub
+    /// with a real body. `warmstate.py maybe_compile_and_run` reads
+    /// `JC_TEMPORARY` and counts that cell instead of entering it.
+    /// `get_compiled_meta` is the execute-path VALUE for guard-failure
+    /// layouts; a miss there aborts the run, it is not this predicate.
     ///
     /// Gating warm-entry dispatch on this predicate lets a tmp-only cell fall
-    /// through to the counter tick / trace-start, which is the pyre-orthodox
-    /// realization of the tmp-callback → resume-interp semantics: the back-edge
-    /// counter keeps ticking until the real loop compiles (a `compiled_loops`
-    /// entry appears) and `redirect_call_assembler` takes over. Entry bridges
-    /// (`ResumeFromInterpDescr`, `compile.py:1079-1083`) DO get a
-    /// `compiled_loops` entry despite carrying 0 target tokens, so they remain
-    /// dispatchable — this predicate only excludes bare tmp callbacks.
+    /// through to the counter tick / trace-start: the back-edge counter keeps
+    /// ticking until the real loop compiles and `redirect_call_assembler`
+    /// takes over. Entry bridges (`ResumeFromInterpDescr`,
+    /// `compile.py ResumeFromInterpDescr.compile_and_attach`) remain
+    /// dispatchable because they carry a non-temporary procedure token.
     ///
     /// No typed twin, and unlike [`Self::has_compiled_loop_for_key`] that is
-    /// not a gap: the strengthening above is pyre-only, so there is no
-    /// warmstate.py reader for a twin to mirror. What a twin would add is a
-    /// `cell_key_for` resolve in front, and the entry path already resolves at
-    /// the producer (`back_edge_internal`, `resolve_cell_key`) — after which
-    /// both conjuncts here index by that one cell key, so the disagreement a
-    /// twin existed to prevent (`compiled_loops` read at the bare
-    /// `key.get_uhash()` while the token half walked the chain) can no longer
-    /// be expressed. `warmstate::tests::
+    /// not a gap: the entry path already resolves at the producer
+    /// (`back_edge_internal`, `resolve_cell_key`) — after which this
+    /// predicate indexes by that one cell key, so the disagreement a twin
+    /// existed to prevent can no longer be expressed. `warmstate::tests::
     /// the_entry_decision_and_the_entry_execution_resolve_through_one_cell_key`
     /// is the pin for that.
     ///
@@ -9912,21 +9904,19 @@ impl<S: JitState> JitDriver<S> {
     /// second time.
     ///
     /// `warmstate.py` reads `procedure_token = cell.get_procedure_token()`
-    /// once and `:509-511` carries that object out through `raise
-    /// EnterJitAssembler(procedure_token, *execute_args)`; the executor never
-    /// asks the cell again. This is the reader that makes the same carry
-    /// expressible for a caller outside this crate.
+    /// once and `maybe_compile_and_run` carries that object out through
+    /// `raise EnterJitAssembler(procedure_token, *execute_args)`; the
+    /// executor never asks the cell again. This is the reader that makes
+    /// the same carry expressible for a caller outside this crate.
     ///
-    /// How the predicate's two conjuncts divide here: `entry_procedure_token_on_driver`
-    /// IS the `has_compiled_loop` half — that predicate is defined as this
-    /// token being present, not merely as something equivalent to it — so
-    /// binding the token subsumes the first conjunct exactly. It does NOT
-    /// subsume the second: `get_compiled_meta` reads the frontend
-    /// `compiled_loops` table. Nor does either read subsume the cell-owned
-    /// `JC_TEMPORARY` flag: `compile_tmp_callback` can displace a real loop
-    /// while that loop's frontend metadata remains. Both tests therefore stay
-    /// here explicitly, matching the flag-first branch in upstream
-    /// `WarmEnterState.maybe_compile_and_run`.
+    /// `entry_procedure_token_on_driver` IS the `has_compiled_loop` half —
+    /// that predicate is defined as this token being present, not merely as
+    /// something equivalent to it — so binding the token subsumes the
+    /// code-presence half exactly. The remaining filters are the cell-owned
+    /// `JC_TEMPORARY` flag (`compile.py compile_tmp_callback`) and the
+    /// token's `outermost_jitdriver_index` matching this driver
+    /// (`history.py JitCellToken.outermost_jitdriver_sd`).
+    /// `get_compiled_meta` is the execute-path VALUE, not this predicate.
     ///
     /// `warmstate.py maybe_compile_and_run` is bound on this driver's
     /// WarmEnterState (`JitDriver::index`), not leftover portal slot 0.
@@ -9942,15 +9932,12 @@ impl<S: JitState> JitDriver<S> {
         let jd_no = self.index().unwrap_or(0);
         self.meta
             .entry_procedure_token_on_driver(jd_no, green_key)
-            .filter(|_| {
+            .filter(|token| {
                 !self
                     .meta
                     .warm_state_ref_for_driver(jd_no)
                     .is_some_and(|warm| warm.procedure_token_is_temporary(green_key))
-                    && self
-                        .meta
-                        .get_compiled_meta_on_driver(jd_no, green_key)
-                        .is_some()
+                    && token.outermost_jitdriver_index == Some(jd_no)
             })
     }
 
@@ -13808,7 +13795,9 @@ mod tests {
         driver.meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x7e15);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(76));
+        let mut token = majit_backend::JitCellToken::new(76);
+        token.outermost_jitdriver_index = Some(idx1);
+        let token = std::sync::Arc::new(token);
         token.set_compiled(Box::new(()));
         driver
             .meta
@@ -13843,6 +13832,30 @@ mod tests {
         assert!(
             driver.meta.entry_procedure_token(key.get_uhash()).is_none(),
             "portal slot 0 does not hold jd1's compiled cell"
+        );
+
+        let key_no_row = gk(0x7e16);
+        let mut token_no_row = majit_backend::JitCellToken::new(77);
+        token_no_row.outermost_jitdriver_index = Some(idx1);
+        let token_no_row = std::sync::Arc::new(token_no_row);
+        token_no_row.set_compiled(Box::new(()));
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&token_no_row);
+        let _ = driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .ensure_cell_for_key(&key_no_row);
+        driver
+            .meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp_for_key(&key_no_row, std::sync::Arc::clone(&token_no_row));
+        let found_no_row = driver.runnable_procedure_token(key_no_row.get_uhash());
+        assert!(
+            found_no_row.is_some_and(|got| std::sync::Arc::ptr_eq(&got, &token_no_row)),
+            "a this-driver token is runnable without a compiled_loops row"
         );
     }
 
@@ -16574,7 +16587,7 @@ mod tests {
         );
         assert!(
             !driver.has_runnable_compiled_loop(hash),
-            "and it has no frontend meta, so the warm-entry runner cannot enter it",
+            "and it is JC_TEMPORARY, so the warm-entry runner cannot enter it",
         );
 
         // Before this fell through, the back edge unwrapped the absent meta and

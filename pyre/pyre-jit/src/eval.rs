@@ -11768,16 +11768,15 @@ fn maybe_compile_and_run(
     // warmstate.py: procedure_token exists → EnterJitAssembler.
     // RPython enters assembler unconditionally when a compiled loop is
     // available for this green_key. Pyre gates on `has_runnable_compiled_loop`
-    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token — which
-    // has a compiled body but no `compiled_loops` meta — falls through to the
-    // counter tick below instead of entering `execute_assembler` with no meta
-    // to interpret its exit (which aborts). The tmp cell then re-ticks until
-    // the real loop compiles.
+    // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token
+    // (`JC_TEMPORARY`) falls through to the counter tick below instead of
+    // entering `execute_assembler`. The tmp cell then re-ticks until the
+    // real loop compiles. `get_compiled_meta` is the execute-path VALUE;
+    // a miss there aborts the run.
     // Why a compiled loop for this green key is or is not enterable, per
-    // back-edge.  `has_runnable_compiled_loop` is the conjunction of an entry
-    // procedure token and a frontend `compiled_loops` entry, and the two fail
-    // for different reasons: a pruned cell reads `cell_present=false
-    // state=NotHot` while its meta survives, an invalidated token reads
+    // back-edge.  `has_runnable_compiled_loop` is the cell's non-temporary
+    // procedure token compiled for this driver. A pruned cell reads
+    // `cell_present=false state=NotHot`, an invalidated token reads
     // `seen_token=true has_token=false`.  Separating them is what distinguishes
     // a cell the warmstate dropped from a token something revoked.
     static GEN_ENTRY_DIAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -13423,10 +13422,10 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
     // JC_TRACING: skipping here dropped residual portal ticks for inlined
     // callees during the parent trace.
 
-    // RPython warmstate.py maybe_compile_and_run: read the cell's procedure
+    // warmstate.py maybe_compile_and_run: read the cell's procedure
     // token, and only when it is absent ask the counter. A bare
-    // `compile_tmp_callback` token (a token, but no `compiled_loops` meta) is
-    // not runnable, so it keeps ticking toward compiling the real loop.
+    // `compile_tmp_callback` token (`JC_TEMPORARY`) is not runnable, so
+    // it keeps ticking toward compiling the real loop.
     //
     // One call, one walk of the cell chain. The three questions this replaces --
     // `has_runnable_compiled_loop`, the counter gate, then
