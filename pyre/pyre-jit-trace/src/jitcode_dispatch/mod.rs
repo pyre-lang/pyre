@@ -14201,34 +14201,6 @@ fn establish_nullity<Sym: WalkSym>(
         });
     };
     let value = bits != 0;
-    // The screens fold the `debugdata` test to its null arm
-    // (`PyFrame.__init__` stores `debugdata = None`); a frame whose
-    // `debugdata` carries a trace function would run the arm's
-    // `bytecode_only_trace` call they did not examine, so the walk
-    // stops there. A non-null `debugdata` without a trace function
-    // only reads `w_f_trace` and rejoins.
-    if !ctx.is_top_level && value && op.opname == "goto_if_not_ptr_iszero" {
-        let descr_refs = ctx
-            .fbw_mode
-            .transparent_helper_jitcode_index
-            .map(descr_refs_for_jitcode_index)
-            .or_else(|| {
-                ctx.inline_callee_consts
-                    .map(|c| descr_refs_for_jitcode_index(c.jitcode_index as usize))
-            })
-            .unwrap_or(&[]);
-        if let Some(ops) = linear_decoded_ops(code)
-            && let Some(idx) = ops.iter().position(|d| d.pc == op.pc)
-        {
-            let pred = previous_non_live_op(&ops, idx);
-            if is_jitted_arm_w_f_trace_null_goto(code, op, pred, descr_refs) {
-                return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
-                    pc: op.pc,
-                    symbolic: 0,
-                });
-            }
-        }
-    }
     // `warmspot.py split_graph_and_record_jitdriver` starts the portal graph
     // at `jit_merge_point`, so a loop trace never records what
     // `interp_jit.py PyFrame.dispatch` evaluates before it

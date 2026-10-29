@@ -579,9 +579,7 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
 /// folds (`pyjitpl.py` `_establish_nullity` records nothing for a known-null
 /// box), so a `goto_if_not_ptr_iszero` of that `getfield_vable_r` follows only
 /// its fallthrough and is itself not yielded. Ops reachable only through the
-/// non-null arm are dropped. The fold is the screens' assumption, which
-/// `establish_nullity` checks at walk time (the walk stops at the arm's
-/// `w_f_trace` test when a trace function is installed).
+/// non-null arm are dropped.
 ///
 /// `None` when a reachable instruction cannot be decoded. Walks the CFG from
 /// pc 0: fallthrough, `goto` targets, both successors of every other
@@ -642,7 +640,7 @@ fn is_live_marker(opname: &str) -> bool {
     opname == "live" || opname.starts_with("live/")
 }
 
-pub(crate) fn previous_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Option<&'a DecodedOp> {
+fn previous_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Option<&'a DecodedOp> {
     let mut i = idx;
     while i > 0 {
         i -= 1;
@@ -653,7 +651,7 @@ pub(crate) fn previous_non_live_op<'a>(ops: &'a [DecodedOp], idx: usize) -> Opti
     None
 }
 
-pub(crate) fn linear_decoded_ops(code: &[u8]) -> Option<Vec<DecodedOp>> {
+fn linear_decoded_ops(code: &[u8]) -> Option<Vec<DecodedOp>> {
     let mut ops = Vec::new();
     let mut pc = 0usize;
     while pc < code.len() {
@@ -738,56 +736,6 @@ fn is_fresh_frame_debugdata_null_goto(
         .is_some_and(descr_is_vable_debugdata)
 }
 
-fn w_f_trace_field_name(name: &str) -> bool {
-    name == "w_f_trace" || name.rsplit(['.', ':']).next() == Some("w_f_trace")
-}
-
-fn descr_is_frame_debug_data_w_f_trace(descr: &DescrRef) -> bool {
-    if std::sync::Arc::ptr_eq(descr, &crate::descr::frame_debug_data_w_f_trace_descr()) {
-        return true;
-    }
-    descr
-        .as_field_descr()
-        .is_some_and(|field| w_f_trace_field_name(field.field_name()))
-}
-
-/// `goto_if_not_ptr_iszero` of `FrameDebugData.w_f_trace` written by the
-/// immediately preceding `getfield_gc_r`.
-///
-/// `emit_dispatch_bytecode_jitted_trace_arm` is the only emitter of this
-/// field descr. The non-null arm residualizes `bytecode_only_trace`.
-pub(crate) fn is_jitted_arm_w_f_trace_null_goto(
-    code: &[u8],
-    op: &DecodedOp,
-    pred: Option<&DecodedOp>,
-    descr_refs: &[DescrRef],
-) -> bool {
-    if op.opname != "goto_if_not_ptr_iszero" {
-        return false;
-    }
-    let Some(pred) = pred else {
-        return false;
-    };
-    if !pred.opname.starts_with("getfield_gc_r") {
-        return false;
-    }
-    let Some(&cond) = code.get(op.pc + 1) else {
-        return false;
-    };
-    let Some(&dst) = code.get(pred.next_pc.wrapping_sub(1)) else {
-        return false;
-    };
-    if cond != dst {
-        return false;
-    }
-    let Some(descr_index) = descr_operand_index(code, pred) else {
-        return false;
-    };
-    body_descr_at(descr_refs, descr_index)
-        .as_ref()
-        .is_some_and(descr_is_frame_debug_data_w_f_trace)
-}
-
 fn switch_targets_for_body(descr_refs: &[DescrRef], descr_index: usize) -> Option<Vec<usize>> {
     let descr = body_descr_at(descr_refs, descr_index)?;
     let switch = descr.as_switch_descr()?;
@@ -852,7 +800,7 @@ fn fresh_frame_successors(
     }
 }
 
-pub(crate) fn descr_refs_for_jitcode_index(jitcode_index: usize) -> &'static [DescrRef] {
+fn descr_refs_for_jitcode_index(jitcode_index: usize) -> &'static [DescrRef] {
     crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
         .and_then(|pjc| {
             if pjc.code_ptr.is_null() {
