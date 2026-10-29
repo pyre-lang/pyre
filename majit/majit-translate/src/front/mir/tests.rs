@@ -12220,6 +12220,23 @@ pub(in crate::front::mir) fn rows(spec: &[(&str, &str)]) -> Vec<crate::front::se
         .collect()
 }
 
+pub(in crate::front::mir) fn opaque_type_decl(def_id: u64, path: &[&str]) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": true
+        },
+        "kind": "Opaque"
+    })
+}
+
 pub(in crate::front::mir) fn code_struct(def_id: u64, path: &[&str]) -> serde_json::Value {
     let span = serde_json::json!({"data": {
         "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}

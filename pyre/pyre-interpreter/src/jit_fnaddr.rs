@@ -6938,6 +6938,18 @@ pub fn jit_static_ref_addrs() -> Vec<(&'static str, i64)> {
             "stack_check::PYRE_STACKTOOBIG",
             &crate::stack_check::PYRE_STACKTOOBIG as *const _ as i64,
         ),
+        // Process-global `FnPtrCell` alloc hooks. `try_gc_alloc_stable`
+        // reads `GC_ALLOC_STABLE_HOOK.get()`; without this row the Global
+        // place becomes a nullary Call on the static's path and the
+        // caller's lift dies as `not registered in CallRegistry`.
+        (
+            "gc_hook::GC_ALLOC_HOOK",
+            pyre_object::gc_hook::gc_alloc_hook_static_addr() as i64,
+        ),
+        (
+            "gc_hook::GC_ALLOC_STABLE_HOOK",
+            pyre_object::gc_hook::gc_alloc_stable_hook_static_addr() as i64,
+        ),
         // `gil.py` `GILThreadLocals.gil_ready`. `static mut`, so the
         // address is the live cell: a translated field load must not
         // fold the initializer. `&raw const` — a shared reference to

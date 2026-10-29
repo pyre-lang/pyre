@@ -2179,6 +2179,16 @@ impl<'a> Lowering<'a> {
                         self.cast_ptr_to_int_src.insert(result.clone(), orig);
                         return Ok((Some(retype), result));
                     }
+                    // `i64 as *mut Utf8Str` is `cast_int_to_ptr(Ptr(STR), int)`:
+                    // the value is rstr `STR` (`node_is_string_value`), not
+                    // the 1-arg `MAJIT_REF_OPAQUE` placeholder.
+                    if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc)
+                    {
+                        let bb_id = self.emit_bb(mir_bb);
+                        let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, arg);
+                        return Ok((None, raw));
+                    }
                     // `ann_cast_int_to_ptr(PtrT, s_int)` keeps dest PTRTYPE.
                     // Overlay `as *const T` must not alias or fold back to
                     // the GC orig (`rewrite_op_cast_opaque_ptr`); getattr
@@ -2635,6 +2645,14 @@ impl<'a> Lowering<'a> {
                     self.gc_struct_ids,
                     &self.raw_alloc_flavor_structs,
                 );
+                if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    && matches!(dst_kind, ValueType::Str)
+                    && tyref_raw_ptr_pointee_is_string_value(&ty, self.llbc)
+                {
+                    let bb_id = self.emit_bb(mir_bb);
+                    let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, v);
+                    return Ok((None, raw));
+                }
                 let crosses_raw_ref = (src_raw_addr && matches!(dst_kind, ValueType::Ref(_)))
                     || (matches!(src_kind, Some(ValueType::Ref(_))) && dest_raw_addr);
                 if crosses_raw_ref
@@ -3917,6 +3935,12 @@ impl<'a> Lowering<'a> {
         use crate::translator::rtyper::lltypesystem::lltype::{
             GcKind, LowLevelType, Ptr, Struct, frozendict,
         };
+        // `ann_cast_int_to_ptr` of `Ptr(STR)` is the string itself
+        // (`node_is_string_value`). Overlay would recast that header as a
+        // raw `SomePtr` and merge `Ptr ∪ String` with a field-load STR.
+        if tyref_raw_ptr_pointee_is_string_value(dest_ty, self.llbc) {
+            return None;
+        }
         let pointee = tyref_peel_one_raw_ptr_node(dest_ty, self.llbc)?;
         // `ann_cast_int_to_ptr(PTRTYPE, s_int)` keeps PTRTYPE; whether that
         // is a raw `Ptr(Struct)` or a GC pointer is `PTRTYPE.TO._gckind`.
@@ -6559,7 +6583,13 @@ impl<'a> Lowering<'a> {
                 // and field-bearing strategy holders, whose address is stored
                 // in W_DictObject.dstrategy. A bare ConstRefAddr would instead
                 // annotate the latter as SomePtr and lose its instance repr.
-                if let Some(root) = self.refs_static_struct_root(&place_ty)
+                // `FnPtrCell` hook statics are Opaque in the consuming
+                // crate's LLBC (`majit_gc::hook_cell::FnPtrCell`), so
+                // `refs_static_struct_root` is empty; `immutablevalue`
+                // still annotates the prebuilt with its class.
+                if let Some(root) = self
+                    .refs_static_struct_root(&place_ty)
+                    .or_else(|| tyref_class_root_with(&place_ty, self.llbc, self.tombstoned_leaves))
                     && let Some(op @ OpKind::ConstRefAddr(_)) = self.static_addr_op(&segments)
                 {
                     let bb_id = self.emit_bb(mir_bb);
@@ -7232,7 +7262,9 @@ impl<'a> Lowering<'a> {
                 // and union every payload onto one `__pos_0`.
                 let dest_adt = dest_ty.and_then(|ty| tyref_adt_map(ty, self.llbc));
                 let inst_adt = concrete_instantiation_adt(head_adt, dest_adt, self.llbc);
-                let suffix = inst_adt.and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
+                let suffix = inst_adt.and_then(|h| {
+                    adt_head_instantiation_suffix(h, self.llbc, self.tombstoned_leaves)
+                });
                 let leaf = match suffix {
                     Some(suffix) => majit_ir::descr::with_instantiation_suffix(&type_leaf, &suffix),
                     None => type_leaf,
@@ -7421,7 +7453,7 @@ impl<'a> Lowering<'a> {
         let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
             strip_crate_prefix(&name_path)
         } else {
-            match adt_head_instantiation_suffix(head, self.llbc) {
+            match adt_head_instantiation_suffix(head, self.llbc, self.tombstoned_leaves) {
                 Some(suffix) => majit_ir::descr::with_instantiation_suffix(&owner_base, &suffix),
                 None => match struct_instantiation_suffix(&name_path, head, self.llbc) {
                     Some(suffix) => {
@@ -7671,7 +7703,7 @@ impl<'a> Lowering<'a> {
         let def_id = inline_adt_def_id(v)?;
         let name_path = self.llbc.type_by_id(def_id)?.item_meta.name_path();
         let adt = v.as_object()?.get("Adt")?.as_object()?;
-        match adt_head_instantiation_suffix(adt, self.llbc) {
+        match adt_head_instantiation_suffix(adt, self.llbc, self.tombstoned_leaves) {
             Some(suffix) => Some(majit_ir::descr::with_instantiation_suffix(
                 &name_path, &suffix,
             )),
@@ -8848,6 +8880,42 @@ pub(in crate::front::mir) fn overlay_field_lltype(
         return LowLevelType::Ptr(Box::new(NONGCREF.clone()));
     }
     tyref_to_external_lltype(ty, llbc)
+}
+
+/// `lltype.cast_int_to_ptr(Ptr(STR), int)` for an integer word that is
+/// already an rstr `STR` (`alloc_utf8_payload` / `bh_alloc_str_nofill`).
+/// The 1-arg form annotates as `SomePtr(MAJIT_REF_OPAQUE)` and unions
+/// with a field-load `SomeString` (`w_str_storage`) at
+/// `module_dict_key_block`. `ann_cast_int_to_ptr` of `Ptr(STR)` is the
+/// string itself (`node_is_string_value`).
+pub(in crate::front::mir) fn emit_cast_int_to_strptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    addr: Variable,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+    let ptr_ty = STRPTR.clone();
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+    stamp_as_rstr_str(&raw);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(addr),
+            ],
+            result_ty: ValueType::Str,
+        },
+    });
+    raw
 }
 
 /// `lltype.cast_int_to_ptr(PTRTYPE, int)` (`lltype.py` `ann_cast_int_to_ptr`).

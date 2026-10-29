@@ -7221,6 +7221,14 @@ impl<'a> Lowering<'a> {
         result_ty: ValueType,
     ) -> Result<(), LowerError> {
         let bb_id = self.emit_bb(mir_bb);
+        if op == "cast_int_to_ptr" && matches!(result_ty, ValueType::Str) {
+            let raw = emit_cast_int_to_strptr(&mut self.graph, bb_id, operand);
+            self.local_var[dest_local] = Some(LocalValue::One(raw));
+            let target_bb = self.block_id[target];
+            let link_args = self.edge_args(mir_bb, target)?;
+            self.graph.set_goto(bb_id, target_bb, link_args);
+            return Ok(());
+        }
         let concretetype = if op == "cast_int_to_ptr" {
             crate::model::ConcreteType::GcRef
         } else {

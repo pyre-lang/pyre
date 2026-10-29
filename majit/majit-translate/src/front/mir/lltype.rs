@@ -4155,6 +4155,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     output: &TyRef,
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let payload = if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec) {
         crate::front::result_exc::tyref_result_ok(output, llbc)
@@ -4166,14 +4167,14 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let adt = node.as_object()?.get("Adt")?.as_object()?;
     let td = llbc.type_by_id(adt_node_def_id(node)?)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let type_args = adt
         .get("generics")
         .and_then(|g| g.get("types"))
         .and_then(serde_json::Value::as_array)?;
     if type_args.is_empty() {
-        return adt_node_class_root_with(node, llbc, no_tombstoned_leaves());
+        return adt_node_class_root_with(node, llbc, tombstoned);
     }
     let by_value_args = type_args.iter().all(|arg| {
         strip_ty_indirections(arg, llbc).is_some_and(|arg| {
@@ -4183,7 +4184,7 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     if !by_value_args {
         return None;
     }
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let suffix = adt_head_instantiation_suffix(adt, llbc, tombstoned)?;
     Some(format!("{}{suffix}", td.item_meta.name_path()))
 }
 
@@ -5239,7 +5240,7 @@ pub(in crate::front::mir) fn tyref_split_core_enum_param_root(
     {
         return None;
     }
-    let suffix = adt_head_instantiation_suffix(adt, llbc)?;
+    let suffix = adt_head_instantiation_suffix(adt, llbc, tombstoned)?;
     let identity = class_identity_spelling(&name, tombstoned);
     Some(majit_ir::descr::with_instantiation_suffix(
         &identity, &suffix,
@@ -6330,7 +6331,7 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
             let tagged_result = name.ends_with("::result::Result");
             let tagged_control_flow = name.ends_with("::control_flow::ControlFlow");
             let tagged_option = name.ends_with("::option::Option");
-            let split = adt_head_instantiation_suffix(adt, llbc).is_some();
+            let split = adt_head_instantiation_suffix(adt, llbc, tombstoned).is_some();
             // A pointer-niche Option is the null word, not an enum class.
             // Gate on the modeled niche (`tyref_is_niche_option`). A
             // transparent pointer handle over a nullable raw pointer still
@@ -6394,7 +6395,7 @@ pub(in crate::front::mir) fn adt_node_class_root_identity(
     // constructor / field-read sites must agree — they share
     // `adt_head_instantiation_suffix`.  Non-enum and primitive-payload
     // heads return `None` and keep the class identity.
-    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
+    if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc, tombstoned) {
         return Some(majit_ir::descr::with_instantiation_suffix(&leaf, &suffix));
     }
     if let Some(suffix) = struct_instantiation_suffix(&name, adt, llbc) {
@@ -10239,7 +10240,10 @@ pub(in crate::front::mir) fn charon_int_kind_to_rust(kind: &str, signed: bool) -
 /// [`charon_adt_to_ast_string`] (full type printer) and
 /// [`adt_head_instantiation_suffix`] (variant-class projection) so a
 /// rendered type and its `<…>` class suffix spell one instantiation
-/// identically.
+/// identically.  Tombstoned-leaf ADT arguments in the suffix path go
+/// through [`render_adt_suffix_type_args`] instead, so two declarations
+/// that share a leaf (`alloc::layout::Layout` beside
+/// `typeobject::Layout`) do not intern one `Result<Layout,_>::Ok`.
 pub(in crate::front::mir) fn render_adt_type_args(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
@@ -10270,6 +10274,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
     depth: usize,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Vec<String> {
     type_decl_ref_generics(adt, llbc)
         .and_then(|g| g.as_object())
@@ -10278,7 +10283,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
         .map(|arr| {
             arr.iter()
                 .filter_map(|t| {
-                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    let rendered = charon_type_value_to_enum_arg(t, llbc, depth + 1, tombstoned);
                     if rendered == "Global" || rendered == "RandomState" {
                         return None;
                     }
@@ -10287,7 +10292,7 @@ pub(in crate::front::mir) fn render_adt_payload_type_args(
                         transparent_handle_field_spelling(
                             &ty,
                             llbc,
-                            no_tombstoned_leaves(),
+                            tombstoned,
                             gc_struct_ids,
                             raw_alloc_flavor_structs,
                         )
@@ -10606,9 +10611,13 @@ pub(in crate::front::mir) fn tyref_adt_map<'l>(
 /// (an `f32`/`()`/`""` argument yields `None`).  Fail-closed: a
 /// missing `Adt` node, a non-enum type, or a deferred argument yields `""` —
 /// the bare owner, unchanged.
-pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(ty: &TyRef, llbc: &Llbc) -> String {
+pub(in crate::front::mir) fn tyref_enum_instantiation_suffix(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
     tyref_adt_map(ty, llbc)
-        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc))
+        .and_then(|adt| adt_head_instantiation_suffix(adt, llbc, tombstoned))
         .unwrap_or_default()
 }
 
@@ -10746,7 +10755,15 @@ pub(in crate::front::mir) fn type_arg_splits_per_instantiation(arg: &str) -> boo
 /// anywhere, nested arguments included. Distinct from
 /// [`type_arg_splits_per_instantiation`]: `()` and `f32` are concrete
 /// (`Bookkeeper.getuniqueclassdef`) and still do not split.
+///
+/// Charon's Never / Infallible JSON is a non-object type node and
+/// renders as `??scalar`. That is a fully substituted uninhabited
+/// type, not an open parameter: a dest_ty `Result<??scalar, E>` must
+/// still suffix a bare-head Result aggregate
+/// (`bookkeeper.py` `getuniqueclassdef`). Other `??` spellings
+/// (`??TypeVar`, `??adt#N`) stay non-concrete.
 pub(in crate::front::mir) fn type_arg_is_concrete(arg: &str) -> bool {
+    let arg = arg.replace("??scalar", "Never");
     !arg.contains("TypeVar") && !arg.contains("??")
 }
 
@@ -10800,7 +10817,10 @@ pub(in crate::front::mir) fn enum_instantiation_suffix_from_args(
 /// `enum` instantiation.  Returned `Some` only when the head names an
 /// `enum` (struct generics keep collapsing to their flat classdef) and
 /// [`enum_instantiation_suffix_from_args`] accepts the rendered
-/// type-arguments.  Every projection site (receiver type,
+/// type-arguments.  Tombstoned-leaf type arguments use
+/// [`class_identity_spelling`] so two declarations that share a leaf
+/// intern two ClassDefs (`Result<layout::Layout,_>` vs
+/// `Result<typeobject::Layout,_>`).  Every projection site (receiver type,
 /// variant constructor, variant field read, numbering pre-scan) routes
 /// through this one predicate so they all agree on which instantiations
 /// split and how they spell the suffix.
@@ -10815,13 +10835,109 @@ pub(in crate::front::mir) fn enum_instantiation_suffix_from_args(
 pub(crate) fn adt_head_instantiation_suffix(
     adt: &serde_json::Map<String, serde_json::Value>,
     llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
     let def_id = type_decl_ref_adt_id(adt)?;
     let td = llbc.type_by_id(def_id)?;
     if !matches!(td.kind, TypeDeclKind::Enum(_)) {
         return None;
     }
-    enum_instantiation_suffix_from_args(&render_adt_type_args(adt, llbc, 0))
+    enum_instantiation_suffix_from_args(&render_adt_suffix_type_args(adt, llbc, 0, tombstoned))
+}
+
+/// Type-argument spellings for an enum instantiation suffix.
+///
+/// Unique-leaf ADTs keep the TypeDecl leaf (`OsError`, `i64`) so existing
+/// intern keys stay put. A leaf [`harden_duplicate_leaf_metadata`] withdrew
+/// uses [`class_identity_spelling`] instead: `alloc::layout::Layout` and
+/// `typeobject::Layout` share the leaf `Layout`, and a leaf suffix would
+/// intern one `Result<Layout, LayoutError>::Ok` whose `__pos_0` unions
+/// them (`bookkeeper.py` `getuniqueclassdef`). Nested generic arguments
+/// (`Vec<T>`) keep the field-type printer so `type_align` still sees
+/// `Vec<Rooted>` rather than a crate-qualified element.
+fn render_adt_suffix_type_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .map(|t| charon_type_value_to_enum_arg(t, llbc, depth + 1, tombstoned))
+                .filter(|s| s != "Global" && s != "RandomState")
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Spelling of one Result/Option type argument for the intern suffix and
+/// the substituted variant payload row. A tombstoned-leaf ADT with no
+/// type arguments (`Layout`) uses [`class_identity_spelling`]; every
+/// other shape reuses the field-type printer.
+fn charon_type_value_to_enum_arg(
+    v: &serde_json::Value,
+    llbc: &Llbc,
+    depth: usize,
+    tombstoned: &std::collections::HashSet<String>,
+) -> String {
+    if depth > 24 {
+        return "??deep".to_string();
+    }
+    let Some(obj) = v.as_object() else {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    };
+    if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return match llbc.dedup_body(id) {
+            Some(body) => charon_type_value_to_enum_arg(body, llbc, depth + 1, tombstoned),
+            None => format!("??unresolved_dedup#{id}"),
+        };
+    }
+    if let Some(arr) = obj.get("Value").and_then(serde_json::Value::as_array)
+        && arr.len() == 2
+    {
+        return charon_type_value_to_enum_arg(&arr[1], llbc, depth + 1, tombstoned);
+    }
+    if let Some(r) = obj.get("Ref") {
+        if let Some(arr) = r.as_array()
+            && let Some(inner) = arr.get(1)
+        {
+            return charon_type_value_to_enum_arg(inner, llbc, depth + 1, tombstoned);
+        }
+        return "??ref_shape".to_string();
+    }
+    let Some(adt) = obj.get("Adt").and_then(|a| a.as_object()) else {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    };
+    if adt.get("builtin").filter(|b| !b.is_null()).is_some() {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    }
+    let nested = render_adt_type_args(adt, llbc, depth);
+    if !nested.is_empty() {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    }
+    let name = if let Some(def_id) = adt.get("id").and_then(serde_json::Value::as_u64) {
+        llbc.type_by_id(def_id)
+            .map(|td| td.item_meta.name_path())
+            .unwrap_or_else(|| format!("??adt#{def_id}"))
+    } else if let Some(path) = adt
+        .get("id")
+        .and_then(|i| i.get("Path"))
+        .and_then(|p| p.as_str())
+    {
+        path.to_string()
+    } else {
+        return charon_type_value_to_ast_string(v, llbc, depth);
+    };
+    let leaf = name.rsplit("::").next().unwrap_or(&name);
+    if tombstoned.contains(leaf) {
+        super::class_identity_spelling(&name, tombstoned)
+    } else {
+        leaf.to_string()
+    }
 }
 
 /// Format a Charon `Adt` type body (`{"id": …, "generics": {"types": […]}}`).

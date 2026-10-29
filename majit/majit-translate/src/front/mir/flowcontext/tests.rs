@@ -630,16 +630,29 @@ fn result_branch_break_of_infallible_result_builds_err() {
         payloads.break_ty, payloads.err,
         "Result<Infallible, i64> is not banked as i64"
     );
+    let Some(ValueType::Ref(Some(write_owner))) = payloads.break_ty.clone() else {
+        panic!(
+            "Break payload type must be a classed Result, got {:?}",
+            payloads.break_ty
+        );
+    };
     let mut graph = branch_graph(payloads);
     super::lower_result_branch_to_control_flow(&mut graph);
     let mut ctors = Vec::new();
+    let mut err_owners = Vec::new();
     for block in &graph.blocks {
         for op in &block.operations {
             if let OpKind::Call {
-                target: CallTarget::SyntheticTransparentCtor { name, .. },
+                target:
+                    CallTarget::SyntheticTransparentCtor {
+                        name, owner_path, ..
+                    },
                 ..
             } = &op.kind
             {
+                if name == "Err" {
+                    err_owners.push(owner_path.join("::"));
+                }
                 ctors.push(name.clone());
             }
         }
@@ -656,6 +669,10 @@ fn result_branch_break_of_infallible_result_builds_err() {
             ValueType::Ref(Some(name)) if name.starts_with("result::Result<")
         )),
         "Break stores the Result value, got {writes:?}"
+    );
+    assert!(
+        err_owners.iter().any(|owner| owner == &write_owner),
+        "Err ctor owner_path must be the Break payload Result, got {err_owners:?} want {write_owner}"
     );
 }
 
@@ -2012,6 +2029,7 @@ fn ordinary_raw_adt_pointer_does_not_stamp_i64_func_result() {
             spec,
             &empty_gc,
             &std::collections::HashSet::<String>::new(),
+            &empty_names,
             &format!(
                 "fixture::{}",
                 fd.item_meta.name_path().rsplit("::").next().unwrap()

@@ -100,6 +100,18 @@ pub type GcAllocHookFn = fn(type_id: u32, payload_size: usize) -> GCREF;
 majit_gc::global_hook!(static GC_ALLOC_HOOK: GcAllocHookFn);
 majit_gc::global_hook!(static GC_ALLOC_STABLE_HOOK: GcAllocHookFn);
 
+/// Host identity of the process-global nursery alloc hook cell.
+/// A translated `HOOK.get()` is a field load through this pointer, not a
+/// nullary Call on the static's path.
+pub fn gc_alloc_hook_static_addr() -> *const () {
+    &GC_ALLOC_HOOK as *const _ as *const ()
+}
+
+/// Host identity of the process-global old-gen alloc hook cell.
+pub fn gc_alloc_stable_hook_static_addr() -> *const () {
+    &GC_ALLOC_STABLE_HOOK as *const _ as *const ()
+}
+
 /// Placement-reporting companion of [`GcAllocHookFn`] for no-collect
 /// allocations that may spill from the nursery to old-gen.
 pub type GcAllocWithPlacementHookFn =
@@ -176,7 +188,12 @@ pub fn clear_gc_alloc_hook() {
 /// Attempt a GC allocation via the installed hook. Returns `None`
 /// when no hook is installed, or `Some(null)` when the hook itself
 /// returned null.
+// `dont_look_inside`: host hook dispatch (a process-global
+// atomic fn-pointer cell) stays opaque to the JIT — the
+// `try_gc_alloc_nursery_raw` twin; calls residualize via the
+// registered fnaddr (`rlib/jit.py`).
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn try_gc_alloc(type_id: u32, payload_size: usize) -> Option<GCREF> {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
@@ -238,7 +255,12 @@ pub fn clear_gc_alloc_stable_hook() {
 /// Attempt a stable-address GC allocation via the installed hook.
 /// See [`register_gc_alloc_stable_hook`] for semantics. Returns
 /// `None` when no hook is installed.
+// `dont_look_inside`: host hook dispatch (a process-global
+// atomic fn-pointer cell) stays opaque to the JIT — the
+// `try_gc_alloc_stable_raw` twin; calls residualize via the
+// registered fnaddr (`rlib/jit.py`).
 #[inline]
+#[majit_macros::dont_look_inside]
 pub fn try_gc_alloc_stable(type_id: u32, payload_size: usize) -> Option<GCREF> {
     #[cfg(any(test, feature = "test-hooks"))]
     if !hook_test_effects_visible() {
