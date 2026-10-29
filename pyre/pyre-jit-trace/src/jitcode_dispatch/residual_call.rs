@@ -4892,7 +4892,7 @@ fn residual_ref_is_fresh_after_entry<Sym: WalkSym>(
 }
 
 /// Whether every Ref this residual can write is a this-trace allocation
-/// recorded after the outermost helper level's entry.
+/// recorded after `entry_index`.
 /// (`heapcache.py HeapCache.is_unescaped` / `new`).
 /// A Void residual with no Ref argument may write a supplied raw buffer
 /// (Int), which this proof cannot see.
@@ -4906,11 +4906,11 @@ fn residual_ref_args_are_unescaped<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     call_descr: &dyn majit_ir::descr::CallDescr,
     allboxes: &[OpRef],
+    entry_index: Option<u32>,
 ) -> bool {
     let types = call_descr.arg_types();
     let args = allboxes.get(1..).unwrap_or(&[]);
     let dest_only = call_descr.get_extra_info().oopspecindex == majit_ir::OopSpecIndex::Arraycopy;
-    let entry_index = outermost_helper_entry_trace_index(ctx);
     let mut saw_ref = false;
     for (i, ty) in types.iter().enumerate() {
         if *ty != majit_ir::Type::Ref {
@@ -4940,14 +4940,15 @@ fn residual_ref_args_are_unescaped<Sym: WalkSym>(
 /// fails; those stay exempt by resolved callee identity (`make_pyerror`,
 /// `*alloc_and_set_nonnull_r_trampoline`), never by `RuntimeHelperKind`
 /// and never by function-name families. A Void residual is exempt only
-/// when every Ref it can write is unescaped and allocated after the
-/// outermost helper entry. `OS_ARRAYCOPY` dest may use `_seen_alloc`
+/// when every Ref it can write is unescaped and allocated after
+/// `entry_index`. `OS_ARRAYCOPY` dest may use `_seen_alloc`
 /// in place of `is_unescaped` (`pin_root` residual CALL).
 fn residual_skips_heap_writing_odometer<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     call_descr: &dyn majit_ir::descr::CallDescr,
     func_ptr: i64,
     allboxes: &[OpRef],
+    entry_index: Option<u32>,
 ) -> bool {
     if extra_info_is_rewindable_allocation(call_descr.get_extra_info()) {
         return true;
@@ -4956,7 +4957,34 @@ fn residual_skips_heap_writing_odometer<Sym: WalkSym>(
         return true;
     }
     call_descr.result_type() == majit_ir::Type::Void
-        && residual_ref_args_are_unescaped(ctx, call_descr, allboxes)
+        && residual_ref_args_are_unescaped(ctx, call_descr, allboxes, entry_index)
+}
+
+/// Whether a residual executed inside a declinable subwalk writes only objects
+/// allocated after `floor_index`, so the subwalk's native re-run repeats it
+/// against fresh allocations instead of applying it twice.
+///
+/// Narrower than `residual_skips_heap_writing_odometer`: a general Void
+/// residual can write a raw buffer passed as an Int or global state, which the
+/// Ref-argument proof cannot see. Only callees whose writes are fully known
+/// qualify: allocation-only helpers, and `OS_ARRAYCOPY`, which writes its
+/// dest array alone (`rgc.py ll_arraycopy`).
+fn residual_rerun_safe_after_floor<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    func_ptr: i64,
+    allboxes: &[OpRef],
+    floor_index: u32,
+) -> bool {
+    let ei = call_descr.get_extra_info();
+    if extra_info_is_rewindable_allocation(ei)
+        || FRESH_OBJECT_ONLY_RESIDUAL_FNADDRS.contains(&func_ptr)
+    {
+        return true;
+    }
+    ei.oopspecindex == majit_ir::OopSpecIndex::Arraycopy
+        && call_descr.result_type() == majit_ir::Type::Void
+        && residual_ref_args_are_unescaped(ctx, call_descr, allboxes, Some(floor_index))
 }
 
 /// Allocation-only helpers whose residual creates a fresh object and cannot
@@ -6913,12 +6941,27 @@ pub(crate) fn try_execute_residual_call_via_executor_inner<Sym: WalkSym>(
                 func_ptr as usize,
             );
         }
-        fbw_bump_executed_effect("residual");
+        // A residual that writes only objects allocated after the innermost
+        // subwalk's rewind point is re-run against fresh allocations when that
+        // subwalk declines, so it is not an effect the cut leaves behind.
+        let rerun_safe_in_subwalk = !entered_frame
+            && ctx.fbw_mode.subwalk_floor.is_some_and(|floor| {
+                residual_rerun_safe_after_floor(ctx, call_descr, func_ptr, allboxes, floor._index)
+            });
+        if !rerun_safe_in_subwalk {
+            fbw_bump_executed_effect("residual");
+        }
         // CALL-entry re-runs this residual. Bump unless the call is proven
         // not to write an object that existed before it. Journaled stores
         // are refused through `journal_delta`, not this counter.
         if entered_frame
-            || !residual_skips_heap_writing_odometer(ctx, call_descr, func_ptr, allboxes)
+            || !residual_skips_heap_writing_odometer(
+                ctx,
+                call_descr,
+                func_ptr,
+                allboxes,
+                outermost_helper_entry_trace_index(ctx),
+            )
         {
             fbw_bump_heap_writing_effect("residual");
         }
@@ -12539,16 +12582,21 @@ pub(crate) fn dispatch_conditional_call_ir_v<Sym: WalkSym>(
     // the same way residual_call does.
     ctx.trace_ctx
         .heapcache_invalidate_caches_varargs(OpCode::CondCallN, Some(&ei), &allboxes);
-    let cond_true = match ctx.trace_ctx.box_value(cond) {
-        Some(majit_ir::Value::Int(n)) => n != 0,
+    let cond_concrete: Option<bool> = match ctx.trace_ctx.box_value(cond) {
+        Some(majit_ir::Value::Int(n)) => Some(n != 0),
         _ => match read_int_reg_concrete(code, op, 0, ctx) {
-            ConcreteValue::Int(n) => n != 0,
-            ConcreteValue::Bool(b) => b,
-            _ => false,
+            ConcreteValue::Int(n) => Some(n != 0),
+            ConcreteValue::Bool(b) => Some(b),
+            _ => None,
         },
     };
     ctx.clear_last_exc_value();
     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    // `do_conditional_call` always has a concrete BoxInt (`execute_varargs`).
+    if cond_concrete.is_none() && ctx.is_authoritative_executor {
+        walker_gc_store_not_executed(ctx, op.pc)?;
+    }
+    let cond_true = cond_concrete.unwrap_or(false);
     if cond_true && ctx.is_authoritative_executor {
         if let Some(majit_ir::Value::Int(func_addr)) = ctx.trace_ctx.box_value(funcptr)
             && func_addr != 0

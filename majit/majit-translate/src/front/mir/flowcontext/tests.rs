@@ -27,8 +27,9 @@ use crate::front::mir::tests::{
     option_ok_or_else_site, push_fn_const, replace_struct_ctors, rows, same_as_count,
     some_ctor_ops, some_ctor_shape, struct_ctor_graph, struct_ctor_ops, struct_decl, struct_news,
     tyref_to_attr_value_type, window_call_leafs, window_empty_generics, window_graph_ops,
-    window_llbc, window_local, window_meta, window_opaque_fun, window_place, window_shared_slice,
-    window_slice, window_span, window_u8, window_unwind_and_return_blocks, window_usize,
+    window_llbc, window_local, window_meta, window_mut_u8_ptr, window_opaque_fun, window_place,
+    window_shared_slice, window_slice, window_span, window_u8, window_unwind_and_return_blocks,
+    window_usize,
 };
 
 /// Per-graph simplification after lowering — the model-layer slice of
@@ -2146,6 +2147,294 @@ fn rbigint_gc_root_unsafecell_calls_are_word_identity() {
             assert!(!hit, "{name} still calls {target:?}");
         }
     }
+}
+
+/// `s.flag.get()` of `S { flag: Cell<bool> }` is that field's value read.
+/// The existing UnsafeCell identity test loads real majit-rlib LLBC and
+/// cannot spell a struct field plus `Cell::get`.
+#[test]
+fn cell_get_of_a_struct_field_is_that_fields_value_read() {
+    use crate::model::{CallTarget, OpKind, ValueType};
+
+    let bool_ty = serde_json::json!({"Scalar": "Bool"});
+    let ptr_ty = window_mut_u8_ptr();
+    let cell_adt = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [bool_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ptr_adt = serde_json::json!({
+        "Adt": {
+            "id": 1,
+            "builtin": null,
+            "generics": {
+                "regions": [],
+                "types": [ptr_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let cell_ref = serde_json::json!({"Ref": ["Erased", cell_adt.clone(), "Shared"]});
+    let cell_ptr_ref = serde_json::json!({"Ref": ["Erased", cell_ptr_adt.clone(), "Shared"]});
+    let s_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let s_ref = serde_json::json!({"Ref": ["Erased", s_adt.clone(), "Shared"]});
+    let s_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "S"], true),
+        "kind": {"Struct": [
+            {
+                "name": "flag",
+                "ty": cell_adt.clone(),
+                "attr_info": null
+            },
+            {
+                "name": "ptr",
+                "ty": cell_ptr_adt.clone(),
+                "attr_info": null
+            }
+        ]}
+    });
+    let cell_decl = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["core", "cell", "Cell"], false),
+        "kind": "Opaque"
+    });
+    let cell_get = window_opaque_fun(
+        2,
+        &["core", "cell", "Cell", "get"],
+        vec![cell_ref.clone()],
+        bool_ty.clone(),
+    );
+    let user_cell_get = window_opaque_fun(
+        4,
+        &["fixture", "Cell", "get"],
+        vec![cell_ref.clone()],
+        bool_ty.clone(),
+    );
+    let flag_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &s_ref),
+                "Deref"
+            ]}), &s_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &cell_adt,
+    );
+    let ptr_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &s_ref),
+                "Deref"
+            ]}), &s_adt),
+            {"Field": [null, 1]}
+        ]}),
+        &cell_ptr_adt,
+    );
+    let (unwind, ret) = window_unwind_and_return_blocks();
+    let call_get =
+        |fun: u64, arg_ty: &serde_json::Value, arg_local: u64, dest_ty: &serde_json::Value| {
+            serde_json::json!({"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": fun},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Copy": window_place(serde_json::json!({"Local": arg_local}), arg_ty)}],
+            "dest": window_place(serde_json::json!({"Local": 0}), dest_ty)
+        }, "target": 2, "on_unwind": 1}})
+        };
+    let f = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "f"], true),
+        "signature": {"is_unsafe": false, "inputs": [s_ref.clone()], "output": bool_ty.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &bool_ty),
+                window_local(1, &s_ref),
+                window_local(2, &cell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &cell_ref),
+                            {"Ref": {
+                                "place": flag_place.clone(),
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": call_get(2, &cell_ref, 2, &bool_ty)}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
+    let g = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["fixture", "g"], true),
+        "signature": {"is_unsafe": false, "inputs": [cell_ref.clone()], "output": bool_ty.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &bool_ty),
+                window_local(1, &cell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": call_get(2, &cell_ref, 1, &bool_ty)}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
+    let h = serde_json::json!({
+        "def_id": 3,
+        "item_meta": window_meta(&["fixture", "h"], true),
+        "signature": {"is_unsafe": false, "inputs": [s_ref.clone()], "output": ptr_ty.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &ptr_ty),
+                window_local(1, &s_ref),
+                window_local(2, &cell_ptr_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &cell_ptr_ref),
+                            {"Ref": {
+                                "place": ptr_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": call_get(2, &cell_ptr_ref, 2, &ptr_ty)}
+                },
+                unwind.clone(),
+                ret.clone()
+            ]
+        }}
+    });
+    let user_get = serde_json::json!({
+        "def_id": 5,
+        "item_meta": window_meta(&["fixture", "user_get"], true),
+        "signature": {"is_unsafe": false, "inputs": [s_ref.clone()], "output": bool_ty.clone()},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &bool_ty),
+                window_local(1, &s_ref),
+                window_local(2, &cell_ref)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 2}), &cell_ref),
+                            {"Ref": {
+                                "place": flag_place,
+                                "kind": "Shared",
+                                "ptr_metadata": null
+                            }}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": call_get(4, &cell_ref, 2, &bool_ty)}
+                },
+                unwind,
+                ret
+            ]
+        }}
+    });
+    let llbc = window_llbc(
+        vec![s_decl, cell_decl],
+        vec![f, g, cell_get, h, user_cell_get, user_get],
+    );
+    let f_graph = super::lower_function(&llbc, "f").expect("lower f");
+    let f_ops: Vec<_> = f_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .collect();
+    assert!(
+        f_ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::FieldRead { field, ty, .. }
+                if field.name == "flag" && !field.taken_by_address && *ty == ValueType::Bool
+        )),
+        "f must FieldRead flag as a bool value; graph={}",
+        f_graph.dump()
+    );
+    let call_target_ends_with_get = |op: &crate::model::SpaceOperation| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.last().is_some_and(|leaf| leaf.ends_with("get")),
+        OpKind::Call {
+            target: CallTarget::Method { name, .. },
+            ..
+        } => name.ends_with("get"),
+        _ => false,
+    };
+    assert!(
+        f_ops.iter().all(|op| !call_target_ends_with_get(op)),
+        "f must not keep Cell::get as a Call; graph={}",
+        f_graph.dump()
+    );
+    let g_graph = super::lower_function(&llbc, "g").expect("lower g");
+    assert!(
+        g_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(call_target_ends_with_get),
+        "g(&Cell<bool>) keeps its Call; graph={}",
+        g_graph.dump()
+    );
+    let h_graph = super::lower_function(&llbc, "h").expect("lower h");
+    assert!(
+        h_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(call_target_ends_with_get),
+        "h(s.ptr.get()) of Cell<*mut u8> keeps its Call; graph={}",
+        h_graph.dump()
+    );
+    let user_graph = super::lower_function(&llbc, "user_get").expect("lower user_get");
+    assert!(
+        user_graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(call_target_ends_with_get),
+        "a user Cell::get must keep its Call; graph={}",
+        user_graph.dump()
+    );
 }
 
 /// `live_rbigint` clones `&RBigInt` and passes the by-value result to

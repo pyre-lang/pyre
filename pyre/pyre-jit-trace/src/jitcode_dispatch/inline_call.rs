@@ -5708,6 +5708,14 @@ impl SubWalkRewind {
             && !self.unjournaled_before
             && !fbw_has_unjournaled_effect()
     }
+
+    /// Whether every effect executed since the rewind point is one the cut
+    /// undoes.  An unjournaled mark is an op the walk did not execute, which
+    /// the residual re-run applies once, so it does not count.
+    fn nothing_unrewindable_applied(&self) -> bool {
+        fbw_executed_effect_count().saturating_sub(fbw_journaled_effects_since(&self.pre_fold_pos))
+            == self.effects_before
+    }
 }
 
 fn sub_jitcode_body_facts_for_code(code: *const ()) -> Option<crate::pyjitcode::InlineBodyFacts> {
@@ -7759,6 +7767,7 @@ fn walk_translated_builtin_wrapper<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.subwalk_floor = Some(pre_fold_pos);
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
     // The control for `[fbw-mergepoint-in-helper]` in `mod.rs`: that probe answers
@@ -8298,6 +8307,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.subwalk_floor = Some(rewind.pre_fold_pos);
     ctx.fbw_mode.inline_caller_py_pc = Some(call_site_py_pc);
     ctx.fbw_mode.transparent_helper_jitcode_index = Some(jitcode.index());
     ctx.fbw_mode.helper_return = HelperReturn::Converted;
@@ -11208,6 +11218,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // tables.
             fbw_mode: FbwWalkMode {
                 inline_subwalk: true,
+                subwalk_floor: ctx.fbw_mode.subwalk_floor,
                 inline_caller_py_pc,
                 immediate_inline_caller_py_pc: immediate_inline_caller_py_pc(ctx, op.pc),
                 // Callee MIFrame, not a translated helper. Do not inherit
@@ -19095,6 +19106,13 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         && global_slot_is_callee)
         || !ctx.fbw_mode.snapshot_sym.is_null();
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let rewind = SubWalkRewind {
+        pre_fold_pos,
+        effects_before: fbw_executed_effect_count(),
+        unjournaled_before: fbw_has_unjournaled_effect(),
+    };
+    let saved_subwalk_floor = ctx.fbw_mode.subwalk_floor;
+    ctx.fbw_mode.subwalk_floor = Some(pre_fold_pos);
     let walk = if !uses_global_descr_pool {
         run_sub_jitcode_walk(
             ctx,
@@ -19118,6 +19136,7 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
             float_args,
         )
     };
+    ctx.fbw_mode.subwalk_floor = saved_subwalk_floor;
     match walk {
         // Same cut as `try_walker_orthodox_descent`: an un-lowered helper
         // inside the callee is not a portal abort.  Residualize through
@@ -19128,8 +19147,42 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
         // parent resume word (`pyjitpl.py capture_resumedata`).  Aborting
         // the caller would drop a recursive carrier before `getframe`
         // forces it; residualize the helper and keep walking the caller.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. })
-        | Err(DispatchError::GuardResumeCoordinateUnavailable { .. }) => {
+        Err(
+            error @ (DispatchError::OrthodoxSubWalkTraceUnsupported { .. }
+            | DispatchError::GuardResumeCoordinateUnavailable { .. }),
+        ) => {
+            // A walk that already applied an effect cannot be handed to the
+            // residual call, which would apply it again.  Journaled stores
+            // are undone by the cut and do not block.  The abort
+            // propagates and the caller's own decline decides
+            // (`aborted_tracing`).
+            if !rewind.nothing_unrewindable_applied() {
+                if fbw_inline_diag_enabled() {
+                    let abort_pc = error.stop_pc();
+                    let symbolic = match &error {
+                        DispatchError::OrthodoxSubWalkTraceUnsupported { symbolic, .. } => {
+                            *symbolic as u64
+                        }
+                        _ => 0,
+                    };
+                    let name = crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+                        .map(|jc| jc.name.as_str())
+                        .unwrap_or("<missing>");
+                    eprintln!(
+                        "[subwalk-abort] name={} pc={} abort_pc={} symbolic={:#x} \
+                         disp=propagate effects={}/{} unjournaled={}/{}",
+                        name,
+                        pc,
+                        abort_pc,
+                        symbolic,
+                        rewind.effects_before,
+                        fbw_executed_effect_count(),
+                        rewind.unjournaled_before,
+                        fbw_has_unjournaled_effect(),
+                    );
+                }
+                return Err(error);
+            }
             cut_declined_subwalk(ctx, pre_fold_pos);
             // A declined helper walk must not become an opaque
             // `CallMayForce` when the callee is `int_add` / `add` /

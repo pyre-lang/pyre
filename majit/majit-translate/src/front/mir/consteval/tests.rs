@@ -605,12 +605,12 @@ fn named_usize_const_global(
     })
 }
 
-fn size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
-    let ty = usize_ty();
+fn size_of_init_body(size_of_id: u64, arg_ty: serde_json::Value) -> serde_json::Value {
+    let dest_ty = usize_ty();
     serde_json::json!({"Unstructured": {
         "span": span_json(),
         "locals": {"arg_count": 0, "locals": [
-            {"index": 0, "name": null, "span": span_json(), "ty": ty}
+            {"index": 0, "name": null, "span": span_json(), "ty": dest_ty}
         ]},
         "body": [{
             "statements": [],
@@ -621,13 +621,13 @@ fn size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
                         "kind": {"Fun": size_of_id},
                         "generics": {
                             "regions": [],
-                            "types": [ty],
+                            "types": [arg_ty],
                             "const_generics": [],
                             "trait_refs": []
                         }
                     }},
                     "args": [],
-                    "dest": {"kind": {"Local": 0}, "ty": ty}
+                    "dest": {"kind": {"Local": 0}, "ty": dest_ty}
                 },
                 "target": 2,
                 "on_unwind": 1
@@ -642,6 +642,45 @@ fn size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
             "terminator": {"span": span_json(), "kind": "Return"}
         }]
     }})
+}
+
+fn size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
+    size_of_init_body(size_of_id, usize_ty())
+}
+
+fn size_of_call_fun(
+    def_id: u64,
+    path: &[&str],
+    size_of_id: u64,
+    arg_ty: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "signature": {"is_unsafe": false, "inputs": [], "output": usize_ty()},
+        "body": size_of_init_body(size_of_id, arg_ty)
+    })
+}
+
+fn nominal_adt_type_decl(def_id: u64, path: &[&str], ptr_metadata: &str) -> serde_json::Value {
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": item_meta_json(path, "", true),
+        "kind": {"Struct": []},
+        "ptr_metadata": ptr_metadata
+    })
+}
+
+fn raw_ptr_to_nominal_adt(id: u64) -> serde_json::Value {
+    serde_json::json!({
+        "RawPtr": [{
+            "Adt": {
+                "id": id,
+                "generics": empty_generics(),
+                "builtin": null
+            }
+        }, "Mut"]
+    })
 }
 
 fn two_times_size_of_usize_init_body(size_of_id: u64) -> serde_json::Value {
@@ -1061,6 +1100,58 @@ fn discover_foldable_const_lits_harvests_size_of_usize() {
             "fixture::LOWLEVEL_STRING_LEN_OFFSET".into(),
             OpKind::ConstUInt(word)
         )]
+    );
+
+    // Charon spells a nominal ADT as `"builtin": null`. The inline
+    // `size_of` fold shares `size_align_const_from_tyexpr` with
+    // `fold_size_const_global`; `nominal_adt_pointee` folds only when
+    // that ADT's declaration has `ptr_metadata: "None"` (a thin
+    // `lltype.Ptr`, one word). `size_of::<*mut Adt>()` must not
+    // residualize as a `size_of` Call.
+    let inline = llbc_with_types(
+        "fixture",
+        vec![nominal_adt_type_decl(0, &["fixture", "Adt"], "None")],
+        vec![
+            size_of_call_fun(0, &["fixture", "ptr_size"], 1, raw_ptr_to_nominal_adt(0)),
+            size_of_fun(1),
+        ],
+    );
+    let graph =
+        super::lower_function(&inline, "ptr_size").expect("lower size_of of *mut nominal ADT");
+    let word = crate::layout::target_word_size() as i64;
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| matches!(op.kind, OpKind::ConstInt(n) if n == word)),
+        "size_of of a raw pointer to a nominal ADT with ptr_metadata None folds to the target word: {graph:#?}"
+    );
+    assert_eq!(
+        nullary_calls_ending(&graph, "size_of"),
+        0,
+        "the folded size_of must not remain a residual Call: {graph:#?}"
+    );
+
+    let fat = llbc_with_types(
+        "fixture",
+        vec![nominal_adt_type_decl(0, &["fixture", "FatAdt"], "Length")],
+        vec![
+            size_of_call_fun(
+                0,
+                &["fixture", "fat_ptr_size"],
+                1,
+                raw_ptr_to_nominal_adt(0),
+            ),
+            size_of_fun(1),
+        ],
+    );
+    let graph =
+        super::lower_function(&fat, "fat_ptr_size").expect("lower size_of of *mut Length ADT");
+    assert_eq!(
+        nullary_calls_ending(&graph, "size_of"),
+        1,
+        "size_of of a raw pointer to a Length-metadata ADT must stay a Call: {graph:#?}"
     );
 }
 

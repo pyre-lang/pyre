@@ -2278,6 +2278,12 @@ pub struct FbwWalkMode<Sym: WalkSym> {
     /// boundary rather than mapping the callee `op_pc` through the outer
     /// jitcode in `walker_capture_snapshot_for_last_guard`.
     pub inline_subwalk: bool,
+    /// Recorder position the innermost subwalk whose decline hands its region
+    /// to a native re-run of the call cuts back to (`cut_declined_subwalk` /
+    /// `History.cut`). A `new*` recorded before it is visible to that re-run,
+    /// so stores into it are journaled. Nested subwalks inherit it; `None`
+    /// outside such a region.
+    pub subwalk_floor: Option<majit_metainterp::recorder::TracePosition>,
     /// Python pc of the caller CALL instruction an inline sub-walk is
     /// executing under.  Used only for the temporary live-frame coordinate a
     /// residual frame reader observes; it is not a walk-end resume claim.
@@ -2399,6 +2405,7 @@ impl<Sym: WalkSym> Default for FbwWalkMode<Sym> {
         Self {
             snapshot_sym: std::ptr::null(),
             inline_subwalk: false,
+            subwalk_floor: None,
             inline_caller_py_pc: None,
             immediate_inline_caller_py_pc: None,
             transparent_helper_subwalk: false,

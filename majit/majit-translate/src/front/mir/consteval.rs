@@ -793,10 +793,7 @@ impl<'a> Lowering<'a> {
         if let Some(pointee) = pointee {
             // A pointer to a sized pointee is one address word.
             let pointee = tyexpr_body(self.llbc, pointee)?;
-            let sized = pointee.get("Scalar").is_some()
-                || pointee
-                    .get("Adt")
-                    .is_some_and(|adt| adt.get("builtin").is_none());
+            let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(self.llbc, pointee);
             return sized.then(|| crate::layout::target_word_size() as i64);
         }
         i64::try_from(primitive_size_align(want_align, body.get("Scalar")?)?).ok()
@@ -2977,10 +2974,7 @@ pub(in crate::front::mir) fn size_align_of_tyexpr(
     };
     if let Some(pointee) = pointee {
         let pointee = tyexpr_body(llbc, pointee)?;
-        // Charon spells a nominal ADT as `"builtin": null`. A missing key
-        // and a null value are the same sized pointee; a present builtin
-        // (`str`, a slice) is not one address word.
-        let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(pointee);
+        let sized = pointee.get("Scalar").is_some() || nominal_adt_pointee(llbc, pointee);
         return sized.then(|| crate::layout::target_word_size() as u64);
     }
     let adt = inline_adt_def_id(body).or_else(|| resolve_tyexpr_to_adt_def_id_free(llbc, ty))?;
@@ -2993,16 +2987,23 @@ pub(in crate::front::mir) fn size_align_of_tyexpr(
     }
 }
 
-/// `true` when `pointee` is a nominal ADT. Charon writes `"builtin": null`
-/// for that shape; a present builtin is `str`, a slice, or `Box`.
-pub(in crate::front::mir) fn nominal_adt_pointee(pointee: &serde_json::Value) -> bool {
+/// `true` when `pointee` is a nominal ADT (`"builtin": null`) whose
+/// declaration's `ptr_metadata` is `"None"` — a thin `lltype.Ptr`, one
+/// word (`lltypelayout.py` `get_fixed_size`). A missing decl is unsized.
+pub(in crate::front::mir) fn nominal_adt_pointee(llbc: &Llbc, pointee: &serde_json::Value) -> bool {
     let Some(adt) = pointee.get("Adt") else {
         return false;
     };
     match adt.get("builtin") {
-        None => true,
-        Some(builtin) => builtin.is_null(),
+        None => {}
+        Some(builtin) if builtin.is_null() => {}
+        Some(_) => return false,
     }
+    let Some(id) = inline_adt_def_id(pointee) else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|decl| decl.ptr_metadata.as_str() == Some("None"))
 }
 
 pub(in crate::front::mir) fn tyexpr_body<'a>(

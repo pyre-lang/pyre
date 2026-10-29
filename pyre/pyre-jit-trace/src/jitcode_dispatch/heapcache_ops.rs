@@ -183,6 +183,24 @@ fn walker_execute_gc_store<Sym: WalkSym>(
     }
 }
 
+/// Whether a store into `obj` is visible to the residual a declined subwalk
+/// hands its region to.
+///
+/// `heapcache.py` `HF_SEEN_ALLOCATION` / `new` marks a box this walk allocated.
+/// `FbwWalkMode::subwalk_floor` is the innermost re-run region's rewind
+/// (`cut_declined_subwalk` / `History.cut`).  An allocation whose
+/// `OpRef::RefOp` `raw()` is before that `_index`
+/// (`opencoder.py Trace._index` / [`residual_call::opref_allocated_after`])
+/// survives the cut, so the store is journaled like a pre-existing object's.
+fn store_into_pre_floor_allocation<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    obj: OpRef,
+) -> bool {
+    ctx.fbw_mode
+        .subwalk_floor
+        .is_some_and(|floor| !residual_call::opref_allocated_after(obj, floor._index))
+}
+
 /// A recorded store — or a recorded `COND_CALL` whose condition held — the
 /// walk could not execute.
 ///
@@ -532,13 +550,17 @@ pub(crate) fn walker_execute_setarrayitem_gc<Sym: WalkSym>(
         return Ok(());
     };
     // A block the walk allocated is held by nothing outside it, so its
-    // stores need no undo entry.  The ref-items fill has its own path;
+    // stores need no undo entry.  An allocation made before the enclosing
+    // subwalk's rewind point is visible to the residual call a declined
+    // subwalk hands its region to, so its stores are journaled like a
+    // pre-existing object's.  The ref-items fill has its own path;
     // a `Signed` / `Float` block takes the typed store below.
-    let fresh = ctx.trace_ctx.heap_cache().saw_allocation(array)
+    let fresh = (ctx.trace_ctx.heap_cache().saw_allocation(array)
         || matches!(
             ctx.trace_ctx.opcode_of(array),
             Some(OpCode::NewArray | OpCode::NewArrayClear)
-        );
+        ))
+        && !store_into_pre_floor_allocation(ctx, array);
     if fresh && ad.is_array_of_pointers() && !ad.is_array_of_structs() {
         walker_fill_materialized_array(ctx, array, index, value);
         return Ok(());
@@ -1276,9 +1298,14 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         // `execute_new_allocation` hands back a real, zeroed object) is held
         // by nothing outside the walk, so the write needs no journal entry
         // to survive a non-commit rollback — the abandoned allocation goes
-        // with it.  A store into a pre-existing object is observable, so
+        // with it.  An allocation made before the enclosing subwalk's rewind
+        // point is visible to the residual call a declined subwalk hands its
+        // region to, so its stores are journaled like a pre-existing object's.
+        // A store into a pre-existing object is observable, so
         // [`walker_execute_gc_store`] journals what it displaces.
-        if ctx.trace_ctx.heap_cache().saw_allocation(obj) {
+        if ctx.trace_ctx.heap_cache().saw_allocation(obj)
+            && !store_into_pre_floor_allocation(ctx, obj)
+        {
             if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
                 && let Some(value) = ctx.trace_ctx.box_value(valuebox)
             {

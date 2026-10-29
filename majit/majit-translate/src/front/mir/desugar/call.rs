@@ -4928,6 +4928,64 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // The read is the field's own `getfield` (`jtransform.py rewrite_op_getfield`)
+                // for a scalar `T`; upstream keeps such flags as plain attributes,
+                // e.g. `nestedscope.py CellFamily.ever_mutated`.
+                if args.len() == 1
+                    && self.is_cell_get(&reg)
+                    && tyref_is_primitive_scalar(&call.dest.ty, self.llbc)
+                {
+                    let dest_ty = tyref_to_value_type_with(
+                        &call.dest.ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                        self.gc_struct_ids,
+                        &self.raw_alloc_flavor_structs,
+                    );
+                    let field_kind = {
+                        let block = self.graph.block(bb_id);
+                        block.operations.iter().rev().find_map(|op| {
+                            let OpKind::FieldRead { field, .. } = &op.kind else {
+                                return None;
+                            };
+                            if op.result.as_ref() == Some(&args[0])
+                                && field.taken_by_address
+                                && field.vec_part.is_none()
+                                && !field.inline_vec
+                            {
+                                Some(op.kind.clone())
+                            } else {
+                                None
+                            }
+                        })
+                    };
+                    if let Some(OpKind::FieldRead {
+                        base,
+                        mut field,
+                        pure,
+                        ..
+                    }) = field_kind
+                    {
+                        field.taken_by_address = false;
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: OpKind::FieldRead {
+                                base,
+                                field,
+                                ty: dest_ty,
+                                pure,
+                            },
+                        });
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
                 // `alloc::fmt::format` of a no-placeholder constant
                 // message — `format!("literal")`, whose `format_args!`
                 // lowered to `Arguments::from_str` (aliased to its
@@ -8584,6 +8642,32 @@ impl<'a> Lowering<'a> {
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(())
+    }
+
+    /// `Cell<T>` is `#[repr(transparent)]` over `T`, so `get` of a field place
+    /// is that field's value read. `core::cell::Cell` only. `RefCell` /
+    /// `OnceCell` / `UnsafeCell` / `LazyCell` do not match: `OnceCell::get`
+    /// returns `Option<&T>`.
+    fn is_cell_get(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let leaf_is_get = |leaf: &str| leaf == "get";
+        let owner_is_cell = |owner: &str| owner == "Cell" || owner.ends_with("::Cell");
+        let path = fd.item_meta.name_path();
+        if let Some((owner, leaf)) = path.rsplit_once("::")
+            && leaf_is_get(leaf)
+            && owner_is_cell(owner)
+            && path.starts_with("core::cell::")
+        {
+            return true;
+        }
+        impl_method_owner_for_fundecl(self.llbc, fd).is_some_and(|(owner, leaf)| {
+            leaf_is_get(&leaf) && owner_is_cell(&owner) && path.starts_with("core::cell::")
+        })
     }
 
     pub(in crate::front::mir) fn set_spec(

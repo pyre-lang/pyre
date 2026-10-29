@@ -33689,20 +33689,26 @@ pub fn __majit_wrap_set_descr_add(args: &[PyObjectRef]) -> Result<PyObjectRef, c
     crate::type_methods::arity_exact(args, "add", 1)?;
     // `try_hash_value` may run a user `__hash__` that allocates and triggers
     // a moving minor collection; root `self` and the element across it, then
-    // reload. Its digest keys the store, so the element is hashed once.
+    // reload. Its digest keys the store, so the element is hashed once. The
+    // slots are read back as `base + <literal>` through the scope and the
+    // error arm is a `match`, not a closure, so the codewriter erases the
+    // bracket (as in `set_add_value`).
     unsafe {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let sp = pyre_object::gc_roots::pin_roots(&[args[0], args[1]]);
-        let hash = crate::builtins::try_hash_value(pyre_object::gc_roots::shadow_stack_get(sp + 1))
-            .map_err(|err| {
-                crate::baseobjspace::wrap_set_element_hash_error(
-                    pyre_object::gc_roots::shadow_stack_get(sp + 1),
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.base();
+        let (w_set, w_elem) = (args[0], args[1]);
+        let _ = roots.pin_root(w_set);
+        let _ = roots.pin_root(w_elem);
+        let hash = match crate::builtins::try_hash_value(roots.get(base + 1)) {
+            Ok(hash) => hash,
+            Err(err) => {
+                return Err(crate::baseobjspace::wrap_set_element_hash_error(
+                    roots.get(base + 1),
                     err,
-                )
-            })?;
-        let set = pyre_object::gc_roots::shadow_stack_get(sp);
-        let item = pyre_object::gc_roots::shadow_stack_get(sp + 1);
-        pyre_object::w_set_add_hashed_checked(set, item, hash)
+                ));
+            }
+        };
+        pyre_object::w_set_add_hashed_checked(roots.get(base), roots.get(base + 1), hash)
             .map_err(crate::baseobjspace::map_set_update_error)?;
     }
     Ok(pyre_object::w_none())

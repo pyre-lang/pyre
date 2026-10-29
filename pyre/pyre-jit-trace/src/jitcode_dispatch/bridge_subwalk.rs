@@ -1918,6 +1918,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             fbw_mode: FbwWalkMode {
                 snapshot_sym: root_sym_ptr,
                 inline_subwalk: true,
+                subwalk_floor: None,
                 carrier_resume: true,
                 transparent_helper_subwalk: helper_walk,
                 transparent_helper_jitcode_index: if helper_walk { helper_index } else { None },

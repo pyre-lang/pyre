@@ -311,6 +311,12 @@ pub struct TypeDecl {
     /// unmodelled origin cannot fail the load.
     #[serde(default)]
     pub src: Option<Value>,
+    /// Thin vs fat pointer metadata for this type. Charon writes the
+    /// string `"None"` when a pointer to the type is one address word;
+    /// `"Length"`, `{"VTable": ..}`, or `{"InheritFrom": ..}` when the
+    /// pointer is fat. A missing key deserializes as `Null`.
+    #[serde(default)]
+    pub ptr_metadata: Value,
     /// Set when a defining crate's struct fields were copied onto this
     /// import. Field projection reads those fields. Call routing,
     /// construction, spill, and metadata still treat the decl as the

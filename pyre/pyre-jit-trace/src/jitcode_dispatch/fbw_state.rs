@@ -1132,13 +1132,32 @@ pub(crate) fn fbw_gc_store_journal_cut(pos: &majit_metainterp::recorder::TracePo
         let mut i = entries.len();
         while i > 0 {
             i -= 1;
-            if matches!(entries[i], FbwCellStore::Gc { op_count, .. } if op_count > pos._count) {
+            if fbw_gc_store_journal_cut_matches(&entries[i], pos) {
                 undo_cell_store_entry(entries.remove(i));
                 undone += 1;
             }
         }
     });
     fbw_unbump_executed_effects(undone);
+}
+
+fn fbw_gc_store_journal_cut_matches(
+    entry: &FbwCellStore,
+    pos: &majit_metainterp::recorder::TracePosition,
+) -> bool {
+    matches!(*entry, FbwCellStore::Gc { op_count, .. } if op_count > pos._count)
+}
+
+/// Mirrors the undo `cut_trace_with_snapshots` performs through [`fbw_gc_store_journal_cut`].
+pub(crate) fn fbw_journaled_effects_since(
+    pos: &majit_metainterp::recorder::TracePosition,
+) -> usize {
+    FBW_CELL_STORE_JOURNAL.with(|j| {
+        j.borrow()
+            .iter()
+            .filter(|entry| fbw_gc_store_journal_cut_matches(entry, pos))
+            .count()
+    })
 }
 
 /// Keep, without an undo entry, the journaled stores into `obj` pushed since

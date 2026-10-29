@@ -77,6 +77,15 @@ impl UnicodeArray {
         }
     }
 
+    /// The block word and the length, so a `dont_look_inside` helper can take
+    /// the array as ABI words; ownership of the block moves with the parts.
+    pub fn into_raw_parts(mut self) -> (*mut ItemsBlock, usize) {
+        let parts = (self.block, self.len_relaxed());
+        // `Drop` deallocates the block; a null block is the empty array, whose drop frees nothing.
+        self.block = std::ptr::null_mut();
+        parts
+    }
+
     /// `AbstractUnwrappedStrategy.get_empty_storage(sizehint)` for ASCII text.
     pub fn with_capacity(capacity: usize) -> Self {
         if capacity == 0 {

@@ -1233,7 +1233,7 @@ fn window_const_u8_ptr() -> serde_json::Value {
     serde_json::json!({"RawPtr": [window_u8(), "Const"]})
 }
 
-fn window_mut_u8_ptr() -> serde_json::Value {
+pub(in crate::front::mir) fn window_mut_u8_ptr() -> serde_json::Value {
     serde_json::json!({"RawPtr": [window_u8(), "Mut"]})
 }
 

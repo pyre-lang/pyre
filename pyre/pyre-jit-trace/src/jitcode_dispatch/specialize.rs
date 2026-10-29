@@ -16490,6 +16490,7 @@ pub(crate) fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let walk_start = ctx.trace_ctx.get_trace_position();
     let saved_fbw_mode = ctx.fbw_mode;
     ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.subwalk_floor = Some(walk_start);
     ctx.fbw_mode.helper_return = nested_entry.ret;
     let helper_frame = enter_helper_level(ctx, nested_entry.level);
     let walk_result = run_sub_jitcode_walk(
