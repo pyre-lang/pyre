@@ -492,12 +492,23 @@
       background: color-mix(in srgb, var(--accent) 14%, transparent);
     }
 
-    .output-wrap .status {
+    .output-wrap .status-row {
       min-height: 48px;
       display: flex;
       align-items: center;
       justify-self: end;
       margin-top: 0;
+      gap: 12px;
+    }
+
+    .run-time {
+      color: var(--dim);
+      font-size: 0.9rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .run-time:empty {
+      display: none;
     }
 
     .ghost {
@@ -756,7 +767,10 @@ print(fib(100))</textarea>
             <div class="output-wrap">
               <div class="label">Output</div>
               <pre id="output">Initializing pyre...</pre>
-              <div class="status" id="playground-status">Loading WebAssembly module...</div>
+              <div class="status-row">
+                <span class="run-time" id="run-time"></span>
+                <div class="status" id="playground-status">Loading WebAssembly module...</div>
+              </div>
             </div>
           </div>
         </div>
@@ -835,6 +849,7 @@ print(fib(100))</textarea>
   <script type="module">
     import { examples } from "./examples.js";
     const statusNode = document.getElementById("playground-status");
+    const runTimeNode = document.getElementById("run-time");
     const sourceNode = document.getElementById("source");
     const outputNode = document.getElementById("output");
     const runButton = document.getElementById("run-button");
@@ -930,13 +945,15 @@ print(fib(100))</textarea>
 
       runButton.disabled = true;
       setStatus("Running...", "");
+      runTimeNode.textContent = "";
 
       setTimeout(() => {
         try {
           const t0 = performance.now();
           const result = runPython(sourceNode.value);
           const elapsed = (performance.now() - t0).toFixed(1);
-          setOutput(result + (result ? "\n" : "") + "─── " + elapsed + " ms");
+          setOutput(result);
+          runTimeNode.textContent = elapsed + " ms";
           setStatus("Ready", "ready");
         } catch (error) {
           console.error(error);
