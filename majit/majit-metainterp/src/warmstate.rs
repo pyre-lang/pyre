@@ -3242,8 +3242,8 @@ impl WarmEnterState {
     /// walk happens ONCE, at the hash producer, and the cell key it yields is
     /// what `counter_tick`, `maybe_compile`,
     /// `finish_tracing`, `abort_tracing`, `get_cell` and the rest are handed —
-    /// along with `MetaInterp`'s `compiled_loops` / `cut_compiled_keys`, which
-    /// are indexed by the same key and so describe the same cell. That is the
+    /// along with `MetaInterp`'s `compiled_loops`, which is indexed by the same
+    /// key and so describes the same cell. That is the
     /// property the `u64` currency previously lacked: it named a bucket, and a
     /// bucket is not a cell.
     pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<Rc<BaseJitCell>> {

@@ -2578,52 +2578,6 @@ pub struct MetaInterp<M: Clone> {
     /// Recycled terminal blackhole banks for guard-failure resume.
     /// Capacity reuse for the terminal banks, same role as the CRN scratch.
     pub(crate) blackhole_terminal_scratch: Option<crate::blackhole::BlackholeTerminalImage>,
-    /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
-    /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
-    /// own header.
-    ///
-    /// A cut loop's entry is not a general procedure entry, even though it is
-    /// structurally shaped like one. `cut_trace_from` does run
-    /// (`[jit] cut_trace_from: start.op_index=40 original_boxes=33
-    /// trace_ops=77`) and the artifact does carry a peeled preamble —
-    /// `token.target_tokens` is `[preamble(no virtual state), specialized]`,
-    /// the same pair a loop compiled at its own header gets, which is what
-    /// makes `jump_to_preamble` (unroll.py) sound there.
-    ///
-    /// What the peel cannot restore is a fact the CUTTING trace proved in the
-    /// ops the cut discarded. `PreambleCompileData` re-optimizes the cut trace
-    /// from scratch, so it neither inherits those facts nor re-derives them —
-    /// it only replays the ops that survived, and an op the tracer recorded
-    /// WITHOUT a guard because the guard sat in the dropped prefix stays
-    /// unguarded. On cel's `batch_chain_eager_fold_traps` the cut trace opens
-    /// with exactly that:
-    ///
-    /// ```text
-    ///   v33 = IntAdd(v5, 1)
-    ///   v34 = IntMul(v33, 8)
-    ///   v35 = RawLoadI(v13, v34)      <- no bound guard; it was before the cut
-    ///   ...
-    ///   RawStore(v2, v55, v54)        <- likewise
-    /// ```
-    ///
-    /// so an entry that has not run the discarded prefix loads and stores out
-    /// of bounds. Only the cutting trace's own closing JUMP arrives with those
-    /// facts proven.
-    ///
-    /// Keyed by `(jitdriver_sd.index, cell green_key)` like `compiled_loops`.
-    pub(crate) cut_compiled_keys: crate::FxIndexSet<(usize, u64)>,
-    /// The [`Self::cut_compiled_keys`] entry the running `compile_loop_body`
-    /// recorded on the way in, kept so `compile_loop` can retire it when the
-    /// body returns without installing a loop.
-    ///
-    /// The marker has to be written before the ctx carrying
-    /// `cut_inner_green_key` is drained, which puts it ahead of every give-up
-    /// the body can still take. Nothing else retires it: `forget_loop_side_tables`
-    /// is keyed on a loop that in that case never existed, so a marker left
-    /// behind makes `is_cross_loop_cut_key` answer true forever and
-    /// `jitdriver.rs`'s target-lookup miss decline every later
-    /// interpreter-origin entry bridge at that key.
-    pub(crate) speculative_cut_owned_key: Option<u64>,
     pub(crate) tracing: Option<TraceCtx>,
     /// Taken recorder parked for the compile window. `walk_active_trace_refs`
     /// still forwards its ConstPtrs until intern / drop; `tracing.take()`
@@ -4610,8 +4564,6 @@ impl<M: Clone> MetaInterp<M> {
             compiled_graph_minor_scan_pending: true,
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             blackhole_terminal_scratch: None,
-            cut_compiled_keys: crate::FxIndexSet::default(),
-            speculative_cut_owned_key: None,
             tracing: None,
             compile_tracing: None,
             single_pass_outcome: None,
@@ -8793,7 +8745,6 @@ impl<M: Clone> MetaInterp<M> {
         majit_gc::ensure_type_registry_closed();
         self.remember_compiled_graph_write();
         let outcome = self.compile_loop_body(jump_args, meta);
-        self.retire_speculative_cut_key(outcome);
         self.compile_snapshot_refs.clear();
         // pyjitpl.py:3015-3032 parity: once the body has taken the trace
         // ctx (tracing=None), drop the matching frontend session so the
@@ -8806,22 +8757,6 @@ impl<M: Clone> MetaInterp<M> {
             self.clear_trace_session();
         }
         outcome
-    }
-
-    /// Settle the claim `compile_loop_body` staked on the cut's inner key.
-    ///
-    /// The body marks that key as cut-owned before it can know whether a loop
-    /// will be stored there, and every give-up after that point returns
-    /// without one. Retiring here rather than at each of those exits keeps the
-    /// rule in one place: the ownership claim is about a compiled loop, so it
-    /// only survives an outcome that installed one.
-    fn retire_speculative_cut_key(&mut self, outcome: CompileOutcome) {
-        if let Some(cut_key) = self.speculative_cut_owned_key.take()
-            && !matches!(outcome, CompileOutcome::Compiled { .. })
-        {
-            let key = self.compiled_loop_key(cut_key);
-            self.cut_compiled_keys.swap_remove(&key);
-        }
     }
 
     fn compile_loop_body(&mut self, jump_args: &[OpRef], meta: M) -> CompileOutcome {
@@ -9069,18 +9004,6 @@ impl<M: Clone> MetaInterp<M> {
         // (`compile.py compile_retrace get_procedure_token`), so that is where a retrace
         // budget legitimately persists.
 
-        // compile.py:269-270 `jitcell_token = cross_loop.jitcell_token`: mark
-        // the key this loop is about to be stored under as cut-owned, before
-        // the ctx that carries `cut_inner_green_key` is drained. Recorded on
-        // the way in rather than on success so a retried compile at the same
-        // key cannot leave the mark behind; `forget_loop_side_tables` retires
-        // it with the loop.
-        if let Some(cut_key) = cut_inner_green_key.as_ref() {
-            let hash = cut_key.get_uhash();
-            let key = self.compiled_loop_key(hash);
-            self.cut_compiled_keys.insert(key);
-            self.speculative_cut_owned_key = Some(hash);
-        }
         self.force_finish_trace = false;
         // Park the recorder where `walk_active_trace_refs` still sees it.
         // `reached_loop_header` calls `history.trace.tracing_done()` before
@@ -10345,11 +10268,9 @@ impl<M: Clone> MetaInterp<M> {
                             )
                         })
                         .collect();
-                    let cut_key = self.compiled_loop_key(green_key);
                     eprintln!(
                         "@@@SPDIAG compiled_loops.insert green_key={green_key} \
-                         cut={} tokens=[{}] front_entry_index={front_entry_index:?}",
-                        self.cut_compiled_keys.contains(&cut_key),
+                         tokens=[{}] front_entry_index={front_entry_index:?}",
                         shape.join(","),
                     );
                 }
@@ -13875,24 +13796,6 @@ impl<M: Clone> MetaInterp<M> {
         self.has_compiled_targets(cell_key).then_some(cell_key)
     }
 
-    /// compile.py:269-270 parity: whether the loop at `green_key` was stored
-    /// under a cross-loop cut's inner jitcell token.
-    ///
-    /// See `MetaInterp::cut_compiled_keys` for why the distinction matters to
-    /// anything that wants to JUMP into the loop from outside the trace that
-    /// cut it.
-    pub fn is_cross_loop_cut_key(&self, green_key: u64) -> bool {
-        let key = self.compiled_loop_key(green_key);
-        self.cut_compiled_keys.contains(&key)
-    }
-
-    /// Back-edge / entry-bridge cut gate on that driver's cell.
-    /// `compile.py` stores the cut on the compiling `jitdriver_sd`; a
-    /// leftover `active_jitdriver_sd` from a later trace is not that cell.
-    pub fn is_cross_loop_cut_key_on_driver(&self, jd_no: usize, green_key: u64) -> bool {
-        self.cut_compiled_keys.contains(&(jd_no, green_key))
-    }
-
     /// Actual key the last compile_loop stored under. Returns inner key
     /// for cross-loop cuts, otherwise the tracing key.
     pub fn last_compiled_key(&self) -> Option<u64> {
@@ -15148,11 +15051,9 @@ impl<M: Clone> MetaInterp<M> {
     /// own index rather than the last traced driver's.
     pub fn remove_compiled_loop_on_driver(&mut self, jd_no: usize, green_key: u64) {
         self.compiled_loops.swap_remove(&(jd_no, green_key));
-        self.forget_loop_side_tables(jd_no, green_key);
     }
 
-    /// Drop every compiled loop whose root trace is `trace_id`, with the
-    /// per-loop side tables that belong to it.
+    /// Drop every compiled loop whose root trace is `trace_id`.
     pub fn invalidate_compiled_trace(&mut self, trace_id: u64) {
         let stale: Vec<(usize, u64)> = self
             .compiled_loops
@@ -15162,17 +15063,7 @@ impl<M: Clone> MetaInterp<M> {
             .collect();
         for key in stale {
             self.compiled_loops.swap_remove(&key);
-            self.forget_loop_side_tables(key.0, key.1);
         }
-    }
-
-    /// Drop the `cut_compiled_keys` marker when a loop is retired, so it
-    /// cannot outlive `compiled_loops`. The driver index is part of the key:
-    /// two `WarmEnterState`s may share a numeric cell key
-    /// (`warmstate.py JitCell`).
-    fn forget_loop_side_tables(&mut self, jd_no: usize, green_key: u64) {
-        let key = (jd_no, green_key);
-        self.cut_compiled_keys.swap_remove(&key);
     }
 
     /// rpython/rlib/rstack.py `stack_almost_full` — delegates to
@@ -15256,7 +15147,6 @@ impl<M: Clone> MetaInterp<M> {
                 // entry (the merged `traces` map and the
                 // previous_tokens Vec drop together).
                 self.compiled_loops.swap_remove(&(jd_no, gk));
-                self.forget_loop_side_tables(jd_no, gk);
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-mem-collect",
@@ -15997,12 +15887,8 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Remove all compiled loops. Used when guard-fail recovery is
     /// unrecoverable (null Ref in resume data).
-    ///
-    /// Bulk form of `remove_compiled_loop`, so it drops the per-loop side
-    /// tables too — see `forget_loop_side_tables`.
     pub fn clear_compiled_loops(&mut self) {
         self.compiled_loops.clear();
-        self.cut_compiled_keys.clear();
     }
 
     /// warmstate.py:385 — whether this driver's portal returns a raw int.
@@ -30833,51 +30719,6 @@ mod metainterp_static_data_tests {
         }
     }
 
-    /// A cut key claimed on the way in survives exactly the outcome that
-    /// stored a loop under it. `forget_loop_side_tables` is the only other
-    /// retirement and it is keyed on a loop, so a marker left behind by a
-    /// give-up would make `is_cross_loop_cut_key` answer true forever and
-    /// decline every later interpreter-origin entry bridge at that key.
-    #[test]
-    fn only_a_compiled_outcome_keeps_the_cut_ownership_marker() {
-        const CUT_KEY: u64 = 0xc0ff_ee00;
-        let seeded = |meta: &mut MetaInterp<()>| {
-            let key = meta.compiled_loop_key(CUT_KEY);
-            meta.cut_compiled_keys.insert(key);
-            meta.speculative_cut_owned_key = Some(CUT_KEY);
-            assert!(meta.is_cross_loop_cut_key(CUT_KEY));
-        };
-
-        for outcome in [
-            CompileOutcome::Cancelled,
-            CompileOutcome::Aborted,
-            CompileOutcome::SwitchToBlackhole {
-                reason: counters::ABORT_BAD_LOOP,
-            },
-        ] {
-            let (mut meta, _jc) = meta_with_recursive_portal();
-            seeded(&mut meta);
-            meta.retire_speculative_cut_key(outcome);
-            assert!(
-                !meta.is_cross_loop_cut_key(CUT_KEY),
-                "{outcome:?} stored no loop, so the claim must go"
-            );
-            assert!(meta.speculative_cut_owned_key.is_none());
-        }
-
-        let (mut meta, _jc) = meta_with_recursive_portal();
-        seeded(&mut meta);
-        meta.retire_speculative_cut_key(CompileOutcome::Compiled {
-            green_key: CUT_KEY,
-            from_retry: false,
-        });
-        assert!(
-            meta.is_cross_loop_cut_key(CUT_KEY),
-            "a loop was stored under this key, so it stays cut-owned"
-        );
-        assert!(meta.speculative_cut_owned_key.is_none());
-    }
-
     #[test]
     fn find_biggest_function_sizes_a_callee_that_already_returned() {
         // pyjitpl.py find_biggest_function. The frame that grew the trace is usually one
@@ -37865,26 +37706,13 @@ mod loop_side_table_tests {
 
     #[test]
     fn runtime_side_tables_read_the_executing_driver() {
-        // warmspot.py handle_jitexception / compile.py cut markers live
-        // on jitdriver_sd.warmstate. Leftover active_jitdriver_sd is
-        // the last traced driver.
+        // warmspot.py handle_jitexception lives on jitdriver_sd.warmstate.
+        // Leftover active_jitdriver_sd is the last traced driver.
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let jd0 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
         let jd1 = meta.register_jitdriver_sd(JitDriverStaticData::new(vec![], vec![]));
         let green_key = gk(17);
-        meta.active_jitdriver_sd = Some(jd1);
-        meta.cut_compiled_keys
-            .insert(meta.compiled_loop_key(green_key.get_uhash()));
-        meta.active_jitdriver_sd = Some(jd0);
-        assert!(
-            !meta.is_cross_loop_cut_key(green_key.get_uhash()),
-            "ambient cut gate follows leftover active_jitdriver_sd"
-        );
-        assert!(
-            meta.is_cross_loop_cut_key_on_driver(jd1, green_key.get_uhash()),
-            "runtime cut gate must read the executing driver's cell"
-        );
         meta.active_jitdriver_sd = Some(jd1);
         meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), compiled_entry(2));
         meta.record_loop_header_pc(green_key.get_uhash(), 99);
@@ -38152,7 +37980,7 @@ mod loop_side_table_tests {
     fn forget_loop_side_tables_keeps_the_sibling_driver_companions() {
         // compiled_loops is (jitdriver_sd.index, cell green_key). Companion
         // tables used to be u64-keyed, so evicting jd1 at a numeric key
-        // dropped jd0's header/cut/preamble too. Leftover
+        // dropped jd0's header/preamble too. Leftover
         // active_jitdriver_sd is 0; the evict path must use the token's
         // outermost_jitdriver_index.
         let mut meta = MetaInterp::<()>::new(1);
@@ -38178,14 +38006,6 @@ mod loop_side_table_tests {
         jd1_entry.token = std::sync::Arc::downgrade(&token);
         meta.insert_compiled_loop_on_driver(jd1, green_key.get_uhash(), jd1_entry);
 
-        meta.active_jitdriver_sd = Some(jd0);
-        let jd0_key = meta.compiled_loop_key(green_key.get_uhash());
-        meta.cut_compiled_keys.insert(jd0_key);
-
-        meta.active_jitdriver_sd = Some(jd1);
-        let jd1_key = meta.compiled_loop_key(green_key.get_uhash());
-        meta.cut_compiled_keys.insert(jd1_key);
-
         meta.warm_state_for_driver(jd1)
             .memory_manager
             .keep_loop_alive(&token);
@@ -38194,14 +38014,6 @@ mod loop_side_table_tests {
             .set_max_age(1, 1);
 
         meta.active_jitdriver_sd = Some(jd0);
-        assert!(
-            meta.cut_compiled_keys
-                .contains(&(jd0, green_key.get_uhash()))
-        );
-        assert!(
-            meta.cut_compiled_keys
-                .contains(&(jd1, green_key.get_uhash()))
-        );
 
         let mut jd1_gone = false;
         for _ in 0..8 {
@@ -38217,17 +38029,6 @@ mod loop_side_table_tests {
         assert!(
             jd1_gone,
             "evicting the jd1 token must drop the jd1 compiled_loops row while leftover active_jitdriver_sd is 0"
-        );
-        assert!(
-            !meta
-                .cut_compiled_keys
-                .contains(&(jd1, green_key.get_uhash())),
-            "jd1 cut marker must go with the evicted row"
-        );
-        assert!(
-            meta.cut_compiled_keys
-                .contains(&(jd0, green_key.get_uhash())),
-            "same-key jd0 cut marker must stay"
         );
         let _keep = token;
     }
