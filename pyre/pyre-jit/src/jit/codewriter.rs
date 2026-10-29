@@ -6708,20 +6708,13 @@ impl CodeWriter {
         // the opname-tail-derived `ResKind` at dispatch time
         // (`assembler.rs`'s `dispatch_residual_call`).
         let key = (effect_info, arg_kinds, result_kind);
-        // `jit_list_append` is recorded as a void LIST_APPEND operation, but
-        // its registered fallback has the uniform `(i64, i64) -> i64` helper
-        // ABI. Preserve that physical result exactly as the other ignored-word
-        // residual producers do; the tag is part of `EffectInfo` and therefore
-        // already separates this entry in the cache key.
-        let void_word_abi =
-            key.2.is_none() && key.0.runtime_helper == majit_ir::RuntimeHelperKind::ListAppendValue;
         let mut cache = self.call_descr_stub_cache.lock();
         let arc = cache.entry(key.clone()).or_insert_with(|| {
             Arc::new(CallDescrStub {
                 effect_info: key.0.clone(),
                 arg_kinds: key.1.clone(),
                 result_kind: key.2,
-                void_word_abi,
+                void_word_abi: false,
             })
         });
         arc.clone() as Arc<dyn majit_ir::Descr>
@@ -17536,7 +17529,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn list_append_void_stub_records_ignored_word_abi() {
+    fn list_append_void_stub_uses_void_abi() {
         let writer = CodeWriter::new();
         let mut effect_info = super::super::flatten::effect_info_for_call_flavor(CallFlavor::Plain);
         effect_info.runtime_helper = majit_ir::RuntimeHelperKind::ListAppendValue;
@@ -17546,7 +17539,7 @@ mod tests {
             .and_then(|descr| descr.downcast_ref::<CallDescrStub>())
             .expect("interned call descr must remain a CallDescrStub");
 
-        assert!(stub.void_word_abi);
+        assert!(!stub.void_word_abi);
     }
 
     #[test]

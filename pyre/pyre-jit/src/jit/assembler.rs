@@ -3606,26 +3606,26 @@ mod tests {
     }
 
     #[test]
-    fn residual_call_r_v_preserves_word_returning_and_genuine_void_abis() {
-        let mut word_builder = JitCodeBuilder::default();
-        let word_fn_idx = word_builder.add_fn_ptr(0x7777usize as *const ());
-        let word_insn = super::super::flatten::build_store_subscr_fn_residual_call_r_v_insn(
-            word_fn_idx,
+    fn residual_call_r_v_uses_genuine_void_abi() {
+        let mut store_builder = JitCodeBuilder::default();
+        let store_fn_idx = store_builder.add_fn_ptr(0x7777usize as *const ());
+        let store_insn = super::super::flatten::build_store_subscr_fn_residual_call_r_v_insn(
+            store_fn_idx,
             0,
             1,
             2,
         );
-        let mut word_ssarepr = SSARepr::new("residual_call_r_v_word_abi");
-        word_ssarepr.insns.push(word_insn);
-        let word_jitcode = assemble(
-            &mut word_ssarepr,
-            word_builder,
+        let mut store_ssarepr = SSARepr::new("residual_call_r_v_store_subscr");
+        store_ssarepr.insns.push(store_insn);
+        let store_jitcode = assemble(
+            &mut store_ssarepr,
+            store_builder,
             Some(NumRegs {
                 ref_: 3,
                 ..NumRegs::default()
             }),
         );
-        let word_bh = word_jitcode
+        let store_bh = store_jitcode
             .exec
             .descrs
             .iter()
@@ -3634,13 +3634,13 @@ mod tests {
                 majit_jitcode::jitcode::BhDescr::Call { calldescr } => Some(calldescr),
                 _ => None,
             })
-            .expect("word-returning residual_call_r_v must emit a BhCallDescr");
-        let word_descr = pyre_jit_trace::descr::make_call_descr_from_bh(word_bh);
-        let word_call = word_descr
+            .expect("store_subscr residual_call_r_v must emit a BhCallDescr");
+        let store_descr = pyre_jit_trace::descr::make_call_descr_from_bh(store_bh);
+        let store_call = store_descr
             .as_call_descr()
-            .expect("word-returning residual_call_r_v must yield a call descr");
-        assert_eq!(word_call.result_type(), majit_ir::Type::Void);
-        assert_eq!(word_call.result_size(), 8);
+            .expect("store_subscr residual_call_r_v must yield a call descr");
+        assert_eq!(store_call.result_type(), majit_ir::Type::Void);
+        assert_eq!(store_call.result_size(), 0);
 
         let mut void_builder = JitCodeBuilder::default();
         let void_fn_idx = void_builder.add_fn_ptr(0x8888usize as *const ());

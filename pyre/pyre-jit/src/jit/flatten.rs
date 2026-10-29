@@ -4443,7 +4443,6 @@ where
         ctx.store_name_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
-        true,
         // Tag so the full-body walker can descend `write_cell`
         // (`try_walker_store_name_cell_fold`); replacing writes stay residual.
         majit_ir::RuntimeHelperKind::StoreName,
@@ -4485,7 +4484,6 @@ where
         ctx.store_global_fn_idx,
         vec![frame_operand, name_operand, value_operand],
         CallFlavor::Plain,
-        true,
         // Tag for the same module-scope IntMutableCell in-place store fold as
         // `lower_store_name_hlop_to_insn` (`try_walker_store_name_cell_fold`).
         majit_ir::RuntimeHelperKind::StoreGlobal,
@@ -4512,7 +4510,6 @@ where
         ctx.delete_name_fn_idx,
         vec![frame_operand, name_operand],
         CallFlavor::Plain,
-        true,
         // Tagged so the walker can run the `jit_force_quasi_immutable` test
         // (`pyjitpl.py opimpl_jit_force_quasi_immutable`) before executing the delete — `delitem_str`
         // calls `mutated()` on a successful removal.
@@ -4722,7 +4719,6 @@ where
         ctx.delete_global_fn_idx,
         vec![frame_operand, name_operand],
         CallFlavor::Plain,
-        true,
         // See [`lower_delete_name_hlop_to_insn`].
         majit_ir::RuntimeHelperKind::DeleteGlobal,
     ))
@@ -5554,7 +5550,6 @@ where
         ctx.store_subscr_fn_idx,
         vec![obj_operand, key_operand, value_operand],
         CallFlavor::MayForce,
-        true,
         majit_ir::RuntimeHelperKind::StoreSubscr,
     ))
 }
@@ -5596,7 +5591,6 @@ where
         ctx.store_slice_fn_idx,
         vec![obj_operand, start_operand, stop_operand, value_operand],
         CallFlavor::MayForce,
-        true,
         majit_ir::RuntimeHelperKind::None,
     ))
 }
@@ -6137,7 +6131,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: None,
-        void_word_abi: true,
+        void_word_abi: false,
     }));
     Some(Insn::op(
         "residual_call_ir_v",
@@ -7525,7 +7519,6 @@ where
         ctx.delete_subscr_fn_idx,
         vec![obj_operand, key_operand],
         CallFlavor::MayForce,
-        true,
         majit_ir::RuntimeHelperKind::None,
     ))
 }
@@ -7607,7 +7600,6 @@ where
         ctx.list_extend_fn_idx,
         vec![list_operand, iterable_operand],
         CallFlavor::MayForce,
-        true,
         majit_ir::RuntimeHelperKind::None,
     ))
 }
@@ -7660,7 +7652,6 @@ where
         fn_idx,
         operands,
         CallFlavor::MayForce,
-        true,
         majit_ir::RuntimeHelperKind::None,
     ))
 }
@@ -7701,7 +7692,7 @@ where
         effect_info,
         arg_kinds: vec![Kind::Ref, Kind::Ref, Kind::Int],
         result_kind: None,
-        void_word_abi: true,
+        void_word_abi: false,
     }));
     Some(Insn::op(
         "residual_call_ir_v",
@@ -7868,7 +7859,6 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
             Operand::Register(Register::new(Kind::Ref, value_reg)),
         ],
         CallFlavor::MayForce,
-        true,
         majit_ir::RuntimeHelperKind::StoreSubscr,
     )
 }
@@ -7895,7 +7885,6 @@ pub fn build_set_current_exception_fn_residual_call_r_v_insn(
         set_current_exception_fn_idx,
         vec![Operand::Register(Register::new(Kind::Ref, exc_reg))],
         CallFlavor::PlainCannotRaiseNoHeap,
-        false,
         majit_ir::RuntimeHelperKind::None,
     )
 }
@@ -7913,7 +7902,6 @@ fn build_residual_call_r_v_insn_from_operands(
     fn_idx: u16,
     ref_operands: Vec<Operand>,
     flavor: CallFlavor,
-    void_word_abi: bool,
     runtime_helper: majit_ir::RuntimeHelperKind,
 ) -> Insn {
     let arg_kinds = vec![Kind::Ref; ref_operands.len()];
@@ -7923,7 +7911,7 @@ fn build_residual_call_r_v_insn_from_operands(
         effect_info,
         arg_kinds,
         result_kind: None,
-        void_word_abi,
+        void_word_abi: false,
     }));
     Insn::op(
         "residual_call_r_v",
