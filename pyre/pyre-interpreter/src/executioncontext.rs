@@ -1537,16 +1537,6 @@ impl ExecutionContext {
         }
     }
 
-    /// Request the CPython refcount boundary associated with exposing a
-    /// coroutine's frame.  The action runs before the next opcode, after the
-    /// attribute receiver has left the value stack.
-    pub fn finalize_discarded_coroutine_after_frame_get(&mut self) {
-        let action = space_user_del_action();
-        if !action.is_null() {
-            unsafe { (*action).collect_oldgen_and_fire() };
-        }
-    }
-
     /// Consume a failed-attribute finalization request after the live red
     /// frame has cleared its own dispatch flag.  This boundary has no live
     /// opcode temporaries outside the published PyFrame roots, so a moving
@@ -3401,12 +3391,6 @@ pub struct UserDelAction {
     pub finalizers_lock_count: usize,
     pub enabled_at_app_level: bool,
     pub pending_with_disabled_del: Option<Vec<PyObjectRef>>,
-    /// Run one old-generation reachability pass immediately before the next
-    /// finalizer drain.  CPython's temporary coroutine decref can make
-    /// `f().cr_frame` warn before the following opcode; pyre's tracing GC
-    /// requests the equivalent pass only after LOAD_ATTR has replaced the
-    /// coroutine with its escaped frame on the value stack.
-    collect_oldgen_before_run: bool,
     /// `pypy/interpreter/executioncontext.py:640` —
     /// `self.space.finalizer_queue` access target.
     ///
@@ -3450,7 +3434,6 @@ impl UserDelAction {
             finalizers_lock_count: 0,
             enabled_at_app_level: true,
             pending_with_disabled_del: None,
-            collect_oldgen_before_run: false,
             finalizer_queue: WRootFinalizerQueue,
         });
         let action_ptr: *mut dyn AsyncActionOps = &mut *action;
@@ -3497,14 +3480,6 @@ impl UserDelAction {
                 }
             }
         }
-    }
-
-    /// Defer the reachability pass until the next opcode boundary.  Calling
-    /// it inside the `cr_frame` getter would still see the getter argument as
-    /// a root and could not observe a discarded temporary coroutine.
-    pub fn collect_oldgen_and_fire(&mut self) {
-        self.collect_oldgen_before_run = true;
-        self.fire();
     }
 
     pub fn gc_disabled(&mut self, w_obj: PyObjectRef) -> bool {
@@ -3687,18 +3662,6 @@ impl AsyncActionOps for UserDelAction {
         _executioncontext: &mut ExecutionContext,
         _frame: *mut PyFrame,
     ) -> Result<AsyncActionControl, crate::PyError> {
-        if self.collect_oldgen_before_run {
-            self.collect_oldgen_before_run = false;
-            // `f().cr_frame` schedules this for the next opcode, after
-            // LOAD_ATTR has popped the temporary coroutine. That coroutine is
-            // nursery-born and registered only as a young finalizer, so the
-            // oldgen-only major never sees it and the "never awaited" warning
-            // waits for a later collection. Generation 2 is the full pass:
-            // the minor promotes the young finalizer, and the major queues it
-            // once nothing else reaches it. This is the same opcode-boundary
-            // collection `run_failed_attr_finalizers` already runs.
-            pyre_object::gc_hook::try_gc_collect(2);
-        }
         self._run_finalizers();
         Ok(AsyncActionControl::Continue)
     }

@@ -640,8 +640,8 @@ pub struct InlineFrame {
     /// Length of the argument array this helper level was entered with, when
     /// the call site knows it.
     pub(crate) helper_entry_array_len: Option<usize>,
-    /// Recorder `_index` (`opencoder.py Trace._index`) when this helper
-    /// level was entered. A Void residual's Ref argument is allocated
+    /// Recorder `_index` (`opencoder.py Trace._index`) before this level's
+    /// allocations (including a Python callee's frame). A Ref is allocated
     /// after this entry when its `new*` OpRef position is at least this
     /// value, so CALL-entry replay cannot write it twice.
     pub(crate) entry_trace_index: u32,
@@ -8817,6 +8817,7 @@ impl<'a> InlineFrameGuard<'a> {
         w_code: usize,
         recursion_greenkey: bool,
         parents: Vec<InlineParentFrame>,
+        entry_trace_index: u32,
     ) -> Self {
         Self::enter_with_resume(
             session,
@@ -8826,7 +8827,7 @@ impl<'a> InlineFrameGuard<'a> {
             HelperResume::Section,
             HelperCallEntry::Unavailable,
             None,
-            0,
+            entry_trace_index,
         )
     }
 

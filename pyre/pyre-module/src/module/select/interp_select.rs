@@ -263,7 +263,8 @@ fn selectable_fd(fd: i32, _index: usize) -> Result<i32, pyre_interpreter::PyErro
 /// `selectable_fd` for WinSock, whose fd_set is a count plus an array of
 /// SOCKETs instead of a bitmap: the handle value itself is unconstrained, but
 /// only `FD_SETSIZE` of them fit and `FD_SET` past that silently drops the
-/// socket. `_rsocket_rffi.FD_SETSIZE` is the SDK default 64.
+/// socket. `_rsocket_rffi.FD_SETSIZE` carries the v3.15.0 select-module
+/// capacity of 512 rather than PyPy's SDK default of 64.
 /// `_build_fd_set` does not apply this count (`MAX_FD_SIZE` is `None`); the
 /// rejection and its message are the ones already raised here.
 #[cfg(all(windows, feature = "host_env"))]

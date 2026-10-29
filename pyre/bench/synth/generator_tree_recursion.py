@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=6.5
+# Caller-owned stores survive an inner helper cut and must be journaled.
+# The resulting TraceTooLong handoff preserves every MIFrame, as
+# blackhole.py convert_and_run_from_pyjitpl does: one multi-frame adoption
+# replaces CALL-entry replay. This adds one guard failure on each backend
+# (4321 native, 4320 wasm). Replacing the innermost image from the carrier
+# dropped five frames and gave wasm a function operand for integer division.
 # Successful bridge closure and a pre-trace Decline are not aborts in
 # `MetaInterp._interpret`. Charging both to pyre's local abort ceiling held this
 # fixture at 29 bridges / 3600 guard failures; the corrected lifecycle reaches

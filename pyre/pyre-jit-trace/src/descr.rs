@@ -3122,7 +3122,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 std::mem::offset_of!(W_ListObject, allocated),
                 std::mem::size_of::<isize>(),
                 Type::Int,
-                false,
+                true,
                 false,
                 false,
             ),
@@ -7393,6 +7393,14 @@ pub fn w_object_object_user_size_descr() -> DescrRef {
 /// consumers must dispatch on `list.strategy` first.
 pub fn list_length_descr() -> DescrRef {
     field_descr_from_group_named(&W_LIST_DESCR_GROUP, "length")
+}
+
+/// The existing 3.15 `__sizeof__` capacity field. `listobject.py`'s list
+/// strategies do not carry it; `Objects/listobject.c PyList_New` at v3.15.0
+/// initializes it to size in both GIL and free-threaded builds. The traced
+/// constructor must initialize it just as `w_list_new_with_strategy` does.
+pub fn list_allocated_descr() -> DescrRef {
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "allocated")
 }
 
 /// rlist.py:116 `l.items: Ptr(GcArray(OBJECTPTR))` — pointer to the
@@ -12760,6 +12768,7 @@ mod tests {
         for (name, expected, ty) in [
             ("strategy", list_strategy_descr(), Type::Int),
             ("length", list_length_descr(), Type::Int),
+            ("allocated", list_allocated_descr(), Type::Int),
             ("items", list_items_descr(), Type::Ref),
         ] {
             let descr = make_descr_from_bh(&BhDescr::Field {
@@ -12786,6 +12795,11 @@ mod tests {
                 expected.as_field_descr().unwrap().offset(),
                 "{name} offset must match the W_LIST_DESCR_GROUP entry",
             );
+            if name == "allocated" {
+                // The -1 sort sentinel must sign-extend on wasm32 too.
+                assert!(field.is_field_signed());
+                assert_eq!(field.field_size(), std::mem::size_of::<isize>());
+            }
         }
     }
 
@@ -16509,6 +16523,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     // group entry (correct offset + parent_descr) like the
                     // `int_items.*` leaves above.
                     "strategy" => return list_strategy_descr(),
+                    "allocated" => return list_allocated_descr(),
                     "length" => return list_length_descr(),
                     "items" => return list_items_descr(),
                     _ => {}

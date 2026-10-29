@@ -5,8 +5,11 @@
 # normalizes a listed directory before the wildcard, and lets spawnv argv errors other than TypeError through.
 # LC_CTYPE is the user locale from startup, and tzname is GetTimeZoneInformation's wide names.
 # chmod on a link does not follow it unless asked to.
+# Windows select must monitor sockets beyond PyPy's 64-entry SDK fd_set.
 import locale
 import os
+import select
+import socket
 import stat
 import sysconfig
 import tempfile
@@ -131,6 +134,27 @@ def spawnv_lets_a_value_error_through():
         raise AssertionError("spawnv accepted an int")
 
 
+def select_monitors_the_last_socket_past_the_sdk_default():
+    sockets = []
+    try:
+        for _ in range(100):
+            sockets.extend(socket.socketpair())
+        sockets[-1].send(b'x')
+        ready, _, _ = select.select(sockets[::2], [], [], 5)
+        assert ready == [sockets[-2]], ready
+        ready, _, _ = select.select([sockets[-2]] * 512, [], [], 0)
+        assert len(ready) == 512, len(ready)
+        try:
+            select.select([sockets[-2]] * 513, [], [], 0)
+        except ValueError as exc:
+            assert str(exc) == 'too many file descriptors in select()', str(exc)
+        else:
+            raise AssertionError('select accepted 513 entries')
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
 hkeys_compare_by_handle_value()
 a_trailing_space_names_the_directory()
 spawnv_lets_a_value_error_through()
@@ -139,4 +163,5 @@ event_source_round_trip()
 startup_sets_the_user_ctype_locale()
 sysconfig_names_the_windows_platform()
 chmod_on_a_link_changes_the_link()
+select_monitors_the_last_socket_past_the_sdk_default()
 print("OK")

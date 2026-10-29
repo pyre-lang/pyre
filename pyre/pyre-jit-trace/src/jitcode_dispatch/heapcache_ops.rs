@@ -1293,27 +1293,27 @@ pub(crate) fn setfield_gc_via_heapcache<Sym: WalkSym>(
         // same field hits the cache and trips its `executor.execute`
         // sanity check (`pyjitpl.py`) on the divergence.
         //
-        // A box this walk allocated (`heapcache.new`'s HF_SEEN_ALLOCATION,
-        // set by `new/d>r` and `new_with_vtable/d>r` right after
-        // `execute_new_allocation` hands back a real, zeroed object) is held
-        // by nothing outside the walk, so the write needs no journal entry
-        // to survive a non-commit rollback — the abandoned allocation goes
-        // with it.  An allocation made before the enclosing subwalk's rewind
-        // point is visible to the residual call a declined subwalk hands its
-        // region to, so its stores are journaled like a pre-existing object's.
-        // A store into a pre-existing object is observable, so
-        // [`walker_execute_gc_store`] journals what it displaces.
-        if ctx.trace_ctx.heap_cache().saw_allocation(obj)
+        // `pyjitpl.py execute_and_record` keeps the executed heap and IR
+        // together. A helper cut discards its own allocations, but retains
+        // allocations made by callers. HF_SEEN_ALLOCATION covers the whole
+        // trace, so only an allocation after THIS frame's entry can omit
+        // the undo journal. An outer frame's entry would still let an inner
+        // rewind retain a partly appended caller-owned list. The residual's
+        // rewind floor must also discard the allocation to omit the journal.
+        let local_allocation = ctx.trace_ctx.heap_cache().saw_allocation(obj)
             && !store_into_pre_floor_allocation(ctx, obj)
-        {
+            && (!ctx.fbw_mode.inline_subwalk
+                || ctx.session.borrow().framestack.last().is_some_and(|frame| {
+                    residual_call::opref_allocated_after(obj, frame.entry_trace_index)
+                }));
+        if local_allocation {
             if let Some(majit_ir::Value::Ref(struct_ref)) = ctx.trace_ctx.box_value(obj)
                 && let Some(value) = ctx.trace_ctx.box_value(valuebox)
             {
                 let struct_ptr = struct_ref.0 as i64;
                 if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
-                    // `box_value` already resolved a ConstPtr to the table
-                    // slot's live pointer. Pin across `field_store`: the
-                    // barrier is an allocation.
+                    // `box_value` resolved the live pointer. The write
+                    // barrier can collect, so root receiver and value.
                     let obj_pin = residual_call::owner_root_if_gc(struct_ptr as usize);
                     let value_pin = match value {
                         majit_ir::Value::Ref(r) => residual_call::owner_root_if_gc(r.0),

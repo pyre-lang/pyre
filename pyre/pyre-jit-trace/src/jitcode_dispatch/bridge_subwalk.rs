@@ -1838,6 +1838,7 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             parent_w_code,
             false,
             guard_parents,
+            ctx.get_trace_position()._index,
         ));
         parent_for_current = recipe_parent_frame_from_recipe(
             ctx,
@@ -1994,7 +1995,13 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         let _frame_state_root = crate::trace::InlineFrameStateGuard::enter(&sub_wc.frame_state);
         let mut callee_parents = vec![parent_for_current];
         callee_parents.extend(pending_tails.drain(..));
-        let _inline_frame = InlineFrameGuard::enter(session, callee_w_code, false, callee_parents);
+        let _inline_frame = InlineFrameGuard::enter(
+            session,
+            callee_w_code,
+            false,
+            callee_parents,
+            sub_wc.trace_ctx.get_trace_position()._index,
+        );
         // No `InlineConcreteFrameGuard` here.  A forward-inline sub-walk owns
         // the callee frame it publishes, so retargeting `last_instr` /
         // `valuestackdepth` onto it is the whole point.  A bridge-resume
@@ -2334,7 +2341,20 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // always true.  `already_latched` is the one that matters — it means
             // this call replaced an inner frame's image with one rooted here.
             let already_latched = audit.then(abort_blackhole_latched);
-            let accepted = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
+            // `blackhole_if_trace_too_long` stops in the innermost MIFrame.
+            // Preserve the image that frame already captured while the error
+            // unwinds, as `walk` does for TraceTooLong. Its pc is not a pc in
+            // this carrier: rebuilding here drops the intervening frames and
+            // resumes this frame with a different opcode's operand stack.
+            // `pyjitpl.py handle_guard_failure` converts the whole live stack
+            // through `run_blackhole_interp_to_cancel_tracing` without replay.
+            let accepted = if matches!(error, DispatchError::TraceTooLong { .. })
+                && abort_blackhole_latched()
+            {
+                false
+            } else {
+                latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361")
+            };
             // The carrier frame keeps locals in its shadow
             // (`InlineConcreteFrameGuard` is not installed on this walk).
             // `virtualizable.py write_boxes` publishes that region before the

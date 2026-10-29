@@ -34469,23 +34469,9 @@ fn coroutine_get_suspended(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 1)
 }
 fn coroutine_get_frame(args: &[PyObjectRef]) -> crate::PyResult {
-    let frame = coroutine_getter(args, 2)?;
-    // CPython 3.14 releases a temporary coroutine immediately after
-    // `f().cr_frame`; schedule pyre's tracing-GC equivalent for the next
-    // opcode, when the getter receiver is no longer rooted by LOAD_ATTR.
-    // A running coroutine stays rooted by its executing frame and an
-    // exhausted one has nothing left to finalize, so neither can be observed
-    // through that pass.
-    let obj = args[1];
-    let observable = unsafe {
-        !pyre_object::generator::w_generator_is_running(obj)
-            && !pyre_object::generator::w_generator_is_exhausted(obj)
-    };
-    let ec = crate::call::getexecutioncontext() as *mut crate::executioncontext::ExecutionContext;
-    if observable && !ec.is_null() {
-        unsafe { (*ec).finalize_discarded_coroutine_after_frame_get() };
-    }
-    Ok(frame)
+    // generator.py Coroutine.descr_gicr_frame returns the live frame;
+    // finalizers run through the collector, not as a frame-read side effect.
+    coroutine_getter(args, 2)
 }
 fn coroutine_get_code(args: &[PyObjectRef]) -> crate::PyResult {
     coroutine_getter(args, 3)

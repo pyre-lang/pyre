@@ -661,9 +661,13 @@ mod winsock {
         fd == INVALID_SOCKET
     }
 
-    /// WinSock `FD_SETSIZE`. `constants_w_defaults` uses 64 when the header
-    /// does not override it, and the SDK default is 64.
-    pub const FD_SETSIZE: usize = 64;
+    /// WinSock `fd_set` capacity. `_rsocket_rffi.py CConfig` measures the
+    /// SDK default of 64, which silently drops later sockets in PyPy.
+    /// Windows `Modules/selectmodule.c` at v3.15.0 defines FD_SETSIZE as 512
+    /// before including WinSock (also in the free-threaded build). Preserve
+    /// the count/array representation, with the capacity its public select
+    /// contract requires.
+    pub const FD_SETSIZE: usize = 512;
     /// `MAX_FD_SIZE` is `None` on Windows: the set is a count, not a bitmap.
     pub const MAX_FD_SIZE: Option<i32> = None;
 

@@ -3256,8 +3256,8 @@ fn socket_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
 }
 
 #[cfg(any(unix, windows))]
-fn socket_set_attr(obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_object::PyObjectRef) {
-    let d = pyre_object::with_roots!(v => pyre_interpreter::baseobjspace::getdict_native(obj));
+fn socket_set_attr(mut obj: pyre_object::PyObjectRef, key: &str, mut v: pyre_object::PyObjectRef) {
+    let d = pyre_object::with_roots!(obj, v => pyre_interpreter::baseobjspace::getdict_native(obj));
     if d.is_null() {
         return;
     }
@@ -3563,14 +3563,23 @@ fn socket_from_fd_with_class(
 
 #[cfg(any(unix, windows))]
 fn socket_init_state(
-    mut obj: pyre_object::PyObjectRef,
+    obj: pyre_object::PyObjectRef,
     fd: rffi::Socket,
     family: libc::c_int,
     ty: libc::c_int,
     proto: libc::c_int,
 ) -> Result<(), pyre_interpreter::PyError> {
-    pyre_object::with_roots!(obj => socket_set_attr(obj, "_fd", pyre_object::w_int_new(rffi::socket_to_i64(fd))));
-    pyre_object::with_roots!(obj => socket_set_attr(obj, "_family", pyre_object::w_int_new(family as i64)));
+    // `interp_socket.py W_Socket.descr_init` keeps self live across RSocket
+    // construction. `framework.py gct_fv_gc_malloc` / shadowstack.py pop_roots
+    // reload live references after collection. Reload the receiver after
+    // boxing each value and after socket_apply_timeout releases the GIL;
+    // merely pinning an already evaluated function argument cannot move it.
+    let roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = roots.pin_roots(&[obj]);
+    let value = pyre_object::w_int_new(rffi::socket_to_i64(fd));
+    socket_set_attr(roots.get(obj_slot), "_fd", value);
+    let value = pyre_object::w_int_new(family as i64);
+    socket_set_attr(roots.get(obj_slot), "_family", value);
     // `rsocket.py:RSocket.__init__` clears both creation flags out of the type
     // it keeps, so that `sock.type == SOCK_STREAM` answers the same on a host
     // that accepts them inside `socket()`'s type argument as on one that does
@@ -3583,8 +3592,10 @@ fn socket_init_state(
     if stored_type & rffi::SOCK_NONBLOCK != 0 {
         stored_type -= rffi::SOCK_NONBLOCK;
     }
-    pyre_object::with_roots!(obj => socket_set_attr(obj, "_type", pyre_object::w_int_new(stored_type as i64)));
-    pyre_object::with_roots!(obj => socket_set_attr(obj, "_proto", pyre_object::w_int_new(proto as i64)));
+    let value = pyre_object::w_int_new(stored_type as i64);
+    socket_set_attr(roots.get(obj_slot), "_type", value);
+    let value = pyre_object::w_int_new(proto as i64);
+    socket_set_attr(roots.get(obj_slot), "_proto", value);
     // `rsocket.py:RSocket.__init__` calls `settimeout(defaults.timeout)` for
     // every new or wrapped descriptor, and `make_socket` copies that same
     // process-wide value.  Applying it here (not merely reporting it from
@@ -3594,7 +3605,8 @@ fn socket_init_state(
     // the descriptor was opened in, so the timeout it stands for is recorded
     // without a `settimeout` of its own.
     if ty & rffi::SOCK_NONBLOCK != 0 {
-        pyre_object::with_roots!(obj => socket_set_attr(obj, "_timeout", pyre_object::floatobject::w_float_new(0.0)));
+        let value = pyre_object::floatobject::w_float_new(0.0);
+        socket_set_attr(roots.get(obj_slot), "_timeout", value);
     } else {
         let timeout = default_socket_timeout();
         let stored_timeout = if timeout < 0.0 {
@@ -3602,18 +3614,22 @@ fn socket_init_state(
         } else {
             pyre_object::floatobject::w_float_new(timeout)
         };
-        pyre_object::with_roots!(obj => socket_set_attr(obj, "_timeout", stored_timeout));
+        socket_set_attr(roots.get(obj_slot), "_timeout", stored_timeout);
         socket_apply_timeout(fd, timeout)?;
     }
     // `sock_new` starts this at 0 on every socket object, and only
     // `setsockopt` moves it: `SIO_TCP_SET_ACK_FREQUENCY` has no counterpart to
     // read the live setting back with, so what was written is the answer.
     #[cfg(windows)]
-    socket_set_attr(obj, "_quickack", pyre_object::w_int_new(0));
+    {
+        let value = pyre_object::w_int_new(0);
+        socket_set_attr(roots.get(obj_slot), "_quickack", value);
+    }
     // `interp_socket.py usecount = 1` — start the refcount at 1 so
     // `_drop` followed by no `_reuse` closes the underlying fd exactly
     // once.
-    socket_set_attr(obj, "_usecount", pyre_object::w_int_new(1));
+    let value = pyre_object::w_int_new(1);
+    socket_set_attr(roots.get(obj_slot), "_usecount", value);
     Ok(())
 }
 
@@ -4930,11 +4946,8 @@ pub fn __majit_wrap_socket_setsockopt(
             if unsafe { rffi::set_ack_frequency(fd, optval) } != 0 {
                 return Err(socket_last_error());
             }
-            socket_set_attr(
-                roots.get(base),
-                "_quickack",
-                pyre_object::w_int_new(optval as i64),
-            );
+            let value = pyre_object::w_int_new(optval as i64);
+            socket_set_attr(roots.get(base), "_quickack", value);
             return Ok(pyre_object::w_none());
         }
         // `RSocket.setsockopt_int`.
@@ -5155,15 +5168,18 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                                 obj,
                             ));
                         }
-                        #[cfg(unix)]
-                        {
-                            let _ = majit_rlib::rsocket::close(fd);
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = { rffi::close(fd) };
-                        }
-                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                        pyre_object::with_roots!(obj => {
+                            #[cfg(unix)]
+                            {
+                                let _ = majit_rlib::rsocket::close(fd);
+                            }
+                            #[cfg(windows)]
+                            {
+                                let _ = { rffi::close(fd) };
+                            }
+                        });
+                        let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
+                        socket_set_attr(obj, "_fd", value);
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -5450,7 +5466,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     // `rsocket.py:RSocket.close` drops ownership before the
                     // syscall and still reports its failure.  This prevents a
                     // later double close while preserving EBADF/ENOTSOCK.
-                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                    let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
+                    socket_set_attr(obj, "_fd", value);
                     #[cfg(unix)]
                     majit_rlib::rsocket::close(fd).map_err(rsocket_os_error)?;
                     #[cfg(windows)]
@@ -5473,7 +5490,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
             |args| {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let fd = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd"));
-                socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
+                socket_set_attr(obj, "_fd", value);
                 Ok(pyre_object::w_int_new(fd))
             },
             1,
@@ -5494,7 +5512,8 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
                 let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
                 let n = if n < 0 { 1 } else { n };
-                socket_set_attr(obj, "_usecount", pyre_object::w_int_new(n + 1));
+                let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(n + 1));
+                socket_set_attr(obj, "_usecount", value);
                 Ok(pyre_object::w_none())
             },
             1,
@@ -5510,21 +5529,25 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 let n = pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_usecount"));
                 let n = if n < 0 { 1 } else { n };
                 let next = n - 1;
-                pyre_object::with_roots!(obj => socket_set_attr(obj, "_usecount", pyre_object::w_int_new(next)));
+                let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(next));
+                socket_set_attr(obj, "_usecount", value);
                 if next <= 0 {
                     let fd = rffi::socket_from_i64(
                         pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
                     );
                     if !rffi::is_invalid(fd) {
-                        #[cfg(unix)]
-                        {
-                            let _ = majit_rlib::rsocket::close(fd);
-                        }
-                        #[cfg(windows)]
-                        {
-                            let _ = unsafe { rffi::close(fd) };
-                        }
-                        socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                        pyre_object::with_roots!(obj => {
+                            #[cfg(unix)]
+                            {
+                                let _ = majit_rlib::rsocket::close(fd);
+                            }
+                            #[cfg(windows)]
+                            {
+                                let _ = unsafe { rffi::close(fd) };
+                            }
+                        });
+                        let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
+                        socket_set_attr(obj, "_fd", value);
                     }
                 }
                 Ok(pyre_object::w_none())
@@ -7176,7 +7199,7 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     let timeout =
                         pyre_object::with_roots!(obj, w_t => socket_timeout_w(w_t))?;
                     let fd = pyre_object::with_roots!(obj, w_t => socket_fd(obj))?;
-                    socket_apply_timeout(fd, timeout)?;
+                    pyre_object::with_roots!(obj, w_t => socket_apply_timeout(fd, timeout))?;
                     // `gettimeout()` reports a float, and the timeout readers below
                     // recognise only that type; storing the caller's `int` verbatim
                     // would make `settimeout(1)` silently untimed.
@@ -7232,15 +7255,18 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     pyre_object::with_roots!(obj => socket_get_attr_i64(obj, "_fd")),
                 );
                 if !rffi::is_invalid(fd) {
-                    #[cfg(unix)]
-                    {
-                        let _ = majit_rlib::rsocket::close(fd);
-                    }
-                    #[cfg(windows)]
-                    {
-                        let _ = unsafe { rffi::close(fd) };
-                    }
-                    socket_set_attr(obj, "_fd", pyre_object::w_int_new(-1));
+                    pyre_object::with_roots!(obj => {
+                        #[cfg(unix)]
+                        {
+                            let _ = majit_rlib::rsocket::close(fd);
+                        }
+                        #[cfg(windows)]
+                        {
+                            let _ = unsafe { rffi::close(fd) };
+                        }
+                    });
+                    let value = pyre_object::with_roots!(obj => pyre_object::w_int_new(-1));
+                    socket_set_attr(obj, "_fd", value);
                 }
             }
             Ok(pyre_object::w_bool_from(false))

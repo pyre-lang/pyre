@@ -1211,9 +1211,9 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 /// Float and Bytes strategies use their typed storage with `items` null.
 pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::descr::{
-        list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
-        list_int_items_len_descr, list_items_descr, list_length_descr, list_strategy_descr,
-        w_list_size_descr,
+        list_allocated_descr, list_ascii_items_len_descr, list_bytes_items_len_descr,
+        list_float_items_len_descr, list_int_items_len_descr, list_items_descr, list_length_descr,
+        list_strategy_descr, w_list_size_descr,
     };
     use crate::state::pyobject_gcarray_descr;
 
@@ -1226,7 +1226,7 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     let array_descr = pyobject_gcarray_descr();
     let items_block =
         ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr.clone());
-    ctx.heap_cache_mut().new_object(items_block);
+    ctx.heap_cache_mut().new_array(items_block, cap_ref, true);
 
     // Step 2 — items_block[i] = items[i].
     for (i, &item) in items.iter().enumerate() {
@@ -1236,6 +1236,7 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
             &[items_block, idx, item],
             array_descr.clone(),
         );
+        ctx.heapcache_setarrayitem(items_block, idx, array_descr.index(), item);
     }
 
     // Step 3 — allocate the W_ListObject wrapper.
@@ -1244,10 +1245,11 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 
     // Step 4 — length / items / strategy SetfieldGc, mirroring the
     // Object-strategy arm of `w_list_new`.
-    let length_descr = list_length_descr();
-    let length_idx = length_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], length_descr);
-    ctx.heapcache_setfield_cached(list, length_idx, len_ref);
+    for descr in [list_allocated_descr(), list_length_descr()] {
+        let index = descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], descr);
+        ctx.heapcache_setfield_cached(list, index, len_ref);
+    }
 
     let zero = ctx.const_int(0);
     for inactive_len_descr in [
@@ -1310,8 +1312,9 @@ pub fn emit_rlist_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
 /// OptVirtualize folds the whole wrapper when the list never escapes.
 pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     use crate::descr::{
-        list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
-        list_int_items_len_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
+        list_allocated_descr, list_ascii_items_len_descr, list_bytes_items_len_descr,
+        list_float_items_len_descr, list_int_items_len_descr, list_length_descr,
+        list_strategy_descr, w_list_size_descr,
     };
 
     let list = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], w_list_size_descr());
@@ -1324,6 +1327,7 @@ pub fn emit_empty_list_inline(ctx: &mut TraceCtx) -> OpRef {
     ctx.heapcache_setfield_cached(list, length_idx, zero);
 
     for inactive_len_descr in [
+        list_allocated_descr(),
         list_int_items_len_descr(),
         list_float_items_len_descr(),
         list_bytes_items_len_descr(),
@@ -1444,8 +1448,9 @@ pub fn emit_typed_list_inline(
     strategy: pyre_object::listobject::ListStrategy,
 ) -> OpRef {
     use crate::descr::{
-        list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
-        list_int_items_len_descr, list_length_descr, list_strategy_descr, w_list_size_descr,
+        list_allocated_descr, list_ascii_items_len_descr, list_bytes_items_len_descr,
+        list_float_items_len_descr, list_int_items_len_descr, list_length_descr,
+        list_strategy_descr, w_list_size_descr,
     };
 
     let len = raws.len();
@@ -1478,6 +1483,10 @@ pub fn emit_typed_list_inline(
     // Step 4 — initialize every scalar field, then install the active typed
     // storage. The pointer fields are cleared by the GC rewriter.
     let zero = ctx.const_int(0);
+    let allocated = list_allocated_descr();
+    let allocated_index = allocated.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], allocated);
+    ctx.heapcache_setfield_cached(list, allocated_index, len_ref);
     for scalar_descr in [
         list_length_descr(),
         list_int_items_len_descr(),

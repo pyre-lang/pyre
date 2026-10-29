@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=3.5
-# Local cranelift 2.0x; the ceiling is 3.5.
+# pyre-check: max-pypy-ratio=2.2
+# The recorded cranelift 2.0x maximum plus 10% headroom gives 2.2x.
+# Windows median reruns measure dynasm 0.6x-0.7x and cranelift 1.1x;
+# the old 3.5x ceiling's derived 0.875x floor rejected the faster dynasm run.
 # pyre-check: skip-cpython
 # cpython 2.30s vs pyre 0.42s (5.5x on the ubuntu runner), and it is not
 # gated on — only pypy is.

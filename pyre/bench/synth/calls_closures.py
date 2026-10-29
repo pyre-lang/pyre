@@ -5,6 +5,9 @@
 # stay isolated so a miscompile is not diluted). check.py runs every *.py here.
 
 # ── recursion ──
+# The trace-limit exit converts the complete recursive MIFrame chain through
+# blackhole.py convert_and_run_from_pyjitpl instead of CALL-entry replay.
+# One multi-frame adoption preserves the existing loop, bridge and guard counts.
 def recursion__fib(n):
     if n < 2:
         return n

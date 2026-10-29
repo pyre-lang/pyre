@@ -5546,6 +5546,7 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
     let list_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(result_concrete);
 
+    let object_storage = matches!(emit, Emit::Object);
     // emit the virtualizable decomposed newlist (walker-native)
     let list_op = match emit {
         Emit::Int(vals) => {
@@ -5623,6 +5624,26 @@ pub(crate) fn try_walker_specialize_newlist<Sym: WalkSym>(
             pyre_object::gc_roots::shadow_stack_get(list_slot) as usize,
         )),
     );
+    if object_storage {
+        // `pyjitpl.py MIFrame.opimpl_newlist` executes both allocations:
+        // the list and its items array each retain their concrete value.
+        // The cached `items` edge must name that same array here. Otherwise
+        // a descended append can update length without being able to write
+        // its element through the cached array box.
+        let descr = crate::descr::list_items_descr();
+        if let Some(items_block) = ctx
+            .trace_ctx
+            .heapcache_getfield_cached(list_op, descr.index())
+        {
+            let list = pyre_object::gc_roots::shadow_stack_get(list_slot);
+            if let Some(value) =
+                ctx.trace_ctx
+                    .field_sanity_load(list as usize as i64, &descr, majit_ir::Type::Ref)
+            {
+                ctx.trace_ctx.set_opref_concrete(items_block, value);
+            }
+        }
+    }
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, list_op)?;
     Ok(Some(()))
 }

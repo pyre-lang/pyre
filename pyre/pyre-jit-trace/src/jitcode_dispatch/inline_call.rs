@@ -10682,6 +10682,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // (`sys._getframe`, a traceback) must see the callee it is running in.
     #[allow(unused_assignments)]
     let mut concrete_callee_frame = std::ptr::null_mut::<pyre_interpreter::PyFrame>();
+    // `MetaInterp.newframe` owns the callee's frame and scratch allocations.
+    // A declined inline discards them along with the callee body, so measure
+    // its lifetime before emitting the frame rather than at body entry.
+    let callee_entry_trace_index = ctx.trace_ctx.get_trace_position()._index;
     // Each precondition below answers "can the multiframe seed serve this
     // callee".  A "no" declines the INLINE — `Ok(None)`, this function's own
     // did-not-inline answer, which every caller follows to the ordinary
@@ -11297,6 +11301,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             pyre_object::gc_roots::shadow_stack_get(inline_code_slot) as usize,
             true,
             parents,
+            callee_entry_trace_index,
         );
         // A level without a live `W_Code` shares its caller's id and is no
         // `MIFrame` of its own, so it has nothing to pop.

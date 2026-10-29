@@ -50,10 +50,10 @@ fn session_roots_cover_nested_attempts_and_vec_frame_retirement() {
     let c = BASE + 0x3000;
     let t = BASE + 0x4000;
     let frames = vec![
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(a)]),
-        InlineFrameGuard::enter(&outer, 0, false, vec![parent(b)]),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(a)], 0),
+        InlineFrameGuard::enter(&outer, 0, false, vec![parent(b)], 0),
     ];
-    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(c)]);
+    let inner_frame = InlineFrameGuard::enter(&inner, 0, false, vec![parent(c)], 0);
     let forward = || {
         let mut seen = Vec::new();
         let mut visit = |root: &mut majit_ir::GcRef| {
@@ -157,7 +157,7 @@ fn operator_tail_caller_is_read_from_the_rooted_session_after_return() {
     let pre_call = parent(word);
     let stale = pre_call.clone();
     let interned = stale.boxes[0];
-    let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call]);
+    let frame = InlineFrameGuard::enter(&session, 0, false, vec![pre_call], 0);
     let _wave = majit_ir::const_ptr_table::Wave::enter();
     majit_gc::shadow_stack::walk_my_extra_areas(|root| {
         if (word..word + 0x1000).contains(&root.0) {
@@ -1933,6 +1933,7 @@ fn portal_may_force_records_the_callee_execution_context() {
             caller_py_pc: None,
             result_slot: CallResultSlot::Dead,
         }],
+        0,
     );
     let regs_r = Vec::new();
     let regs_i = Vec::new();
@@ -15188,7 +15189,7 @@ fn release_gil_forcing_stores_precede_call() {
         result_slot: CallResultSlot::Unknown,
     };
     let session = std::cell::RefCell::new(WalkSession::default());
-    let _inline = InlineFrameGuard::enter(&session, 1, false, vec![parent]);
+    let _inline = InlineFrameGuard::enter(&session, 1, false, vec![parent], 0);
     let mut effect = majit_ir::EffectInfo::default();
     effect.extraeffect = majit_ir::ExtraEffect::CanRaise;
     effect.call_release_gil_target = (forces_folded_vref_for_release_gil as *const () as u64, 0);
@@ -22286,6 +22287,8 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
 
 #[test]
 fn traceback_journal_rollback_unwinds_every_walk_node() {
+    // The exception type flags must also be initialized in a filtered run.
+    pyre_interpreter::typedef::init_typeobjects();
     // A recording walk attaches one node per frame it delivers the exception
     // through, so by the time the walk ends the exception carries SEVERAL
     // journaled nodes — the bridge handler entry that introduced the log only
