@@ -211,6 +211,33 @@ pub(crate) fn async_force_result_slot(
     }
 }
 
+/// One operand-stack slot for the capture-only vable overlay.
+///
+/// `pyjitpl.py get_list_of_active_boxes` reads `MIFrame.registers_r`; the
+/// walk-level mirror is pyre's analogue. A ConstPtr(NULL) in that mirror is
+/// either CALL's live `self_or_null` (the last store into the slot wrote
+/// NULL, and `virtualizable_slot_stored_live_null` is set) or the dense-array
+/// encoding of an unwritten word. `collect_outer_active_boxes` and
+/// `reseed_vstack_from_shadow` already treat the latter as a hole. Overlaying
+/// it onto a slot `_opimpl_setarrayitem_vable` has already filled (handler-entry
+/// `last_exc_value`) replaces the exception with PY_NULL; `blackhole.py`
+/// `bhimpl_raise` then sees a null ref register.
+pub(crate) fn vstack_overlay_box(
+    value: OpRef,
+    existing: Option<OpRef>,
+    live_null: bool,
+) -> Option<OpRef> {
+    let v = vstack_box_for_snapshot(value)?;
+    if opref_is_null_const_ptr(v) {
+        let existing_real =
+            existing.is_some_and(|b| b != OpRef::NONE && !opref_is_null_const_ptr(b));
+        if existing_real && !live_null {
+            return None;
+        }
+    }
+    Some(v)
+}
+
 /// Per-guard capture buffers taken out of [`WalkSession`] so encode may
 /// collect without a session borrow. Drop returns them empty with capacity
 /// kept (`opencoder.py create_top_snapshot` allocates only the snapshot arrays).
@@ -930,9 +957,8 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     // mirror, slot beyond the mirror, or an Int-bank temp the
                     // Ref-only mirror leaves NONE) is simply omitted; resume
                     // re-materializes it rather than reading the flat color. A
-                    // ConstPtr(NULL) is not a hole: it is CALL's live
-                    // `self_or_null` operand and must overwrite a stale shadow
-                    // slot in the capture-only overlay.
+                    // ConstPtr(NULL) overwrites only a hole or a live-NULL slot
+                    // (`vstack_overlay_box`); CALL's `self_or_null` is the latter.
                     let vstack = ctx.frame_state.borrow();
                     for s in 0..depth {
                         if nlocals + s >= publish_limit {
@@ -942,9 +968,6 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                             continue;
                         }
                         let v = vstack.vstack_boxes.get(s).copied().unwrap_or(OpRef::NONE);
-                        let Some(v) = vstack_box_for_snapshot(v) else {
-                            continue;
-                        };
                         let idx = nvs + nlocals + s;
                         // The operand stack is `virtualizable_boxes`
                         // (`pyjitpl.py get_list_of_active_boxes` reads only
@@ -953,16 +976,13 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         // color a later op reused (`vstack_last_ref`), so it
                         // does not replace a real vable box unless that slot
                         // holds a stored NULL (`PUSH_NULL`).
-                        if opref_is_null_const_ptr(v) {
-                            if let Some(old) = ctx.trace_ctx.virtualizable_box_at(idx) {
-                                if old != OpRef::NONE
-                                    && !opref_is_null_const_ptr(old)
-                                    && !ctx.trace_ctx.virtualizable_slot_stored_live_null(idx)
-                                {
-                                    continue;
-                                }
-                            }
-                        }
+                        let Some(v) = vstack_overlay_box(
+                            v,
+                            ctx.trace_ctx.virtualizable_box_at(idx),
+                            ctx.trace_ctx.virtualizable_slot_stored_live_null(idx),
+                        ) else {
+                            continue;
+                        };
                         scratch.stack_sync.push((idx, v));
                     }
                 }
@@ -1163,6 +1183,14 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                         continue;
                     }
                     let vable_index = nvs + slot as usize;
+                    let Some(value) = vstack_overlay_box(
+                        value,
+                        ctx.trace_ctx.virtualizable_box_at(vable_index),
+                        ctx.trace_ctx
+                            .virtualizable_slot_stored_live_null(vable_index),
+                    ) else {
+                        continue;
+                    };
                     if let Some((_, current)) = scratch
                         .stack_sync
                         .iter_mut()

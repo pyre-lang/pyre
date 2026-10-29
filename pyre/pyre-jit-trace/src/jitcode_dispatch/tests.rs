@@ -23935,6 +23935,48 @@ fn nested_binop_rewind_refuse_does_not_claim_the_abort_coordinate() {
     reset_single_frame_blackhole();
 }
 
+/// Capture-only overlay must not replace last_exc with a hole ConstPtr(NULL).
+///
+/// `collect_outer_active_boxes` / `reseed_vstack_from_shadow` already treat
+/// that encoding as unwritten; overlaying it onto `_opimpl_setarrayitem_vable`
+/// last_exc is what made `bhimpl_raise` see a null ref register.
+#[test]
+fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
+    let last_exc = OpRef::const_ptr(majit_ir::GcRef(0x1000));
+    let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let live = OpRef::const_ptr(majit_ir::GcRef(0x2000));
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), false),
+        None,
+        "Const NULL must not overwrite a live last_exc box"
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), true),
+        Some(hole),
+        "CALL self_or_null still overwrites when the slot stored live NULL"
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(hole), false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, None, false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(OpRef::NONE), false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(live, Some(last_exc), false),
+        Some(live)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(OpRef::NONE, Some(last_exc), false),
+        None
+    );
+}
+
 #[test]
 fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     // codewriter shape contract says `R-list.len() <=
@@ -31389,6 +31431,11 @@ fn paused_portal_mirror_uses_abort_point_not_entry_vstack() {
 /// `_opimpl_setfield_vable` writes `virtualizable_boxes`.
 #[test]
 fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
+    assert_perfn_vablefield_updates_valuestackdepth_boxes(false);
+    assert_perfn_vablefield_updates_valuestackdepth_boxes(true);
+}
+
+fn assert_perfn_vablefield_updates_valuestackdepth_boxes(own_frame: bool) {
     use majit_jitcode::jitcode::BhDescr;
     use majit_metainterp::jitcode::RuntimeBhDescr;
 
@@ -31398,7 +31445,7 @@ fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
         .expect("valuestackdepth is a static vable field");
     let nstatic = info.num_static_extra_boxes;
     let mut tc = TraceCtx::for_test_types(&[Type::Ref]);
-    let standard = tc.const_ref(1);
+    let standard = OpRef::input_arg_ref(0);
     let mut boxes = vec![tc.const_null(); nstatic];
     let mut values = vec![Value::Ref(majit_ir::GcRef::NULL); nstatic];
     boxes[vsd_idx] = tc.const_int(3);
@@ -31411,7 +31458,7 @@ fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
         &values,
         &[0],
     );
-    let vable = OpRef::input_arg_ref(0);
+    let vable = standard;
     tc.set_opref_concrete(vable, Value::Ref(majit_ir::GcRef(1)));
 
     let byte = *insns_opname_to_byte()
@@ -31426,7 +31473,11 @@ fn setfield_vable_int_imm_perfn_vablefield_updates_valuestackdepth_boxes() {
     let session = std::cell::RefCell::new(WalkSession::default());
     let mut wc = WalkContext {
         frame_state: WalkFrameState::new(WalkFrameStateData {
-            callee_shadow: None,
+            callee_shadow: own_frame.then(|| CalleeLocalsShadow {
+                fold_frame_reg: 0,
+                frame_box: vable,
+                ..Default::default()
+            }),
             concrete_registers_r: ([]).to_vec(),
             outer_active_boxes: Vec::new(),
             vstack_boxes: Vec::new(),
