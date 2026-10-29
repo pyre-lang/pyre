@@ -56,13 +56,6 @@ struct MemoryManagerInner {
     /// `-1` is "uninitialized"; `set_max_age` derives a real value
     /// (`int(sqrt(max_age))` by default per `memmgr.py`).
     check_frequency: i64,
-    /// How many times this manager has let go of loops: each
-    /// `_kill_old_loops_now` that evicted something, and each
-    /// `release_all_loops`. A strong handle dropped here can be a cell's last,
-    /// after which its weak reference no longer upgrades and the cell stops
-    /// answering runnable — so this is one input of
-    /// `MetaInterp::runnable_generation`.
-    evictions: u64,
 
     /// `memmgr.py` `self.alive_loops = {}` — a dict keyed on the
     /// looptoken object itself.  In Rust the dict key uses the Arc's
@@ -120,7 +113,6 @@ impl MemoryManagerInner {
             check_frequency: -1,
             max_age: 0,
             alive_loops: indexmap::IndexMap::new(),
-            evictions: 0,
             // rlib/jit.py PARAMETERS defaults.
             retrace_limit: 0,
             max_retrace_guards: 15,
@@ -290,9 +282,6 @@ impl MemoryManagerInner {
         // `_keepalive_jitcell_tokens` stays alive. Break only garbage
         // `record_jump_to` cycles so `JitCellToken::drop` can run.
         self.trial_delete_keepalive_tokens(&evicted_tokens);
-        if !evicted_tokens.is_empty() {
-            self.evictions = self.evictions.wrapping_add(1);
-        }
         if log {
             let newtotal = self.alive_loops.len();
             crate::debug::debug_print(&format!("Loop tokens freed: {}", oldtotal - newtotal));
@@ -320,7 +309,6 @@ impl MemoryManagerInner {
             .map(|(_, token)| token)
             .collect();
         self.trial_delete_keepalive_tokens(&evicted_tokens);
-        self.evictions = self.evictions.wrapping_add(1);
     }
 
     /// Clear `keepalive_tokens` only on tokens that are garbage after
@@ -419,11 +407,6 @@ impl MemoryManagerInner {
         }
     }
 
-    /// The counter [`Self::evictions`] documents.
-    pub fn eviction_generation(&self) -> u64 {
-        self.evictions
-    }
-
     /// Number of loops currently tracked.  Test/debug accessor; no
     /// upstream counterpart since RPython's `alive_loops` is a Python
     /// dict whose `len()` is read directly.
@@ -488,11 +471,6 @@ impl MemoryManager {
     /// `memmgr.py` `release_all_loops`.
     pub fn release_all_loops(&mut self) {
         self.inner.borrow_mut().release_all_loops()
-    }
-
-    /// The counter `MemoryManagerInner::evictions` documents.
-    pub fn eviction_generation(&self) -> u64 {
-        self.inner.borrow().eviction_generation()
     }
 
     /// `len(self.alive_loops)`.

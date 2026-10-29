@@ -722,17 +722,6 @@ pub struct WarmEnterState {
     /// handle is `Clone`; `MetaInterp::make_enter_function` hands each
     /// extra slot the runner's.
     pub memory_manager: crate::memmgr::MemoryManager,
-    /// Bumped by every mutation that can change what
-    /// [`Self::maybe_compile_decision`] answers for a key it already refused
-    /// at the abort ceiling: installing a cell, which resets `abort_count` to
-    /// zero, and attaching a procedure token, which can make the key runnable
-    /// through a sibling cell in the same chain.
-    ///
-    /// It exists so a caller can cache that refusal rather than re-derive it
-    /// per back edge. The refusal is pure — it bumps a diagnostic slot and
-    /// returns `NotHot` above `decay_all_counters`, deliberately — so a cache
-    /// keyed on this counter changes nothing but the work spent reaching it.
-    cell_generation: u64,
     /// `warmstate.py` `WarmEnterState.__init__` `self.jitdriver_sd` — the
     /// driver this state belongs to, as its `jd_no`. Cells it files carry it
     /// ([`BaseJitCell::jitdriver_sd`]) and its chain walks match on it.
@@ -1192,7 +1181,6 @@ impl WarmEnterState {
             disable_unrolling_threshold: DEFAULT_DISABLE_UNROLLING,
             pureop_historylength: 16,
             memory_manager,
-            cell_generation: 0,
             jitdriver_sd,
             confirm_enter_jit_ptr: Rc::new(Cell::new(None)),
             should_unroll_one_iteration_ptr: None,
@@ -1262,15 +1250,6 @@ impl WarmEnterState {
     pub fn tick_function_entry_empty_chain(&mut self, hash: u64) -> bool {
         crate::mc_diag_bump(25);
         self.counter.tick(hash, self.increment_function_threshold)
-    }
-
-    /// The counter [`Self::cell_generation`] documents.
-    pub fn cell_generation(&self) -> u64 {
-        self.cell_generation
-    }
-
-    fn bump_cell_generation(&mut self) {
-        self.cell_generation = self.cell_generation.wrapping_add(1);
     }
 
     /// Hash-form door of `warmstate.py maybe_compile_and_run`.
@@ -1661,7 +1640,6 @@ impl WarmEnterState {
         );
         cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
         let previous = cell.set_procedure_token(token, false);
-        self.bump_cell_generation();
         previous
     }
 
@@ -1681,7 +1659,6 @@ impl WarmEnterState {
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags.set(cell.flags.get() & (!JcFlags::JC_TRACING));
         let previous = cell.set_procedure_token(token, false);
-        self.bump_cell_generation();
         previous
     }
 
@@ -3221,11 +3198,8 @@ impl WarmEnterState {
     }
 
     /// `jitcounter.install_new_cell(hash, newcell)` (counter.py), reached
-    /// from this driver's `get_jitcell` / `_ensure_jit_cell_at_key`. The
-    /// counter owns the table; this state only notes that what
-    /// [`Self::maybe_compile_decision`] answers may have changed.
+    /// from this driver's `get_jitcell` / `_ensure_jit_cell_at_key`.
     pub fn install_new_cell(&mut self, hash: u64, newcell: Option<BaseJitCell>) {
-        self.bump_cell_generation();
         self.counter.install_new_cell(hash, newcell.map(Rc::new));
     }
 
@@ -3238,7 +3212,6 @@ impl WarmEnterState {
 
     /// `jitcounter.cleanup_chain(hash)` (counter.py).
     pub fn cleanup_chain(&mut self, hash: u64) {
-        self.bump_cell_generation();
         self.counter.cleanup_chain(hash);
     }
 
@@ -8206,32 +8179,14 @@ mod tests {
             "a ceiling-latched never-seen-token cell is banned",
         );
 
-        let generation = ws.cell_generation();
         assert!(matches!(
             ws.maybe_compile_decision(cell_key, &gk(42).types),
             HotResult::NotHot
         ));
-        assert_eq!(ws.cell_generation(), generation);
         assert_eq!(
             ws.get_cell(cell_key).unwrap().abort_count.get(),
             MAX_TRACE_ABORT_COUNT,
             "the refusal did not consume the latch",
-        );
-    }
-
-    #[test]
-    fn attaching_a_procedure_token_moves_the_generation_a_cache_keys_on() {
-        let mut ws = WarmEnterState::new(2);
-        let cell_key = 7u64;
-        ws.ensure_cell_for_key(&gk(cell_key as i64));
-        let cell_key = ws.cell_key_for(&gk(cell_key as i64)).expect("cell");
-        let generation = ws.cell_generation();
-        ws.attach_procedure_to_interp(cell_key, JitCellToken::new(JitCellToken::NUMBER_UNASSIGNED));
-        assert_ne!(
-            ws.cell_generation(),
-            generation,
-            "a token can make a latched key runnable through its chain, so a \
-             cache must be told",
         );
     }
 

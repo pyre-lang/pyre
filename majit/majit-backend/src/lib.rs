@@ -2137,23 +2137,6 @@ pub struct LoopInvalidation {
     sites: Arc<parking_lot::Mutex<InvalidateSites>>,
 }
 
-/// How many loop invalidations this process has performed, over every
-/// backend and every driver.
-///
-/// One input of `MetaInterp::runnable_generation`: an invalidated token is
-/// one `get_procedure_token` stops returning, so a reader caching a
-/// runnable-or-not answer across calls has to learn of it. Invalidation
-/// funnels through [`LoopInvalidation::invalidate`], which is where the count
-/// moves, and it moves from whichever thread performs the invalidation, so it
-/// lives here as a process-wide atomic rather than on a driver.
-static TOKEN_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
-
-/// The current value of the process-wide invalidation count.
-#[inline]
-pub fn token_invalidation_generation() -> u64 {
-    TOKEN_INVALIDATIONS.load(Ordering::Acquire)
-}
-
 impl LoopInvalidation {
     /// quasiimmut.py `QuasiImmut.invalidate`: `looptoken.invalidated = True`
     /// followed by `cpu.invalidate_loop(looptoken)`.  Both happen here: the
@@ -2203,12 +2186,6 @@ impl LoopInvalidation {
             sites.positions.clear();
             break;
         }
-        // After the flags, not before: a reader that keys a cache on the
-        // generation pairs the value it read with the answer it computed, so
-        // the new value must not be observable while the flags still say the
-        // token is live. Read with acquire, this orders the flag stores ahead
-        // of any computation keyed on the new generation.
-        TOKEN_INVALIDATIONS.fetch_add(1, Ordering::Release);
     }
 }
 
