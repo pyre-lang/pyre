@@ -10577,19 +10577,29 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
         );
     // The store the body recorded, for a walk that could not execute it.
     let replay = cursor_unchanged && !seq_before.is_null() && index_before >= 0;
-    // A kept store has no undo entry, so the bridge cursor snapshot is the
-    // only way back for a walk that aborts with its delivery refused; it is
-    // taken from the pre-walk pair whichever side moved the cursor.
-    if ctx.trace_ctx.is_bridge_trace
-        && (!cursor_unchanged || (replay && (item.is_some() || exhausted)))
-    {
+    // A kept store has no undo entry, so the cursor snapshot is the only way
+    // back for a walk that aborts with its delivery refused; it is taken from
+    // the pre-walk pair whichever side moved the cursor.  A root walk needs it
+    // as much as a bridge: its non-commit epilogue leaves the snapshot to the
+    // delivery site, whose header refusal restores it so the resume
+    // re-consumes the item.  Without it that refusal restores nothing and the
+    // iteration is lost.  A root walk has no delivery for an exhausting step,
+    // so it snapshots only a consume.
+    let cursor_moved = !cursor_unchanged || (replay && (item.is_some() || exhausted));
+    let journaled = cursor_moved && (ctx.trace_ctx.is_bridge_trace || item.is_some());
+    if journaled {
         fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
     }
     if let Some(item) = item {
         if replay {
             unsafe { pyre_object::w_list_iter_set_index(iter_now, index_before + 1) };
         }
-        fbw_foriter_inflight_capture(InflightForiterOwner::current(ctx.session), item, body, true);
+        fbw_foriter_inflight_capture(
+            InflightForiterOwner::current(ctx.session),
+            item,
+            body,
+            journaled,
+        );
     } else if exhausted && replay {
         unsafe { pyre_object::w_list_iter_set_seq(iter_now, pyre_object::PY_NULL) };
     }
