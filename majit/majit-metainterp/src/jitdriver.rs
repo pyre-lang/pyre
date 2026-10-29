@@ -6789,7 +6789,6 @@ impl<S: JitState> JitDriver<S> {
             }
             meta.with_trace_ctx_and_token_resolver(
                 |ctx,
-                 resolve,
                  rec_target,
                  rec_decision,
                  rec_exec,
@@ -6798,7 +6797,6 @@ impl<S: JitState> JitDriver<S> {
                  rec_exec_void| {
                     let runtime = crate::pyjitpl::ClosureRuntimeWithResolver::new(
                         |pc: usize| pc,
-                        resolve,
                         rec_target,
                         rec_decision,
                         rec_exec,

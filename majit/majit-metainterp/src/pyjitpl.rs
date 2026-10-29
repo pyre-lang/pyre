@@ -7333,17 +7333,13 @@ impl<M: Clone> MetaInterp<M> {
     /// MetaInterp fields immutably.  Hands the caller, in order:
     ///
     /// 1. the active `&mut TraceCtx`;
-    /// 2. `resolve_token` — `jitcell_token_by_number`, so the dispatcher
-    ///    routes `BC_CALL_ASSEMBLER_*` against the production
-    ///    `Arc<JitCellToken>` rather than the `_by_number_typed` synth-Arc
-    ///    fallback (borrows `compiled_loops` + `warm_state`);
-    /// 3. `recursive_target` — recursive-call green-key → `(Arc<JitCellToken>,
+    /// 2. `recursive_target` — recursive-call green-key → `(Arc<JitCellToken>,
     ///    green_key)` resolver for a recursive CALL_ASSEMBLER (mirrors
     ///    `WarmEnterState.get_assembler_token`, including creation of a
     ///    temporary callback token for an uncompiled callee);
-    /// 4. `recursive_decision` — the recursive-portal inline decision,
+    /// 3. `recursive_decision` — the recursive-portal inline decision,
     ///    sharing `decide_recursive_inline` with `should_inline_core`;
-    /// 5. `recursive_exec` — runs a recursive callee's compiled loop via
+    /// 4. `recursive_exec` — runs a recursive callee's compiled loop via
     ///    `backend.execute_token_raw` and decodes the int FINISH output.
     ///
     /// Returns `None` when no trace is active.
@@ -7351,7 +7347,6 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         f: impl FnOnce(
             &mut TraceCtx,
-            &dyn Fn(u64) -> Option<Arc<JitCellToken>>,
             &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
             &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
             &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
@@ -7361,10 +7356,8 @@ impl<M: Clone> MetaInterp<M> {
         ) -> R,
     ) -> Option<R> {
         self.with_trace_ctx_and_framestack(
-            |ctx, _framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
-                f(
-                    ctx, resolve, target, decision, exec_i, exec_r, exec_f, exec_v,
-                )
+            |ctx, _framestack, target, decision, exec_i, exec_r, exec_f, exec_v| {
+                f(ctx, target, decision, exec_i, exec_r, exec_f, exec_v)
             },
         )
     }
@@ -7378,7 +7371,6 @@ impl<M: Clone> MetaInterp<M> {
         f: impl FnOnce(
             &mut TraceCtx,
             &mut crate::pyjitpl::MIFrameStack,
-            &dyn Fn(u64) -> Option<Arc<JitCellToken>>,
             &dyn Fn(usize, &[i64]) -> Option<(Arc<JitCellToken>, u64)>,
             &dyn Fn(usize, &[i64], usize, usize) -> InlineDecision,
             &dyn Fn(&JitCellToken, &[Value]) -> Option<i64>,
@@ -7402,11 +7394,6 @@ impl<M: Clone> MetaInterp<M> {
         let staticdata = &self.staticdata;
         let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
         let runtime_state = std::cell::RefCell::new(&mut *self.backend);
-        let resolver = |_n: u64| -> Option<Arc<JitCellToken>> {
-            // BC_CALL_ASSEMBLER descrs carry a Weak to the token object
-            // (`JitCallAssemblerTarget`). Number is log-only.
-            None
-        };
         // recursive-call green-key → token resolver (pyjitpl.py
         // `do_recursive_call` → `direct_assembler_call` →
         // `warmrunnerstate.get_assembler_token`).  An absent compiled token is
@@ -7563,7 +7550,6 @@ impl<M: Clone> MetaInterp<M> {
         let result = f(
             tracing,
             &mut self.framestack,
-            &resolver,
             &recursive_target,
             &recursive_decision,
             &recursive_exec,
@@ -7601,10 +7587,9 @@ impl<M: Clone> MetaInterp<M> {
         let pending_exc_value = self.last_exc_value;
         let (action, last_exc_box, last_exc_value) = self
             .with_trace_ctx_and_framestack(
-                |ctx, framestack, resolve, target, decision, exec_i, exec_r, exec_f, exec_v| {
+                |ctx, framestack, target, decision, exec_i, exec_r, exec_f, exec_v| {
                     let runtime = crate::pyjitpl::ClosureRuntimeWithResolver::new(
                         |pc| pc,
-                        resolve,
                         target,
                         decision,
                         exec_i,
@@ -35358,14 +35343,9 @@ mod tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let resolved = meta
             .with_trace_ctx_and_token_resolver(
-                |_ctx,
-                 _resolve,
-                 recursive_target,
-                 _decision,
-                 _exec,
-                 _exec_ref,
-                 _exec_float,
-                 _exec_void| { recursive_target(idx1, &[55]) },
+                |_ctx, recursive_target, _decision, _exec, _exec_ref, _exec_float, _exec_void| {
+                    recursive_target(idx1, &[55])
+                },
             )
             .expect("trace is active");
         let (token, _) = resolved.expect("target driver compiled key resolves");
@@ -35404,14 +35384,9 @@ mod tests {
 
         let target = meta
             .with_trace_ctx_and_token_resolver(
-                |_ctx,
-                 _resolve,
-                 recursive_target,
-                 _decision,
-                 _exec,
-                 _exec_ref,
-                 _exec_float,
-                 _exec_void| { recursive_target(0, &[]) },
+                |_ctx, recursive_target, _decision, _exec, _exec_ref, _exec_float, _exec_void| {
+                    recursive_target(0, &[])
+                },
             )
             .expect("trace is active");
         assert!(

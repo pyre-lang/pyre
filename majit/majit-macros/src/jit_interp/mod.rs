@@ -2398,19 +2398,16 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     __meta.close_header_revisit(__pc);
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
-                // Slice X-D production wire-up: split-borrow the active
-                // TraceCtx and a `jitcell_token_by_number` resolver so
-                // the dispatcher's BC_CALL_ASSEMBLER_* path can route
-                // through the production `Arc<JitCellToken>` rather
-                // than the synth-Arc `_by_number_typed` fallback.  The
-                // helper also hands over the recursive-call recursive-call seams
-                // (green-key target resolver, inline decision, and the
+                // Split-borrow the active TraceCtx. CALL_ASSEMBLER descrs
+                // carry a `Weak<JitCellToken>` (`history.py JitCellToken`,
+                // `pyjitpl.py direct_assembler_call`); the token number is
+                // log-only. The helper also hands over the recursive-call
+                // seams (green-key target resolver, inline decision, and the
                 // `execute_token_raw` concrete executor) wired to the
                 // production warmstate / backend.
                 let __result = __meta
                     .with_trace_ctx_and_token_resolver(
                         |__ctx,
-                         __resolve,
                          __rec_target,
                          __rec_decision,
                          __rec_exec,
@@ -2420,7 +2417,6 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                             let __runtime =
                                 majit_metainterp::ClosureRuntimeWithResolver::new(
                                     |pc: usize| pc,
-                                    __resolve,
                                     __rec_target,
                                     __rec_decision,
                                     __rec_exec,

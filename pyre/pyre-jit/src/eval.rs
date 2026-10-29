@@ -8443,7 +8443,6 @@ fn drive_generatorentry_trace(
     };
     let drove = meta.with_trace_ctx_and_token_resolver(
         |ctx,
-         resolve_token,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -8452,7 +8451,6 @@ fn drive_generatorentry_trace(
          recursive_exec_void| {
             let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
                 |_pc: usize| 0usize,
-                resolve_token,
                 recursive_target,
                 recursive_decision,
                 recursive_exec,
@@ -9220,7 +9218,6 @@ fn drive_unpack_iterable_trace(
     // compiled-loop / warmstate state.
     let drove = meta.with_trace_ctx_and_token_resolver(
         |ctx,
-         resolve_token,
          recursive_target,
          recursive_decision,
          recursive_exec,
@@ -9229,7 +9226,6 @@ fn drive_unpack_iterable_trace(
          recursive_exec_void| {
             let runtime = majit_metainterp::ClosureRuntimeWithResolver::new(
                 |_pc: usize| 0usize,
-                resolve_token,
                 recursive_target,
                 recursive_decision,
                 recursive_exec,
