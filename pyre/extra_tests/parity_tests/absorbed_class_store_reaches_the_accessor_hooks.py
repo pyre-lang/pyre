@@ -1,4 +1,4 @@
-# pyre-check: pypy-diverges: pins 3.14's accessor slots being re-fixed on every
+# pyre-check: pypy-diverges: pins 3.15's accessor slots being re-fixed on every
 # class-namespace store; pypy3 leaves `uses_object_getattribute` /
 # `uses_object_setattr` memoised, and its `LOAD_ATTR` / `STORE_ATTR` cache
 # entries valid, when a cell absorbs the store, so its third access still takes

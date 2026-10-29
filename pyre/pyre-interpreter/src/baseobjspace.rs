@@ -7401,7 +7401,6 @@ pub fn getattr_str_impl(
                         return match super_getattribute_str(
                             pyre_object::gc_roots::shadow_stack_get(obj_slot),
                             name,
-                            PY_NULL,
                         ) {
                             Ok(value) => Ok(value),
                             Err(err) if call_getattr && err.kind == PyErrorKind::AttributeError => {
@@ -7687,7 +7686,6 @@ pub fn getattr_str_impl(
 unsafe fn super_getattribute_wtf8(
     obj: PyObjectRef,
     name: &Wtf8,
-    w_name: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
         if !pyre_object::descriptor::is_super(obj)
@@ -7732,7 +7730,7 @@ unsafe fn super_getattribute_wtf8(
             // former routes the read through an `@elidable` keyed on the
             // version tag, which both folds it and keeps every argument inside
             // the residual call ABI's one machine word.
-            if let Some(mut attr) = w_type_getdictvalue(t, name, w_name) {
+            if let Some(mut attr) = w_type_getdictvalue(t, name) {
                 // W_Super.getattribute binds every descriptor rather than only
                 // the three builtin method-wrapper shapes, which also covers
                 // property, getset, member and user-defined descriptors.
@@ -7763,10 +7761,11 @@ unsafe fn super_getattribute_wtf8(
 /// is what that selected builtin slot executes.  Keeping the two levels apart
 /// lets a `super` subclass override the slot without making an inherited or
 /// explicit `super.__getattribute__(obj, name)` call recurse.
-fn super_getattribute_str(mut obj: PyObjectRef, name: &str, w_name: PyObjectRef) -> PyResult {
+fn super_getattribute_str(mut obj: PyObjectRef, name: &str) -> PyResult {
     unsafe {
         if name != "__class__"
-            && let Some(value) = pyre_object::with_roots!(obj => super_getattribute_wtf8(obj, Wtf8::new(name), w_name))?
+            && let Some(value) =
+                pyre_object::with_roots!(obj => super_getattribute_wtf8(obj, Wtf8::new(name)))?
         {
             return Ok(value);
         }
@@ -7787,15 +7786,14 @@ pub(crate) fn super_getattribute(mut obj: PyObjectRef, mut w_name: PyObjectRef) 
     }
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
     if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(name) } {
-        super_getattribute_str(
-            obj,
-            unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
-            w_name,
-        )
+        super_getattribute_str(obj, unsafe {
+            pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+        })
     } else {
         unsafe {
             if name.as_str() != Ok("__class__")
-                && let Some(value) = pyre_object::with_roots!(obj, w_name => super_getattribute_wtf8(obj, name, w_name))?
+                && let Some(value) =
+                    pyre_object::with_roots!(obj, w_name => super_getattribute_wtf8(obj, name))?
             {
                 return Ok(value);
             }
@@ -7819,11 +7817,9 @@ pub(crate) unsafe fn super_getattribute_code_name(
     w_name: PyObjectRef,
 ) -> PyResult {
     let name = unsafe { pyre_object::w_str_get_wtf8(w_name) };
-    super_getattribute_str(
-        obj,
-        unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name) },
-        w_name,
-    )
+    super_getattribute_str(obj, unsafe {
+        pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(name)
+    })
 }
 
 // ─── `w_name`-taking attribute API ───
@@ -11438,7 +11434,9 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
     } else {
         pyre_object::typeobject::COMPARES_BY_IDENTITY_NO
     };
-    pyre_object::typeobject::w_type_set_compares_by_identity_status(w_type, result);
+    if side_effects_ok() {
+        pyre_object::typeobject::w_type_set_compares_by_identity_status(w_type, result);
+    }
     compares_by_identity
 }
 
@@ -12316,35 +12314,37 @@ unsafe fn _cached_lookup_where_name(
     }
     let tup = lookup_where_pair_wtf8(w_type, name)
         .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
-    // incminimark `remember_young_pointer`: the method cache is a prebuilt
-    // (old) root. A store records it only when the stored pointer is young.
-    // An old descriptor does not make the next minor collection rescan every
-    // prebuilt root. A young rawmalloc object is not in the nursery window;
-    // those descriptors are not what this cache fills during startup, and a
-    // null miss is not a pointer.
-    if majit_gc::gc_is_nursery_object(tup.0 as usize)
-        || majit_gc::gc_is_nursery_object(tup.1 as usize)
-    {
-        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    if side_effects_ok() {
+        // incminimark `remember_young_pointer`: the method cache is a prebuilt
+        // (old) root. A store records it only when the stored pointer is young.
+        // An old descriptor does not make the next minor collection rescan every
+        // prebuilt root. A young rawmalloc object is not in the nursery window;
+        // those descriptors are not what this cache fills during startup, and a
+        // null miss is not a pointer.
+        if majit_gc::gc_is_nursery_object(tup.0 as usize)
+            || majit_gc::gc_is_nursery_object(tup.1 as usize)
+        {
+            pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+        }
+        // SAFETY: the GIL is held; the walk above has already finished.
+        let cache = unsafe { method_cache_mut() };
+        let entry = &mut cache.entries[h];
+        entry.version = version_tag;
+        entry.lookup_where = tup;
+        let container = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
+        if container != 0 {
+            pyre_object::gc_hook::try_gc_write_barrier(container as pyre_object::gc_hook::GCREF);
+        }
+        // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
+        // Rust owns the bytes instead, so overwrite the buffer the slot
+        // already holds rather than minting one and dropping the displaced one:
+        // the fill rate is the miss rate, and a lookup on a freshly created type
+        // misses every time, so a fresh `Wtf8Buf` per fill is a malloc and a free
+        // on that path.
+        let cached_name = entry.name.get_or_insert_with(Wtf8Buf::new);
+        cached_name.clear();
+        cached_name.push_wtf8(name);
     }
-    // SAFETY: the GIL is held; the walk above has already finished.
-    let cache = unsafe { method_cache_mut() };
-    let entry = &mut cache.entries[h];
-    entry.version = version_tag;
-    entry.lookup_where = tup;
-    let container = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
-    if container != 0 {
-        pyre_object::gc_hook::try_gc_write_barrier(container as pyre_object::gc_hook::GCREF);
-    }
-    // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
-    // Rust owns the bytes instead, so overwrite the buffer the slot
-    // already holds rather than minting one and dropping the displaced one:
-    // the fill rate is the miss rate, and a lookup on a freshly created type
-    // misses every time, so a fresh `Wtf8Buf` per fill is a malloc and a free
-    // on that path.
-    let cached_name = entry.name.get_or_insert_with(Wtf8Buf::new);
-    cached_name.clear();
-    cached_name.push_wtf8(name);
     tup
 }
 
@@ -12478,11 +12478,11 @@ unsafe fn unwrap_method_cache_value(
 }
 
 /// `typeobject.py W_TypeObject.getdictvalue` — the read of a type's own
-/// namespace.  One path for interpreter and JIT (upstream branches only on
-/// `version_tag is None`, never on `we_are_jitted()`): promote the type and
-/// its `version_tag`, then read through the `@elidable`
-/// [`_pure_getdictvalue_no_unwrapping`].  Without a tag the read is
-/// uncacheable and runs raw, through `_getdictvalue_no_unwrapping`.
+/// namespace.  Without a tag the read is uncacheable and runs raw, through
+/// `_getdictvalue_no_unwrapping`.  A tagged read goes through the `@elidable`
+/// [`_pure_getdictvalue_no_unwrapping`] on the trace with the name as one
+/// STR; the interpreter runs that elidable's body directly (the same split
+/// as `type_setdictvalue_wtf8`).
 ///
 /// The raw probe this replaces on the traced path reaches `w_dict_getitem_wtf8`
 /// with a `&Wtf8`, whose two machine words exceed the residual call ABI's one,
@@ -12493,11 +12493,7 @@ unsafe fn unwrap_method_cache_value(
 /// Both arms pass the stored object through `unwrap_cell`
 /// (`W_TypeObject.getdictvalue`).  `_pure_getdictvalue_no_unwrapping` itself
 /// stays raw: the method cache holds the cell.
-pub(crate) unsafe fn w_type_getdictvalue(
-    w_type: PyObjectRef,
-    name: &Wtf8,
-    w_name: PyObjectRef,
-) -> Option<PyObjectRef> {
+pub(crate) unsafe fn w_type_getdictvalue(w_type: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
     if w_type.is_null() || !is_type(w_type) {
         return None;
     }
@@ -12506,32 +12502,20 @@ pub(crate) unsafe fn w_type_getdictvalue(
     // the one type it was handed (`W_TypeObject.getdictvalue` opens with just
     // `version_tag = self.version_tag()`).
     let version_tag = w_type_version_tag(w_type);
-    if version_tag == 0 || w_name.is_null() {
-        // No tag means uncacheable: `W_TypeObject.getdictvalue`'s untagged
-        // arm reads raw.  A caller that reached this walk holding only the
-        // unwrapped name takes that same arm, because the elidable's ABI needs
-        // the wrapper -- see the `w_name` note below.
-        //
-        // Both are tests on what this call was handed, not on
-        // `we_are_jitted()`: the tagged read has one owner for interpreter and
-        // JIT alike, which is what the doc above claims and what upstream
-        // does.  Nothing is lost by routing the interpreter through the
-        // elidable, whose body is the same `type_dict_lookup_wtf8` this arm
-        // calls directly.
+    if version_tag == 0 {
+        // `W_TypeObject.getdictvalue`'s untagged arm: uncacheable, read raw.
         return crate::type_dict_lookup_wtf8(w_type, name)
             .map(|w_value| pyre_object::celldict::unwrap_cell(w_value));
     }
-    // `w_name` is the caller's own wrapped name, not a fresh
-    // `box_str_constant`.  `LOAD_SUPER_ATTR` already carries it
-    // (`super_getattribute_code_name`), and boxing it again would put a
-    // `box_str_constant` residual on the traced path -- which is a symbolic
-    // fnaddr the sub-walk cannot name, so the descent declines there instead.
-    // Its `_utf8` field is the STR the elidable takes.
-    let w_value = _pure_getdictvalue_no_unwrapping(
-        w_type,
-        pyre_object::unicodeobject::w_str_storage(w_name),
-        version_tag,
-    );
+    // `name` is an RPython `str` (`Ptr(STR)`): on the trace
+    // `prebuilt_wtf8_storage` is the operand itself.  The interpreter reads
+    // the namespace directly, which is the elidable's own body.
+    let w_value = if majit_metainterp::jit::we_are_jitted() {
+        let name_str = pyre_object::unicodeobject::prebuilt_wtf8_storage(name);
+        _pure_getdictvalue_no_unwrapping(w_type, name_str, version_tag)
+    } else {
+        crate::type_dict_lookup_wtf8_no_unwrapping(w_type, name).unwrap_or(PY_NULL)
+    };
     if w_value.is_null() {
         None
     } else {
@@ -13924,9 +13908,10 @@ pub(crate) unsafe fn getattribute_if_not_from_object(w_type: PyObjectRef) -> Opt
     }
     if let Some(w_descr) = lookup_in_type_where(w_type, "__getattribute__") {
         if is_object_getattribute_descr(w_descr) {
-            // typeobject.py:313-315 — remember the default (`_side_effects_ok()`
-            // is true in normal builds).
-            pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+            // typeobject.py getattribute_if_not_from_object — remember the default.
+            if side_effects_ok() {
+                pyre_object::typeobject::w_type_set_uses_object_getattribute(w_type, true);
+            }
             return None;
         }
         return Some(w_descr);
@@ -13980,7 +13965,10 @@ pub(crate) unsafe fn setattr_if_not_from_object(w_type: PyObjectRef) -> Option<P
     }
     if let Some(w_descr) = lookup_in_type_where(w_type, "__setattr__") {
         if is_object_setattr_descr(w_descr) {
-            pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
+            // typeobject.py setattr_if_not_from_object — remember the default.
+            if side_effects_ok() {
+                pyre_object::typeobject::w_type_set_uses_object_setattr(w_type, true);
+            }
             return None;
         }
         return Some(w_descr);

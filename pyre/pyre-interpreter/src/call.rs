@@ -7767,6 +7767,12 @@ unsafe fn copy_flags_from_bases(
                 if pyre_object::w_type_get_hasuserdel(base) {
                     pyre_object::w_type_set_hasuserdel(w_type, true);
                 }
+                if pyre_object::typeobject::w_type_get_flag_patma_collection(w_type) == b'X' {
+                    pyre_object::typeobject::w_type_set_flag_patma_collection(
+                        w_type,
+                        pyre_object::typeobject::w_type_get_flag_patma_collection(base),
+                    );
+                }
             }
         }
     }
@@ -7802,7 +7808,7 @@ pub unsafe fn create_all_slots(
         w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
         w_bases = pyre_object::gc_roots::shadow_stack_get(bases_slot);
 
-        // typeobject.py:1507-1508: inherit flag_map_or_seq from bases
+        // typeobject.py `setup_user_defined_type`: inherit flag_map_or_seq from bases
         pyre_object::typeobject::inherit_flag_map_or_seq(w_type, w_bases);
 
         // typeobject.py: copy_flags_from_bases — inherit hasdict/weakrefable/hasuserdel

@@ -1667,7 +1667,15 @@ impl W_Deque {
 crate::py_module! {
     "_collections",
     interpleveldefs: {
-        "deque"                   => type_object(),
+        "deque"                   => {
+            let w_deque_type = type_object();
+            // [3.15-spec] `_collectionsmodule.c` deque has Py_TPFLAGS_SEQUENCE;
+            // PyPy's deque leaves "X" for the `issequence_w` fallback.
+            unsafe {
+                pyre_object::typeobject::w_type_set_flag_patma_collection(w_deque_type, b'S');
+            }
+            w_deque_type
+        },
         "_deque_iterator"         => deque_iter::public_type(),
         "_deque_reverse_iterator" => deque_rev_iter::public_type(),
     },

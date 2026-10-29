@@ -1859,20 +1859,16 @@ pub fn init_typeobjects() {
             let w_typeobject = w_typeobject_addr as PyObjectRef;
             pyre_object::pyobject::set_instantiate(tp, w_typeobject);
         }
-        // typeobject.py `flag_patma_collection` — store the public mapping and
-        // sequence marker on W_TypeObject. Heap types inherit it from bases in
+        // `objspace.py StdObjSpace.initialize` / `dictproxyobject.py
+        // _set_flag_map_or_seq`: dict and mappingproxy are 'M', list and tuple
+        // 'S'.  `frozendict` is a dict.  Heap types inherit it in
         // `inherit_flag_map_or_seq`.
         for (pytype, flag) in [
             (&pyre_object::pyobject::DICT_TYPE, b'M'),
             (&pyre_object::pyobject::FROZENDICT_TYPE, b'M'),
             (&pyre_object::pyobject::MAPPING_PROXY_TYPE, b'M'),
-            (&pyre_object::pyobject::STR_TYPE, b'S'),
-            (&pyre_object::bytesobject::BYTES_TYPE, b'S'),
-            (&pyre_object::bytearrayobject::BYTEARRAY_TYPE, b'S'),
             (&pyre_object::pyobject::LIST_TYPE, b'S'),
             (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
-            (&pyre_object::functional::RANGE_TYPE, b'S'),
-            (&pyre_object::memoryview::MEMORYVIEW_TYPE, b'S'),
         ] {
             let w_typeobject = *reg
                 .get(&(pytype as *const PyType as usize))
@@ -1880,6 +1876,30 @@ pub fn init_typeobjects() {
                 as PyObjectRef;
             unsafe {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
+            }
+        }
+        // [3.15-spec] `flag_patma_collection` for the built-ins whose type
+        // object carries `Py_TPFLAGS_MAPPING` / `Py_TPFLAGS_SEQUENCE` statically
+        // (dict, mappingproxy, list, tuple, range, memoryview; frozendict).
+        // PyPy leaves them "X" and `MATCH_*` falls back to `ismapping_w` /
+        // `issequence_w`; that fallback is dropped (see `match_sequence_value`),
+        // so the marker is the whole test here.
+        for (pytype, flag) in [
+            (&pyre_object::pyobject::DICT_TYPE, b'M'),
+            (&pyre_object::pyobject::FROZENDICT_TYPE, b'M'),
+            (&pyre_object::pyobject::MAPPING_PROXY_TYPE, b'M'),
+            (&pyre_object::pyobject::LIST_TYPE, b'S'),
+            (&pyre_object::pyobject::TUPLE_TYPE, b'S'),
+            (&pyre_object::functional::RANGE_TYPE, b'S'),
+            (&pyre_object::memoryview::MEMORYVIEW_TYPE, b'S'),
+        ] {
+            let w_typeobject = *reg
+                .get(&(pytype as *const PyType as usize))
+                .expect(
+                    "built-in type object must be registered before flag_patma_collection init",
+                ) as PyObjectRef;
+            unsafe {
+                pyre_object::typeobject::w_type_set_flag_patma_collection(w_typeobject, flag);
             }
         }
         // typeobject.py TypeCache.build: `w_type.flag_sequence_bug_compat =
@@ -3198,7 +3218,8 @@ pub fn ensure_array_typeobjects() {
                 array_type,
                 Some(pyre_object::TypeDefBuffer::ReadWrite),
             );
-            pyre_object::typeobject::w_type_set_flag_map_or_seq(array_type, b'S');
+            // [3.15-spec] `arraymodule.c` Py_TPFLAGS_SEQUENCE; PyPy's array leaves "X" for the `issequence_w` fallback.
+            pyre_object::typeobject::w_type_set_flag_patma_collection(array_type, b'S');
         }
         pyre_object::pyobject::set_instantiate(
             &pyre_object::interp_array::ARRAY_TYPE,

@@ -378,25 +378,29 @@ pub fn list_to_tuple_value(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
 // run exactly the same code.
 
 /// `MATCH_MAPPING` — push whether the subject is a mapping.
-/// `pyopcode.py` reads `flag_patma_collection` and only falls back to
-/// `ismapping_w` when the type declares neither marker; every pyre type
-/// carries the marker, so the flag read is the whole test.  This is the raw
-/// mapping marker, not `__getitem__` duck-typing — that is the
-/// pattern-matching contract.
+/// `pyopcode.py` reads `flag_patma_collection` and, when the type carries
+/// neither marker, falls back to `ismapping_w`.  [3.15-spec] That fallback is
+/// dropped: `ceval` tests `Py_TPFLAGS_MAPPING` alone, so a class with
+/// `keys` and `__getitem__` that was never registered is not a mapping
+/// (`pypy3` matches it).  The built-ins and `_abc` registration stamp the
+/// marker, so the flag read is the whole test.
 pub fn match_mapping_value(subject: PyObjectRef) -> PyObjectRef {
     let is_mapping = unsafe {
         let ty = crate::typedef::r#type(subject).map_or(std::ptr::null_mut(), |p| p.as_ptr());
-        pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) == b'M'
+        pyre_object::typeobject::w_type_get_flag_patma_collection(ty) == b'M'
     };
     w_bool_from(is_mapping)
 }
 
 /// `MATCH_SEQUENCE` — push whether the subject is a sequence.
-/// `pyopcode.py`, mirroring [`match_mapping_value`].
+/// `pyopcode.py`, with the same [3.15-spec] drop of the `issequence_w`
+/// fallback as [`match_mapping_value`] (a class with only `__getitem__` is not
+/// a sequence; `pypy3` matches it), and `pyopcode.py`'s str / bytes /
+/// bytearray exclusion kept.
 pub fn match_sequence_value(subject: PyObjectRef) -> PyObjectRef {
     let is_sequence = unsafe {
         let ty = crate::typedef::r#type(subject).map_or(std::ptr::null_mut(), |p| p.as_ptr());
-        match pyre_object::typeobject::w_type_get_flag_map_or_seq(ty) {
+        match pyre_object::typeobject::w_type_get_flag_patma_collection(ty) {
             b'M' => false,
             flag => {
                 let is_sequence = flag == b'S';

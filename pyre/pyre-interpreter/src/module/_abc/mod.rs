@@ -670,8 +670,8 @@ fn register(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
     // the registration, not only with `__abc_tpflags__` at class creation.
     // `_abc_register` reads the flags under `if isinstance(cls, type):`.
     if unsafe { is_type(cls) } {
-        let flag = unsafe { typeobject::w_type_get_flag_map_or_seq(cls) };
-        if flag != b'?' {
+        let flag = unsafe { typeobject::w_type_get_flag_patma_collection(cls) };
+        if flag != b'X' {
             // Same livevar set as the `issubclass` / `weak_cache_add` arms
             // above: `interp_abc.py set_collection_flag_recursive` walks
             // `weak_subclasses`, so `subclass` is re-read from its slot
@@ -698,7 +698,7 @@ const COLLECTION_FLAGS: i64 = PATMA_SEQUENCE | PATMA_MAPPING;
 /// strict test below only ever rejects a caller that spells the flag itself.
 fn set_collection_flag_of(w_type: PyObjectRef, flag: i64) -> Result<(), pyre_interpreter::PyError> {
     let marker = collection_marker(w_type, flag, "_internal_set_collection_flag")?;
-    unsafe { typeobject::w_type_set_flag_map_or_seq(w_type, marker) };
+    unsafe { typeobject::w_type_set_flag_patma_collection(w_type, marker) };
     Ok(())
 }
 
@@ -761,33 +761,29 @@ fn internal_set_collection_flag_recursive(
 }
 
 // `typeobject.c set_flags_recursive` — stamp the marker on `w_type` and every
-// class already deriving from it.  `interp_abc.py set_collection_flag_recursive`
-// carries neither of the two stops below and would mark `str`.
+// class already deriving from it.
 fn set_collection_flag_recursive(w_type: PyObjectRef, flag: u8) {
     unsafe {
-        // `Py_TPFLAGS_IMMUTABLETYPE`: a non-heap type's marker is fixed at
-        // registration (`objspace.py StdObjSpace.initialize` marks exactly
-        // dict / dictproxy / list / tuple). `_collections_abc` runs
-        // `Sequence.register(str)` and `ByteString.register(bytes)`, so without
-        // this stop `str` / `bytes` / `bytearray` would start matching
-        // `case [...]` — the one thing a sequence pattern must never accept.
-        //
-        // `(tp_flags & mask) == flags`: a class already carrying the marker
-        // passed it to its descendants at creation
-        // (`inherit_flag_map_or_seq`), so that subtree is done.
-        //
-        // `set_flags_recursive` also stops on IMMUTABLETYPE, which
-        // `PyType_Freeze` sets on a heap type without clearing its heap-type
-        // bit; `interp_abc.py` has no such stop.  [3.15-spec] observable:
+        // [3.15-spec] `typeobject.c set_flags_recursive` stops on
+        // `Py_TPFLAGS_IMMUTABLETYPE` and on a type that already carries the
+        // flag; `interp_abc.py set_collection_flag_recursive` stamps every
+        // subclass.  A non-heap type is immutable there, so `str` / `bytes` /
+        // `bytearray` keep no marker after `_collections_abc` runs
+        // `Sequence.register(str)` (`str.__flags__` shows no
+        // `Py_TPFLAGS_SEQUENCE`; `pypy3` shows it), and `PyType_Freeze` sets
+        // IMMUTABLETYPE on a heap type without clearing its heap-type bit:
         // `contextvars.Context` is immutable and registered as a `Mapping`, so
         // `match copy_context(): case {}` fails on 3.15 and matches on PyPy.
+        //
+        // A class already carrying the marker passed it to its descendants at
+        // creation (`copy_flags_from_bases`), so that subtree is done.
         if !typeobject::w_type_is_heaptype(w_type)
             || typeobject::w_type_is_cpython_immutabletype(w_type)
-            || typeobject::w_type_get_flag_map_or_seq(w_type) == flag
+            || typeobject::w_type_get_flag_patma_collection(w_type) == flag
         {
             return;
         }
-        typeobject::w_type_set_flag_map_or_seq(w_type, flag);
+        typeobject::w_type_set_flag_patma_collection(w_type, flag);
         // `only_real_subclasses` is False for every walk but
         // `descr___subclasses__` (typeobject.py).
         for child in typeobject::w_type_get_subclasses(w_type, false) {

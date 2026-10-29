@@ -624,10 +624,12 @@ unsafe fn type_object_destructor(obj_addr: usize) {
     // the only writer, and a type compiled against and never renamed still
     // holds the instance.  `flag_cpython_immutabletype?` is the Freeze /
     // construction twin: a type compiled against and never frozen still holds
-    // the instance.
+    // the instance.  `flag_patma_collection?` is the `_abc` twin: a type
+    // compiled against and never registered still holds the instance.
     unsafe { (*t).mutate_version_tag.reclaim() };
     unsafe { (*t).mutate_w_name.reclaim() };
     unsafe { (*t).mutate_flag_cpython_immutabletype.reclaim() };
+    unsafe { (*t).mutate_flag_patma_collection.reclaim() };
 }
 
 /// Reclaim `W_Property`'s `w_fget?` / `w_fset?` / `w_fdel?` instances on sweep.

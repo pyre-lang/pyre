@@ -2172,6 +2172,10 @@ struct PyreMethodsAttrs {
     text_signature: Option<syn::LitStr>,
     weakrefable: bool,
     unhashable: bool,
+    /// `Py_TPFLAGS_MAPPING` on the static type: `type_object()` stamps
+    /// `flag_map_or_seq` and `flag_patma_collection` 'M' when it builds the
+    /// type.
+    mapping: bool,
     /// Optional base class expression — the `__base` of the TypeDef.
     /// Mirrors `TypeDef("X", __base=W_Base.typedef)` in
     /// `pypy/interpreter/typedef.py`.  Defaults to `w_object()` (the
@@ -2198,6 +2202,7 @@ impl syn::parse::Parse for PyreMethodsAttrs {
                 }
                 "weakrefable" => out.weakrefable = true,
                 "unhashable" => out.unhashable = true,
+                "mapping" => out.mapping = true,
                 "base" => {
                     input.parse::<syn::Token![=]>()?;
                     out.base = Some(input.parse()?);
@@ -2208,7 +2213,7 @@ impl syn::parse::Parse for PyreMethodsAttrs {
                         format!(
                             "unknown `#[pyre_methods]` key `{other}` — expected \
                              `doc = \"...\"` / `_text_signature_ = \"...\"` / \
-                             `weakrefable` / `unhashable` / `base = <expr>`",
+                             `weakrefable` / `unhashable` / `mapping` / `base = <expr>`",
                         ),
                     ));
                 }
@@ -3411,6 +3416,16 @@ fn expand_pyre_methods(
         },
         None => quote! {},
     };
+    let set_type_mapping_flags = if attrs.mapping {
+        quote! {
+            unsafe {
+                ::pyre_object::typeobject::w_type_set_flag_map_or_seq(tp, b'M');
+                ::pyre_object::typeobject::w_type_set_flag_patma_collection(tp, b'M');
+            }
+        }
+    } else {
+        quote! {}
+    };
 
     let type_object_fn = quote! {
         pub fn type_object() -> ::pyre_object::PyObjectRef {
@@ -3448,6 +3463,7 @@ fn expand_pyre_methods(
                         },
                         tp,
                     );
+                    #set_type_mapping_flags
                     #set_type_text_signature
                     tp as usize
                 }) as ::pyre_object::PyObjectRef

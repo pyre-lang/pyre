@@ -318,9 +318,11 @@ pub(crate) unsafe fn type_setdictvalue_wtf8(
                 // type inherits object's accessor" for a type that stopped
                 // inheriting it.
                 //
-                // [3.14-spec] PyPy returns here unconditionally and leaves both
-                // stale; `type_setattro` re-fixes the accessor slots on every
-                // store, so the rebound hook runs.  Running `mutated()` for
+                // [3.15-spec] PyPy returns here unconditionally and leaves both
+                // stale, while 3.15's `type_setattro` re-fixes the accessor slots
+                // on every store, so the rebound hook runs
+                // (`parity_tests/absorbed_class_store_reaches_the_accessor_hooks.py`
+                // passes on 3.15.2 and fails on `pypy3`).  Running `mutated()` for
                 // these two names reaches that answer, and it is what the first
                 // rebind of the same name already does -- that one replaces a
                 // plain value, so `write_cell` builds a cell and the store falls

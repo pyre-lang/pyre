@@ -206,7 +206,9 @@ impl Layout {
     "flag_cpython_heaptype",
     "flag_cpython_immutabletype?",
     "version_tag?",
-    "w_name?"
+    "w_name?",
+    "flag_patma_collection?",
+    "flag_map_or_seq"
 )]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
@@ -300,16 +302,15 @@ pub struct W_TypeObject {
     /// not inherit it; `TypeCache.build` copies the TypeDef bit and heap
     /// types stay false.
     pub flag_sequence_bug_compat: bool,
-    /// typeobject.py:169 `flag_map_or_seq` (`'?'`, `'M'`, `'S'`).
-    ///
-    /// Default `'?'` per typeobject.py:216.  Inherited from base
-    /// classes during heap-type construction (typeobject.py:1495):
-    /// when self's flag is `'?'` and a base's flag is non-`'?'`, copy.
-    /// Used by `descroperation.py is_iterable` and `:330-346
-    /// iter` to skip the `__getitem__` fallback for mapping-typed
-    /// classes.  Stored on `W_TypeObject` (not the low-level
-    /// `PyType`) so user-defined `dict`/`list`/`tuple` subclasses
-    /// inherit the marker the same way PyPy does.
+    /// typeobject.py `flag_patma_collection?` (`"X"`, `"M"`, `"S"`), set in the
+    /// `_abc` module and inherited in `copy_flags_from_bases`.  Read by
+    /// `MATCH_SEQUENCE` / `MATCH_MAPPING` and by `get_flags` for the PATMA bits.
+    pub flag_patma_collection: std::sync::atomic::AtomicU8,
+    /// typeobject.py `flag_map_or_seq` (`'?'`, `'M'`, `'S'`), listed in
+    /// `_immutable_fields_`; set for dict / mappingproxy / list / tuple at
+    /// startup (`objspace.py StdObjSpace.initialize`), inherited in
+    /// `setup_user_defined_type`; read by `ismapping_w` / `issequence_w` and
+    /// `descroperation.py` `is_iterable` / `iter`.
     pub flag_map_or_seq: std::sync::atomic::AtomicU8,
     /// typeobject.py `compares_by_identity_status?` —
     /// `UNKNOWN=0`, `COMPARES_BY_IDENTITY=1`,
@@ -437,6 +438,13 @@ pub struct W_TypeObject {
     /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
     /// no GC pointers, reclaimed by `type_object_destructor`.
     pub mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField,
+    /// Hidden `mutate_flag_patma_collection` field `rclass.py
+    /// InstanceRepr._setup_repr` synthesizes as `mutate_<name>` for
+    /// `"flag_patma_collection?"`.  Written by `_abc` registration.
+    ///
+    /// Same ownership as [`mutate_version_tag`]: an `AtomicPtr` plus a lock,
+    /// no GC pointers, reclaimed by `type_object_destructor`.
+    pub mutate_flag_patma_collection: crate::quasiimmut::QuasiImmutField,
     /// `Py_TPFLAGS_HAVE_GC` (`1 << 14`) — whether instances of this type join
     /// the collector's traversal. A build that keeps the global interpreter
     /// lock gives them a two-word `PyGC_Head` for it, which is what
@@ -637,6 +645,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         weakrefable: false,
         hasuserdel: false,
         flag_sequence_bug_compat: false,
+        flag_patma_collection: std::sync::atomic::AtomicU8::new(b'X'),
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
         compares_by_identity_status: std::sync::atomic::AtomicU8::new(COMPARES_BY_IDENTITY_UNKNOWN),
         weak_subclasses: std::ptr::null_mut(),
@@ -665,6 +674,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
         mutate_version_tag: crate::quasiimmut::QuasiImmutField::new(),
         mutate_w_name: crate::quasiimmut::QuasiImmutField::new(),
         mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_flag_patma_collection: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     };
@@ -694,7 +704,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: crate::gc_hook::GCRE
     w_type
 }
 
-/// typeobject.py in setup_user_defined_type — copy
+/// typeobject.py `setup_user_defined_type` — copy
 /// `flag_map_or_seq` from the first base whose flag is non-`?`.
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -791,7 +801,10 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         weakrefable: false,
         hasuserdel: false,
         flag_sequence_bug_compat: false,
-        // typeobject.py:216 default; built-in dict/list/tuple
+        // typeobject.py default "X"; built-ins with a static collection flag are stamped at typedef
+        // registration.
+        flag_patma_collection: std::sync::atomic::AtomicU8::new(b'X'),
+        // typeobject.py default; built-in dict/list/tuple
         // override via `w_type_set_flag_map_or_seq` at typedef
         // registration time (see `typedef.rs`).
         flag_map_or_seq: std::sync::atomic::AtomicU8::new(b'?'),
@@ -818,6 +831,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         mutate_version_tag: crate::quasiimmut::QuasiImmutField::new(),
         mutate_w_name: crate::quasiimmut::QuasiImmutField::new(),
         mutate_flag_cpython_immutabletype: crate::quasiimmut::QuasiImmutField::new(),
+        mutate_flag_patma_collection: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
         lifeline: crate::PY_NULL,
     }) as PyObjectRef
@@ -919,6 +933,37 @@ pub unsafe fn w_type_set_flag_map_or_seq(w_type: PyObjectRef, flag: u8) {
     let t = &*(w_type as *const W_TypeObject);
     t.flag_map_or_seq
         .store(flag, std::sync::atomic::Ordering::Release);
+}
+
+/// typeobject.py — `flag_patma_collection` read.  `b'X'` for a null or
+/// non-type receiver.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_get_flag_patma_collection(w_type: PyObjectRef) -> u8 {
+    if w_type.is_null() || !is_type(w_type) {
+        return b'X';
+    }
+    let t = &*(w_type as *const W_TypeObject);
+    t.flag_patma_collection
+        .load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// typeobject.py — store to `flag_patma_collection?`.  `rclass.py
+/// hook_setfield` emits `jit_force_quasi_immutable` ahead of the store, so
+/// loops that read the old marker are invalidated first.
+/// # Safety
+/// The caller must uphold every validity, runtime-type, aliasing, and lifetime
+/// invariant required by the object and pointer arguments for the entire call.
+pub unsafe fn w_type_set_flag_patma_collection(w_type: PyObjectRef, flag: u8) {
+    if w_type.is_null() || !is_type(w_type) {
+        return;
+    }
+    let t = w_type as *const W_TypeObject;
+    (*t).mutate_flag_patma_collection.invalidate_then_store(|| {
+        (*t).flag_patma_collection
+            .store(flag, std::sync::atomic::Ordering::Release);
+    });
 }
 
 /// `Py_TPFLAGS_DISALLOW_INSTANTIATION` reader — `True` when `w_type`'s
@@ -2100,22 +2145,12 @@ pub unsafe fn w_type_get_flags(obj: PyObjectRef) -> i64 {
     if t.flag_method_descriptor {
         flags |= TpFlags::PY_TPFLAGS_METHOD_DESCRIPTOR;
     }
-    match t.flag_map_or_seq.load(std::sync::atomic::Ordering::Acquire) {
+    match t
+        .flag_patma_collection
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
         b'M' => flags |= TpFlags::PY_TPFLAGS_MAPPING,
-        // CPython deliberately omits the sequence-pattern flag from str,
-        // bytes and bytearray (`unicodeobject.c:15805`,
-        // `bytesobject.c:3118`, `bytearrayobject.c:2867`). Pyre keeps PyPy's
-        // internal S marker on these types for `issequence_w`; MATCH_SEQUENCE
-        // applies the same exclusion, so only the public bit is masked here.
-        b'S' if !w_type_issubtype(obj, get_instantiate(&STR_TYPE))
-            && !w_type_issubtype(obj, get_instantiate(&crate::bytesobject::BYTES_TYPE))
-            && !w_type_issubtype(
-                obj,
-                get_instantiate(&crate::bytearrayobject::BYTEARRAY_TYPE),
-            ) =>
-        {
-            flags |= TpFlags::PY_TPFLAGS_SEQUENCE
-        }
+        b'S' => flags |= TpFlags::PY_TPFLAGS_SEQUENCE,
         _ => {}
     }
     if w_type_has_match_self(obj) {

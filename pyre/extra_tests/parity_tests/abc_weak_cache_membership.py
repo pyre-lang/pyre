@@ -1,4 +1,5 @@
-# pyre-check: pypy-diverges: pins 3.14's "cannot use ... as a set element"; pypy3 reports only "unhashable type"
+# pyre-check: pypy-diverges: pins 3.14's "cannot use ... as a set element" (pypy3 reports only "unhashable type")
+# and 3.15's collection markers (pypy3 matches an unregistered `__getitem__` class as a sequence)
 # CPython-suite gap: `test_abc` asks membership only through classes whose
 # caches it never inspects, so it covers neither the empty-collection answer,
 # nor an item that cannot carry a weakref, nor a class whose hash raises, and
@@ -403,4 +404,89 @@ if hasattr(ABCMeta('_Probe', (), {}), '_abc_cache'):
     a_shadowed_typeerror_global_is_consulted()
     a_rebound_builtin_typeerror_is_consulted()
     an_empty_cache_still_builds_the_probe()
+
+
+def collection_markers_follow_the_type_flags():
+    # [3.15-spec] `MATCH_*` and `__flags__` read the collection marker alone.
+    # pypy3 also accepts an unregistered `__getitem__` class as a sequence and
+    # a `keys` + `__getitem__` class as a mapping, and shows
+    # Py_TPFLAGS_SEQUENCE on `str`.
+    import array
+    import collections
+    import types
+
+    def kind(x):
+        match x:
+            case [*_]:
+                return 'seq'
+            case {}:
+                return 'map'
+            case _:
+                return '-'
+
+    class OnlyGetitem:
+        def __getitem__(self, i):
+            raise IndexError
+
+    class KeysAndGetitem:
+        def keys(self):
+            return []
+
+        def __getitem__(self, k):
+            raise KeyError
+
+    cases = [
+        (OnlyGetitem(), '-', 0),
+        (KeysAndGetitem(), '-', 0),
+        ('s', '-', 0),
+        (b'b', '-', 0),
+        (bytearray(), '-', 0),
+        ([], 'seq', 1),
+        ((), 'seq', 1),
+        (range(1), 'seq', 1),
+        (memoryview(b''), 'seq', 1),
+        (array.array('b'), 'seq', 1),
+        (collections.deque(), 'seq', 1),
+        (collections.UserList(), 'seq', 1),
+        ({}, 'map', 2),
+        (types.MappingProxyType({}), 'map', 2),
+        (collections.OrderedDict(), 'map', 2),
+        (collections.ChainMap(), 'map', 2),
+        (frozenset(), '-', 0),
+        ({}.values(), '-', 0),
+    ]
+    for value, want_kind, want_bits in cases:
+        name = type(value).__name__
+        assert kind(value) == want_kind, (name, kind(value), want_kind)
+        bits = type(value).__flags__ >> 5 & 3
+        assert bits == want_bits, (name, bits, want_bits)
+
+
+def registration_stamps_heap_types_only():
+    # [3.15-spec] `set_flags_recursive` stops on an immutable type.
+    import collections.abc
+    import contextvars
+
+    class Registered:
+        pass
+
+    class Child(Registered):
+        pass
+
+    collections.abc.Sequence.register(Registered)
+    assert Child.__flags__ >> 5 & 3 == 1
+    match Child():
+        case [*_]:
+            pass
+        case _:
+            raise AssertionError('registered subclass is not a sequence')
+    match contextvars.copy_context():
+        case {}:
+            raise AssertionError('immutable Context matched a mapping pattern')
+        case _:
+            pass
+
+
+collection_markers_follow_the_type_flags()
+registration_stamps_heap_types_only()
 print('OK')

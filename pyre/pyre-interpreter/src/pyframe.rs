@@ -937,7 +937,9 @@ pub mod frame_locals_proxy {
         }
     }
 
-    #[crate::pyre_methods(doc = "A write-through view of a frame's optimized locals.")]
+    // `frameobject.c` `PyFrameLocalsProxy_Type` has `Py_TPFLAGS_MAPPING`;
+    // `mapping` stamps both markers when `type_object()` builds the type.
+    #[crate::pyre_methods(doc = "A write-through view of a frame's optimized locals.", mapping)]
     impl FrameLocalsProxy {
         #[staticmethod]
         fn __new__(_cls: PyObjectRef, args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -1360,8 +1362,9 @@ pub mod frame_locals_proxy {
         let _roots = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(w_frame);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let w_type = type_object();
-        unsafe { pyre_object::typeobject::w_type_set_flag_map_or_seq(w_type, b'M') };
+        // `allocate_stable` stamps `w_class` from `get_instantiate`; the
+        // class pointer exists only after `type_object()` builds the type.
+        let _ = type_object();
         FrameLocalsProxy::allocate_stable(FrameLocalsProxy {
             ob: PyObject {
                 ob_type: std::ptr::null(),
