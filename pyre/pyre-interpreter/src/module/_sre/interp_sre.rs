@@ -848,20 +848,19 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             )));
         }
     }
-    let flags = unsafe { w_int_get_value(args[1]) };
     let groups_arg = args.get(3).copied().filter(|o| !o.is_null());
-    let groups = match groups_arg {
-        Some(g) => unsafe { w_int_get_value(g) },
-        None => 0,
-    };
     let groupindex_arg = args.get(4).copied().filter(|o| !o.is_null());
     let indexgroup_arg = args.get(5).copied().filter(|o| !o.is_null());
     // `extract_code` allocates.  Publish every already-live operand first,
     // then mint the omitted defaults — a sequential pin of a fresh object
     // after a published live set is safe; pinning an unpublished live
     // second slice is not.
+    // interp_sre.py `_sre_compile` `@unwrap_spec(flags=int, groups=int, ...)`.
     let roots = pyre_object::gc_roots::push_roots();
-    let mut live = vec![args[0], args[2]];
+    let mut live = vec![args[0], args[1], args[2]];
+    if let Some(groups) = groups_arg {
+        live.push(groups);
+    }
     if let Some(groupindex) = groupindex_arg {
         live.push(groupindex);
     }
@@ -870,18 +869,34 @@ fn sre_compile(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     }
     let base = roots.pin_roots(&live);
     let pattern_slot = base;
-    let code_list_slot = base + 1;
+    let flags_slot = base + 1;
+    let code_list_slot = base + 2;
+    let after_groups = base + 3 + usize::from(groups_arg.is_some());
+    let groups_slot = groups_arg.is_some().then_some(base + 3);
     let groupindex_slot = if groupindex_arg.is_some() {
-        base + 2
+        after_groups
     } else {
         let _ = roots.pin_root(w_dict_new());
         pyre_object::gc_roots::shadow_stack_len() - 1
     };
     let indexgroup_slot = if indexgroup_arg.is_some() {
-        base + 2 + usize::from(groupindex_arg.is_some())
+        after_groups + usize::from(groupindex_arg.is_some())
     } else {
         let _ = roots.pin_root(w_tuple_new(vec![]));
         pyre_object::gc_roots::shadow_stack_len() - 1
+    };
+
+    let mut w_flags = roots.get(flags_slot);
+    let flags = pyre_object::with_roots!(
+        w_flags => crate::baseobjspace::gateway_int_w(w_flags)
+    )?;
+    let groups = if let Some(slot) = groups_slot {
+        let mut w_groups = roots.get(slot);
+        pyre_object::with_roots!(
+            w_groups => crate::baseobjspace::gateway_int_w(w_groups)
+        )?
+    } else {
+        0
     };
 
     let pattern = roots.get(pattern_slot);

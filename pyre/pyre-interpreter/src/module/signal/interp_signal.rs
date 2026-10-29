@@ -1344,7 +1344,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     } else {
                         pyre_object::PY_NULL
                     };
-                    let which = (unsafe { pyre_object::w_int_get_value(w_which) }) as i32;
+                    // interp_signal.py `setitimer` `@unwrap_spec(which=int, ...)`.
+                    let which = if w_interval.is_null() {
+                        pyre_object::with_roots!(
+                            w_which, w_seconds => crate::baseobjspace::gateway_int_w(w_which)
+                        )?
+                    } else {
+                        pyre_object::with_roots!(
+                            w_which, w_seconds, w_interval => crate::baseobjspace::gateway_int_w(w_which)
+                        )?
+                    } as i32;
                     let read_f = |o: pyre_object::PyObjectRef| -> f64 {
                         unsafe {
                             if pyre_object::is_float(o) {
@@ -1403,7 +1412,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                             ));
                         }
                         let mut w_which = args[0];
-                        let which = (unsafe { pyre_object::w_int_get_value(w_which) }) as i32;
+                        // interp_signal.py `getitimer` `@unwrap_spec(which=int)`.
+                        let which = pyre_object::with_roots!(
+                            w_which => crate::baseobjspace::gateway_int_w(w_which)
+                        )? as i32;
                         let mut old = unsafe { std::mem::zeroed::<libc::itimerval>() };
                         let _ = pyre_object::with_roots!(w_which => unsafe {
                             majit_rlib::rsignal::c_getitimer(which, &mut old)
@@ -1435,13 +1447,17 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "siginterrupt() requires 2 arguments",
                             ));
                         }
-                        // interp_signal.py — `check_signum_in_range` runs
-                        // before the argument reaches `c_siginterrupt`, so the
-                        // narrowing below is exact.
-                        let sig = unsafe { pyre_object::w_int_get_value(args[0]) };
+                        // interp_signal.py `siginterrupt` `@unwrap_spec(signum=int, flag=int)`.
+                        let mut w_sig = args[0];
+                        let mut w_flag = args[1];
+                        let sig = pyre_object::with_roots!(
+                            w_sig, w_flag => signum_arg(w_sig)
+                        )?;
                         check_signum_in_range(sig)?;
                         let sig = sig as i32;
-                        let flag = (unsafe { pyre_object::w_int_get_value(args[1]) }) as i32;
+                        let flag = pyre_object::with_roots!(
+                            w_sig, w_flag => crate::baseobjspace::gateway_int_w(w_flag)
+                        )? as i32;
                         // `rsignal.c_siginterrupt` is `pypysig_siginterrupt`
                         // and saves errno.
                         if unsafe { majit_rlib::rsignal::c_siginterrupt(sig, flag) } < 0 {
@@ -1623,8 +1639,15 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                                 "pthread_sigmask() requires 2 arguments",
                             ));
                         }
-                        let how = (unsafe { pyre_object::w_int_get_value(args[0]) }) as i32;
-                        let mut set = fill_sigset(args[1])?;
+                        // interp_signal.py `pthread_sigmask` `@unwrap_spec(how=int)`.
+                        let mut w_how = args[0];
+                        let mut w_signals = args[1];
+                        let how = pyre_object::with_roots!(
+                            w_how, w_signals => crate::baseobjspace::gateway_int_w(w_how)
+                        )? as i32;
+                        let mut set = pyre_object::with_roots!(
+                            w_how, w_signals => fill_sigset(w_signals)
+                        )?;
                         let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
                         let ret = unsafe {
                             majit_rlib::rsignal::c_pthread_sigmask(how, &mut set, &mut previous)
