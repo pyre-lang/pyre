@@ -2383,41 +2383,6 @@ pub(crate) fn bridge_semantic_maps_from_jitcode_pc(
     bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, None, jitcode_pc)
 }
 
-/// Operand-stack Ref constants (`(semantic_slot, raw_ref)`) at the resume PC of
-/// a jitcode. The pcdep color map records live Variables only;
-/// `reconstruct_inline_recipe` uses this to refill the registerless constant
-/// slots an inlined-callee guard resume leaves empty after the color→slot
-/// inversion. Sources the slots from the predecessor-keyed
-/// `const_ref_slots_by_jit_pc` twin so the constant lookup uses the same
-/// coordinate as `pcdep_entries` and the liveness decode.
-pub(crate) fn const_ref_slots_at_pc_at(jitcode_index: i32, jitcode_pc: i32) -> Vec<(u16, i64)> {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        let sd = r.borrow();
-        let Some(jc) = sd.jitcodes.get(jitcode_index as usize) else {
-            return Vec::new();
-        };
-        if jitcode_pc != majit_ir::resumedata::NO_JITCODE_PC && jitcode_pc >= 0 {
-            let jp = jitcode_pc as usize;
-            if jc.payload.jitcode.can_decode_live_vars(jp, sd.op_live) {
-                // Source the const slots directly from the carried
-                // genuine `jitcode_pc` via the predecessor-keyed twin — the same
-                // decode-identity shape the pcdep/depth twins use at
-                // `bridge_semantic_maps_at_with_jitcode_pc`. A colored jitcode
-                // returns `Some` (an empty slot list is a legitimate hit).
-                if let Some(slots) = jc.payload.const_ref_slots_for_jitcode_pc(jp) {
-                    return slots;
-                }
-            }
-        }
-        Vec::new()
-    })
-}
-
-pub(crate) fn const_ref_slots_from_pc(jitcode_index: i32, pc: i32) -> Vec<(u16, i64)> {
-    const_ref_slots_at_pc_at(jitcode_index, pc)
-}
-
 /// Return the post-regalloc Ref-bank colors of the portal red args
 /// (`pypy/module/pypyjit/interp_jit.py reds = ['frame', 'ec']`) for
 /// the registered jitcode at `jitcode_index`. Both are `u16::MAX` for skeletons.
@@ -8651,9 +8616,10 @@ fn reconstruct_transparent_helper_recipe(
 /// model + super-instruction bytecode cannot guarantee those invariants for
 /// every reconstructed callee, so this returns `None` exactly where a rebuild
 /// would be unsound: a no-snapshot pc, an unresolved jitcode, a pure cellvar
-/// band, unrecoverable callee globals, an `enumerate_vars` count that disagrees
-/// with the encoded section (`consume_boxes`), or an int/float-bank register
-/// with no boxed-Ref source. Existing freevar cell objects, and a cellvar that
+/// band, unrecoverable callee globals, a missing callee frame red, an
+/// `enumerate_vars` count that disagrees with the encoded section
+/// (`consume_boxes`), or an int/float-bank register with no boxed-Ref source.
+/// Existing freevar cell objects, and a cellvar that
 /// overlaps a varname, are ordinary entries in the frame red's
 /// `locals_cells_stack_w` array and are rebuilt with that frame, exactly as
 /// `resume.py consume_boxes` rebuilds every MIFrame slot.
@@ -9030,8 +8996,8 @@ fn reconstruct_inline_recipe(
         semantic_ref_slot_for_reg_color(nlocals, stack_only, &maps.pcdep_entries, color)
     });
     // The Ref bank decodes COLOR-indexed (the liveness register `reg_idx` is the
-    // post-regalloc color). Built once here so the LiveRefColorUnmapped check,
-    // both portal returns, and the generic tail share the same vector.
+    // post-regalloc color). Built once here so the LiveRefColorUnmapped check
+    // and both portal returns share the same vector.
     let mut by_color_r: Vec<OpRef> = Vec::new();
     let mut by_color_c: Vec<majit_ir::Value> = Vec::new();
     let mut value_cursor = int_len;
@@ -9390,113 +9356,11 @@ fn reconstruct_inline_recipe(
         });
     }
 
-    // resume.py rebuild_from_resumedata / _callback_r writes every live
-    // register by color (`_prepare_next_section` → `enumerate_vars` →
-    // `_callback_r`). An empty per-PC map declines: there is no inversion
-    // to place those colors into the slot-indexed recipe banks
-    // (`load_local_value` / `stack_slot_reg_idx` /
-    // `assemble_bridge_inline_pending` read `registers_r` and `concrete_r`
-    // by `locals_cells_stack_w` slot). Otherwise every live color is placed
-    // by the `pcdep_entries` color → slot inversion below, and every decoded
-    // live color, slotted or not, is kept by color in `registers_r_color`
-    // except a slot-less color whose decoded box is the encoder's CONST_NULL
-    // drop marker (LiveRefColorUnmapped, above).
-    if maps.pcdep_entries.is_empty() {
-        crate::jitcode_dispatch::census_record("P2Recipe::PortalShapeRejected");
-        return None;
-    }
-
-    // The reconstructed inline frame's `registers_r`/`concrete_r` are read
-    // SLOT-indexed (`assemble_bridge_inline_pending` seeds
-    // `locals_cells_stack_w[k]` and the resumed tracer reads LOAD_FAST's
-    // `nlocals + stack_idx`), so invert the COLOR-indexed decode from above
-    // — for a borrowed local pushed on the stack the color ≠ slot, and a
-    // color-indexed seed lands the value at the wrong slot.  The int/float
-    // banks were decoded above and need no inversion.
-
-    // `pyframe.py valuestackdepth`: locals + cells + stack. Pure cellvars
-    // are gated out above; a cellvar that overlaps a varname is that
-    // local's slot.
-    // The semantic `valuestackdepth` is `stack_base() + operand_depth`, where
-    // `operand_depth` is the logical stack height the codewriter's forward
-    // dataflow computes for this pc (`LiveVars::stack_depth_at`). The portal
-    // frame reads the equivalent figure from the encoded vable
-    // `valuestackdepth` scalar (`state.rs`); an inline frame has no such
-    // scalar, so derive it from the bytecode here. An unreachable resume pc
-    // aborts the multi-frame path.
-    let valuestackdepth = nlocals + stack_only;
-
-    // Invert the COLOR-indexed decode into SLOT-indexed `registers_r`/
-    // `concrete_r`, mirroring the root frame's `setup_bridge_sym` color→slot
-    // mirror. `maps.pcdep_entries` is the per-PC `(color, slot)` map (non-empty
-    // — the empty-map decline above returned otherwise): each decoded color is
-    // placed at the semantic slot it denotes at this resume pc, so a borrowed
-    // local on the operand stack lands at its stack slot.
-    let mut registers_r = vec![OpRef::NONE; valuestackdepth];
-    let mut concrete_r = vec![majit_ir::Value::Void; valuestackdepth];
-    for &(bank, color, slot) in &maps.pcdep_entries {
-        if bank != 1 {
-            continue;
-        } // Ref bank only
-        let s = slot as usize;
-        let c = color as usize;
-        if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
-            registers_r[s] = by_color_r[c];
-            concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
-        }
-    }
-
-    // Refill registerless operand-stack constants the color map omits (an
-    // inlined callee has no value-stack resumedata to rematerialize them from).
-    for (slot, raw) in const_ref_slots_from_pc(frame.jitcode_index, frame.pc) {
-        let s = slot as usize;
-        if Some(s) == pending_result_abs_slot {
-            continue;
-        }
-        if s < valuestackdepth {
-            registers_r[s] = ctx.const_ref(raw);
-            concrete_r[s] = value_for_slot(Type::Ref, raw);
-        }
-    }
-
-    // Every operand-stack slot is live (the logical stack is dense). If one is
-    // still unfilled after the color→slot inversion and the constant refill,
-    // the slot holds a value neither path can reconstruct (an int/float operand
-    // constant, or an unsupported shape) — decline to the single-frame bridge
-    // rather than seed a NULL operand the re-executed bridge would deref.
-    // This path rebuilds from resumedata colors exactly as the virtual-array
-    // one above does, so it owes the operands a paused call consumed the same
-    // exemption: no callee ever flushed them and the resume collapses them to
-    // the result `make_result_of_lastop` delivers.
-    for s in nlocals..valuestackdepth {
-        if Some(s) == pending_result_abs_slot
-            || unreconstructable_operand_floor.is_some_and(|floor| s >= floor)
-        {
-            continue;
-        }
-        if registers_r[s] == OpRef::NONE {
-            decline!("MandatoryOperandMissing");
-        }
-    }
-
-    Some(ReconstructRecipe {
-        code_ptr: raw_code as *const (),
-        jitcode_index: frame.jitcode_index,
-        jitcode_pc: frame.pc,
-        nlocals,
-        valuestackdepth,
-        registers_i,
-        registers_r,
-        registers_f,
-        concrete_r,
-        registers_r_color: by_color_r,
-        frame: OpRef::NONE,
-        nargs: frame_nlocals,
-        return_substitute: None,
-        len_tail: false,
-        rebuilt_frame: None,
-        rebuilt_ec: None,
-    })
+    // Without the callee frame red the rebuilt frame cannot read
+    // `get_w_globals` (`debugdata.w_globals` or the code's first namespace),
+    // so the reconstruction cannot know which namespace this activation
+    // ran under.
+    decline!("NoFrameForGlobals");
 }
 
 fn bridge_decode_box(
@@ -16469,10 +16333,9 @@ pub(crate) fn recover_inline_callee_globals(code_ptr: *const ()) -> pyre_object:
 /// Globals for a reconstructed inline callee: `PyFrame.get_w_globals` on the
 /// resume-decoded frame when a concrete `PyFrame` is still attached, else the
 /// constructor `debugdata.w_globals` still sitting in that frame red's
-/// heapcache. `pycode.w_globals` is the fallback when `recipe.frame` is
-/// `NONE` — the generic `reconstruct_inline_recipe` tail that stores
-/// `frame: OpRef::NONE` would need a `w_globals` field captured onto the
-/// recipe at that `Some(ReconstructRecipe { ... })` to recover an override.
+/// heapcache. `pycode.w_globals` is the fallback when those reads do not
+/// answer. A Python callee with no frame red is declined at reconstruct
+/// time (`NoFrameForGlobals`) rather than rebuilt under the first namespace.
 pub(crate) fn recover_inline_callee_globals_from_recipe(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
