@@ -4250,6 +4250,10 @@ fn build_hasher_default_without_layout_is_void_zst() {
         super::tyref_is_void_zst(&ty, &llbc),
         "hasher param / field is lltype.Void"
     );
+    assert!(
+        super::tyref_default_is_unit(&ty, &llbc),
+        "Trait Default of Opaque BuildHasherDefault is unit"
+    );
 }
 
 #[test]

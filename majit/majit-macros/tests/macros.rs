@@ -948,6 +948,38 @@ mod jit_module {
         assert_eq!(oopspec_lookup_outer_trampoline, "dict.lookup");
         assert_eq!(oopspec_lookup_inner_trampoline, "dict.lookup");
     }
+
+    /// Residual CALL of the `@dont_look_inside` trampoline is a different
+    /// graph from the dispatch wrapper (`call.py get_jitcode` keys by
+    /// graph). `HELPER_FNADDRS` must publish that name so a subwalk can
+    /// execute it instead of a symbolic fnaddr.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_look_inside_iff_publishes_trampoline_helper_fnaddr() {
+        let mut found_wrapper = false;
+        let mut found_trampoline = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::lookup_outer") {
+                found_wrapper = true;
+                assert_eq!(desc.arity, 3);
+            }
+            if desc.path.ends_with("::lookup_outer_trampoline") {
+                found_trampoline = true;
+                assert_eq!(desc.arity, 3);
+                let f: extern "C" fn(i64, i64, i64) -> i64 =
+                    unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(1, 2, 3), 6);
+            }
+        });
+        assert!(
+            found_wrapper,
+            "look_inside_iff wrapper HELPER_FNADDR was not published"
+        );
+        assert!(
+            found_trampoline,
+            "look_inside_iff trampoline HELPER_FNADDR was not published"
+        );
+    }
 }
 
 mod jit_struct {

@@ -6954,6 +6954,114 @@ fn trait_as_ref_str_of_string_is_identity() {
 }
 
 #[test]
+fn trait_default_of_build_hasher_default_is_unit() {
+    let hasher = named_adt(0, vec![named_adt(1, vec![])]);
+    let llbc = std_trait_call_fixture(
+        "trait_default_hasher",
+        &["core", "default", "Default"],
+        "default",
+        &[],
+        hasher,
+        vec![
+            type_decl_struct(0, &["core", "hash", "BuildHasherDefault"], vec![]),
+            type_decl_struct(1, &["fixture", "ObjectKeyHasher"], vec![]),
+        ],
+    );
+    let graph = super::lower_function(&llbc, "trait_default_hasher")
+        .expect("lower Trait Default BuildHasherDefault");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(op.kind, OpKind::ConstNone)),
+        "<BuildHasherDefault<H> as Default>::default must become ConstNone; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "Trait Default of BuildHasherDefault must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn trait_default_of_opaque_build_hasher_default_is_unit() {
+    let hasher = named_adt(0, vec![named_adt(1, vec![])]);
+    let llbc = std_trait_call_fixture(
+        "trait_default_opaque_hasher",
+        &["core", "default", "Default"],
+        "default",
+        &[],
+        hasher,
+        vec![
+            opaque_type_decl(0, &["core", "hash", "BuildHasherDefault"]),
+            type_decl_struct(1, &["fixture", "ObjectKeyHasher"], vec![]),
+        ],
+    );
+    let graph = super::lower_function(&llbc, "trait_default_opaque_hasher")
+        .expect("lower Trait Default Opaque BuildHasherDefault");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(op.kind, OpKind::ConstNone)),
+        "Opaque BuildHasherDefault Default must become ConstNone; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "Trait Default of Opaque BuildHasherDefault must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
+fn user_named_build_hasher_default_stays_residual() {
+    let hasher = named_adt(0, vec![]);
+    let llbc = std_trait_call_fixture(
+        "user_hasher_default",
+        &["core", "default", "Default"],
+        "default",
+        &[],
+        hasher,
+        vec![type_decl_struct(
+            0,
+            &["pyre_test", "BuildHasherDefault"],
+            vec![],
+        )],
+    );
+    let graph = super::lower_function(&llbc, "user_hasher_default")
+        .expect("lower user BuildHasherDefault Default");
+    let ops = graph_ops(&graph);
+    assert!(
+        !ops.iter().any(|op| matches!(op.kind, OpKind::ConstNone)),
+        "a user type named BuildHasherDefault must not become unit; ops={ops:?}"
+    );
+    assert!(
+        call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "a user type named BuildHasherDefault stays a residual Default; ops={ops:?}"
+    );
+}
+
+#[test]
+fn fun_regular_hash_impl_default_of_build_hasher_default_is_unit() {
+    let hasher = named_adt(0, vec![named_adt(1, vec![])]);
+    let llbc = std_extern_call_fixture_with_types(
+        "hash_impl_default",
+        &["core", "hash", "<Impl>", "default"],
+        &[],
+        hasher,
+        vec![
+            opaque_type_decl(0, &["core", "hash", "BuildHasherDefault"]),
+            type_decl_struct(1, &["fixture", "ObjectKeyHasher"], vec![]),
+        ],
+    );
+    let graph = super::lower_function(&llbc, "hash_impl_default")
+        .expect("lower Fun Regular hash::<Impl>::default");
+    let ops = graph_ops(&graph);
+    assert!(
+        ops.iter().any(|op| matches!(op.kind, OpKind::ConstNone)),
+        "core::hash::<Impl>::default of BuildHasherDefault must become ConstNone; ops={ops:?}"
+    );
+    assert!(
+        !call_leafs(&ops).iter().any(|leaf| *leaf == "default"),
+        "Fun Regular void-ZST std default must not residualize; ops={ops:?}"
+    );
+}
+
+#[test]
 fn trait_default_of_i64_is_zero() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let llbc = std_trait_call_fixture(

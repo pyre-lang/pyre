@@ -9063,12 +9063,19 @@ pub(in crate::front::mir) fn tyref_checked_binop_value_type(
 }
 
 /// Default of `ty` is the unit value without running a `Default` body:
-/// `()` (`is_unit_type`) or `core::marker::PhantomData`. Any other ZST,
-/// a user type named `PhantomData` included, may have a custom
-/// `Default` (`tyref_is_zero_sized` is not this).
+/// `()` (`is_unit_type`) or a std void ZST (`PhantomData`,
+/// `BuildHasherDefault` — `type_str_leaf_is_void_zst`). A user type of
+/// the same leaf, or any other ZST, may have a custom `Default`
+/// (`tyref_is_zero_sized` is not this).
 pub(in crate::front::mir) fn tyref_default_is_unit(ty: &TyRef, llbc: &Llbc) -> bool {
-    is_unit_type(ty, llbc)
-        || adt_path_of_tyref(ty, llbc).as_deref() == Some("core::marker::PhantomData")
+    if is_unit_type(ty, llbc) {
+        return true;
+    }
+    let Some(path) = adt_path_of_tyref(ty, llbc) else {
+        return false;
+    };
+    let root = path.split("::").next().unwrap_or("");
+    matches!(root, "core" | "std") && crate::codewriter::call::type_str_leaf_is_void_zst(&path)
 }
 
 /// True when `ty` is Charon's unit type `()`.

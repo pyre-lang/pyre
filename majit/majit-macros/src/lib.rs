@@ -4314,6 +4314,25 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
             Ok(None) => None,
             Err(err) => return err.to_compile_error(),
         };
+    // The `@dont_look_inside` trampoline is a different graph
+    // (`call.py CallControl.get_jitcode` keys by graph). Residual CALL
+    // of `{name}_trampoline` (wrapper else-branch, or a specialized
+    // residual when the predicate is false) needs its own adapter.
+    // Aliasing that name onto the wrapper re-enters the iff dispatch.
+    let mut trampoline_func = func.clone();
+    trampoline_func.sig.ident = trampoline_name.clone();
+    let trampoline_call_target_fn = match emit_helper_call_target_fn(
+        &trampoline_func,
+        true,
+        None,
+        "look_inside_iff",
+        &[],
+        false,
+    ) {
+        Ok(Some((_, _, tokens))) => Some(tokens),
+        Ok(None) => None,
+        Err(err) => return err.to_compile_error(),
+    };
 
     quote! {
         // rlib/jit.py — func = unroll_safe(func)
@@ -4363,6 +4382,7 @@ fn expand_look_inside_iff_item(predicate_path: Path, mut func: ItemFn) -> proc_m
         }
 
         #call_target_fn
+        #trampoline_call_target_fn
     }
 }
 
@@ -5526,6 +5546,53 @@ mod tests {
         assert_eq!(
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
+        );
+    }
+
+    #[test]
+    fn look_inside_iff_trampoline_emits_its_own_word_abi_adapter() {
+        let func = parse_fn(
+            "fn store(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) -> bool { true }",
+        );
+        assert_eq!(trampoline_skip_reason(&func, "look_inside_iff", &[]), None);
+        let (_, _, wrapper_tokens) =
+            emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], false)
+                .expect("emit wrapper")
+                .expect("wrapper adapter");
+        let wrapper_text = wrapper_tokens.to_string();
+        assert!(
+            wrapper_text.contains("fn __majit_call_target_store ("),
+            "{wrapper_text}"
+        );
+        assert!(
+            wrapper_text.contains("stringify ! (store)"),
+            "{wrapper_text}"
+        );
+
+        let mut trampoline = func.clone();
+        trampoline.sig.ident = format_ident!("store_trampoline");
+        let (_, _, tramp_tokens) =
+            emit_helper_call_target_fn(&trampoline, true, None, "look_inside_iff", &[], false)
+                .expect("emit trampoline")
+                .expect("trampoline adapter");
+        let tramp_text = tramp_tokens.to_string();
+        assert!(
+            tramp_text.contains(
+                "fn __majit_call_target_store_trampoline (__majit_arg_0 : i64 , __majit_arg_1 : i64 , __majit_arg_2 : i64)"
+            ),
+            "{tramp_text}"
+        );
+        assert!(
+            tramp_text.contains("store_trampoline ("),
+            "adapter must call the trampoline graph, got {tramp_text}"
+        );
+        assert!(
+            tramp_text.contains("stringify ! (store_trampoline)"),
+            "HELPER_FNADDRS path must be the trampoline name, got {tramp_text}"
+        );
+        assert!(
+            !wrapper_text.contains("stringify ! (store_trampoline)"),
+            "wrapper adapter must not publish the trampoline name, got {wrapper_text}"
         );
     }
 

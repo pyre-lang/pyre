@@ -4931,10 +4931,11 @@ impl<'a> Lowering<'a> {
             || tyref_is_string_value(ty, self.llbc)
     }
 
-    /// Default of `ty`: primitive scalar zero, unit / `PhantomData`,
-    /// empty `Vec` (`vec::Vec::new` → `newlist` / `ll_newemptylist`),
-    /// empty rstr `STR` (`Wtf8` / `Wtf8Buf` / `str`), or
-    /// `TupleRepr.newtuple` of those.
+    /// Default of `ty`: primitive scalar zero, unit / std void ZST
+    /// (`PhantomData`, `BuildHasherDefault`), empty `Vec`
+    /// (`vec::Vec::new` → `newlist` / `ll_newemptylist`), empty rstr
+    /// `STR` (`Wtf8` / `Wtf8Buf` / `str`), or `TupleRepr.newtuple` of
+    /// those.
     pub(in crate::front::mir) fn emit_default_of_ty(
         &mut self,
         bb_id: BlockId,
