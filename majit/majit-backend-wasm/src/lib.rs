@@ -6064,7 +6064,7 @@ impl majit_backend::Backend for WasmBackend {
         // fail args positionally into `frame[1..]`. `build_function` reads the
         // positional slot `k`, independently of the bridge value id, so no
         // argument-recovery layout is needed — hence `caller_recovery_layout`
-        // and `previous_tokens` are unused.
+        // is unused. `descr_owning_jct` names the source loop.
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
             diag_bump(1);

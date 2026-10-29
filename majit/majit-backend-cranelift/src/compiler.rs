@@ -23123,9 +23123,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // directly via
         // `rd_loop_token_clt`.  The metainterp caller now passes that
         // owning JCT as `original_token`, so the matching backend descr
-        // is always reachable inside `original_compiled.fail_descrs` —
-        // the prior `previous_tokens` scan was a TODO compensating
-        // for the absence of `descr_owning_jct` and has been retired.
+        // is always reachable inside `original_compiled.fail_descrs`.
         let source_trace_id = fail_descr.trace_id();
         let source_descr = find_fail_descr_in_fail_descrs(
             &original_compiled.fail_descrs,
