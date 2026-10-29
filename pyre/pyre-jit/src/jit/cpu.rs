@@ -423,7 +423,7 @@ pub struct Cpu {
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
         i64,
-    ) -> i64,
+    ),
     /// BINARY_SLICE residual — `(obj, start, stop) → obj[start:stop]`.
     pub binary_slice_fn: extern "C" fn(
         pyre_object::PyObjectRef,
@@ -437,40 +437,33 @@ pub struct Cpu {
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
-    ) -> i64,
+    ),
     /// DELETE_SUBSCR residual — `(obj, index) → void` (`del obj[index]`).
-    pub delete_subscr_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub delete_subscr_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// LIST_EXTEND residual — `(list, iterable) → void` (`list.extend(iterable)`,
     /// list peeked + mutated in place).
-    pub list_extend_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub list_extend_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// SET_ADD residual — `(set, value) → void` (`set.add(value)`, peeked).
-    pub set_add_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub set_add_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// SET_UPDATE residual — `(set, iterable) → void` (`set.update`, peeked).
-    pub set_update_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub set_update_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// DICT_UPDATE residual — `(dict, source) → void` (`dict.update`, peeked).
-    pub dict_update_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub dict_update_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// MAP_ADD residual — `(dict, key, value) → void` (`dict[key]=value`, peeked).
-    pub map_add_fn: extern "C" fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> i64,
+    pub map_add_fn:
+        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// DICT_MERGE residual — `(dict, source, callable) → void` (`**` merge,
     /// peeked; callable only for error-message prefixes).
-    pub dict_merge_fn: extern "C" fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> i64,
+    pub dict_merge_fn:
+        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// LIST_APPEND residual — `(list, value) → void` (`list.append(value)`,
     /// list peeked + mutated in place).  The full-body walker's #171 fold
     /// intercepts it (`RuntimeHelperKind::ListAppendValue`); this is the decline
     /// fallback, identical to the residual the retired MIFrame tracer recorded.
-    pub list_append_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
+    pub list_append_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// DELETE_ATTR residual — `(obj, code, name_idx) → void` (`del obj.name`).
     /// Resolves the name from the code object and runs generic `delattr`.
-    pub delete_attr_fn:
-        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, i64) -> i64,
+    pub delete_attr_fn: extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, i64),
     /// FORMAT_SIMPLE residual — `value → str` (`f"{x}"`, empty spec).
     /// User `__format__` may run Python (fallible).
     pub format_simple_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
@@ -563,19 +556,13 @@ pub struct Cpu {
     pub for_iter_exception_match_fn:
         extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef) -> i64,
     /// interp_jit.py `jump_absolute` residual: the `bytecode_trace` slow
-    /// path.  Void result (`residual_call_r_v`):
-    /// always returns 0; an exception is published for `GuardNoException`.
-    pub bytecode_trace_jitted_slow_fn: extern "C" fn(
-        *mut pyre_interpreter::PyExecutionContext,
-        *mut pyre_interpreter::PyFrame,
-    ) -> i64,
+    /// path.  Void result (`residual_call_r_v`); an exception is published for `GuardNoException`.
+    pub bytecode_trace_jitted_slow_fn:
+        extern "C" fn(*mut pyre_interpreter::PyExecutionContext, *mut pyre_interpreter::PyFrame),
     /// `dispatch_bytecode` jitted arm residual: `bytecode_only_trace`.
-    /// Void result (`residual_call_r_v`): always returns 0; an exception
-    /// is published for `GuardNoException`.
-    pub bytecode_only_trace_jitted_fn: extern "C" fn(
-        *mut pyre_interpreter::PyExecutionContext,
-        *mut pyre_interpreter::PyFrame,
-    ) -> i64,
+    /// Void result (`residual_call_r_v`); an exception is published for `GuardNoException`.
+    pub bytecode_only_trace_jitted_fn:
+        extern "C" fn(*mut pyre_interpreter::PyExecutionContext, *mut pyre_interpreter::PyFrame),
     /// `bh_unary_negative_fn(value)` — UNARY_NEGATIVE `-value` residual
     /// (a user `__neg__` may run Python → fallible).
     pub unary_negative_fn: extern "C" fn(pyre_object::PyObjectRef) -> pyre_object::PyObjectRef,
@@ -648,11 +635,8 @@ pub struct Cpu {
     /// `bhimpl_load_const` — load constant from frame's code object.
     pub load_const_fn: extern "C" fn(pyre_object::PyObjectRef, i64) -> pyre_object::PyObjectRef,
     /// `bhimpl_store_subscr` — obj[key] = value.
-    pub store_subscr_fn: extern "C" fn(
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-        pyre_object::PyObjectRef,
-    ) -> i64,
+    pub store_subscr_fn:
+        extern "C" fn(pyre_object::PyObjectRef, pyre_object::PyObjectRef, pyre_object::PyObjectRef),
     /// `bhimpl_getattr` — `getattr(obj, w_name)`.
     /// `(obj: Ref, w_name: Ref) → Ref` with `w_name` an interned str
     /// constant.  Blackhole/deopt lowering of `LOAD_ATTR`
@@ -676,7 +660,7 @@ pub struct Cpu {
         *mut pyre_interpreter::PyFrame,
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
-    ) -> i64,
+    ),
     /// `bhimpl_store_global` — `(frame: Ref, w_name: Ref, value: Ref) →
     /// Void` with `w_name` an interned str constant.  Blackhole/deopt
     /// lowering of `STORE_GLOBAL` (`pyopcode.py`); writes directly
@@ -685,17 +669,15 @@ pub struct Cpu {
         *mut pyre_interpreter::PyFrame,
         pyre_object::PyObjectRef,
         pyre_object::PyObjectRef,
-    ) -> i64,
+    ),
     /// `bh_delete_name_fn` — `(frame: Ref, w_name: Ref) → Void`, the
     /// lowering of `DELETE_NAME`; deletes the binding from `w_locals` and
     /// raises `NameError` when it is absent.
-    pub delete_name_fn:
-        extern "C" fn(*mut pyre_interpreter::PyFrame, pyre_object::PyObjectRef) -> i64,
+    pub delete_name_fn: extern "C" fn(*mut pyre_interpreter::PyFrame, pyre_object::PyObjectRef),
     /// `bh_delete_global_fn` — `(frame: Ref, w_name: Ref) → Void`, the
     /// lowering of `DELETE_GLOBAL`; deletes directly from `w_globals`,
     /// bypassing `w_locals`.
-    pub delete_global_fn:
-        extern "C" fn(*mut pyre_interpreter::PyFrame, pyre_object::PyObjectRef) -> i64,
+    pub delete_global_fn: extern "C" fn(*mut pyre_interpreter::PyFrame, pyre_object::PyObjectRef),
     /// `bh_load_locals_fn` — `(frame: Ref) → Ref`, the lowering of
     /// `LOAD_LOCALS` (`pyopcode.py`); hands back the frame's own
     /// `w_locals` mapping.

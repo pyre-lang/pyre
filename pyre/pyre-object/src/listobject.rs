@@ -7060,9 +7060,8 @@ unsafe fn w_list_setslice_inner(
 }
 
 #[majit_macros::dont_look_inside]
-pub extern "C" fn jit_list_append(list: PyObjectRef, item: PyObjectRef) -> i64 {
+pub extern "C" fn jit_list_append(list: PyObjectRef, item: PyObjectRef) {
     unsafe { w_list_append(list, item) };
-    0
 }
 
 #[majit_macros::dont_look_inside]
@@ -7735,7 +7734,7 @@ mod tests {
             );
         }
         assert_eq!(jit_list_setitem(list, 0, w_int_new(9)), 0);
-        assert_eq!(jit_list_append(list, w_int_new(7)), 0);
+        jit_list_append(list, w_int_new(7));
         unsafe {
             assert_eq!(w_list_len(list), 3);
             assert_eq!(

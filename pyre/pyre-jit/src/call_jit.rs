@@ -7441,14 +7441,14 @@ pub extern "C" fn bh_load_attr_fn(
 /// symmetric counterpart of [`bh_load_attr_fn`]: resolves the attribute
 /// name from the resume frame's code object via `name_idx` and runs the
 /// generic `setattr_str` (may invoke user `__setattr__` → `MayForce`).
-/// Void result, so always returns 0; an exception is published through
+/// Void result; an exception is published through
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`.
 pub extern "C" fn bh_store_attr_fn(
     obj: PyObjectRef,
     value: PyObjectRef,
     w_code_ptr: PyObjectRef,
     name_idx: i64,
-) -> i64 {
+) {
     let code = unsafe {
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
     };
@@ -7460,14 +7460,13 @@ pub extern "C" fn bh_store_attr_fn(
         code.names.len()
     );
     if idx >= code.names.len() {
-        return 0;
+        return;
     }
     let name = code.names[idx].as_ref();
     if let Err(mut err) = pyre_interpreter::baseobjspace::setattr_str(obj, name, value) {
         let exc_obj = err.to_exc_object();
         publish_residual_call_exception(exc_obj);
     }
-    0
 }
 
 /// DELETE_ATTR residual (`delete_attr` HLOp → `residual_call_ir_v`).
@@ -7475,13 +7474,8 @@ pub extern "C" fn bh_store_attr_fn(
 /// (same invariant as `bh_store_attr_fn`) and runs `del obj.name` through
 /// `baseobjspace::delattr_str`.  A user `__delattr__` may run Python
 /// (`MayForce`); on error the exception is published through
-/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException` and the call
-/// returns 0.
-pub extern "C" fn bh_delete_attr_fn(
-    obj: PyObjectRef,
-    w_code_ptr: PyObjectRef,
-    name_idx: i64,
-) -> i64 {
+/// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`.
+pub extern "C" fn bh_delete_attr_fn(obj: PyObjectRef, w_code_ptr: PyObjectRef, name_idx: i64) {
     let code = unsafe {
         &*(pyre_interpreter::w_code_get_ptr(w_code_ptr) as *const pyre_interpreter::CodeObject)
     };
@@ -7492,14 +7486,13 @@ pub extern "C" fn bh_delete_attr_fn(
         code.names.len()
     );
     if idx >= code.names.len() {
-        return 0;
+        return;
     }
     let name = code.names[idx].as_ref();
     if let Err(mut err) = pyre_interpreter::baseobjspace::delattr_str(obj, name) {
         let exc_obj = err.to_exc_object();
         publish_residual_call_exception(exc_obj);
     }
-    0
 }
 
 /// IMPORT_FROM residual (`import_from` HLOp → `residual_call_ir_r`).
@@ -7642,8 +7635,8 @@ pub extern "C" fn bh_binary_slice_fn(
 /// `runtime_ops::store_slice_values` (the same code the interpreter's
 /// `store_slice` runs — builds a `slice(start, stop, None)` and dispatches
 /// `setitem`).  A user `__setitem__` or slice-bound `__index__` may run
-/// Python and force virtualizables (`MayForce`).  Void result, so always
-/// returns 0; on error the exception is published through
+/// Python and force virtualizables (`MayForce`).  Void result; on error the
+/// exception is published through
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
 /// `bh_delete_subscr_fn`.
 pub extern "C" fn bh_store_slice_fn(
@@ -7651,23 +7644,22 @@ pub extern "C" fn bh_store_slice_fn(
     start: PyObjectRef,
     stop: PyObjectRef,
     value: PyObjectRef,
-) -> i64 {
+) {
     if let Err(mut err) = pyre_interpreter::runtime_ops::store_slice_values(obj, start, stop, value)
     {
         let exc_obj = err.to_exc_object();
         publish_residual_call_exception(exc_obj);
     }
-    0
 }
 
 /// DELETE_SUBSCR residual (`delete_subscr` HLOp → `residual_call_r_v`).
 /// Runs `del obj[index]` through the shared `baseobjspace::delitem` (the
 /// same code the interpreter's `delete_subscript` runs).  A `__delitem__`
-/// on a user object may run Python (`MayForce`).  Void result, so always
-/// returns 0; on error the exception is published through
+/// on a user object may run Python (`MayForce`).  Void result; on error the
+/// exception is published through
 /// `BH_LAST_EXC_VALUE` for the trailing `GuardNoException`, matching
 /// `bh_store_subscr_fn`.
-pub extern "C" fn bh_delete_subscr_fn(obj: PyObjectRef, index: PyObjectRef) -> i64 {
+pub extern "C" fn bh_delete_subscr_fn(obj: PyObjectRef, index: PyObjectRef) {
     // Diagnostic (#24 wasm-Linux miscompile): the delete target and index Refs
     // must be non-null at the residual boundary. A null `items` on the wasm
     // resume path would silently mis-route — `is_list(null)` is false without a
@@ -7681,7 +7673,6 @@ pub extern "C" fn bh_delete_subscr_fn(obj: PyObjectRef, index: PyObjectRef) -> i
         let exc_obj = err.to_exc_object();
         publish_residual_call_exception(exc_obj);
     }
-    0
 }
 
 /// LIST_EXTEND residual (`list_extend` HLOp → `residual_call_r_v`).
@@ -7689,37 +7680,34 @@ pub extern "C" fn bh_delete_subscr_fn(obj: PyObjectRef, index: PyObjectRef) -> i
 /// `opcode_ops::list_extend_value` (the same code the interpreter's
 /// `list_extend` runs); `list` is peeked and mutated in place.  A
 /// non-iterable operand or a user iterator running Python can raise
-/// (`MayForce`).  Void result, so always returns 0; on error the
+/// (`MayForce`).  Void result; on error the
 /// exception is published through `BH_LAST_EXC_VALUE` for the trailing
 /// `GuardNoException`, matching `bh_delete_subscr_fn`.
-pub extern "C" fn bh_list_extend_fn(list: PyObjectRef, iterable: PyObjectRef) -> i64 {
+pub extern "C" fn bh_list_extend_fn(list: PyObjectRef, iterable: PyObjectRef) {
     if let Err(mut err) = pyre_interpreter::opcode_ops::list_extend_value(list, iterable) {
         let exc_obj = err.to_exc_object();
         publish_residual_call_exception(exc_obj);
     }
-    0
 }
 
 /// SET_ADD residual (`set_add` HLOp → `residual_call_r_v`).  Runs
 /// `set.add(value)` (or `list.append`) through the shared
 /// `opcode_ops::set_add_value`; `set` is peeked and mutated in place.
 /// A user `__hash__`/`__eq__` can run Python (`MayForce`).  Void result.
-pub extern "C" fn bh_set_add_fn(set: PyObjectRef, value: PyObjectRef) -> i64 {
+pub extern "C" fn bh_set_add_fn(set: PyObjectRef, value: PyObjectRef) {
     if let Err(mut err) = pyre_interpreter::opcode_ops::set_add_value(set, value) {
         publish_residual_call_exception(err.to_exc_object());
     }
-    0
 }
 
 /// SET_UPDATE residual (`set_update` HLOp → `residual_call_r_v`).  Runs
 /// `set.update(iterable)` (or `list.extend`) through the shared
 /// `opcode_ops::set_update_value`; `set` is peeked and mutated in place.
 /// A user iterator / `__hash__` can run Python (`MayForce`).  Void result.
-pub extern "C" fn bh_set_update_fn(set: PyObjectRef, iterable: PyObjectRef) -> i64 {
+pub extern "C" fn bh_set_update_fn(set: PyObjectRef, iterable: PyObjectRef) {
     if let Err(mut err) = pyre_interpreter::opcode_ops::set_update_value(set, iterable) {
         publish_residual_call_exception(err.to_exc_object());
     }
-    0
 }
 
 /// DICT_UPDATE residual (`dict_update` HLOp → `residual_call_r_v`).  Runs
@@ -7727,22 +7715,20 @@ pub extern "C" fn bh_set_update_fn(set: PyObjectRef, iterable: PyObjectRef) -> i
 /// shared `opcode_ops::dict_update_value`; `dict` is peeked and mutated in
 /// place.  A `keys()`/`__getitem__`/`__hash__` can run Python
 /// (`MayForce`).  Void result.
-pub extern "C" fn bh_dict_update_fn(dict: PyObjectRef, source: PyObjectRef) -> i64 {
+pub extern "C" fn bh_dict_update_fn(dict: PyObjectRef, source: PyObjectRef) {
     if let Err(mut err) = pyre_interpreter::opcode_ops::dict_update_value(dict, source) {
         publish_residual_call_exception(err.to_exc_object());
     }
-    0
 }
 
 /// MAP_ADD residual (`map_add` HLOp → `residual_call_r_v`).  Runs
 /// `dict[key] = value` through the shared `opcode_ops::map_add_value`;
 /// `dict` is peeked and mutated in place.  A user key `__hash__`/`__eq__`
 /// can run Python (`MayForce`).  Void result.
-pub extern "C" fn bh_map_add_fn(dict: PyObjectRef, key: PyObjectRef, value: PyObjectRef) -> i64 {
+pub extern "C" fn bh_map_add_fn(dict: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     if let Err(mut err) = pyre_interpreter::opcode_ops::map_add_value(dict, key, value) {
         publish_residual_call_exception(err.to_exc_object());
     }
-    0
 }
 
 /// DICT_MERGE residual (`dict_merge` HLOp → `residual_call_r_v`).  Runs
@@ -7755,11 +7741,10 @@ pub extern "C" fn bh_dict_merge_fn(
     dict: PyObjectRef,
     source: PyObjectRef,
     w_callable: PyObjectRef,
-) -> i64 {
+) {
     if let Err(mut err) = pyre_interpreter::opcode_ops::dict_merge_value(dict, source, w_callable) {
         publish_residual_call_exception(err.to_exc_object());
     }
-    0
 }
 
 /// Compute the LOOKUP_METHOD `null_or_self` for blackhole LOAD_ATTR resume,
@@ -7901,13 +7886,12 @@ pub extern "C" fn bh_load_name_fn(
 /// cache upstream and this residual is handed the wrapped name rather than an
 /// index, so it enters through `store_name_value_w`, which names the key from
 /// that `w_name` instead of resolving a `co_names_w` slot.
-/// Returns 1 on success; on error it sets `BH_LAST_EXC_VALUE` and
-/// returns 0, matching `bh_store_subscr_fn`.
+/// On error it sets `BH_LAST_EXC_VALUE`.
 pub extern "C" fn bh_store_name_fn(
     frame_ptr: *mut PyFrame,
     w_name: PyObjectRef,
     value: PyObjectRef,
-) -> i64 {
+) {
     use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
     assert!(
         !frame_ptr.is_null(),
@@ -7915,17 +7899,15 @@ pub extern "C" fn bh_store_name_fn(
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *frame_ptr };
-    match unsafe { pyre_interpreter::eval::store_name_value_w(frame, w_name, value) } {
-        Ok(()) => 1,
-        Err(mut err) => {
-            // Publish into both exception cells: STORE_NAME lowers into the
-            // full-body-walk compiled trace, whose `GUARD_NO_EXCEPTION` reads
-            // the backend `_store_exception` cells; writing only
-            // `BH_LAST_EXC_VALUE` would let a raising `__setitem__` on a
-            // mapping-locals namespace be silently swallowed.
-            publish_residual_call_exception(err.to_exc_object());
-            0
-        }
+    if let Err(mut err) =
+        unsafe { pyre_interpreter::eval::store_name_value_w(frame, w_name, value) }
+    {
+        // Publish into both exception cells: STORE_NAME lowers into the
+        // full-body-walk compiled trace, whose `GUARD_NO_EXCEPTION` reads
+        // the backend `_store_exception` cells; writing only
+        // `BH_LAST_EXC_VALUE` would let a raising `__setitem__` on a
+        // mapping-locals namespace be silently swallowed.
+        publish_residual_call_exception(err.to_exc_object());
     }
 }
 
@@ -7938,13 +7920,13 @@ pub extern "C" fn bh_store_name_fn(
 /// blackhole-only execution contract and `w_name` ABI as
 /// `bh_store_name_fn`.  `STORE_GLOBAL` carries no nameindex-keyed cache
 /// and this residual is handed the wrapped name rather than an index, so it
-/// enters through `store_global_value_w`.  Returns 1 on
-/// success; on error it sets `BH_LAST_EXC_VALUE` and returns 0.
+/// enters through `store_global_value_w`.  On error it sets
+/// `BH_LAST_EXC_VALUE`.
 pub extern "C" fn bh_store_global_fn(
     frame_ptr: *mut PyFrame,
     w_name: PyObjectRef,
     value: PyObjectRef,
-) -> i64 {
+) {
     use pyre_interpreter::pyopcode::NamespaceOpcodeHandler;
     assert!(
         !frame_ptr.is_null(),
@@ -7952,17 +7934,15 @@ pub extern "C" fn bh_store_global_fn(
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *frame_ptr };
-    match unsafe { pyre_interpreter::eval::store_global_value_w(frame, w_name, value) } {
-        Ok(()) => 1,
-        Err(mut err) => {
-            // Publish into both exception cells, matching the STORE_NAME arm.
-            // `store_global_value` is infallible today (this arm is dead), but
-            // STORE_GLOBAL lowers into the compiled trace with a following
-            // `GUARD_NO_EXCEPTION` that reads the backend cells, so should a
-            // fallible path appear the raise must not be swallowed.
-            publish_residual_call_exception(err.to_exc_object());
-            0
-        }
+    if let Err(mut err) =
+        unsafe { pyre_interpreter::eval::store_global_value_w(frame, w_name, value) }
+    {
+        // Publish into both exception cells, matching the STORE_NAME arm.
+        // `store_global_value` is infallible today (this arm is dead), but
+        // STORE_GLOBAL lowers into the compiled trace with a following
+        // `GUARD_NO_EXCEPTION` that reads the backend cells, so should a
+        // fallible path appear the raise must not be swallowed.
+        publish_residual_call_exception(err.to_exc_object());
     }
 }
 
@@ -7971,19 +7951,15 @@ pub extern "C" fn bh_store_global_fn(
 /// when the binding is absent.  The trace carries no `co_names` index, so it
 /// enters through `delete_name_w`, which deletes through the key object the
 /// trace already holds.
-pub extern "C" fn bh_delete_name_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef) -> i64 {
+pub extern "C" fn bh_delete_name_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef) {
     assert!(
         !frame_ptr.is_null(),
         "bh_delete_name_fn requires a non-null PyFrame; every DELETE_NAME emit \
          site must thread portal_frame_reg as the leading ref operand"
     );
     let frame = unsafe { &mut *frame_ptr };
-    match unsafe { pyre_interpreter::eval::delete_name_w(frame, w_name) } {
-        Ok(()) => 1,
-        Err(mut err) => {
-            publish_residual_call_exception(err.to_exc_object());
-            0
-        }
+    if let Err(mut err) = unsafe { pyre_interpreter::eval::delete_name_w(frame, w_name) } {
+        publish_residual_call_exception(err.to_exc_object());
     }
 }
 
@@ -8096,7 +8072,7 @@ pub extern "C" fn bh_load_import_globals_fn(frame_ptr: *mut PyFrame) -> PyObject
 
 /// DELETE_GLOBAL residual using the frame receiver and interned-name ABI.
 /// pyopcode.py DELETE_GLOBAL deletes directly from `w_globals`.
-pub extern "C" fn bh_delete_global_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef) -> i64 {
+pub extern "C" fn bh_delete_global_fn(frame_ptr: *mut PyFrame, w_name: PyObjectRef) {
     use pyre_interpreter::pyopcode::OpcodeStepExecutor;
     assert!(
         !frame_ptr.is_null(),
@@ -8112,14 +8088,10 @@ pub extern "C" fn bh_delete_global_fn(frame_ptr: *mut PyFrame, w_name: PyObjectR
         msg.push_str("'");
         let mut err = pyre_interpreter::PyError::key_error(msg);
         publish_residual_call_exception(err.to_exc_object());
-        return 0;
+        return;
     };
-    match frame.delete_global(name) {
-        Ok(()) => 1,
-        Err(mut err) => {
-            publish_residual_call_exception(err.to_exc_object());
-            0
-        }
+    if let Err(mut err) = frame.delete_global(name) {
+        publish_residual_call_exception(err.to_exc_object());
     }
 }
 
@@ -8530,7 +8502,7 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
 /// `ec.bytecode_trace(frame, decr_by)`.
 ///
 /// Void result (`residual_call_r_v`), matching `bh_delete_subscr_fn`:
-/// always returns 0; an exception is published through `BH_LAST_EXC_VALUE`
+/// an exception is published through `BH_LAST_EXC_VALUE`
 /// for the trailing `GuardNoException`.
 ///
 /// pyre-adaptation: the walked guard fails on `word >= JIT_BREAKER_FLOOR`,
@@ -8543,9 +8515,9 @@ pub extern "C" fn bh_get_iter_fn(obj: PyObjectRef) -> PyObjectRef {
 pub extern "C" fn bh_bytecode_trace_jitted_slow(
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame_ptr: *mut PyFrame,
-) -> i64 {
+) {
     if ec.is_null() {
-        return 0;
+        return;
     }
     let decr_by = if pyre_interpreter::module::thread::gil::threads_initialized() {
         crate::eval::_get_adapted_tick_counter()
@@ -8553,10 +8525,9 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(
         0
     };
     match unsafe { (*ec).bytecode_trace(frame_ptr, decr_by) } {
-        Ok(()) => 0,
+        Ok(()) => {}
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
-            0
         }
     }
 }
@@ -8565,14 +8536,14 @@ pub extern "C" fn bh_bytecode_trace_jitted_slow(
 /// (`pyopcode.py`): `ec.bytecode_only_trace(frame)`.
 ///
 /// Void result (`residual_call_r_v`), matching `bh_bytecode_trace_jitted_slow`:
-/// always returns 0; an exception is published through `BH_LAST_EXC_VALUE`
+/// an exception is published through `BH_LAST_EXC_VALUE`
 /// for the trailing `GuardNoException`.
 pub extern "C" fn bh_bytecode_only_trace_jitted(
     ec: *mut pyre_interpreter::PyExecutionContext,
     frame_ptr: *mut PyFrame,
-) -> i64 {
+) {
     if ec.is_null() {
-        return 0;
+        return;
     }
     let before = if frame_ptr.is_null() {
         -1
@@ -8594,11 +8565,9 @@ pub extern "C" fn bh_bytecode_only_trace_jitted(
                     unsafe { (*frame).set_last_instr_from_next_instr(jump_target) };
                 }
             }
-            0
         }
         Err(mut err) => {
             publish_residual_call_exception(err.to_exc_object());
-            0
         }
     }
 }

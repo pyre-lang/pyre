@@ -1391,10 +1391,12 @@ pub extern "C" fn jit_baseobjspace_dict_display_setitem(
     obj: PyObjectRef,
     key: PyObjectRef,
     value: PyObjectRef,
-) -> i64 {
+) {
     match crate::baseobjspace::dict_display_setitem(obj, key, value) {
-        Ok(()) => 0,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(()) => {}
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+        }
     }
 }
 
@@ -1421,10 +1423,12 @@ pub extern "C" fn jit_opcode_ops_list_extend_value(
 // `set_add_value`; its Rust `Result` is a different ABI, so the two must not
 // share an address.
 #[inline(never)]
-pub extern "C" fn jit_opcode_ops_set_add_value(set: PyObjectRef, value: PyObjectRef) -> i64 {
+pub extern "C" fn jit_opcode_ops_set_add_value(set: PyObjectRef, value: PyObjectRef) {
     match set_add_value(set, value) {
-        Ok(()) => 0,
-        Err(err) => crate::runtime_ops::jit_publish_residual_error(err),
+        Ok(()) => {}
+        Err(err) => {
+            crate::runtime_ops::jit_publish_residual_error(err);
+        }
     }
 }
 
@@ -1538,7 +1542,7 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: *mut crate::pyframe::PyF
     }
 }
 
-/// C-ABI 3-arg `(obj, key, value) → i64` store_subscr helper bound by
+/// C-ABI 3-arg `(obj, key, value)` store_subscr helper bound by
 /// `pyre-jit::cpu.store_subscr_fn` (`pyre-jit/src/jit/cpu.rs`).
 /// The codewriter emits a `residual_call_r_v(store_subscr_fn, obj,
 /// key, value)` (`codewriter.rs`
@@ -1561,23 +1565,17 @@ pub extern "C" fn bh_execute_store_subscr(executor_ptr: *mut crate::pyframe::PyF
 /// dual-publish mirrors `bh_store_attr_fn`
 /// (`call_jit::publish_residual_call_exception`) and `jit_next`; writing
 /// only `BH_LAST_EXC_VALUE` would leave `GuardNoException` reading a
-/// stale 0 and silently swallow the raise. The 1/0 return signals
-/// raise-vs-success to the walker's residual executor. The walker drains
+/// stale 0 and silently swallow the raise. The walker drains
 /// the backend cells after an Err (`jitcode_dispatch.rs` execute-raised
 /// arm), so the extra publish does not leak into tracing.
 #[allow(improper_ctypes_definitions)]
-pub extern "C" fn bh_store_subscr_fn(
-    obj: PyObjectRef,
-    key: PyObjectRef,
-    value: PyObjectRef,
-) -> i64 {
+pub extern "C" fn bh_store_subscr_fn(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     if let Err(mut err) = crate::baseobjspace::setitem(obj, key, value) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
         crate::runtime_ops::jit_publish_exception(exc_obj);
-        return 0;
+        return;
     }
-    1
 }
 
 /// C-ABI residual bridge for the `dont_look_inside`
