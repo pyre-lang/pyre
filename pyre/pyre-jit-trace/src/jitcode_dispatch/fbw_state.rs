@@ -382,14 +382,6 @@ thread_local! {
     /// effect outside the FBW journals; later exit handling must not replay it.
     static FBW_EXECUTED_NONPURE_RESIDUAL: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
-
-    /// Set when this walk concretely executed a non-provably-pure residual that
-    /// is NOT the self-recursive `CALL_ASSEMBLER` fold target — a foreign body
-    /// write (`events.append(n)`).  A self-recursive fold ahead of which such a
-    /// residual ran declines, since folding would leave the walk uncommittable
-    /// and the interpreter would replay the executed mutation.
-    static FBW_EXECUTED_BODY_RESIDUAL: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
 }
 
 /// Arm/disarm the bridge `Terminate` no-replay shortcut for the next walk
@@ -414,27 +406,6 @@ pub(crate) fn fbw_mark_executed_nonpure_residual() {
 /// Clear the executed-residual latch at a walk boundary.
 pub(crate) fn fbw_executed_nonpure_residual_reset() {
     FBW_EXECUTED_NONPURE_RESIDUAL.with(|c| c.set(false));
-}
-
-/// Record a foreign (non self-recursive) non-pure residual concrete execution.
-pub(crate) fn fbw_mark_executed_body_residual() {
-    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.set(true));
-}
-
-/// Whether a foreign non-pure residual has concretely executed this walk.
-pub(crate) fn fbw_executed_body_residual() -> bool {
-    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.get())
-}
-
-/// Clear the foreign-body-residual latch at a walk boundary.
-pub(crate) fn fbw_executed_body_residual_reset() {
-    FBW_EXECUTED_BODY_RESIDUAL.with(|c| c.set(false));
-}
-
-/// Whether the `CALL_ASSEMBLER` fold's own concrete-stamp executor is on the
-/// stack (see [`SELFREC_CA_FOLD_ACTIVE`]).
-pub(crate) fn selfrec_ca_fold_active() -> bool {
-    SELFREC_CA_FOLD_ACTIVE.with(|c| c.get())
 }
 
 /// Whether `PYRE_FBW_DEBUG_ABORT` is set.  When on, `full_body_walk_trace`
@@ -3186,12 +3157,6 @@ pub(crate) fn fbw_abort_carrier_clear() {
 /// the unjournaled-effect / legacy-replay path is sound, so only abort when
 /// nested.
 thread_local! {
-    /// Marks the self-recursive `CALL_ASSEMBLER` fold's concrete-stamp
-    /// executor call. RPython `do_residual_call` executes the recorded
-    /// residual at any framestack depth (`pyjitpl.py`), while
-    /// pyre's nested-residual decline below is a local protection for
-    /// FOREIGN unjournaled residuals.
-    pub(crate) static SELFREC_CA_FOLD_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// The bounded `str(exc)` / `repr(exc)` descriptor inline may retain an
     /// interior residual such as `repr(self.args)`. The caller's original
     /// iteration already supplied the concrete result, while the compiled
@@ -3278,16 +3243,10 @@ pub(crate) fn fbw_abort_nested_unjournaled_residual<Sym: WalkSym>(
     }
     // Under the current portal-runner ABI the inline frame is a real red
     // frame in the captured chain and aborts resume forward, so the residual
-    // is executed and recorded exactly as `do_residual_call` does.
-    // The one remaining miscompile, a self-recursive callee whose hot
-    // `CALL_ASSEMBLER` recursion-bridge frame the residual trampoline cannot
-    // retain, is the `CALL_ASSEMBLER` fold itself and is exempted by
-    // `SELFREC_CA_FOLD_ACTIVE` where it is folded.
-    //
-    // What is left is the rewind region, which has no forward resume of its
-    // own: the abort of a `BINARY_OP` / `COMPARE_OP` dunder answering
-    // `NotImplemented` rewinds to the operator, so that region refuses every
-    // unjournaled commit, this one included.
+    // is executed and recorded exactly as `do_residual_call` does.  The rewind
+    // region has no forward resume of its own: the abort of a `BINARY_OP` /
+    // `COMPARE_OP` dunder answering `NotImplemented` rewinds to the operator,
+    // so that region refuses every unjournaled commit, this one included.
     fbw_binop_rewind_refuse_commit(ctx, pc, None)
 }
 

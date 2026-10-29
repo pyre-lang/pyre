@@ -9761,29 +9761,6 @@ fn callee_vable_ref_at(
     }
 }
 
-/// Scoped setter for [`SELFREC_CA_FOLD_ACTIVE`]. Restores the prior value so
-/// nested folds and early `?` unwinds cannot strand the exemption enabled.
-struct SelfRecCaFoldGuard {
-    prior: bool,
-}
-
-impl SelfRecCaFoldGuard {
-    fn enter() -> Self {
-        let prior = SELFREC_CA_FOLD_ACTIVE.with(|c| {
-            let prior = c.get();
-            c.set(true);
-            prior
-        });
-        Self { prior }
-    }
-}
-
-impl Drop for SelfRecCaFoldGuard {
-    fn drop(&mut self) {
-        SELFREC_CA_FOLD_ACTIVE.with(|c| c.set(self.prior));
-    }
-}
-
 struct ExceptionStringInlineGuard {
     prior: bool,
 }

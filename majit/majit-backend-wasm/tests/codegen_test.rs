@@ -4868,6 +4868,140 @@ fn parameter_entry_registers_distinct_guard_fail_arities() {
 }
 
 #[test]
+fn attached_frame_entry_bridge_enters_with_jf_descr_clear() {
+    // The failing guard writes its descr cell into jf_descr, then the
+    // frame-entry epilogue tail-calls the attached bridge. The recovery
+    // stub never runs (`patch_jump_for_descr`), so the bridge must see
+    // jf_descr == 0. jf_gcmap stays the spilled map, proving the spill ran.
+    const CELL_ADDR: u32 = 64;
+    const EXIT_TABLE: u32 = 128;
+    const DESCR_CELL: u32 = 0x00AB_CDEF;
+    const GCMAP_PTR: u32 = 0x0011_2233;
+    const FRAME_PTR: i32 = 4096;
+    const BRIDGE_SLOT: u32 = 1;
+
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let ops = vec![
+        make_guard(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            &[OpRef::input_arg_int(0)],
+        ),
+        Op::new(OpCode::Finish, &[rb(OpRef::input_arg_int(0))]),
+    ];
+    let mut ca = codegen::CaParams::default();
+    ca.exit_table_base = EXIT_TABLE;
+    let inputs = codegen::ModuleBuildInputs {
+        inputargs,
+        ops,
+        inlined_bridges: Vec::new(),
+        constants: indexmap::IndexMap::new(),
+        vtable_offset: Some(0),
+        classptr_to_typeid: HashMap::new(),
+        guard_gc_type_info: codegen::GuardGcTypeInfo::default(),
+        alloc: codegen::AllocHelpers::default(),
+        wb: codegen::WriteBarrierHelpers::for_current_gc(0, 0),
+        nursery: None,
+        invalidated_flag_addr: 0,
+        gc_table_base: 0,
+        gc_const_keys: Vec::new(),
+        fail_index_base: 0,
+        bridge_cells_base: CELL_ADDR,
+        guard_cell_addrs: Vec::new(),
+        bridge_entry_arity: None,
+        bridge_param_dispatch: false,
+        trace_entry_census: None,
+        inline_trip: None,
+        external_jump_slot: 0,
+        external_jump_wide_slot: 0,
+        external_jump_key: 0,
+        frame: codegen::FrameGeometry::fixed(),
+        ca,
+    };
+    let (bytes, guards, _, _) =
+        codegen::build_wasm_module(&inputs).expect("wasm codegen should succeed");
+    validate_wasm(&bytes);
+    assert_eq!(guards.len(), 2, "GuardTrue and Finish");
+
+    let engine = Engine::default();
+    let module = Module::new(&engine, &bytes).expect("generated trace should compile");
+    let mut store = Store::new(&engine, (u32::MAX, u32::MAX));
+    let memory =
+        Memory::new(&mut store, MemoryType::new(1, None)).expect("test memory should allocate");
+    let table = Table::new(
+        &mut store,
+        TableType::new(ValType::FuncRef, 8, None),
+        Val::default(ValType::FuncRef),
+    )
+    .expect("test table should allocate");
+    let bridge = wasmi::Func::wrap(
+        &mut store,
+        move |mut caller: wasmi::Caller<'_, (u32, u32)>, frame: i32| -> i32 {
+            let header = frame as usize - majit_backend::jitframe::FIRST_ITEM_OFFSET;
+            let mut descr = [0u8; 4];
+            memory
+                .read(
+                    &caller,
+                    header + majit_backend::jitframe::JF_DESCR_OFS as usize,
+                    &mut descr,
+                )
+                .expect("jf_descr");
+            let mut gcmap = [0u8; 4];
+            memory
+                .read(
+                    &caller,
+                    header + majit_backend::jitframe::JF_GCMAP_OFS as usize,
+                    &mut gcmap,
+                )
+                .expect("jf_gcmap");
+            *caller.data_mut() = (u32::from_le_bytes(descr), u32::from_le_bytes(gcmap));
+            frame
+        },
+    );
+    table
+        .set(&mut store, BRIDGE_SLOT.into(), Val::from(bridge))
+        .expect("bridge occupies slot 1");
+    memory
+        .write(&mut store, CELL_ADDR as usize, &BRIDGE_SLOT.to_le_bytes())
+        .unwrap();
+    memory
+        .write(&mut store, EXIT_TABLE as usize, &DESCR_CELL.to_le_bytes())
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            EXIT_TABLE as usize + 4,
+            &GCMAP_PTR.to_le_bytes(),
+        )
+        .unwrap();
+    memory
+        .write(
+            &mut store,
+            FRAME_PTR as usize + codegen::FRAME_SLOT_BASE as usize,
+            &0i64.to_le_bytes(),
+        )
+        .unwrap();
+    let mut linker = Linker::new(&engine);
+    linker.define("env", "memory", memory).unwrap();
+    linker
+        .define("env", "__indirect_function_table", table)
+        .unwrap();
+    let instance = linker
+        .instantiate_and_start(&mut store, &module)
+        .expect("generated trace should instantiate");
+    instance
+        .get_typed_func::<i32, i32>(&store, "trace")
+        .unwrap()
+        .call(&mut store, FRAME_PTR)
+        .expect("generated trace should execute");
+    assert_eq!(
+        *store.data(),
+        (0, GCMAP_PTR),
+        "attached bridge sees jf_descr clear and the spilled gcmap"
+    );
+}
+
+#[test]
 fn building_a_module_does_not_stamp_the_guard_cell_on_its_descr() {
     // The caller can still decline after `build_wasm_module` returns (the host
     // rejects the module), and a decline frees the cell array. The descr is

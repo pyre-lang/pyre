@@ -3679,18 +3679,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // A foreign (non self-recursive) non-pure residual already executed
-    // concretely earlier in this walk (e.g. `events.append(n)` ahead of the
-    // self-call).  Folding to CALL_ASSEMBLER terminates the walk symbolically;
-    // a later value-unavailable decline then leaves it uncommittable, so the
-    // interpreter replays the region and double-applies that mutation.  Decline
-    // to the plain residual path, which eagerly executes and commits the call.
-    if fbw_executed_body_residual() {
-        if p2_diag_enabled() {
-            eprintln!("[p2-ca] decline pc={} reason=executed-body-residual", op.pc);
-        }
-        return Ok(None);
-    }
     // Branch A frame shape only: `ncells == 0`, non-global-storing callee.
     let raw = unsafe { pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef) }
         as *const pyre_interpreter::CodeObject;
@@ -3972,7 +3960,6 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     let mut ran = false;
     let mut ca_result = OpRef::NONE;
     let exec = {
-        let _selfrec_ca_fold_guard = SelfRecCaFoldGuard::enter();
         let token_for_record = token.clone();
         let mut record_call = |ctx: &mut WalkContext<'_, '_, Sym>,
                                value: Option<majit_ir::Value>| {
@@ -9308,15 +9295,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // virtual frame is seeded and snapshot-covered exactly as the loop's is.
     // There the decline is lifted: the call falls through to the self-recursive
     // unroll gate and multiframe seed as if walked from a primary trace.
-    // True once this attempt takes the root-bridge admission for a
-    // self-recursive callee.  The admitted top-level inline's
-    // body sub-walk reaches its own recursive CALL as a nested residual, which
-    // `fbw_abort_nested_unjournaled_residual` declines on the self-recursive
-    // hazard arm — an abort storm that folds the whole guard bridge back to
-    // residual.  The `CALL_ASSEMBLER` self-recursion fold already exempts that
-    // decline via `SELFREC_CA_FOLD_ACTIVE`; the same exemption applies to this
-    // admitted inline, whose recursive residual runs concretely at the
-    // pre-execute site (executed, so no replay double-apply).
     let mut bridge_rec_root_selfrec = false;
     if ctx.trace_ctx.is_bridge_trace
         && args_all_builtin_integer
@@ -9345,11 +9323,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // general answer: its flag means "do not inline calls to this function",
     // and the enclosing loop is left free to retrace.
     //
-    // `bridge_rec_root_selfrec` is exempt: that admission carries its own
-    // `SELFREC_CA_FOLD_ACTIVE` exemption from
-    // `fbw_abort_nested_unjournaled_residual`, so its recursive residual is
-    // not what named the callee here.  The warmstate verdict is deferred to
-    // this same point so its typed lookup cannot hide the exemption.
+    // The root-bridge self-recursive admission still inlines: its recursive
+    // residual is not what named the callee here.  The warmstate verdict is
+    // deferred to this same point so its typed lookup cannot hide the admission.
     if !bridge_rec_root_selfrec && fbw_hazardous_inline_denied(callee_code_key) {
         return resolved_inline_decline(op.pc, line!());
     }
@@ -11515,11 +11491,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         let result = {
-            // #704 root-bridge self-recursive inline: exempt this callee body
-            // sub-walk's nested recursive residual from the self-recursive
-            // nested-residual decline, mirroring the native `CALL_ASSEMBLER`
-            // fold's `SELFREC_CA_FOLD_ACTIVE` exemption.
-            let _bridge_rec_selfrec_guard = bridge_rec_root_selfrec.then(SelfRecCaFoldGuard::enter);
             // Root this sub-walk's own Ref bank: a callee fold mints its
             // `ConstPtr` into `sub_wc.registers_r`, which is not the anchored
             // `sym.registers_r`.
