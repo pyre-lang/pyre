@@ -4051,6 +4051,10 @@ mod tests {
             OpCode::SameAsI | OpCode::SameAsR => bhimpl_int_same_as(a),
             OpCode::CastIntToFloat => bhimpl_cast_int_to_float(a).to_bits() as i64,
             OpCode::CastFloatToInt => bhimpl_cast_float_to_int(f64::from_bits(a as u64)),
+            OpCode::CastFloatToSinglefloat => {
+                bhimpl_cast_float_to_singlefloat(f64::from_bits(a as u64))
+            }
+            OpCode::CastSinglefloatToFloat => bhimpl_cast_singlefloat_to_float(a).to_bits() as i64,
             OpCode::ConvertFloatBytesToLonglong => {
                 bhimpl_convert_float_bytes_to_longlong(f64::from_bits(a as u64))
             }
@@ -4158,6 +4162,41 @@ mod tests {
         assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(2.9)), 2);
         assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(-2.9)), -2);
         assert_eq!(exec_unop(OpCode::CastFloatToInt, f64_bits(0.999)), 0);
+    }
+
+    #[test]
+    fn test_executor_singlefloat_cast_round_trip() {
+        let fr = |r: i64| f64::from_bits(r as u64);
+        let bits_1_5 = exec_unop(OpCode::CastFloatToSinglefloat, f64_bits(1.5));
+        assert_eq!(fr(exec_unop(OpCode::CastSinglefloatToFloat, bits_1_5)), 1.5);
+        let bits_0_1 = exec_unop(OpCode::CastFloatToSinglefloat, f64_bits(0.1));
+        assert_eq!(
+            fr(exec_unop(OpCode::CastSinglefloatToFloat, bits_0_1)),
+            0.1f32 as f64
+        );
+        assert_eq!(
+            bhimpl_cast_float_to_singlefloat(1.5),
+            (1.5f32).to_bits() as i64
+        );
+        assert_eq!(
+            bhimpl_cast_singlefloat_to_float(bhimpl_cast_float_to_singlefloat(1.5)),
+            1.5
+        );
+        assert_eq!(
+            bhimpl_cast_singlefloat_to_float(bhimpl_cast_float_to_singlefloat(0.1)),
+            0.1f32 as f64
+        );
+    }
+
+    #[test]
+    fn singlefloat2int_minus_one_follows_signed_width() {
+        let bits = (-1.0f32).to_bits();
+        assert_eq!(singlefloat2int_for_word(bits, 4), -1_082_130_432);
+        assert_eq!(singlefloat2int_for_word(bits, 8), 3_212_836_864);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(singlefloat2int(-1.0), 3_212_836_864);
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(singlefloat2int(-1.0), -1_082_130_432);
     }
 
     #[test]
@@ -5597,6 +5636,31 @@ mod tests {
                 slot as usize, placeholder as usize,
                 "`cast_float_to_int/f>i` (byte {byte}) is unwired in the production builder",
             );
+        }
+
+        #[test]
+        fn production_bh_builder_wires_singlefloat_casts() {
+            let builder = super::build_inline_call_only_bh_builder(&[(
+                "recursive_call_v/iIRFIRF",
+                majit_jitcode::insns::BC_RECURSIVE_CALL_VOID,
+            )]);
+            let placeholder = super::unwired_handler_placeholder as super::BhOpcodeHandler;
+            for (key, byte) in [
+                (
+                    "cast_float_to_singlefloat/f>i",
+                    majit_jitcode::insns::BC_CAST_FLOAT_TO_SINGLEFLOAT,
+                ),
+                (
+                    "cast_singlefloat_to_float/i>f",
+                    majit_jitcode::insns::BC_CAST_SINGLEFLOAT_TO_FLOAT,
+                ),
+            ] {
+                let slot = builder.dispatch_table[byte as usize];
+                assert_ne!(
+                    slot as usize, placeholder as usize,
+                    "`{key}` (byte {byte}) is unwired in the production builder",
+                );
+            }
         }
 
         /// `blackhole.py` has no `bhimpl_call_assembler`. Recursive portal
@@ -7722,16 +7786,32 @@ fn bhimpl_cast_int_to_float(a: i64) -> f64 {
     a as f64
 }
 
-/// blackhole.py `bhimpl_cast_float_to_singlefloat(a): return
-/// singlefloat2int(r_singlefloat(a))`.
-fn bhimpl_cast_float_to_singlefloat(a: f64) -> i64 {
-    // `longlong.singlefloat2int`: `intmask` of the 32-bit pattern.
-    let bits = (a as f32).to_bits();
-    if cfg!(target_pointer_width = "32") {
+/// `longlong.singlefloat2int`: `rffi.cast(lltype.Signed, rffi.cast(rffi.UINT, x))`.
+/// `word` is the target `Signed` width in bytes. Word 4 sign-extends bit 31;
+/// a wider word zero-extends. Runtime-on-target uses
+/// `cfg!(target_pointer_width)`.
+pub fn singlefloat2int_for_word(bits: u32, word: usize) -> i64 {
+    if word == 4 {
         bits as i32 as i64
     } else {
         bits as i64
     }
+}
+
+/// `longlong.singlefloat2int`.
+pub fn singlefloat2int(x: f32) -> i64 {
+    let word = if cfg!(target_pointer_width = "32") {
+        4
+    } else {
+        8
+    };
+    singlefloat2int_for_word(x.to_bits(), word)
+}
+
+/// blackhole.py `bhimpl_cast_float_to_singlefloat(a): return
+/// singlefloat2int(r_singlefloat(a))`.
+fn bhimpl_cast_float_to_singlefloat(a: f64) -> i64 {
+    singlefloat2int(a as f32)
 }
 
 /// blackhole.py `bhimpl_cast_singlefloat_to_float(a): return
@@ -11715,6 +11795,14 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         (
             "cast_float_to_int/f>i",
             majit_jitcode::insns::BC_CAST_FLOAT_TO_INT,
+        ),
+        (
+            "cast_float_to_singlefloat/f>i",
+            majit_jitcode::insns::BC_CAST_FLOAT_TO_SINGLEFLOAT,
+        ),
+        (
+            "cast_singlefloat_to_float/i>f",
+            majit_jitcode::insns::BC_CAST_SINGLEFLOAT_TO_FLOAT,
         ),
         (
             "cast_ptr_to_int/r>i",

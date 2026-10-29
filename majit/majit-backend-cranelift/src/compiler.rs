@@ -2718,9 +2718,10 @@ fn register_call_assembler_target(
     // `x86/assembler.py assemble_loop` publishes
     // `looptoken._ll_function_addr = rawstart + functionpos` only after
     // the loop is fully assembled. The host-ABI wrapper stays on
-    // `entry_code_ptr` for `execute_token`; in-code CALL_ASSEMBLER loads
-    // this slot.
-    token.set_ll_function_addr(entry_body as usize);
+    // `entry_code_ptr` for `execute_token`; CALL_ASSEMBLER and the
+    // wrapper's key-0 arm enter `call_header_stub`. Redirect overlays
+    // that stub and never rewrites this slot.
+    token.set_ll_function_addr(compiled.call_header_stub_ptr);
     clt.set_ca_unregister(token.identity_key(), unregister_call_assembler_target);
     // `regalloc.py` `_set_initial_bindings`: contiguous layout
     // → `locs[i] = i * SIZEOFSIGNED`.
@@ -3539,15 +3540,15 @@ fn emit_call_footer_shadowstack(
 /// it, so they keep the full `_call_header_with_stack_check` prologue.
 const IN_CODE_ENTRY_KEY_FLAG: i32 = 1 << 30;
 
-/// Publish the compact inputarg-ref gcmap on dispatch_key selector 0.
+/// Publish the inputarg-ref gcmap on dispatch_key selector 0.
 ///
 /// A retrace bridge (`compile.py compile_retrace`) is a loop-like body:
 /// two-arg Tail + `br_table` on `dispatch_key`, matching how loops
 /// enter a LABEL (`x86/regalloc.py consider_jump` /
 /// `assembler.py closing_jump` jump to `_ll_loop_code` and never
 /// re-enter the bridge prologue). Key 0 is the guard HIT / host
-/// preamble; the HIT path compact-stores failargs into the frame
-/// first. Key `label_block_id + 1` is a JUMP re-entry: the source
+/// preamble; Ref bits are the bind homes (`source_slots[i]`).
+/// Key `label_block_id + 1` is a JUMP re-entry: the source
 /// already published its gcmap over the carried slots, and replacing
 /// it with the bridge inputarg map would mark the wrong words when
 /// LABEL arity differs from the guard live list.
@@ -3679,13 +3680,59 @@ impl PairedSlotStores {
     }
 }
 
+/// Last writer at a duplicated offset wins, then ascending offset order so
+/// adjacent slots lower as `STP`/`LDP`. Packed failarg / ref-root homes are
+/// assigned in failarg order (`RegisterManager.loc` / `store_info_on_descr`);
+/// emission is the only thing reordered.
+fn sort_slot_stores<T>(pairs: Vec<(i32, T)>) -> Vec<(i32, T)> {
+    let mut last: IndexMap<i32, T> = IndexMap::new();
+    for (offset, val) in pairs {
+        last.insert(offset, val);
+    }
+    let mut out: Vec<(i32, T)> = last.into_iter().collect();
+    out.sort_by_key(|&(offset, _)| offset);
+    out
+}
+
+fn emit_sorted_frame_stores(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    pairs: Vec<(i32, CValue)>,
+) {
+    let mut publish = PairedSlotStores::default();
+    for (offset, val) in sort_slot_stores(pairs) {
+        publish.store(builder, jf_ptr, offset, val);
+    }
+    publish.flush(builder, jf_ptr);
+}
+
 /// The read direction of `PairedSlotStores`: load a run of `Signed` frame slots,
 /// taking two adjacent ones per `load` of an `I128` (`aarch64/lower.isle:2655` →
 /// `aarch64_loadp64`, i.e. `LDP`; x86 splits it into the two halves again).
 ///
-/// `offsets` is in the order the caller wants the values back; only neighbours
-/// that are genuinely adjacent in the frame are paired.
+/// Independent loads are emitted in ascending offset order so packed homes
+/// still pair; returned values stay in `offsets` order.
 fn load_frame_slot_run(
+    builder: &mut FunctionBuilder,
+    jf_ptr: CValue,
+    offsets: &[i32],
+) -> Vec<CValue> {
+    let n = offsets.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| offsets[i]);
+    let sorted_offsets: Vec<i32> = order.iter().map(|&i| offsets[i]).collect();
+    let sorted_vals = load_adjacent_frame_slots(builder, jf_ptr, &sorted_offsets);
+    let mut vals = vec![None; n];
+    for (sorted_i, &orig_i) in order.iter().enumerate() {
+        vals[orig_i] = Some(sorted_vals[sorted_i]);
+    }
+    vals.into_iter().map(Option::unwrap).collect()
+}
+
+fn load_adjacent_frame_slots(
     builder: &mut FunctionBuilder,
     jf_ptr: CValue,
     offsets: &[i32],
@@ -3896,11 +3943,10 @@ fn call_assembler_frame_outputs(frame_ptr: i64, outputs_ptr: *const i64) -> *con
 }
 
 /// `compile.py must_compile`'s `cpu.get_value_direct(deadframe, index)` for
-/// a GUARD_VALUE exit. The index is a fail-argument position, read
-/// through `rd_locs`, or the trace's counter slot past them
-/// (`counter_slot_for`), a raw frame slot; `JitFrameDeadFrame::slot_of`
-/// resolves it the same way. `None` when the guard keeps no per-value
-/// counter.
+/// a GUARD_VALUE exit. The index is a physical jitframe slot
+/// (`regalloc.py consider_guard_value` / `llmodel.py get_int_value_direct`);
+/// `get_int_value` still maps fail-argument indices through `rd_locs`.
+/// `None` when the guard keeps no per-value counter.
 ///
 /// # Safety
 /// `frame` is the live jitframe the guard exited with.
@@ -3909,13 +3955,8 @@ unsafe fn guard_value_operand_in_frame(
     frame: *const majit_backend::jitframe::JitFrame,
 ) -> Option<i64> {
     let index = majit_backend::guard_value_counter_slot(descr)?;
-    let slot = match descr.rd_locs().get(index) {
-        Some(&pos) if pos != 0xFFFF => pos as usize,
-        Some(_) => return Some(0),
-        None => index,
-    };
     let frame = unsafe { JitFrame::resolve(frame as *mut JitFrame) };
-    Some(unsafe { majit_backend::llmodel::get_int_value_direct(frame, slot) as i64 })
+    Some(unsafe { majit_backend::llmodel::get_int_value_direct(frame, index) as i64 })
 }
 
 /// direct call_assembler path. Ultra-lightweight: just increments
@@ -5702,13 +5743,9 @@ fn resolve_call_assembler_target(
     let Some(target) = lookup_call_assembler_target(token) else {
         return Ok(None);
     };
-    let descr_addr = token.ll_function_addr();
-    if descr_addr != 0 && !target.body_ptr.is_null() {
-        debug_assert_eq!(
-            descr_addr, target.body_ptr as usize,
-            "CALL_ASSEMBLER descr token address disagrees with its CLT's target"
-        );
-    }
+    // After `redirect_call_assembler` `_ll_function_addr` is the overlay
+    // site (`assembler.py` `oldadr`, the `call_header_stub`) and `body_ptr`
+    // is the new loop. CALL_ASSEMBLER calls the overlay site.
 
     // A null `code_ptr` has no compiled code or finish descriptors. Return
     // None so codegen uses the shim fallback.
@@ -6858,6 +6895,35 @@ fn emit_host_call(
     return_type.map(|_| builder.inst_results(call)[0])
 }
 
+/// Direct Tail call of a compiled loop's `_ll_function_addr`.
+///
+/// `assembler.py` `_call_assembler_emit_call` calls `_ll_function_addr`
+/// as an immediate. Residual calls already bake the same way (`host_{addr}`
+/// Import + `call`); CALL_ASSEMBLER can too once `redirect_call_assembler`
+/// overlays a JMP at the old `call_header_stub` (`x86/assembler.py
+/// redirect_call_assembler`).
+fn emit_call_assembler_body_call(
+    module: &mut JITModule,
+    builder: &mut FunctionBuilder,
+    ptr_type: cranelift_codegen::ir::Type,
+    body_call_conv: cranelift_codegen::isa::CallConv,
+    func_ptr: usize,
+    jf_ptr: CValue,
+    dispatch_key: CValue,
+) -> CValue {
+    let mut sig = Signature::new(body_call_conv);
+    sig.params.push(AbiParam::new(ptr_type));
+    sig.params.push(AbiParam::new(cl_types::I32));
+    sig.returns.push(AbiParam::new(ptr_type));
+    let name = format!("ca_body_{func_ptr:x}");
+    let func_id = module
+        .declare_function(&name, Linkage::Import, &sig)
+        .expect("call-assembler body import");
+    let fref = module.declare_func_in_func(func_id, builder.func);
+    let call = builder.ins().call(fref, &[jf_ptr, dispatch_key]);
+    builder.inst_results(call)[0]
+}
+
 /// `regalloc.py before_call()`: write the paired `GUARD_NOT_FORCED`'s fail
 /// args into the jitframe slots the guard's resume data names, so a callee
 /// that forces this frame reads the values the resume decoder expects.
@@ -6885,10 +6951,17 @@ fn spill_guard_fail_args(
     demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
 ) {
+    // Resolve every source before any store: `resolve_failarg_opref` may
+    // load a demoted / stale home that a packed failarg also writes.
+    // `jf_force_descr` / `jf_gcmap` stay with the caller; they must precede
+    // the call and are not part of this image.
+    let mut pairs = Vec::new();
     for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
         // resume.py failargs may contain None holes.  They retain their slot
         // index in rd_locs, but no value exists to resolve or publish.
-        if arg_ref.is_none() {
+        // `RegisterManager.loc`: a Const has no frame location.
+        let loc = info.fail_locs[index];
+        if arg_ref.is_none() || loc == FAIL_LOC_HOLE {
             continue;
         }
         // Read from the frame slot the call spills it to (`rd_locs`).
@@ -6918,16 +6991,12 @@ fn spill_guard_fail_args(
                 arg_ref,
             )
         };
-        // `fail_locs[index]` is the slot `rd_locs` names for this arg: the
-        // index itself, or the original compile's location when a merged
-        // recompile keeps the descr.
-        builder.ins().store(
-            MemFlagsData::trusted(),
-            raw,
-            jf_ptr,
-            JF_FRAME_ITEM0_OFS + (info.fail_locs[index] as i32) * 8,
-        );
+        // `fail_locs[index]` is the slot `rd_locs` names for this arg:
+        // packed dense, a ref-root / demoted home, or the original compile's
+        // location when a merged recompile keeps the descr.
+        pairs.push((JF_FRAME_ITEM0_OFS + (loc as i32) * 8, raw));
     }
+    emit_sorted_frame_stores(builder, jf_ptr, pairs);
     if info.gcmap != 0 {
         emit_jitframe_write_barrier(
             module,
@@ -6954,6 +7023,7 @@ fn spill_ref_roots(
     demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
 ) {
+    let mut pairs = Vec::new();
     for &(var_idx, slot) in ref_root_slots {
         if !defined_ref_vars.contains(&var_idx) || stale_ref_vars.contains(&var_idx) {
             continue;
@@ -6968,10 +7038,9 @@ fn spill_ref_roots(
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
         let val = builder.use_var(var(opref_vars, var_idx));
-        builder
-            .ins()
-            .store(MemFlagsData::new(), val, jf_ptr, offset);
+        pairs.push((offset, val));
     }
+    emit_sorted_frame_stores(builder, jf_ptr, pairs);
 }
 
 /// assembler.py _pop_all_regs_from_frame:
@@ -6986,6 +7055,7 @@ fn reload_ref_roots(
     demoted_failarg_slots: &IndexMap<u32, i32>,
     ref_root_base_ofs: i32,
 ) {
+    let mut var_offsets = Vec::new();
     for &(var_idx, slot) in ref_root_slots {
         if !defined_ref_vars.contains(&var_idx) {
             continue;
@@ -7000,9 +7070,11 @@ fn reload_ref_roots(
             continue;
         }
         let offset = ref_root_base_ofs + (slot as i32) * 8;
-        let val = builder
-            .ins()
-            .load(cl_types::I64, MemFlagsData::trusted(), jf_ptr, offset);
+        var_offsets.push((var_idx, offset));
+    }
+    let offsets: Vec<i32> = var_offsets.iter().map(|&(_, offset)| offset).collect();
+    let vals = load_frame_slot_run(builder, jf_ptr, &offsets);
+    for (&(var_idx, _), val) in var_offsets.iter().zip(vals) {
         builder.def_var(var(opref_vars, var_idx), val);
     }
 }
@@ -7082,7 +7154,7 @@ fn ptr_arg_as_i64(
 /// as RPython's allocate_gcmap), or 0 (NULLGCMAP) if no live refs.
 fn get_gcmap(
     position: usize,
-    max_output_slots: usize,
+    ref_root_gcmap_base: usize,
     always_live_bit_positions: &[usize],
     dense_ref_bindings: &IndexMap<usize, u32>,
     ref_root_slots: &[(u32, usize)],
@@ -7121,7 +7193,7 @@ fn get_gcmap(
         // `box.type == REF and is_still_alive(box)` means for a value the
         // register allocator has pinned to the frame.
         if is_demoted_failarg(demoted_failarg_slots, var_idx) {
-            live_bit_positions.push(max_output_slots + slot);
+            live_bit_positions.push(ref_root_gcmap_base + slot);
             continue;
         }
         if !defined_ref_vars.contains(&var_idx) {
@@ -7132,7 +7204,7 @@ fn get_gcmap(
         if let Some(&last_usage) = longevity.get(&var_idx)
             && last_usage >= position
         {
-            live_bit_positions.push(max_output_slots + slot);
+            live_bit_positions.push(ref_root_gcmap_base + slot);
         }
     }
     allocate_gcmap(&live_bit_positions)
@@ -8311,22 +8383,21 @@ fn resident_failarg_home(
     None
 }
 
-/// Point `rd_locs` at a fail arg's existing frame home and drop that arg
-/// from the positional publish.
+/// Skip the store when `fail_locs[k]` already holds the current value.
 ///
 /// `llsupport/assembler.py rebuild_faillocs_from_descr` records where each
-/// fail arg lives; readers (`llmodel.py _decode_pos`, `execute_bridge`,
-/// the shared-frame tail jump) decode the table. A stale ref root or a
-/// demoted home is already that word, so the guard exit must not copy it
-/// into `jf_frame[k]`. Every other fail arg keeps positional slot `k`.
-/// Holes stay `0xFFFF`. When nothing was redirected the descr's table is
-/// left alone, so an empty `rd_locs` remains the identity fast path.
+/// fail arg lives; readers (`llmodel.py _decode_pos`, `execute_bridge`)
+/// decode `rd_locs`. Packing already stamped that table, so this only
+/// decides whether the exit must still write the slot: a stale ref-root
+/// or a demoted home is already that word (`resident_failarg_home`). A
+/// live Ref whose `fail_locs` names its ref-root home is stored there so
+/// the home stays current. Holes stay `0xFFFF`.
 ///
-/// Returns one flag per fail arg, true when the positional store is
-/// skipped. Empty when the layout stays identity.
+/// Returns one flag per fail arg, true when the store is skipped. Empty
+/// when `redirect_resident_failargs` is off (FINISH / JUMP identity).
 fn apply_resident_failarg_locs(
-    info: &mut GuardInfo,
-    fail_descrs: &[DescrRef],
+    info: &GuardInfo,
+    _fail_descrs: &[DescrRef],
     ref_root_slots: &[(u32, usize)],
     stale_ref_vars: &IndexSet<u32>,
     demoted_failarg_slots: &IndexMap<u32, i32>,
@@ -8335,109 +8406,56 @@ fn apply_resident_failarg_locs(
     if !info.redirect_resident_failargs {
         return Vec::new();
     }
-    let Some(fd) = fail_descrs
-        .get(info.fail_index as usize)
-        .and_then(|descr| descr.as_fail_descr())
-    else {
-        return Vec::new();
-    };
-    // FINISH singletons and propagate descrs either have no `rd_locs`
-    // slot or are read positionally (`jf_frame[0]`). Only resume-family
-    // guards publish a recovery map.
-    if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
-        return Vec::new();
-    }
-    let existing: Vec<u16> = fd.rd_locs().to_vec();
     // The reduced scalar is not the vector's frame home. Those positions
-    // keep the positional store `accum_info` already describes.
+    // keep the store `accum_info` already describes.
     let accum_positions: IndexSet<usize> =
         info.accum_info.iter().map(|ai| ai.failargs_pos).collect();
-    let mut locs: Vec<u16> = Vec::with_capacity(info.fail_arg_refs.len());
     let mut skip_store: Vec<bool> = Vec::with_capacity(info.fail_arg_refs.len());
-    let mut redirected = false;
     for (k, &arg) in info.fail_arg_refs.iter().enumerate() {
-        if arg.is_none() || existing.get(k).copied() == Some(0xFFFF) {
-            locs.push(0xFFFF);
+        let loc = info.fail_locs.get(k).copied().unwrap_or(FAIL_LOC_HOLE);
+        if arg.is_none() || loc == FAIL_LOC_HOLE {
             skip_store.push(false);
             continue;
         }
-        let Ok(positional) = u16::try_from(k) else {
-            // A slot index that does not fit the `rd_locs` USHORT cannot
-            // be named. Leave the whole guard on the identity publish.
-            return Vec::new();
-        };
-        if positional == 0xFFFF {
-            return Vec::new();
-        }
-        if !accum_positions.contains(&k)
-            && let Some(home) = resident_failarg_home(
-                ref_root_slots,
-                stale_ref_vars,
-                demoted_failarg_slots,
-                ref_root_base_ofs,
-                arg,
-            )
-            && home != positional
-        {
-            redirected = true;
-            locs.push(home);
-            skip_store.push(true);
+        if accum_positions.contains(&k) {
+            skip_store.push(false);
             continue;
         }
-        // Stored at `k`. An identity-with-holes table already names that
-        // index; an empty table is identity. Rewriting the whole table
-        // (because some other arg was redirected) keeps this entry on the
-        // slot the publish writes.
-        locs.push(positional);
-        skip_store.push(false);
+        let home_is_current = resident_failarg_home(
+            ref_root_slots,
+            stale_ref_vars,
+            demoted_failarg_slots,
+            ref_root_base_ofs,
+            arg,
+        )
+        .is_some_and(|home| home as usize == loc);
+        skip_store.push(home_is_current);
     }
-    if !redirected {
-        return Vec::new();
-    }
-    fd.set_rd_locs(locs.iter().copied().collect());
-    info.bridge_source_slots = locs
-        .iter()
-        .copied()
-        .filter(|&loc| loc != 0xFFFF)
-        .map(|loc| loc as usize)
-        .collect();
-    // The deadframe gcmap has to mark the word the reader will load. A
-    // ref that moved to its home is no longer in the dense slot, so the
-    // map names the home instead of `k`.
-    let mut ref_slots = Vec::new();
-    for (k, &loc) in locs.iter().enumerate() {
-        if loc != 0xFFFF && info.failarg_ref_slots.contains(&k) {
-            ref_slots.push(loc as usize);
-        }
-    }
-    ref_slots.sort_unstable();
-    ref_slots.dedup();
-    info.failarg_ref_slots = ref_slots;
-    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
     skip_store
 }
 
-/// Dense image a `FailArgSource::Slice` reader indexes by logical fail-arg
-/// position. Identity entries stay the raw frame word (including an
-/// unwritten hole). A redirected entry is copied in from its home so the
-/// slice agrees with `rd_locs` without changing the vector's length.
+/// Per-position image a `FailArgSource::Slice` reader indexes by logical
+/// fail-arg position. Built through `rd_locs` (`0xFFFF` → hole 0). Does not
+/// size the jitframe. Empty `rd_locs` is the identity path used by FINISH
+/// outputs, external JUMP inputs, and execute_token input stores.
 fn overlay_rd_locs_on_dense(frame: &[i64], rd_locs: &[u16], dense_len: usize) -> Vec<i64> {
-    let mut outputs: Vec<i64> = frame.iter().copied().take(dense_len).collect();
-    if outputs.len() < dense_len {
-        outputs.resize(dense_len, 0);
-    }
     if rd_locs.is_empty() {
+        let mut outputs: Vec<i64> = frame.iter().copied().take(dense_len).collect();
+        if outputs.len() < dense_len {
+            outputs.resize(dense_len, 0);
+        }
         return outputs;
     }
-    for (index, &loc) in rd_locs.iter().enumerate() {
-        if loc == 0xFFFF || index >= outputs.len() || loc as usize == index {
-            continue;
-        }
-        if let Some(&value) = frame.get(loc as usize) {
-            outputs[index] = value;
-        }
-    }
-    outputs
+    rd_locs
+        .iter()
+        .map(|&loc| {
+            if loc == 0xFFFF {
+                0
+            } else {
+                frame.get(loc as usize).copied().unwrap_or(0)
+            }
+        })
+        .collect()
 }
 
 /// Ops whose non-exiting emission stores `JF_FRAME_ITEM0_OFS + j*8`.
@@ -8593,6 +8611,10 @@ fn record_entry_resident_failargs(
     guaranteed_frame_depth: i64,
     guard_infos: &mut [GuardInfo],
     merge_segments: &[MergeSegment],
+    bind_homes: &IndexMap<u32, usize>,
+    absolute_homes: bool,
+    home_intervals: Option<&IndexMap<u32, (usize, usize)>>,
+    var_slots: Option<&IndexMap<u32, usize>>,
 ) -> Vec<(usize, Vec<bool>)> {
     let num_inputs = inputargs.len();
     let label_arity = label_arity_by_identity(ops);
@@ -8621,7 +8643,28 @@ fn record_entry_resident_failargs(
             .map(|(idx, _)| idx)
     });
 
-    let mut loaded: Vec<Option<u32>> = inputargs.iter().map(|ia| Some(ia.index)).collect();
+    // Occupancy is by physical slot. Loops seed identity `i → inputargs[i]`.
+    // Bridges seed the bind homes (`_update_bindings`). An inputarg without
+    // a bind home is the `rebuild_faillocs_from_descr` REGISTER case and is
+    // not resident: failarg stores happen normally (`entry_resident_skip`).
+    let occupancy_len = (guaranteed_frame_depth.max(0) as usize).max(num_inputs);
+    let mut loaded: Vec<Option<u32>> = vec![None; occupancy_len];
+    if !absolute_homes {
+        for (i, ia) in inputargs.iter().enumerate() {
+            if i < loaded.len() {
+                loaded[i] = Some(ia.index);
+            }
+        }
+    } else {
+        for ia in inputargs {
+            if let Some(&slot) = bind_homes.get(&ia.index) {
+                if slot >= loaded.len() {
+                    loaded.resize(slot + 1, None);
+                }
+                loaded[slot] = Some(ia.index);
+            }
+        }
+    }
     let mut live = implicit_loop_label != Some(None);
     let mut seen_terminator = false;
     let mut info_idx = 0usize;
@@ -8701,6 +8744,17 @@ fn record_entry_resident_failargs(
         let is_finish = op.opcode == OpCode::Finish;
         let is_external_jump = jump_is_external(op, &label_arity);
         if is_guard || is_finish || is_external_jump {
+            if let (Some(intervals), Some(slots)) = (home_intervals, var_slots) {
+                for (&var, &(_, last_use)) in intervals {
+                    if last_use < op_idx {
+                        if let Some(&home) = slots.get(&var) {
+                            if loaded.get(home).copied().flatten() == Some(var) {
+                                loaded[home] = None;
+                            }
+                        }
+                    }
+                }
+            }
             let info = &mut guard_infos[info_idx];
             info.guaranteed_frame_depth = guaranteed_frame_depth;
             info.entry_resident_skip = info
@@ -8718,7 +8772,20 @@ fn record_entry_resident_failargs(
                         return false;
                     }
                     let k = info.fail_locs[slot];
-                    loaded.get(k).copied().flatten() == Some(arg.raw())
+                    if loaded.get(k).copied().flatten() != Some(arg.raw()) {
+                        return false;
+                    }
+                    // A slot reused by a later box is no longer this box's
+                    // home after its last use.
+                    match (home_intervals, var_slots) {
+                        (Some(intervals), Some(slots)) => {
+                            slots.get(&arg.raw()) == Some(&k)
+                                && intervals
+                                    .get(&arg.raw())
+                                    .is_some_and(|&(s, e)| s <= op_idx && op_idx <= e)
+                        }
+                        _ => true,
+                    }
                 })
                 .collect();
             info_idx += 1;
@@ -8805,6 +8872,7 @@ impl GuardExitPlan {
         let mut stores = Vec::new();
         for (slot, &arg) in info.fail_arg_refs.iter().enumerate() {
             if arg.is_none()
+                || info.fail_locs.get(slot).copied() == Some(FAIL_LOC_HOLE)
                 || skip_store.get(slot).copied().unwrap_or(false)
                 || info.entry_resident_skip.get(slot).copied().unwrap_or(false)
             {
@@ -9069,16 +9137,20 @@ fn emit_failarg_stores(
     // SSA cannot save-all-regs in an out-of-line stub, so the stores stay
     // on this cold block; recovery and the bridge-hit arm do not.
 
-    let mut publish = PairedSlotStores::default();
+    // Resolve every source before any store: `resolve_failarg_opref` may
+    // load a demoted / stale home that another packed failarg writes.
+    // `counter_value_spill` is collected last so a duplicated offset keeps
+    // that last-writer. Then emit in ascending offset order.
+    let mut pairs = Vec::new();
     for (slot, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
-        let offset = JF_FRAME_ITEM0_OFS + (info.fail_locs[slot] as i32) * 8;
-
+        let loc = info.fail_locs[slot];
         // resume.py failargs may contain None holes.  Keep the slot numbering
         // positional, while leaving the dead slot unwritten like PyPy's
-        // recovery stub.
-        if arg_ref.is_none() {
+        // recovery stub. A Const has no frame location (`RegisterManager.loc`).
+        if arg_ref.is_none() || loc == FAIL_LOC_HOLE {
             continue;
         }
+        let offset = JF_FRAME_ITEM0_OFS + (loc as i32) * 8;
 
         if let Some(accum) = accum_positions.get(&slot) {
             // _update_at_exit: reduce vector accumulator to scalar.
@@ -9086,7 +9158,7 @@ fn emit_failarg_stores(
             // resume.py + vector_ext.py:132: accum_info.getoriginal() → scalar
             // type info only
             let reduced = reduce_accum_to_scalar(builder, opref_vars, constants, accum);
-            publish.store(builder, jf_ptr, offset, reduced);
+            pairs.push((offset, reduced));
         } else if skip_store.get(slot).copied().unwrap_or(false) {
             // Already at the frame home `rd_locs` names. Copying it into
             // the positional slot is a frame-to-frame move.
@@ -9106,7 +9178,7 @@ fn emit_failarg_stores(
                 ref_root_base_ofs,
                 arg_ref,
             );
-            publish.store(builder, jf_ptr, offset, val);
+            pairs.push((offset, val));
         }
     }
     // `make_a_counter_per_value`'s slot when the compared operand is not one of
@@ -9124,9 +9196,9 @@ fn emit_failarg_stores(
             ref_root_base_ofs,
             operand,
         );
-        publish.store(builder, jf_ptr, offset, val);
+        pairs.push((offset, val));
     }
-    publish.flush(builder, jf_ptr);
+    emit_sorted_frame_stores(builder, jf_ptr, pairs);
 
     // Failarg stores wrote young refs into the frame; the JITFrame barrier
     // belongs on this block (HIT and miss both publish). `jf_gcmap` /
@@ -9141,44 +9213,6 @@ fn emit_failarg_stores(
             call_conv,
             jf_ptr,
             jitframe_write_barrier_flag(),
-        );
-    }
-}
-
-/// `rebuild_faillocs_from_descr`: pack live failargs from `rd_locs` into
-/// compact slots `0..N` so a 2-arg bridge body matches `execute_bridge`.
-/// Identity (slot i at index i) is a no-op. Called only on the in-code
-/// guard-HIT entry (`IN_CODE_ENTRY_KEY_FLAG`); recovery leaves values at
-/// `fail_locs` for the deadframe walk.
-fn emit_compact_rd_locs_into_frame(
-    builder: &mut FunctionBuilder,
-    jf_ptr: CValue,
-    source_slots: &[usize],
-) {
-    if source_slots
-        .iter()
-        .enumerate()
-        .all(|(dense, source)| dense == *source)
-    {
-        return;
-    }
-    let values: Vec<CValue> = source_slots
-        .iter()
-        .map(|source| {
-            builder.ins().load(
-                cl_types::I64,
-                MemFlagsData::trusted(),
-                jf_ptr,
-                JF_FRAME_ITEM0_OFS + (*source as i32) * 8,
-            )
-        })
-        .collect();
-    for (dense, value) in values.into_iter().enumerate() {
-        builder.ins().store(
-            MemFlagsData::trusted(),
-            value,
-            jf_ptr,
-            JF_FRAME_ITEM0_OFS + (dense as i32) * 8,
         );
     }
 }
@@ -10187,6 +10221,11 @@ struct CompiledLoop {
     /// `ll_loop_code` for loops; the tail-call target when this trace is a
     /// bridge dispatched from a parent guard.
     body_ptr: *const u8,
+    /// CALL_ASSEMBLER / `execute_token` door: a `STUB_SIZE` trampoline JMP
+    /// to [`Self::body_ptr`]. `JitCellToken._ll_function_addr` names this
+    /// stub; `redirect_call_assembler` overlays it and never rewrites the
+    /// slot. LABEL re-entry uses `body_ptr` (`ll_loop_code`) and skips it.
+    call_header_stub_ptr: usize,
     code_size: usize,
     /// Finalized native ranges awaiting transfer to the owning CLT.
     asm_memory_blocks: Vec<majit_backend::AsmMemoryBlock>,
@@ -10242,10 +10281,11 @@ struct CompiledLoop {
     /// - `execute_with_inputs_at_dispatch_key` — host entry for
     ///   `execute_token`, `execute_token_with_dispatch_key`, `execute_token_ints`
     /// - `execute_token_ints_raw` — raw host entry
-    /// - `register_call_assembler_target` — copies the current Tail body into
-    ///   `JitCellToken::set_ll_function_addr` (`assembler.py`
-    ///   `_ll_function_addr` is the assembler body) and the current wrapper
-    ///   into `RegisteredLoopTarget.code_ptr` / `ca_dispatch_slot`
+    /// - `register_call_assembler_target` — copies the current
+    ///   `call_header_stub` into `JitCellToken::set_ll_function_addr`
+    ///   (`assembler.py` `_ll_function_addr` is `_call_header` /
+    ///   `functionpos`) and the current wrapper into
+    ///   `RegisteredLoopTarget.code_ptr` / `ca_dispatch_slot`
     ///
     /// Left on the plain `code_ptr` / `body_ptr` fields (the original
     /// function's own bytes):
@@ -11162,10 +11202,9 @@ struct GuardInfo {
     /// is keyed by and the one a merged region names as its `source_fail_index`.
     fail_index: u32,
     can_have_bridge: bool,
-    /// Guards other than `GuardNotForced2` may retarget a fail arg that
-    /// already has a frame home through `rd_locs` and skip its positional
-    /// store. FINISH, external JUMP, and `GuardNotForced2` keep publishing
-    /// every value themselves.
+    /// Guards may skip the store when `fail_locs` already names a current
+    /// resident home (stale ref-root / demoted). FINISH and external JUMP
+    /// keep publishing every value themselves (identity locations).
     redirect_resident_failargs: bool,
     fail_arg_refs: Vec<OpRef>,
     /// Parallel to `fail_arg_refs`. Types name which failargs are Refs
@@ -11180,9 +11219,8 @@ struct GuardInfo {
     /// `_build_failure_recovery` helper directly.
     stub_addr: usize,
     /// assembler.py `store_info_on_descr`: physical frame locations, in
-    /// logical fail-argument order. GUARD_NOT_FORCED_2 keeps slot zero free
-    /// for `genop_finish`'s return value, like a spilled FrameLoc rather than
-    /// the return register's save slot.
+    /// logical fail-argument order. Holes are `0xFFFF`. Homed Refs name the
+    /// ref-root / demoted slot; other boxes share one packed dense slot.
     fail_locs: Vec<usize>,
     /// The GUARD_VALUE operand this exit stores in the trace's counter slot
     /// so `make_a_counter_per_value` has a slot to name, paired with that
@@ -11202,11 +11240,10 @@ struct GuardInfo {
     /// `llsupport/assembler.py rebuild_faillocs_from_descr`: the physical
     /// frame slot each of an attached bridge's inputargs is read from, in
     /// bridge inputarg order.  Decoded from this guard's `rd_locs` — one
-    /// entry per logical resume position, `0xFFFF` for a hole — which
-    /// `optimizeopt/mod.rs` writes as identity-with-holes for this backend.
-    /// Emission may replace an identity entry with the fail arg's frame
-    /// home when that value is not stored again. Empty when the descr
-    /// carries no `rd_locs` and nothing was redirected, i.e. plain identity.
+    /// entry per logical resume position, `0xFFFF` for a hole. Packed
+    /// dense slots, ref-root homes, and demoted homes are the real
+    /// locations `store_info_on_descr` records. Empty when the descr
+    /// carries no `rd_locs` (FINISH / JUMP / execute_token identity).
     bridge_source_slots: Vec<usize>,
     /// Leaked `[length, data...]` gcmap pointer, or 0 for NULLGCMAP.
     /// allocate_gcmap (gcmap.py) parity.
@@ -11678,7 +11715,9 @@ impl CraneliftBackend {
         // Host shims are imported as `host_{addr}` so `emit_host_call` can
         // emit a direct `call` (rel32) instead of `movabs` + `call_indirect`.
         jit_builder.symbol_lookup_fn(Box::new(|name: &str| {
-            let hex = name.strip_prefix("host_")?;
+            let hex = name
+                .strip_prefix("host_")
+                .or_else(|| name.strip_prefix("ca_body_"))?;
             usize::from_str_radix(hex, 16)
                 .ok()
                 .map(|addr| addr as *const u8)
@@ -12169,37 +12208,18 @@ impl CraneliftBackend {
         parent_descr: &dyn FailDescr,
         attachments: &'static CpuDescrAttachments,
     ) -> DeadFrame {
-        // `compile.py ResumeGuardDescr.compile_and_attach` passes only live
-        // boxes to the bridge.  `rd_locs` still has one entry per logical
-        // resume position, including `0xFFFF` holes, and maps each live entry
-        // to the physical word in `parent_outputs`.  Decode that table just as
-        // `llmodel.py _decode_pos` does instead of slicing the first N logical
-        // positions (which shifts every value after the first hole).
+        // Host and in-code HIT share the parent guard's physical layout.
+        // `parent_outputs` is already the jitframe image indexed by `rd_locs`
+        // (`parent_outputs_from_rd_locs` / `extract_outputs`). Do not gather
+        // a compact `0..N` vector; the body loads `source_slots[i]`.
         let rd_locs = parent_descr.rd_locs();
-        let mut bridge_inputs = Vec::with_capacity(bridge.num_inputs);
-        if rd_locs.is_empty() {
-            bridge_inputs.extend(parent_outputs.iter().copied().take(bridge.num_inputs));
-        } else {
-            for &loc in rd_locs {
-                if loc == 0xFFFF {
-                    continue;
-                }
-                let Some(&value) = parent_outputs.get(loc as usize) else {
-                    break;
-                };
-                bridge_inputs.push(value);
-                if bridge_inputs.len() == bridge.num_inputs {
-                    break;
-                }
-            }
-        }
         let exec = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
             bridge.num_ref_roots,
             bridge.max_output_slots,
             0,
-            &FrameInputs::Ints(&bridge_inputs),
+            &FrameInputs::Ints(parent_outputs),
             attachments,
             0, // bridge entry (br_table preamble slot)
         );
@@ -12207,9 +12227,12 @@ impl CraneliftBackend {
         let direct_descr = exec.direct_descr.clone();
 
         if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
+            // CALL_ASSEMBLER resume prefix is the logical live list, not the
+            // physical image.
+            let logical = live_bridge_input_values(rd_locs, parent_outputs, bridge.num_inputs);
             return wrap_call_assembler_deadframe_with_caller_prefix(
                 frame,
-                &CallAssemblerCallerContext::from_bridge_data(bridge, &bridge_inputs),
+                &CallAssemblerCallerContext::from_bridge_data(bridge, &logical),
             );
         }
 
@@ -12518,195 +12541,44 @@ impl CraneliftBackend {
             .iter()
             .map(|(&k, c)| (k, c.as_raw_i64()))
             .collect();
-        // One slot past the value area, reserved only when some GUARD_VALUE's
-        // compared operand has nowhere else to live (`counter_slot_for`).
-        let counter_slot = counter_slot_for(inputargs, ops);
-        collect_guards(
-            ops,
-            inputargs,
-            counter_slot,
-            &mut fail_descrs,
-            &mut fail_descr_cells,
-            &mut guard_infos,
-            &mut max_output_slots,
-            trace_id,
-            header_pc,
-            source_guard,
-            caller_layout,
-            &constants_i64,
-            attached_descrs,
-            frame_value_count_fn,
-            merge.is_some(),
-        )?;
-        // `write_pending_failure_recoveries` / `generate_quick_failure`: one
-        // out-of-line trampoline per bridgeable guard. Finish and JUMP
-        // deadframe exits tail-call the shared helper directly.
-        // `x86/assembler.py assemble_loop` keeps `(faildescr, addr)` in
-        // `pending_guard_tokens` and stamps `adr_jump_offset` only in
-        // `patch_pending_failure_recoveries` after `materialize_loop`.
-        self.ensure_failure_recovery()?;
-        let mut stub_blocks = Vec::new();
-        let mut pending_guard_tokens: Vec<(DescrRef, usize)> = Vec::new();
-        for (i, info) in guard_infos.iter_mut().enumerate() {
-            let recovery = self.failure_recovery[usize::from(info.must_save_exception)]
-                .expect("failure-recovery helper compiled");
-            if info.can_have_bridge {
-                let fd = fail_descrs.get(i).and_then(|d| d.as_fail_descr());
-                // A merged recompile re-emits guards that an older function
-                // already holds. A descr has one `adr_jump_offset`, so every
-                // copy exits through that one trampoline and
-                // `patch_jump_for_descr` redirects all of them at once.
-                if let Some(addr) = fd.map(|fd| fd.adr_jump_offset()).filter(|&a| a != 0) {
-                    info.stub_addr = addr;
-                    continue;
-                }
-                let block = self
-                    .asm_memory_handle
-                    .allocate_executable(crate::stub::STUB_SIZE)
-                    .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
-                let addr = block.ptr() as usize;
-                info.stub_addr = addr;
-                // Once `patch_jump_for_descr` ran, `adr_jump_offset` is
-                // cleared; a re-emitted copy gets a trampoline that starts
-                // patched, jumping to that bridge body, and stays cleared.
-                match fd.and_then(fail_descr_bridge_ref) {
-                    Some(bridge) => {
-                        crate::stub::write_redirect_branch(addr, bridge.body_ptr as usize);
-                    }
-                    None => {
-                        crate::stub::emit_recovery_stub(addr, recovery);
-                        if let Some(descr) = fd.and(fail_descrs.get(i)) {
-                            pending_guard_tokens.push((descr.clone(), addr));
-                        }
-                    }
-                }
-                stub_blocks.push(block);
-            } else {
-                info.stub_addr = recovery;
-            }
-        }
-        #[cfg(test)]
-        if self.fail_after_pending_trampolines {
-            return Err(BackendError::CompilationFailed(
-                "test: fail after pending trampolines".into(),
-            ));
-        }
-        // RPython jitframe layout parity: ref_root slots start AFTER all
-        // output slots. max_output_slots must be >= inputs.len() so that
-        // input loading (jf_frame[0..n]) and ref_root storage don't overlap.
-        // store_final_boxes_in_guard may reduce fail_args (snapshot liveboxes)
-        // below input count; ensure the minimum here.
-        max_output_slots = max_output_slots.max(inputargs.len());
-        // x86/regalloc.py `consider_guard_not_forced_2` spills every failarg
-        // through the frame manager before `FINISH` writes its own result
-        // slots. Reserve the equivalent disjoint tail here. Sharing the dense
-        // output slots is incorrect even with parallel source resolution:
-        // FINISH immediately overwrites slot zero with its return value.
-        let force_spill_base = max_output_slots;
-        let force_spill_slots = guard_infos
-            .iter()
-            .filter(|info| ops[info.source_op_index].opcode == OpCode::GuardNotForced2)
-            .map(|info| info.fail_arg_refs.len())
-            .max()
-            .unwrap_or(0);
-        max_output_slots += force_spill_slots;
-        let mut finish_force_ref_slots = Vec::new();
-        for info in &mut guard_infos {
-            match ops[info.source_op_index].opcode {
-                OpCode::GuardNotForced2 => {
-                    let rd_locs: majit_ir::RdLocs = info
-                        .fail_arg_refs
-                        .iter()
-                        .enumerate()
-                        .map(|(index, arg)| {
-                            if arg.is_none() {
-                                0xFFFF
-                            } else {
-                                u16::try_from(force_spill_base + index)
-                                    .expect("GUARD_NOT_FORCED_2 spill slot must fit rd_locs")
-                            }
-                        })
-                        .collect();
-                    if merge.is_none()
-                        && let Some(fd) = fail_descrs
-                            .get(info.fail_index as usize)
-                            .and_then(|descr| descr.as_fail_descr())
-                    {
-                        fd.set_rd_locs(rd_locs.clone());
-                    }
-                    info.bridge_source_slots = rd_locs
-                        .iter()
-                        .filter(|&&slot| slot != 0xFFFF)
-                        .map(|&slot| slot as usize)
-                        .collect();
-                    // Stores write `force_spill_base + fail-arg index`.
-                    // `collect_guards` recorded Ref slots at
-                    // `fail_loc_base + index` (`fail_loc_base == 1` for
-                    // GUARD_NOT_FORCED_2) using `resolve_fail_arg_types`.
-                    // Re-base those slots; do not re-filter with
-                    // `OpRef::ty()`, which is the redefining op's variant
-                    // and can drop a live Ref.
-                    info.failarg_ref_slots = info
-                        .failarg_ref_slots
-                        .iter()
-                        .map(|slot| force_spill_base + (slot - 1))
-                        .collect();
-                    info.fail_locs = (0..info.fail_arg_refs.len())
-                        .map(|index| force_spill_base + index)
-                        .collect();
-                    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
-                    // opassembler.py `_finish_gcmap`: the map armed by
-                    // GUARD_NOT_FORCED_2 remains installed on the returned
-                    // JITFRAME.  FINISH may overwrite value slot zero, but it
-                    // must union that result root with these force-spill roots
-                    // so a later async force sees forwarded references.
-                    finish_force_ref_slots.clone_from(&info.failarg_ref_slots);
-                }
-                OpCode::Finish if !finish_force_ref_slots.is_empty() => {
-                    info.failarg_ref_slots
-                        .extend(finish_force_ref_slots.iter().copied());
-                    info.failarg_ref_slots.sort_unstable();
-                    info.failarg_ref_slots.dedup();
-                    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
-                }
-                _ => {}
-            }
-        }
-        let terminal_exit_layouts = collect_terminal_exit_layouts(
-            ops,
-            inputargs,
-            trace_id,
-            header_pc,
-            source_guard,
-            caller_layout,
-        )?;
-
         let num_inputs = inputargs.len();
-        let known_values = build_known_values_set(inputargs, ops);
-        let used_vars = build_used_vars_set(ops);
         let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(ops, &type_index);
-        let ref_root_slots =
+        let mut ref_root_slots =
             build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
-
-        // Hoisted before the entry-prologue frame sizing so the reserved frame
-        // tail (`reserved_tail`) accounts for demoted non-ref homes.
+        // `prepare_bridge` / `_update_bindings`: a bridge inputarg starts
+        // bound to the location the parent guard left it in. Loops keep
+        // `_set_initial_bindings` identity (`i*8`) and a ref-root tail.
+        //
+        // `JITFRAME_FIXED_SIZE` analogue for the FINISH identity slots.
+        // `rebuild_faillocs_from_descr` maps a parent guard position inside
+        // the fixed area back to a REGISTER, so a bridge never binds an
+        // inputarg to a slot `genop_finish` `save_into_mem(base_ofs)` overwrites.
+        let finish_arity = max_finish_arity(ops);
+        let has_gnf2 = ops.iter().any(|op| op.opcode == OpCode::GuardNotForced2);
+        let fixed_area = if is_bridge && has_gnf2 {
+            finish_arity
+        } else {
+            0
+        };
+        let bind_homes = if is_bridge {
+            bridge_bind_homes(
+                inputargs,
+                bridge_source_slots.as_deref().unwrap_or(&[]),
+                fixed_area,
+            )
+        } else {
+            IndexMap::new()
+        };
+        let mut bind_occupied: IndexSet<usize> = bind_homes.values().copied().collect();
+        let absolute_homes = is_bridge;
         let label_indices: Vec<usize> = ops
             .iter()
             .enumerate()
             .filter_map(|(idx, op)| (op.opcode == OpCode::Label).then_some(idx))
             .collect();
-        // Pre-scan for vector-producing ops (SIMD variable types). Needed here to
-        // exclude SIMD lanes (a 128-bit value carrying `Type::Int`) from non-ref
-        // demotion, whose home is a single 8-byte slot.
         let vec_oprefs = build_vec_oprefs(ops, num_inputs);
         let vec_float_oprefs = build_vec_float_oprefs(ops, num_inputs);
-
-        // Loop-invariant deopt-only LABEL args are demoted from SSA loop phis to
-        // frame-resident slots (see `compute_loop_phi_keep`). `keep[i] == false`
-        // means position `i` of that LABEL gets no Cranelift block param: it is
-        // read from its forwarded frame home and dropped from every incoming
-        // JUMP's argument list.
         let mut loop_phi_keep_by_label = compute_loop_phi_keep(ops, &label_indices);
         // Two home regions carry a demoted arg:
         //
@@ -12766,14 +12638,222 @@ impl CraneliftBackend {
                 keep.iter().any(|keep| !keep)
             });
         }
-        // Reserved frame slots after the dense output region: ref roots plus
-        // demoted non-ref homes.  Both must exist before the body writes them, so
-        // the entry prologue sizes the frame to `max_output_slots + reserved_tail`.
+        let mut bridge_home_intervals: IndexMap<u32, (usize, usize)> = IndexMap::new();
+        let mut bridge_var_slots: IndexMap<u32, usize> = IndexMap::new();
+        let identity_floor = if absolute_homes {
+            max_label_arity(ops)
+        } else {
+            0
+        };
+        let demoted_home_index = if absolute_homes {
+            let mut demoted_vars: IndexSet<u32> = IndexSet::new();
+            for (&li, keep) in &loop_phi_keep_by_label {
+                for (_, raw) in nonref_demoted_positions(li, keep, ops, &ref_root_slots) {
+                    demoted_vars.insert(raw);
+                }
+            }
+            let mut home_vars: IndexSet<u32> = bind_homes.keys().copied().collect();
+            for &(var_idx, _) in &ref_root_slots {
+                home_vars.insert(var_idx);
+            }
+            home_vars.extend(demoted_vars.iter().copied());
+            bridge_home_intervals = compute_bridge_home_intervals(inputargs, ops, &home_vars);
+            let ref_vars: IndexSet<u32> =
+                ref_root_slots.iter().map(|&(var_idx, _)| var_idx).collect();
+            let (var_slots, all_assigned) = assign_bridge_homes_linear_scan(
+                &bridge_home_intervals,
+                &bind_homes,
+                &ref_vars,
+                &demoted_vars,
+                fixed_area.max(identity_floor),
+            );
+            for (var_idx, slot) in ref_root_slots.iter_mut() {
+                if let Some(&home) = var_slots.get(var_idx) {
+                    *slot = home;
+                }
+            }
+            let mut demoted = IndexMap::new();
+            for &var in &demoted_vars {
+                if let Some(&home) = var_slots.get(&var) {
+                    demoted.insert(var, home);
+                }
+            }
+            bind_occupied = all_assigned;
+            bridge_var_slots = var_slots;
+            demoted
+        } else {
+            demoted_home_index_map(&loop_phi_keep_by_label, ops, &ref_root_slots, None, 0)
+        };
         let num_nonref_homes: usize = loop_phi_keep_by_label
             .iter()
             .map(|(&li, keep)| nonref_demoted_positions(li, keep, ops, &ref_root_slots).len())
             .sum();
-        let reserved_tail = ref_root_slots.len() + num_nonref_homes;
+        // Bridges fold ref-roots and demoted homes into the same slot
+        // space as the bind set (`FrameManager.get_new_loc`). Loops keep
+        // a tail past the dense value area.
+        let reserved_tail = if absolute_homes {
+            0
+        } else {
+            ref_root_slots.len() + num_nonref_homes
+        };
+        let fail_arg_homes = FailArgHomes {
+            ref_root_slots: &ref_root_slots,
+            demoted_home_index: &demoted_home_index,
+            bind_homes: &bind_homes,
+            occupied: &bind_occupied,
+            absolute_homes,
+            home_intervals: absolute_homes.then_some(&bridge_home_intervals),
+            identity_floor,
+        };
+        // One slot past the value area, reserved only when some GUARD_VALUE's
+        // compared operand has nowhere else to live (`counter_slot_for`).
+        let counter_slot = counter_slot_for(inputargs, ops, &fail_arg_homes, finish_arity);
+        collect_guards(
+            ops,
+            inputargs,
+            counter_slot,
+            &mut fail_descrs,
+            &mut fail_descr_cells,
+            &mut guard_infos,
+            &mut max_output_slots,
+            trace_id,
+            header_pc,
+            source_guard,
+            caller_layout,
+            &constants_i64,
+            attached_descrs,
+            frame_value_count_fn,
+            merge.is_some(),
+            &fail_arg_homes,
+            finish_arity,
+        )?;
+        // `write_pending_failure_recoveries` / `generate_quick_failure`: one
+        // out-of-line trampoline per bridgeable guard. Finish and JUMP
+        // deadframe exits tail-call the shared helper directly.
+        // `x86/assembler.py assemble_loop` keeps `(faildescr, addr)` in
+        // `pending_guard_tokens` and stamps `adr_jump_offset` only in
+        // `patch_pending_failure_recoveries` after `materialize_loop`.
+        self.ensure_failure_recovery()?;
+        let mut stub_blocks = Vec::new();
+        let mut pending_guard_tokens: Vec<(DescrRef, usize)> = Vec::new();
+        for (i, info) in guard_infos.iter_mut().enumerate() {
+            let recovery = self.failure_recovery[usize::from(info.must_save_exception)]
+                .expect("failure-recovery helper compiled");
+            if info.can_have_bridge {
+                let fd = fail_descrs.get(i).and_then(|d| d.as_fail_descr());
+                // A merged recompile re-emits guards that an older function
+                // already holds. A descr has one `adr_jump_offset`, so every
+                // copy exits through that one trampoline and
+                // `patch_jump_for_descr` redirects all of them at once.
+                if let Some(addr) = fd.map(|fd| fd.adr_jump_offset()).filter(|&a| a != 0) {
+                    info.stub_addr = addr;
+                    continue;
+                }
+                let block = self
+                    .asm_memory_handle
+                    .allocate_executable(crate::stub::STUB_SIZE)
+                    .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+                let addr = block.ptr() as usize;
+                info.stub_addr = addr;
+                // Once `patch_jump_for_descr` ran, `adr_jump_offset` is
+                // cleared; a re-emitted copy gets a trampoline that starts
+                // patched, jumping to that bridge body, and stays cleared.
+                match fd.and_then(fail_descr_bridge_ref) {
+                    Some(bridge) => {
+                        crate::stub::write_redirect_branch(addr, bridge.body_ptr as usize);
+                    }
+                    None => {
+                        crate::stub::emit_recovery_stub(addr, recovery);
+                        if let Some(descr) = fd.and(fail_descrs.get(i)) {
+                            pending_guard_tokens.push((descr.clone(), addr));
+                        }
+                    }
+                }
+                stub_blocks.push(block);
+            } else {
+                info.stub_addr = recovery;
+            }
+        }
+        #[cfg(test)]
+        if self.fail_after_pending_trampolines {
+            return Err(BackendError::CompilationFailed(
+                "test: fail after pending trampolines".into(),
+            ));
+        }
+        // Loops: `_set_initial_bindings` / LABEL loader stay `i*8`, so the
+        // dense width is at least `inputargs.len()` and `max_label_arity`.
+        // Bridges: inputarg homes are the bind set; drop the N floor.
+        // Keep the LABEL-arity floor only when a LABEL is present (0 else).
+        if absolute_homes {
+            let bind_span = bind_occupied
+                .iter()
+                .copied()
+                .max()
+                .map(|s| s + 1)
+                .unwrap_or(0);
+            let ref_span = ref_root_slots
+                .iter()
+                .map(|(_, slot)| *slot + 1)
+                .max()
+                .unwrap_or(0);
+            let demoted_span = demoted_home_index
+                .values()
+                .copied()
+                .max()
+                .map(|s| s + 1)
+                .unwrap_or(0);
+            max_output_slots = max_output_slots
+                .max(bind_span)
+                .max(ref_span)
+                .max(demoted_span)
+                .max(max_label_arity(ops));
+        } else {
+            max_output_slots = max_output_slots
+                .max(inputargs.len())
+                .max(max_label_arity(ops));
+        }
+        resolve_fail_locs_and_stamp(
+            &mut guard_infos,
+            ops,
+            &fail_descrs,
+            max_output_slots,
+            ref_root_slots.len(),
+            merge.is_some(),
+        );
+        // opassembler.py `_finish_gcmap`: the map armed by
+        // `store_force_descr` remains installed on the returned JITFRAME.
+        // FINISH may overwrite value slot zero, but it must union that
+        // result root with the force-path roots so a later async force
+        // sees forwarded references. Locations come from packing, not a
+        // second dense block (`consider_guard_not_forced_2` /
+        // `store_force_descr`).
+        let mut finish_force_ref_slots = Vec::new();
+        for info in &mut guard_infos {
+            match ops[info.source_op_index].opcode {
+                OpCode::GuardNotForced2 => {
+                    finish_force_ref_slots.clone_from(&info.failarg_ref_slots);
+                }
+                OpCode::Finish if !finish_force_ref_slots.is_empty() => {
+                    info.failarg_ref_slots
+                        .extend(finish_force_ref_slots.iter().copied());
+                    info.failarg_ref_slots.sort_unstable();
+                    info.failarg_ref_slots.dedup();
+                    info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
+                }
+                _ => {}
+            }
+        }
+        let terminal_exit_layouts = collect_terminal_exit_layouts(
+            ops,
+            inputargs,
+            trace_id,
+            header_pc,
+            source_guard,
+            caller_layout,
+        )?;
+
+        let known_values = build_known_values_set(inputargs, ops);
+        let used_vars = build_used_vars_set(ops);
         // `assembler.py assemble_bridge` sizes the bridge frame as
         // `max(self.current_clt.frame_info.jfi_frame_depth, own)`. A baked
         // closing JUMP's target depth is that `jfi_frame_depth`: the prologue
@@ -12797,19 +12877,24 @@ impl CraneliftBackend {
             guaranteed_frame_depth,
             &mut guard_infos,
             merge_segments,
+            &bind_homes,
+            absolute_homes,
+            absolute_homes.then_some(&bridge_home_intervals),
+            absolute_homes.then_some(&bridge_var_slots),
         );
 
         let gc_nursery_addrs =
             with_cranelift_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr()));
         let gc_max_nursery_object_size = with_cranelift_gc(|gc| gc.max_nursery_object_size());
-        // llmodel.py:64-69 self.vtable_offset — backend property used by
-        // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
+        // llmodel.py AbstractLLCPU.__init__ self.vtable_offset — backend
+        // property used by bh_new_with_vtable. Capture for use in
+        // NEW_WITH_VTABLE codegen.
         let vtable_offset = self.vtable_offset;
         // llsupport/gc.py GcLLDescr_framework
         //   .get_typeid_from_classptr_if_gcremovetypeptr — used by
         // _cmp_guard_class when vtable_offset is None. Reads through the
-        // thread-local `CRANELIFT_ACTIVE_GC` (`llmodel.py:58`
-        // `cpu.gc_ll_descr` parity), so the closure does not need a
+        // thread-local `CRANELIFT_ACTIVE_GC` (`llmodel.py AbstractLLCPU.__init__
+        // cpu.gc_ll_descr` parity), so the closure does not need a
         // reference to `self` and can be moved freely past borrow
         // conflicts with `func_ctx`.
         let gc_typeid_lookup = move |classptr: usize| -> Option<u32> {
@@ -12877,78 +12962,32 @@ impl CraneliftBackend {
             Vec::new()
         };
         debug_assert_eq!(entry_arg_params.len(), n_tail_extras);
-        // `rebuild_faillocs_from_descr` / `execute_bridge`: host entry
-        // already packs live `rd_locs` into compact slots `0..N`. An
-        // in-code guard HIT (`patch_jump_for_descr`) still has failargs
-        // at those `rd_locs` — compact here so the 2-arg body loads the
-        // same layout. LABEL re-entry (`selector != 0`) and host (`key
-        // 0`) skip; identity `rd_locs` is a no-op. Runs before the
-        // preamble gcmap / `_check_frame_depth` so a LABEL-bridge HIT
-        // publishes the compact map over already-packed slots.
-        if is_bridge {
-            if let Some(ref slots) = bridge_source_slots {
-                if slots
-                    .iter()
-                    .enumerate()
-                    .any(|(dense, source)| dense != *source)
-                {
-                    let remap_block = builder.create_block();
-                    let skip_block = builder.create_block();
-                    let hit_key = builder
-                        .ins()
-                        .iconst(cl_types::I32, IN_CODE_ENTRY_KEY_FLAG as i64);
-                    let is_guard_hit = builder.ins().icmp(IntCC::Equal, raw_dispatch_key, hit_key);
-                    builder
-                        .ins()
-                        .brif(is_guard_hit, remap_block, &[], skip_block, &[]);
-                    builder.switch_to_block(remap_block);
-                    builder.seal_block(remap_block);
-                    emit_compact_rd_locs_into_frame(&mut builder, initial_jf_ptr, slots);
-                    builder.ins().jump(skip_block, &[]);
-                    builder.switch_to_block(skip_block);
-                    builder.seal_block(skip_block);
-                }
-            }
-        }
-        // `prepare_bridge` / `_update_bindings`: the in-code Tail args are
-        // the guard's fail locations that fit in Tail GPRs. Publish those
-        // extra params into compact slots `0..n_tail_extras`; overflow
-        // inputargs already occupy `n_tail_extras..N` from the HIT store
-        // or the host wrapper. JUMP `entry_resident_skip` treats slots
-        // `0..N` as already holding the inputargs
-        // (`record_entry_resident_failargs`), and Refs must be in the
-        // gcmap before `_check_frame_depth` / `cranelift_realloc_frame`
-        // or any later collecting op. SSA still uses the Tail registers
-        // for Int/Float extras; Refs reload after realloc so a
-        // forwarding collection updates them.
+        // `prepare_bridge` / `_update_bindings`: HIT and host leave
+        // failargs at the parent guard's `rd_locs`. No compact shuffle.
+        // Tail extras store into `source_slots[i]` only when that home
+        // is not already the register's value; overflow inputargs already
+        // occupy their bind homes. Refs must be in the gcmap before
+        // `_check_frame_depth` / `cranelift_realloc_frame`.
         let mut extra_gcmaps: Vec<i64> = Vec::new();
+        let source_slots_for_entry = bridge_source_slots.as_deref().unwrap_or(&[]);
+        let bridge_ref_gcmap_slots: Vec<usize> = bridge_arg_types
+            .iter()
+            .enumerate()
+            .filter(|(_, tp)| **tp == Type::Ref)
+            .map(|(i, _)| source_slots_for_entry.get(i).copied().unwrap_or(i))
+            .collect();
         if register_carried {
-            for i in 0..n_tail_extras {
-                let stored = coerce_ty(&mut builder, entry_arg_params[i], cl_types::I64);
-                builder.ins().store(
-                    MemFlagsData::trusted(),
-                    stored,
-                    initial_jf_ptr,
-                    JF_FRAME_ITEM0_OFS + (i as i32) * 8,
-                );
-            }
-            let ref_slots: Vec<usize> = bridge_arg_types
-                .iter()
-                .enumerate()
-                .filter(|(_, tp)| **tp == Type::Ref)
-                .map(|(i, _)| i)
-                .collect();
+            // Tail extras already occupy `source_slots[i]` on HIT and host
+            // (`_update_bindings`). The compact `0..n_tail_extras` store is
+            // gone; do not write a home that already holds the value.
             // The in-code hit dispatched before the parent stored its
             // gcmap (`patch_jump_for_descr` never runs the recovery stub),
             // so `jf_gcmap` still names the loop body's last map. Always
-            // replace it: a Ref extra is rooted in the compact slots just
-            // written, and a no-ref extra must clear the stale map
-            // (`pop_gcmap`) before `_check_frame_depth` /
-            // `cranelift_realloc_frame`.
-            let entry_gcmap = if ref_slots.is_empty() {
+            // replace it with the bind-home map.
+            let entry_gcmap = if bridge_ref_gcmap_slots.is_empty() {
                 0
             } else {
-                allocate_gcmap(&ref_slots)
+                allocate_gcmap(&bridge_ref_gcmap_slots)
             };
             if entry_gcmap != 0 {
                 extra_gcmaps.push(entry_gcmap);
@@ -12968,16 +13007,9 @@ impl CraneliftBackend {
                 );
             }
         } else if is_bridge {
-            // HIT compact-packs into `0..N` just above; host `execute_bridge`
-            // already packed the same layout. Publish that compact map so
-            // `_check_frame_depth` traces the packed refs. LABEL re-entry
-            // (`selector != 0`) skips, matching `emit_label_bridge_preamble_gcmap`.
-            let ref_slots: Vec<usize> = bridge_arg_types
-                .iter()
-                .enumerate()
-                .filter(|(_, tp)| **tp == Type::Ref)
-                .map(|(i, _)| i)
-                .collect();
+            // Selector 0 (HIT / host): mark Ref inputargs at `source_slots[i]`.
+            // LABEL re-entry (`selector != 0`) skips, matching
+            // `emit_label_bridge_preamble_gcmap`.
             emit_label_bridge_preamble_gcmap(
                 module,
                 &mut builder,
@@ -12985,7 +13017,7 @@ impl CraneliftBackend {
                 call_conv,
                 initial_jf_ptr,
                 raw_dispatch_key,
-                &ref_slots,
+                &bridge_ref_gcmap_slots,
                 &mut extra_gcmaps,
             );
         }
@@ -13184,10 +13216,11 @@ impl CraneliftBackend {
         builder.ins().jump(shadowstack_done_block, &[]);
         builder.switch_to_block(shadowstack_done_block);
         builder.seal_block(shadowstack_done_block);
-        // Ref root slots live in jf_frame after output/fail_args area.
-        // RPython: refs are always in jf_frame; gcmap marks which slots
-        // are live at each GC point (regalloc.py get_gcmap).
-        let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (max_output_slots as i32) * 8;
+        // Loops: ref-root tail after the dense value area.
+        // Bridges: ref-root slots are absolute frame indexes (`bind` /
+        // `_find_frame_location`), so the byte base is ITEM0.
+        let ref_root_gcmap_base = if absolute_homes { 0 } else { max_output_slots };
+        let ref_root_base_ofs = JF_FRAME_ITEM0_OFS + (ref_root_gcmap_base as i32) * 8;
         if majit_log_enabled() {
             eprintln!(
                 "[codegen] max_output={} ref_roots={} longevity={:?}",
@@ -13239,14 +13272,10 @@ impl CraneliftBackend {
                     (label_idx, positions)
                 })
                 .collect();
-        // Demoted non-ref (i64) args: home in the region AFTER the ref-root slots,
-        // disjoint from the dense scratch that guard failargs / before-call spills
-        // clobber.  Each demoted position gets one 8-byte home, assigned by a
-        // running counter that matches `num_nonref_homes` (asserted).  Read by
-        // guard exits through `demoted_failarg_slots`; re-seeded on every LABEL
-        // entry edge (preamble fall-through and loader re-entry) so a non-ref
-        // inputarg's home can never go stale.  Not a GC root (never marked in the
-        // gcmap, which is driven by `ref_root_slots`).
+        // Demoted non-ref (i64) args. Loops: home in the region AFTER the
+        // ref-root slots, disjoint from the dense scratch. Bridges: lowest
+        // free slot (`_find_frame_location`), must not alias a bind home.
+        // Re-seeded on every LABEL entry edge. Not a GC root.
         let nonref_home_base_ofs = ref_root_base_ofs + (ref_root_slots.len() as i32) * 8;
         let mut next_nonref_home = 0usize;
         let demoted_nonref_positions_by_label: IndexMap<usize, Vec<(usize, u32, i32)>> = {
@@ -13254,7 +13283,13 @@ impl CraneliftBackend {
             for (&label_idx, keep) in &loop_phi_keep_by_label {
                 let mut positions = Vec::new();
                 for (i, raw) in nonref_demoted_positions(label_idx, keep, ops, &ref_root_slots) {
-                    positions.push((i, raw, nonref_home_base_ofs + (next_nonref_home as i32) * 8));
+                    let offset = if absolute_homes {
+                        let slot = *demoted_home_index.get(&raw).expect("demoted home");
+                        JF_FRAME_ITEM0_OFS + (slot as i32) * 8
+                    } else {
+                        nonref_home_base_ofs + (next_nonref_home as i32) * 8
+                    };
+                    positions.push((i, raw, offset));
                     next_nonref_home += 1;
                 }
                 if !positions.is_empty() {
@@ -13468,45 +13503,43 @@ impl CraneliftBackend {
             *cell.borrow_mut() = Some(op_result_positions);
         });
 
-        // Load the inputarg boxes from frame slots `[0, num_inputs)` (the
-        // entry layout `run_compiled_code_inner` populated). The per-LABEL
-        // `br_table` re-entry path reads each LABEL's carried values directly
-        // from the frame in its loader, so the entry block only needs the
-        // host-entry inputs.
+        // Load the inputarg boxes. Loops and LABEL re-entry use identity
+        // `ITEM0 + i*8`. A bridge HIT/host path loads inputarg i from
+        // `source_slots[i]` (`_ll_initial_locs`).
         //
         // A register-carried bridge uses the Tail extra params for the
         // failargs that fit in Tail GPRs: Int/Float extras stay in those
-        // registers; Refs were stored into compact slots above and are
-        // reloaded after realloc so a forwarding collection updates them.
-        // Overflow inputargs (`tail_register_failargs` remainder) are
-        // already in compact slots `n_tail_extras..N`.
+        // registers; Refs reload after realloc from their bind homes so a
+        // forwarding collection updates them. Overflow inputargs already
+        // occupy `source_slots[n_tail_extras..]`.
+        let entry_home_slot = |i: usize| -> usize {
+            if is_bridge {
+                source_slots_for_entry.get(i).copied().unwrap_or(i)
+            } else {
+                i
+            }
+        };
         let entry_input_vals = if register_carried {
             debug_assert_eq!(entry_arg_params.len(), n_tail_extras);
-            (0..num_inputs)
-                .map(|i| {
-                    if i < n_tail_extras {
-                        match bridge_arg_types[i] {
-                            Type::Ref => builder.ins().load(
-                                cl_types::I64,
-                                MemFlagsData::trusted(),
-                                inputs_ptr,
-                                JF_FRAME_ITEM0_OFS + (i as i32) * 8,
-                            ),
-                            _ => coerce_ty(&mut builder, entry_arg_params[i], cl_types::I64),
-                        }
-                    } else {
-                        builder.ins().load(
-                            cl_types::I64,
-                            MemFlagsData::trusted(),
-                            inputs_ptr,
-                            JF_FRAME_ITEM0_OFS + (i as i32) * 8,
-                        )
-                    }
-                })
-                .collect()
+            let mut vals: Vec<Option<CValue>> = vec![None; num_inputs];
+            let mut load_idx = Vec::new();
+            let mut load_off = Vec::new();
+            for i in 0..num_inputs {
+                if i < n_tail_extras && bridge_arg_types[i] != Type::Ref {
+                    vals[i] = Some(coerce_ty(&mut builder, entry_arg_params[i], cl_types::I64));
+                } else {
+                    load_idx.push(i);
+                    load_off.push(JF_FRAME_ITEM0_OFS + (entry_home_slot(i) as i32) * 8);
+                }
+            }
+            let loaded = load_frame_slot_run(&mut builder, inputs_ptr, &load_off);
+            for (i, val) in load_idx.into_iter().zip(loaded) {
+                vals[i] = Some(val);
+            }
+            vals.into_iter().map(Option::unwrap).collect()
         } else {
             let entry_input_offsets: Vec<i32> = (0..num_inputs)
-                .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
+                .map(|i| JF_FRAME_ITEM0_OFS + (entry_home_slot(i) as i32) * 8)
                 .collect();
             load_frame_slot_run(&mut builder, inputs_ptr, &entry_input_offsets)
         };
@@ -13529,8 +13562,10 @@ impl CraneliftBackend {
         // per-LABEL loaders read their carried values from the dense slots
         // `JF_FRAME_ITEM0_OFS + i*8`, which overlap the ref-root region when
         // `max_output_slots < arity`, so seeding here would clobber a carried
-        // value before its loader reads it. A linear entry needs no eager
-        // root-home write at all.
+        // value before its loader reads it. A linear loop entry needs no
+        // eager root-home write: the ref-root tail is spilled before the
+        // first collecting op. A linear bridge whose Ref home moved out of
+        // `fixed_area` stores that home here, matching the loop-tail seed.
         //
         // A guard gcmap names a ref-root slot only when `rd_locs` redirects
         // that fail arg onto a home that already holds the value: a demoted
@@ -13555,8 +13590,23 @@ impl CraneliftBackend {
         for (i, val) in entry_input_vals.iter().copied().enumerate() {
             let slot = inputargs[i].index;
             builder.def_var(var(&opref_var_map, slot), val);
-            if has_labels {
+            if has_labels || absolute_homes {
                 deferred_entry_root_syncs.push((slot, val));
+            }
+        }
+        if absolute_homes && !has_labels {
+            let mut entry_sync_jf_ptr = None;
+            for &(slot, val) in &deferred_entry_root_syncs {
+                sync_ref_root_var(
+                    &mut builder,
+                    ptr_type,
+                    &mut entry_sync_jf_ptr,
+                    &ref_root_slots,
+                    slot,
+                    val,
+                    ref_root_base_ofs,
+                    &mut synced_ref_vars,
+                );
             }
         }
 
@@ -13751,18 +13801,47 @@ impl CraneliftBackend {
                 // phi defined on the loader edge), and re-sync the ref-root slot
                 // the body's guard exits read from.  Reading the ref-root slot
                 // directly would be stale: a bridge does not repopulate it.
+                //
+                // Kept and demoted dense slots are independent loads of
+                // `ITEM0 + i*8`; load the whole identity run once so adjacent
+                // slots pair. Root re-sync stores stay after every dense load:
+                // when `max_output_slots < arity` the ref-root region aliases
+                // the tail of the dense slots (same hazard
+                // `deferred_entry_root_syncs` defers past the dispatch above).
                 let loop_phi_keep = loop_phi_keep_by_label.get(&label_idx);
-                let mut demoted_root_syncs: Vec<(CValue, i32)> = Vec::new();
+                let mut need: Vec<usize> = (0..arity)
+                    .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
+                    .collect();
+                if let Some(positions) = demoted_ref_positions_by_label.get(&label_idx) {
+                    for &(i, _, _) in positions {
+                        if !need.contains(&i) {
+                            need.push(i);
+                        }
+                    }
+                }
+                if let Some(positions) = demoted_nonref_positions_by_label.get(&label_idx) {
+                    for &(i, _, _) in positions {
+                        if !need.contains(&i) {
+                            need.push(i);
+                        }
+                    }
+                }
+                need.sort_unstable();
+                let dense_offsets: Vec<i32> = need
+                    .iter()
+                    .map(|&i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
+                    .collect();
+                let dense_loaded = load_frame_slot_run(&mut builder, cur_jf, &dense_offsets);
+                let mut dense_at: Vec<Option<CValue>> = vec![None; arity];
+                for (&i, val) in need.iter().zip(dense_loaded) {
+                    dense_at[i] = Some(val);
+                }
+                let mut demoted_root_syncs: Vec<(i32, CValue)> = Vec::new();
                 if let Some(positions) = demoted_ref_positions_by_label.get(&label_idx) {
                     for &(i, raw, root_ofs) in positions {
-                        let v = builder.ins().load(
-                            cl_types::I64,
-                            MemFlagsData::trusted(),
-                            cur_jf,
-                            JF_FRAME_ITEM0_OFS + (i as i32) * 8,
-                        );
+                        let v = dense_at[i].expect("demoted ref dense slot was loaded");
                         builder.def_var(var(&opref_var_map, raw), v);
-                        demoted_root_syncs.push((v, root_ofs));
+                        demoted_root_syncs.push((root_ofs, v));
                     }
                 }
                 // Demoted non-ref homes: re-seed on loader re-entry, but do NOT
@@ -13774,31 +13853,17 @@ impl CraneliftBackend {
                 // writes arg i → slot i); copy it into the home the guards read.
                 if let Some(positions) = demoted_nonref_positions_by_label.get(&label_idx) {
                     for &(i, _raw, home_ofs) in positions {
-                        let v = builder.ins().load(
-                            cl_types::I64,
-                            MemFlagsData::trusted(),
-                            cur_jf,
-                            JF_FRAME_ITEM0_OFS + (i as i32) * 8,
-                        );
-                        demoted_root_syncs.push((v, home_ofs));
+                        demoted_root_syncs.push((
+                            home_ofs,
+                            dense_at[i].expect("demoted nonref dense slot was loaded"),
+                        ));
                     }
                 }
-                let carried_offsets: Vec<i32> = (0..arity)
+                let vals: Vec<CValue> = (0..arity)
                     .filter(|&i| loop_phi_keep.is_none_or(|keep| keep[i]))
-                    .map(|i| JF_FRAME_ITEM0_OFS + (i as i32) * 8)
+                    .map(|i| dense_at[i].expect("kept LABEL arg dense slot was loaded"))
                     .collect();
-                let vals = load_frame_slot_run(&mut builder, cur_jf, &carried_offsets);
-                // Ref-root re-syncs go after every dense carried-slot load:
-                // when `max_output_slots < arity` the ref-root region aliases
-                // the tail of the dense slots, and a store emitted before the
-                // loads would clobber a carried value the loader has yet to
-                // read (same hazard `deferred_entry_root_syncs` defers past
-                // the dispatch above).
-                for &(v, root_ofs) in &demoted_root_syncs {
-                    builder
-                        .ins()
-                        .store(MemFlagsData::new(), v, cur_jf, root_ofs);
-                }
+                emit_sorted_frame_stores(&mut builder, cur_jf, demoted_root_syncs);
                 let args = block_args_to(&mut builder, label_block, &vals);
                 builder.ins().jump(label_block, &args);
             }
@@ -14343,7 +14408,7 @@ impl CraneliftBackend {
             // marking the alive ref root slots at this position.
             let per_call_gcmap = get_gcmap(
                 op_idx,
-                max_output_slots,
+                ref_root_gcmap_base,
                 pre_call_failarg_slots,
                 &dense_ref_bindings,
                 &ref_root_slots,
@@ -15316,11 +15381,10 @@ impl CraneliftBackend {
                     // x86/regalloc.py consider_guard_not_forced_2:
                     //   assembler.store_force_descr(op, fail_locs, frame_depth)
                     //
-                    // RPython's recovery code (_update_at_exit) writes fail_arg
-                    // values from registers to jf_frame[rd_locs[i]]. In majit,
-                    // emit_guard_exit does this for inline guards. For
-                    // GUARD_NOT_FORCED_2 (no inline branch), we write fail_args
-                    // to jf_frame[0..n] here so force() sees correct values.
+                    // `before_call(save_all_regs=True)` then records the
+                    // current locations. Homed Refs already live in their
+                    // ref-root slots; non-homed values go to the packed dense
+                    // slots `pack_fail_locs` assigned. No second dense block.
                     let info = &mut guard_infos[guard_idx];
                     guard_idx += 1;
 
@@ -15334,41 +15398,42 @@ impl CraneliftBackend {
                         JF_FORCE_DESCR_OFS,
                     );
 
-                    // x86/regalloc.py `consider_guard_not_forced_2` first
-                    // performs `before_call(..., save_all_regs=True)`, then
-                    // records the resulting locations. Resolve every source
-                    // before writing any positional destination: an inputarg
-                    // source can itself live in jf_frame[0..n], and a
-                    // left-to-right copy would clobber a later source.
-                    let mut force_values = Vec::with_capacity(info.fail_arg_refs.len());
-                    for &arg_ref in &info.fail_arg_refs {
-                        force_values.push((!arg_ref.is_none()).then(|| {
-                            resolve_failarg_opref(
-                                &mut builder,
-                                &opref_var_map,
-                                &constants,
-                                cur_jf,
-                                &ref_root_slots,
-                                &stale_ref_vars,
-                                &demoted_failarg_slots,
-                                ref_root_base_ofs,
-                                arg_ref,
-                            )
-                        }));
-                    }
-                    // implement_guard_recovery / _update_at_exit parity:
-                    // Write fail_arg values to jf_frame[0..n] in fail_args order.
-                    for (index, raw) in force_values.into_iter().enumerate() {
-                        let Some(raw) = raw else {
+                    let skip_store = apply_resident_failarg_locs(
+                        info,
+                        &fail_descrs,
+                        &ref_root_slots,
+                        &stale_ref_vars,
+                        &demoted_failarg_slots,
+                        ref_root_base_ofs,
+                    );
+                    // Resolve every source before writing any destination:
+                    // an inputarg source can itself live in jf_frame[0..n],
+                    // and a left-to-right copy would clobber a later source.
+                    // `jf_force_descr` was stored above; it must stay ahead of
+                    // this image. Emit the image in ascending offset order.
+                    let mut force_pairs = Vec::with_capacity(info.fail_arg_refs.len());
+                    for (index, &arg_ref) in info.fail_arg_refs.iter().enumerate() {
+                        if arg_ref.is_none() || skip_store.get(index).copied().unwrap_or(false) {
                             continue;
-                        };
-                        builder.ins().store(
-                            MemFlagsData::trusted(),
-                            raw,
+                        }
+                        let loc = info.fail_locs[index];
+                        if loc == FAIL_LOC_HOLE {
+                            continue;
+                        }
+                        let raw = resolve_failarg_opref(
+                            &mut builder,
+                            &opref_var_map,
+                            &constants,
                             cur_jf,
-                            JF_FRAME_ITEM0_OFS + ((force_spill_base + index) as i32) * 8,
+                            &ref_root_slots,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                            arg_ref,
                         );
+                        force_pairs.push((JF_FRAME_ITEM0_OFS + (loc as i32) * 8, raw));
                     }
+                    emit_sorted_frame_stores(&mut builder, cur_jf, force_pairs);
                     if info.gcmap != 0 {
                         emit_jitframe_write_barrier(
                             module,
@@ -16208,64 +16273,68 @@ impl CraneliftBackend {
                     let ca_merge_block = builder.create_block();
                     builder.append_block_param(ca_merge_block, cl_types::I64);
 
-                    // Direct call via the descr-carried token: always load the
-                    // entry address from the token's `_ll_function_addr` slot
-                    // at runtime, never bake it as an immediate.  Unlike
-                    // dynasm, cranelift does not patch an old loop's entry
-                    // code on `Assembler386.redirect_call_assembler` (x86 `assembler.py`) —
-                    // it stores the new address into the OLD token's slot, so
-                    // a baked immediate would pin every call to a redirected
-                    // tmp-callback body forever (portal round-trip per call).
-                    // A slot that still contains 0 (recursive target still
-                    // tracing) falls back to the shim via the runtime null
-                    // check until `register_call_assembler_target` stores the
-                    // real address. Descrs without an Arc fall back to the
-                    // helper shim instead of a number-keyed dispatch slot.
+                    // `llsupport/assembler.py call_assembler` /
+                    // `_call_assembler_emit_call(self.imm(descr._ll_function_addr))`:
+                    // bake the entry as an immediate. `redirect_call_assembler`
+                    // overlays a JMP at that address (`x86/assembler.py
+                    // redirect_call_assembler`), so a later retrace of the
+                    // callee does not need the slot reloaded. A slot that
+                    // still contains 0 (recursive target still tracing)
+                    // falls back to load-from-slot + null diamond until
+                    // `register_call_assembler_target` stores the real
+                    // address. Descrs without an Arc fall back to the helper
+                    // shim instead of a number-keyed dispatch slot.
+                    let baked_addr = descr_token
+                        .map(|token| token.ll_function_addr())
+                        .filter(|&addr| addr != 0);
                     let descr_addr_slot =
                         descr_token.map(|token| token.ll_function_addr_slot() as usize);
+                    let emit_ca_shim = baked_addr.is_none();
+                    let mut slot_code_addr = None;
+                    let mut shim_fallback_block = None;
 
-                    if let Some(addr_slot) = descr_addr_slot {
+                    if baked_addr.is_some() || descr_addr_slot.is_some() {
                         // No separate out_slot: callee writes outputs to args_slot (shared).
 
-                        // Load code_ptr from the token slot.  RPython's
-                        // call_assembler path compares the returned jf_descr
-                        // against the CPU's DoneWithThisFrame* descr for the
-                        // CALL_ASSEMBLER result type; it is not target-local.
-                        // Keep the finish descr as a compile-time immediate
-                        // like dynasm instead of reloading it on every
-                        // recursive call.
-                        // RPython done_with_this_frame parity: compare jf_descr
-                        // with the finish FailDescr pointer directly.
-                        let code_addr = {
-                            let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
-                            builder
-                                .ins()
-                                .load(ptr_type, MemFlagsData::trusted(), entry_ptr, 0)
-                        };
+                        // RPython's call_assembler path compares the returned
+                        // jf_descr against the CPU's DoneWithThisFrame* descr
+                        // for the CALL_ASSEMBLER result type; it is not
+                        // target-local. Keep the finish descr as a
+                        // compile-time immediate like dynasm instead of
+                        // reloading it on every recursive call.
                         let expected_finish_descr_ptr = attached_descrs
                             .done_with_this_frame_descr_ptr_for_type(op.opcode.result_type())
                             as i64;
                         let expected_finish_descr = builder
                             .ins()
                             .iconst(cl_types::I64, expected_finish_descr_ptr);
-                        // assembler.py:call_assembler() parity:
-                        // CMP + conditional branch: null → shim, else → direct call.
-                        let direct_call_block = builder.create_block();
-                        let shim_fallback_block = builder.create_block();
-                        let null_ptr = builder.ins().iconst(ptr_type, 0);
-                        let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
-                        builder.ins().brif(
-                            is_null,
-                            shim_fallback_block,
-                            &[],
-                            direct_call_block,
-                            &[],
-                        );
 
-                        // ── Direct call to compiled code ──
-                        // assembler.py:_call_assembler_emit_call
-                        builder.switch_to_block(direct_call_block);
-                        builder.seal_block(direct_call_block);
+                        if baked_addr.is_none() {
+                            // assembler.py call_assembler parity:
+                            // CMP + conditional branch: null → shim, else → direct call.
+                            let addr_slot = descr_addr_slot
+                                .expect("slot-only CALL_ASSEMBLER has an _ll_function_addr slot");
+                            let code_addr = {
+                                let entry_ptr = builder.ins().iconst(ptr_type, addr_slot as i64);
+                                builder
+                                    .ins()
+                                    .load(ptr_type, MemFlagsData::trusted(), entry_ptr, 0)
+                            };
+                            slot_code_addr = Some(code_addr);
+                            let direct_call_block = builder.create_block();
+                            let shim_block = builder.create_block();
+                            shim_fallback_block = Some(shim_block);
+                            let null_ptr = builder.ins().iconst(ptr_type, 0);
+                            let is_null = builder.ins().icmp(IntCC::Equal, code_addr, null_ptr);
+                            builder
+                                .ins()
+                                .brif(is_null, shim_block, &[], direct_call_block, &[]);
+
+                            // ── Direct call to compiled code ──
+                            // assembler.py `_call_assembler_emit_call`
+                            builder.switch_to_block(direct_call_block);
+                            builder.seal_block(direct_call_block);
+                        }
 
                         // assembler.py _call_assembler_emit_call:
                         // Spill caller's GC refs, then direct-call the callee.
@@ -16295,18 +16364,31 @@ impl CraneliftBackend {
                         // CALL_ASSEMBLER enters the callee at its preamble
                         // (dispatch_key 0); the callee is a freshly entered
                         // function, not an external-JUMP LABEL re-entry.
-                        let mut sig = Signature::new(body_call_conv);
-                        sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
-                        sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
-                        sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
-                        let sig_ref = builder.import_signature(sig);
                         let ca_dispatch_key = builder.ins().iconst(cl_types::I32, 0);
-                        let call_inst = builder.ins().call_indirect(
-                            sig_ref,
-                            code_addr,
-                            &[args_ptr, ca_dispatch_key],
-                        );
-                        let result_jf = builder.inst_results(call_inst)[0];
+                        let result_jf = if let Some(baked) = baked_addr {
+                            emit_call_assembler_body_call(
+                                module,
+                                &mut builder,
+                                ptr_type,
+                                body_call_conv,
+                                baked,
+                                args_ptr,
+                                ca_dispatch_key,
+                            )
+                        } else {
+                            let mut sig = Signature::new(body_call_conv);
+                            sig.params.push(AbiParam::new(ptr_type)); // jf_ptr
+                            sig.params.push(AbiParam::new(cl_types::I32)); // dispatch_key selector
+                            sig.returns.push(AbiParam::new(ptr_type)); // returned jf_ptr
+                            let sig_ref = builder.import_signature(sig);
+                            let call_inst = builder.ins().call_indirect(
+                                sig_ref,
+                                slot_code_addr
+                                    .expect("slot-only CALL_ASSEMBLER loaded _ll_function_addr"),
+                                &[args_ptr, ca_dispatch_key],
+                            );
+                            builder.inst_results(call_inst)[0]
+                        };
 
                         // _reload_frame_if_necessary: GC may have moved
                         // the caller's jitframe during the call.
@@ -16476,102 +16558,116 @@ impl CraneliftBackend {
                             .ins()
                             .jump(ca_merge_block, &[BlockArg::from(force_result.unwrap())]);
 
-                        // ── Fallback: null code_ptr, unknown finish, or deadframe ──
-                        builder.switch_to_block(shim_fallback_block);
-                        builder.seal_block(shim_fallback_block);
+                        if let Some(shim_fallback_block) = shim_fallback_block {
+                            // ── Fallback: null code_ptr, unknown finish, or deadframe ──
+                            builder.switch_to_block(shim_fallback_block);
+                            builder.seal_block(shim_fallback_block);
+                        }
                     }
 
-                    // Shim call (always present as fallback, or sole path
-                    // when target isn't resolved or has non-primitive result)
+                    if emit_ca_shim {
+                        // Shim call (fallback, or sole path when the target
+                        // isn't resolved). A baked `_ll_function_addr` skips
+                        // this: `opt_level=none` would still compile a dead
+                        // shim (`llsupport/assembler.py call_assembler` has
+                        // no equivalent).
 
-                    // After switch_to_block(shim_fallback_block), the cached
-                    // jf_ptr local may correspond to a value defined in a
-                    // different block on the upstream tree. Read the fresh
-                    // jitframe pointer through the Variable so Cranelift
-                    // threads it through the necessary block params.
-                    jf_ptr = builder.ins().get_pinned_reg(ptr_type);
-                    spill_ref_roots(
-                        &mut builder,
-                        &opref_var_map,
-                        jf_ptr,
-                        &live_ref_root_slots,
-                        &defined_ref_vars,
-                        &stale_ref_vars,
-                        &demoted_failarg_slots,
-                        ref_root_base_ofs,
-                    );
-                    emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    let result = emit_host_call(
-                        module,
-                        &mut builder,
-                        ptr_type,
-                        call_conv,
-                        call_assembler_shim as *const () as usize,
-                        &[
-                            target_token,
-                            args_ptr_i64,
-                            outcome_ptr_i64,
-                            expected_result_kind,
-                        ],
-                        Some(cl_types::I64),
-                    );
-                    // `_reload_frame_if_necessary` (x86 `assembler.py`):
-                    // GC may have moved the jitframe during the shim call.
-                    // Reload jf_ptr from shadow stack before reading from it.
-                    jf_ptr =
-                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
-                    builder.ins().set_pinned_reg(jf_ptr);
-                    emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                    reload_ref_roots(
-                        &mut builder,
-                        &opref_var_map,
-                        jf_ptr,
-                        &live_ref_root_slots,
-                        &defined_ref_vars,
-                        &demoted_failarg_slots,
-                        ref_root_base_ofs,
-                    );
-                    mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
+                        // After switch_to_block(shim_fallback_block), the cached
+                        // jf_ptr local may correspond to a value defined in a
+                        // different block on the upstream tree. Read the fresh
+                        // jitframe pointer through the Variable so Cranelift
+                        // threads it through the necessary block params.
+                        jf_ptr = builder.ins().get_pinned_reg(ptr_type);
+                        spill_ref_roots(
+                            &mut builder,
+                            &opref_var_map,
+                            jf_ptr,
+                            &live_ref_root_slots,
+                            &defined_ref_vars,
+                            &stale_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        let result = emit_host_call(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                            call_assembler_shim as *const () as usize,
+                            &[
+                                target_token,
+                                args_ptr_i64,
+                                outcome_ptr_i64,
+                                expected_result_kind,
+                            ],
+                            Some(cl_types::I64),
+                        );
+                        // `_reload_frame_if_necessary` (x86 `assembler.py`):
+                        // GC may have moved the jitframe during the shim call.
+                        // Reload jf_ptr from shadow stack before reading from it.
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
+                        builder.ins().set_pinned_reg(jf_ptr);
+                        emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
+                        reload_ref_roots(
+                            &mut builder,
+                            &opref_var_map,
+                            jf_ptr,
+                            &live_ref_root_slots,
+                            &defined_ref_vars,
+                            &demoted_failarg_slots,
+                            ref_root_base_ofs,
+                        );
+                        mark_ref_roots_fresh(&mut stale_ref_vars, &live_ref_root_slots);
 
-                    let outcome_kind =
-                        builder
+                        let outcome_kind =
+                            builder
+                                .ins()
+                                .stack_load(ptr_type, cl_types::I64, outcome_slot, 0);
+                        let finish_kind = builder
                             .ins()
-                            .stack_load(ptr_type, cl_types::I64, outcome_slot, 0);
-                    let finish_kind = builder
-                        .ins()
-                        .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
-                    let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
-                    let exit_block = builder.create_block();
-                    builder.set_cold_block(exit_block);
-                    builder.ins().brif(
-                        is_finish,
-                        ca_merge_block,
-                        &[BlockArg::from(result.unwrap())],
-                        exit_block,
-                        &[],
-                    );
+                            .iconst(cl_types::I64, CALL_ASSEMBLER_OUTCOME_FINISH);
+                        let is_finish = builder.ins().icmp(IntCC::Equal, outcome_kind, finish_kind);
+                        let exit_block = builder.create_block();
+                        builder.set_cold_block(exit_block);
+                        builder.ins().brif(
+                            is_finish,
+                            ca_merge_block,
+                            &[BlockArg::from(result.unwrap())],
+                            exit_block,
+                            &[],
+                        );
 
-                    builder.switch_to_block(exit_block);
-                    builder.seal_block(exit_block);
-                    let deadframe_handle =
-                        builder
+                        builder.switch_to_block(exit_block);
+                        builder.seal_block(exit_block);
+                        let deadframe_handle =
+                            builder
+                                .ins()
+                                .stack_load(ptr_type, cl_types::I64, outcome_slot, 8);
+                        builder.ins().store(
+                            MemFlagsData::trusted(),
+                            deadframe_handle,
+                            jf_ptr,
+                            JF_FRAME_ITEM0_OFS,
+                        );
+                        let sentinel = builder
                             .ins()
-                            .stack_load(ptr_type, cl_types::I64, outcome_slot, 8);
-                    builder.ins().store(
-                        MemFlagsData::trusted(),
-                        deadframe_handle,
-                        jf_ptr,
-                        JF_FRAME_ITEM0_OFS,
-                    );
-                    let sentinel = builder
-                        .ins()
-                        .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
-                    builder
-                        .ins()
-                        .store(MemFlagsData::trusted(), sentinel, jf_ptr, JF_DESCR_OFS);
-                    // `_call_footer_shadowstack` (x86 `assembler.py`) — inline SUB
-                    emit_call_footer_shadowstack(&mut builder, ptr_type);
-                    builder.ins().return_(&[jf_ptr]);
+                            .iconst(cl_types::I64, CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64);
+                        builder.ins().store(
+                            MemFlagsData::trusted(),
+                            sentinel,
+                            jf_ptr,
+                            JF_DESCR_OFS,
+                        );
+                        // `_call_footer_shadowstack` (x86 `assembler.py`) — inline SUB
+                        emit_call_footer_shadowstack(&mut builder, ptr_type);
+                        builder.ins().return_(&[jf_ptr]);
+                    }
 
                     // ── Merge: result from cache or shim ──
                     builder.switch_to_block(ca_merge_block);
@@ -20375,10 +20471,20 @@ impl CraneliftBackend {
         }
         self.module.clear_context(&mut ctx);
 
-        // Build trace_N_entry wrapper: forwards jf_ptr to body via call_indirect,
-        // returns body's deadframe pointer.  Host-callable (default_call_conv),
-        // bridging the AppleAarch64/SystemV C ABI to the Tail-conv body.  This
-        // is the only function the host's `run_compiled_code` / iconst-loaded
+        // `call_header_stub`: CALL_ASSEMBLER / execute_token door. Allocated
+        // before the wrapper so key 0 can bake `ca_body_{stub}`; filled with
+        // a JMP to the Tail body after finalize. Same allocator as guard
+        // trampolines (`generate_quick_failure`).
+        let call_header_block = self
+            .asm_memory_handle
+            .allocate_executable(crate::stub::STUB_SIZE)
+            .map_err(|e| BackendError::CompilationFailed(e.to_string()))?;
+        let call_header_stub_ptr = call_header_block.ptr() as usize;
+
+        // Build trace_N_entry wrapper: forwards jf_ptr to the stub (key 0)
+        // or the body (key ≠ 0). Host-callable (default_call_conv), bridging
+        // the AppleAarch64/SystemV C ABI to the Tail-conv body. This is the
+        // only function the host's `run_compiled_code` / iconst-loaded
         // bridge pointer dispatches to; the body's address is exposed solely
         // via `LoopTargetDescr.ll_loop_code` for in-code closing_jump.
         let mut wrapper_func = Function::with_name_signature(
@@ -20406,36 +20512,74 @@ impl CraneliftBackend {
             // funnels back through this single `return_`.
             let host_pinned = wb.ins().get_pinned_reg(ptr_type);
             let body_ref = self.module.declare_func_in_func(func_id, wb.func);
-            // Forward the host-supplied dispatch_key to the body's entry
-            // `br_table`.  `run_compiled_code` passes 0 for initial entry
-            // through the preamble, or `label_block_id + 1` for any
-            // external-JUMP host re-entry (including the first LABEL),
-            // matching assembler.py:990-993 per-LABEL `_ll_loop_code`: a
-            // JUMP branches straight to the target LABEL.
+            // Forward the host-supplied dispatch_key. `run_compiled_code`
+            // passes 0 for initial entry through the preamble, or
+            // `label_block_id + 1` for any external-JUMP host re-entry
+            // (including the first LABEL), matching `assembler.py
+            // closing_jump` / `fixup_target_tokens` per-LABEL
+            // `_ll_loop_code`: a JUMP branches straight to the target LABEL.
+            // Key 0 tail-calls the `call_header_stub` so `execute_token(old)`
+            // follows a `redirect_call_assembler` overlay; key ≠ 0 tail-calls
+            // the body so LABEL re-entry does not.
             //
             // A register-carried bridge body also takes the live failargs
             // as Tail extra params (`prepare_bridge` / `_update_bindings`).
             // Deadframe / blackhole / `run_compiled_code` still land here
             // with those values in compact jitframe slots, so the wrapper
-            // loads them and the body keeps one signature.
+            // loads them and the body keeps one signature. That extras path
+            // cannot go through the 2-arg stub.
             let mut body_args = Vec::with_capacity(2 + n_tail_extras);
             body_args.push(jf_ptr_in);
             body_args.push(dispatch_key_in);
             if register_carried {
                 for i in 0..n_tail_extras {
+                    let dest = source_slots_for_entry.get(i).copied().unwrap_or(i);
                     let loaded = wb.ins().load(
                         cl_types::I64,
                         MemFlagsData::trusted(),
                         jf_ptr_in,
-                        JF_FRAME_ITEM0_OFS + (i as i32) * 8,
+                        JF_FRAME_ITEM0_OFS + (dest as i32) * 8,
                     );
                     body_args.push(loaded);
                 }
+                let call_inst = wb.ins().call(body_ref, &body_args);
+                let ret = wb.inst_results(call_inst)[0];
+                wb.ins().set_pinned_reg(host_pinned);
+                wb.ins().return_(&[ret]);
+            } else {
+                let stub_block = wb.create_block();
+                let body_block = wb.create_block();
+                let merge = wb.create_block();
+                wb.append_block_param(merge, ptr_type);
+                let zero = wb.ins().iconst(cl_types::I32, 0);
+                let is_zero = wb.ins().icmp(IntCC::Equal, dispatch_key_in, zero);
+                wb.ins().brif(is_zero, stub_block, &[], body_block, &[]);
+
+                wb.switch_to_block(stub_block);
+                wb.seal_block(stub_block);
+                let ret_stub = emit_call_assembler_body_call(
+                    &mut self.module,
+                    &mut wb,
+                    ptr_type,
+                    body_call_conv,
+                    call_header_stub_ptr,
+                    jf_ptr_in,
+                    dispatch_key_in,
+                );
+                wb.ins().jump(merge, &[BlockArg::from(ret_stub)]);
+
+                wb.switch_to_block(body_block);
+                wb.seal_block(body_block);
+                let call_inst = wb.ins().call(body_ref, &body_args);
+                let ret_body = wb.inst_results(call_inst)[0];
+                wb.ins().jump(merge, &[BlockArg::from(ret_body)]);
+
+                wb.switch_to_block(merge);
+                wb.seal_block(merge);
+                let ret = wb.block_params(merge)[0];
+                wb.ins().set_pinned_reg(host_pinned);
+                wb.ins().return_(&[ret]);
             }
-            let call_inst = wb.ins().call(body_ref, &body_args);
-            let ret = wb.inst_results(call_inst)[0];
-            wb.ins().set_pinned_reg(host_pinned);
-            wb.ins().return_(&[ret]);
             wb.finalize(frontend_config);
             self.func_ctx = wrapper_ctx;
         }
@@ -20478,6 +20622,7 @@ impl CraneliftBackend {
         let code_bytes = body_code_bytes + wrapper_code_bytes;
         let body_ptr = self.module.get_finalized_function(func_id);
         let code_ptr = self.module.get_finalized_function(entry_id);
+        crate::stub::write_call_header_stub(call_header_stub_ptr, body_ptr as usize);
         let mut asm_memory_blocks = Vec::with_capacity(2);
         for ptr in [body_ptr, code_ptr] {
             if asm_memory_blocks
@@ -20493,6 +20638,7 @@ impl CraneliftBackend {
             })?;
             asm_memory_blocks.push(block);
         }
+        stub_blocks.push(call_header_block);
         asm_memory_blocks.extend(stub_blocks);
         // Stubs live on the `CompiledLoop` that `compile_loop` /
         // `compile_bridge` / `publish_merged_recompile` will publish.
@@ -20644,6 +20790,7 @@ impl CraneliftBackend {
             _func_id: func_id,
             code_ptr,
             body_ptr,
+            call_header_stub_ptr,
             code_size: code_bytes,
             asm_memory_blocks,
             pending_guard_tokens,
@@ -20753,6 +20900,532 @@ fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
     Some(arg0)
 }
 
+/// Pending home encodings in `fail_locs` until `max_output_slots` is known.
+///
+/// `llsupport/assembler.py store_info_on_descr` writes `0xFFFF` for a `None`
+/// hole. A ref-root or demoted home cannot be numbered until the dense region
+/// is sized, so those sit in the high tags and
+/// [`resolve_fail_locs_and_stamp`] rewrites them to `max_output_slots + …`.
+const FAIL_LOC_HOLE: usize = 0xFFFF;
+const FAIL_LOC_REF_ROOT: usize = 1 << 30;
+const FAIL_LOC_DEMOTED: usize = 1 << 31;
+const FAIL_LOC_PAYLOAD: usize = (1 << 30) - 1;
+
+fn max_finish_arity(ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| op.opcode == OpCode::Finish)
+        .map(|op| op.num_args())
+        .max()
+        .unwrap_or(0)
+}
+
+/// Widest LABEL in this function. The loader still reads `ITEM0 + i*8`
+/// for `0..arity` (item 4); the dense region has to cover those slots so
+/// a packed guard cannot slide the ref-root tail over a carried value.
+fn max_label_arity(ops: &[Op]) -> usize {
+    ops.iter()
+        .filter(|op| op.opcode == OpCode::Label)
+        .map(|op| op.num_args())
+        .max()
+        .unwrap_or(0)
+}
+
+/// `rebuild_faillocs_from_descr`: skip `0xFFFF`, then the first `limit`
+/// survivors are the bridge inputarg homes. Same walk as
+/// `CraneliftBackend::execute_bridge`. Extra duplicate positions after
+/// `limit` must not compact-store into the ref-root tail.
+fn live_bridge_source_slots(rd_locs: &[u16], limit: usize) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for &loc in rd_locs {
+        if loc == 0xFFFF {
+            continue;
+        }
+        slots.push(loc as usize);
+        if slots.len() == limit {
+            break;
+        }
+    }
+    slots
+}
+
+/// Logical live failarg values in bridge inputarg order. Used only for the
+/// CALL_ASSEMBLER caller prefix; the bridge body reads the physical image.
+fn live_bridge_input_values(rd_locs: &[u16], parent_outputs: &[i64], limit: usize) -> Vec<i64> {
+    if rd_locs.is_empty() {
+        return parent_outputs.iter().copied().take(limit).collect();
+    }
+    let mut values = Vec::with_capacity(limit);
+    for &loc in rd_locs {
+        if loc == 0xFFFF {
+            continue;
+        }
+        let Some(&value) = parent_outputs.get(loc as usize) else {
+            break;
+        };
+        values.push(value);
+        if values.len() == limit {
+            break;
+        }
+    }
+    values
+}
+
+/// `prepare_bridge` / `_update_bindings` plus the FrameManager homes a
+/// failarg can already occupy. Loops leave `bind_homes` empty and
+/// `absolute_homes` false (ref-root / demoted indexes are relative).
+struct FailArgHomes<'a> {
+    ref_root_slots: &'a [(u32, usize)],
+    demoted_home_index: &'a IndexMap<u32, usize>,
+    bind_homes: &'a IndexMap<u32, usize>,
+    occupied: &'a IndexSet<usize>,
+    absolute_homes: bool,
+    /// Bridge home `[start, last_use]` over op indices. `None` for loops.
+    home_intervals: Option<&'a IndexMap<u32, (usize, usize)>>,
+    /// LABEL-bridge identity span (`_ll_initial_locs`): JUMP/LABEL loader
+    /// read `jf_frame[i]`. New FrameManager homes and dense failargs start
+    /// past this. 0 when the bridge has no LABEL.
+    identity_floor: usize,
+}
+
+/// `FrameManager._find_frame_location`: lowest index at least `start`
+/// that is not already bound.
+fn find_frame_location(occupied: &IndexSet<usize>, start: usize) -> usize {
+    let mut i = start;
+    while occupied.contains(&i) {
+        i += 1;
+    }
+    i
+}
+
+/// `llsupport/regalloc.py` `compute_vars_longevity` for bridge frame homes:
+/// `[start, last_use]` over op indices. Inputargs start at 0; last_use is the
+/// last op that reads the box (op args, guard failargs, JUMP args). An
+/// interval live at a LABEL is extended to the end of the trace so a value
+/// used in the loop survives the back edge.
+fn compute_bridge_home_intervals(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+    home_vars: &IndexSet<u32>,
+) -> IndexMap<u32, (usize, usize)> {
+    let num_inputs = inputargs.len();
+    let mut start: IndexMap<u32, usize> = IndexMap::new();
+    let mut last_use: IndexMap<u32, usize> = IndexMap::new();
+    for ia in inputargs {
+        if home_vars.contains(&ia.index) {
+            start.insert(ia.index, 0);
+        }
+    }
+    for (i, op) in ops.iter().enumerate() {
+        if op.result_type() != Type::Void {
+            let raw = op_var_index(op, i, num_inputs) as u32;
+            if home_vars.contains(&raw) {
+                start.entry(raw).or_insert(i);
+            }
+        }
+        for arg in op
+            .args_slice()
+            .iter()
+            .chain(op.guard_fail_args().into_iter().flatten())
+        {
+            if arg.is_constant() || arg.is_none() {
+                continue;
+            }
+            let raw = arg.to_opref().raw();
+            if home_vars.contains(&raw) {
+                last_use.insert(raw, i);
+            }
+        }
+    }
+    let mut intervals = IndexMap::new();
+    for &var in home_vars {
+        let s = start.get(&var).copied().unwrap_or(0);
+        let e = last_use.get(&var).copied().unwrap_or(s);
+        intervals.insert(var, (s, e));
+    }
+    let label_idxs: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(i, op)| (op.opcode == OpCode::Label).then_some(i))
+        .collect();
+    if !label_idxs.is_empty() {
+        let end = ops.len().saturating_sub(1);
+        for (s, e) in intervals.values_mut() {
+            if label_idxs.iter().any(|&li| *s < li && *e >= li) {
+                *e = end;
+            }
+        }
+    }
+    intervals
+}
+
+/// `FrameManager.get_new_loc` / `mark_as_free`: walk intervals by start, free
+/// slots whose interval ended before the current start, bind homes stay
+/// pre-assigned, and a Ref or demoted var takes `_find_frame_location`.
+fn assign_bridge_homes_linear_scan(
+    intervals: &IndexMap<u32, (usize, usize)>,
+    bind_homes: &IndexMap<u32, usize>,
+    ref_vars: &IndexSet<u32>,
+    demoted_vars: &IndexSet<u32>,
+    fixed_area: usize,
+) -> (IndexMap<u32, usize>, IndexSet<usize>) {
+    let mut order: Vec<u32> = intervals.keys().copied().collect();
+    order.sort_by_key(|var| {
+        let (s, _) = intervals[var];
+        let bind_first = if bind_homes.contains_key(var) { 0 } else { 1 };
+        (s, bind_first, *var)
+    });
+    let mut occupied: IndexSet<usize> = IndexSet::new();
+    let mut active: Vec<(usize, usize, u32)> = Vec::new();
+    let mut var_slots: IndexMap<u32, usize> = IndexMap::new();
+    let mut all_assigned: IndexSet<usize> = IndexSet::new();
+    for var in order {
+        let (start, last_use) = intervals[&var];
+        let mut ended: Vec<usize> = Vec::new();
+        active.retain(|&(end, slot, _)| {
+            if end < start {
+                ended.push(slot);
+                false
+            } else {
+                true
+            }
+        });
+        for slot in ended {
+            if !active.iter().any(|a| a.1 == slot) {
+                occupied.swap_remove(&slot);
+            }
+        }
+        let slot = if let Some(&home) = bind_homes.get(&var) {
+            home
+        } else if ref_vars.contains(&var) || demoted_vars.contains(&var) {
+            find_frame_location(&occupied, fixed_area)
+        } else {
+            continue;
+        };
+        occupied.insert(slot);
+        all_assigned.insert(slot);
+        var_slots.insert(var, slot);
+        active.push((last_use, slot, var));
+    }
+    (var_slots, all_assigned)
+}
+
+fn bridge_var_home(var: u32, homes: &FailArgHomes<'_>) -> Option<usize> {
+    if let Some(&home) = homes.bind_homes.get(&var) {
+        return Some(home);
+    }
+    if homes.absolute_homes
+        && let Some((_, slot)) = homes.ref_root_slots.iter().find(|(idx, _)| *idx == var)
+    {
+        return Some(*slot);
+    }
+    homes.demoted_home_index.get(&var).copied()
+}
+
+/// Dense packing skips every home still live at this op (`FrameManager`
+/// bindings). Dead homes are free. Reusing a still-live non-failarg home
+/// is unsafe: vable force, `before_call` GNF publish, and GNF2 all keep
+/// reading those slots on a path that does not abandon the frame.
+/// GNF2 also occupies `[0, finish_arity)` so FINISH identity stores miss
+/// the force image. A LABEL-bridge occupies `[0, identity_floor)` so the
+/// loop's `_ll_initial_locs` stay intact on the success path.
+fn bridge_exit_dense_occupied(
+    op: &Op,
+    op_idx: usize,
+    homes: &FailArgHomes<'_>,
+    finish_arity: usize,
+) -> IndexSet<usize> {
+    let mut occ = IndexSet::new();
+    if !homes.absolute_homes {
+        return occ;
+    }
+    // Every FrameManager home ever assigned stays reserved for packing.
+    // Reusing a dead bind home as a dense failarg is unsafe on the
+    // CALL_ASSEMBLER getframe path: `before_call` publishes into those
+    // slots and the success path still holds the frame.
+    for &slot in homes.occupied {
+        occ.insert(slot);
+    }
+    if let Some(intervals) = homes.home_intervals {
+        for (&var, &(start, last_use)) in intervals {
+            if start <= op_idx && last_use >= op_idx {
+                if let Some(slot) = bridge_var_home(var, homes) {
+                    occ.insert(slot);
+                }
+            }
+        }
+    }
+    for s in 0..homes.identity_floor {
+        occ.insert(s);
+    }
+    if op.opcode == OpCode::GuardNotForced2 {
+        for s in 0..finish_arity {
+            occ.insert(s);
+        }
+    }
+    occ
+}
+
+fn bridge_bind_homes(
+    inputargs: &[InputArgRc],
+    source_slots: &[usize],
+    fixed_area: usize,
+) -> IndexMap<u32, usize> {
+    let mut homes = IndexMap::new();
+    for (i, ia) in inputargs.iter().enumerate() {
+        let slot = source_slots.get(i).copied().unwrap_or(i);
+        // `rebuild_faillocs_from_descr` REGISTER case: a parent location
+        // inside the FINISH identity slots is loaded at entry and then
+        // not resident (`JITFRAME_FIXED_SIZE` analogue).
+        if slot < fixed_area {
+            continue;
+        }
+        homes.insert(ia.index, slot);
+    }
+    homes
+}
+
+/// Ref inputargs keep their bind home; a Ref without one, and every new
+/// Ref, takes `FrameManager.get_new_loc` / `_find_frame_location` starting
+/// at `fixed_area`. `occupied` starts as the bind set and grows.
+#[cfg(test)]
+fn assign_bridge_ref_root_slots(
+    slots: &mut [(u32, usize)],
+    bind_homes: &IndexMap<u32, usize>,
+    occupied: &mut IndexSet<usize>,
+    fixed_area: usize,
+) {
+    for (var_idx, slot) in slots.iter_mut() {
+        if let Some(&home) = bind_homes.get(var_idx) {
+            *slot = home;
+        } else {
+            let home = find_frame_location(occupied, fixed_area);
+            occupied.insert(home);
+            *slot = home;
+        }
+    }
+}
+
+fn fail_arg_pending_home(arg: OpRef, homes: &FailArgHomes<'_>) -> Option<usize> {
+    if arg.is_none() || arg.is_constant() {
+        return None;
+    }
+    let raw = arg.raw();
+    if let Some(&home) = homes.bind_homes.get(&raw) {
+        return Some(home);
+    }
+    if let Some((_, root)) = homes.ref_root_slots.iter().find(|(idx, _)| *idx == raw) {
+        if homes.absolute_homes {
+            return Some(*root);
+        }
+        return Some(FAIL_LOC_REF_ROOT | *root);
+    }
+    homes.demoted_home_index.get(&raw).map(|&idx| {
+        if homes.absolute_homes {
+            idx
+        } else {
+            FAIL_LOC_DEMOTED | idx
+        }
+    })
+}
+
+/// `RegisterManager.loc` / `store_info_on_descr`: one location per box.
+///
+/// A `None` hole is `0xFFFF` and takes no dense slot. A Const takes no slot
+/// (`history.py` inline-Const). A Ref (or demoted non-ref) that already has a
+/// resident home reuses that home. Any other box gets the next packed dense
+/// slot, reused if the same box appears again in this list.
+///
+/// FINISH and external JUMP stay identity: `genop_finish` `save_into_mem(base_ofs)`
+/// and JUMP input stores write `jf_frame[i]`. `GUARD_NOT_FORCED_2` packs like
+/// any other guard (`store_force_descr` records the current locations) but
+/// starts its dense run at `dense_base` so those slots do not alias a later
+/// FINISH identity write. Bridges keep bind homes and new FrameManager
+/// locations out of the same `fixed_area` (`JITFRAME_FIXED_SIZE` analogue);
+/// this is not a second K-sized block.
+fn pack_fail_locs(
+    fail_arg_refs: &[OpRef],
+    identity: bool,
+    dense_base: usize,
+    homes: &FailArgHomes<'_>,
+    extra_occupied: &IndexSet<usize>,
+) -> (Vec<usize>, usize) {
+    if identity {
+        return ((0..fail_arg_refs.len()).collect(), fail_arg_refs.len());
+    }
+    let mut box_to_dense: IndexMap<u32, usize> = IndexMap::new();
+    let mut used: IndexSet<usize> = extra_occupied.iter().copied().collect();
+    if homes.absolute_homes {
+        // Live homes arrive in `extra_occupied`. Also pin this guard's own
+        // pending homes so a failarg that is a bind/ref/demoted box keeps
+        // that slot (`RegisterManager.loc`).
+        for &arg in fail_arg_refs {
+            if let Some(home) = fail_arg_pending_home(arg, homes) {
+                used.insert(home);
+            }
+        }
+    } else {
+        for &slot in homes.occupied {
+            used.insert(slot);
+        }
+    }
+    let mut highest_new = 0usize;
+    let mut allocated = false;
+    let mut fail_locs = Vec::with_capacity(fail_arg_refs.len());
+    for &arg in fail_arg_refs {
+        if arg.is_none() || arg.is_constant() {
+            fail_locs.push(FAIL_LOC_HOLE);
+            continue;
+        }
+        if let Some(home) = fail_arg_pending_home(arg, homes) {
+            fail_locs.push(home);
+            continue;
+        }
+        let raw = arg.raw();
+        if let Some(&slot) = box_to_dense.get(&raw) {
+            fail_locs.push(slot);
+            continue;
+        }
+        let slot = find_frame_location(&used, dense_base);
+        used.insert(slot);
+        allocated = true;
+        highest_new = highest_new.max(slot + 1);
+        box_to_dense.insert(raw, slot);
+        fail_locs.push(slot);
+    }
+    let span = if allocated { highest_new } else { 0 };
+    (fail_locs, span)
+}
+
+fn demoted_home_index_map(
+    loop_phi_keep_by_label: &IndexMap<usize, Vec<bool>>,
+    ops: &[Op],
+    ref_root_slots: &[(u32, usize)],
+    mut occupied: Option<&mut IndexSet<usize>>,
+    start: usize,
+) -> IndexMap<u32, usize> {
+    let mut map = IndexMap::new();
+    let mut next = 0usize;
+    for (&label_idx, keep) in loop_phi_keep_by_label {
+        for (_i, raw) in nonref_demoted_positions(label_idx, keep, ops, ref_root_slots) {
+            let idx = if let Some(occ) = occupied.as_mut() {
+                let slot = find_frame_location(occ, start);
+                occ.insert(slot);
+                slot
+            } else {
+                let i = next;
+                next += 1;
+                i
+            };
+            map.insert(raw, idx);
+        }
+    }
+    map
+}
+
+fn resolve_fail_locs_and_stamp(
+    guard_infos: &mut [GuardInfo],
+    ops: &[Op],
+    fail_descrs: &[DescrRef],
+    max_output_slots: usize,
+    num_ref_roots: usize,
+    preserve_descrs: bool,
+) {
+    for info in guard_infos.iter_mut() {
+        let is_guard = ops[info.source_op_index].opcode.is_guard();
+        for loc in &mut info.fail_locs {
+            if *loc == FAIL_LOC_HOLE {
+                continue;
+            }
+            if *loc & FAIL_LOC_DEMOTED != 0 {
+                *loc = max_output_slots + num_ref_roots + (*loc & FAIL_LOC_PAYLOAD);
+            } else if *loc & FAIL_LOC_REF_ROOT != 0 {
+                *loc = max_output_slots + (*loc & FAIL_LOC_PAYLOAD);
+            }
+        }
+        let mut ref_slots = Vec::new();
+        for (i, tp) in info.fail_arg_types.iter().enumerate() {
+            if *tp != Type::Ref {
+                continue;
+            }
+            let arg = info.fail_arg_refs.get(i).copied().unwrap_or(OpRef::NONE);
+            if arg.is_none() {
+                continue;
+            }
+            let loc = info.fail_locs[i];
+            if loc == FAIL_LOC_HOLE {
+                continue;
+            }
+            ref_slots.push(loc);
+        }
+        info.failarg_ref_slots = ref_slots;
+        info.gcmap = allocate_gcmap(&info.failarg_ref_slots);
+        info.bridge_source_slots = info
+            .fail_locs
+            .iter()
+            .copied()
+            .filter(|&loc| loc != FAIL_LOC_HOLE)
+            .collect();
+        // `regalloc.py consider_guard_value` records `all_reg_indexes[x.value]`,
+        // a physical deadframe slot; stamp only once `fail_locs` are absolute
+        // (ref-root / demoted rewritten above). A merged recompile keeps the
+        // original status (`preserve_descrs`).
+        if !preserve_descrs
+            && ops[info.source_op_index].opcode == OpCode::GuardValue
+            && let Some(fd) = fail_descrs
+                .get(info.fail_index as usize)
+                .and_then(|descr| descr.as_fail_descr())
+        {
+            stamp_guard_value_counter(info, &ops[info.source_op_index], fd);
+        }
+        if !is_guard || preserve_descrs {
+            continue;
+        }
+        let Some(fd) = fail_descrs
+            .get(info.fail_index as usize)
+            .and_then(|descr| descr.as_fail_descr())
+        else {
+            continue;
+        };
+        if !(fd.is_resume_guard() || fd.is_resume_guard_copied()) {
+            continue;
+        }
+        let rd_locs: majit_ir::RdLocs = info
+            .fail_locs
+            .iter()
+            .map(|&loc| u16::try_from(loc).expect("failarg frame location must fit rd_locs"))
+            .collect();
+        fd.set_rd_locs(rd_locs);
+    }
+}
+
+/// `compile.py make_a_counter_per_value` / `regalloc.py consider_guard_value`.
+///
+/// The index is the physical frame slot the guarded value occupies in the
+/// exit image: `fail_locs[k]` when the operand is failarg k, else the
+/// trace-wide spill slot (`counter_value_spill`).
+fn stamp_guard_value_counter(info: &GuardInfo, op: &Op, fd: &dyn FailDescr) {
+    let arg0 = op.arg(0).to_opref();
+    let slot_type = match info.counter_value_spill {
+        Some((operand, slot)) => Some((slot, operand.ty())),
+        None => info
+            .fail_arg_refs
+            .iter()
+            .position(|r| *r == arg0)
+            .and_then(|k| {
+                let loc = *info.fail_locs.get(k)?;
+                (loc != FAIL_LOC_HOLE).then_some((loc, info.fail_arg_types.get(k).copied()))
+            }),
+    };
+    if let Some((slot, ty)) = slot_type {
+        let type_tag = match ty {
+            Some(Type::Ref) => majit_backend::STATUS_TY_REF,
+            Some(Type::Float) => majit_backend::STATUS_TY_FLOAT,
+            _ => majit_backend::STATUS_TY_INT,
+        };
+        fd.make_a_counter_per_value(slot as u32, type_tag);
+    }
+}
+
 /// The trace-wide GUARD_VALUE counter slot, or `None` when no guard needs one.
 ///
 /// `precompute_max_output_slots` is the width of the value area every exit
@@ -20760,34 +21433,65 @@ fn counter_value_spill(op: &Op, fail_args: &[OpRef]) -> Option<OpRef> {
 /// still ahead of the ref roots, which `emit_body` places at
 /// `max_output_slots`. Reserving it is what makes `max_output_slots` one wider
 /// than the exits alone require.
-fn counter_slot_for(inputargs: &[InputArgRc], ops: &[Op]) -> Option<usize> {
+///
+/// The spill slot is one past the dense value area (`precompute_max_output_slots`)
+/// so it does not alias a failarg store. It is a physical frame index
+/// (`llmodel.py get_value_direct`); it does not need to sit past `rd_locs.len()`.
+fn counter_slot_for(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+    homes: &FailArgHomes<'_>,
+    finish_arity: usize,
+) -> Option<usize> {
     let needs = ops.iter().any(|op| {
-        op.opcode == OpCode::GuardValue && {
-            let fail_args: Vec<OpRef> = op
-                .getfailargs()
-                .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode))
-                .iter()
-                .map(|a| a.to_opref())
-                .collect();
-            counter_value_spill(op, &fail_args).is_some()
+        if op.opcode != OpCode::GuardValue {
+            return false;
         }
+        let fail_args: Vec<OpRef> = op
+            .getfailargs()
+            .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode))
+            .iter()
+            .map(|a| a.to_opref())
+            .collect();
+        counter_value_spill(op, &fail_args).is_some()
     });
-    needs.then(|| precompute_max_output_slots(inputargs, ops))
+    needs.then(|| precompute_max_output_slots(inputargs, ops, homes, finish_arity))
 }
 
-fn precompute_max_output_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
-    // x86/regalloc.py:1273 / aarch64/regalloc.py:276 line-by-line: a JUMP
-    // whose descr targets a same-function Label with matching arity is an
-    // internal jump (no fail args); otherwise external and contributes
-    // `op.args.len()` slots.
+fn precompute_max_output_slots(
+    inputargs: &[InputArgRc],
+    ops: &[Op],
+    homes: &FailArgHomes<'_>,
+    finish_arity: usize,
+) -> usize {
+    // x86/regalloc.py / aarch64/regalloc.py compute_hint_frame_locations
+    // line-by-line: a JUMP whose descr targets a same-function Label with
+    // matching arity is an internal jump (no fail args); otherwise external
+    // and contributes `op.args.len()` slots.
     //
     // Key by `descr_identity` (Arc allocation address) per
     // `history.py` TargetToken object-identity semantics: `d.index()`
     // is not unique across distinct TargetTokens in the same trace.
     let label_arity = label_arity_by_identity(ops);
     let num_inputs = inputargs.len();
-    let mut max_slots = num_inputs;
-    for op in ops {
+    // Loops: input stores and the LABEL loader stay `i*8`. Floor on both
+    // so a packed failarg list cannot shrink the dense region under a
+    // later LABEL whose arity exceeds `inputargs.len()`.
+    // Bridges: `_ll_initial_locs` are the bind set; drop the N floor.
+    // Keep the LABEL-arity floor only when a LABEL is present (0 else).
+    let mut max_slots = if homes.absolute_homes {
+        let bind_span = homes
+            .occupied
+            .iter()
+            .copied()
+            .max()
+            .map(|s| s + 1)
+            .unwrap_or(0);
+        bind_span.max(max_label_arity(ops))
+    } else {
+        num_inputs.max(max_label_arity(ops))
+    };
+    for (op_idx, op) in ops.iter().enumerate() {
         let is_guard = op.opcode.is_guard();
         let is_finish = op.opcode == OpCode::Finish;
         let is_external_jump = jump_is_external(op, &label_arity);
@@ -20797,14 +21501,21 @@ fn precompute_max_output_slots(inputargs: &[InputArgRc], ops: &[Op]) -> usize {
         let n = if is_finish || is_external_jump {
             op.num_args()
         } else {
-            // x86/regalloc.py locs_for_fail iterates guard_op.getfailargs()
-            // directly. An absent list skipped store_final_boxes_in_guard /
-            // ResumeDataVirtualAdder.finish.
-            op.getfailargs()
-                .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode))
-                .len()
+            // x86/regalloc.py locs_for_fail / aarch64/regalloc.py _guard_impl:
+            // `self.loc(failargs[i])`. Holes, Consts, duplicate boxes, and
+            // boxes that already have a resident home take no new dense slot.
+            let fa = op
+                .getfailargs()
+                .unwrap_or_else(|| panic!("{:?} reached the backend without fail args", op.opcode));
+            let refs: Vec<OpRef> = fa.iter().map(|a| a.to_opref()).collect();
+            let dense_base = if op.opcode == OpCode::GuardNotForced2 {
+                finish_arity
+            } else {
+                0
+            };
+            let extra = bridge_exit_dense_occupied(op, op_idx, homes, finish_arity);
+            pack_fail_locs(&refs, false, dense_base, homes, &extra).1
         };
-        let n = n + usize::from(op.opcode == OpCode::GuardNotForced2);
         if n > max_slots {
             max_slots = n;
         }
@@ -20831,6 +21542,8 @@ fn collect_guards(
     // process-global callback.
     frame_value_count_fn: Option<fn(i32, i32) -> usize>,
     preserve_descrs: bool,
+    homes: &FailArgHomes<'_>,
+    finish_arity: usize,
 ) -> Result<(), BackendError> {
     let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, op_def_positions) = build_type_overrides(ops, &type_index);
@@ -20932,14 +21645,22 @@ fn collect_guards(
         let counter_value_spill = counter_value_spill(op, &fail_arg_refs)
             .zip(recorded_counter_slot.or(counter_slot))
             .inspect(|&(_, slot)| *max_output_slots = (*max_output_slots).max(slot + 1));
-        let fail_loc_base = usize::from(op.opcode == OpCode::GuardNotForced2);
-        let mut fail_locs: Vec<usize> = (0..fail_arg_refs.len())
-            .map(|index| fail_loc_base + index)
-            .collect();
+        // `RegisterManager.loc` / `store_info_on_descr`: pack holes, Consts,
+        // duplicate boxes, and already-homed Refs out of the dense region
+        // *before* sizing. FINISH / external JUMP stay identity.
+        let identity = is_finish || is_external_jump;
+        let dense_base = if op.opcode == OpCode::GuardNotForced2 {
+            finish_arity
+        } else {
+            0
+        };
+        let extra = bridge_exit_dense_occupied(op, op_idx, homes, finish_arity);
+        let (mut fail_locs, packed_span) =
+            pack_fail_locs(&fail_arg_refs, identity, dense_base, homes, &extra);
         // Merged recompile: `fail_locs` are the descr's existing `rd_locs`.
-        // An empty table is the identity fast path. A non-empty table of the
-        // fail args' length is the layout `apply_resident_failarg_locs`
-        // already published; holes stay `0xFFFF`.
+        // An empty table is the identity fast path used by FINISH / JUMP /
+        // execute_token. A non-empty table of the fail args' length is the
+        // layout already published; holes stay `0xFFFF`.
         if preserve_descrs && let Some(descr) = op.getdescr() {
             if let Some(fd) = descr.as_fail_descr() {
                 let rd = fd.rd_locs();
@@ -20951,18 +21672,18 @@ fn collect_guards(
         // Ref-root slots start at `max_output_slots`. A merged exit stores
         // fail arg k at `rd_locs[k]`, which may be a stale ref-root or a
         // demoted home from the original compile. Widening the value area
-        // to cover every non-hole location keeps that store inside the
-        // output region, so it cannot overwrite a ref-root slot that
-        // another fail arg of the same exit reloads from
-        // (`resolve_failarg_opref`).
+        // to cover every already-resolved (non-tagged, non-hole) location
+        // keeps that store inside the output region.
         let n = fail_locs
             .iter()
             .copied()
-            .filter(|&loc| loc != 0xFFFF)
+            .filter(|&loc| {
+                loc != FAIL_LOC_HOLE && (loc & (FAIL_LOC_REF_ROOT | FAIL_LOC_DEMOTED)) == 0
+            })
             .max()
             .map(|loc| loc + 1)
             .unwrap_or(0)
-            .max(fail_arg_refs.len() + fail_loc_base);
+            .max(packed_span);
         if n > *max_output_slots {
             *max_output_slots = n;
         }
@@ -21321,10 +22042,10 @@ fn collect_guards(
             }
         }
         let recovery_layout = Some(recovery_layout);
-        // Guard gcmap fail-arg portion: bit i ⟺ fail_args[i] is Ref,
-        // stored at jf_frame[i]. No JITFRAME_FIXED_SIZE offset is needed
-        // because fail_args start at jf_frame[0]. `get_gcmap` later unions
-        // these slots with the live Ref-home region starting at
+        // Guard gcmap fail-arg portion: each live Ref fail arg is marked at
+        // the physical slot `fail_locs` names (packed dense or a ref-root /
+        // demoted home). Holes and pending home tags stay out. `get_gcmap`
+        // later unions those slots with the live Ref-home region starting at
         // `max_output_slots`; keeping positions instead of a u64 avoids
         // truncating frames wider than one bitmap word.
         // assembler.py genop_finish + regalloc.py:1190-1206 longevity:
@@ -21363,9 +22084,10 @@ fn collect_guards(
                         "regalloc.py:1206: guard fail_args must not contain Const (slot={i}, opref={arg_ref:?})"
                     );
                     let loc = fail_locs[i];
-                    // A `0xFFFF` hole is not a frame word. `emit_guard_exit`
-                    // skips it; the gcmap must not mark it either.
-                    if loc == 0xFFFF {
+                    // A `0xFFFF` hole is not a frame word. Pending ref-root /
+                    // demoted tags are rewritten after `max_output_slots` is
+                    // known; they must not enter a gcmap here.
+                    if loc == FAIL_LOC_HOLE || (loc & (FAIL_LOC_REF_ROOT | FAIL_LOC_DEMOTED)) != 0 {
                         continue;
                     }
                     slots.push(loc);
@@ -21522,34 +22244,10 @@ fn collect_guards(
             );
         }
         // store_hash is called after compile_loop by pyjitpl.rs using
-        // jitcounter.fetch_next_hash() (compile.py:826-830 parity).
+        // jitcounter.fetch_next_hash() (`compile.py store_hash`).
         //
-        // regalloc.py consider_guard_value / compile.py:813-824
-        // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
-        // index + type tag in status (overrides store_hash).
-        if op.opcode == majit_ir::OpCode::GuardValue {
-            let arg0 = op.arg(0).to_opref();
-            let slot_type = match counter_value_spill {
-                // Not a fail argument of its own guard, which is the usual
-                // case: the compared operand is a promoted value the resume
-                // re-derives. It parks in the trace's counter slot.
-                Some((operand, slot)) => Some((slot, operand.ty())),
-                None => fail_arg_refs
-                    .iter()
-                    .position(|r| *r == arg0)
-                    .map(|idx| (idx, as_fd(&descr).fail_arg_types().get(idx).copied())),
-            };
-            if let Some((slot, ty)) = slot_type {
-                let type_tag = match ty {
-                    Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
-                    Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
-                    _ => majit_backend::STATUS_TY_INT,
-                };
-                if !preserve_descrs {
-                    as_fd(&descr).make_a_counter_per_value(slot as u32, type_tag);
-                }
-            }
-        }
+        // `make_a_counter_per_value` is stamped in `resolve_fail_locs_and_stamp`
+        // once `fail_locs` are absolute (`regalloc.py consider_guard_value`).
         // assembler.py get_gcref_from_faildescr parity: store the
         // FailDescr Arc data pointer in jf_descr.
         // FINISH and non-FINISH alike bake a thin pointer identity;
@@ -21625,23 +22323,10 @@ fn collect_guards(
         } else {
             None
         };
-        if op.opcode == OpCode::GuardNotForced2 && !preserve_descrs {
-            // llsupport/assembler.py `store_info_on_descr`: force() reads
-            // exactly the locations written by the register allocator.
-            as_fd(&descr).set_rd_locs(
-                fail_arg_refs
-                    .iter()
-                    .zip(&fail_locs)
-                    .map(|(arg, &loc)| {
-                        if arg.is_none() {
-                            0xFFFF
-                        } else {
-                            u16::try_from(loc)
-                                .expect("force failarg frame location exceeds rd_locs")
-                        }
-                    })
-                    .collect(),
-            );
+        if op.opcode == OpCode::GuardNotForced2 {
+            // `store_force_descr` records current locations after packing;
+            // `resolve_fail_locs_and_stamp` writes `rd_locs`. Keep the
+            // force-path gcmap union for FINISH (`opassembler.py _finish_gcmap`).
             finish_gcmap_slots.clone_from(&failarg_ref_slots);
         }
         let mut gcmap_slots = failarg_ref_slots.clone();
@@ -21673,9 +22358,7 @@ fn collect_guards(
             fail_index,
             can_have_bridge,
             stub_addr: 0,
-            redirect_resident_failargs: !preserve_descrs
-                && is_guard
-                && op.opcode != OpCode::GuardNotForced2,
+            redirect_resident_failargs: !preserve_descrs && is_guard,
             fail_arg_refs,
             fail_arg_types,
             fail_locs,
@@ -21839,16 +22522,17 @@ impl CraneliftBackend {
     /// `LoopTargetDescr` in `token.target_tokens` whose `ll_loop_code` is the
     /// anchor's current body — with the block id this function assigned,
     /// since that body may be another anchor's family function — then
-    /// `set_ll_function_addr` (Tail body), `ca_dispatch_slot` (host wrapper),
-    /// the call-assembler registry, then `entry_body_ptr` and
-    /// `entry_code_ptr` (Release).
+    /// retargets the anchor's existing `call_header_stub` to the family
+    /// body (key 0) without rewriting `_ll_function_addr`, then
+    /// `ca_dispatch_slot` (host wrapper), the call-assembler registry,
+    /// then `entry_body_ptr` and `entry_code_ptr` (Release).
     ///
     /// Each member retargets the LABELs of its own retained loop whose
     /// `ll_loop_code` is that member's `entry_body_ptr`, using the block id
     /// this function assigned, updates its frame depth the same way, and
     /// stores `entry_body_ptr`. Its host entry (`entry_code_ptr`,
     /// `ca_dispatch_slot`, `RegisteredLoopTarget.code_ptr`) and
-    /// CALL_ASSEMBLER body (`set_ll_function_addr`) stay: the function's
+    /// CALL_ASSEMBLER stub (`_ll_function_addr`) stay: the function's
     /// key-0 entry is the anchor's preamble.
     ///
     /// Every retargeted descr's `backend_loop_entry` is replaced with
@@ -21912,7 +22596,15 @@ impl CraneliftBackend {
             target.set_dispatch_target(body_ptr, block_id, depth);
             repointed.push(descr.clone());
         }
-        token.set_ll_function_addr(body_ptr);
+        // Keep `_ll_function_addr` as the anchor's `call_header_stub` and
+        // retarget that stub to the new family body. `write_call_header_stub`
+        // keeps the far veneer so `follow_jump` does not walk the door
+        // (`redirect_call_assembler` overlays `oldadr`; baked CALL_ASSEMBLER
+        // still enters the stub). Members keep their own stubs.
+        let stub = token.ll_function_addr();
+        if stub != 0 && stub != body_ptr {
+            crate::stub::write_call_header_stub(stub, body_ptr);
+        }
         if let Some(clt) = token.compiled_loop_token() {
             let mut slot = clt.call_assembler_target.write();
             if let Some(target) = slot
@@ -22465,13 +23157,7 @@ impl majit_backend::Backend for CraneliftBackend {
         // Snapshot before `do_compile`, like the loop path above.
         let merge_source = merge_source_eligible(!self.constants.is_empty(), ops)
             .then(|| retained_merge_source(inputargs, ops));
-        let bridge_source_slots: Vec<usize> = fail_descr
-            .rd_locs()
-            .iter()
-            .copied()
-            .filter(|&loc| loc != 0xFFFF)
-            .map(|loc| loc as usize)
-            .collect();
+        let bridge_source_slots = live_bridge_source_slots(fail_descr.rd_locs(), inputargs.len());
         let compiled = self.do_compile(
             inputargs,
             ops,
@@ -22600,6 +23286,7 @@ impl majit_backend::Backend for CraneliftBackend {
                     num_inputs: bridge_num_inputs,
                     num_ref_roots: compiled.num_ref_roots,
                     max_output_slots: compiled.max_output_slots,
+                    frame_depth: compiled.frame_depth,
 
                     invalidated_arc: Some(invalidated_arc),
                     gc_table: compiled.gc_table.clone(),
@@ -23269,8 +23956,14 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn get_value_direct(&self, frame: &DeadFrame, slot: usize) -> i64 {
-        // Cranelift's slot space is the dense fail-value vector.
-        self.get_int_value(frame, slot)
+        // `llmodel.py get_value_direct`: `get_int_value_direct(deadframe, index * WORD)`.
+        // The counter index `consider_guard_value` records is a physical frame
+        // slot; `get_int_value` still maps fail-argument indices through `rd_locs`.
+        match frame {
+            DeadFrame::JitFrame(data) => data.get_int_at_slot(slot),
+            DeadFrame::LibcJitFrame(data) => data.get_int_at_slot(slot),
+            DeadFrame::Boxed(_) => panic!("cranelift deadframe is a jitframe"),
+        }
     }
 
     fn get_float_value(&self, frame: &DeadFrame, index: usize) -> f64 {
@@ -23313,9 +24006,20 @@ impl majit_backend::Backend for CraneliftBackend {
         // (`assert old_nbargs == new_nbargs`) and only then copies frame
         // info and patches.
         let new_target = validate_redirect_call_assembler_target(old, new)?;
+        let old_addr = old.ll_function_addr();
         let new_addr = new.ll_function_addr();
-        if new_addr != 0 {
-            old.set_ll_function_addr(new_addr);
+        // `x86/assembler.py redirect_call_assembler` / `aarch64/assembler.py
+        // redirect_call_assembler`: overwrite the instructions at the old
+        // `_ll_function_addr` with a JMP/B to the new one. The slot stays
+        // the overlay site so a later redirect of the same token patches
+        // the same bytes (`mc.copy_to_raw_memory(oldadr)`). `mc.JMP(imm(
+        // follow_jump(target)))` skips a JMP already sitting at the new
+        // entry so a chain of redirects is one hop.
+        if old_addr != 0 && new_addr != 0 {
+            let target = crate::stub::follow_jump(new_addr);
+            if old_addr != target {
+                crate::stub::write_entry_redirect(old_addr, target);
+            }
         }
         // `x86/assembler.py redirect_call_assembler` `update_frame_info`
         // parity: propagate the new loop's frame depth onto the old token
@@ -23982,6 +24686,27 @@ mod tests {
     use majit_ir::operand::Operand;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Scatter logical failarg values into a physical jitframe image
+    /// `execute_bridge` indexes through `rd_locs`.
+    fn parent_outputs_from_rd_locs(rd_locs: &[u16], logical: &[i64]) -> Vec<i64> {
+        let mut max_slot = logical.len().saturating_sub(1);
+        for &loc in rd_locs {
+            if loc != 0xFFFF {
+                max_slot = max_slot.max(loc as usize);
+            }
+        }
+        let mut frame = vec![0i64; max_slot + 1];
+        for (i, &val) in logical.iter().enumerate() {
+            match rd_locs.get(i).copied() {
+                Some(0xFFFF) => {}
+                Some(loc) => frame[loc as usize] = val,
+                None if i < frame.len() => frame[i] = val,
+                None => {}
+            }
+        }
+        frame
+    }
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> majit_ir::OpRc {
         let bx: Vec<Operand> = args.iter().map(|a| rb(*a)).collect();
@@ -25568,7 +26293,10 @@ mod tests {
         let guard_descr = as_fd(&compiled.fail_descrs[0]);
         let attachments = backend.cpu_handle().read();
         let bridge = fail_descr_bridge_ref(guard_descr).expect("bridge attached");
-        let parent_outputs = [42i64, root.0 as i64, 1.25f64.to_bits() as i64];
+        let parent_outputs = parent_outputs_from_rd_locs(
+            guard_descr.rd_locs(),
+            &[42i64, root.0 as i64, 1.25f64.to_bits() as i64],
+        );
         let host =
             CraneliftBackend::execute_bridge(&bridge, &parent_outputs, guard_descr, attachments);
         assert_eq!(backend.get_int_value(&host, 0), 42);
@@ -25688,7 +26416,10 @@ mod tests {
         let guard_descr = as_fd(&compiled.fail_descrs[0]);
         let attachments = backend.cpu_handle().read();
         let bridge = fail_descr_bridge_ref(guard_descr).expect("bridge attached");
-        let parent_outputs = [10i64, 20, 30, 40, root.0 as i64, 50];
+        let parent_outputs = parent_outputs_from_rd_locs(
+            guard_descr.rd_locs(),
+            &[10i64, 20, 30, 40, root.0 as i64, 50],
+        );
         let host =
             CraneliftBackend::execute_bridge(&bridge, &parent_outputs, guard_descr, attachments);
         assert_eq!(backend.get_int_value(&host, 0), 10);
@@ -26571,6 +27302,161 @@ mod tests {
     }
 
     #[test]
+    fn test_guard_value_counter_sits_past_rd_locs_when_failargs_pack_small() {
+        // Packed holes shrink the dense region below failarg-list length.
+        // The spill slot is one past that dense region so it does not alias
+        // the packed failarg; `get_value_direct` reads the physical word, so
+        // the slot may sit inside `rd_locs.len()`.
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let guard = Op::new(
+            OpCode::GuardValue,
+            &[rb(OpRef::int_op(1)), rb(OpRef::int_op(102))],
+        );
+        guard.pos().set(OpRef::NONE);
+        guard.set_fail_arg_types(vec![
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+        ]);
+        guard.setfailargs(
+            vec![
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(ia0),
+            ]
+            .into(),
+        );
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            mk_op(OpCode::IntAdd, &[ia0, OpRef::int_op(100)], 1),
+            OpRc::new(guard),
+            mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, 7i64);
+        constants.insert(102, 999i64);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(0xc0df);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("compiled loop");
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        let descr = backend.get_latest_descr_arc(&frame);
+        let fd = descr
+            .as_fail_descr()
+            .expect("guard exit carries a FailDescr");
+        assert_eq!(fd.rd_locs().len(), 8);
+        assert_eq!(
+            fd.rd_locs()[7],
+            0,
+            "the live failarg packs to physical slot 0"
+        );
+        let slot = majit_backend::guard_value_counter_slot(fd)
+            .expect("the GUARD_VALUE stamped a counter slot");
+        assert_ne!(
+            slot, 0,
+            "spill slot {slot} must not alias the packed failarg; max_output={}",
+            compiled.max_output_slots
+        );
+        assert_eq!(
+            backend.get_value_direct(&frame, slot),
+            7,
+            "the compared operand is readable at the slot the stamp names"
+        );
+        assert_eq!(
+            backend.get_int_value(&frame, 7),
+            0,
+            "get_int_value still decodes the logical failarg through rd_locs"
+        );
+    }
+
+    #[test]
+    fn test_guard_value_counter_is_physical_packed_failarg_slot() {
+        // The guarded value is failarg 7 with holes before it, so packing
+        // maps logical index 7 to physical slot 0. `consider_guard_value`
+        // stamps that physical slot; `get_value_direct` reads it without
+        // going through `rd_locs`.
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ia0 = OpRef::input_arg_int(0);
+        let guard = Op::new(OpCode::GuardValue, &[rb(ia0), rb(OpRef::int_op(102))]);
+        guard.pos().set(OpRef::NONE);
+        guard.set_fail_arg_types(vec![
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+        ]);
+        guard.setfailargs(
+            vec![
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(OpRef::NONE),
+                rb(ia0),
+            ]
+            .into(),
+        );
+        let ops = [
+            mk_op(OpCode::Label, &[ia0], OpRef::NONE.raw()),
+            OpRc::new(guard),
+            mk_op(OpCode::Finish, &[ia0], OpRef::NONE.raw()),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(102, 999i64);
+        backend.set_constants(constants);
+
+        let token = JitCellToken::new(0xc0e0);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let frame = backend.execute_token(&token, &[Value::Int(42)]);
+        let descr = backend.get_latest_descr_arc(&frame);
+        let fd = descr
+            .as_fail_descr()
+            .expect("guard exit carries a FailDescr");
+        assert_eq!(fd.rd_locs().len(), 8);
+        assert_eq!(fd.rd_locs()[7], 0, "packed failarg sits at physical slot 0");
+        let slot = majit_backend::guard_value_counter_slot(fd)
+            .expect("the GUARD_VALUE stamped a counter slot");
+        assert_eq!(
+            slot, 0,
+            "counter index is the physical packed slot, not logical 7"
+        );
+        assert_eq!(
+            backend.get_value_direct(&frame, slot),
+            42,
+            "get_value_direct reads the operand at the physical slot"
+        );
+        assert_eq!(
+            backend.get_int_value(&frame, 7),
+            42,
+            "get_int_value still decodes the logical failarg through rd_locs"
+        );
+    }
+
+    #[test]
     fn test_simple_add_finish() {
         let mut backend = CraneliftBackend::new();
 
@@ -26783,6 +27669,7 @@ mod tests {
                 family_entry,
             )
         };
+        let stub_a = token_a.ll_function_addr();
         backend.publish_merged_entry(
             &token_a,
             b_code,
@@ -26806,8 +27693,75 @@ mod tests {
             .as_loop_target_descr()
             .expect("LABEL descr is a LoopTargetDescr");
         assert_eq!(target.ll_loop_code(), b_body);
+        assert_eq!(token_a.ll_function_addr(), stub_a);
         // `token_b` keeps B's assembler memory alive for the redirected entry.
         let _keep_b = token_b;
+    }
+
+    #[test]
+    fn publish_merged_entry_keeps_the_stable_door() {
+        let mut backend = make_call_assembler_backend();
+        let label_a = make_label_descr(1_500_640);
+        let label_b = make_label_descr(1_500_641);
+        let label_c = make_label_descr(1_500_642);
+        let token_a = JitCellToken::new(9110);
+        let token_b = JitCellToken::new(9111);
+        let token_c = JitCellToken::new(9112);
+        compile_int_add_loop(&mut backend, &token_a, &label_a, 1);
+        compile_int_add_loop(&mut backend, &token_b, &label_b, 100);
+        compile_int_add_loop(&mut backend, &token_c, &label_c, 7);
+
+        let (b_code, b_body, depth, family_entry) = {
+            let compiled_b = token_b
+                .compiled
+                .get()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap();
+            let family_entry = LoopTargetEntry {
+                code_ptr: compiled_b.code_ptr,
+                fail_descrs: compiled_b.fail_descrs.clone(),
+                fail_descr_cells: compiled_b.fail_descr_cells.clone(),
+                num_inputs: compiled_b.num_inputs,
+                num_ref_roots: compiled_b.num_ref_roots,
+                max_output_slots: compiled_b.max_output_slots,
+            };
+            (
+                compiled_b.code_ptr as usize,
+                compiled_b.body_ptr as usize,
+                compiled_b.frame_depth,
+                family_entry,
+            )
+        };
+        let stub_b = token_b.ll_function_addr();
+        backend.publish_merged_entry(
+            &token_b,
+            b_code,
+            b_body,
+            depth,
+            Arc::new(MergedGeneration {
+                asm_memory_blocks: Vec::new(),
+                gcmap_allocs: Vec::new(),
+                fail_descr_cells: Vec::new(),
+                gc_table: None,
+                cpu_attachments: None,
+            }),
+            &[(label_b.clone(), 0)],
+            &[],
+            &family_entry,
+        );
+        assert_eq!(
+            crate::stub::follow_jump(stub_b),
+            stub_b,
+            "merged publish must keep the far-veneer door"
+        );
+
+        backend.redirect_call_assembler(&token_a, &token_b).unwrap();
+        backend.redirect_call_assembler(&token_b, &token_c).unwrap();
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&token_a, &[Value::Int(0)]), 0),
+            7
+        );
     }
 
     fn bind_target_owner(label: &majit_ir::DescrRef, token: &Arc<JitCellToken>) {
@@ -33367,6 +34321,239 @@ mod tests {
     }
 
     #[test]
+    fn test_call_assembler_redirect_after_caller_compiled() {
+        let mut backend = make_call_assembler_backend();
+
+        let callee_inputargs = vec![InputArg::new_int_rc(0)];
+        let callee_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let mut callee_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        callee_constants.insert(100, 1);
+        backend.set_constants(callee_constants);
+
+        let callee_token = Arc::new(JitCellToken::new(1_500_610));
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, callee_token.as_ref())
+            .unwrap();
+
+        let caller_inputargs = vec![InputArg::new_int_rc(0)];
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef::input_arg_int(0)],
+                1,
+                make_call_assembler_descr(&callee_token, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend.set_constants(indexmap::IndexMap::new());
+        let caller_token = JitCellToken::new(1_500_611);
+        backend
+            .compile_loop(&caller_inputargs, &caller_ops, &caller_token)
+            .unwrap();
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller_token, &[Value::Int(0)]), 0),
+            1
+        );
+
+        let mut repl_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        repl_constants.insert(100, 100);
+        backend.set_constants(repl_constants);
+        let replacement = JitCellToken::new(1_500_612);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &replacement)
+            .unwrap();
+        let overlay = callee_token.ll_function_addr();
+        backend
+            .redirect_call_assembler(callee_token.as_ref(), &replacement)
+            .unwrap();
+        assert_eq!(callee_token.ll_function_addr(), overlay);
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller_token, &[Value::Int(0)]), 0),
+            100
+        );
+
+        let mut second_constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        second_constants.insert(100, 7);
+        backend.set_constants(second_constants);
+        let second = JitCellToken::new(1_500_613);
+        backend
+            .compile_loop(&callee_inputargs, &callee_ops, &second)
+            .unwrap();
+        backend
+            .redirect_call_assembler(callee_token.as_ref(), &second)
+            .unwrap();
+        assert_eq!(callee_token.ll_function_addr(), overlay);
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller_token, &[Value::Int(0)]), 0),
+            7
+        );
+    }
+
+    fn compile_int_add_loop(
+        backend: &mut CraneliftBackend,
+        token: &JitCellToken,
+        label: &majit_ir::DescrRef,
+        addend: i64,
+    ) {
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                label.clone(),
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::int_op(100)],
+                1,
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(100, addend);
+        backend.set_constants(constants);
+        token.record_target_token(label.clone());
+        backend.compile_loop(&inputargs, &ops, token).unwrap();
+    }
+
+    #[test]
+    fn test_redirect_call_assembler_label_reentry_stays_on_old_body() {
+        let mut backend = make_call_assembler_backend();
+        let old_label = make_label_descr(1_500_620);
+        let new_label = make_label_descr(1_500_621);
+        let old = JitCellToken::new(1_500_622);
+        let new = JitCellToken::new(1_500_623);
+        compile_int_add_loop(&mut backend, &old, &old_label, 1);
+        compile_int_add_loop(&mut backend, &new, &new_label, 100);
+
+        let ltd = old_label
+            .as_loop_target_descr()
+            .expect("LABEL is a LoopTargetDescr");
+        let old_loop_code = ltd.ll_loop_code();
+        let old_stub = old.ll_function_addr();
+        let compiled = old
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        assert_eq!(old_stub, compiled.call_header_stub_ptr);
+        assert_ne!(old_stub, compiled.body_ptr as usize);
+        assert_eq!(old_loop_code, compiled.body_ptr as usize);
+
+        let jumper_label = make_label_descr(1_500_624);
+        let jumper = JitCellToken::new(1_500_625);
+        jumper.record_target_token(jumper_label.clone());
+        let jumper_ops = vec![
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                jumper_label,
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+                old_label.clone(),
+            ),
+        ];
+        backend.set_constants(indexmap::IndexMap::new());
+        backend
+            .compile_loop(&[InputArg::new_int_rc(0)], &jumper_ops, &jumper)
+            .unwrap();
+
+        backend.redirect_call_assembler(&old, &new).unwrap();
+        assert_eq!(old.ll_function_addr(), old_stub);
+        assert_eq!(ltd.ll_loop_code(), old_loop_code);
+
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&old, &[Value::Int(0)]), 0),
+            100
+        );
+        let key = ltd.label_block_id() + 1;
+        assert_eq!(
+            backend.get_int_value(
+                &backend.execute_token_with_dispatch_key(&old, &[Value::Int(0)], key),
+                0
+            ),
+            1
+        );
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&jumper, &[Value::Int(0)]), 0),
+            1
+        );
+    }
+
+    #[test]
+    fn test_redirect_call_assembler_chain_reaches_final_target() {
+        let mut backend = make_call_assembler_backend();
+        let label_a = make_label_descr(1_500_630);
+        let label_b = make_label_descr(1_500_631);
+        let label_c = make_label_descr(1_500_632);
+        let token_a = Arc::new(JitCellToken::new(1_500_633));
+        let token_b = JitCellToken::new(1_500_634);
+        let token_c = JitCellToken::new(1_500_635);
+        compile_int_add_loop(&mut backend, token_a.as_ref(), &label_a, 1);
+        compile_int_add_loop(&mut backend, &token_b, &label_b, 100);
+        compile_int_add_loop(&mut backend, &token_c, &label_c, 7);
+
+        let caller_ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op_with_descr(
+                OpCode::CallAssemblerI,
+                &[OpRef::input_arg_int(0)],
+                1,
+                make_call_assembler_descr(&token_a, vec![Type::Int], Type::Int),
+            ),
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend.set_constants(indexmap::IndexMap::new());
+        let caller = JitCellToken::new(1_500_636);
+        backend
+            .compile_loop(&[InputArg::new_int_rc(0)], &caller_ops, &caller)
+            .unwrap();
+
+        let stub_a = token_a.ll_function_addr();
+        backend
+            .redirect_call_assembler(token_a.as_ref(), &token_b)
+            .unwrap();
+        backend.redirect_call_assembler(&token_b, &token_c).unwrap();
+        assert_eq!(token_a.ll_function_addr(), stub_a);
+        assert_eq!(
+            label_a.as_loop_target_descr().unwrap().ll_loop_code(),
+            token_a
+                .compiled
+                .get()
+                .unwrap()
+                .downcast_ref::<CompiledLoop>()
+                .unwrap()
+                .body_ptr as usize
+        );
+        assert_eq!(
+            backend.get_int_value(&backend.execute_token(&caller, &[Value::Int(0)]), 0),
+            7
+        );
+        assert_eq!(
+            backend.get_int_value(
+                &backend.execute_token(token_a.as_ref(), &[Value::Int(0)]),
+                0
+            ),
+            7
+        );
+    }
+
+    #[test]
     fn test_call_assembler_requires_gc_runtime_for_rewrite_parity() {
         let mut backend = CraneliftBackend::new();
         let callee_token = Arc::new(JitCellToken::new(1_500_352));
@@ -36065,6 +37252,1277 @@ mod tests {
         assert!(!force_token.is_null());
         let forced = force_token_to_dead_frame(force_token);
         assert_eq!(get_int_from_deadframe(&forced, 0).unwrap(), 30);
+    }
+
+    #[test]
+    fn test_sort_slot_stores_orders_by_offset_and_keeps_last_writer() {
+        let unsorted = vec![(80, "a"), (64, "b"), (80, "c"), (72, "d"), (96, "e")];
+        assert_eq!(
+            sort_slot_stores(unsorted),
+            vec![(64, "b"), (72, "d"), (80, "c"), (96, "e")]
+        );
+        assert!(sort_slot_stores(Vec::<(i32, i32)>::new()).is_empty());
+        assert_eq!(sort_slot_stores(vec![(8, 1)]), vec![(8, 1)]);
+        let dups = sort_slot_stores(vec![(16, 1), (16, 2), (16, 3)]);
+        assert_eq!(dups, vec![(16, 3)]);
+    }
+
+    #[test]
+    fn test_pack_fail_locs_holes_duplicates_and_homes() {
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let r0 = OpRef::input_arg_ref(0);
+        let roots = [(0u32, 0usize)];
+        let demoted: IndexMap<u32, usize> = IndexMap::new();
+
+        let empty_bind = IndexMap::new();
+        let empty_occ = IndexSet::new();
+        let loop_homes = FailArgHomes {
+            ref_root_slots: &[],
+            demoted_home_index: &demoted,
+            bind_homes: &empty_bind,
+            occupied: &empty_occ,
+            absolute_homes: false,
+            home_intervals: None,
+            identity_floor: 0,
+        };
+        let (locs, span) = pack_fail_locs(
+            &[OpRef::NONE, i0, OpRef::NONE, i1],
+            false,
+            0,
+            &loop_homes,
+            &empty_occ,
+        );
+        assert_eq!(locs, vec![FAIL_LOC_HOLE, 0, FAIL_LOC_HOLE, 1]);
+        assert_eq!(span, 2);
+
+        let (locs, span) = pack_fail_locs(&[i0, i0], false, 0, &loop_homes, &empty_occ);
+        assert_eq!(locs, vec![0, 0]);
+        assert_eq!(span, 1);
+
+        let root_homes = FailArgHomes {
+            ref_root_slots: &roots,
+            demoted_home_index: &demoted,
+            bind_homes: &empty_bind,
+            occupied: &empty_occ,
+            absolute_homes: false,
+            home_intervals: None,
+            identity_floor: 0,
+        };
+        let (locs, span) = pack_fail_locs(&[OpRef::NONE, r0], false, 0, &root_homes, &empty_occ);
+        assert_eq!(locs, vec![FAIL_LOC_HOLE, FAIL_LOC_REF_ROOT]);
+        assert_eq!(span, 0);
+
+        // Bridge bind set: a failarg that is an inputarg maps to its home;
+        // a new box takes the lowest slot not in this guard's resident homes.
+        let mut bind = IndexMap::new();
+        bind.insert(i0.raw(), 2);
+        let occupied: IndexSet<usize> = std::iter::once(2).collect();
+        let bridge_homes = FailArgHomes {
+            ref_root_slots: &[],
+            demoted_home_index: &demoted,
+            bind_homes: &bind,
+            occupied: &occupied,
+            absolute_homes: true,
+            home_intervals: None,
+            identity_floor: 0,
+        };
+        let (locs, span) = pack_fail_locs(&[i0, i1], false, 0, &bridge_homes, &empty_occ);
+        assert_eq!(locs, vec![2, 0]);
+        assert_eq!(span, 1);
+    }
+
+    #[test]
+    fn test_bridge_bind_homes_skips_fixed_area() {
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let no_fixed = bridge_bind_homes(&inputargs, &[0, 3], 0);
+        assert_eq!(no_fixed.get(&0), Some(&0));
+        assert_eq!(no_fixed.get(&1), Some(&3));
+        let fixed = bridge_bind_homes(&inputargs, &[0, 3], 1);
+        assert!(fixed.get(&0).is_none());
+        assert_eq!(fixed.get(&1), Some(&3));
+    }
+
+    #[test]
+    fn test_assign_bridge_ref_root_slots_starts_at_fixed_area() {
+        let mut slots = [(0u32, 99usize)];
+        let bind = IndexMap::new();
+        let mut occupied = IndexSet::new();
+        assign_bridge_ref_root_slots(&mut slots, &bind, &mut occupied, 1);
+        assert_eq!(slots[0].1, 1);
+        assert!(occupied.contains(&1));
+        assert!(!occupied.contains(&0));
+
+        let mut bound = IndexMap::new();
+        bound.insert(0u32, 4usize);
+        let mut occupied = std::iter::once(4usize).collect();
+        let mut slots = [(0u32, 99usize)];
+        assign_bridge_ref_root_slots(&mut slots, &bound, &mut occupied, 1);
+        assert_eq!(slots[0].1, 4);
+    }
+
+    #[test]
+    fn test_compute_bridge_home_intervals_and_linear_scan_reuse() {
+        // Four bind ints die at the two IntAdds; the new Ref reuses slot 0.
+        let inputargs = vec![
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
+            InputArg::new_int_rc(3),
+        ];
+        let ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                4,
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(2), OpRef::input_arg_int(3)],
+                5,
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 6),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(6)], OpRef::NONE.raw()),
+        ];
+        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let mut home_vars = IndexSet::new();
+        for ia in &inputargs {
+            home_vars.insert(ia.index);
+        }
+        home_vars.insert(6);
+        let intervals = compute_bridge_home_intervals(&inputargs, &ops, &home_vars);
+        assert_eq!(intervals.get(&0), Some(&(0, 0)));
+        assert_eq!(intervals.get(&1), Some(&(0, 0)));
+        assert_eq!(intervals.get(&2), Some(&(0, 1)));
+        assert_eq!(intervals.get(&3), Some(&(0, 1)));
+        assert_eq!(intervals.get(&6), Some(&(2, 3)));
+
+        let mut bind = IndexMap::new();
+        bind.insert(0, 0);
+        bind.insert(1, 1);
+        bind.insert(2, 2);
+        bind.insert(3, 3);
+        let mut refs = IndexSet::new();
+        refs.insert(6);
+        let demoted = IndexSet::new();
+        let (slots, assigned) =
+            assign_bridge_homes_linear_scan(&intervals, &bind, &refs, &demoted, 0);
+        assert_eq!(slots.get(&6), Some(&0), "new Ref reuses the dead bind home");
+        assert_eq!(assigned.iter().copied().max(), Some(3));
+    }
+
+    #[test]
+    fn test_label_crossing_interval_extends_to_end() {
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
+        let ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::const_int(0), OpRef::const_int(0)],
+                2,
+            ),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            mk_op(
+                OpCode::PtrEq,
+                &[OpRef::input_arg_ref(1), OpRef::input_arg_ref(1)],
+                3,
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let mut home_vars = IndexSet::new();
+        home_vars.insert(0);
+        home_vars.insert(1);
+        let intervals = compute_bridge_home_intervals(&inputargs, &ops, &home_vars);
+        assert_eq!(
+            intervals.get(&1),
+            Some(&(0, 3)),
+            "a Ref used after LABEL must survive the back edge"
+        );
+    }
+
+    #[test]
+    fn test_label_bridge_identity_floor_skips_slot_zero() {
+        // LABEL arity 1 owns slot 0 (`_ll_initial_locs`). A later Ref must
+        // not reuse a dead preamble bind home inside that span.
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::const_int(1)],
+                2,
+            ),
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(1)], OpRef::NONE.raw()),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 3),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(1), OpRef::ref_op(3)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let ops: Vec<Op> = ops.iter().map(|rc| (**rc).clone()).collect();
+        let mut home_vars = IndexSet::new();
+        home_vars.insert(0);
+        home_vars.insert(1);
+        home_vars.insert(3);
+        let intervals = compute_bridge_home_intervals(&inputargs, &ops, &home_vars);
+        let mut bind = IndexMap::new();
+        bind.insert(0, 0);
+        bind.insert(1, 1);
+        let mut refs = IndexSet::new();
+        refs.insert(3);
+        let demoted = IndexSet::new();
+        let identity_floor = max_label_arity(&ops);
+        assert_eq!(identity_floor, 1);
+        let (slots, _) =
+            assign_bridge_homes_linear_scan(&intervals, &bind, &refs, &demoted, identity_floor);
+        assert_ne!(
+            slots.get(&3).copied(),
+            Some(0),
+            "new Ref must not take LABEL identity slot 0"
+        );
+        assert!(
+            slots.get(&3).copied().unwrap() >= identity_floor,
+            "new Ref home {} must sit past identity_floor",
+            slots.get(&3).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_gnf2_holes_and_homed_refs_add_no_dense_slots() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
+        let guard = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::NONE),
+            rb(OpRef::input_arg_ref(0)),
+            rb(OpRef::NONE),
+            rb(OpRef::input_arg_ref(1)),
+        ]);
+        guard.set_fail_arg_types(vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_ref(0), OpRef::input_arg_ref(1)],
+                OpRef::NONE.raw(),
+            ),
+            mk_op(OpCode::ForceToken, &[], 2),
+            guard,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(2)], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9018);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("compiled loop");
+        assert_eq!(compiled.max_output_slots, inputargs.len());
+        let fd = compiled.fail_descrs[0].as_fail_descr().expect("GNF2 descr");
+        let locs = fd.rd_locs();
+        assert_eq!(locs.len(), 4);
+        assert_eq!(locs[0], 0xFFFF);
+        assert_eq!(locs[2], 0xFFFF);
+        assert_eq!(locs[1], locs[3] - 1);
+        assert!(locs[1] >= inputargs.len() as u16);
+
+        let frame = backend.execute_token(
+            &token,
+            &[Value::Ref(GcRef(0x1111)), Value::Ref(GcRef(0x2222))],
+        );
+        let force_token = backend.get_ref_value(&frame, 0);
+        let forced = force_token_to_dead_frame(force_token);
+        assert_eq!(get_ref_from_deadframe(&forced, 1).unwrap(), GcRef(0x1111));
+        assert_eq!(get_ref_from_deadframe(&forced, 3).unwrap(), GcRef(0x2222));
+    }
+
+    #[test]
+    fn test_label_arity_floors_max_output_when_guards_pack_small() {
+        // Packed failargs can be narrower than a later LABEL. The loader
+        // still reads `ITEM0 + i*8` for `0..arity`, so the dense region
+        // has to cover those slots.
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let add1 = mk_op(
+            OpCode::IntAdd,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(0)],
+            1,
+        );
+        let add2 = mk_op(
+            OpCode::IntAdd,
+            &[OpRef::int_op(1), OpRef::input_arg_int(0)],
+            2,
+        );
+        let guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::input_arg_int(0))]);
+        guard.set_fail_arg_types(vec![Type::Int]);
+        let ops = vec![
+            add1,
+            add2,
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::int_op(1), OpRef::int_op(2)],
+                OpRef::NONE.raw(),
+            ),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let token = JitCellToken::new(9022);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("compiled loop");
+        assert_eq!(compiled.max_output_slots, 3);
+    }
+
+    #[test]
+    fn test_live_bridge_source_slots_stops_at_inputarg_limit() {
+        let locs: [u16; 4] = [5, 0xFFFF, 5, 9];
+        assert_eq!(live_bridge_source_slots(&locs, 1), vec![5]);
+        assert_eq!(live_bridge_source_slots(&locs, 2), vec![5, 5]);
+        assert_eq!(live_bridge_source_slots(&locs, 8), vec![5, 5, 9]);
+    }
+
+    /// Parent guard with a hole, a duplicate box, and a homed Ref. The
+    /// bridge binds inputargs to those `rd_locs` (`prepare_bridge`). HIT
+    /// and host `execute_bridge` must read the same physical image.
+    #[test]
+    fn test_bridge_bind_homes_hit_and_host() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut u64) = 0xB1D0_0001;
+        }
+        let mut backend = backend_with_gc(gc);
+        let i0 = OpRef::input_arg_int(0);
+        let r = OpRef::input_arg_ref(2);
+        // Extra unused Int inputarg floors the parent `max_output` so the
+        // Ref home sits at slot 3, not compact live-index 2.
+        let loop_inputargs = vec![
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_ref_rc(2),
+        ];
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![rb(OpRef::NONE), rb(i0), rb(i0), rb(r),]);
+        guard.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Int, Type::Ref]);
+        let loop_ops = vec![guard, mk_op(OpCode::Finish, &[i0, r], OpRef::NONE.raw())];
+        let token = JitCellToken::new(9_100_001);
+        backend
+            .compile_loop(&loop_inputargs, &loop_ops, &token)
+            .unwrap();
+        let failed =
+            backend.execute_token(&token, &[Value::Int(77), Value::Int(0), Value::Ref(root)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("guard");
+        let rd = guard_descr.rd_locs();
+        assert!(rd.len() >= 4);
+        assert_eq!(rd[0], 0xFFFF);
+        assert_eq!(rd[1], rd[2], "duplicate box shares one home");
+        assert_ne!(rd[3], 0xFFFF);
+        assert_ne!(rd[3], 2, "homed Ref must not sit at compact live-index 2");
+        let live_root = backend.get_ref_value(&failed, 3);
+        assert_eq!(unsafe { *(live_root.0 as *const u64) }, 0xB1D0_0001);
+
+        let i1 = OpRef::input_arg_int(1);
+        let bridge_inputargs = vec![
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_ref_rc(2),
+        ];
+        // Live walk of `[NONE, i0, i0, r]` binds both int inputargs to the
+        // same home; Finish names both so a missed load would show.
+        let finish = mk_op(OpCode::Finish, &[i0, i1, r], OpRef::NONE.raw());
+        finish.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Ref]);
+        backend
+            .compile_bridge(guard_descr, &bridge_inputargs, &[finish], &token, None)
+            .unwrap();
+
+        let in_code = backend.execute_token(
+            &token,
+            &[Value::Int(77), Value::Int(0), Value::Ref(live_root)],
+        );
+        assert_eq!(backend.get_int_value(&in_code, 0), 77);
+        assert_eq!(backend.get_int_value(&in_code, 1), 77);
+        let hit_ref = backend.get_ref_value(&in_code, 2);
+        assert_eq!(unsafe { *(hit_ref.0 as *const u64) }, 0xB1D0_0001);
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let guard_descr = as_fd(&compiled.fail_descrs[0]);
+        let attachments = backend.cpu_handle().read();
+        let bridge = fail_descr_bridge_ref(guard_descr).expect("bridge attached");
+        let parent_outputs =
+            parent_outputs_from_rd_locs(guard_descr.rd_locs(), &[0i64, 77, 77, hit_ref.0 as i64]);
+        let host =
+            CraneliftBackend::execute_bridge(&bridge, &parent_outputs, guard_descr, attachments);
+        assert_eq!(backend.get_int_value(&host, 0), 77);
+        assert_eq!(backend.get_int_value(&host, 1), 77);
+        let host_ref = backend.get_ref_value(&host, 2);
+        assert_eq!(unsafe { *(host_ref.0 as *const u64) }, 0xB1D0_0001);
+    }
+
+    /// Old layout was `max(N, packed) + num_ref_roots` as a tail. Bind +
+    /// hole reuse must be strictly smaller on this 4-ref parent.
+    #[test]
+    fn test_bridge_frame_depth_reuses_bind_and_holes() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let roots: Vec<GcRef> = (0..4).map(|_| gc.alloc_with_type(0, 16)).collect();
+        let mut backend = backend_with_gc(gc);
+        let args = [
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
+            OpRef::input_arg_ref(2),
+            OpRef::input_arg_ref(3),
+        ];
+        let types = vec![Type::Ref, Type::Ref, Type::Ref, Type::Ref];
+        let inputargs: Vec<InputArgRc> = (0..4).map(InputArg::new_ref_rc).collect();
+        let guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(args.iter().copied().map(rb).collect());
+        guard.set_fail_arg_types(types.clone());
+        let loop_ops = vec![guard, mk_op(OpCode::Finish, &args, OpRef::NONE.raw())];
+        let token = JitCellToken::new(9_100_002);
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+        let values: Vec<Value> = roots.iter().copied().map(Value::Ref).collect();
+        let failed = backend.execute_token(&token, &values);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("guard");
+        let rd = guard_descr.rd_locs();
+        let bind_span = rd
+            .iter()
+            .copied()
+            .filter(|&l| l != 0xFFFF)
+            .map(|l| l as usize + 1)
+            .max()
+            .unwrap_or(0);
+        assert!(bind_span > inputargs.len(), "parent refs are tailed homes");
+
+        let finish = mk_op(OpCode::Finish, &args, OpRef::NONE.raw());
+        finish.set_fail_arg_types(types);
+        let bridge_ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(64)], 4),
+            finish,
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .unwrap();
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let old_layout = inputargs.len() + 5; // N + (4 input refs + 1 new)
+        assert!(
+            bridge.frame_depth < old_layout,
+            "bind+reuse depth {} must be < old tail layout {}",
+            bridge.frame_depth,
+            old_layout
+        );
+        assert!(
+            bridge.frame_depth >= bind_span,
+            "depth {} must cover max(bind)+1 = {}",
+            bridge.frame_depth,
+            bind_span
+        );
+    }
+
+    #[test]
+    fn test_bridge_gnf2_force_preserves_int_inputarg_from_slot_0() {
+        let _guard = may_force_test_lock().lock();
+        let mut backend = CraneliftBackend::new();
+        let i0 = OpRef::input_arg_int(0);
+        let loop_inputargs = vec![InputArg::new_int_rc(0)];
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(i0)]);
+        parent_guard.set_fail_arg_types(vec![Type::Int]);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &[i0], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9_100_030);
+        backend
+            .compile_loop(&loop_inputargs, &loop_ops, &token)
+            .unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(77)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+        let rd = guard_descr.rd_locs();
+        assert_eq!(rd[0], 0, "parent int failarg lives in slot 0");
+
+        let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
+        let gnf2 = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        gnf2.setfailargs(smallvec::smallvec![rb(i0)]);
+        gnf2.set_fail_arg_types(vec![Type::Int]);
+        let bridge_ops = vec![
+            mk_op(OpCode::ForceToken, &[], 1),
+            mk_op_with_descr(
+                OpCode::CallMayForceI,
+                &[OpRef::int_op(100), OpRef::ref_op(1), OpRef::const_int(0)],
+                2,
+                descr,
+            ),
+            gnf2,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(
+            100,
+            maybe_force_and_return_int_isolated as *const () as usize as i64,
+        );
+        backend.set_constants(constants);
+        backend
+            .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token, None)
+            .unwrap();
+
+        let returned = backend.execute_token(&token, &[Value::Int(77)]);
+        let force_token = backend.get_ref_value(&returned, 0);
+        let forced = backend.force(force_token).expect("armed force token");
+        assert_eq!(backend.get_int_value(&forced, 0), 77);
+        assert_ne!(backend.get_int_value(&forced, 0), force_token.0 as i64);
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let locs = as_fd(&bridge.fail_descrs[0]).rd_locs();
+        assert!(
+            locs[0] >= 1,
+            "GNF2 must pack the saved int past the FINISH identity slot, got {}",
+            locs[0]
+        );
+    }
+
+    #[test]
+    fn test_bridge_gnf2_force_preserves_ref_inputarg_from_slot_0() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let _guard = may_force_test_lock().lock();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 1 << 20,
+            large_object_threshold: 1 << 20,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let mut backend = backend_with_gc(gc);
+
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(OpRef::ref_op(0))]);
+        parent_guard.set_fail_arg_types(vec![Type::Ref]);
+        let loop_ops = vec![
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 0),
+            parent_guard,
+            mk_op(OpCode::Finish, &[], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9_100_031);
+        backend.compile_loop(&[], &loop_ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+        let rd = guard_descr.rd_locs();
+        assert_eq!(rd[0], 0, "parent Ref failarg lives in slot 0");
+
+        let r0 = OpRef::input_arg_ref(0);
+        let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
+        let gnf2 = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        gnf2.setfailargs(smallvec::smallvec![rb(r0)]);
+        gnf2.set_fail_arg_types(vec![Type::Ref]);
+        let bridge_ops = vec![
+            mk_op(OpCode::ForceToken, &[], 1),
+            mk_op_with_descr(
+                OpCode::CallMayForceI,
+                &[OpRef::int_op(100), OpRef::ref_op(1), OpRef::const_int(0)],
+                2,
+                descr,
+            ),
+            gnf2,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(1)], OpRef::NONE.raw()),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(
+            100,
+            maybe_force_and_return_int_isolated as *const () as usize as i64,
+        );
+        backend.set_constants(constants);
+        backend
+            .compile_bridge(
+                guard_descr,
+                &[InputArg::new_ref_rc(0)],
+                &bridge_ops,
+                &token,
+                None,
+            )
+            .unwrap();
+
+        let returned = backend.execute_token(&token, &[]);
+        let force_token = backend.get_ref_value(&returned, 0);
+        let forced = backend.force(force_token).expect("armed force token");
+        let saved = backend.get_ref_value(&forced, 0);
+        assert!(!saved.is_null());
+        assert_ne!(
+            saved, force_token,
+            "FINISH result must not overwrite the saved Ref"
+        );
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let locs = as_fd(&bridge.fail_descrs[0]).rd_locs();
+        assert!(
+            locs[0] >= 1,
+            "GNF2 Ref home must sit past the FINISH identity slot, got {}",
+            locs[0]
+        );
+        // FINISH identity: empty `rd_locs` means `jf_frame[i]`.
+        assert!(as_fd(&bridge.fail_descrs[1]).rd_locs().is_empty());
+    }
+
+    #[test]
+    fn test_bridge_without_gnf2_still_binds_slot_0() {
+        let mut backend = CraneliftBackend::new();
+        let i0 = OpRef::input_arg_int(0);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(i0)]);
+        parent_guard.set_fail_arg_types(vec![Type::Int]);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &[i0], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9_100_032);
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(77)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+        assert_eq!(guard_descr.rd_locs()[0], 0);
+
+        let finish = mk_op(OpCode::Finish, &[i0], OpRef::NONE.raw());
+        finish.set_fail_arg_types(vec![Type::Int]);
+        backend
+            .compile_bridge(guard_descr, &inputargs, &[finish], &token, None)
+            .unwrap();
+        let hit = backend.execute_token(&token, &[Value::Int(77)]);
+        assert_eq!(backend.get_int_value(&hit, 0), 77);
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        assert_eq!(
+            bridge.frame_depth, 1,
+            "no-GNF2 bridge must still bind slot 0 rather than reserve a fixed area"
+        );
+    }
+
+    /// Bind homes die at the two IntAdds; the later nursery Ref reuses slot 0
+    /// so frame depth is the peak occupancy, not bind-count plus a fresh root.
+    #[test]
+    fn test_bridge_dead_bind_home_reused_by_new_ref() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let mut backend = backend_with_gc(gc);
+        let args = [
+            OpRef::input_arg_int(0),
+            OpRef::input_arg_int(1),
+            OpRef::input_arg_int(2),
+            OpRef::input_arg_int(3),
+        ];
+        let types = vec![Type::Int, Type::Int, Type::Int, Type::Int];
+        let inputargs: Vec<InputArgRc> = (0..4).map(InputArg::new_int_rc).collect();
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(args.iter().copied().map(rb).collect());
+        parent_guard.set_fail_arg_types(types);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &args, OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9_100_040);
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+        let failed = backend.execute_token(
+            &token,
+            &[Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+        );
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+
+        let field = make_field_descr(0, 8, Type::Int, true);
+        let fail = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        fail.setfailargs(smallvec::smallvec![rb(OpRef::ref_op(6))]);
+        fail.set_fail_arg_types(vec![Type::Ref]);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                4,
+            ),
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::input_arg_int(2), OpRef::input_arg_int(3)],
+                5,
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 6),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::ref_op(6), OpRef::const_int(99)],
+                OpRef::NONE.raw(),
+                field,
+            ),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 7),
+            fail,
+            mk_op(OpCode::Finish, &[OpRef::ref_op(6)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .unwrap();
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let locs = as_fd(&bridge.fail_descrs[0]).rd_locs();
+        assert_eq!(
+            locs[0], 0,
+            "new Ref must reuse the dead bind home at slot 0"
+        );
+        assert!(
+            bridge.frame_depth < 5,
+            "peak occupancy depth {} must be < bind-plus-fresh-root 5",
+            bridge.frame_depth
+        );
+
+        let hit = backend.execute_token(
+            &token,
+            &[Value::Int(1), Value::Int(2), Value::Int(3), Value::Int(4)],
+        );
+        let moved = backend.get_ref_value(&hit, 0);
+        assert!(!moved.is_null());
+        assert_eq!(unsafe { *(moved.0 as *const i64) }, 99);
+    }
+
+    /// A dead inputarg's bind home stays reserved for packing. Dense
+    /// failargs skip it (`CALL_ASSEMBLER` getframe / `before_call` still
+    /// hold the frame). The new int takes the next free slot.
+    #[test]
+    fn test_bridge_guard_dense_reuses_dead_inputarg_home() {
+        let mut backend = CraneliftBackend::new();
+        let i0 = OpRef::input_arg_int(0);
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(i0)]);
+        parent_guard.set_fail_arg_types(vec![Type::Int]);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &[i0], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9_100_041);
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(54)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+
+        let fail = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        fail.setfailargs(smallvec::smallvec![rb(OpRef::int_op(1))]);
+        fail.set_fail_arg_types(vec![Type::Int]);
+        let bridge_ops = vec![
+            mk_op(OpCode::IntAdd, &[i0, OpRef::const_int(100)], 1),
+            fail,
+            mk_op(OpCode::Finish, &[OpRef::int_op(1)], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .unwrap();
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let locs = as_fd(&bridge.fail_descrs[0]).rd_locs();
+        assert_eq!(
+            locs[0], 1,
+            "dense failarg skips the ever-assigned bind home"
+        );
+
+        let hit = backend.execute_token(&token, &[Value::Int(54)]);
+        assert_eq!(backend.get_int_value(&hit, 0), 154);
+    }
+
+    /// A box live past GNF2 keeps its bind home; the call result packs around it.
+    #[test]
+    fn test_bridge_gnf2_live_past_box_keeps_home() {
+        let _guard = may_force_test_lock().lock();
+        let mut backend = CraneliftBackend::new();
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let i2 = OpRef::input_arg_int(2);
+        let loop_inputargs = vec![
+            InputArg::new_int_rc(0),
+            InputArg::new_int_rc(1),
+            InputArg::new_int_rc(2),
+        ];
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(i0), rb(i1), rb(i2)]);
+        parent_guard.set_fail_arg_types(vec![Type::Int, Type::Int, Type::Int]);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &[i0, i1, i2], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9_100_042);
+        backend
+            .compile_loop(&loop_inputargs, &loop_ops, &token)
+            .unwrap();
+        let failed =
+            backend.execute_token(&token, &[Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+
+        let descr = make_call_descr(vec![Type::Ref, Type::Int], Type::Int);
+        let gnf2 = mk_op(OpCode::GuardNotForced2, &[], OpRef::NONE.raw());
+        gnf2.setfailargs(smallvec::smallvec![rb(OpRef::int_op(4)), rb(i2)]);
+        gnf2.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        let bridge_ops = vec![
+            mk_op(OpCode::ForceToken, &[], 3),
+            mk_op_with_descr(
+                OpCode::CallMayForceI,
+                &[OpRef::int_op(100), OpRef::ref_op(3), OpRef::const_int(0)],
+                4,
+                descr,
+            ),
+            gnf2,
+            mk_op(OpCode::IntAdd, &[i2, OpRef::const_int(1)], 5),
+            mk_op(OpCode::Finish, &[OpRef::ref_op(3)], OpRef::NONE.raw()),
+        ];
+        let mut constants: indexmap::IndexMap<u32, i64> = indexmap::IndexMap::new();
+        constants.insert(
+            100,
+            maybe_force_and_return_int_isolated as *const () as usize as i64,
+        );
+        backend.set_constants(constants);
+        backend
+            .compile_bridge(guard_descr, &loop_inputargs, &bridge_ops, &token, None)
+            .unwrap();
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let locs = as_fd(&bridge.fail_descrs[0]).rd_locs();
+        assert_eq!(locs[1], 2, "i2 live past GNF2 keeps bind home 2");
+        assert_ne!(locs[0], 2, "call result must not alias i2's home");
+
+        let returned =
+            backend.execute_token(&token, &[Value::Int(10), Value::Int(20), Value::Int(30)]);
+        let force_token = backend.get_ref_value(&returned, 0);
+        let forced = backend.force(force_token).expect("armed force token");
+        assert_eq!(backend.get_int_value(&forced, 0), 42);
+        assert_eq!(backend.get_int_value(&forced, 1), 30);
+    }
+
+    /// A LABEL-bridge loop keeps a pre-label Ref alive across the back edge.
+    #[test]
+    fn test_label_bridge_keeps_pre_label_ref_across_back_edge() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let root = gc.alloc_with_type(0, 16);
+        unsafe {
+            *(root.0 as *mut i64) = 99;
+        }
+        let mut backend = backend_with_gc(gc);
+        let i0 = OpRef::input_arg_int(0);
+        let r0 = OpRef::input_arg_ref(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_ref_rc(1)];
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(i0), rb(r0)]);
+        parent_guard.set_fail_arg_types(vec![Type::Int, Type::Ref]);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &[i0, r0], OpRef::NONE.raw()),
+        ];
+        let token = Arc::new(JitCellToken::new(9_100_043));
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(0), Value::Ref(root)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+
+        let label_t = make_label_descr(9_100_044);
+        bind_target_owner(&label_t, &token);
+        let field = make_field_descr(0, 8, Type::Int, true);
+        let magic_ok = mk_op(OpCode::GuardTrue, &[OpRef::int_op(4)], OpRef::NONE.raw());
+        magic_ok.setfailargs(smallvec::smallvec![rb(i0)]);
+        magic_ok.set_fail_arg_types(vec![Type::Int]);
+        let exit = mk_op(OpCode::GuardTrue, &[OpRef::int_op(7)], OpRef::NONE.raw());
+        exit.setfailargs(smallvec::smallvec![rb(OpRef::int_op(6))]);
+        exit.set_fail_arg_types(vec![Type::Int]);
+        let bridge_ops = vec![
+            mk_op(
+                OpCode::IntAdd,
+                &[OpRef::const_int(0), OpRef::const_int(0)],
+                2,
+            ),
+            mk_op_with_descr(OpCode::Label, &[i0], OpRef::NONE.raw(), label_t.clone()),
+            mk_op_with_descr(OpCode::GetfieldGcI, &[r0], 3, field),
+            mk_op(OpCode::IntEq, &[OpRef::int_op(3), OpRef::const_int(99)], 4),
+            magic_ok,
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 5),
+            mk_op(OpCode::IntAdd, &[i0, OpRef::const_int(1)], 6),
+            mk_op(OpCode::IntLt, &[OpRef::int_op(6), OpRef::const_int(2)], 7),
+            exit,
+            mk_op_with_descr(
+                OpCode::Jump,
+                &[OpRef::int_op(6)],
+                OpRef::NONE.raw(),
+                label_t,
+            ),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .unwrap();
+
+        let hit = backend.execute_token(&token, &[Value::Int(0), Value::Ref(root)]);
+        assert_eq!(
+            backend.get_int_value(&hit, 0),
+            2,
+            "two iterations must keep the pre-label Ref rooted"
+        );
+    }
+
+    /// A LABEL-bridge's identity span is not a free home: a new Ref after a
+    /// dead preamble inputarg takes a slot past `_ll_initial_locs`.
+    #[test]
+    fn test_label_bridge_new_ref_sits_past_identity_slots() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 160,
+            large_object_threshold: 1024,
+            ..GcConfig::default()
+        });
+        gc.register_type(TypeInfo::simple(16));
+        let mut backend = backend_with_gc(gc);
+        let i0 = OpRef::input_arg_int(0);
+        let i1 = OpRef::input_arg_int(1);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let parent_guard = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        parent_guard.setfailargs(smallvec::smallvec![rb(i0), rb(i1)]);
+        parent_guard.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        let loop_ops = vec![
+            parent_guard,
+            mk_op(OpCode::Finish, &[i0, i1], OpRef::NONE.raw()),
+        ];
+        let token = Arc::new(JitCellToken::new(9_100_045));
+        backend.compile_loop(&inputargs, &loop_ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(1), Value::Int(2)]);
+        let guard_descr = get_latest_descr_from_deadframe(&failed).expect("parent guard");
+
+        let label_t = make_label_descr(9_100_046);
+        bind_target_owner(&label_t, &token);
+        let field = make_field_descr(0, 8, Type::Int, true);
+        let fail = mk_op(
+            OpCode::GuardFalse,
+            &[OpRef::const_int(1)],
+            OpRef::NONE.raw(),
+        );
+        fail.setfailargs(smallvec::smallvec![rb(OpRef::ref_op(4))]);
+        fail.set_fail_arg_types(vec![Type::Ref]);
+        let bridge_ops = vec![
+            mk_op(OpCode::IntAdd, &[i0, OpRef::const_int(1)], 2),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(16)], 4),
+            mk_op_with_descr(
+                OpCode::SetfieldGc,
+                &[OpRef::ref_op(4), OpRef::const_int(99)],
+                OpRef::NONE.raw(),
+                field,
+            ),
+            mk_op_with_descr(OpCode::Label, &[i1], OpRef::NONE.raw(), label_t),
+            mk_op(OpCode::CallMallocNursery, &[OpRef::const_int(256)], 5),
+            fail,
+            mk_op(OpCode::Finish, &[i1], OpRef::NONE.raw()),
+        ];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .unwrap();
+
+        let compiled = token
+            .compiled
+            .get()
+            .unwrap()
+            .downcast_ref::<CompiledLoop>()
+            .unwrap();
+        let bridge = fail_descr_bridge_ref(as_fd(&compiled.fail_descrs[0])).expect("bridge");
+        let locs = as_fd(&bridge.fail_descrs[0]).rd_locs();
+        assert!(
+            locs[0] >= 1,
+            "new Ref home {} must sit past LABEL identity slot 0",
+            locs[0]
+        );
+
+        let hit = backend.execute_token(&token, &[Value::Int(1), Value::Int(2)]);
+        let moved = backend.get_ref_value(&hit, 0);
+        assert!(!moved.is_null());
+        assert_eq!(unsafe { *(moved.0 as *const i64) }, 99);
+    }
+
+    /// A collecting op in the bridge body must keep Ref inputargs rooted
+    /// at their bind homes (no compact 0..N map).
+    #[test]
+    fn test_bridge_homed_ref_rooted_across_collect() {
+        let _const_ptr_guard = const_ptr_gc_test_guard();
+        let (backend, token, root) = register_carried_bridge_fixture(0xB1D0_00C1, 9_100_010);
+        let in_code = backend.execute_token(
+            &token,
+            &[Value::Int(42), Value::Ref(root), Value::Float(1.25)],
+        );
+        assert_eq!(backend.get_int_value(&in_code, 0), 42);
+        let moved = backend.get_ref_value(&in_code, 1);
+        assert_ne!(moved, root, "collection must forward the bound Ref");
+        assert_eq!(unsafe { *(moved.0 as *const u64) }, 0xB1D0_00C1);
+        assert_eq!(backend.get_float_value(&in_code, 2), 1.25);
+    }
+
+    /// JUMP re-entry of a LABEL-bridge still reads identity `ITEM0 + i*8`,
+    /// even when the HIT/host path binds inputargs to non-identity homes.
+    #[test]
+    fn test_label_bridge_reentry_reads_identity_slots() {
+        jump_into_bridge_label_preserves_ref_failargs();
+    }
+
+    #[test]
+    fn test_guard_duplicate_box_one_dense_slot() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0)];
+        let guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::input_arg_int(0)),
+        ]);
+        guard.set_fail_arg_types(vec![Type::Int, Type::Int]);
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef::input_arg_int(0)], OpRef::NONE.raw()),
+            guard,
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let token = JitCellToken::new(9019);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("compiled loop");
+        let fd = compiled.fail_descrs[0]
+            .as_fail_descr()
+            .expect("guard descr");
+        let locs = fd.rd_locs();
+        assert_eq!(locs.len(), 2);
+        assert_eq!(locs[0], locs[1]);
+        assert_ne!(locs[0], 0xFFFF);
+
+        let frame = backend.execute_token(&token, &[Value::Int(0)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 1), 0);
+    }
+
+    #[test]
+    fn test_guard_hole_rd_loc_is_ffff() {
+        let mut backend = CraneliftBackend::new();
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let guard_op = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard_op.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::NONE),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        guard_op.set_fail_arg_types(vec![Type::Int, Type::Ref, Type::Int]);
+        let ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            guard_op,
+            mk_op(OpCode::Finish, &[], OpRef::NONE.raw()),
+        ];
+        let token = JitCellToken::new(9020);
+        backend.compile_loop(&inputargs, &ops, &token).unwrap();
+        let compiled = token
+            .compiled
+            .get()
+            .and_then(|c| c.downcast_ref::<CompiledLoop>())
+            .expect("compiled loop");
+        let fd = compiled.fail_descrs[0]
+            .as_fail_descr()
+            .expect("guard descr");
+        let locs = fd.rd_locs();
+        assert_eq!(locs[1], 0xFFFF);
+        assert_eq!(locs[0], locs[2] - 1);
+
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(42)]);
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 2), 42);
+    }
+
+    #[test]
+    fn test_bridge_from_guard_with_hole_reads_packed_values() {
+        let mut backend = CraneliftBackend::new();
+        let tail = make_label_descr(1_500_380);
+        let inputargs = vec![InputArg::new_int_rc(0), InputArg::new_int_rc(1)];
+        let guard = mk_op(
+            OpCode::GuardTrue,
+            &[OpRef::input_arg_int(0)],
+            OpRef::NONE.raw(),
+        );
+        guard.setfailargs(smallvec::smallvec![
+            rb(OpRef::input_arg_int(0)),
+            rb(OpRef::NONE),
+            rb(OpRef::input_arg_int(1)),
+        ]);
+        guard.set_fail_arg_types(vec![Type::Int, Type::Ref, Type::Int]);
+        let root_ops = vec![
+            mk_op(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+            guard,
+            mk_op_with_descr(
+                OpCode::Label,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+                tail.clone(),
+            ),
+            mk_op(
+                OpCode::Finish,
+                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+                OpRef::NONE.raw(),
+            ),
+        ];
+        let token = JitCellToken::new(1_500_381);
+        backend.compile_loop(&inputargs, &root_ops, &token).unwrap();
+        let failed = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
+        let guard_descr =
+            get_latest_descr_from_deadframe(&failed).expect("guard should produce a descr");
+        assert_eq!(guard_descr.rd_locs()[1], 0xFFFF);
+
+        let bridge_ops = vec![mk_op_with_descr(
+            OpCode::Jump,
+            &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
+            OpRef::NONE.raw(),
+            tail,
+        )];
+        backend
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, None)
+            .unwrap();
+        let frame = backend.execute_token(&token, &[Value::Int(0), Value::Int(7)]);
+        let descr = backend.get_latest_descr(&frame);
+        assert!(descr.is_finish());
+        assert_eq!(backend.get_int_value(&frame, 0), 0);
+        assert_eq!(backend.get_int_value(&frame, 1), 7);
     }
 
     #[test]

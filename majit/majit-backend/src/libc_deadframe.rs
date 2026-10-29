@@ -136,11 +136,12 @@ impl LibcJitFrameDeadFrame {
     /// `llmodel.py _decode_pos` — the jitframe slot logical failarg
     /// `index` lives in, or `None` when the descr maps it nowhere.
     ///
-    /// Indices past `rd_locs` fall through to identity slot indexing, which is
-    /// what the synthetic descrs the runner mints rely on. The logical index
-    /// is deliberately decoded before the physical frame bound is checked:
-    /// sparse resume data can have more failarg positions than this fallback
-    /// bound, while a late failarg still maps to a valid live frame slot.
+    /// Indices past `rd_locs` fall through to identity slot indexing: FINISH /
+    /// JUMP / execute_token, and the synthetic descrs the runner mints. Guards
+    /// always stamp the real slot. The logical index is decoded before the
+    /// physical frame bound is checked: sparse resume data can have more
+    /// failarg positions than this fallback bound, while a late failarg still
+    /// maps to a valid live frame slot.
     fn slot_of(&self, index: usize) -> Option<usize> {
         let descr = self.fail_descr.as_fail_descr();
         let locs = descr.rd_locs();

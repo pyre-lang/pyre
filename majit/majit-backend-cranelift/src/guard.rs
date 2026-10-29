@@ -108,6 +108,8 @@ pub struct BridgeData {
     pub num_ref_roots: usize,
     /// Maximum output slots for guard exits within the bridge.
     pub max_output_slots: usize,
+    /// `guaranteed_frame_depth`: `max(bind+1, own needs, baked JUMP target)`.
+    pub frame_depth: usize,
     /// Static terminal-exit layouts within the bridge trace.
     /// Write-once during bridge compilation, read-only after.
     /// No lock needed — RPython ResumeGuardDescr has no lock (GIL).

@@ -997,7 +997,8 @@ fn is_gc_write_barrier_path(segments: &[String]) -> bool {
 
 /// Unary ops `optimize_block` drops as `same_as`.
 ///
-/// `jtransform.py rewrite_op_same_as`, `rewrite_op_cast_bool_to_*` /
+/// `jtransform.py rewrite_op_same_as`, `rewrite_op_cast_pointer` →
+/// `rewrite_op_same_as`, `rewrite_op_cast_bool_to_*` /
 /// `cast_int_to_uint` / `cast_uint_to_int` (explicit no-ops),
 /// `rewrite_op_cast_opaque_ptr`, and the `deref` reborrow (`&mut *p`).
 pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
@@ -1006,6 +1007,7 @@ pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
         "same_as"
             | "deref"
             | "cast_opaque_ptr"
+            | "cast_pointer"
             | "cast_bool_to_int"
             | "cast_bool_to_uint"
             | "cast_int_to_uint"
@@ -1015,10 +1017,12 @@ pub(crate) fn is_same_as_identity_unary(name: &str) -> bool {
 
 /// Call paths `rewrite_op_direct_call` folds to the operand alias, the
 /// same `same_as` drop as [`is_same_as_identity_unary`].
+/// `jtransform.py rewrite_op_cast_pointer` → `rewrite_op_same_as`.
 pub(crate) fn is_same_as_identity_call_path(segments: &[String]) -> bool {
     is_identity_cast_path(segments)
         || is_ptr_from_ref_path(segments)
         || is_lltype_cast_path(segments, "cast_opaque_ptr")
+        || is_lltype_cast_path(segments, "cast_pointer")
         || is_current_gc_ref_path(segments)
 }
 
@@ -3603,21 +3607,140 @@ impl<'a> Transformer<'a> {
         );
     }
 
-    /// `jtransform.py rewrite_op_force_cast`. Same concretetype or GC→GC
-    /// is `same_as`. Otherwise the arg is not GC; int→int (a raw `Ptr`
-    /// counts as int: `rffi.size_and_sign` is `(WORD, unsigned=False)`)
-    /// uses `_int_to_int_cast`, which returns None when dest size is
-    /// `sizeof(Signed)`.
-    fn rewrite_op_force_cast(
-        &self,
+    /// `jtransform.py varoftype(T)` — a fresh Variable stamped with `T`.
+    fn varoftype(
+        &mut self,
+        graph: &mut FunctionGraph,
+        ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> crate::flowspace::model::Variable {
+        let kind = crate::model::getkind(&ty);
+        let var = self.fresh_synthetic_variable_typed(graph, kind);
+        var.set_concretetype(Some(ty));
+        var
+    }
+
+    /// Recurse through `rewrite_operation` for an emitted follow-up.
+    /// `Keep` means the opname is already final (`keep_operation_unchanged`).
+    fn rewrite_emitted(
+        &mut self,
+        op: SpaceOperation,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> Vec<SpaceOperation> {
+        match self.rewrite_operation(&op, graph_name, graph) {
+            RewriteResult::Replace(ops) => ops,
+            RewriteResult::Keep => vec![op],
+            RewriteResult::Identity(_) => {
+                panic!("force_cast follow-up rewrite was Identity")
+            }
+        }
+    }
+
+    fn force_cast_unary(
+        operand: &crate::flowspace::model::Variable,
+        result: &crate::flowspace::model::Variable,
+        op: &str,
+        result_ty: ValueType,
+    ) -> SpaceOperation {
+        SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::UnaryOp {
+                op: op.into(),
+                operand: operand.clone(),
+                result_ty,
+            },
+        }
+    }
+
+    fn force_cast_result_ty(
+        ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> ValueType {
+        match crate::model::getkind(ty) {
+            crate::codewriter::type_state::ConcreteType::Float => ValueType::Float,
+            crate::codewriter::type_state::ConcreteType::GcRef => ValueType::Ref(None),
+            crate::codewriter::type_state::ConcreteType::Void => ValueType::Void,
+            crate::codewriter::type_state::ConcreteType::Signed => ValueType::Int,
+            crate::codewriter::type_state::ConcreteType::Unknown => ValueType::Unknown,
+        }
+    }
+
+    /// Recurse into `rewrite_op_force_cast` for an inner `force_cast`.
+    /// Identity aliases `v_arg` (`jtransform.py`: `if oplist: ... else: v1 = v_arg`).
+    fn rewrite_inner_force_cast(
+        &mut self,
+        v_arg: &crate::flowspace::model::Variable,
+        tmp_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        let v_tmp = self.varoftype(graph, tmp_ty);
+        match self.rewrite_op_force_cast(v_arg, Some(&v_tmp), graph_name, graph) {
+            RewriteResult::Identity(v) => (v, Vec::new()),
+            RewriteResult::Replace(ops) => (v_tmp, ops),
+            RewriteResult::Keep => {
+                panic!("inner force_cast Keep on a stamped intermediate")
+            }
+        }
+    }
+
+    /// Outer `force_cast` after a middle conversion. Identity retargets
+    /// `ops[-1].result` (`jtransform.py rewrite_op_force_cast`).
+    fn apply_outer_force_cast(
+        &mut self,
+        mut ops: Vec<SpaceOperation>,
+        v_tmp: &crate::flowspace::model::Variable,
+        v_result: &crate::flowspace::model::Variable,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        match self.rewrite_op_force_cast(v_tmp, Some(v_result), graph_name, graph) {
+            RewriteResult::Identity(_) => {
+                if let Some(last) = ops.last_mut() {
+                    last.result = Some(v_result.clone());
+                }
+                RewriteResult::Replace(ops)
+            }
+            RewriteResult::Replace(more) => {
+                ops.extend(more);
+                RewriteResult::Replace(ops)
+            }
+            RewriteResult::Keep => {
+                panic!("outer force_cast Keep on a stamped intermediate")
+            }
+        }
+    }
+
+    /// `Transformer.rewrite_op_cast_primitive` delegates to
+    /// `rewrite_op_force_cast`.
+    fn rewrite_op_cast_primitive(
+        &mut self,
         v_arg: &crate::flowspace::model::Variable,
         v_result: Option<&crate::flowspace::model::Variable>,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
     ) -> RewriteResult {
+        self.rewrite_op_force_cast(v_arg, v_result, graph_name, graph)
+    }
+
+    /// `jtransform.py rewrite_op_force_cast`. Same concretetype or GC→GC
+    /// is identity. Otherwise the arg is not GC; int→int / float→float /
+    /// int→float / float→int follow the upstream branch order.
+    fn rewrite_op_force_cast(
+        &mut self,
+        v_arg: &crate::flowspace::model::Variable,
+        v_result: Option<&crate::flowspace::model::Variable>,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
         use crate::translator::rtyper::lltypesystem::rffi;
 
         let src = v_arg.concretetype();
         let dst = v_result.and_then(|r| r.concretetype());
         let (Some(src_ty), Some(dst_ty)) = (src.as_ref(), dst.as_ref()) else {
+            return RewriteResult::Keep;
+        };
+        let Some(v_result) = v_result else {
             return RewriteResult::Keep;
         };
         if src_ty == dst_ty {
@@ -3629,24 +3752,308 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Identity(v_arg.clone());
         }
         assert!(!src_gc, "rewrite_op_force_cast: GC source with non-GC dest");
-        if force_cast_is_float(src_ty) || force_cast_is_float(dst_ty) {
-            return RewriteResult::Keep;
+
+        let float_arg = force_cast_is_float(src_ty);
+        let float_res = force_cast_is_float(dst_ty);
+        if !float_arg && !float_res {
+            return self.int_to_int_cast(v_arg, v_result, graph_name, graph);
         }
-        let (size1, _) =
-            rffi::size_and_sign(src_ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast: {e}"));
-        let (size2, _) =
-            rffi::size_and_sign(dst_ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast: {e}"));
-        let word = crate::layout::target_word_size();
-        // `_int_to_int_cast` after the longlong arms: size1/size2 fit in
-        // Signed; dest LONG/ULONG returns None.
-        assert!(
-            size1 <= word,
-            "rewrite_op_force_cast: source wider than Signed"
-        );
+        if float_arg && float_res {
+            return self.float_to_float_cast(v_arg, v_result);
+        }
+        let size_and_sign = |ty: &LowLevelType, what: &str| {
+            rffi::size_and_sign(ty).unwrap_or_else(|e| panic!("rewrite_op_force_cast {what}: {e}"))
+        };
+        let signed_ss = size_and_sign(&LowLevelType::Signed, "Signed");
+        if !float_arg && float_res {
+            // some int → some float
+            let mut ops = Vec::new();
+            let v2 = self.varoftype(graph, LowLevelType::Float);
+            let sizesign = size_and_sign(src_ty, "src");
+            if sizesign <= signed_ss {
+                // fits in an int: smaller, or equal and not unsigned
+                let (v1, inner) =
+                    self.rewrite_inner_force_cast(v_arg, LowLevelType::Signed, graph_name, graph);
+                ops.extend(inner);
+                // `cast_int_to_float` has no rewrite arm (already final).
+                ops.extend(self.rewrite_emitted(
+                    Self::force_cast_unary(&v1, &v2, "cast_int_to_float", ValueType::Float),
+                    graph_name,
+                    graph,
+                ));
+            } else {
+                let opname = if sizesign == size_and_sign(&LowLevelType::Unsigned, "Unsigned") {
+                    "cast_uint_to_float"
+                } else if sizesign == size_and_sign(&LowLevelType::SignedLongLong, "SignedLongLong")
+                {
+                    "cast_longlong_to_float"
+                } else if sizesign
+                    == size_and_sign(&LowLevelType::UnsignedLongLong, "UnsignedLongLong")
+                {
+                    "cast_ulonglong_to_float"
+                } else {
+                    panic!("cast_x_to_float: {sizesign:?}");
+                };
+                // `cast_uint_to_float` rewrites to a residual helper call;
+                // the longlong names have no rewrite arm (already final).
+                ops.extend(self.rewrite_emitted(
+                    Self::force_cast_unary(v_arg, &v2, opname, ValueType::Float),
+                    graph_name,
+                    graph,
+                ));
+            }
+            return self.apply_outer_force_cast(ops, &v2, v_result, graph_name, graph);
+        }
+        if float_arg && !float_res {
+            // some float → some int
+            let mut ops = Vec::new();
+            let (v1, inner) =
+                self.rewrite_inner_force_cast(v_arg, LowLevelType::Float, graph_name, graph);
+            ops.extend(inner);
+            let sizesign = size_and_sign(dst_ty, "dst");
+            if matches!(dst_ty, LowLevelType::Bool) {
+                // `float_is_true` rewrites to `float_ne` against 0.0.
+                ops.extend(self.rewrite_emitted(
+                    Self::force_cast_unary(&v1, v_result, "float_is_true", ValueType::Int),
+                    graph_name,
+                    graph,
+                ));
+                return RewriteResult::Replace(ops);
+            }
+            if sizesign <= signed_ss {
+                let v2 = self.varoftype(graph, LowLevelType::Signed);
+                // `cast_float_to_int` has no rewrite arm (already final).
+                ops.extend(self.rewrite_emitted(
+                    Self::force_cast_unary(&v1, &v2, "cast_float_to_int", ValueType::Int),
+                    graph_name,
+                    graph,
+                ));
+                return self.apply_outer_force_cast(ops, &v2, v_result, graph_name, graph);
+            }
+            let opname = if sizesign == size_and_sign(&LowLevelType::Unsigned, "Unsigned") {
+                "cast_float_to_uint"
+            } else if sizesign == size_and_sign(&LowLevelType::SignedLongLong, "SignedLongLong") {
+                "cast_float_to_longlong"
+            } else if sizesign == size_and_sign(&LowLevelType::UnsignedLongLong, "UnsignedLongLong")
+            {
+                "cast_float_to_ulonglong"
+            } else {
+                panic!("cast_float_to_x: {sizesign:?}");
+            };
+            // `cast_float_to_uint` rewrites to a residual helper call;
+            // the longlong names have no rewrite arm (already final).
+            ops.extend(self.rewrite_emitted(
+                Self::force_cast_unary(&v1, v_result, opname, Self::force_cast_result_ty(dst_ty)),
+                graph_name,
+                graph,
+            ));
+            return RewriteResult::Replace(ops);
+        }
+        unreachable!("rewrite_op_force_cast: neither int nor float");
+    }
+
+    /// `jtransform.py _int_to_int_cast`.
+    fn int_to_int_cast(
+        &mut self,
+        v_arg: &crate::flowspace::model::Variable,
+        v_result: &crate::flowspace::model::Variable,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+    ) -> RewriteResult {
+        use crate::codewriter::longlong::is_longlong;
+        use crate::flowspace::model::ConstValue;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi;
+
+        let src_ty = v_arg
+            .concretetype()
+            .expect("int_to_int_cast: source has no concretetype");
+        let dst_ty = v_result
+            .concretetype()
+            .expect("int_to_int_cast: dest has no concretetype");
+        let longlong_arg = is_longlong(&src_ty);
+        let longlong_res = is_longlong(&dst_ty);
+        let size_and_sign = |ty: &LowLevelType, what: &str| {
+            rffi::size_and_sign(ty).unwrap_or_else(|e| panic!("int_to_int_cast {what}: {e}"))
+        };
+        let (size1, unsigned1) = size_and_sign(&src_ty, "src");
+        let (size2, unsigned2) = size_and_sign(&dst_ty, "dst");
+
+        if longlong_arg && longlong_res {
+            return RewriteResult::Identity(v_arg.clone());
+        }
+        if longlong_arg {
+            if matches!(dst_ty, LowLevelType::Bool) {
+                let name = if unsigned1 { "ullong_ne" } else { "llong_ne" };
+                let zero = self.varoftype(graph, src_ty.clone());
+                // `llong_ne` / `ullong_ne` have no rewrite arm (already
+                // final here; on 32-bit upstream residualizes via
+                // `OS_LLONG_NE`).
+                let mut ops = vec![SpaceOperation {
+                    result: Some(zero.clone()),
+                    kind: OpKind::ConstInt(0),
+                }];
+                ops.extend(self.rewrite_emitted(
+                    SpaceOperation {
+                        result: Some(v_result.clone()),
+                        kind: OpKind::BinOp {
+                            op: name.into(),
+                            lhs: v_arg.clone(),
+                            rhs: zero,
+                            result_ty: ValueType::Int,
+                        },
+                    },
+                    graph_name,
+                    graph,
+                ));
+                return RewriteResult::Replace(ops);
+            }
+            let v = self.varoftype(graph, LowLevelType::Signed);
+            // `truncate_longlong_to_int` has no rewrite arm (already final).
+            let ops = self.rewrite_emitted(
+                Self::force_cast_unary(v_arg, &v, "truncate_longlong_to_int", ValueType::Int),
+                graph_name,
+                graph,
+            );
+            return self.apply_outer_force_cast(ops, &v, v_result, graph_name, graph);
+        }
+        if longlong_res {
+            let intermediate = if unsigned1 {
+                LowLevelType::Unsigned
+            } else {
+                LowLevelType::Signed
+            };
+            let (v, mut ops) =
+                self.rewrite_inner_force_cast(v_arg, intermediate, graph_name, graph);
+            let opname = match (unsigned1, unsigned2) {
+                (true, true) => "cast_uint_to_ulonglong",
+                (true, false) => "cast_uint_to_longlong",
+                (false, true) => "cast_int_to_ulonglong",
+                (false, false) => "cast_int_to_longlong",
+            };
+            // These `cast_*_to_*longlong` names have no rewrite arm
+            // (already final; on 32-bit upstream residualizes via
+            // `OS_LLONG_FROM_*`).
+            ops.extend(self.rewrite_emitted(
+                Self::force_cast_unary(&v, v_result, opname, Self::force_cast_result_ty(&dst_ty)),
+                graph_name,
+                graph,
+            ));
+            return RewriteResult::Replace(ops);
+        }
+
+        let word = match rffi::sizeof(&LowLevelType::Signed) {
+            Ok(ConstValue::Int(n)) if n >= 0 => n as usize,
+            Ok(other) => panic!("int_to_int_cast sizeof(Signed): expected Int, got {other:?}"),
+            Err(e) => panic!("int_to_int_cast sizeof(Signed): {e}"),
+        };
+        assert!(size1 <= word, "int_to_int_cast: source wider than Signed");
+        assert!(size2 <= word, "int_to_int_cast: dest wider than Signed");
+
+        // Bool dest always needs 0/1 normalization, before the range checks.
+        if matches!(dst_ty, LowLevelType::Bool) {
+            // `int_is_true` is already final (`rewrite_op_int_is_true`
+            // only folds `_we_are_jitted` / `malloc_zero_filled` constants).
+            return RewriteResult::Replace(vec![Self::force_cast_unary(
+                v_arg,
+                v_result,
+                "int_is_true",
+                ValueType::Int,
+            )]);
+        }
+
+        // LONG / ULONG dest
         if size2 == word {
             return RewriteResult::Identity(v_arg.clone());
         }
-        RewriteResult::Keep
+
+        let (min1, max1) = integer_bounds(size1, unsigned1);
+        let (min2, max2) = integer_bounds(size2, unsigned2);
+        if min2 <= min1 && min1 <= max1 && max1 <= max2 {
+            return RewriteResult::Identity(v_arg.clone());
+        }
+
+        if min2 != 0 {
+            let c_bytes = self.varoftype(graph, LowLevelType::Signed);
+            RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: Some(c_bytes.clone()),
+                    kind: OpKind::ConstInt(size2 as i64),
+                },
+                SpaceOperation {
+                    result: Some(v_result.clone()),
+                    kind: OpKind::BinOp {
+                        op: "int_signext".into(),
+                        lhs: v_arg.clone(),
+                        rhs: c_bytes,
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ])
+        } else {
+            let mask = (1_i64 << (8 * size2)) - 1;
+            let c_mask = self.varoftype(graph, LowLevelType::Signed);
+            RewriteResult::Replace(vec![
+                SpaceOperation {
+                    result: Some(c_mask.clone()),
+                    kind: OpKind::ConstInt(mask),
+                },
+                SpaceOperation {
+                    result: Some(v_result.clone()),
+                    kind: OpKind::BinOp {
+                        op: "int_and".into(),
+                        lhs: v_arg.clone(),
+                        rhs: c_mask,
+                        result_ty: ValueType::Int,
+                    },
+                },
+            ])
+        }
+    }
+
+    /// `jtransform.py _float_to_float_cast`.
+    fn float_to_float_cast(
+        &self,
+        v_arg: &crate::flowspace::model::Variable,
+        v_result: &crate::flowspace::model::Variable,
+    ) -> RewriteResult {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+
+        let src = v_arg.concretetype();
+        let dst = v_result.concretetype();
+        if src.as_ref() == Some(&LowLevelType::SingleFloat) {
+            assert_eq!(
+                dst.as_ref(),
+                Some(&LowLevelType::Float),
+                "cast {:?} -> {:?}",
+                src,
+                dst
+            );
+            // `cast_singlefloat_to_float` has no rewrite arm (already final).
+            return RewriteResult::Replace(vec![Self::force_cast_unary(
+                v_arg,
+                v_result,
+                "cast_singlefloat_to_float",
+                ValueType::Float,
+            )]);
+        }
+        if dst.as_ref() == Some(&LowLevelType::SingleFloat) {
+            assert_eq!(
+                src.as_ref(),
+                Some(&LowLevelType::Float),
+                "cast {:?} -> {:?}",
+                src,
+                dst
+            );
+            // `cast_float_to_singlefloat` has no rewrite arm (already final).
+            return RewriteResult::Replace(vec![Self::force_cast_unary(
+                v_arg,
+                v_result,
+                "cast_float_to_singlefloat",
+                ValueType::Int,
+            )]);
+        }
+        RewriteResult::Identity(v_arg.clone())
     }
 
     /// Stamp the synthetic kind from a `ValueType` source, skipping
@@ -4044,7 +4451,16 @@ impl<'a> Transformer<'a> {
                 operand,
                 ..
             } if unop_name == "force_cast" => {
-                self.rewrite_op_force_cast(operand, op.result.as_ref())
+                self.rewrite_op_force_cast(operand, op.result.as_ref(), graph_name, graph)
+            }
+            // `Transformer.rewrite_op_cast_primitive` delegates to
+            // `rewrite_op_force_cast`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "cast_primitive" => {
+                self.rewrite_op_cast_primitive(operand, op.result.as_ref(), graph_name, graph)
             }
             // `rewrite_op_force_cast` / `_int_to_int_cast`: int → raw-pointer
             // is an int→int identity (`history.getkind` of the raw `Ptr`).
@@ -8594,7 +9010,7 @@ impl<'a> Transformer<'a> {
             // so the Call reaches here with one operand.
             if is_rffi_cast_path(segments) && args.len() == 1 {
                 let src = resolve_alias(&args[0], &self.aliases);
-                return self.rewrite_op_force_cast(&src, op.result.as_ref());
+                return self.rewrite_op_force_cast(&src, op.result.as_ref(), graph_name, graph);
             }
             if is_same_as_identity_call_path(segments) && args.len() == 1 {
                 // `rewrite_op_cast_pointer` aliases a same-bank ptr→ptr.
@@ -27857,6 +28273,46 @@ mod tests {
         }
     }
 
+    /// `lltype.cast_pointer` (`rbuiltin.py gen_cast` Ptr→Ptr) folds to
+    /// the operand alias (`jtransform.py rewrite_op_cast_pointer` →
+    /// `rewrite_op_same_as`).
+    #[test]
+    fn lltype_cast_pointer_call_elides_to_operand_alias() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("lltype_cast_pointer");
+        let arg = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result_var = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path([
+            "rpython",
+            "rtyper",
+            "lltypesystem",
+            "lltype",
+            "cast_pointer",
+        ]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result_var),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let rewritten = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            std::slice::from_ref(&arg),
+            &result_ty,
+            "lltype_cast_pointer",
+            &mut graph,
+        );
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            _ => panic!("expected Identity alias to the operand"),
+        }
+    }
+
     /// `ptr::from_ref` is rustc `return r` / rtyper `cast_pointer` /
     /// `rewrite_op_same_as`. The host Call must alias, not residualise.
     #[test]
@@ -28076,6 +28532,19 @@ mod tests {
         match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
             RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
             _ => panic!("expected the explicit opaque cast to alias its operand"),
+        }
+        let recast = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let op = SpaceOperation {
+            result: Some(recast),
+            kind: OpKind::UnaryOp {
+                op: "cast_pointer".into(),
+                operand: ptr.clone(),
+                result_ty: ValueType::Int,
+            },
+        };
+        match transformer.rewrite_operation(&op, "pointer_casts", &mut graph) {
+            RewriteResult::Identity(alias) => assert_eq!(alias, ptr),
+            _ => panic!("expected cast_pointer to alias its operand"),
         }
     }
 
@@ -32049,6 +32518,309 @@ mod tests {
             RewriteResult::Identity(alias) => assert_eq!(alias, arg),
             _ => panic!("expected Identity alias to the operand"),
         }
+    }
+
+    fn rewrite_named_cast(
+        opname: &str,
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> (RewriteResult, crate::flowspace::model::Variable) {
+        use crate::model::getkind;
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new(opname);
+        let arg = graph.alloc_value_var_with_type(getkind(&from));
+        arg.set_concretetype(Some(from));
+        let result = graph.alloc_value_var_with_type(getkind(&to));
+        result.set_concretetype(Some(to.clone()));
+        let result_ty = match getkind(&to) {
+            ConcreteType::Float => ValueType::Float,
+            _ => ValueType::Int,
+        };
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: opname.into(),
+                operand: arg.clone(),
+                result_ty,
+            },
+        };
+        (transformer.rewrite_operation(&op, opname, &mut graph), arg)
+    }
+
+    fn force_cast_replace(
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
+        named_cast_replace("force_cast", from, to)
+    }
+
+    fn force_cast_identity(
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) {
+        named_cast_identity("force_cast", from, to)
+    }
+
+    fn named_cast_replace(
+        opname: &str,
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> (Vec<SpaceOperation>, crate::flowspace::model::Variable) {
+        let (rewritten, arg) = rewrite_named_cast(opname, from, to);
+        match rewritten {
+            RewriteResult::Replace(ops) => (ops, arg),
+            RewriteResult::Identity(_) => panic!("expected Replace, got Identity"),
+            RewriteResult::Keep => panic!("expected Replace, got Keep"),
+        }
+    }
+
+    fn named_cast_identity(
+        opname: &str,
+        from: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+        to: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) {
+        let (rewritten, arg) = rewrite_named_cast(opname, from, to);
+        match rewritten {
+            RewriteResult::Identity(alias) => assert_eq!(alias, arg),
+            RewriteResult::Replace(_) => panic!("expected Identity, got Replace"),
+            RewriteResult::Keep => panic!("expected Identity, got Keep"),
+        }
+    }
+
+    fn ops_unaries(ops: &[SpaceOperation]) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::UnaryOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ops_binops(ops: &[SpaceOperation]) -> Vec<&str> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::BinOp { op, .. } => Some(op.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ops_const_ints(ops: &[SpaceOperation]) -> Vec<i64> {
+        ops.iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::ConstInt(n) => Some(*n),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `test_flatten.py test_force_cast_char_to_bool` / Char→Bool.
+    #[test]
+    fn force_cast_char_to_bool_is_int_is_true() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Char, LowLevelType::Bool);
+        assert_eq!(ops_unaries(&ops), ["int_is_true"]);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Signed→Bool.
+    #[test]
+    fn force_cast_signed_to_bool_is_int_is_true() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Signed, LowLevelType::Bool);
+        assert_eq!(ops_unaries(&ops), ["int_is_true"]);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Bool→Char: range fits.
+    #[test]
+    fn force_cast_bool_to_char_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        force_cast_identity(LowLevelType::Bool, LowLevelType::Char);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Signed→Char: `int_and 255`.
+    #[test]
+    fn force_cast_signed_to_char_is_int_and_255() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Signed, LowLevelType::Char);
+        assert_eq!(ops_binops(&ops), ["int_and"]);
+        assert_eq!(ops_const_ints(&ops), [255]);
+    }
+
+    /// `LowLevelType` has no signed 1-byte/2-byte primitive, so
+    /// `int_signext` has no dest type to unit-test. Unsigned→Char is
+    /// `int_and 255`; Char→Signed is identity (`test_flatten.py`).
+    #[test]
+    fn force_cast_unsigned_to_char_is_int_and_255() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Unsigned, LowLevelType::Char);
+        assert_eq!(ops_binops(&ops), ["int_and"]);
+        assert_eq!(ops_const_ints(&ops), [255]);
+    }
+
+    #[test]
+    fn force_cast_char_to_signed_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        force_cast_identity(LowLevelType::Char, LowLevelType::Signed);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Unsigned→Signed: word dest.
+    #[test]
+    fn force_cast_unsigned_to_signed_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        force_cast_identity(LowLevelType::Unsigned, LowLevelType::Signed);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→SingleFloat.
+    #[test]
+    fn force_cast_float_to_singlefloat() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Float, LowLevelType::SingleFloat);
+        assert_eq!(ops_unaries(&ops), ["cast_float_to_singlefloat"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` SingleFloat→Float.
+    #[test]
+    fn force_cast_singlefloat_to_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::SingleFloat, LowLevelType::Float);
+        assert_eq!(ops_unaries(&ops), ["cast_singlefloat_to_float"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Signed→Float.
+    #[test]
+    fn force_cast_signed_to_float_is_cast_int_to_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Signed, LowLevelType::Float);
+        assert_eq!(ops_unaries(&ops), ["cast_int_to_float"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Unsigned→Float.
+    #[test]
+    fn force_cast_unsigned_to_float_is_cast_uint_to_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Unsigned, LowLevelType::Float);
+        // `rewrite_op_cast_uint_to_float` residualizes to a helper call.
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "Unsigned→Float residualizes cast_uint_to_float; ops={ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, .. } if op == "cast_int_to_float"
+            )),
+            "Unsigned→Float must not use cast_int_to_float; ops={ops:?}"
+        );
+    }
+
+    /// Char→Float: inner Char→Signed is identity (word dest), then
+    /// `cast_int_to_float` (`test_flatten.py` `chr(i)` → Float).
+    #[test]
+    fn force_cast_char_to_float_is_cast_int_to_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Char, LowLevelType::Float);
+        assert_eq!(ops_unaries(&ops), ["cast_int_to_float"]);
+        assert!(ops_binops(&ops).is_empty());
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→Signed.
+    #[test]
+    fn force_cast_float_to_signed_is_cast_float_to_int() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Float, LowLevelType::Signed);
+        assert_eq!(ops_unaries(&ops), ["cast_float_to_int"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→Bool: `float_is_true`
+    /// rewrites to `float_ne`.
+    #[test]
+    fn force_cast_float_to_bool_is_float_is_true() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Float, LowLevelType::Bool);
+        assert_eq!(ops_binops(&ops), ["float_ne"]);
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::ConstFloat(bits) if *bits == 0.0_f64.to_bits()
+        )));
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→Char:
+    /// `cast_float_to_int` then `int_and 255`.
+    #[test]
+    fn force_cast_float_to_char_is_cast_then_int_and() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Float, LowLevelType::Char);
+        assert_eq!(ops_unaries(&ops), ["cast_float_to_int"]);
+        assert_eq!(ops_binops(&ops), ["int_and"]);
+        assert_eq!(ops_const_ints(&ops), [255]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→Unsigned.
+    #[test]
+    fn force_cast_float_to_unsigned_is_cast_float_to_uint() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = force_cast_replace(LowLevelType::Float, LowLevelType::Unsigned);
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "Float→Unsigned residualizes cast_float_to_uint; ops={ops:?}"
+        );
+    }
+
+    /// `rewrite_op_cast_primitive` delegates to `rewrite_op_force_cast`.
+    /// `test_flatten.py test_force_cast_ints` Signed→Char: `int_and 255`.
+    #[test]
+    fn cast_primitive_signed_to_char_is_int_and_255() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) =
+            named_cast_replace("cast_primitive", LowLevelType::Signed, LowLevelType::Char);
+        assert_eq!(ops_binops(&ops), ["int_and"]);
+        assert_eq!(ops_const_ints(&ops), [255]);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Char→Bool: `int_is_true`.
+    #[test]
+    fn cast_primitive_char_to_bool_is_int_is_true() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = named_cast_replace("cast_primitive", LowLevelType::Char, LowLevelType::Bool);
+        assert_eq!(ops_unaries(&ops), ["int_is_true"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` Float→SingleFloat.
+    #[test]
+    fn cast_primitive_float_to_singlefloat() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = named_cast_replace(
+            "cast_primitive",
+            LowLevelType::Float,
+            LowLevelType::SingleFloat,
+        );
+        assert_eq!(ops_unaries(&ops), ["cast_float_to_singlefloat"]);
+    }
+
+    /// `test_flatten.py test_force_cast_floats` SingleFloat→Float.
+    #[test]
+    fn cast_primitive_singlefloat_to_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let (ops, _) = named_cast_replace(
+            "cast_primitive",
+            LowLevelType::SingleFloat,
+            LowLevelType::Float,
+        );
+        assert_eq!(ops_unaries(&ops), ["cast_singlefloat_to_float"]);
+    }
+
+    /// `test_flatten.py test_force_cast_ints` Signed→Unsigned: identity.
+    #[test]
+    fn cast_primitive_signed_to_unsigned_is_identity() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        named_cast_identity(
+            "cast_primitive",
+            LowLevelType::Signed,
+            LowLevelType::Unsigned,
+        );
     }
 
     /// `rffi.cast` Call with RESTYPE dropped by `call_arg_vars` aliases

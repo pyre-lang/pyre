@@ -54,11 +54,10 @@ pub unsafe fn set_latest_descr(ptr: *mut JitFrame, descr: usize) {
 
 #[inline]
 fn decode_rd_loc_slot_from_locs(locs: &[u16], index: usize) -> Option<usize> {
-    // Synthetic descrs never receive `write_failure_recovery_description`,
-    // so the table stays empty and the fail-arg index *is* the slot
-    // (`runner.rs` identity fallback). A stamped table uses `0xFFFF`
-    // for a numbering hole (`optimizeopt` `logical_rd_locs`); resume
-    // reconstructs those through TAGCONST/TAGVIRTUAL, not the jitframe.
+    // Empty table is identity: FINISH outputs, external JUMP inputs, and
+    // execute_token input stores (`_ll_initial_locs` / LABEL loader).
+    // Guards always stamp `rd_locs` (`store_info_on_descr`); `0xFFFF` is a
+    // numbering hole and has no jitframe word.
     if locs.is_empty() {
         return Some(index);
     }

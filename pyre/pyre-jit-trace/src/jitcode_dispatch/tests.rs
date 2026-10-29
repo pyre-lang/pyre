@@ -13510,6 +13510,85 @@ fn cast_float_to_int_folds_a_const_float_without_recording() {
     );
 }
 
+#[test]
+fn cast_float_to_singlefloat_folds_a_const_float_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("cast_float_to_singlefloat/f>i")
+        .expect("`cast_float_to_singlefloat/f>i` must be in insns table");
+    let code = [byte, 0x00, 0x00]; // `f>i`: f-src=0, i-dst=0
+    let mut tc = fresh_trace_ctx();
+    let operand = tc.const_float((1.5f64).to_bits() as i64);
+    let mut regs_f = [operand];
+    let mut regs_i = [OpRef::None];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("cast_float_to_singlefloat on a const float must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const operand folds without recording");
+    assert_eq!(
+        regs_i[0].inline_const_to_value(),
+        Some(majit_ir::Value::Int((1.5f32).to_bits() as i64)),
+        "dst must hold the f32 bit pattern",
+    );
+}
+
+#[test]
+fn cast_singlefloat_to_float_folds_a_const_int_without_recording() {
+    let byte = *insns_opname_to_byte()
+        .get("cast_singlefloat_to_float/i>f")
+        .expect("`cast_singlefloat_to_float/i>f` must be in insns table");
+    let code = [byte, 0x00, 0x00]; // `i>f`: i-src=0, f-dst=0
+    let mut tc = fresh_trace_ctx();
+    let bits = (1.5f32).to_bits() as i64;
+    let operand = tc.const_int(bits);
+    let mut regs_i = [operand];
+    let mut regs_f = [OpRef::None];
+    let (_, next_pc) = run_float_step(&code, &mut tc, &mut regs_f, &mut regs_i)
+        .expect("cast_singlefloat_to_float on a const int must fold");
+    assert_eq!(next_pc, 3);
+    assert_eq!(tc.num_ops(), 0, "a const operand folds without recording");
+    assert_eq!(
+        regs_f[0].inline_const_to_value(),
+        Some(majit_ir::Value::Float(1.5)),
+        "dst must hold the widened f64",
+    );
+}
+
+#[test]
+fn singlefloat_cast_round_trip_folds_1_5_and_rounds_0_1() {
+    let to_sf = *insns_opname_to_byte()
+        .get("cast_float_to_singlefloat/f>i")
+        .expect("`cast_float_to_singlefloat/f>i` must be in insns table");
+    let to_f = *insns_opname_to_byte()
+        .get("cast_singlefloat_to_float/i>f")
+        .expect("`cast_singlefloat_to_float/i>f` must be in insns table");
+
+    for (src, expected) in [(1.5f64, 1.5f64), (0.1f64, 0.1f32 as f64)] {
+        let mut tc = fresh_trace_ctx();
+        let operand = tc.const_float(src.to_bits() as i64);
+        let mut regs_f = [operand];
+        let mut regs_i = [OpRef::None];
+        let code_sf = [to_sf, 0x00, 0x00];
+        run_float_step(&code_sf, &mut tc, &mut regs_f, &mut regs_i)
+            .expect("cast_float_to_singlefloat must fold");
+        let bits = match regs_i[0].inline_const_to_value() {
+            Some(majit_ir::Value::Int(n)) => n,
+            other => panic!("expected folded Int bits, got {other:?}"),
+        };
+        let mut tc2 = fresh_trace_ctx();
+        let operand_i = tc2.const_int(bits);
+        let mut regs_i2 = [operand_i];
+        let mut regs_f2 = [OpRef::None];
+        let code_f = [to_f, 0x00, 0x00];
+        run_float_step(&code_f, &mut tc2, &mut regs_f2, &mut regs_i2)
+            .expect("cast_singlefloat_to_float must fold");
+        assert_eq!(
+            regs_f2[0].inline_const_to_value(),
+            Some(majit_ir::Value::Float(expected)),
+            "round-trip of {src}",
+        );
+    }
+}
+
 /// A result-classified abort is still an abort.  The destination byte records
 /// the unsupported operation's SSA shape; it must not turn that operation into
 /// a no-op whose stale destination can be consumed later.

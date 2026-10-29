@@ -6193,6 +6193,26 @@ impl JitCodeBuilder {
         self.push_u8(dst as u8);
     }
 
+    /// `blackhole.py bhimpl_cast_float_to_singlefloat`. `[src][dst]`,
+    /// float source, int result (f32 bit pattern).
+    pub fn record_cast_float_to_singlefloat(&mut self, dst: u16, src: u16) {
+        self.touch_reg(dst);
+        self.touch_float_reg(src);
+        self.write_insn("cast_float_to_singlefloat/f>i");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
+    /// `blackhole.py bhimpl_cast_singlefloat_to_float`. `[src][dst]`,
+    /// int source (f32 bit pattern), float result.
+    pub fn record_cast_singlefloat_to_float(&mut self, dst: u16, src: u16) {
+        self.touch_float_reg(dst);
+        self.touch_reg(src);
+        self.write_insn("cast_singlefloat_to_float/i>f");
+        self.push_u8(src as u8);
+        self.push_u8(dst as u8);
+    }
+
     /// `cast_ptr_to_int/r>i`. Same bits, ref bank to int bank.
     pub fn record_cast_ptr_to_int(&mut self, dst: u16, src: u16) {
         self.touch_reg(dst);

@@ -221,6 +221,10 @@ where
         table[jitcode::insns::BC_FLOAT_GE as usize] = Self::opimpl_float_ge;
         table[jitcode::insns::BC_CAST_INT_TO_FLOAT as usize] = Self::opimpl_cast_int_to_float;
         table[jitcode::insns::BC_CAST_FLOAT_TO_INT as usize] = Self::opimpl_cast_float_to_int;
+        table[jitcode::insns::BC_CAST_FLOAT_TO_SINGLEFLOAT as usize] =
+            Self::opimpl_cast_float_to_singlefloat;
+        table[jitcode::insns::BC_CAST_SINGLEFLOAT_TO_FLOAT as usize] =
+            Self::opimpl_cast_singlefloat_to_float;
         table[jitcode::insns::BC_CAST_PTR_TO_INT as usize] = Self::opimpl_cast_ptr_to_int;
         table[jitcode::insns::BC_CAST_INT_TO_PTR as usize] = Self::opimpl_cast_int_to_ptr;
         table[jitcode::insns::BC_CONVERT_FLOAT_BYTES_TO_LONGLONG as usize] =
@@ -8605,6 +8609,32 @@ where
         bytecode: u8,
     ) -> TraceAction {
         self.trace_cast_float_to_int(ctx);
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_cast_float_to_singlefloat(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.trace_cast_float_to_singlefloat(ctx);
+        TraceAction::Continue
+    }
+
+    #[inline(never)]
+    #[allow(unused_variables)]
+    fn opimpl_cast_singlefloat_to_float(
+        &mut self,
+        ctx: &mut TraceCtx,
+        sym: &mut S,
+        _runtime: &R,
+        bytecode: u8,
+    ) -> TraceAction {
+        self.trace_cast_singlefloat_to_float(ctx);
         TraceAction::Continue
     }
 

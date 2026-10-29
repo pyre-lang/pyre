@@ -2929,12 +2929,14 @@ pub fn robjmodel_instantiate(
 
 /// `ann_cast_pointer(PtrT, s_p)` (lltype.py): the result of
 /// `cast_pointer(PTRTYPE, ptr)` is annotated from the constant target
-/// type, independent of the operand's annotation.  Pyre's
-/// instance-classed world resolves the constant target class to its
+/// type. A constant `LowLevelType` Ptr first argument is
+/// `cast_pointer(PtrT.const, s_p.ll_ptrtype._defl())`, which raises
+/// through `_cast_to` → `castable` for unrelated types or a gc-status
+/// change; the result is `SomePtr(ll_ptrtype=typeOf(cast_p))`.
+/// Instance-classed world resolves a constant target class to its
 /// unique classdef; the operand's nullability survives the cast (a
-/// downcast of a possibly-null pointer stays possibly-null — upstream
-/// `SomePtr` does not track null, pyre's `SomeInstance.can_be_none`
-/// does).
+/// downcast of a possibly-null pointer stays possibly-null — `SomePtr`
+/// does not track null, pyre's `SomeInstance.can_be_none` does).
 fn lltype_cast_pointer(
     _bk: &Rc<Bookkeeper>,
     args_s: &[Option<SomeValue>],
@@ -2946,6 +2948,31 @@ fn lltype_cast_pointer(
         ));
     }
     let s_clspbc_v = arg_at(args_s, 0, "lltype_cast_pointer");
+    // `ann_cast_pointer(PtrT, s_p)` (lltype.py): a constant LowLevelType
+    // Ptr is `cast_pointer(PtrT.const, s_p.ll_ptrtype._defl())` via
+    // `_cast_to` → `castable`.
+    if let Some(ConstValue::LowLevelType(ll)) = s_clspbc_v.const_() {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr, castable};
+        let LowLevelType::Ptr(ptr_ty) = ll.as_ref() else {
+            return Err(AnnotatorError::new(
+                "cast_pointer() PtrT.const is not a Ptr",
+            ));
+        };
+        let ptrtype = (**ptr_ty).clone();
+        match arg_at(args_s, 1, "lltype_cast_pointer") {
+            SomeValue::Ptr(s_p) => {
+                if let Err(msg) = castable(&ptrtype, &s_p.ll_ptrtype) {
+                    return Err(AnnotatorError::new(msg));
+                }
+                return Ok(SomeValue::Ptr(SomePtr::new(ptrtype)));
+            }
+            other => {
+                return Err(AnnotatorError::new(format!(
+                    "cast_pointer(): casting of non-pointer: {other:?}"
+                )));
+            }
+        }
+    }
     let SomeValue::PBC(s_clspbc) = s_clspbc_v else {
         return Err(AnnotatorError::new(
             "cast_pointer() expected a constant class PBC as first argument",
@@ -2964,8 +2991,28 @@ fn lltype_cast_pointer(
     // must be a pointer carrier.  Pyre's carriers are `SomePtr` and
     // `SomeInstance` (classed cast targets and classdef-less erased
     // pointers); anything else is a non-pointer cast.
+    //
+    // `ann_cast_pointer` → `cast_pointer` → `_cast_to` → `castable` /
+    // `_castdepth` (lltype.py): in the instance-classed world the
+    // first-field struct chain is the classdef hierarchy (rclass
+    // OBJECT inheritance), so the types are related iff one classdef
+    // is a subclass of the other (downcast, upcast, or same).
     let can_be_none = match arg_at(args_s, 1, "lltype_cast_pointer") {
-        SomeValue::Instance(inst) => inst.can_be_none,
+        SomeValue::Instance(inst) => {
+            if let Some(src) = inst.classdef.as_ref() {
+                let related = Rc::ptr_eq(&cdef, src)
+                    || cdef.borrow().issubclass(src)
+                    || src.borrow().issubclass(&cdef);
+                if !related {
+                    return Err(AnnotatorError::new(format!(
+                        "cast_pointer() cannot cast between unrelated types: {:?} -> {:?}",
+                        src.borrow(),
+                        cdef.borrow(),
+                    )));
+                }
+            }
+            inst.can_be_none
+        }
         SomeValue::Ptr(_) => false,
         // A constant-None operand is a null pointer.  Upstream null
         // constants annotate as SomePtr and pass the lltype.py
@@ -4531,6 +4578,122 @@ mod tests {
         }
     }
 
+    fn classdef_as_const_pbc(cdef: &Rc<RefCell<ClassDef>>) -> SomeValue {
+        SomeValue::PBC(crate::annotator::model::SomePBC::new(
+            vec![DescEntry::Class(cdef.borrow().classdesc.clone())],
+            false,
+        ))
+    }
+
+    fn classed_ptr(cdef: &Rc<RefCell<ClassDef>>) -> SomeValue {
+        SomeValue::Instance(SomeInstance::new(
+            Some(cdef.clone()),
+            false,
+            Default::default(),
+        ))
+    }
+
+    /// `ClassDef::new_standalone` hierarchy used by classdesc tests:
+    /// Sub and Sibling both inherit CastBase.
+    fn cast_pointer_class_hierarchy() -> (
+        Rc<RefCell<ClassDef>>,
+        Rc<RefCell<ClassDef>>,
+        Rc<RefCell<ClassDef>>,
+    ) {
+        let base = ClassDef::new_standalone("pkg.CastBase", None);
+        let sub = ClassDef::new_standalone("pkg.CastSub", Some(&base));
+        let sibling = ClassDef::new_standalone("pkg.CastSibling", Some(&base));
+        (base, sub, sibling)
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_accepts_upcast() {
+        // `castable` / `_castdepth`: Sub → Base is an upcast.
+        let (base, sub, _) = cast_pointer_class_hierarchy();
+        let result = lltype_cast_pointer(
+            &bk(),
+            &[Some(classdef_as_const_pbc(&base)), Some(classed_ptr(&sub))],
+            &no_kwds(),
+        )
+        .expect("upcast Sub → Base");
+        match result {
+            SomeValue::Instance(inst) => {
+                let cdef = inst.classdef.expect("target classdef");
+                assert!(
+                    Rc::ptr_eq(&cdef, &base),
+                    "upcast result is the Base classdef"
+                );
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_accepts_downcast() {
+        // `castable` / `_castdepth`: Base → Sub is a downcast.
+        let (base, sub, _) = cast_pointer_class_hierarchy();
+        let result = lltype_cast_pointer(
+            &bk(),
+            &[Some(classdef_as_const_pbc(&sub)), Some(classed_ptr(&base))],
+            &no_kwds(),
+        )
+        .expect("downcast Base → Sub");
+        match result {
+            SomeValue::Instance(inst) => {
+                let cdef = inst.classdef.expect("target classdef");
+                assert!(
+                    Rc::ptr_eq(&cdef, &sub),
+                    "downcast result is the Sub classdef"
+                );
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_accepts_same_class() {
+        // `castable`: CURTYPE == PTRTYPE.
+        let (base, _, _) = cast_pointer_class_hierarchy();
+        let result = lltype_cast_pointer(
+            &bk(),
+            &[Some(classdef_as_const_pbc(&base)), Some(classed_ptr(&base))],
+            &no_kwds(),
+        )
+        .expect("identity Base → Base");
+        match result {
+            SomeValue::Instance(inst) => {
+                let cdef = inst.classdef.expect("target classdef");
+                assert!(Rc::ptr_eq(&cdef, &base), "same-class result is Base");
+            }
+            other => panic!("expected SomeInstance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lltype_cast_pointer_class_pbc_rejects_unrelated_siblings() {
+        // `castable` / `_castdepth`: sibling classdefs share a parent
+        // but are not on each other's first-field chain.
+        let (_, sub, sibling) = cast_pointer_class_hierarchy();
+        let err = lltype_cast_pointer(
+            &bk(),
+            &[
+                Some(classdef_as_const_pbc(&sub)),
+                Some(classed_ptr(&sibling)),
+            ],
+            &no_kwds(),
+        )
+        .expect_err("unrelated sibling classes are not castable");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("cannot cast between unrelated types"),
+            "expected unrelated-types error, got {msg:?}"
+        );
+        assert!(
+            msg.contains("CastSibling") && msg.contains("CastSub"),
+            "error names both classdefs, got {msg:?}"
+        );
+    }
+
     #[test]
     fn lltype_cast_pointer_rejects_non_class_target() {
         // upstream `assert s_CURTYPE.is_constant()` — a non-PBC first
@@ -4583,6 +4746,148 @@ mod tests {
             }
             other => panic!("expected SomeInstance, got {other:?}"),
         }
+    }
+
+    fn const_lltype(
+        ll: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> SomeValue {
+        use crate::flowspace::model::{ConstValue, Constant};
+        let mut s = SomeValue::Type(super::super::model::SomeType::new());
+        s.set_const_box(Constant::new(ConstValue::LowLevelType(Box::new(ll))));
+        s
+    }
+
+    /// Same layout as `lltype.rs` `_castdepth` / `castable` tests: GC
+    /// Struct B whose first field is an inlined Struct A of the same
+    /// gckind.
+    fn related_gc_struct_ptrs() -> (
+        crate::translator::rtyper::lltypesystem::lltype::Ptr,
+        crate::translator::rtyper::lltypesystem::lltype::Ptr,
+    ) {
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+        let a = Struct::gc("A", vec![("x".into(), LowLevelType::Signed)]);
+        let b = Struct::gc(
+            "B",
+            vec![
+                ("head".into(), LowLevelType::Struct(Box::new(a.clone()))),
+                ("y".into(), LowLevelType::Signed),
+            ],
+        );
+        (
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(a))).unwrap(),
+            Ptr::from_container_type(LowLevelType::Struct(Box::new(b))).unwrap(),
+        )
+    }
+
+    #[test]
+    fn lltype_cast_pointer_identity_const_ptr_type() {
+        // `ann_cast_pointer` / `castable`: `cast_pointer(Ptr(S), SomePtr(Ptr(S)))`.
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, SomePtr, Struct};
+
+        let s = Struct::new("S", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr_s = Ptr::from_container_type(LowLevelType::Struct(Box::new(s))).unwrap();
+        let s_ptrt = const_lltype(LowLevelType::Ptr(Box::new(ptr_s.clone())));
+        let s_p = SomeValue::Ptr(SomePtr::new(ptr_s.clone()));
+        let out = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
+            .expect("identity cast_pointer");
+        let SomeValue::Ptr(ptr) = &out else {
+            panic!("expected SomePtr, got {out:?}");
+        };
+        assert_eq!(ptr.ll_ptrtype, ptr_s);
+    }
+
+    #[test]
+    fn lltype_cast_pointer_struct_upcast_and_downcast() {
+        // `castable` / `_castdepth`: Ptr(A) ↔ Ptr(B) when B inlines A.
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+
+        let (ptr_a, ptr_b) = related_gc_struct_ptrs();
+        let s_a = const_lltype(LowLevelType::Ptr(Box::new(ptr_a.clone())));
+        let s_b = const_lltype(LowLevelType::Ptr(Box::new(ptr_b.clone())));
+        let down = lltype_cast_pointer(
+            &bk(),
+            &[
+                Some(s_a.clone()),
+                Some(SomeValue::Ptr(SomePtr::new(ptr_b.clone()))),
+            ],
+            &no_kwds(),
+        )
+        .expect("downcast B → A");
+        let SomeValue::Ptr(down_ptr) = &down else {
+            panic!("expected SomePtr, got {down:?}");
+        };
+        assert_eq!(down_ptr.ll_ptrtype, ptr_a);
+
+        let up = lltype_cast_pointer(
+            &bk(),
+            &[Some(s_b), Some(SomeValue::Ptr(SomePtr::new(ptr_a)))],
+            &no_kwds(),
+        )
+        .expect("upcast A → B");
+        let SomeValue::Ptr(up_ptr) = &up else {
+            panic!("expected SomePtr, got {up:?}");
+        };
+        assert_eq!(up_ptr.ll_ptrtype, ptr_b);
+    }
+
+    #[test]
+    fn lltype_cast_pointer_rejects_unrelated_arrays() {
+        // `castable` rejects CArrayPtr(Signed) ← CCHARP (why MIR recast
+        // uses `rffi.cast`).
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, SomePtr};
+        use crate::translator::rtyper::lltypesystem::rffi::{CArrayPtr, CCHARP};
+
+        let dest = CArrayPtr(LowLevelType::Signed);
+        let s_ptrt = const_lltype(dest);
+        let LowLevelType::Ptr(ccharp) = (*CCHARP).clone() else {
+            panic!("CCHARP is a pointer");
+        };
+        let s_p = SomeValue::Ptr(SomePtr::new(*ccharp));
+        let err = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
+            .expect_err("unrelated array pointers are not castable");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("invalid cast"),
+            "expected castable error, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_rejects_gc_status_change() {
+        // `castable`: GC struct ptr → raw struct ptr.
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, SomePtr, Struct};
+
+        let gc_s = Struct::gc("GcS", vec![("x".into(), LowLevelType::Signed)]);
+        let raw_s = Struct::new("RawS", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr_gc = Ptr::from_container_type(LowLevelType::Struct(Box::new(gc_s))).unwrap();
+        let ptr_raw = Ptr::from_container_type(LowLevelType::Struct(Box::new(raw_s))).unwrap();
+        let s_ptrt = const_lltype(LowLevelType::Ptr(Box::new(ptr_raw)));
+        let s_p = SomeValue::Ptr(SomePtr::new(ptr_gc));
+        let err = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_p)], &no_kwds())
+            .expect_err("gc-status change is not castable");
+        let msg = err.msg.as_deref().unwrap_or("");
+        assert!(
+            msg.contains("cannot change the gc status"),
+            "expected gc-status error, got {msg:?}"
+        );
+    }
+
+    #[test]
+    fn lltype_cast_pointer_const_ptr_rejects_non_pointer_operand() {
+        // `ann_cast_pointer` asserts `isinstance(s_p, SomePtr)`.
+        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, Struct};
+
+        let s = Struct::new("S", vec![("x".into(), LowLevelType::Signed)]);
+        let ptr_s = Ptr::from_container_type(LowLevelType::Struct(Box::new(s))).unwrap();
+        let s_ptrt = const_lltype(LowLevelType::Ptr(Box::new(ptr_s)));
+        let s_int = bk().immutablevalue(&ConstValue::Int(1)).unwrap();
+        let err = lltype_cast_pointer(&bk(), &[Some(s_ptrt), Some(s_int)], &no_kwds()).unwrap_err();
+        assert!(
+            err.msg
+                .as_deref()
+                .unwrap_or("")
+                .contains("casting of non-pointer"),
+        );
     }
 
     #[test]

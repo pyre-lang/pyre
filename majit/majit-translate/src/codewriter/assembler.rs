@@ -7265,6 +7265,120 @@ mod tests {
     }
 
     #[test]
+    fn singlefloat_cast_unaries_keep_the_rpython_llop_name() {
+        let operand = crate::flowspace::model::Variable::new();
+        for (op, result_ty) in [
+            ("cast_float_to_singlefloat", crate::model::ValueType::Int),
+            ("cast_singlefloat_to_float", crate::model::ValueType::Float),
+        ] {
+            let kind = crate::model::OpKind::UnaryOp {
+                op: op.into(),
+                operand: operand.clone(),
+                result_ty,
+            };
+            assert_eq!(op_kind_to_opname(&kind), op);
+        }
+    }
+
+    /// `cast_float_to_singlefloat/f>i` — same encoding as
+    /// `cast_float_to_int/f>i` (`[src][dst]`).
+    #[test]
+    fn encode_cast_float_to_singlefloat_f_i() {
+        use crate::model::{OpKind, SpaceOperation, ValueType};
+
+        let operand = crate::flowspace::model::Variable::new();
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &operand,
+            crate::model::ConcreteType::Float,
+        );
+        let result = crate::flowspace::model::Variable::new();
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::model::ConcreteType::Signed,
+        );
+
+        let mut regallocs = empty_regallocs();
+        let float_ra = regallocs.get_mut(&RegKind::Float).unwrap();
+        float_ra.coloring.insert(operand.clone(), 0);
+        float_ra.num_regs = 1;
+        let int_ra = regallocs.get_mut(&RegKind::Int).unwrap();
+        int_ra.coloring.insert(result.clone(), 0);
+        int_ra.num_regs = 1;
+
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: "cast_float_to_singlefloat".into(),
+                operand,
+                result_ty: ValueType::Int,
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        state.num_regs_f = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "cast_float_to_singlefloat/f>i";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(asm.insns[key], crate::insns::BC_CAST_FLOAT_TO_SINGLEFLOAT);
+        assert_eq!(state.code, vec![asm.insns[key], 0, 0]);
+    }
+
+    /// `cast_singlefloat_to_float/i>f` — same encoding as
+    /// `cast_int_to_float/i>f` (`[src][dst]`).
+    #[test]
+    fn encode_cast_singlefloat_to_float_i_f() {
+        use crate::model::{OpKind, SpaceOperation, ValueType};
+
+        let operand = crate::flowspace::model::Variable::new();
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &operand,
+            crate::model::ConcreteType::Signed,
+        );
+        let result = crate::flowspace::model::Variable::new();
+        crate::model::FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::model::ConcreteType::Float,
+        );
+
+        let mut regallocs = empty_regallocs();
+        let int_ra = regallocs.get_mut(&RegKind::Int).unwrap();
+        int_ra.coloring.insert(operand.clone(), 0);
+        int_ra.num_regs = 1;
+        let float_ra = regallocs.get_mut(&RegKind::Float).unwrap();
+        float_ra.coloring.insert(result.clone(), 0);
+        float_ra.num_regs = 1;
+
+        let op = SpaceOperation {
+            result: Some(result),
+            kind: OpKind::UnaryOp {
+                op: "cast_singlefloat_to_float".into(),
+                operand,
+                result_ty: ValueType::Float,
+            },
+        };
+        let mut asm = Assembler::new();
+        let mut state = empty_state();
+        state.num_regs_i = 1;
+        state.num_regs_f = 1;
+        asm.encode_op(&op, &regallocs, &mut state, None);
+
+        let key = "cast_singlefloat_to_float/i>f";
+        assert!(
+            asm.insns.contains_key(key),
+            "expected {key}, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert_eq!(asm.insns[key], crate::insns::BC_CAST_SINGLEFLOAT_TO_FLOAT);
+        assert_eq!(state.code, vec![asm.insns[key], 0, 0]);
+    }
+
+    #[test]
     fn front_signext_binop_encodes_as_int_signext_ii() {
         use crate::flatten::flatten_graph;
         use crate::model::{FunctionGraph, OpKind, ValueType};

@@ -852,12 +852,9 @@ fn transduce_op(
         }
         // Word-sized integer casts are identity at JitCode level
         // (`getkind(Signed) == getkind(Unsigned) == getkind(Char) == 'int'`).
-        // `Transformer.rewrite_op_cast_primitive` delegates to
-        // `rewrite_op_force_cast`, whose `_int_to_int_cast` returns `None`
-        // for these same-width cases; the named char cast is also an explicit
-        // no-op method.  Route all of them through the rich graph's
-        // `same_as`, which the shared jtransform tail drops while installing
-        // the result→operand alias.
+        // The named char/bool/uint casts are explicit no-op methods.
+        // Route them through the rich graph's `same_as`, which the shared
+        // jtransform tail drops while installing the result→operand alias.
         name @ ("cast_bool_to_int"
         | "cast_bool_to_uint"
         | "cast_char_to_int"
@@ -865,35 +862,10 @@ fn transduce_op(
         | "cast_int_to_char"
         | "cast_int_to_unichar"
         | "cast_int_to_uint"
-        | "cast_uint_to_int"
-        | "cast_primitive") => {
+        | "cast_uint_to_int") => {
             let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
-            if name == "cast_primitive" {
-                let word_int = |ty: Option<&LowLevelType>| {
-                    matches!(ty, Some(LowLevelType::Signed | LowLevelType::Unsigned))
-                };
-                let wide_int = |ty: Option<&LowLevelType>| {
-                    matches!(
-                        ty,
-                        Some(
-                            LowLevelType::SignedLongLong
-                                | LowLevelType::UnsignedLongLong
-                                | LowLevelType::SignedLongLongLong
-                                | LowLevelType::UnsignedLongLongLong
-                        )
-                    )
-                };
-                let src = operand.concretetype();
-                let dst = result.concretetype();
-                assert!(
-                    (word_int(src.as_ref()) && word_int(dst.as_ref()))
-                        || wide_int(src.as_ref())
-                        || wide_int(dst.as_ref()),
-                    "jtransform_opname::lower_graph: cast_primitive is only ported for word-sized \
-                     Signed/Unsigned or a longlong widen"
-                );
-            }
+            let _ = name;
             let result_ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
@@ -1074,17 +1046,20 @@ fn transduce_op(
         }
         // `jtransform.py Transformer.rewrite_op_debug_assert` returns [].
         "debug_assert" => {}
-        // `ForceCastEntry` (`ll2ctypes.py`) emits `force_cast`. The rich
-        // graph keeps the opname so `Transformer.rewrite_op_force_cast`
-        // can alias same-size raw ptr/int.
-        "force_cast" => {
+        // `ForceCastEntry` (`ll2ctypes.py`) emits `force_cast`.
+        // `Transformer.rewrite_op_cast_primitive` delegates to
+        // `rewrite_op_force_cast`. The rich graph keeps the original
+        // opname (`name.to_string()`) so `rewrite_operation` can
+        // dispatch it; a typed cast never survives that rewrite
+        // (assembler `int_force_cast` would be unsupported).
+        name @ ("force_cast" | "cast_primitive") => {
             let operand = materialize(out, block, &op.args[0]);
             let result = expect_var(&op.result);
             let result_ty = value_type_of(&result);
             out.push_op_with_result_var(
                 block,
                 OpKind::UnaryOp {
-                    op: "force_cast".to_string(),
+                    op: name.to_string(),
                     operand,
                     result_ty,
                 },
@@ -2350,7 +2325,7 @@ mod tests {
             vec![
                 "int_neg",
                 "int_force_ge_zero",
-                "same_as",
+                "cast_primitive",
                 "same_as",
                 "int_is_true"
             ]

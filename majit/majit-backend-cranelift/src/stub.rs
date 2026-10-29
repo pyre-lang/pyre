@@ -37,11 +37,16 @@ fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
 /// aarch64: `assembler.py patch_trace` overwrites the stub, but with `B`
 /// rather than `BL` — see the module comment.
 pub(crate) fn encode_redirect_branch(at: usize, target: usize) -> [u8; STUB_SIZE] {
+    encode_redirect_branch_kind(at, target, false)
+}
+
+fn encode_redirect_branch_kind(at: usize, target: usize, force_far: bool) -> [u8; STUB_SIZE] {
     let mut bytes = [0u8; STUB_SIZE];
     #[cfg(target_arch = "x86_64")]
     {
         let offset = target as isize - (at as isize + 5);
-        if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
+        let near = !force_far && offset >= i32::MIN as isize && offset <= i32::MAX as isize;
+        if near {
             bytes[0] = 0xE9;
             bytes[1..5].copy_from_slice(&(offset as i32).to_le_bytes());
         } else {
@@ -61,7 +66,8 @@ pub(crate) fn encode_redirect_branch(at: usize, target: usize) -> [u8; STUB_SIZE
         );
         let offset = target as isize - at as isize;
         const B_REACH: isize = 1 << 27;
-        let words: [u32; 5] = if (-B_REACH..B_REACH).contains(&offset) {
+        let near = !force_far && (-B_REACH..B_REACH).contains(&offset);
+        let words: [u32; 5] = if near {
             let imm26 = ((offset >> 2) & 0x03FF_FFFF) as u32;
             [
                 0x1400_0000 | imm26,
@@ -88,7 +94,7 @@ pub(crate) fn encode_redirect_branch(at: usize, target: usize) -> [u8; STUB_SIZE
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        let _ = (at, target);
+        let _ = (at, target, force_far);
         panic!("guard-stub patching is implemented for x86_64 and aarch64");
     }
     bytes
@@ -98,6 +104,99 @@ pub(crate) fn encode_redirect_branch(at: usize, target: usize) -> [u8; STUB_SIZE
 /// bytes.
 pub(crate) fn write_redirect_branch(at: usize, target: usize) {
     let bytes = encode_redirect_branch(at, target);
+    with_writable(at as *mut u8, STUB_SIZE, || unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, STUB_SIZE);
+    });
+}
+
+/// `x86/callbuilder.py follow_jump`: if `addr` starts with another jump,
+/// step to that target and repeat. x86 walks `JMP rel32` (`E9`); aarch64
+/// walks an unlinked `B` (`0x14`). A far veneer (x86 `MOV r11` / aarch64
+/// `MOVZ x16`) stops the walk, matching `follow_jump` ignoring anything
+/// but `E9`.
+pub(crate) fn follow_jump(mut addr: usize) -> usize {
+    loop {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let byte = unsafe { (addr as *const u8).read() };
+            if byte != 0xE9 {
+                return addr;
+            }
+            let rel = unsafe { (addr as *const u8).add(1).cast::<i32>().read_unaligned() };
+            addr = addr.wrapping_add(5).wrapping_add(rel as i64 as usize);
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let word = unsafe { (addr as *const u32).read() };
+            if word & 0xFC00_0000 != 0x1400_0000 {
+                return addr;
+            }
+            let imm26 = word & 0x03FF_FFFF;
+            let offset = ((imm26 as i32) << 6) >> 6 << 2;
+            addr = (addr as isize).wrapping_add(offset as isize) as usize;
+        }
+        #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+        {
+            return addr;
+        }
+    }
+}
+
+/// Bytes a `redirect_call_assembler` overlay occupies.
+///
+/// `x86/assembler.py redirect_call_assembler` asserts `get_relative_pos() == 5`
+/// (32-bit) or `<= 13` (64-bit). `aarch64/assembler.py redirect_call_assembler`
+/// writes one `B` (4 bytes) or a far veneer. Guard trampolines pad to
+/// [`STUB_SIZE`]; a live loop entry must not be NOP-padded.
+pub(crate) fn entry_redirect_len(at: usize, target: usize) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    {
+        let offset = target as isize - (at as isize + 5);
+        if offset >= i32::MIN as isize && offset <= i32::MAX as isize {
+            5
+        } else {
+            13
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let offset = target as isize - at as isize;
+        const B_REACH: isize = 1 << 27;
+        if (-B_REACH..B_REACH).contains(&offset) {
+            4
+        } else {
+            STUB_SIZE
+        }
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        let _ = (at, target);
+        STUB_SIZE
+    }
+}
+
+/// `x86/assembler.py redirect_call_assembler` `mc.copy_to_raw_memory(oldadr)`.
+///
+/// Overlay a JMP/B at a compiled loop entry. Writes only
+/// [`entry_redirect_len`] bytes so the rest of the live prologue is left
+/// intact for threads already past the first instruction.
+pub(crate) fn write_entry_redirect(at: usize, target: usize) {
+    let bytes = encode_redirect_branch(at, target);
+    let len = entry_redirect_len(at, target);
+    with_writable(at as *mut u8, len, || unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, len);
+    });
+}
+
+/// Fill a CALL_ASSEMBLER / `execute_token` door with a jump to the Tail body.
+///
+/// Uses the far veneer so [`follow_jump`] does not walk this hop. A near
+/// [`write_entry_redirect`] to the body would make `follow_jump(stub)` skip
+/// the overlay site, and an A→B then B→C redirect would leave A's stub
+/// jumping at B's body. `x86/assembler.py redirect_call_assembler` overlays
+/// at `_call_header`, which is not itself a JMP.
+pub(crate) fn write_call_header_stub(at: usize, body: usize) {
+    let bytes = encode_redirect_branch_kind(at, body, true);
     with_writable(at as *mut u8, STUB_SIZE, || unsafe {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, STUB_SIZE);
     });
@@ -140,6 +239,55 @@ pub(crate) fn patch_jump_for_descr(descr: &dyn FailDescr, adr_new_target: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn follow_jump_walks_a_near_jump_chain() {
+        let mut buf = vec![0u8; 64];
+        let at = buf.as_mut_ptr() as usize;
+        let mid = at + 16;
+        let end = at + 32;
+        let first = encode_redirect_branch(at, mid);
+        let first_len = entry_redirect_len(at, mid);
+        unsafe {
+            std::ptr::copy_nonoverlapping(first.as_ptr(), at as *mut u8, first_len);
+        }
+        let second = encode_redirect_branch(mid, end);
+        let second_len = entry_redirect_len(mid, end);
+        unsafe {
+            std::ptr::copy_nonoverlapping(second.as_ptr(), mid as *mut u8, second_len);
+        }
+        assert_eq!(follow_jump(at), end);
+        assert_eq!(follow_jump(end), end);
+    }
+
+    #[test]
+    fn entry_redirect_len_matches_jump_encoding() {
+        let at = 0x1000usize;
+        let near = 0x1100usize;
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(entry_redirect_len(at, near), 5);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(entry_redirect_len(at, near), 4);
+        let far = at.wrapping_add(1usize << 40);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(entry_redirect_len(at, far), 13);
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(entry_redirect_len(at, far), STUB_SIZE);
+    }
+
+    #[test]
+    fn follow_jump_stops_at_a_call_header_far_veneer() {
+        let mut buf = vec![0u8; 80];
+        let raw = buf.as_mut_ptr() as usize;
+        let at = (raw + 15) & !0b11;
+        assert!(at + STUB_SIZE <= raw + buf.len());
+        let body = at + 32;
+        let bytes = encode_redirect_branch_kind(at, body, true);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, STUB_SIZE);
+        }
+        assert_eq!(follow_jump(at), at);
+    }
 
     #[test]
     fn near_redirect_encodes_a_direct_jump() {

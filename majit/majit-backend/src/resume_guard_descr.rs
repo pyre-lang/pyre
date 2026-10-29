@@ -69,18 +69,17 @@ use crate::rd_payload::RdPayload;
 // `make_a_counter_per_value` (`regalloc.py consider_guard_value`) records a
 // register or frame position of the trace that failed:
 //
-//   * dynasm and wasm record a DEADFRAME slot.  Only the caller still holding
-//     the deadframe can read it, so it does so with
-//     `Backend::get_value_direct` and hands the result to
-//     `must_compile_with_values` as `guard_value_operand`.  Wasm uses a dense
-//     exit-value area, but parks an operand absent from the fail arguments in
-//     one trailing `counter_value_spill` slot.  When the operand is present it
-//     is authoritative; nothing indexes `fail_values` with the slot.
-//   * cranelift records a FAIL-ARGUMENT position, because its slot space is the
-//     dense fail-argument vector.  Its raw entry resolves the index the way the
-//     deadframe's `get_value_direct` does (through `rd_locs`, else the raw frame
-//     slot) and hands the result over as `guard_value_operand`, because the
-//     jitdriver run loop calls `must_compile` with no fail values.
+//   * dynasm and cranelift record a DEADFRAME slot.  Only the caller still
+//     holding the deadframe can read it, so it does so with
+//     `Backend::get_value_direct` (`llmodel.py get_int_value_direct`) and hands
+//     the result to `must_compile_with_values` as `guard_value_operand`.
+//     Cranelift stamps `fail_locs[k]` after `resolve_fail_locs_and_stamp` when
+//     the operand is failarg k, else the trace-wide spill slot.
+//   * wasm stamps a logical fail-argument index and reads it through
+//     `get_int_value` / fail_locs.  It parks an operand absent from the fail
+//     arguments in one trailing `counter_value_spill` slot.  When the operand
+//     is present it is authoritative; nothing indexes `fail_values` with the
+//     slot.
 pub const STATUS_BUSY_FLAG: u64 = 0x01;
 pub const STATUS_TYPE_MASK: u64 = 0x06;
 pub const STATUS_SHIFT: u32 = 3;
@@ -96,9 +95,8 @@ pub const STATUS_TY_FLOAT: u64 = 0x06;
 /// early `return False` (`compile.py must_compile`).
 ///
 /// The slot is only meaningful to the backend that recorded it — see the
-/// status-layout note above: dynasm and wasm read it as a deadframe slot
-/// (through `get_value_direct`), while cranelift resolves the same index out of
-/// the fail-argument vector.
+/// status-layout note above: dynasm and cranelift read it as a deadframe slot
+/// (through `get_value_direct`); wasm reads a logical fail-argument index.
 pub fn guard_value_counter_slot(descr: &dyn FailDescr) -> Option<usize> {
     let status = descr.get_status();
     if status & STATUS_TYPE_MASK == 0 || status & STATUS_BUSY_FLAG != 0 {

@@ -38,6 +38,63 @@ pub fn target_word_size() -> usize {
     })
 }
 
+fn host_target_env() -> &'static str {
+    if cfg!(target_env = "msvc") {
+        "msvc"
+    } else if cfg!(target_env = "gnu") {
+        "gnu"
+    } else if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "sgx") {
+        "sgx"
+    } else if cfg!(target_env = "uclibc") {
+        "uclibc"
+    } else if cfg!(target_env = "newlib") {
+        "newlib"
+    } else {
+        ""
+    }
+}
+
+/// OS the layout model describes — cargo's `CARGO_CFG_TARGET_OS`.
+/// Host `std::env::consts::OS` when unset. Same channel as
+/// [`target_word_size`].
+pub fn target_os() -> &'static str {
+    static OS: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    OS.get_or_init(|| {
+        std::env::var("CARGO_CFG_TARGET_OS")
+            .ok()
+            .filter(|os| !os.is_empty())
+            .unwrap_or_else(|| std::env::consts::OS.to_string())
+    })
+    .as_str()
+}
+
+/// Arch the layout model describes — cargo's `CARGO_CFG_TARGET_ARCH`.
+/// Host `std::env::consts::ARCH` when unset. Same channel as
+/// [`target_word_size`].
+pub fn target_arch() -> &'static str {
+    static ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ARCH.get_or_init(|| {
+        std::env::var("CARGO_CFG_TARGET_ARCH")
+            .ok()
+            .filter(|arch| !arch.is_empty())
+            .unwrap_or_else(|| std::env::consts::ARCH.to_string())
+    })
+    .as_str()
+}
+
+/// Env the layout model describes — cargo's `CARGO_CFG_TARGET_ENV`
+/// (empty on macOS / wasm32). Host `cfg!(target_env)` when unset.
+/// Same channel as [`target_word_size`].
+pub fn target_env() -> &'static str {
+    static ENV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_else(|_| host_target_env().to_string())
+    })
+    .as_str()
+}
+
 /// Whether `target` is a real cross target — non-empty and distinct from the
 /// build `host` — so its layout sidecars apply. Native builds share the host's
 /// struct layouts and need no sidecar.

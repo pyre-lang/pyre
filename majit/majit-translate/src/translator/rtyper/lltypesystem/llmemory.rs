@@ -4,7 +4,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 use crate::annotator::model::{KnownType, SomeObject, SomeObjectTrait, SomeValue};
 use crate::flowspace::model::ConstValue;
@@ -799,18 +799,94 @@ pub fn array_type_match(a1: &LowLevelType, a2: &LowLevelType) -> bool {
 /// Word size (length-field width / pointer width).
 const WORD: i64 = std::mem::size_of::<usize>() as i64;
 
-/// `ctypes.sizeof(ctypes.c_longdouble)` (ll2ctypes.py:151) — the
-/// `long double` width is target-C-ABI-derived, not fixed: 16 on the
-/// x86-64 SysV (80-bit extended) and AArch64 AAPCS64 (128-bit quad)
-/// ABIs, but 8 where `long double == double` (Apple AArch64). Resolved
-/// from the build target — for the in-process JIT the build target is
-/// the execution target, the same coupling RPython gets from `ctypes`.
-pub(crate) const SIZEOF_LONGFLOAT: i64 = if cfg!(all(target_arch = "aarch64", target_os = "macos"))
-{
-    8
-} else {
-    16
-};
+/// C ABI `sizeof(wchar_t)` from a cargo target triple.
+///
+/// Windows is 2; Linux / macOS / wasm32 clang are 4 (`r_wchar_t.BITS/8`,
+/// `ll2ctypes` `sizeof(c_wchar)`).
+pub(crate) fn sizeof_wchar_t_for(os: &str, _arch: &str, _env: &str) -> i64 {
+    if os == "windows" { 2 } else { 4 }
+}
+
+/// Target `wchar_t` width in bytes. Reads cargo's `CARGO_CFG_TARGET_OS`
+/// through [`crate::layout::target_os`] (same channel as
+/// `layout::target_word_size`); host `cfg!` when unset.
+pub(crate) fn sizeof_wchar_t() -> i64 {
+    static SIZE: OnceLock<i64> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        sizeof_wchar_t_for(
+            crate::layout::target_os(),
+            crate::layout::target_arch(),
+            crate::layout::target_env(),
+        )
+    })
+}
+
+/// C ABI `sizeof(long double)` from a cargo target triple.
+///
+/// Upstream `rffi.py sizeof` / `sizeof_c_type("long double")` probes the
+/// C compiler. This table stands in for that probe using clang TargetInfo
+/// `LongDoubleWidth` (bytes). Unknown triples fall back to the host
+/// `cfg!` width.
+pub(crate) fn sizeof_longfloat_for(os: &str, arch: &str, env: &str) -> i64 {
+    longfloat_width_bytes(os, arch, env).unwrap_or_else(|| {
+        let host_env = if cfg!(target_env = "msvc") {
+            "msvc"
+        } else {
+            ""
+        };
+        longfloat_width_bytes(std::env::consts::OS, std::env::consts::ARCH, host_env).unwrap_or(16)
+    })
+}
+
+fn longfloat_width_bytes(os: &str, arch: &str, env: &str) -> Option<i64> {
+    Some(match arch {
+        "x86" => {
+            if env == "msvc" {
+                8
+            } else if matches!(os, "macos" | "ios") {
+                16
+            } else if os == "android" {
+                8
+            } else {
+                // Linux, BSDs, MinGW
+                12
+            }
+        }
+        "x86_64" => {
+            if env == "msvc" {
+                8
+            } else {
+                16
+            }
+        }
+        "aarch64" => {
+            if matches!(os, "macos" | "ios" | "tvos" | "watchos" | "windows") {
+                8
+            } else {
+                16
+            }
+        }
+        "arm" | "mips" => 8,
+        "wasm32" | "wasm64" | "riscv32" | "riscv64" | "powerpc64" | "s390x" | "mips64"
+        | "loongarch64" => 16,
+        _ => return None,
+    })
+}
+
+/// Target `long double` width in bytes. Reads cargo's
+/// `CARGO_CFG_TARGET_{OS,ARCH,ENV}` through [`crate::layout::target_os`]
+/// / `target_arch` / `target_env` (same channel as
+/// `layout::target_word_size`); host `cfg!` when unset.
+pub(crate) fn sizeof_longfloat() -> i64 {
+    static SIZE: OnceLock<i64> = OnceLock::new();
+    *SIZE.get_or_init(|| {
+        sizeof_longfloat_for(
+            crate::layout::target_os(),
+            crate::layout::target_arch(),
+            crate::layout::target_env(),
+        )
+    })
+}
 
 /// Resolver for the layout-dependent symbolic offsets, mirroring
 /// `rpython/jit/backend/llsupport/symbolic.py`. The codewriter owns the
@@ -839,8 +915,9 @@ pub trait OffsetLayout {
 /// `Unsigned` / `Address` are the target word (`word`, from
 /// [`OffsetLayout::word_bytes`]). `long long` and `double` stay 8 on
 /// every target this codewriter emits; the host `usize` is not their
-/// width. `UniChar` is the 4-byte UCS-4 codepoint; `LongFloat` is the
-/// target-derived `long double` width ([`SIZEOF_LONGFLOAT`]).
+/// width. `UniChar` is [`sizeof_wchar_t`] (`r_wchar_t.BITS/8`);
+/// `LongFloat` is the target-derived `long double` width
+/// ([`sizeof_longfloat`]).
 fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
     match ty {
         LowLevelType::Signed | LowLevelType::Unsigned | LowLevelType::Address => Ok(word),
@@ -850,8 +927,9 @@ fn primitive_byte_size(ty: &LowLevelType, word: i64) -> Result<i64, String> {
         // `r_longlonglong` / `r_ulonglonglong` are 128-bit on every target
         // that defines them, so 16 is stable; `long double` is not.
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Ok(16),
-        LowLevelType::LongFloat => Ok(SIZEOF_LONGFLOAT),
-        LowLevelType::SingleFloat | LowLevelType::UniChar => Ok(4),
+        LowLevelType::LongFloat => Ok(sizeof_longfloat()),
+        LowLevelType::SingleFloat => Ok(4),
+        LowLevelType::UniChar => Ok(sizeof_wchar_t()),
         LowLevelType::Bool | LowLevelType::Char => Ok(1),
         other => Err(format!("no primitive byte size for {other:?}")),
     }
@@ -1522,6 +1600,10 @@ mod tests {
     fn byte_size_resolves_primitives_and_sums_composites() {
         assert_eq!(item(LowLevelType::Signed, 3).byte_size(&NoLayout), Ok(24));
         assert_eq!(item(LowLevelType::Char, 4).byte_size(&NoLayout), Ok(4));
+        assert_eq!(
+            item(LowLevelType::UniChar, 1).byte_size(&NoLayout),
+            Ok(sizeof_wchar_t())
+        );
         let composite = composite(vec![
             item(LowLevelType::Signed, 1),
             item(LowLevelType::Char, 2),
@@ -1815,5 +1897,47 @@ mod tests {
             item(item_ty.clone(), 1).r#ref(&item0).unwrap()
         };
         assert_eq!(end_ptr()._obj().unwrap(), end_ptr()._obj().unwrap());
+    }
+
+    #[test]
+    fn sizeof_wchar_t_for_windows_is_2_else_4() {
+        assert_eq!(sizeof_wchar_t_for("windows", "x86_64", "msvc"), 2);
+        assert_eq!(sizeof_wchar_t_for("windows", "aarch64", "msvc"), 2);
+        assert_eq!(sizeof_wchar_t_for("linux", "x86_64", "gnu"), 4);
+        assert_eq!(sizeof_wchar_t_for("macos", "aarch64", ""), 4);
+        assert_eq!(sizeof_wchar_t_for("unknown", "wasm32", ""), 4);
+    }
+
+    #[test]
+    fn sizeof_longfloat_for_follows_c_abi_table() {
+        // 8: MSVC; Apple aarch64; AAPCS32 arm; Android x86
+        assert_eq!(sizeof_longfloat_for("windows", "x86_64", "msvc"), 8);
+        assert_eq!(sizeof_longfloat_for("windows", "aarch64", "msvc"), 8);
+        assert_eq!(sizeof_longfloat_for("macos", "aarch64", ""), 8);
+        assert_eq!(sizeof_longfloat_for("ios", "aarch64", ""), 8);
+        assert_eq!(sizeof_longfloat_for("linux", "arm", "gnu"), 8);
+        assert_eq!(sizeof_longfloat_for("android", "x86", "gnu"), 8);
+        // 12: SysV x86 (Linux, BSDs, MinGW)
+        assert_eq!(sizeof_longfloat_for("linux", "x86", "gnu"), 12);
+        assert_eq!(sizeof_longfloat_for("windows", "x86", "gnu"), 12);
+        // 16: i386 Darwin; x86_64 non-msvc; aarch64 non-Apple/Windows; wasm; …
+        assert_eq!(sizeof_longfloat_for("macos", "x86", ""), 16);
+        assert_eq!(sizeof_longfloat_for("linux", "x86_64", "gnu"), 16);
+        assert_eq!(sizeof_longfloat_for("windows", "x86_64", "gnu"), 16);
+        assert_eq!(sizeof_longfloat_for("macos", "x86_64", ""), 16);
+        assert_eq!(sizeof_longfloat_for("linux", "aarch64", "gnu"), 16);
+        assert_eq!(sizeof_longfloat_for("unknown", "wasm32", ""), 16);
+        assert_eq!(sizeof_longfloat_for("linux", "riscv64", "gnu"), 16);
+        assert_eq!(sizeof_longfloat_for("linux", "powerpc64", "gnu"), 16);
+        assert_eq!(sizeof_longfloat_for("linux", "s390x", "gnu"), 16);
+    }
+
+    #[test]
+    fn sizeof_wchar_t_and_longfloat_match_target_helpers() {
+        let os = crate::layout::target_os();
+        let arch = crate::layout::target_arch();
+        let env = crate::layout::target_env();
+        assert_eq!(sizeof_wchar_t(), sizeof_wchar_t_for(os, arch, env));
+        assert_eq!(sizeof_longfloat(), sizeof_longfloat_for(os, arch, env));
     }
 }

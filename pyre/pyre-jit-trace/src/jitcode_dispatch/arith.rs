@@ -770,6 +770,7 @@ pub(crate) fn record_float_cmp<Sym: WalkSym>(
 
 /// Bank-crossing unary cast family from the `pyjitpl.py`
 /// exec-generated unary loop (`cast_float_to_int` / `cast_int_to_float` /
+/// `cast_float_to_singlefloat` / `cast_singlefloat_to_float` /
 /// `cast_int_to_ptr` / `cast_ptr_to_int`). PyPy generates these from one template
 /// because its boxes are untyped; pyre's typed register banks make
 /// each cast a distinct (src-bank, dst-bank, concrete-fold) triple, so
@@ -859,6 +860,33 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
             let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
             write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
         }
+        // `cast_float_to_singlefloat/f>i`: Float-bank → Int-bank of
+        // the f32 bit pattern. `bhimpl_cast_float_to_singlefloat`.
+        OpCode::CastFloatToSinglefloat => {
+            let a = read_float_reg(code, op, 0, ctx)?;
+            let result = if let Some(majit_ir::Value::Float(f)) = a.inline_const_to_value()
+                && let Some(majit_ir::Value::Int(n)) =
+                    majit_metainterp::executor::execute_cast_const(
+                        opcode,
+                        majit_ir::Value::Float(f),
+                    ) {
+                ctx.trace_ctx.const_int(n)
+            } else {
+                count_ops_recorded(ctx, opcode);
+                let result = ctx.trace_ctx.record_op(opcode, &[a]);
+                if let Some(majit_ir::Value::Float(f)) = ctx.trace_ctx.box_value(a) {
+                    ctx.trace_ctx.set_opref_concrete(
+                        result,
+                        majit_ir::Value::Int(majit_metainterp::blackhole::singlefloat2int(
+                            f as f32,
+                        )),
+                    );
+                }
+                result
+            };
+            let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+            write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?;
+        }
         // `cast_int_to_float/i>f`: Int-bank → Float-bank. Stamp the
         // result with the operand's Box.value as an f64 so downstream
         // `box_value(result)` callers see the live value.
@@ -875,6 +903,38 @@ pub(crate) fn unop_cast_record<Sym: WalkSym>(
                 if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
                     ctx.trace_ctx
                         .set_opref_concrete(result, majit_ir::Value::Float(n as f64));
+                }
+                result
+            };
+            let len = ctx.registers_f.len();
+            let _ = ctx
+                .registers_f
+                .get(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            ctx.registers_f.set(dst, result);
+        }
+        // `cast_singlefloat_to_float/i>f`: Int-bank f32 bits → Float-bank.
+        // `bhimpl_cast_singlefloat_to_float`.
+        OpCode::CastSinglefloatToFloat => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = if let Some(majit_ir::Value::Int(n)) = a.inline_const_to_value()
+                && let Some(majit_ir::Value::Float(f)) =
+                    majit_metainterp::executor::execute_cast_const(opcode, majit_ir::Value::Int(n))
+            {
+                ctx.trace_ctx.const_float(f.to_bits() as i64)
+            } else {
+                count_ops_recorded(ctx, opcode);
+                let result = ctx.trace_ctx.record_op(opcode, &[a]);
+                if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(a) {
+                    ctx.trace_ctx.set_opref_concrete(
+                        result,
+                        majit_ir::Value::Float(f32::from_bits(n as u32) as f64),
+                    );
                 }
                 result
             };
@@ -1182,6 +1242,8 @@ regular_record_table! {
     unop_cast_record {
         "cast_float_to_int/f>i" => CastFloatToInt,
         "cast_int_to_float/i>f" => CastIntToFloat,
+        "cast_float_to_singlefloat/f>i" => CastFloatToSinglefloat,
+        "cast_singlefloat_to_float/i>f" => CastSinglefloatToFloat,
         "cast_int_to_ptr/i>r" => CastIntToPtr,
         "cast_ptr_to_int/r>i" => CastPtrToInt,
         "convert_float_bytes_to_longlong/f>i" => ConvertFloatBytesToLonglong,

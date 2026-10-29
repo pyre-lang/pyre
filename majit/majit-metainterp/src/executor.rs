@@ -1067,7 +1067,7 @@ pub fn execute_cast_const_row(opcode: OpCode, arg: majit_ir::Value) -> ConstFold
         }
         (OpCode::CastIntToFloat, Value::Int(i)) => ConstFold::Folded(Value::Float(i as f64)),
         (OpCode::CastFloatToSinglefloat, Value::Float(f)) => {
-            ConstFold::Folded(Value::Int((f as f32).to_bits() as i64))
+            ConstFold::Folded(Value::Int(crate::blackhole::singlefloat2int(f as f32)))
         }
         (OpCode::CastSinglefloatToFloat, Value::Int(i)) => {
             ConstFold::Folded(Value::Float(f32::from_bits(i as u32) as f64))

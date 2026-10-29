@@ -101,16 +101,25 @@ pub fn int2singlefloat(x: i64) -> f32 {
     f32::from_bits(x as u32)
 }
 
-pub fn singlefloat2int(x: f32) -> i64 {
-    // `rffi.cast(lltype.Signed, uint32)` is `intmask`. A 32-bit pattern
-    // already fits in a 64-bit Signed, so it stays zero-extended. On a
-    // 32-bit Signed the high bit folds to negative.
-    let bits = x.to_bits();
-    if cfg!(target_pointer_width = "32") {
+/// `longlong.singlefloat2int`: `rffi.cast(lltype.Signed, rffi.cast(rffi.UINT, x))`.
+/// `word` is the target `Signed` width in bytes. Word 4 sign-extends bit 31;
+/// a wider word zero-extends.
+pub fn singlefloat2int_for_word(bits: u32, word: usize) -> i64 {
+    if word == 4 {
         bits as i32 as i64
     } else {
         bits as i64
     }
+}
+
+pub fn singlefloat2int(x: f32) -> i64 {
+    // Runtime-on-target: `cfg!(target_pointer_width)` is the Signed width.
+    let word = if cfg!(target_pointer_width = "32") {
+        4
+    } else {
+        8
+    };
+    singlefloat2int_for_word(x.to_bits(), word)
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -226,6 +235,13 @@ mod tests {
             assert_eq!(high, -2147483648);
         } else {
             assert_eq!(high, 0x8000_0000);
+        }
+        let bits = (-1.0f32).to_bits();
+        assert_eq!(singlefloat2int_for_word(bits, 4), -1_082_130_432);
+        #[cfg(target_pointer_width = "64")]
+        {
+            assert_eq!(singlefloat2int(-1.0), 3_212_836_864);
+            assert_eq!(singlefloat2int_for_word(bits, 8), 3_212_836_864);
         }
     }
 }

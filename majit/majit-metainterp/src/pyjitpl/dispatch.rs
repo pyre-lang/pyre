@@ -5114,6 +5114,52 @@ where
         self.set_int_reg(ctx, dst, Some(opref), Some(ivalue));
     }
 
+    /// `cast_float_to_singlefloat/f>i`: f64 → f32 bit pattern in the int
+    /// bank. `[src][dst]`. `bhimpl_cast_float_to_singlefloat`
+    /// (`blackhole.py`) / `singlefloat2int(r_singlefloat(a))`.
+    fn trace_cast_float_to_singlefloat(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, bits) = self.read_float_reg(ctx, src_idx);
+        let ivalue = crate::blackhole::singlefloat2int(f64::from_bits(bits as u64) as f32);
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::CastFloatToSinglefloat,
+            None,
+            &[src],
+            Some(majit_ir::Value::Int(ivalue)),
+            self.last_exception_value,
+        );
+        self.set_int_reg(ctx, dst, Some(opref), Some(ivalue));
+    }
+
+    /// `cast_singlefloat_to_float/i>f`: f32 bit pattern in the int bank
+    /// → f64. `[src][dst]`. `bhimpl_cast_singlefloat_to_float`
+    /// (`blackhole.py`) / `float(int2singlefloat(a))`.
+    fn trace_cast_singlefloat_to_float(&mut self, ctx: &mut TraceCtx) {
+        let (src_idx, dst) = {
+            let frame = self.frames.current_mut();
+            let src_idx = frame.next_u8() as usize;
+            let dst = frame.next_u8() as usize;
+            (src_idx, dst)
+        };
+        let (src, src_value) = self.read_int_reg(ctx, src_idx);
+        let fvalue = f32::from_bits(src_value as u32) as f64;
+        let opref = ctx.execute_and_record(
+            Some(self.cpu.as_ref()),
+            OpCode::CastSinglefloatToFloat,
+            None,
+            &[src],
+            Some(majit_ir::Value::Float(fvalue)),
+            self.last_exception_value,
+        );
+        self.set_float_reg(ctx, dst, Some(opref), Some(fvalue.to_bits() as i64));
+    }
+
     /// `convert_float_bytes_to_longlong/f>i`: reinterpret a float's 64-bit
     /// pattern as an int. `[src][dst]`. The i64 bits are exactly what
     /// the float register box already carries, so the concrete value is identity.
@@ -10561,6 +10607,47 @@ mod tests {
             )],
         );
         assert!(recorded.contains(&OpCode::CastFloatToInt));
+    }
+
+    #[test]
+    fn cast_float_to_singlefloat_folds_a_constant_float() {
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_f_value(0, 1.5f64.to_bits() as i64);
+        builder.record_cast_float_to_singlefloat(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastFloatToSinglefloat));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_float_to_singlefloat(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Float],
+            &builder.finish(),
+            &[(
+                JitArgKind::Float,
+                OpRef::input_arg_float(0),
+                1.5f64.to_bits() as i64,
+            )],
+        );
+        assert!(recorded.contains(&OpCode::CastFloatToSinglefloat));
+    }
+
+    #[test]
+    fn cast_singlefloat_to_float_folds_a_constant_int() {
+        let bits = (1.5f32).to_bits() as i64;
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, bits);
+        builder.record_cast_singlefloat_to_float(1, 0);
+        let folded = traced_opcodes(&[], &builder.finish(), &[]);
+        assert!(!folded.contains(&OpCode::CastSinglefloatToFloat));
+
+        let mut builder = JitCodeBuilder::new();
+        builder.record_cast_singlefloat_to_float(1, 0);
+        let recorded = traced_opcodes(
+            &[majit_ir::Type::Int],
+            &builder.finish(),
+            &[(JitArgKind::Int, OpRef::input_arg_int(0), bits)],
+        );
+        assert!(recorded.contains(&OpCode::CastSinglefloatToFloat));
     }
 
     #[test]

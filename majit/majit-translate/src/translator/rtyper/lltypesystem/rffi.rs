@@ -478,33 +478,45 @@ pub fn ptradd() -> Result<(), TyperError> {
 }
 
 /// `rffi.py sizeof(tp)`: integer size when known. A `Struct` without a
-/// numeric `_hints["size"]` is `llmemory.sizeof(tp)` upstream (symbolic)
-/// and has no integer here.
-pub fn sizeof(tp: &LowLevelType) -> Result<usize, TyperError> {
+/// numeric `_hints["size"]` is `llmemory.sizeof(tp)` (symbolic
+/// `AddressOffset`). `FixedSizeArray` is `sizeof(OF) * length`.
+pub fn sizeof(tp: &LowLevelType) -> Result<ConstValue, TyperError> {
     match tp {
-        LowLevelType::FixedSizeArray(a) => Ok(sizeof(&a.OF)? * a.length),
+        LowLevelType::FixedSizeArray(a) => match sizeof(&a.OF)? {
+            ConstValue::Int(n) if n >= 0 => Ok(ConstValue::Int(n * a.length as i64)),
+            ConstValue::AddressOffset(off) => off
+                .mul(a.length as i64)
+                .map(ConstValue::AddressOffset)
+                .ok_or_else(|| TyperError::message(format!("sizeof({tp:?}): cannot scale offset"))),
+            other => Err(TyperError::message(format!(
+                "sizeof({tp:?}): unexpected element size {other:?}"
+            ))),
+        },
         LowLevelType::Struct(s) => match s._hints.get("size") {
-            Some(ConstValue::Int(n)) if *n >= 0 => Ok(*n as usize),
+            Some(ConstValue::Int(n)) if *n >= 0 => Ok(ConstValue::Int(*n)),
             _ => {
-                // `llmemory.sizeof(tp)` is symbolic upstream and has no integer here.
-                Err(deferred("sizeof"))
+                // `llmemory.sizeof(tp)` — a symbolic result in this case.
+                llmemory::sizeof(tp, None).map_err(TyperError::message)
             }
         },
         LowLevelType::Signed | LowLevelType::Ptr(_) | LowLevelType::Address => {
-            Ok(crate::layout::target_word_size())
+            Ok(ConstValue::Int(crate::layout::target_word_size() as i64))
         }
-        LowLevelType::Char | LowLevelType::Bool => Ok(1),
+        LowLevelType::Char | LowLevelType::Bool => Ok(ConstValue::Int(1)),
         LowLevelType::UniChar => {
-            // `r_wchar_t.BITS/8`. `setup()` maps `wchar_t` to UniChar;
-            // `llmemory::primitive_byte_size` sizes UniChar at 4.
-            Ok(4)
+            // `rffi.py sizeof`: `r_wchar_t.BITS/8`. `setup()` maps
+            // `wchar_t` to UniChar; `ll2ctypes.py` stores UniChar as
+            // `c_uint16` when `sizeof(c_wchar) == 2` else `c_uint32`.
+            Ok(ConstValue::Int(llmemory::sizeof_wchar_t()))
         }
-        LowLevelType::Float => Ok(8),
-        LowLevelType::SingleFloat => Ok(4),
-        LowLevelType::LongFloat => Ok(llmemory::SIZEOF_LONGFLOAT as usize),
-        LowLevelType::Unsigned => Ok(crate::layout::target_word_size()),
-        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => Ok(8),
-        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Ok(16),
+        LowLevelType::Float => Ok(ConstValue::Int(8)),
+        LowLevelType::SingleFloat => Ok(ConstValue::Int(4)),
+        LowLevelType::LongFloat => Ok(ConstValue::Int(llmemory::sizeof_longfloat())),
+        LowLevelType::Unsigned => Ok(ConstValue::Int(crate::layout::target_word_size() as i64)),
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => Ok(ConstValue::Int(8)),
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => {
+            Ok(ConstValue::Int(16))
+        }
         _ => Err(TyperError::message(format!("sizeof({tp:?}): not a Number"))),
     }
 }
@@ -512,9 +524,17 @@ pub fn sizeof(tp: &LowLevelType) -> Result<usize, TyperError> {
 /// `rffi.py size_and_sign(tp)`: `(sizeof(tp), unsigned)`.
 /// `_type.SIGNED` for Number types; non-Primitive is unsigned False;
 /// `Signed` / FLOAT / DOUBLE / LONGDOUBLE / Address are False;
-/// Char / UniChar / Bool are True.
+/// Char / UniChar / Bool are True. Upstream calls this on Numbers /
+/// Ptr; a symbolic sizeof is an error here.
 pub fn size_and_sign(tp: &LowLevelType) -> Result<(usize, bool), TyperError> {
-    let size = sizeof(tp)?;
+    let size = match sizeof(tp)? {
+        ConstValue::Int(n) if n >= 0 => n as usize,
+        other => {
+            return Err(TyperError::message(format!(
+                "size_and_sign({tp:?}): need an integer size, got {other:?}"
+            )));
+        }
+    };
     let unsigned = match tp {
         LowLevelType::Unsigned
         | LowLevelType::UnsignedLongLong
@@ -1526,10 +1546,55 @@ mod tests {
         );
         let four_signed =
             LowLevelType::FixedSizeArray(Box::new(CFixedArray(LowLevelType::Signed, 4)));
-        assert_eq!(sizeof(&four_signed).unwrap(), 4 * word);
+        assert_eq!(
+            sizeof(&four_signed).unwrap(),
+            ConstValue::Int((4 * word) as i64)
+        );
         assert_eq!(size_and_sign(&four_signed).unwrap(), (4 * word, false));
         assert!(sizeof(&LowLevelType::Void).is_err());
         assert!(size_and_sign(&LowLevelType::Void).is_err());
+    }
+
+    #[test]
+    fn sizeof_unichar_is_sizeof_wchar_t() {
+        assert_eq!(
+            sizeof(&LowLevelType::UniChar).unwrap(),
+            ConstValue::Int(llmemory::sizeof_wchar_t())
+        );
+        assert_eq!(
+            size_and_sign(&LowLevelType::UniChar).unwrap(),
+            (llmemory::sizeof_wchar_t() as usize, true)
+        );
+    }
+
+    #[test]
+    fn sizeof_unprobed_struct_is_symbolic_item_offset() {
+        let s = LowLevelType::Struct(Box::new(Struct::new(
+            "S",
+            vec![("f".to_string(), LowLevelType::Signed)],
+        )));
+        let expected = llmemory::sizeof(&s, None).unwrap();
+        assert_eq!(sizeof(&s).unwrap(), expected);
+        assert!(matches!(expected, ConstValue::AddressOffset(_)));
+        assert!(size_and_sign(&s).is_err());
+
+        let arr = LowLevelType::FixedSizeArray(Box::new(CFixedArray(s.clone(), 3)));
+        let ConstValue::AddressOffset(base) = expected else {
+            panic!("llmemory::sizeof(S, None) is AddressOffset");
+        };
+        let scaled = base.mul(3).expect("ItemOffset.__mul__ scales repeat");
+        assert_eq!(sizeof(&arr).unwrap(), ConstValue::AddressOffset(scaled));
+    }
+
+    #[test]
+    fn sizeof_struct_with_size_hint_is_int() {
+        let hinted = LowLevelType::Struct(Box::new(Struct::with_hints(
+            "Hinted",
+            vec![("f".to_string(), LowLevelType::Signed)],
+            vec![("size".to_string(), ConstValue::Int(24))],
+        )));
+        assert_eq!(sizeof(&hinted).unwrap(), ConstValue::Int(24));
+        assert_eq!(size_and_sign(&hinted).unwrap(), (24, false));
     }
 
     #[test]

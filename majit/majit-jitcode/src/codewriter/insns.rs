@@ -387,6 +387,13 @@ pub const BC_FLOAT_ADD: u8 = 133;
 pub const BC_FLOAT_SUB: u8 = 134;
 pub const BC_FLOAT_MUL: u8 = 135;
 pub const BC_FLOAT_TRUEDIV: u8 = 136;
+/// `blackhole.py` `bhimpl_cast_float_to_singlefloat` /
+/// `bhimpl_cast_singlefloat_to_float`. Gap 137/138 between the float
+/// arithmetic family and `float_neg`; `jtransform.py`
+/// `_float_to_float_cast` emits these when a `force_cast` /
+/// `cast_primitive` crosses Float↔SingleFloat.
+pub const BC_CAST_FLOAT_TO_SINGLEFLOAT: u8 = 137;
+pub const BC_CAST_SINGLEFLOAT_TO_FLOAT: u8 = 138;
 pub const BC_FLOAT_NEG: u8 = 139;
 pub const BC_FLOAT_ABS: u8 = 140;
 pub const BC_INT_INVERT: u8 = 141;
@@ -1247,11 +1254,21 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     // Cross-kind casts — `bhimpl_cast_ptr_to_int` (`blackhole.py`),
     // `bhimpl_cast_int_to_ptr` (`blackhole.py`),
     // `bhimpl_cast_int_to_float` (`blackhole.py`),
-    // `bhimpl_cast_float_to_int` (`blackhole.py`).
+    // `bhimpl_cast_float_to_int` (`blackhole.py`),
+    // `bhimpl_cast_float_to_singlefloat` (`blackhole.py`),
+    // `bhimpl_cast_singlefloat_to_float` (`blackhole.py`).
     m.insert("cast_int_to_float/i>f", BC_CAST_INT_TO_FLOAT);
     m.insert("cast_int_to_ptr/i>r", BC_CAST_INT_TO_PTR);
     m.insert("cast_ptr_to_int/r>i", BC_CAST_PTR_TO_INT);
     m.insert("cast_float_to_int/f>i", BC_CAST_FLOAT_TO_INT);
+    m.insert(
+        "cast_float_to_singlefloat/f>i",
+        BC_CAST_FLOAT_TO_SINGLEFLOAT,
+    );
+    m.insert(
+        "cast_singlefloat_to_float/i>f",
+        BC_CAST_SINGLEFLOAT_TO_FLOAT,
+    );
     m.insert(
         "convert_float_bytes_to_longlong/f>i",
         BC_CONVERT_FLOAT_BYTES_TO_LONGLONG,

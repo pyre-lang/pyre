@@ -693,10 +693,12 @@ impl JitFrameDeadFrame {
     /// `llmodel.py _decode_pos` — translate a logical fail-argument index
     /// through the exit descriptor's recovery locations.
     ///
-    /// Cranelift currently publishes a dense identity layout, while dynasm
-    /// keeps register spills in their architecture slots. The deadframe is
-    /// backend-neutral, so the mapping belongs at this common accessor just
-    /// as it does for [`crate::libc_deadframe::LibcJitFrameDeadFrame`].
+    /// A stamped `rd_locs` names the physical home or packed dense slot;
+    /// `0xFFFF` is a hole. An empty table (or an index past it) is identity:
+    /// FINISH / JUMP / execute_token, and the synthetic descrs the runner
+    /// mints. The deadframe is backend-neutral, so the mapping belongs at
+    /// this common accessor just as it does for
+    /// [`crate::libc_deadframe::LibcJitFrameDeadFrame`].
     #[inline]
     fn slot_of(&self, index: usize) -> Option<usize> {
         let descr = self.fail_descr.as_fail_descr();
