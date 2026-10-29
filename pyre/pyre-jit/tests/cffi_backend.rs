@@ -29,7 +29,7 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
     init_jit_hooks();
 
     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-    importing::init_sys_path(&cwd, cwd.as_os_str());
+    importing::init_sys_path(&cwd, Some(cwd.as_os_str()));
     importing::add_sys_path_0();
     importing::set_sys_argv(&[std::ffi::OsString::from(name)]);
 

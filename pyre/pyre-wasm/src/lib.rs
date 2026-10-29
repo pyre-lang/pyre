@@ -877,7 +877,7 @@ fn run_python_impl(source: &str) -> String {
             .with(|p| p.borrow().clone())
             .and_then(|p| std::path::Path::new(&p).parent().map(|d| d.to_path_buf()))
             .unwrap_or_default();
-        pyre_interpreter::importing::init_sys_path(&script_dir, script_dir.as_os_str());
+        pyre_interpreter::importing::init_sys_path(&script_dir, Some(script_dir.as_os_str()));
     }
     #[cfg(not(all(target_arch = "wasm32", feature = "wasm-host")))]
     pyre_interpreter::importing::install_builtin_modules();

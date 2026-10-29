@@ -547,38 +547,41 @@ fn parse_interact(parser: &mut lexopt::Parser) -> Result<RunMode, lexopt::Error>
 /// the controller (the virtual `/tmp`) through `rposix.getcwd`, so an untrusted
 /// child never learns the trusted parent's real working directory; off sandbox
 /// it is the process cwd.
-fn sys_path_cwd() -> std::path::PathBuf {
+fn sys_path_cwd() -> Option<std::path::PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
+        // [3.15-spec] any failure, `MemoryError` included, gives `None` and the run continues ↔
+        // `app_main.py run_command_line` `-m` calls `abspath('.')`, whose `getcwd` failure propagates —
+        // observable: `-m` with a failed cwd lookup runs without a `sys.path[0]` entry; evidence: v3.15.0
+        // Python/pathconfig.c `_PyPathConfig_ComputeSysPath0` returns 0 when `_Py_wgetcwd` fails. -c and stdin
+        // add '' without a lookup; this value is only the shadowing-check anchor there.
         let got = {
             #[cfg(feature = "sandbox")]
             {
                 match majit_rlib::rsandbox::catch_os_error(|| majit_rlib::rposix::getcwd()) {
                     Ok(Ok(Ok(bytes))) => Ok(bytes),
-                    Ok(Ok(Err(_))) => Err(()),
-                    Ok(Err(_)) => panic!("MemoryError while reading the current directory"),
-                    Err(_) => Err(()),
+                    _ => Err(()),
                 }
             }
             #[cfg(not(feature = "sandbox"))]
             {
-                // `rposix.getcwd` lets `MemoryError` escape; only an OS error falls back.
                 match majit_rlib::rposix::getcwd() {
                     Ok(Ok(bytes)) => Ok(bytes),
-                    Ok(Err(_)) => Err(()),
-                    Err(_) => panic!("MemoryError while reading the current directory"),
+                    _ => Err(()),
                 }
             }
         };
         match got {
-            Ok(bytes) => std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)),
-            Err(()) => Path::new(".").to_path_buf(),
+            Ok(bytes) => Some(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(
+                &bytes,
+            ))),
+            Err(()) => None,
         }
     }
     #[cfg(not(unix))]
     {
-        std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf())
+        std::env::current_dir().ok()
     }
 }
 
@@ -1091,8 +1094,8 @@ fn real_main(binary_name: &str) {
             // `_PyPathConfig_ComputeSysPath0` yields "" for a `-c` argv[0]. The
             // cwd is still the anchor the shadowing check compares module
             // origins against.
-            let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
+            let cwd = sys_path_cwd().unwrap_or_else(|| PathBuf::from("."));
+            importing::init_sys_path(&cwd, Some(std::ffi::OsStr::new("")));
             let mut argv = vec![std::ffi::OsString::from("-c")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -1108,7 +1111,8 @@ fn real_main(binary_name: &str) {
             // `['-m'] + args`); `_run_module_as_main` then sets it to the
             // module's resolved origin.
             let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, cwd.as_os_str());
+            let anchor = cwd.clone().unwrap_or_else(|| std::path::PathBuf::from("."));
+            importing::init_sys_path(&anchor, cwd.as_deref().map(std::path::Path::as_os_str));
             let mut argv = vec![std::ffi::OsString::from("-m")];
             argv.extend(args);
             importing::set_sys_argv(&argv);
@@ -1119,7 +1123,7 @@ fn real_main(binary_name: &str) {
         }
         RunMode::Script(path) => {
             let script_dir = script_startup_dir(&path);
-            importing::init_sys_path(&script_dir, script_dir.as_os_str());
+            importing::init_sys_path(&script_dir, Some(script_dir.as_os_str()));
             // sys.argv[0] is the script path; remaining values go to argv[1:].
             let mut argv = vec![std::ffi::OsString::from(&path)];
             argv.extend(args);
@@ -1134,8 +1138,8 @@ fn real_main(binary_name: &str) {
             // The prompt and piped stdin both take "" for `sys.path[0]`
             // (`_PyPathConfig_ComputeSysPath0` on an argv[0] of "" / "-"); the
             // cwd stays the shadowing-check anchor.
-            let cwd = sys_path_cwd();
-            importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
+            let cwd = sys_path_cwd().unwrap_or_else(|| PathBuf::from("."));
+            importing::init_sys_path(&cwd, Some(std::ffi::OsStr::new("")));
             // `sys.argv` is `['']` with no script argument and `['-', …]` for
             // an explicit dash.
             let mut argv = vec![std::ffi::OsString::from(argv0)];
@@ -1683,7 +1687,10 @@ fn absolute_script_path(filename: &str) -> Option<String> {
     let to_absolutize = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        sys_path_cwd().join(path)
+        match sys_path_cwd() {
+            Some(cwd) => cwd.join(path),
+            None => return Some(filename.to_string()),
+        }
     };
     Some(match std::path::absolute(&to_absolutize) {
         Ok(p) => p.to_string_lossy().into_owned(),
@@ -1719,7 +1726,8 @@ fn script_startup_dir(path: &str) -> PathBuf {
         // spelling absolute without resolving junctions or symlinks.  Rust's
         // `canonicalize` is a realpath operation and incorrectly changed a
         // runner-temp junction into its target in `sys.path[0]`.
-        std::path::absolute(parent).unwrap_or_else(|_| sys_path_cwd())
+        std::path::absolute(parent)
+            .unwrap_or_else(|_| sys_path_cwd().unwrap_or_else(|| PathBuf::from(".")))
     }
 }
 

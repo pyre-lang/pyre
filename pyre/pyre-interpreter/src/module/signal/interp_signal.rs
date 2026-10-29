@@ -693,7 +693,8 @@ fn report_wakeup_fd_error(ec: &mut ExecutionContext, errno_val: i32) {
                 rustpython_wtf8::Wtf8Buf::from_string(format!("error {errno_val}"))
             }),
         ),
-        Err(err) => err,
+        // The outer `except Exception: pass` drops a failure while building the report.
+        Err(_) => return,
     };
     let w_exc = err.to_exc_object();
     let roots = pyre_object::gc_roots::push_roots();
@@ -1152,6 +1153,10 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                     // `'Unknown signal: 32'` on pypy.
                     check_signum_in_range(signum)?;
                     let signum = signum as i32;
+                    // [3.15-spec] strict UTF-8 decode of the description ↔ `interp_signal.py strsignal` passes the
+                    // bytes to `space.newtext`, which stores them as the str's UTF-8 without decoding — observable: a
+                    // non-UTF-8 description raises UnicodeDecodeError; evidence: v3.15.0 Modules/signalmodule.c
+                    // `signal_strsignal_impl` returns `PyUnicode_FromString(res)`.
                     #[cfg(unix)]
                     let text: Option<PyObjectRef> =
                         match majit_rlib::rsignal::strsignal(signum).map_err(|e| {
