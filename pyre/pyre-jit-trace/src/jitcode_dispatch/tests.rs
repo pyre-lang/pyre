@@ -18879,6 +18879,48 @@ fn splice_success_keeps_the_staged_image() {
     reset_single_frame_blackhole();
 }
 
+/// Capture-only overlay must not replace last_exc with a hole ConstPtr(NULL).
+///
+/// `collect_outer_active_boxes` / `reseed_vstack_from_shadow` already treat
+/// that encoding as unwritten; overlaying it onto `_opimpl_setarrayitem_vable`
+/// last_exc is what made `bhimpl_raise` see a null ref register.
+#[test]
+fn vstack_overlay_does_not_clobber_last_exc_with_const_null() {
+    let last_exc = OpRef::const_ptr(majit_ir::GcRef(0x1000));
+    let hole = OpRef::const_ptr(majit_ir::GcRef::NULL);
+    let live = OpRef::const_ptr(majit_ir::GcRef(0x2000));
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), false),
+        None,
+        "Const NULL must not overwrite a live last_exc box"
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(last_exc), true),
+        Some(hole),
+        "CALL self_or_null still overwrites when the slot stored live NULL"
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(hole), false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, None, false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(hole, Some(OpRef::NONE), false),
+        Some(hole)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(live, Some(last_exc), false),
+        Some(live)
+    );
+    assert_eq!(
+        resume_snapshot::vstack_overlay_box(OpRef::NONE, Some(last_exc), false),
+        None
+    );
+}
+
 #[test]
 fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
     // codewriter shape contract says `R-list.len() <=
