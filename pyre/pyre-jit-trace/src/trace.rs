@@ -5113,29 +5113,23 @@ fn run_perfn_walk<Sym: WalkSym>(
     if let Some(entry_depth) = pjc.depth_for_jitcode_pc_pred(entry) {
         let stack_base = crate::state::concrete_nlocals(cf_addr).unwrap_or(sym.nlocals());
         let live_stack = sym.valuestackdepth().saturating_sub(stack_base);
-        // A mismatch is unsound only when the carried coordinate IS the
-        // resume marker.  That is the marker-inside-super-instruction shape:
-        // the live frame has advanced through the super-instruction while the
-        // predecessor depth twin still describes the marker's pre-op stack.
-        // An interior branch resume resolves *through* a marker but carries
-        // its own jitcode offset, so it may legitimately have a different
-        // live depth and must continue walking.
+        // The resume coordinate is a numbered `-live-`; the operand depth
+        // there is that `-live-`'s static depth, the same value
+        // `eval.rs correct_resume_vsd` gives the blackhole for the same pc
+        // (`resume.py rebuild_from_resumedata` /
+        // `pyjitpl.py MIFrame.setup_resume_at_op`).
         let entry_is_resume_marker = pjc.resume_marker_for_jitcode_pc(entry) == Some(entry);
         if live_stack != entry_depth as usize && entry_is_resume_marker {
             if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
                 let marker_py =
                     crate::py_coord::containing_py_pc_for_jitcode_pc(&pjc.metadata, entry);
                 eprintln!(
-                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \\
-                     entry_depth={entry_depth} marker_py={marker_py}; declining marker-entry walk"
+                    "[fbw-abort] start_pc={start_pc} entry={entry} live_stack={live_stack} \
+                     entry_depth={entry_depth} marker_py={marker_py}; \
+                     re-deriving vsd from the resume marker (`correct_resume_vsd`)"
                 );
             }
-            fbw_decline(crate::driver::make_green_key(
-                w_code,
-                start_pc,
-                is_being_profiled,
-            ));
-            return None;
+            sym.set_valuestackdepth(stack_base + entry_depth as usize);
         }
     }
     // The full-body walk drives a PORTAL trace, so the body must carry the
@@ -5190,14 +5184,18 @@ fn run_perfn_walk<Sym: WalkSym>(
     // post-merge body resolve their loop-invariant reads. A non-bridge
     // entry starts at the `pmgN` `-live-` immediately before
     // `jit_merge_point` (`split_before_jit_merge_point`) and therefore
-    // never walks `pmg_shared`. Decode the merge point's green-int
-    // (`gi` = [next_instr, is_being_profiled]), green-ref (`gr` =
-    // [pycode]) and red (`rr` = [frame, ec], portal jitdriver convention)
-    // register lists and seed each named color from the greenkey / live
-    // frame. `gi[0]` (`next_instr`) and `gi[1]` (`is_being_profiled`) are
-    // the Int greens that `pmg_shared` used to write before the merge;
-    // they are now `const_int` seeds through `argboxes_i`, matching the
-    // Ref green (`pycode`) and red (`frame`, `ec`) seeds. `frame` is the
+    // never walks the instruction-start `int_copy` or `pmg_shared`. Decode
+    // the merge point's green-int (`gi` = [next_instr, is_being_profiled]),
+    // green-ref (`gr` = [pycode]) and red (`rr` = [frame, ec], portal
+    // jitdriver convention) register lists and seed each named color from
+    // the greenkey / live frame. `gi[0]` (`next_instr`) is the trivia-
+    // normalized PC the skipped `int_copy` would have written
+    // (`pyopcode.py dispatch_bytecode`); function-entry `start_pc` is 0
+    // (`RESUME`) while the first instruction start — and `arm_shared`'s
+    // `switch` — is `skip_python_trivia_forward`. `gi[1]` is
+    // `is_being_profiled`. Both are `const_int` seeds through
+    // `argboxes_i`, matching the Ref green (`pycode`) and red (`frame`,
+    // `ec`) seeds. `frame` is the
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `ec` must remain the second live red box.  PyPy's
     // `PyPyJitDriver.reds` names `ec`, and `MIFrame.get_list_of_active_boxes`
@@ -5511,11 +5509,12 @@ fn run_perfn_walk<Sym: WalkSym>(
     // decoded the Int bank color-indexed into `sym.registers_i` (concrete
     // already stamped there); pass it positionally so `dispatch_via_miframe`
     // writes `top_regs_i[color] = value`. A non-bridge entry starts at the
-    // `pmgN` `-live-` and executes `jit_merge_point` without `pmg_shared`,
-    // so `gi[0]` / `gi[1]` are the greenkey (`next_instr`,
-    // `is_being_profiled`). `dispatch_via_miframe` treats `OpRef::NONE` as
-    // unset (`assert_int_bank_box` returns, the slot stays the bank's
-    // initial NONE). Other bridges keep an empty list.
+    // `pmgN` `-live-` and executes `jit_merge_point` without the
+    // instruction-start `int_copy` / `pmg_shared`, so `gi[0]` is the
+    // trivia-normalized `next_instr` that copy would have written and
+    // `gi[1]` is `is_being_profiled`. `dispatch_via_miframe` treats
+    // `OpRef::NONE` as unset (`assert_int_bank_box` returns, the slot
+    // stays the bank's initial NONE). Other bridges keep an empty list.
     let argboxes_i: Vec<majit_ir::OpRef> = if sym.bridge_walk_entry_pc().is_some() {
         // Clamp to the jitcode's Int register count: `sym.registers_i` may carry
         // trailing scratch/constant colors beyond `num_regs_i`, and
@@ -5537,7 +5536,15 @@ fn run_perfn_walk<Sym: WalkSym>(
                 }
             };
             if let Some(&next_instr_color) = gi.first() {
-                seed_i(next_instr_color, ctx.const_int(start_pc as i64));
+                let next_instr_pc = if pjc.code_ptr.is_null() {
+                    start_pc
+                } else {
+                    crate::jitcode_dispatch::skip_python_trivia_forward(
+                        unsafe { &*pjc.code_ptr },
+                        start_pc,
+                    )
+                };
+                seed_i(next_instr_color, ctx.const_int(next_instr_pc as i64));
             }
             if let Some(&profiled_color) = gi.get(1) {
                 seed_i(profiled_color, ctx.const_int(is_being_profiled as i64));

@@ -906,10 +906,54 @@ fn descr_refs_for_jitcode_index(jitcode_index: usize) -> &'static [DescrRef] {
 /// call (the orthodox non-inlinable path, `should_inline` = False →
 /// `do_residual_call`, `pyjitpl.py`) instead of entering with an empty frame red.
 ///
+/// Pending flags for the shared `pmg_shared` / `arm_shared` switches
+/// (`interp_jit.py PyFrame.dispatch`, `pyopcode.py dispatch_bytecode`).
+/// On a fresh frame `next_instr` is the entry pc, so those switches are
+/// const jumps, not Python-level branches.
+struct SharedDispatchPending {
+    arm: bool,
+    pmg: bool,
+}
+
+impl SharedDispatchPending {
+    fn new() -> Self {
+        Self {
+            arm: false,
+            pmg: false,
+        }
+    }
+
+    /// `Some(ok)` if `d` is a `switch`: `ok` means it is the pending
+    /// `pmg_shared` (`ref_guard_value`) or `arm_shared` (`setfield_vable_i`)
+    /// dispatch. Other ops update the pending flags and return `None`.
+    fn on_op(&mut self, d: &DecodedOp) -> Option<bool> {
+        if d.opname.starts_with("switch") {
+            let ok = self.arm || self.pmg;
+            self.arm = false;
+            self.pmg = false;
+            return Some(ok);
+        }
+        if d.opname != "live" {
+            if d.opname == "setfield_vable_i" {
+                self.arm = true;
+            }
+            self.pmg = d.opname == "ref_guard_value";
+        }
+        None
+    }
+}
+
 /// The predicate still distinguishes straight-line leaves from branch-bearing
 /// bodies because the latter enter the multi-frame branch walk. Both successful
 /// paths now snapshot the guard at the callee's coordinate with a paused caller
 /// frame; neither collapses resume to the caller's CALL boundary.
+///
+/// Shared `pmg_shared` / `arm_shared` `switch next_instr` copies
+/// (`interp_jit.py PyFrame.dispatch`, `pyopcode.py dispatch_bytecode`)
+/// are const jumps on a fresh frame: `next_instr` is the entry pc. They
+/// are the same dispatch the inline arm used to fall through, not a
+/// Python-level branch, so a raise-only leaf stays on this strict path
+/// (`fbw_max_multiframe_depth`) instead of the raising-chain cap.
 pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     body_code: &[u8],
     callee_descr_refs: &[DescrRef],
@@ -921,7 +965,17 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
         // Undecodable reachable op — be conservative and decline the fast path.
         return false;
     };
+    let mut pending = SharedDispatchPending::new();
     for (idx, d) in ops.iter().enumerate() {
+        if let Some(ok) = pending.on_op(d) {
+            if !ok {
+                if fbw_strict_diag_enabled() {
+                    eprintln!("[strict-reject] pc={} op={} (branch)", d.pc, d.opname);
+                }
+                return false;
+            }
+            continue;
+        }
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
             if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
                 if fbw_strict_diag_enabled() {
@@ -1034,21 +1088,21 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
     // switch (`pyjitpl.py` `opimpl_switch`); after the three promote
     // guards `next_instr` is ConstInt and the switch jumps to the body.
     // The screen must not decline a true-portal callee for it.
-    let mut pending_pmg_dispatch = false;
+    //
+    // The shared `dispatch_bytecode` arm (`arm_shared`) stores
+    // `last_instr` (`setfield_vable_i/rid`) then diamonds / residual
+    // before `switch next_instr`. Keep the arm pending flag across
+    // those ops until the switch.
+    let mut pending = SharedDispatchPending::new();
     for d in &ops {
-        let is_live = d.opname == "live";
-        if d.opname.starts_with("switch") {
-            if !pending_pmg_dispatch {
+        if let Some(ok) = pending.on_op(d) {
+            if !ok {
                 if fbw_strict_diag_enabled() {
                     eprintln!("[strict-reject-mf] pc={} op={} (switch)", d.pc, d.opname);
                 }
                 return false;
             }
-            pending_pmg_dispatch = false;
             continue;
-        }
-        if !is_live {
-            pending_pmg_dispatch = false;
         }
         if d.opname.starts_with("goto_if_not") {
             // Label is the last operand (`branch.rs` `goto.argcodes.len() - 1`,
@@ -1085,9 +1139,6 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
                 );
             }
             return false;
-        }
-        if !is_live {
-            pending_pmg_dispatch = d.opname == "ref_guard_value";
         }
     }
     true
@@ -1433,7 +1484,14 @@ fn body_sample_safe_with(
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
         return false;
     };
+    let mut pending = SharedDispatchPending::new();
     for (idx, d) in ops.iter().enumerate() {
+        if let Some(ok) = pending.on_op(d) {
+            if !ok {
+                return false;
+            }
+            continue;
+        }
         if d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch") {
             if !is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d) {
                 return false;
@@ -1549,9 +1607,11 @@ pub(crate) fn exception_string_override_straight_line(
     let Some(ops) = decoded_ops_on_fresh_frame(body_code, descr_refs) else {
         return false;
     };
-    ops.iter().enumerate().all(|(idx, d)| {
-        !(d.opname.starts_with("goto_if_not") || d.opname.starts_with("switch"))
-            || is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d)
+    let mut pending = SharedDispatchPending::new();
+    ops.iter().enumerate().all(|(idx, d)| match pending.on_op(d) {
+        Some(ok) => ok,
+        None => !d.opname.starts_with("goto_if_not")
+            || is_load_fast_unbound_check_goto(body_code, previous_non_live_op(&ops, idx), d),
     })
 }
 
@@ -17549,7 +17609,15 @@ fn walk_generator_resume<Sym: WalkSym>(
         resume_marker,
     ) {
         let is_being_profiled = unsafe { (*gen_frame).get_is_being_profiled() } as i64;
-        let values = [resume_py_pc as i64, is_being_profiled];
+        // `YIELD_VALUE` + 1 is often `RESUME`; `pmg_shared` / `arm_shared`
+        // switch on the trivia-normalized instruction start
+        // (`pyopcode.py dispatch_bytecode`).
+        let resume_dispatch_pc = if pjc.code_ptr.is_null() {
+            resume_py_pc
+        } else {
+            skip_python_trivia_forward(unsafe { &*pjc.code_ptr }, resume_py_pc)
+        };
+        let values = [resume_dispatch_pc as i64, is_being_profiled];
         for (&color, &value) in gi.iter().zip(values.iter()) {
             let color = color as usize;
             if color >= int_seeds.len() {

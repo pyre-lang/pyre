@@ -1162,12 +1162,32 @@ pub const OPNAME_LIVE: &str = "-live-";
 /// matching the single copy in the dispatch loop.
 pub const OPNAME_PORTAL_MERGE_GREENS: &str = "portal_merge_greens";
 
-/// `interp_jit.py PyFrame._virtualizable_`: debugdata is field 3.
+/// Graph op the portal codewriter records for `pyopcode.py
+/// dispatch_bytecode`'s jitted arm, after `self.last_instr =
+/// intmask(next_instr)`:
+///
+/// `_d = self.debugdata`; if `_d is not None and _d.w_f_trace is not
+/// None`: `ec.bytecode_only_trace(self)`.
+///
+/// Pyre unrolls that loop per instruction, so flatten lowers each copy
+/// to `goto arm_shared` and emits one out-of-line block per jitcode,
+/// matching the single copy in the dispatch loop. `pmg_shared` stays
+/// the merge-green switch; this is a second shared block.
+pub const OPNAME_DISPATCH_BYTECODE_JITTED_ARM: &str = "dispatch_bytecode_jitted_arm";
+
+/// `interp_jit.py PyFrame._virtualizable_`: last_instr, pycode,
+/// valuestackdepth, debugdata.
 const PMG_DEBUGDATA_FIELD_IDX: u16 = 3;
+const ARM_LAST_INSTR_FIELD_IDX: u16 = 0;
 
 const SHARED_PMG_LABEL: &str = "pmg_shared";
 const SHARED_PMG_NONNULL_LABEL: &str = "pmg_nonnull";
 const SHARED_PMG_JOIN_LABEL: &str = "pmg_join";
+
+const SHARED_ARM_LABEL: &str = "arm_shared";
+const SHARED_ARM_NONNULL_LABEL: &str = "arm_nonnull";
+const SHARED_ARM_ARMED_LABEL: &str = "arm_armed";
+const SHARED_ARM_JOIN_LABEL: &str = "arm_join";
 
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
@@ -1329,6 +1349,18 @@ pub struct GraphFlattener<'a> {
     /// `(next_instr, body_label)` so the shared block can switch back
     /// after promoting the greens.
     portal_merge_bodies: Vec<(i64, String)>,
+    /// `(frame, next_instr, ec)` registers of the one out-of-line
+    /// `dispatch_bytecode` jitted arm. Recorded from the first
+    /// `dispatch_bytecode_jitted_arm` copy; later copies must resolve
+    /// to the same three.
+    dispatch_arm_regs: Option<(Register, Register, Register)>,
+    /// `bytecode_only_trace` fn_idx from the first copy.
+    dispatch_arm_fn_idx: Option<i64>,
+    /// Calldescr of that residual (`CallFlavor::MayForce`).
+    dispatch_arm_call_descr: Option<Operand>,
+    /// `(next_instr, body_label)` so the shared arm can switch back
+    /// to the opcode body.
+    dispatch_arm_bodies: Vec<(i64, String)>,
     /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
     /// opnames from the four retired families (BINARY_OP / COMPARE_OP
     /// / BOOL / SETITEM) through
@@ -1414,6 +1446,10 @@ impl<'a> GraphFlattener<'a> {
             portal_merge_regs: None,
             portal_merge_reds: None,
             portal_merge_bodies: Vec::new(),
+            dispatch_arm_regs: None,
+            dispatch_arm_fn_idx: None,
+            dispatch_arm_call_descr: None,
+            dispatch_arm_bodies: Vec::new(),
             lowering_ctx: None,
         }
     }
@@ -1522,6 +1558,10 @@ impl<'a> GraphFlattener<'a> {
         }
         if op.opname == OPNAME_PORTAL_MERGE_GREENS {
             self.serialize_portal_merge_greens(op);
+            return;
+        }
+        if op.opname == OPNAME_DISPATCH_BYTECODE_JITTED_ARM {
+            self.serialize_dispatch_bytecode_jitted_arm(op);
             return;
         }
         let insn = self.flatten_space_operation(op);
@@ -1745,6 +1785,209 @@ impl<'a> GraphFlattener<'a> {
         self.emitline(Insn::op("unreachable", Vec::new()));
         self.emitline(Insn::Unreachable);
     }
+
+    /// Each unrolled instruction jumps to the one
+    /// `dispatch_bytecode` jitted arm (`pyopcode.py dispatch_bytecode`),
+    /// then the shared block switches on `next_instr` back to the opcode
+    /// body. Stay a regular op through `compute_liveness` so
+    /// `follow_label` on the shared `switch` cannot union every body's
+    /// live-in into the instruction-start `-live-`.
+    /// `attach_dispatch_arm_gotos` rewrites this op to `goto` + body
+    /// label after liveness.
+    fn serialize_dispatch_bytecode_jitted_arm(&mut self, op: &SpaceOperation) {
+        let frame = match op.args.first() {
+            Some(arg) => self.expect_dispatch_arm_reg(arg, "frame"),
+            None => panic!("{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing frame"),
+        };
+        let next_instr = match op.args.get(1) {
+            Some(arg) => self.expect_dispatch_arm_reg(arg, "next_instr"),
+            None => panic!("{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing next_instr"),
+        };
+        let ec = match op.args.get(2) {
+            Some(arg) => self.expect_dispatch_arm_reg(arg, "ec"),
+            None => panic!("{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing ec"),
+        };
+        let fn_idx = match op.args.get(3) {
+            Some(arg) => match self.flatten_arg(arg) {
+                Operand::ConstInt(n) => n,
+                other => panic!(
+                    "{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} fn_idx must be ConstInt, got {other:?}"
+                ),
+            },
+            None => panic!("{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing fn_idx"),
+        };
+        let descr = match op.args.get(4) {
+            Some(arg) => self.flatten_arg(arg),
+            None => panic!("{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing calldescr"),
+        };
+        let regs = (frame, next_instr, ec);
+        match self.dispatch_arm_regs {
+            None => {
+                self.dispatch_arm_regs = Some(regs);
+                self.dispatch_arm_fn_idx = Some(fn_idx);
+                self.dispatch_arm_call_descr = Some(descr);
+            }
+            Some(first) => {
+                assert!(
+                    first == regs,
+                    "{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} copies must share \
+                     frame/next_instr/ec registers, first={first:?} this={regs:?}"
+                );
+                assert_eq!(
+                    self.dispatch_arm_fn_idx,
+                    Some(fn_idx),
+                    "{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} copies must share fn_idx"
+                );
+            }
+        }
+        let body_name = format!("arm{}", self.next_label_id);
+        self.next_label_id += 1;
+        self.dispatch_arm_bodies
+            .push((op.offset, body_name.clone()));
+        self.emitline(Insn::op(
+            OPNAME_DISPATCH_BYTECODE_JITTED_ARM,
+            vec![
+                Operand::Register(frame),
+                Operand::Register(next_instr),
+                Operand::Register(ec),
+                Operand::TLabel(TLabel::new(body_name)),
+            ],
+        ));
+    }
+
+    fn expect_dispatch_arm_reg(&mut self, arg: &SpaceOperationArg, what: &str) -> Register {
+        match self.flatten_arg(arg) {
+            Operand::Register(reg) => reg,
+            other => {
+                panic!(
+                    "{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} {what} must be a register, got {other:?}"
+                )
+            }
+        }
+    }
+
+    /// One `dispatch_bytecode` jitted arm per jitcode that has instruction
+    /// starts (`pyopcode.py dispatch_bytecode`). `last_instr` is stored
+    /// from the `next_instr` register (`setfield_vable_i/rid`, the
+    /// register form of `jtransform.py` rewrite_op_setfield), then the
+    /// debugdata / `w_f_trace` diamonds and the MayForce residual
+    /// `bytecode_only_trace`. No `catch_exception`: a raise from the
+    /// residual leaves the jitcode (`warmspot.py
+    /// ExitFrameWithExceptionRef`) and `handle_bytecode` /
+    /// `handle_operation_error` looks up the table by `last_instr`.
+    fn emit_shared_dispatch_arm(&mut self) {
+        let Some((frame, next_instr, ec)) = self.dispatch_arm_regs.take() else {
+            return;
+        };
+        let Some(fn_idx) = self.dispatch_arm_fn_idx.take() else {
+            return;
+        };
+        let Some(descr) = self.dispatch_arm_call_descr.take() else {
+            return;
+        };
+        let bodies = std::mem::take(&mut self.dispatch_arm_bodies);
+        if bodies.is_empty() {
+            return;
+        }
+        let live_reds: Vec<Operand> = vec![Operand::Register(frame), Operand::Register(ec)];
+        let live_reds_and_pc: Vec<Operand> = vec![
+            Operand::Register(frame),
+            Operand::Register(ec),
+            Operand::Register(next_instr),
+        ];
+        let debugdata_dst = self.alloc_scratch_reg(Kind::Ref);
+        let f_trace_dst = self.alloc_scratch_reg(Kind::Ref);
+        self.emitline(Insn::Label(Label::new(SHARED_ARM_LABEL)));
+        // `liveness.py` args-on-`-live-`: portal reds plus the
+        // `next_instr` green. Operand-stack colors stay in the
+        // virtualizable (`interp_jit.py` reds `frame, ec`).
+        self.emitline(Insn::live(live_reds_and_pc.clone()));
+        self.emitline(Insn::op(
+            "setfield_vable_i",
+            vec![
+                Operand::Register(frame),
+                Operand::Register(next_instr),
+                Operand::descr_vable_static_field(ARM_LAST_INSTR_FIELD_IDX),
+            ],
+        ));
+        self.emitline(Insn::live(live_reds.clone()));
+        self.emitline(Insn::op_with_result(
+            "getfield_vable_r",
+            vec![
+                Operand::Register(frame),
+                Operand::descr_vable_static_field(PMG_DEBUGDATA_FIELD_IDX),
+            ],
+            debugdata_dst,
+        ));
+        // `jtransform.py optimize_goto_if_not`: `-live-before` on the
+        // `ptr_iszero` exitswitch.
+        self.emitline(Insn::live(live_reds.clone()));
+        self.emitline(Insn::op(
+            "goto_if_not_ptr_iszero",
+            vec![
+                Operand::Register(debugdata_dst),
+                Operand::TLabel(TLabel::new(SHARED_ARM_NONNULL_LABEL)),
+            ],
+        ));
+        self.emitline(Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(SHARED_ARM_JOIN_LABEL))],
+        ));
+        self.emitline(Insn::Label(Label::new(SHARED_ARM_NONNULL_LABEL)));
+        let f_trace_descr = flatten_descr_by_ptr(&super::flow::DescrByPtr(
+            pyre_jit_trace::descr::frame_debug_data_w_f_trace_descr(),
+        ));
+        self.emitline(Insn::op_with_result(
+            "getfield_gc_r",
+            vec![Operand::Register(debugdata_dst), f_trace_descr],
+            f_trace_dst,
+        ));
+        self.emitline(Insn::live(live_reds.clone()));
+        self.emitline(Insn::op(
+            "goto_if_not_ptr_iszero",
+            vec![
+                Operand::Register(f_trace_dst),
+                Operand::TLabel(TLabel::new(SHARED_ARM_ARMED_LABEL)),
+            ],
+        ));
+        self.emitline(Insn::op(
+            "goto",
+            vec![Operand::TLabel(TLabel::new(SHARED_ARM_JOIN_LABEL))],
+        ));
+        self.emitline(Insn::Label(Label::new(SHARED_ARM_ARMED_LABEL)));
+        let residual = Insn::op(
+            "residual_call_r_v",
+            vec![
+                Operand::ConstInt(fn_idx),
+                Operand::ListOfKind(ListOfKind::new(
+                    Kind::Ref,
+                    vec![Operand::Register(ec), Operand::Register(frame)],
+                )),
+                descr,
+            ],
+        );
+        let trailing_live = insn_needs_trailing_live(&residual);
+        self.emitline(residual);
+        if trailing_live {
+            self.emitline(Insn::live(Vec::new()));
+        }
+        self.emitline(Insn::Label(Label::new(SHARED_ARM_JOIN_LABEL)));
+        let mut switchdict = SwitchDictDescr::new();
+        for (pc, body) in &bodies {
+            switchdict.labels.push((*pc, TLabel::new(body.clone())));
+        }
+        self.emitline(Insn::live(live_reds_and_pc));
+        self.emitline(Insn::op(
+            "switch",
+            vec![
+                Operand::Register(next_instr),
+                Operand::descr(DescrOperand::SwitchDict(switchdict)),
+            ],
+        ));
+        self.emitline(Insn::op("unreachable", Vec::new()));
+        self.emitline(Insn::Unreachable);
+    }
+
     /// `flatten.py popline`: pop the most recently emitted
     /// insn off `ssarepr.insns`.  Used by the `_ovf` rewrite at
     /// `flatten.py line = self.popline()` to retract the arithmetic
@@ -2657,6 +2900,7 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         self.emit_shared_portal_merge_greens();
+        self.emit_shared_dispatch_arm();
     }
 
     /// `flatten.py` `make_bytecode_block`. A user frame with a long
@@ -2978,6 +3222,55 @@ pub(crate) fn attach_portal_merge_greens_gotos(ssarepr: &mut SSARepr) -> Vec<usi
                 new_insns.push(Insn::op(
                     "goto",
                     vec![Operand::TLabel(TLabel::new(SHARED_PMG_LABEL))],
+                ));
+                new_insns.push(Insn::Label(Label::new(body_name)));
+            }
+            _ => new_insns.push(insn),
+        }
+    }
+    ssarepr.insns = new_insns;
+    let map_pos = |pos: usize| remap.get(pos).copied().unwrap_or(pos);
+    for (_, pos) in ssarepr.pc_first_insn_pos.iter_mut() {
+        *pos = map_pos(*pos);
+    }
+    for (pos, _) in ssarepr.abort_permanent_insn_pos.iter_mut() {
+        *pos = map_pos(*pos);
+    }
+    for (pos, _) in ssarepr.pc_run_insn_pos.iter_mut() {
+        *pos = map_pos(*pos);
+    }
+    remap
+}
+
+/// Rewrite each `dispatch_bytecode_jitted_arm` op to `goto arm_shared`
+/// plus its body label, after `compute_liveness` has already run.
+///
+/// Same `follow_label` reason as [`attach_portal_merge_greens_gotos`]:
+/// the shared `switch` must not union every opcode body's live-in into
+/// the instruction-start `-live-`. Assembler and the walker see the
+/// factored `goto`; the walker follows it into `arm_shared`
+/// (`opimpl_goto`) and the shared `switch` (`opimpl_switch`) jumps
+/// back to the body.
+pub(crate) fn attach_dispatch_arm_gotos(ssarepr: &mut SSARepr) -> Vec<usize> {
+    let old_len = ssarepr.insns.len();
+    let mut remap = vec![0usize; old_len];
+    let mut new_insns = Vec::with_capacity(old_len);
+    for (i, insn) in ssarepr.insns.iter().cloned().enumerate() {
+        remap[i] = new_insns.len();
+        match &insn {
+            Insn::Op { opname, args, .. } if opname == OPNAME_DISPATCH_BYTECODE_JITTED_ARM => {
+                let body_name = args.iter().find_map(|arg| match arg {
+                    Operand::TLabel(label) => Some(label.name.clone()),
+                    _ => None,
+                });
+                let Some(body_name) = body_name else {
+                    panic!(
+                        "{OPNAME_DISPATCH_BYTECODE_JITTED_ARM} missing body TLabel, args={args:?}"
+                    );
+                };
+                new_insns.push(Insn::op(
+                    "goto",
+                    vec![Operand::TLabel(TLabel::new(SHARED_ARM_LABEL))],
                 ));
                 new_insns.push(Insn::Label(Label::new(body_name)));
             }

@@ -16424,15 +16424,42 @@ fn orthodox_helper_nested_entry<Sym: WalkSym>(
     })
 }
 
+/// `goto arm_shared` returns through the shared `switch` onto the
+/// opcode body, whose first op is its own `-live-` (`flatten.rs
+/// attach_dispatch_arm_gotos`). The body re-executes from there.
+fn past_shared_dispatch_arm(code: &[u8], live_pc: usize) -> usize {
+    let Some(live) = crate::jitcode_runtime::decode_op_at(code, live_pc) else {
+        return live_pc;
+    };
+    if live.opname != "live" {
+        return live_pc;
+    }
+    let Some(goto) = crate::jitcode_runtime::decode_op_at(code, live.next_pc) else {
+        return live_pc;
+    };
+    if goto.key != "goto/L" {
+        return live_pc;
+    }
+    let target = read_label(code, &goto, 0);
+    if !super::vable_ops::is_shared_arm_block(code, target) {
+        return live_pc;
+    }
+    match crate::jitcode_runtime::decode_op_at(code, goto.next_pc) {
+        Some(body) if body.opname == "live" => goto.next_pc,
+        _ => live_pc,
+    }
+}
+
 /// Resume coordinate for re-executing a loop-header opcode.
 ///
 /// `jtransform.py handle_jit_marker__jit_merge_point` emits the preamble
 /// `-live-`, then `jit_merge_point`, then an op2 `-live-`. The opcode
-/// body runs after that merge. `promote_greens` and the portal profiled
-/// diamond sit between the block-head `-live-` and that merge.
-/// `resume_marker_for_jitcode_pc` answers the preamble; this returns the
-/// op2 `-live-` when `marker` is that preamble, and `marker` unchanged
-/// otherwise.
+/// body runs after that merge; with a shared dispatch arm that is the
+/// body `-live-` after `goto arm_shared`. `promote_greens` and the
+/// portal profiled diamond sit between the block-head `-live-` and that
+/// merge. `resume_marker_for_jitcode_pc` answers the preamble; this
+/// returns the body `-live-` (op2 when there is no shared arm) when
+/// `marker` is that preamble, and `marker` unchanged otherwise.
 fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) -> usize {
     let jitcode = payload.jitcode.as_ref();
     let code = jitcode.code.as_slice();
@@ -16451,7 +16478,13 @@ fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) ->
             let Some(resume) = crate::jitcode_runtime::decode_op_at(code, merge.next_pc) else {
                 return marker;
             };
-            return if resume.opname == "live" && jitcode.can_decode_live_vars(resume.pc, op_live) {
+            if resume.opname != "live" {
+                return marker;
+            }
+            let body = past_shared_dispatch_arm(code, resume.pc);
+            return if jitcode.can_decode_live_vars(body, op_live) {
+                body
+            } else if jitcode.can_decode_live_vars(resume.pc, op_live) {
                 resume.pc
             } else {
                 marker
@@ -16464,8 +16497,16 @@ fn loop_header_guard_resume_marker(payload: &crate::PyJitCode, marker: usize) ->
     // `preamble.next_pc` is that first op; the merge lives in its floor.
     super::resume_snapshot::jit_merge_point_pc_in_containing_floor(payload, preamble.next_pc)
         .and_then(|merge_pc| super::resume_snapshot::resume_pc_past_merge_point(payload, merge_pc))
-        .filter(|&resume| {
-            code.get(resume) == Some(&op_live) && jitcode.can_decode_live_vars(resume, op_live)
+        .filter(|&resume| code.get(resume) == Some(&op_live))
+        .map(|resume| {
+            let body = past_shared_dispatch_arm(code, resume);
+            if jitcode.can_decode_live_vars(body, op_live) {
+                body
+            } else if jitcode.can_decode_live_vars(resume, op_live) {
+                resume
+            } else {
+                marker
+            }
         })
         .unwrap_or(marker)
 }

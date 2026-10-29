@@ -29,8 +29,9 @@ use pyre_interpreter::bytecode::{CodeFlags, CodeObject, Instruction, OpArgState,
 use pyre_interpreter::runtime_ops::{binary_op_tag, compare_op_tag};
 
 use super::flatten::{
-    CallDescrStub, CallFlavor, GraphFlattener, Kind, OPNAME_PORTAL_MERGE_GREENS, ResKind, SSARepr,
-    fully_bound_callee_body, inline_call_targets, slot_for_call_flavor,
+    CallDescrStub, CallFlavor, GraphFlattener, Kind, OPNAME_DISPATCH_BYTECODE_JITTED_ARM,
+    OPNAME_PORTAL_MERGE_GREENS, ResKind, SSARepr, fully_bound_callee_body, inline_call_targets,
+    slot_for_call_flavor,
 };
 
 // RPython: codewriter/flatten.py KINDS = ['int', 'ref', 'float']
@@ -306,8 +307,9 @@ fn goto_label_target(
 }
 
 /// `pmg_shared` starts with `-live-`, `getfield_vable_r` of debugdata,
-/// the branch `-live-`, then `goto_if_not_ptr_iszero`. The we_are_jitted
-/// shared block starts with `getfield_vable_r` and no leading `-live-`.
+/// the branch `-live-`, then `goto_if_not_ptr_iszero`. `arm_shared`
+/// (`pyopcode.py dispatch_bytecode`) starts with `-live-` then
+/// `setfield_vable_i` of `last_instr` and must not match.
 fn is_pmg_shared_entry(code: &[u8], pc: usize) -> bool {
     let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) else {
         return false;
@@ -331,6 +333,38 @@ fn is_pmg_shared_entry(code: &[u8], pc: usize) -> bool {
         .is_some_and(|op| op.opname == "goto_if_not_ptr_iszero")
 }
 
+/// `arm_shared` starts with `-live-` then `setfield_vable_i` of
+/// `last_instr` from the `next_instr` register (`pyopcode.py
+/// dispatch_bytecode`). Register form only: `setfield_vable_i_imm` is
+/// the per-pc valuestackdepth store. Same rule as
+/// `pyre-jit-trace vable_ops::is_shared_arm_block`.
+fn is_arm_shared_entry(code: &[u8], pc: usize) -> bool {
+    let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, pc) else {
+        return false;
+    };
+    if live.opname != "live" {
+        return false;
+    }
+    pyre_jit_trace::jitcode_runtime::decode_op_at(code, live.next_pc)
+        .is_some_and(|op| op.opname == "setfield_vable_i")
+}
+
+/// `goto arm_shared` is followed by the `bodyN` label (no bytes) then
+/// that body's leading `-live-`. Resume there so the snapshot matches
+/// the body's live-in after the shared `switch`.
+fn live_after_arm_shared_goto(
+    code: &[u8],
+    op: &pyre_jit_trace::jitcode_runtime::DecodedOp,
+) -> Option<usize> {
+    if goto_label_target(code, op).is_some_and(|target| is_arm_shared_entry(code, target)) {
+        pyre_jit_trace::jitcode_runtime::decode_op_at(code, op.next_pc)
+            .filter(|body| body.opname == "live")
+            .map(|body| body.pc)
+    } else {
+        None
+    }
+}
+
 fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
     let Some(live) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, marker) else {
         return marker;
@@ -347,7 +381,18 @@ fn guard_resume_live_after_portal_merge(code: &[u8], marker: usize) -> usize {
             let Some(op2) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, op.next_pc) else {
                 return marker;
             };
-            return if op2.opname == "live" { op2.pc } else { marker };
+            if op2.opname != "live" {
+                return marker;
+            }
+            if let Some(after) = pyre_jit_trace::jitcode_runtime::decode_op_at(code, op2.next_pc) {
+                if let Some(body) = live_after_arm_shared_goto(code, &after) {
+                    return body;
+                }
+            }
+            return op2.pc;
+        }
+        if let Some(body) = live_after_arm_shared_goto(code, &op) {
+            return body;
         }
         if !portal_merge_prefix_op(code, &op) {
             return marker;
@@ -2746,193 +2791,43 @@ fn emit_portal_is_being_profiled_read(
     (join, profiled_phi)
 }
 
-/// `flatten.py insert_exits` 2-exit `ptr_iszero` diamond: true (null) then
-/// false (non-null), with `-live-before`. The non-null arm receives `ptr_var`
-/// as an extra input so a subsequent field read can name it.
-/// Same link order as [`emit_portal_is_being_profiled_read`]. The true exit
-/// goes straight to the join, which is the shape
-/// `simplify.py eliminate_empty_blocks` leaves for an empty forwarder.
-fn emit_ptr_iszero_split(
-    graph: &mut super::flow::FunctionGraph,
-    current_block: &SpamBlockRef,
-    current_state: &FrameState,
-    ptr_var: super::flow::Variable,
-    join: &SpamBlockRef,
-    all_walker_blocks: &mut Vec<SpamBlockRef>,
-) -> (SpamBlockRef, super::flow::Variable) {
-    current_block.block().borrow_mut().exitswitch = Some(super::flow::ExitSwitch::Tuple(vec![
-        super::flow::ExitSwitchElement::Marker("ptr_iszero".to_owned()),
-        super::flow::ExitSwitchElement::Value(ptr_var.into()),
-        super::flow::ExitSwitchElement::Marker("-live-before".to_owned()),
-    ]));
-
-    let ptr_in = graph.fresh_variable(Kind::Ref);
-    let nonnull_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
-    };
-    let nonnull_arm = SpamBlockRef::new(graph.new_block(Vec::new()), Some(nonnull_state.clone()));
-    let mut nonnull_inputs = nonnull_state.getvariables();
-    nonnull_inputs.push(ptr_in.into());
-    nonnull_arm.block().borrow_mut().inputargs = nonnull_inputs;
-    all_walker_blocks.push(nonnull_arm.clone());
-
-    let join_state = join
-        .framestate()
-        .expect("dispatch_bytecode join carries a FrameState");
-    append_exit(
-        &current_block.block(),
-        output_link(current_state, &join_state, join.block()),
-    );
-    set_last_bool_exitcase(&current_block.block(), true);
-    let mut nonnull_link_args = current_state.getoutputargs(&nonnull_state);
-    nonnull_link_args.push(ptr_var.into());
-    append_exit(
-        &current_block.block(),
-        super::flow::Link::new(nonnull_link_args, Some(nonnull_arm.block()), None).into_ref(),
-    );
-    set_last_bool_exitcase(&current_block.block(), false);
-
-    (nonnull_arm, ptr_in)
-}
-
-fn link_to_join(source: &SpamBlockRef, join: &SpamBlockRef) {
-    let source_state = source
-        .framestate()
-        .expect("dispatch_bytecode arm carries a FrameState");
-    let join_state = join
-        .framestate()
-        .expect("dispatch_bytecode join carries a FrameState");
-    append_exit(
-        &source.block(),
-        output_link(&source_state, &join_state, join.block()),
-    );
-}
-
-/// `pyopcode.py dispatch_bytecode` jitted arm, after
-/// `self.last_instr = intmask(next_instr)`:
+/// Record one `dispatch_bytecode` jitted-arm placeholder
+/// (`pyopcode.py dispatch_bytecode`). Flatten lowers every copy to
+/// `goto arm_shared` and emits the debugdata / `w_f_trace` diamonds and
+/// the MayForce `bytecode_only_trace` residual once per jitcode.
 ///
-/// ```text
-/// _d = self.debugdata
-/// if _d is not None and _d.w_f_trace is not None:
-///     ec.bytecode_only_trace(self)
-///     next_instr = r_uint(self.last_instr)
-/// ```
-///
-/// `ec.space.reverse_debugging` is constant false. Every jitcode emits this
-/// at each instruction start (`frame_var` is that jitcode's own frame).
-/// The three continue paths (null `debugdata`, null `w_f_trace`, residual)
-/// join and the opcode body continues.
-///
-/// `next_instr = r_uint(self.last_instr)` is served by the residual helper
-/// (`bh_bytecode_only_trace_jitted` rebases through
-/// `set_last_instr_from_next_instr`); the jitcode then continues the current
-/// opcode, so a trace-function jump (`fset_f_lineno`) taken inside
-/// compiled/blackholed code continues at the old opcode — the same gap as
-/// `emit_jump_absolute_tick`'s `jumpto = r_uint(self.last_instr)`
-/// (`interp_jit.py PyFrame.jump_absolute`).
-fn emit_dispatch_bytecode_jitted_trace_arm(
-    code: &CodeObject,
-    graph: &mut super::flow::FunctionGraph,
-    current_block: &SpamBlockRef,
-    current_state: &FrameState,
+/// `last_instr` is stored in that shared block from the `next_instr`
+/// register (`setfield_vable_i/rid`). No `catch_exception`: a raise
+/// from the residual leaves the jitcode (`warmspot.py
+/// ExitFrameWithExceptionRef`) and `handle_bytecode` /
+/// `handle_operation_error` looks up the table by `last_instr`.
+fn record_dispatch_bytecode_jitted_arm(
+    block: &super::flow::BlockRef,
     frame_var: super::flow::Variable,
+    next_instr_var: super::flow::Variable,
     ec_var: super::flow::Variable,
-    py_pc: usize,
-    bytecode_only_trace_fn_idx: u16,
-    bytecode_only_trace_flavor: CallFlavor,
-    catch_for_pc: &[Option<u16>],
-    catch_sites: &[ExceptionCatchSite],
-    unwind_memo: &mut Vec<SharedUnwindEntry>,
-    depth_at_pc: &[u16],
-    all_walker_blocks: &mut Vec<SpamBlockRef>,
-    arm_blocks: &mut Vec<super::flow::BlockRef>,
-) -> SpamBlockRef {
-    let debugdata_var = emit_vable_getfield_ref(
-        graph,
-        &current_block.block(),
-        frame_var,
-        VABLE_DEBUGDATA_FIELD_IDX,
-        py_pc as i64,
+    fn_idx: u16,
+    flavor: CallFlavor,
+    offset: i64,
+) {
+    let mut args: Vec<super::flow::SpaceOperationArg> = vec![
+        frame_var.into(),
+        next_instr_var.into(),
+        ec_var.into(),
+        super::flow::Constant::signed(fn_idx as i64).into(),
+    ];
+    let effect_info = super::flatten::effect_info_for_call_flavor(flavor);
+    args.push(
+        super::flatten::intern_call_descr_stub(effect_info, vec![Kind::Ref, Kind::Ref], None)
+            .into(),
     );
-    let join_state = {
-        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        current_state.copy(&mut fresh)
-    };
-    let join = SpamBlockRef::new(graph.new_block(Vec::new()), Some(join_state.clone()));
-    join.block().borrow_mut().inputargs = join_state.getvariables();
-    all_walker_blocks.push(join.clone());
-    arm_blocks.push(join.block());
-
-    let (dd_nonnull, debugdata_in) = emit_ptr_iszero_split(
-        graph,
-        current_block,
-        current_state,
-        debugdata_var,
-        &join,
-        all_walker_blocks,
+    record_graph_op(
+        block,
+        OPNAME_DISPATCH_BYTECODE_JITTED_ARM,
+        args,
+        None,
+        offset,
     );
-    arm_blocks.push(dd_nonnull.block());
-
-    let w_f_trace = emit_graph_op_with_result(
-        graph,
-        &dd_nonnull.block(),
-        "getfield_gc_r",
-        vec![
-            debugdata_in.into(),
-            pyre_jit_trace::descr::frame_debug_data_w_f_trace_descr().into(),
-        ],
-        Kind::Ref,
-        py_pc as i64,
-    );
-    let dd_nonnull_state = dd_nonnull
-        .framestate()
-        .expect("ptr_iszero non-null arm carries a FrameState");
-    let (tr_armed, _) = emit_ptr_iszero_split(
-        graph,
-        &dd_nonnull,
-        &dd_nonnull_state,
-        w_f_trace,
-        &join,
-        all_walker_blocks,
-    );
-    arm_blocks.push(tr_armed.block());
-
-    let _ = record_residual_call_graph_op(
-        graph,
-        &tr_armed.block(),
-        bytecode_only_trace_fn_idx,
-        bytecode_only_trace_flavor,
-        majit_ir::RuntimeHelperKind::None,
-        vec![],
-        vec![ec_var.into(), frame_var.into()],
-        vec![],
-        vec![Kind::Ref, Kind::Ref],
-        ResKind::Void,
-        py_pc as i64,
-    );
-    if let Some(catch_label) = catch_for_pc.get(py_pc).copied().flatten()
-        && let Some(site) = catch_sites
-            .iter()
-            .find(|site| site.landing_label == catch_label)
-    {
-        attach_catch_exception_edge(
-            code,
-            graph,
-            &tr_armed.block(),
-            &site.landing,
-            &tr_armed
-                .framestate()
-                .expect("ptr_iszero armed arm carries a FrameState"),
-            site,
-            unwind_memo,
-            depth_at_pc,
-        );
-    }
-    link_to_join(&tr_armed, &join);
-    restore_canraise_exit_order(&tr_armed.block());
-
-    join
 }
 
 /// interp_jit.py `PyFrame.jump_absolute` jitted arm: `ec.bytecode_trace(self,
@@ -6121,7 +6016,7 @@ fn unique_defining_ops(
     names
 }
 
-fn py_pc_for_label_index(ssarepr: &super::flatten::SSARepr, label_idx: usize) -> usize {
+fn py_pc_for_label_index(ssarepr: &super::flatten::SSARepr, label_idx: usize) -> Option<usize> {
     let mut best: Option<(usize, i64)> = None;
     for &(py_pc, pos) in &ssarepr.pc_first_insn_pos {
         if pos >= label_idx {
@@ -6132,7 +6027,7 @@ fn py_pc_for_label_index(ssarepr: &super::flatten::SSARepr, label_idx: usize) ->
             }
         }
     }
-    best.map(|(_, pc)| pc as usize).unwrap_or(0)
+    best.map(|(_, pc)| pc as usize)
 }
 
 fn is_rename_or_live_op(opname: &str) -> bool {
@@ -6221,28 +6116,33 @@ fn collect_body_live_in_violations(
 
     let mut checked: HashSet<String> = HashSet::new();
     let mut violations = Vec::new();
-    let mut push_violations = |name: &str, py_pc: usize, opname: String| {
-        if !checked.insert(name.to_string()) {
-            return;
-        }
-        let Some(live_in) = label2alive.get(name) else {
-            return;
+    let empty_extra: HashSet<super::flatten::Register> = HashSet::new();
+    let mut push_violations =
+        |name: &str,
+         py_pc: usize,
+         opname: String,
+         extra_allowed: &HashSet<super::flatten::Register>| {
+            if !checked.insert(name.to_string()) {
+                return;
+            }
+            let Some(live_in) = label2alive.get(name) else {
+                return;
+            };
+            let mut extra: Vec<super::flatten::Register> = live_in
+                .iter()
+                .copied()
+                .filter(|reg| !allowed.contains(reg) && !extra_allowed.contains(reg))
+                .collect();
+            extra.sort_by_key(|reg| (reg.kind as u8, reg.index));
+            for register in extra {
+                violations.push(BodyLiveInViolation {
+                    py_pc,
+                    opname: opname.clone(),
+                    register,
+                    defining_ops: unique_defining_ops(ssarepr, register),
+                });
+            }
         };
-        let mut extra: Vec<super::flatten::Register> = live_in
-            .iter()
-            .copied()
-            .filter(|reg| !allowed.contains(reg))
-            .collect();
-        extra.sort_by_key(|reg| (reg.kind as u8, reg.index));
-        for register in extra {
-            violations.push(BodyLiveInViolation {
-                py_pc,
-                opname: opname.clone(),
-                register,
-                defining_ops: unique_defining_ops(ssarepr, register),
-            });
-        }
-    };
 
     for insn in &ssarepr.insns {
         let super::flatten::Insn::Op { args, .. } = insn else {
@@ -6260,23 +6160,85 @@ fn collect_body_live_in_violations(
                     continue;
                 }
                 let py_pc = *pc as usize;
-                push_violations(&lbl.name, py_pc, instruction_opname_at(code, py_pc));
+                push_violations(
+                    &lbl.name,
+                    py_pc,
+                    instruction_opname_at(code, py_pc),
+                    &empty_extra,
+                );
             }
         }
     }
 
     let handler_names = handler_entry_label_names(ssarepr);
     for name in handler_names {
+        let mut link_defined: HashSet<super::flatten::Register> = HashSet::new();
+        if let Some(&idx) = label_index.get(&name) {
+            for i in (0..idx).rev() {
+                let super::flatten::Insn::Op { opname, result, .. } = &ssarepr.insns[i] else {
+                    break;
+                };
+                if !(is_rename_or_live_op(opname) || is_last_exc_op(opname)) {
+                    break;
+                }
+                if let Some(reg) = result {
+                    link_defined.insert(*reg);
+                }
+            }
+            for insn in ssarepr.insns.iter().skip(idx + 1) {
+                let super::flatten::Insn::Op { opname, result, .. } = insn else {
+                    break;
+                };
+                if !(is_rename_or_live_op(opname) || is_last_exc_op(opname)) {
+                    break;
+                }
+                if is_last_exc_op(opname) {
+                    if let Some(reg) = result {
+                        link_defined.insert(*reg);
+                    }
+                }
+            }
+        }
+        let goto_indices: Vec<usize> = ssarepr
+            .insns
+            .iter()
+            .enumerate()
+            .filter_map(|(i, insn)| {
+                let super::flatten::Insn::Op { opname, args, .. } = insn else {
+                    return None;
+                };
+                if opname != "goto" {
+                    return None;
+                }
+                match args.first() {
+                    Some(super::flatten::Operand::TLabel(lbl)) if lbl.name == name => Some(i),
+                    _ => None,
+                }
+            })
+            .collect();
+        for i in goto_indices {
+            for j in (0..i).rev() {
+                let super::flatten::Insn::Op { opname, result, .. } = &ssarepr.insns[j] else {
+                    break;
+                };
+                if !(is_rename_or_live_op(opname) || is_last_exc_op(opname)) {
+                    break;
+                }
+                if let Some(reg) = result {
+                    link_defined.insert(*reg);
+                }
+            }
+        }
         let py_pc = label_index
             .get(&name)
-            .map(|&idx| py_pc_for_label_index(ssarepr, idx))
-            .unwrap_or(0);
+            .and_then(|&idx| py_pc_for_label_index(ssarepr, idx))
+            .unwrap_or(code.instructions.len());
         let opname = if py_pc < code.instructions.len() {
             format!("handler_entry:{}", instruction_opname_at(code, py_pc))
         } else {
             "handler_entry".to_string()
         };
-        push_violations(&name, py_pc, opname);
+        push_violations(&name, py_pc, opname, &link_defined);
     }
 
     violations.sort_by_key(|v| {
@@ -8334,7 +8296,6 @@ impl CodeWriter {
         // blocks deterministically (HashMap iteration order would
         // otherwise diverge bridge-fallback Variable colors).
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
-        let mut arm_blocks: Vec<super::flow::BlockRef> = Vec::new();
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
@@ -10505,6 +10466,7 @@ impl CodeWriter {
                     let emit_portal_merge = is_true_portal
                         && !block_closed_by_terminator
                         && (at_instruction_start || is_foriter_exhaust);
+                    let mut instr_next_instr_var: Option<super::flow::Variable> = None;
                     if emit_portal_merge
                         || (loop_header_pcs.contains(&py_pc) && !block_closed_by_terminator)
                     {
@@ -10567,6 +10529,7 @@ impl CodeWriter {
                                 py_pc as i64,
                             );
                             portal_next_instr_vars.push(next_instr_var);
+                            instr_next_instr_var = Some(next_instr_var);
                             // One `portal_merge_greens` per instruction;
                             // flatten shares `get_is_being_profiled` +
                             // `promote_greens` as `goto pmg_shared`.
@@ -10782,86 +10745,54 @@ impl CodeWriter {
                     exception_edge_handled = false;
 
                     // `dispatch_bytecode` (pyopcode.py) writes
-                    // `self.last_instr = intmask(next_instr)` before every opcode.
-                    // That store is a `setfield_vable_i` of the standard virtualizable
-                    // (`_opimpl_setfield_vable`): compiled code only updates
-                    // `virtualizable_boxes`, and the blackhole replays it like any
-                    // other op. The value is the trivia-normalized opcode PC
-                    // (`skip_python_trivia_forward`): f_lasti / f_lineno name
-                    // the real opcode, not the EXTENDED_ARG prefix.
-                    // The immediate is inline (`setfield_vable_i_imm/rdd`) so a
-                    // per-instruction constant does not consume a `constants_i`
-                    // slot (`assembler.py` `check_result`).
-                    {
-                        if at_instruction_start && current_block.block().borrow().exits.is_empty() {
-                            let norm = pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(
-                                code, py_pc,
-                            );
-                            // `emit_jump_absolute_tick` splits a fresh block
-                            // for the poll so JUMP_BACKWARD does not share a
-                            // CFG block with STORE_FAST. Same here: a
-                            // fall-through predecessor would otherwise keep
-                            // `last_instr` + the debugdata diamond on the
-                            // prior opcode's block. Flatten serializes until
-                            // `raise` and then `insert_exits` would see the
-                            // diamond's `ptr_iszero` exitswitch, dropping
-                            // `catch_exception`.
-                            let mut arm_state = {
-                                let mut fresh = |kind| fresh_variable_for_state(&mut graph, kind);
-                                current_state.copy(&mut fresh)
-                            };
-                            arm_state.next_offset = py_pc;
-                            arm_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            let arm_block = SpamBlockRef::new(
-                                graph.new_block(Vec::new()),
-                                Some(arm_state.clone()),
-                            );
-                            all_walker_blocks.push(arm_block.clone());
-                            arm_block.block().borrow_mut().inputargs = arm_state.getvariables();
-                            append_exit(
-                                &current_block.block(),
-                                output_link(&current_state, &arm_state, arm_block.block()),
-                            );
-                            let v_li: super::flow::FlowValue =
-                                super::flow::Constant::signed(norm as i64).into();
-                            record_graph_op(
-                                &arm_block.block(),
-                                "setfield_vable_i",
-                                vable_setfield_int_graph_args(
-                                    frame_var.into(),
-                                    v_li.into(),
-                                    VABLE_LAST_INSTR_FIELD_IDX,
-                                ),
-                                None,
-                                py_pc as i64,
-                            );
-                            // `dispatch_bytecode` jitted arm (`pyopcode.py`):
-                            // `_d = self.debugdata`; if `_d.w_f_trace` then
-                            // `ec.bytecode_only_trace(self)` and
-                            // `next_instr = r_uint(self.last_instr)`.
-                            current_block = emit_dispatch_bytecode_jitted_trace_arm(
-                                code,
-                                &mut graph,
-                                &arm_block,
-                                &arm_state,
-                                frame_var,
-                                ec_var,
-                                py_pc,
-                                bytecode_only_trace_jitted_fn_idx,
-                                bytecode_only_trace_jitted_fn_flavor,
-                                &catch_for_pc,
-                                &catch_sites,
-                                &mut unwind_memo,
-                                &depth_at_pc,
-                                &mut all_walker_blocks,
-                                &mut arm_blocks,
-                            );
-                            if let Some(state) = current_block.framestate() {
-                                current_state = state;
+                    // `self.last_instr = intmask(next_instr)` before every
+                    // opcode, then the jitted arm tests `debugdata.w_f_trace`.
+                    // Flatten keeps one copy of that arm per jitcode
+                    // (`goto arm_shared`); the store uses the `next_instr`
+                    // register (`setfield_vable_i/rid`). Trivia units
+                    // (`Cache` / `ExtendedArg` / `NotTaken` / `Resume` /
+                    // `Nop`) are not instruction starts. Portal copies
+                    // reuse the merge-green `int_copy`; non-portal
+                    // jitcodes emit their own.
+                    if at_instruction_start && current_block.block().borrow().exits.is_empty() {
+                        let next_instr_var = match instr_next_instr_var {
+                            Some(v) => v,
+                            None => {
+                                let v = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "int_copy",
+                                    vec![super::flow::Constant::signed(py_pc as i64).into()],
+                                    Kind::Int,
+                                    py_pc as i64,
+                                );
+                                portal_next_instr_vars.push(v);
+                                v
                             }
-                            needs_fallthrough = true;
-                        }
-                        needs_fallthrough = true;
+                        };
+                        record_dispatch_bytecode_jitted_arm(
+                            &current_block.block(),
+                            frame_var,
+                            next_instr_var,
+                            ec_var,
+                            bytecode_only_trace_jitted_fn_idx,
+                            bytecode_only_trace_jitted_fn_flavor,
+                            py_pc as i64,
+                        );
+                        // Body-leading `-live-` after the arm placeholder.
+                        // `compute_liveness` fills it with the opcode body's
+                        // live-in; after `attach_dispatch_arm_gotos` it sits
+                        // at `Label bodyN`, the same shape as `pmgN`.
+                        // Empty-args graph `-live-` (`jtransform.py
+                        // SpaceOperation('-live-', [], None)`), not the
+                        // per-PC `emit_live_placeholder!` marker.
+                        record_graph_op(
+                            &current_block.block(),
+                            super::flatten::OPNAME_LIVE,
+                            Vec::new(),
+                            None,
+                            py_pc as i64,
+                        );
                     }
 
                     // Snapshot the entry valuestackdepth for
@@ -16702,41 +16633,13 @@ impl CodeWriter {
         // `flatten.py insert_exits` emits `-live-` before `goto_if_not*`
         // and switch, and `jtransform.py handle_residual_call` emits one
         // after a residual call.  Neither emits a marker at the head of a
-        // plain block or before a `goto`.  The blocks of
-        // `emit_dispatch_bytecode_jitted_trace_arm` (`arm_blocks`) get none
-        // unless they open a PC's first op: they share that PC's first op
-        // already recorded in `pc_first_insn_pos`, and a guard in the opcode
-        // body resumes at the PC's own marker, which re-runs the arm from
-        // the `debugdata` read.  Every other label keeps the block-entry
-        // marker.  A guard in a marker-less arm block resumes at the opcode-start
-        // marker: the walker drops its `-live-` anchor after every branch
-        // (`jitcode_dispatch/mod.rs`).
+        // plain block or before a `goto`.  Every label keeps the
+        // block-entry marker unless the next insn is already a `-live-`
+        // or another Label.  The `dispatch_bytecode` arm is flatten
+        // `emitline` (`arm_shared`), not a graph block, so it is not in
+        // `label_blocks`.
         {
-            let mut arm_ptrs: Vec<*const std::cell::RefCell<super::flow::Block>> = arm_blocks
-                .iter()
-                .map(|b| b.as_ptr_addr() as *const std::cell::RefCell<super::flow::Block>)
-                .collect();
-            arm_ptrs.sort();
-            let mut arm_label_names: Vec<&str> = spliced
-                .label_blocks
-                .iter()
-                .filter(|(_, block)| {
-                    arm_ptrs
-                        .binary_search(
-                            &(block.as_ptr_addr() as *const std::cell::RefCell<super::flow::Block>),
-                        )
-                        .is_ok()
-                })
-                .map(|(name, _)| name.as_str())
-                .collect();
-            arm_label_names.sort();
             let insn_len = spliced.insns.len();
-            let mut is_pc_first = vec![false; insn_len];
-            for &(_, pos) in &spliced.pc_first_insn_pos {
-                if pos < insn_len {
-                    is_pc_first[pos] = true;
-                }
-            }
             let mut new_insns: Vec<super::flatten::Insn> = Vec::with_capacity(insn_len + 4);
             // `shift[old_pos]` = number of markers inserted strictly before
             // `old_pos`; a block-head op at `label_pos + 1` counts the
@@ -16747,22 +16650,13 @@ impl CodeWriter {
             let mut insns = std::mem::take(&mut spliced.insns).into_iter().peekable();
             while let Some(insn) = insns.next() {
                 shift.push(inserted);
-                let is_arm_label = match &insn {
-                    super::flatten::Insn::Label(label) => {
-                        arm_label_names.binary_search(&label.name.as_str()).is_ok()
-                    }
-                    _ => false,
-                };
                 let is_label = matches!(insn, super::flatten::Insn::Label(_));
                 new_insns.push(insn);
                 if is_label {
-                    let next_old_pos = shift.len();
                     let next_blocks_marker = insns.peek().map_or(true, |next| {
                         next.is_live() || matches!(next, super::flatten::Insn::Label(_))
                     });
-                    let next_is_pc_resume =
-                        next_old_pos < is_pc_first.len() && is_pc_first[next_old_pos];
-                    if !next_blocks_marker && (next_is_pc_resume || !is_arm_label) {
+                    if !next_blocks_marker {
                         new_insns.push(super::flatten::Insn::live(Vec::new()));
                         inserted += 1;
                     }
@@ -17077,18 +16971,22 @@ impl CodeWriter {
             true,
         );
         let pmg_remap = super::flatten::attach_portal_merge_greens_gotos(&mut ssarepr);
-        let remap_pmg = |pos: usize| pmg_remap.get(pos).copied().unwrap_or(pos);
+        let arm_remap = super::flatten::attach_dispatch_arm_gotos(&mut ssarepr);
+        let remap_shared = |pos: usize| {
+            let after_pmg = pmg_remap.get(pos).copied().unwrap_or(pos);
+            arm_remap.get(after_pmg).copied().unwrap_or(after_pmg)
+        };
         let post_remove_live_indices: Vec<usize> = post_remove_live_indices
             .into_iter()
-            .map(remap_pmg)
+            .map(remap_shared)
             .collect();
         let after_call_post_merge: Vec<Option<usize>> = after_call_post_merge
             .into_iter()
-            .map(|pos| pos.map(remap_pmg))
+            .map(|pos| pos.map(remap_shared))
             .collect();
         let first_insn_post_merge: Vec<Option<usize>> = first_insn_post_merge
             .into_iter()
-            .map(|pos| pos.map(remap_pmg))
+            .map(|pos| pos.map(remap_shared))
             .collect();
         if is_true_portal {
             self.body_live_in_violations
@@ -18895,9 +18793,10 @@ mod tests {
             "catch_exception must be adjacent to the FOR_ITER residual call"
         );
 
-        // Instruction-start `we_are_jitted` emits `ptr_nonzero` on `debugdata`
-        // before the opcode body.  FOR_ITER's exhaustion split is the one
-        // after its StopIteration catch.
+        // Instruction-start `dispatch_bytecode` tests `debugdata` in
+        // the shared `arm_shared` copy (`goto_if_not_ptr_iszero`).
+        // FOR_ITER's exhaustion split is the `ptr_nonzero` after its
+        // StopIteration catch.
         let ptr_nonzero_index = ops
             .iter()
             .enumerate()
@@ -20776,19 +20675,44 @@ mod tests {
             opnames.contains(&"getfield_gc_i"),
             "non-null arm reads FrameDebugData.is_being_profiled, got {opnames:?}"
         );
-        // `dispatch_bytecode` jitted arm after `last_instr = intmask(next_instr)`:
-        // `-live-` + `getfield_vable_r` of `debugdata` + `ptr_iszero` diamond.
-        // Flatten emits an extra `-live-` for `-live-before` on the exitswitch.
-        assert!(
-            opnames.windows(5).any(|w| w
-                == [
-                    "setfield_vable_i_imm",
+        // `dispatch_bytecode` stores `last_instr` from the `next_instr`
+        // register (`setfield_vable_i/rid`) in the one `arm_shared`
+        // copy, then the debugdata / `w_f_trace` diamonds. Per
+        // instruction start is `goto arm_shared`. Flatten emits an
+        // extra `-live-` for `-live-before` on the exitswitch.
+        let arm_windows = opnames
+            .windows(5)
+            .filter(|w| {
+                *w == [
+                    "setfield_vable_i",
                     "live",
                     "getfield_vable_r",
                     "live",
-                    "goto_if_not_ptr_iszero"
-                ]),
-            "instruction start must emit last_instr then the debugdata arm, got {opnames:?}"
+                    "goto_if_not_ptr_iszero",
+                ]
+            })
+            .count();
+        assert_eq!(
+            arm_windows, 1,
+            "the debugdata arm must live in one arm_shared copy, got {opnames:?}"
+        );
+        let bytes = pyjit.jitcode.code.as_slice();
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+        let arm_targets: Vec<usize> = ops
+            .iter()
+            .filter(|op| op.opname == "goto")
+            .filter_map(|op| {
+                let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+                is_arm_shared_entry(bytes, target).then_some(target)
+            })
+            .collect();
+        assert!(
+            !arm_targets.is_empty(),
+            "each instruction start must goto arm_shared, got {opnames:?}"
+        );
+        assert!(
+            arm_targets.iter().all(|&t| t == arm_targets[0]),
+            "gotos must share one arm_shared, got {arm_targets:?}"
         );
         assert!(
             opnames.contains(&"getfield_gc_r"),
@@ -21122,16 +21046,22 @@ class C:
                 );
                 assert_eq!(ops[i + 1].opname, "live", "op2 -live- after merge");
                 let op2 = ops[i + 1].pc;
-                // After op2: the link to the shared dispatch head (which
-                // stores `last_instr` from the merge green).  Resume of
-                // that store is still op2.
-                let body_pc = ops[i + 2].pc;
+                // After op2: `goto arm_shared`; Label bodyN (no bytes);
+                // body-leading `-live-`. Guard resume skips the goto onto
+                // that live so the snapshot matches the body's live-in.
+                assert_eq!(ops[i + 2].opname, "goto", "goto arm_shared after op2");
                 assert_eq!(
-                    pyjit.resume_marker_for_jitcode_pc(body_pc),
-                    Some(op2),
-                    "guard resume must land on op2 (jtransform handle_jit_marker__jit_merge_point)"
+                    ops[i + 3].opname,
+                    "live",
+                    "bodyN leading -live- after goto arm_shared"
                 );
-                if let Some(ar) = pyjit.after_residual_marker_for_jitcode_pc(body_pc) {
+                let body_live = ops[i + 3].pc;
+                assert_eq!(
+                    pyjit.resume_marker_for_jitcode_pc(ops[i + 2].pc),
+                    Some(body_live),
+                    "guard resume skips goto arm_shared onto the body -live-"
+                );
+                if let Some(ar) = pyjit.after_residual_marker_for_jitcode_pc(ops[i + 2].pc) {
                     assert!(
                         op3_pcs.contains(&ar),
                         "after_residual {ar} must land on op3 so blackhole CRNs at the merge; op2 is {op2}"
@@ -21504,7 +21434,7 @@ def f(xs):
         let total_i = pyjit.jitcode.num_regs_i() as usize + pyjit.jitcode.constants_i.len();
         let total_r = pyjit.jitcode.num_regs_r() as usize + pyjit.jitcode.constants_r.len();
         assert!(
-            total_i <= 256 && total_r <= 256,
+            total_i <= 256 && total_r <= 256 && code_len <= 0xFFFF,
             "try/except portal must assemble: units={} merges={} code_len={} total_i={} total_r={}",
             code.instructions.len(),
             merges,
@@ -21551,20 +21481,31 @@ def f(xs):
             };
             merge_pcs.push(copy_imm);
         }
-        let switch = ops
-            .iter()
-            .find(|op| op.key == "switch/id")
-            .expect("shared hook switch");
-        let descr_idx = u16::from_le_bytes([
-            pyjit.jitcode.code[switch.pc + 2],
-            pyjit.jitcode.code[switch.pc + 3],
-        ]) as usize;
-        let keys: Vec<i64> = match pyjit.jitcode.descr_at(descr_idx) {
-            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
-                descr.switch_const_keys_in_order().to_vec()
+        let switches: Vec<_> = ops.iter().filter(|op| op.key == "switch/id").collect();
+        assert_eq!(
+            switches.len(),
+            2,
+            "portal has pmg_shared and arm_shared switches, got {}",
+            switches.len()
+        );
+        let switch_keys = |switch: &pyre_jit_trace::jitcode_runtime::DecodedOp| {
+            let descr_idx = u16::from_le_bytes([
+                pyjit.jitcode.code[switch.pc + 2],
+                pyjit.jitcode.code[switch.pc + 3],
+            ]) as usize;
+            match pyjit.jitcode.descr_at(descr_idx) {
+                Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
+                    descr.switch_const_keys_in_order().to_vec()
+                }
+                other => panic!("switch descr {descr_idx} is not Switch: {other:?}"),
             }
-            other => panic!("switch descr {descr_idx} is not Switch: {other:?}"),
         };
+        let keys = switch_keys(switches[0]);
+        let arm_keys = switch_keys(switches[1]);
+        assert_eq!(
+            keys, arm_keys,
+            "arm_shared switch keys must match pmg_shared merge-green PCs"
+        );
         for pc in &merge_pcs {
             assert!(
                 keys.contains(pc),
@@ -21579,20 +21520,34 @@ def f(xs):
         let module_jit = assemble_portal(&module);
         let module_ops: Vec<_> =
             pyre_jit_trace::jitcode_runtime::decoded_ops(&module_jit.jitcode.code).collect();
-        let module_switch = module_ops
+        let module_switches: Vec<_> = module_ops
             .iter()
-            .find(|op| op.key == "switch/id")
-            .expect("module shared hook switch");
-        let module_descr_idx = u16::from_le_bytes([
-            module_jit.jitcode.code[module_switch.pc + 2],
-            module_jit.jitcode.code[module_switch.pc + 3],
-        ]) as usize;
-        let module_keys: Vec<i64> = match module_jit.jitcode.descr_at(module_descr_idx) {
-            Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
-                descr.switch_const_keys_in_order().to_vec()
+            .filter(|op| op.key == "switch/id")
+            .collect();
+        assert_eq!(
+            module_switches.len(),
+            2,
+            "module portal has pmg_shared and arm_shared switches, got {}",
+            module_switches.len()
+        );
+        let module_switch_keys = |switch: &pyre_jit_trace::jitcode_runtime::DecodedOp| {
+            let descr_idx = u16::from_le_bytes([
+                module_jit.jitcode.code[switch.pc + 2],
+                module_jit.jitcode.code[switch.pc + 3],
+            ]) as usize;
+            match module_jit.jitcode.descr_at(descr_idx) {
+                Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
+                    descr.switch_const_keys_in_order().to_vec()
+                }
+                other => panic!("module switch descr {descr_idx} is not Switch: {other:?}"),
             }
-            other => panic!("module switch descr {module_descr_idx} is not Switch: {other:?}"),
         };
+        let module_keys = module_switch_keys(module_switches[0]);
+        assert_eq!(
+            module_keys,
+            module_switch_keys(module_switches[1]),
+            "module arm_shared switch keys must match pmg_shared"
+        );
         let mut module_merge_pcs = Vec::new();
         for (index, op) in module_ops.iter().enumerate() {
             if op.key != "jit_merge_point" && !op.key.starts_with("jit_merge_point/") {
@@ -21634,6 +21589,72 @@ def f(xs):
     }
 
     #[test]
+    fn portal_we_are_jitted_is_shared_residual_block() {
+        // One `dispatch_bytecode` copy per jitcode (`pyopcode.py
+        // dispatch_bytecode`): `setfield_vable_i` of `last_instr`,
+        // debugdata / `w_f_trace` diamonds, one MayForce
+        // `bytecode_only_trace` residual, then `switch next_instr`.
+        // `pmg_shared` is the other switch (`interp_jit.py
+        // PyFrame.dispatch`).
+        let code = first_nested_function_code("def f():\n    return 1\n");
+        let pyjit = assemble_portal(&code);
+        let bytes = pyjit.jitcode.code.as_slice();
+        let ops: Vec<_> = pyre_jit_trace::jitcode_runtime::decoded_ops(bytes).collect();
+        let keys: Vec<_> = ops.iter().map(|op| op.key).collect();
+        let residual_void = ops
+            .iter()
+            .filter(|op| op.opname == "residual_call_r_v")
+            .count();
+        assert_eq!(
+            residual_void, 1,
+            "one bytecode_only_trace residual per jitcode, got {keys:?}"
+        );
+        let switches: Vec<_> = ops.iter().filter(|op| op.key == "switch/id").collect();
+        assert_eq!(
+            switches.len(),
+            2,
+            "pmg_shared and arm_shared each switch, got {keys:?}"
+        );
+        let arm_gotos: Vec<usize> = ops
+            .iter()
+            .filter(|op| op.opname == "goto")
+            .filter_map(|op| {
+                let target = u16::from_le_bytes([bytes[op.pc + 1], bytes[op.pc + 2]]) as usize;
+                is_arm_shared_entry(bytes, target).then_some(target)
+            })
+            .collect();
+        assert!(
+            !arm_gotos.is_empty() && arm_gotos.iter().all(|&t| t == arm_gotos[0]),
+            "instruction starts share one arm_shared, got {arm_gotos:?}"
+        );
+        let arm_pc = arm_gotos[0];
+        let arm_ops: Vec<_> = ops.iter().filter(|op| op.pc >= arm_pc).collect();
+        assert!(
+            arm_ops.iter().any(|op| op.key == "setfield_vable_i/rid"),
+            "arm_shared stores last_instr from next_instr, got {keys:?}"
+        );
+        assert!(
+            arm_ops
+                .iter()
+                .any(|op| op.key == "goto_if_not_ptr_iszero/rL"),
+            "arm_shared tests debugdata / w_f_trace, got {keys:?}"
+        );
+        assert!(
+            arm_ops.iter().any(|op| op.opname == "getfield_gc_r"),
+            "arm_shared reads FrameDebugData.w_f_trace, got {keys:?}"
+        );
+        assert!(
+            arm_ops.iter().any(|op| op.opname == "residual_call_r_v"),
+            "arm_shared residual-calls bytecode_only_trace, got {keys:?}"
+        );
+        assert!(
+            !arm_ops.iter().any(|op| op.key == "catch_exception/L"),
+            "arm_shared has no catch_exception; a raise leaves the jitcode \
+             (handle_bytecode / handle_operation_error by last_instr)"
+        );
+    }
+
+    #[test]
     fn portal_exception_metadata_jitstress_run_still_assembles() {
         // Per-instruction portal merge plus the dispatch_bytecode jitted
         // arm must keep `run` inside the u16 `code_len` ceiling.
@@ -21644,8 +21665,39 @@ def f(xs):
         let code_len = pyjit.jitcode.code.len();
         let total_i = pyjit.jitcode.num_regs_i() as usize + pyjit.jitcode.constants_i.len();
         let total_r = pyjit.jitcode.num_regs_r() as usize + pyjit.jitcode.constants_r.len();
+        let ops: Vec<_> =
+            pyre_jit_trace::jitcode_runtime::decoded_ops(&pyjit.jitcode.code).collect();
+        let switches: Vec<_> = ops.iter().filter(|op| op.key == "switch/id").collect();
+        assert_eq!(
+            switches.len(),
+            2,
+            "one pmg_shared switch and one arm_shared switch"
+        );
+        let switch_keys = |switch: &pyre_jit_trace::jitcode_runtime::DecodedOp| {
+            let descr_idx = u16::from_le_bytes([
+                pyjit.jitcode.code[switch.pc + 2],
+                pyjit.jitcode.code[switch.pc + 3],
+            ]) as usize;
+            match pyjit.jitcode.descr_at(descr_idx) {
+                Some(majit_metainterp::jitcode::RuntimeBhDescr::Descr(descr)) => {
+                    descr.switch_const_keys_in_order().to_vec()
+                }
+                other => panic!("switch descr {descr_idx} is not Switch: {other:?}"),
+            }
+        };
+        let pmg_keys = switch_keys(switches[0]);
+        let arm_keys = switch_keys(switches[1]);
+        assert_eq!(
+            pmg_keys, arm_keys,
+            "pmg_shared and arm_shared switch the same instruction-start PCs"
+        );
+        eprintln!(
+            "portal_exception_metadata_jitstress_run_still_assembles: units={} code_len={}",
+            code.instructions.len(),
+            code_len
+        );
         assert!(
-            total_i <= 256 && total_r <= 256,
+            total_i <= 256 && total_r <= 256 && code_len <= 0xFFFF,
             "exception_metadata_jitstress.run must assemble: units={} code_len={} total_i={} total_r={}",
             code.instructions.len(),
             code_len,

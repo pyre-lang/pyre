@@ -953,14 +953,16 @@ pub struct WalkSession {
     /// outside every region rather than inheriting one.
     pub binop_rewind_depth: usize,
     /// The unrolled portal joins every instruction at one
-    /// `dispatch_bytecode` copy.  `liveness.py` `follow_label` on the
-    /// `SwitchDictDescr` unions every body's SSA into that copy's
-    /// `-live-`.  `resume.py` `rebuild_from_resumedata` names this
-    /// opcode's slots, so a `goto` into the copy keeps the predecessor
-    /// opcode's `live_before` until the switch leaves it.
+    /// `dispatch_bytecode` / `portal_merge_greens` copy.  `liveness.py`
+    /// `follow_label` on the `SwitchDictDescr` would union every body's
+    /// SSA into that copy's `-live-` if the `goto` were visible during
+    /// liveness; flatten keeps the graph op until after that pass.
+    /// `resume.py` `rebuild_from_resumedata` names this opcode's slots,
+    /// so a `goto` into the copy keeps the predecessor opcode's
+    /// `live_before` until the switch leaves it.
     pub hold_opcode_live_before: bool,
     /// `dispatch_bytecode` stored `self.last_instr = next_instr` at the
-    /// shared we_are_jitted copy.  `pmg_shared` only reads debugdata and
+    /// shared `arm_shared` copy.  `pmg_shared` only reads debugdata and
     /// promotes greens (`interp_jit.py` `PyFrame.dispatch`); it does not
     /// write `last_instr`.  `shared_hook_next_instr` reads that field
     /// only when this is set.
@@ -1187,7 +1189,7 @@ impl WalkSession {
     /// later raise in the same copy (the copy's first op, or a
     /// `refresh_virtualizable_shadow_from_heap` on the next `step`)
     /// sees live banks that have moved; keep the entering snapshot.
-    /// Mixing two `pmg_shared` `uses_vable_last_instr` values on
+    /// Mixing `arm_shared` / `pmg_shared` `uses_vable_last_instr` on
     /// one hold is a walk bug.
     pub(crate) fn begin_hold_opcode_live_before(
         &mut self,
@@ -5292,19 +5294,22 @@ pub fn step<Sym: WalkSym>(
     // `self.pc - SIZE_LIVE_OP`).  `op.pc` is the genuine jitcode offset of
     // the `-live-` byte.  Side-data only — read under a debug audit gate.
     // The first instruction may land on flatten's shared
-    // `pmg_shared` copy (`getfield debugdata`) with no `goto/L`.
+    // `pmg_shared` / `arm_shared` copy with no `goto/L`.
     // Hold the predecessor opcode's live across that copy's `-live-`.
     // Raise the hold before synthesizing DEBUG_MERGE_POINT: the
     // copy's first op would otherwise floor to py_pc 0.
     vable_ops::begin_hold_if_shared_hook(code, ctx, op.pc);
-    // `pmg_shared` sits after the body (`emitline`), so `py_exact` of
-    // `goto pmg_shared` floors to the last opcode (RETURN) and would
-    // overlay NULL stack slots.  This is the one hold-raise for that
-    // goto: it must precede `step_vstack_mirror`.  The `"goto/L"` arm
-    // does not raise again (that arm runs after the mirror).
+    // `pmg_shared` / `arm_shared` sit after the body (`emitline`), so
+    // `py_exact` of `goto pmg_shared` / `goto arm_shared` floors to
+    // the last opcode (RETURN) and would overlay NULL stack slots.
+    // This is the one hold-raise for that goto: it must precede
+    // `step_vstack_mirror`.  The `"goto/L"` arm does not raise again
+    // (that arm runs after the mirror).
     if op.key == "goto/L" {
         let target = read_label(code, &op, 0);
-        if vable_ops::is_shared_pmg_block(code, target) {
+        if vable_ops::is_shared_pmg_block(code, target)
+            || vable_ops::is_shared_arm_block(code, target)
+        {
             vable_ops::begin_hold_if_shared_hook(code, ctx, target);
         }
     }

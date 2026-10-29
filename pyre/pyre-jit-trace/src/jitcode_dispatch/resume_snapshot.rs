@@ -32,9 +32,9 @@ fn vable_static_int<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, name: &str) ->
 }
 
 /// `dispatch_bytecode` stored `self.last_instr = next_instr` at the
-/// shared we_are_jitted head (`setfield_vable_i`).  That next_instr is
-/// the Python opcode whose `goto` entered the copy; use it as orgpc
-/// when the walk is still inside that copy
+/// shared arm (`setfield_vable_i` from the `next_instr` register).
+/// That next_instr is the Python opcode whose `goto` entered the copy;
+/// use it as orgpc when the walk is still inside that copy
 /// (`hold_uses_vable_last_instr`).  `pmg_shared` does not write
 /// `last_instr`, so a pmg hold leaves orgpc on the entering opcode's
 /// `live_before` py.

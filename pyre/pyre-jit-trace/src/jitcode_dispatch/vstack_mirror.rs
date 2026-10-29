@@ -1272,7 +1272,7 @@ pub(crate) fn step_vstack_mirror<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym
         return;
     }
     // Flatten's shared copies sit after the body (`emitline`), so a
-    // `goto pmg_shared` / `goto waj_shared` floors to the last opcode
+    // `goto pmg_shared` / `goto arm_shared` floors to the last opcode
     // (RETURN) and would overlay NULL stack slots.  The hold is raised
     // on those gotos before this step (`begin_hold_if_shared_hook`).
     if ctx.session.borrow().hold_opcode_live_before {
