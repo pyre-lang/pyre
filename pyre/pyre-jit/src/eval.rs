@@ -11788,8 +11788,8 @@ fn maybe_compile_and_run(
     // (not `has_compiled_loop`) so a bare `compile_tmp_callback` token
     // (`JC_TEMPORARY`) falls through to the counter tick below instead of
     // entering `execute_assembler`. The tmp cell then re-ticks until the
-    // real loop compiles. `get_compiled_meta` is the execute-path VALUE;
-    // a miss there aborts the run.
+    // real loop compiles. `get_compiled_meta` is leftover frontend metadata,
+    // not the enter predicate.
     // Why a compiled loop for this green key is or is not enterable, per
     // back-edge.  `has_runnable_compiled_loop` is the cell's non-temporary
     // procedure token compiled for this driver. A pruned cell reads
@@ -15003,7 +15003,6 @@ impl DecodedGuardFailure {
 #[majit_macros::dont_look_inside]
 pub(crate) fn decode_and_restore_guard_failure(
     jit_state: &mut PyreJitState,
-    meta: &crate::jit::state::PyreMeta,
     raw_values: &[i64],
     exit_layout: &CompiledExitLayout,
 ) -> Option<DecodedGuardFailure> {
@@ -15116,7 +15115,11 @@ pub(crate) fn decode_and_restore_guard_failure(
         )
     };
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
-    let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
+    // `has_virtualizable` / extra reds are driver-static; build them from the
+    // live frame (`JitState::build_meta`) rather than a compiled_loops snapshot.
+    let meta = jit_state.build_meta(0, &PyreEnv);
+    let restored =
+        jit_state.restore_guard_failure_values(&meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit] guard-fail restored: ni={} vsd={}",

@@ -4005,27 +4005,6 @@ fn bridge_bail_stage() -> u32 {
     })
 }
 
-/// Frontend compiled-loop metadata for the loop a failing guard belongs to.
-///
-/// `pyjitpl.py handle_guard_failure` / `compile.py _trace_and_compile_from_bridge`
-/// read `rd_loop_token.outermost_jitdriver_sd`. `get_compiled_meta` keys
-/// `compiled_loops` by leftover `active_jitdriver_sd`.
-pub(crate) fn compiled_meta_for_bridge_source<M: Clone>(
-    meta_interp: &majit_metainterp::MetaInterp<M>,
-    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
-    green_key: u64,
-) -> Option<std::sync::Arc<M>> {
-    let token = descr_arc
-        .as_fail_descr()
-        .and_then(majit_backend::descr_owning_jct)?;
-    let jd_no = token
-        .outermost_jitdriver_index
-        .expect("compile.py make_jitcell_token always sets outermost_jitdriver_sd");
-    meta_interp
-        .get_compiled_meta_on_driver(jd_no, green_key)
-        .cloned()
-}
-
 /// compile.py (_trace_and_compile_from_bridge):
 /// Called when a guard failure reaches the trace_eagerness threshold.
 /// Traces the alternative path from the guard failure point and compiles
@@ -4186,15 +4165,10 @@ pub fn trace_and_compile_from_bridge(
     let mut bridge_frame_root = FrameRoot::new(frame);
 
     // pyjitpl.py handle_guard_failure / compile.py _trace_and_compile_from_bridge:
-    // frontend meta is the compiled_loops row on
-    // `rd_loop_token.outermost_jitdriver_sd`, not leftover `active_jitdriver_sd`.
-    // RPython then calls initialize_state_from_guard_failure(resumedescr, deadframe)
-    // which internally calls rebuild_from_resumedata (resume.py).
+    // `initialize_state_from_guard_failure(resumedescr, deadframe)` calls
+    // `rebuild_from_resumedata` (resume.py). Restore uses the live frame's
+    // jit state (`JitState::build_meta`), not a compiled_loops snapshot.
     // This restores the complete frame stack INSIDE the bridge function.
-    let meta = {
-        let (driver, _) = crate::eval::driver_pair();
-        compiled_meta_for_bridge_source(driver.meta_interp(), descr_arc, green_key)
-    };
     let mut jit_state_local = build_jit_state(bridge_frame_root.frame(), &info);
     // `num_resume_frames > 1` marks a multi-frame (inlined-callee) guard:
     // the guard fired inside a callee inlined into the trace, so the resume
@@ -4202,14 +4176,11 @@ pub fn trace_and_compile_from_bridge(
     // live (outer) frame `eval_loop_jit` runs. Such a resume cannot be
     // completed by interpreting the live frame forward — see the
     // blackhole routing at the handoff below.
-    let decoded_resume = meta.as_ref().and_then(|meta| {
-        crate::eval::decode_and_restore_guard_failure(
-            &mut jit_state_local,
-            meta,
-            raw_values,
-            exit_layout,
-        )
-    });
+    let decoded_resume = crate::eval::decode_and_restore_guard_failure(
+        &mut jit_state_local,
+        raw_values,
+        exit_layout,
+    );
     if bridge_bail_stage() == 2 {
         return BridgeResolution::ResumeBlackhole;
     }

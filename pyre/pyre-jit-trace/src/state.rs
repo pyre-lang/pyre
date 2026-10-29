@@ -10919,6 +10919,24 @@ impl JitState for PyreJitState {
         }
     }
 
+    /// `warmstate.py WarmEnterState.maybe_compile_and_run` unspecializes the
+    /// live portal reds (`interp_jit.py` `reds = ['frame', 'ec']`) already in
+    /// `*args`. Same pair `extract_live_values_into` emits when
+    /// `trace_extra_reds == 1`.
+    fn fill_entry_reds_without_meta(&mut self, out: &mut Vec<Value>) -> bool {
+        out.push(Value::Ref(majit_ir::GcRef(self.frame)));
+        out.push(Value::Ref(majit_ir::GcRef(
+            self.execution_context_as_usize(),
+        )));
+        true
+    }
+
+    fn fill_entry_raw_reds(&mut self, out: &mut Vec<i64>) -> bool {
+        out.push(self.frame as i64);
+        out.push(self.execution_context_as_usize() as i64);
+        true
+    }
+
     fn close_loop_live_values(
         ctx: &majit_metainterp::TraceCtx,
         sym: &Self::Sym,
@@ -14301,6 +14319,38 @@ mod tests {
                 .map(|(instruction, _)| predicate(instruction))
                 .unwrap_or(false)
         })
+    }
+
+    #[test]
+    fn fill_entry_reds_without_meta_emits_the_live_portal_reds() {
+        // `interp_jit.py` `reds = ['frame', 'ec']`; `warmstate.py`
+        // `maybe_compile_and_run` unspecializes those live args.
+        let mut state = empty_state();
+        state.frame = 0x11;
+        state.execution_context = 0x22;
+        let mut out = Vec::new();
+        assert!(<PyreJitState as JitState>::fill_entry_reds_without_meta(
+            &mut state, &mut out
+        ));
+        assert_eq!(
+            out,
+            vec![
+                Value::Ref(majit_ir::GcRef(0x11)),
+                Value::Ref(majit_ir::GcRef(0x22)),
+            ]
+        );
+    }
+
+    #[test]
+    fn fill_entry_raw_reds_emits_the_live_portal_reds() {
+        let mut state = empty_state();
+        state.frame = 0x11;
+        state.execution_context = 0x22;
+        let mut out = Vec::new();
+        assert!(<PyreJitState as JitState>::fill_entry_raw_reds(
+            &mut state, &mut out
+        ));
+        assert_eq!(out, vec![0x11i64, 0x22]);
     }
 
     #[test]

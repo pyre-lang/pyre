@@ -409,10 +409,10 @@ pub trait JitState: Sized {
     /// Fill compiled-entry reds without `compiled_loops`.
     ///
     /// `execute_assembler` receives reds the caller already unboxed. It does
-    /// not look up a side table of compiled metadata. Returns `true` only
-    /// when `is_compatible` does not read meta and the reds do not either,
-    /// so the entry can skip `IndexMap::get` of `CompiledEntry`. The default
-    /// is the meta path.
+    /// not look up a side table of compiled metadata. Returns `true` when
+    /// the live reds can be unspecialized here, so the entry skips
+    /// `IndexMap::get` of `CompiledEntry` and does not call `is_compatible`.
+    /// The default is the meta path.
     fn fill_entry_reds_without_meta(&mut self, out: &mut Vec<Value>) -> bool {
         let _ = out;
         false
