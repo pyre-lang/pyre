@@ -3958,6 +3958,81 @@ impl<'a> Transformer<'a> {
         }
     }
 
+    /// `jtransform.py Transformer.rewrite_op_malloc` reads `d['flavor']`
+    /// from the result STRUCT (`rclass.py getgcflavor` /
+    /// `TYPE.TO._gckind`). `history.getkind` of a raw `Ptr` is `'int'`.
+    /// Harvested `_alloc_flavor_ = raw` is the classdesc fact for the
+    /// owner; it is the fallback when no `concretetype` cell is present
+    /// and also when the owner itself is raw (`MapNode::Terminator`
+    /// inherits `MapNode`).
+    fn malloc_result_is_raw_flavored(
+        &self,
+        result: Option<&crate::flowspace::model::Variable>,
+        owner: &str,
+    ) -> bool {
+        let harvest = self.callcontrol.as_deref().is_some_and(|cc| {
+            crate::front::llbc_hints::alloc_flavor_raw_contains(&cc.raw_alloc_flavor_structs, owner)
+        });
+        if let Some(var) = result {
+            if let Some(ct) = var.concretetype() {
+                if matches!(
+                    &ct,
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Ptr(_)
+                ) {
+                    return crate::model::try_getkind(&ct, true, true, true)
+                        == Ok(crate::codewriter::type_state::ConcreteType::Signed)
+                        || harvest;
+                }
+            }
+            // `set_concretetype_of_inline` may store the canonical Signed
+            // representative of a raw Ptr. A New result already in the int
+            // bank cannot be GC `new`.
+            if FunctionGraph::concretetype_of(var)
+                == crate::codewriter::type_state::ConcreteType::Signed
+            {
+                return true;
+            }
+        }
+        harvest
+    }
+
+    /// `jtransform.py Transformer.rewrite_op_malloc`: `d['flavor'] == 'raw'`
+    /// residualizes `raw_malloc_fixedsize` (`_rewrite_raw_malloc`); GC
+    /// `new` / `new_with_vtable` only for GC. `optimize_block` does not
+    /// re-dispatch `Replace` ops, so a ctor that allocates raw must call
+    /// `rewrite_op_raw_malloc` here.
+    fn rewrite_ctor_malloc(
+        &mut self,
+        graph_name: &str,
+        graph: &mut FunctionGraph,
+        result: Option<crate::flowspace::model::Variable>,
+        owner: String,
+        has_vtable: bool,
+        extra_ops: Vec<SpaceOperation>,
+    ) -> RewriteResult {
+        if self.malloc_result_is_raw_flavored(result.as_ref(), &owner) {
+            let malloc_op = SpaceOperation {
+                result,
+                kind: OpKind::raw_malloc(owner, false, None),
+            };
+            match self.rewrite_op_raw_malloc(&malloc_op, graph_name, graph) {
+                RewriteResult::Replace(mut ops) => {
+                    ops.extend(extra_ops);
+                    RewriteResult::Replace(ops)
+                }
+                other => other,
+            }
+        } else {
+            let mut ops = Vec::with_capacity(1 + extra_ops.len());
+            ops.push(SpaceOperation {
+                result,
+                kind: crate::model::malloc_opkind(owner, has_vtable),
+            });
+            ops.extend(extra_ops);
+            RewriteResult::Replace(ops)
+        }
+    }
+
     /// `history.getkind` of a raw-flavor `Ptr` is `'int'` (`rclass.py
     /// getgcflavor`). `rewrite_op_force_cast` sends int → raw-pointer
     /// through `_int_to_int_cast`, a no-op for same-size words;
@@ -4757,21 +4832,23 @@ impl<'a> Transformer<'a> {
             OpKind::NewList { args } => {
                 rewrite_fixed_newlist(graph, op, args, self.callcontrol.as_deref())
             }
-            // `rewrite_op_malloc`: a `new` whose STRUCT has a vtable is
-            // `new_with_vtable`. scalar_replace may have already emitted
-            // `New` before this pass sees the constructor.
+            // `rewrite_op_malloc`: flavor `'raw'` residualizes
+            // `raw_malloc_fixedsize`; a GC STRUCT whose first-field chain
+            // reaches a typeptr header is `new_with_vtable`. scalar_replace
+            // may have already emitted `New` before this pass sees the
+            // constructor.
             OpKind::New { owner } => {
                 let has_vtable = self.callcontrol.as_deref().is_some_and(|cc| {
                     crate::codewriter::heaptracker::callcontrol_has_vtable(cc, owner)
                 });
-                if has_vtable {
-                    RewriteResult::Replace(vec![SpaceOperation {
-                        result: op.result.clone(),
-                        kind: crate::model::malloc_opkind(owner.clone(), true),
-                    }])
-                } else {
-                    RewriteResult::Keep
-                }
+                self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    op.result.clone(),
+                    owner.clone(),
+                    has_vtable,
+                    Vec::new(),
+                )
             }
             // ── rewrite_op_hint ──
             //
@@ -10182,12 +10259,14 @@ impl<'a> Transformer<'a> {
             && args.is_empty()
             && let ValueType::Ref(Some(owner)) = result_ty
         {
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::New {
-                    owner: owner.clone(),
-                },
-            }]);
+            return self.rewrite_ctor_malloc(
+                graph_name,
+                graph,
+                op.result.clone(),
+                owner.clone(),
+                false,
+                Vec::new(),
+            );
         }
         // A fixed `Array<T;N>` is allocated in the layout its `&[T]` reader
         // already uses (`slice_array_type_id`). `FixedSizeListRepr` /
@@ -10241,12 +10320,14 @@ impl<'a> Transformer<'a> {
                 ]);
             }
             if let ValueType::Ref(Some(owner)) = result_ty {
-                return RewriteResult::Replace(vec![SpaceOperation {
-                    result: op.result.clone(),
-                    kind: OpKind::New {
-                        owner: owner.clone(),
-                    },
-                }]);
+                return self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    op.result.clone(),
+                    owner.clone(),
+                    false,
+                    Vec::new(),
+                );
             }
         }
         // A niladic named-struct ctor is an allocation, exactly like the tuple
@@ -10299,10 +10380,14 @@ impl<'a> Transformer<'a> {
             let has_vtable = self.callcontrol.as_deref().is_some_and(|cc| {
                 crate::codewriter::heaptracker::callcontrol_has_vtable(cc, &alloc_owner)
             });
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: crate::model::malloc_opkind(alloc_owner, has_vtable),
-            }]);
+            return self.rewrite_ctor_malloc(
+                graph_name,
+                graph,
+                op.result.clone(),
+                alloc_owner,
+                has_vtable,
+                Vec::new(),
+            );
         }
         // RPython `rtyper` lowers a heap-carried sum-type variant to
         // `malloc(GcStruct)` plus its discriminant/payload `setfield`s before
@@ -10354,28 +10439,25 @@ impl<'a> Transformer<'a> {
                 .result
                 .clone()
                 .expect("SyntheticTransparentCtor must produce a value");
-            return RewriteResult::Replace(vec![
-                SpaceOperation {
-                    result: Some(result.clone()),
-                    kind: OpKind::New { owner: alloc_owner },
+            let extra = vec![SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: result.clone(),
+                    field: crate::model::FieldDescriptor::new("__discriminant", Some(result_base)),
+                    value: crate::model::LinkArg::Const(crate::flowspace::model::Constant::new(
+                        crate::flowspace::model::ConstValue::Int(tag),
+                    )),
+                    ty: ValueType::Int,
                 },
-                SpaceOperation {
-                    result: None,
-                    kind: OpKind::FieldWrite {
-                        base: result,
-                        field: crate::model::FieldDescriptor::new(
-                            "__discriminant",
-                            Some(result_base),
-                        ),
-                        value: crate::model::LinkArg::Const(
-                            crate::flowspace::model::Constant::new(
-                                crate::flowspace::model::ConstValue::Int(tag),
-                            ),
-                        ),
-                        ty: ValueType::Int,
-                    },
-                },
-            ]);
+            }];
+            return self.rewrite_ctor_malloc(
+                graph_name,
+                graph,
+                Some(result),
+                alloc_owner,
+                false,
+                extra,
+            );
         }
         // The struct-shaped spelling of the same aggregate: Charon writes
         // `Aggregate::Adt(ty, variant_idx = null)` for an `Option<T>` built
@@ -10387,12 +10469,14 @@ impl<'a> Transformer<'a> {
             && crate::front::option_ctor::is_option_base_ctor(target)
             && let ValueType::Ref(Some(owner)) = result_ty
         {
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::New {
-                    owner: owner.clone(),
-                },
-            }]);
+            return self.rewrite_ctor_malloc(
+                graph_name,
+                graph,
+                op.result.clone(),
+                owner.clone(),
+                false,
+                Vec::new(),
+            );
         }
         // RPython's rtyper materialises every heap-carried enum variant as
         // `malloc(GcStruct)` plus a tag store and payload stores. Charon gives
@@ -10409,17 +10493,22 @@ impl<'a> Transformer<'a> {
             && let CallTarget::SyntheticTransparentCtor { name, .. } = target
             && let ValueType::Ref(Some(owner)) = result_ty
             && let Some(result_base) = owner.strip_suffix(&format!("::{name}"))
-            && let Some(cc) = self.callcontrol.as_deref()
         {
-            let variants = enum_variants_for_ctor_base(cc, result_base);
-            let tag = variants.and_then(|variants| {
-                variants
-                    .iter()
-                    .find_map(|(tag, variant)| (variant == name).then_some(*tag))
-            });
-            let allocatable =
-                crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
-                    .is_some_and(|spec| !spec.all_fielddescrs.is_empty());
+            let (tag, allocatable) = match self.callcontrol.as_deref() {
+                Some(cc) => {
+                    let variants = enum_variants_for_ctor_base(cc, result_base);
+                    let tag = variants.and_then(|variants| {
+                        variants
+                            .iter()
+                            .find_map(|(tag, variant)| (variant == name).then_some(*tag))
+                    });
+                    let allocatable =
+                        crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
+                            .is_some_and(|spec| !spec.all_fielddescrs.is_empty());
+                    (tag, allocatable)
+                }
+                None => (None, false),
+            };
             if let Some(tag) = tag
                 && allocatable
             {
@@ -10427,30 +10516,30 @@ impl<'a> Transformer<'a> {
                     .result
                     .clone()
                     .expect("synthetic enum variant ctor must produce a value");
-                return RewriteResult::Replace(vec![
-                    SpaceOperation {
-                        result: Some(result.clone()),
-                        kind: OpKind::New {
-                            owner: owner.clone(),
-                        },
-                    },
-                    SpaceOperation {
-                        result: None,
-                        kind: OpKind::FieldWrite {
-                            base: result,
-                            field: crate::model::FieldDescriptor::new(
-                                "__discriminant",
-                                Some(result_base.to_string()),
+                let extra = vec![SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: result.clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            "__discriminant",
+                            Some(result_base.to_string()),
+                        ),
+                        value: crate::model::LinkArg::Const(
+                            crate::flowspace::model::Constant::new(
+                                crate::flowspace::model::ConstValue::Int(tag),
                             ),
-                            value: crate::model::LinkArg::Const(
-                                crate::flowspace::model::Constant::new(
-                                    crate::flowspace::model::ConstValue::Int(tag),
-                                ),
-                            ),
-                            ty: ValueType::Int,
-                        },
+                        ),
+                        ty: ValueType::Int,
                     },
-                ]);
+                }];
+                return self.rewrite_ctor_malloc(
+                    graph_name,
+                    graph,
+                    Some(result),
+                    owner.clone(),
+                    false,
+                    extra,
+                );
             }
         }
         // `rbuiltin.py rtype_const_result` (`lltype.nullptr`): by the time
@@ -31397,6 +31486,114 @@ mod tests {
                     == Some("core::ops::range::Bound<i64>")
                 && value.value == crate::flowspace::model::ConstValue::Int(0)
         ));
+    }
+
+    /// `jtransform.py rewrite_op_malloc`: a niladic enum-variant ctor whose
+    /// result is `Ptr` with `TO._gckind == 'raw'` residualizes
+    /// `raw_malloc_fixedsize` and keeps the tag store. Assembler
+    /// `FieldWrite` of an Int-banked base is `setfield_raw_*`
+    /// (`is_gc = kc == 'r'`).
+    #[test]
+    fn niladic_raw_flavored_enum_variant_lowers_to_raw_malloc_and_tag_store() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+
+        let owner = "jtransform_raw_ctor::MapNode::Terminator";
+        let result_base = "jtransform_raw_ctor::MapNode";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _registry =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let mut cc = crate::call::CallControl::new();
+        let mut by_discr = std::collections::HashMap::new();
+        by_discr.insert(0, "Terminator".to_string());
+        let mut map = std::collections::HashMap::new();
+        map.insert(result_base.to_string(), by_discr);
+        cc.set_enum_variant_by_discriminant(map);
+
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("__pos_0".to_string(), "i64".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        cc.set_struct_layout(owner_id, raw_tuple_i64_layout());
+        cc.raw_alloc_flavor_structs.insert(result_base.to_string());
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("raw_variant_malloc");
+        let result_var = graph.alloc_value_var();
+        result_var.set_concretetype(Some(LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(Struct::new(owner, vec![])),
+        }))));
+        let target = CallTarget::synthetic_transparent_enum_variant_ctor(
+            vec!["jtransform_raw_ctor".to_string(), "MapNode".to_string()],
+            "Terminator",
+            0,
+        );
+        let result_ty = ValueType::Ref(Some(owner.to_string()));
+        let op = SpaceOperation {
+            result: Some(result_var.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![]),
+                result_ty: result_ty.clone(),
+            },
+        };
+
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[],
+            &result_ty,
+            "raw_variant_malloc",
+            &mut graph,
+        ) else {
+            panic!("raw-flavored variant ctor must lower to raw malloc + tag store");
+        };
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::New { .. } | OpKind::NewWithVtable { .. })),
+            "raw flavor must not emit GC new: {ops:?}"
+        );
+        let (path, descriptor, _args_i) = raw_malloc_residual(&ops);
+        assert!(
+            path.ends_with("ll_raw_malloc_fixedsize"),
+            "raw-flavored ctor residual is ll_raw_malloc_fixedsize, got {path}"
+        );
+        assert_eq!(descriptor.extra_info.oopspecindex, OopSpecIndex::None);
+        let residual = ops.iter().find_map(|op| match &op.kind {
+            OpKind::CallResidual { result_kind, .. } => Some(*result_kind),
+            _ => None,
+        });
+        assert_eq!(
+            residual,
+            Some('i'),
+            "raw malloc result stays in the int bank"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::FieldWrite {
+                    base,
+                    field,
+                    value: crate::model::LinkArg::Const(value),
+                    ty: ValueType::Int,
+                } if base == &result_var
+                    && field.name == "__discriminant"
+                    && field.owner_root.as_deref() == Some(result_base)
+                    && value.value == crate::flowspace::model::ConstValue::Int(0)
+            )),
+            "tag store must survive beside the raw malloc: {ops:?}"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&result_var),
+            ConcreteType::Signed
+        );
     }
 
     /// The payload-less half of the same arm: `Option::None` has no fields, so

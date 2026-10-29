@@ -482,7 +482,8 @@ pub(crate) fn spelling_is_one_word_flavor_raw_ptr(raw: &HashSet<String>, spellin
 /// known struct keys). A tombstoned or unregistered leaf does not
 /// guess from the raw subset. `rclass.py getgcflavor` /
 /// `classdesc.py ClassDesc.get_param` read `_alloc_flavor_` off that
-/// classdesc.
+/// classdesc. An enum variant owner `X::Variant` is the same class as
+/// `X` (`ClassDesc.get_param` walks the MRO).
 pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bool {
     if raw.is_empty() {
         return false;
@@ -491,6 +492,20 @@ pub(crate) fn alloc_flavor_raw_contains(raw: &HashSet<String>, path: &str) -> bo
     // `_alloc_flavor_` is a class attribute: every instantiation of the
     // ADT (`CodeObject<ConstantData>`) shares its flavor.
     let path = path.split('<').next().unwrap_or(path);
+    if alloc_flavor_raw_identity_matches(raw, path) {
+        return true;
+    }
+    // `MapNode::Terminator` inherits `_alloc_flavor_MapNode`.
+    if let Some((enum_owner, _)) = path.rsplit_once("::")
+        && !enum_owner.is_empty()
+        && alloc_flavor_raw_identity_matches(raw, enum_owner)
+    {
+        return true;
+    }
+    false
+}
+
+fn alloc_flavor_raw_identity_matches(raw: &HashSet<String>, path: &str) -> bool {
     let identity = majit_ir::descr::canonical_struct_name(path);
     if raw.contains(path) || raw.contains(&identity) {
         return true;
@@ -1236,5 +1251,32 @@ mod tests {
         let raw_node = HashSet::from(["a::Node".to_string()]);
         assert!(super::alloc_flavor_raw_contains(&raw_node, "a::Node"));
         assert!(!super::alloc_flavor_raw_contains(&raw_node, "Node"));
+    }
+
+    #[test]
+    fn alloc_flavor_raw_enum_variant_inherits_enum_identity() {
+        let raw = HashSet::from(["mapdict::MapNode".to_string()]);
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "mapdict::MapNode::Terminator"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "pyre_object::mapdict::MapNode::Terminator"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "*const pyre_object::mapdict::MapNode::Terminator"
+        ));
+        assert!(super::alloc_flavor_raw_contains(
+            &raw,
+            "&mapdict::MapNode::Terminator"
+        ));
+        assert!(super::alloc_flavor_raw_contains(&raw, "mapdict::MapNode"));
+        assert!(!super::alloc_flavor_raw_contains(
+            &raw,
+            "mapdict::Other::Terminator"
+        ));
+        assert!(!super::alloc_flavor_raw_contains(&raw, "Terminator"));
     }
 }
