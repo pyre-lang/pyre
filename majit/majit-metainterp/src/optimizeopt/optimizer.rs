@@ -122,6 +122,14 @@ pub trait Optimization {
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
 
+    /// `OptPure`'s `Rc<RefCell<OptPureState>>`. The driver clones it and
+    /// drops the `passes[i]` borrow before `propagate_with_optimizer`, so
+    /// `force_box` / `_int_add` can reenter the pure pass. Other passes
+    /// return `None`.
+    fn pure_state_handle(&self) -> Option<crate::optimizeopt::pure::SharedOptPure> {
+        None
+    }
+
     /// optimizer.py:557 parity hook — drain this pass's accumulated
     /// `Counters.*` bumps into `staticdata.profiler` and reset the
     /// internal accumulators.
@@ -2171,6 +2179,34 @@ impl Optimizer {
         let op_rc = OpRc::new(op.clone());
         ctx.register_extra_producer(&op_rc);
         self.propagate_from_pass(after_pass_idx + 1, &op_rc, ctx)
+    }
+
+    /// `Optimization.emit_extra` / `send_extra_operation(op, next_optimization)`.
+    /// Same entry index as `emit_extra_rc` (`after_pass_idx + 1`) and the same
+    /// `OpRc` (box identity). Restores `current_pass_idx`.
+    ///
+    /// No pass sits at `next_optimization` (`start >= passes.len()`): `emit_extra`
+    /// leaves the op queued at that entry index. An empty `propagate_from_pass`
+    /// still reads `SameAs*.arg(0)` and then calls `_emit_operation`. That panics
+    /// on the 0-arg synthetic a producer-less virtual box mints, and it skips
+    /// the `OptEarlyForce.next` slot `force_box` enters at.
+    pub(super) fn emit_extra_immediate(
+        &mut self,
+        after_pass_idx: usize,
+        op: &OpRc,
+        ctx: &mut OptContext,
+    ) -> Result<(), crate::optimize::InvalidLoop> {
+        let start_pass = after_pass_idx + 1;
+        if start_pass >= self.passes.len() {
+            ctx.emit_extra_rc(after_pass_idx, op.clone());
+            return Ok(());
+        }
+        ctx.assign_extra_pos(op);
+        ctx.register_extra_producer(op);
+        let saved = ctx.current_pass_idx;
+        let result = self.propagate_from_pass(start_pass, op, ctx);
+        ctx.current_pass_idx = saved;
+        result
     }
 
     /// optimizer.py: force_box — force a virtual to be materialized.
@@ -4998,16 +5034,17 @@ impl Optimizer {
     }
 
     /// `optimizer.py:623-625` forces every argument before the operation is
-    /// appended, and `info.py force_box` emits the allocation as it
-    /// clears the virtual flag — so a forced box's definition is always already
-    /// in `_newoperations`. Pyre's `force_box` only *queues* the allocation
-    /// when it runs from a pass rather than from final emission, which leaves a
-    /// window where the box reads as non-virtual (so `force_box` is a no-op on
-    /// it) while its `NEW_WITH_VTABLE` is still parked. Emitting a store in that
-    /// window puts the use ahead of the definition.
+    /// appended, and `info.py` `force_box` emits the allocation as it clears
+    /// the virtual flag — so a forced box's definition is already in
+    /// `_newoperations`. Pass-level `force_box` now does that itself
+    /// (`emit_extra` / `_force_elements`): the allocation and its field stores
+    /// propagate immediately and are not parked here.
     ///
-    /// Close the window by propagating that one parked definition here, ahead
-    /// of the operation that reads it. Everything else keeps its queued order.
+    /// Other `emit_extra` producers (heap lazy sets, rewrite, virtualize,
+    /// string ops that are not on the force path, pure's postponed op) still
+    /// park on `extra_pending` / `extra_operations_after`. Propagate that one
+    /// parked definition here, ahead of the operation that reads it.
+    /// Everything else keeps its queued order.
     pub(super) fn flush_queued_producer(
         &mut self,
         opref: OpRef,
@@ -5175,9 +5212,64 @@ impl Optimizer {
 
         for pass_idx in start_pass..end_pass {
             ctx.current_pass_idx = pass_idx;
+            // `earlyforce` / `string` / `pure` call `force_box`, which needs
+            // `&mut Optimizer` (`optforce.optimizer`, `AbstractVirtualPtrInfo.force_box`)
+            // while this loop would still be borrowing `passes[i]`. Snapshot
+            // the name, then dispatch those three without holding the vec slot:
+            // ZST stack copies, or a cloned `SharedOptPure`. Every other pass
+            // keeps the vec borrow. The borrow of `passes[i]` ends before the
+            // match arms reborrow `self`.
+            enum Dispatch {
+                Early,
+                String,
+                Pure(crate::optimizeopt::pure::SharedOptPure),
+                Other,
+            }
+            let pass_name = self.passes[pass_idx].name();
+            let dispatch = if pass_name == "earlyforce" {
+                Dispatch::Early
+            } else if pass_name == "string" {
+                Dispatch::String
+            } else if pass_name == "pure" {
+                Dispatch::Pure(
+                    self.passes[pass_idx]
+                        .pure_state_handle()
+                        .expect("pure pass exposes SharedOptPure"),
+                )
+            } else {
+                Dispatch::Other
+            };
             let result = {
-                let pass = &mut self.passes[pass_idx];
-                pass.propagate_forward(&current_op, minted.as_ref().unwrap_or(op_rc), ctx)
+                // Post-`replace_op_with` walk: an opcode-changing `Emit` minted
+                // the producer later passes must see. Every arm, including the
+                // three that reenter through `propagate_with_optimizer`, walks
+                // that box.
+                let walked = minted.as_ref().unwrap_or(op_rc);
+                match dispatch {
+                    Dispatch::Early => crate::optimizeopt::earlyforce::propagate_with_optimizer(
+                        self,
+                        &current_op,
+                        walked,
+                        ctx,
+                    ),
+                    Dispatch::String => crate::optimizeopt::vstring::propagate_with_optimizer(
+                        self,
+                        &current_op,
+                        walked,
+                        ctx,
+                    ),
+                    Dispatch::Pure(state) => crate::optimizeopt::pure::propagate_with_optimizer(
+                        &state,
+                        self,
+                        &current_op,
+                        walked,
+                        ctx,
+                    ),
+                    Dispatch::Other => {
+                        let pass = &mut self.passes[pass_idx];
+                        pass.propagate_forward(&current_op, walked, ctx)
+                    }
+                }
             };
             // A leaf site deep in the pass may have recorded a deferred
             // `InvalidLoop` (e.g. `get_const_info_mut_box`) while still

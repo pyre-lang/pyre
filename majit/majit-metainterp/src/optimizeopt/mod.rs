@@ -1596,6 +1596,14 @@ pub struct OptContext {
     /// just before final emission. In this phase, virtual forcing must emit
     /// directly into new_operations instead of re-entering the pass chain.
     pub in_final_emission: bool,
+    /// `info.py` `_force_elements` calls `optforce.optimizer.force_box(fld)`.
+    /// `Optimizer.force_box` defaults `optforce` to the `Optimizer`, so the
+    /// child allocation and its stores use `Optimizer.emit_extra` (direct
+    /// append) even when the parent used `Optimization.emit_extra`. Set around
+    /// that `force_box` and restored after. `emit_for_force` reads it for
+    /// STRLEN and the string stores. `_int_add` does not: it always
+    /// `optimizer.send_extra_operation` from `first_optimization`.
+    pub force_direct: bool,
     /// effectinfo.py: CallInfoCollection — maps oopspec indices to
     /// (calldescr, func_ptr) pairs. Used by generate_modified_call
     /// (vstring.py) to emit specialized string comparison calls.
@@ -2588,6 +2596,7 @@ impl OptContext {
             optearlyforce_idx: 0,
 
             in_final_emission: false,
+            force_direct: false,
             callinfocollection: None,
             resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::resume::ResumeDataLoopMemo::new(),
@@ -3270,6 +3279,7 @@ impl OptContext {
             optearlyforce_idx: 0,
 
             in_final_emission: false,
+            force_direct: false,
             callinfocollection: None,
             resumedata_memo: std::rc::Rc::new(std::cell::RefCell::new(
                 crate::resume::ResumeDataLoopMemo::new(),
@@ -3373,17 +3383,46 @@ impl OptContext {
     /// info.py emit during force_box: routes through emit_extra
     /// normally, or direct emit when in_final_emission is true.
     pub fn emit_for_force(&mut self, op: Op) -> OpRef {
-        if self.in_final_emission {
-            self.emit(op)
-        } else {
-            self.emit_extra(self.current_pass_idx, op)
-        }
+        self.emit_for_force_with(&mut None, op)
+    }
+
+    /// `emit_for_force` with the owning `Optimizer`, so a force-time STRLEN
+    /// or string store follows `Optimization.emit_extra` immediately
+    /// (`emit_extra_immediate`) instead of parking on `extra_operations_after`.
+    /// `force_direct` or `in_final_emission` appends via `Optimizer.emit_extra`
+    /// (`emit` / `emit_rc`) and does not force arguments here — arg forcing
+    /// stays in `force_box`'s `emit_op_rc`.
+    pub(crate) fn emit_for_force_with(
+        &mut self,
+        optimizer: &mut Option<&mut optimizer::Optimizer>,
+        op: Op,
+    ) -> OpRef {
+        self.emit_for_force_rc_with(optimizer, majit_ir::OpRc::new(op))
     }
 
     /// `emit_for_force` when the caller keeps the op as its box.
     pub fn emit_for_force_rc(&mut self, op: majit_ir::OpRc) -> OpRef {
-        if self.in_final_emission {
+        self.emit_for_force_rc_with(&mut None, op)
+    }
+
+    /// `emit_for_force_rc` with the owning `Optimizer`. See `emit_for_force_with`.
+    pub(crate) fn emit_for_force_rc_with(
+        &mut self,
+        optimizer: &mut Option<&mut optimizer::Optimizer>,
+        op: majit_ir::OpRc,
+    ) -> OpRef {
+        let direct = self.in_final_emission || self.force_direct;
+        if direct {
             self.emit_rc(op)
+        } else if let Some(opt) = optimizer.as_deref_mut() {
+            // `vstring.py` `optstring.emit_extra` / `Optimization.emit_extra`:
+            // same entry index as `emit_extra_rc` (`current_pass_idx + 1`).
+            if let Err(crate::optimize::InvalidLoop(reason)) =
+                opt.emit_extra_immediate(self.current_pass_idx, &op, self)
+            {
+                self.signal_invalid_loop(reason);
+            }
+            op.pos().get()
         } else {
             self.emit_extra_rc(self.current_pass_idx, op)
         }
@@ -3418,7 +3457,18 @@ impl OptContext {
     ///
     /// Delegates to `getstrlen_for(opref, opref, mode)`.
     pub fn getstrlen_opref(&mut self, opref: OpRef, mode: u8) -> Operand {
-        self.getstrlen_for(opref, opref, mode)
+        self.getstrlen_opref_with(&mut None, opref, mode)
+    }
+
+    /// `getstrlen_opref` with the owning `Optimizer` (`vstring.py`
+    /// `optstring.emit_extra` for the STRLEN, via `emit_for_force_rc_with`).
+    pub(crate) fn getstrlen_opref_with(
+        &mut self,
+        optimizer: &mut Option<&mut optimizer::Optimizer>,
+        opref: OpRef,
+        mode: u8,
+    ) -> Operand {
+        self.getstrlen_for_with(optimizer, opref, opref, mode)
     }
 
     /// vstring.py StrPtrInfo.getstrlen(op, optstring, mode)
@@ -3430,6 +3480,19 @@ impl OptContext {
     ///
     /// When both are the same, use `getstrlen_opref(opref, mode)` instead.
     pub fn getstrlen_for(&mut self, info_opref: OpRef, op_opref: OpRef, mode: u8) -> Operand {
+        self.getstrlen_for_with(&mut None, info_opref, op_opref, mode)
+    }
+
+    /// `getstrlen_for` with the owning `Optimizer`. Entry index stays
+    /// `current_pass_idx + 1` (`emit_for_force`); it is not retargeted at
+    /// `optstring`.
+    pub(crate) fn getstrlen_for_with(
+        &mut self,
+        optimizer: &mut Option<&mut optimizer::Optimizer>,
+        info_opref: OpRef,
+        op_opref: OpRef,
+        mode: u8,
+    ) -> Operand {
         let resolved_box = self.get_box_replacement_operand_opt(info_opref);
         // vstring.py:112/283: if self.lgtop is not None: return self.lgtop
         if let Some(info) = resolved_box.as_ref().and_then(|b| self.getptrinfo(b))
@@ -3466,9 +3529,10 @@ impl OptContext {
             });
         if let Some((vleft, vright)) = concat_children {
             // vstring.py:286-293
-            let left_len = self.getstrlen_for(vleft, vleft, mode);
-            let right_len = self.getstrlen_for(vright, vright, mode);
-            let result = crate::optimizeopt::vstring::_int_add(&left_len, &right_len, self);
+            let left_len = self.getstrlen_for_with(optimizer, vleft, vleft, mode);
+            let right_len = self.getstrlen_for_with(optimizer, vright, vright, mode);
+            let result =
+                crate::optimizeopt::vstring::_int_add_with(optimizer, &left_len, &right_len, self);
             // vstring.py: self.lgtop = _int_add(optstring, len1box, len2box)
             if let Some(b) = self.get_box_replacement_operand_opt(info_opref) {
                 self.set_str_lgtop(&b, result.clone());
@@ -3492,7 +3556,7 @@ impl OptContext {
         // Optimizer.emit immediately, so the STRLEN precedes NEWSTR.
         // `emit_for_force_rc` is that routing. `emit_extra_rc` queues the
         // STRLEN after the NEWSTR/COPYSTRCONTENT that consume it.
-        self.emit_for_force_rc(lengthop.clone());
+        self.emit_for_force_rc_with(optimizer, lengthop.clone());
         let result = Operand::from_bound_op(&lengthop);
         // vstring.py: lengthop.set_forwarded(self.getlenbound(mode)). The
         // lenbound is lazily installed on the StrPtrInfo, a PtrInfo-internal
@@ -4042,19 +4106,26 @@ impl OptContext {
     /// `start_pass`. `emit_extra` enters downstream of the caller; head
     /// re-dispatch (`send_extra_operation`, optimizer.py with
     /// `opt=first_optimization`) enters at pass 0.
-    fn emit_extra_at(&mut self, start_pass: usize, op: majit_ir::OpRc) -> OpRef {
+    /// Assign a result position to an extra op and check the box-type
+    /// invariant. Shared by the queued `emit_extra` path and
+    /// `Optimizer::emit_extra_immediate`.
+    pub(crate) fn assign_extra_pos(&mut self, op: &majit_ir::OpRc) {
         if op.pos().get().is_none() {
             // Typed allocation, same rationale as `emit`.
             op.pos().set(self.reserve_pos_typed(op.result_type()));
         } else {
             self.next_pos = self.next_pos.max(op.pos().get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos().get();
         // Queued ops carry their intrinsic `op.type_`
         // (resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
         // its type without the side-table detour.
-        Self::debug_assert_box_type_invariant(&op);
+        Self::debug_assert_box_type_invariant(op);
+    }
+
+    fn emit_extra_at(&mut self, start_pass: usize, op: majit_ir::OpRc) -> OpRef {
+        self.assign_extra_pos(&op);
+        let pos_ref = op.pos().get();
         // Register the queued op as the producer for its position so a fold
         // through `make_equal_to(from_bound_op(op_rc), ..)` reaches a host
         // `find_producer_op` resolves to.
