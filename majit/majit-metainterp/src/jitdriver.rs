@@ -10300,14 +10300,6 @@ impl<S: JitState> JitDriver<S> {
                 })
     }
 
-    /// See [`MetaInterp::runnable_generation`]: a number that holds while
-    /// [`Self::resolved_entry_procedure_token`] cannot change its answer
-    /// for any key, and moves when it may.
-    #[inline]
-    pub fn runnable_generation(&self) -> u64 {
-        self.meta.runnable_generation()
-    }
-
     /// [`Self::resolve_cell_key`] and the whole CELL-OWNED half of
     /// [`Self::runnable_procedure_token`] from one walk of the cell chain.
     ///
@@ -16192,42 +16184,6 @@ mod tests {
             driver.get_stats().bridges_compiled,
             "the callback count and the driver's own tally are the same number"
         );
-    }
-
-    #[test]
-    fn compiling_a_loop_moves_the_runnable_generation() {
-        let mut driver = JitDriver::<NonTraceableState>::new(2);
-        driver.meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = gk(405);
-        let cold = driver.runnable_generation();
-        assert!(matches!(
-            driver.meta.on_back_edge(&green_key, &[0]),
-            BackEdgeAction::Interpret
-        ));
-        assert!(matches!(
-            driver.meta.on_back_edge(&green_key, &[0]),
-            BackEdgeAction::StartedTracing
-        ));
-        {
-            let ctx = driver.meta.trace_ctx().expect("should be tracing");
-            let i0 = OpRef::input_arg_int(0);
-            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
-            ctx.capture_snapshot_for_last_guard(&[], 0, 0);
-            ctx.set_fail_args(g, &[]);
-        }
-        let tracing = driver.runnable_generation();
-        driver.meta.compile_loop(&[OpRef::input_arg_int(0)], ());
-        assert!(driver.has_runnable_compiled_loop(green_key.get_uhash()));
-        let compiled = driver.runnable_generation();
-        assert_ne!(
-            compiled, tracing,
-            "the compile made the key runnable, so a reader caching the \
-             answer from the trace-time number must be told"
-        );
-        // Once compiled, asking is free of side effects on the number.
-        assert!(driver.has_runnable_compiled_loop(green_key.get_uhash()));
-        assert_eq!(driver.runnable_generation(), compiled);
-        assert_ne!(cold, compiled);
     }
 
     #[test]
