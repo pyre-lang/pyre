@@ -1367,9 +1367,11 @@ impl WarmEnterState {
     }
 
     /// The typed cell-policy decision without marking a tracing start.
-    /// `has_compiled_meta` supplies the frontend half of pyre's runnable-loop
-    /// predicate; keeping it inside this decision prevents an entry door from
-    /// bypassing the compiled-code veto with an earlier fast path.
+    /// `has_compiled_meta` is the caller's check that this driver's cell
+    /// still holds a procedure token compiled for this driver
+    /// (`warmstate.py maybe_compile_and_run`); keeping it inside this
+    /// decision prevents an entry door from bypassing that veto with an
+    /// earlier fast path.
     pub fn maybe_compile_decision_with_key(
         &mut self,
         key: &GreenKey,
@@ -2213,8 +2215,9 @@ impl WarmEnterState {
     /// The function-entry door's whole answer, from ONE walk of the cell chain.
     ///
     /// `warmstate.py maybe_compile_and_run` with `increment_function_threshold`.
-    /// `has_compiled_meta` is the frontend half of `has_runnable_compiled_loop`
-    /// (`compiled_loops`, a map the warm state does not own); the cell half is
+    /// `has_compiled_meta` is the caller's check that the cell's procedure
+    /// token was compiled for this driver
+    /// (`history.py JitCellToken.outermost_jitdriver_sd`); the cell half is
     /// `is_compiled` plus `has_compiled_code`. Both together make an ordinary
     /// token runnable; `JC_TRACING` and `JC_TEMPORARY` precede that test.
     ///

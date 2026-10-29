@@ -6804,37 +6804,42 @@ impl<M: Clone> MetaInterp<M> {
         // (`with_trace_ctx_and_framestack`). A fire cannot nest here, so
         // `maybe_compile_decision_with_*_nested` parks it at 0.98.
         self.make_enter_function(jd_no);
-        let compiled_loops = &self.compiled_loops;
         let engine_is_tracing = self.trace_attempt_in_progress();
-        let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
-        // A raw bucket hash is not a cell identity: `cell_by_key(hash)`
-        // picks the first occupant. `JitCell.get_jitcell_for_args`
-        // (`warmstate.py`) walks `comparekey`. Always try the typed key
-        // first; `engine_is_tracing` still parks through
-        // `maybe_compile_decision_with_key_nested`. The no-confirm hash
-        // shortcut on `maybe_compile_and_run_step_on_driver` is the same
-        // hole on main and is left there.
-        match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            warm_state.maybe_compile_decision_with_key_nested(
-                key,
-                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
-                engine_is_tracing,
-                reds,
-            )
-        }) {
+        // Same procedure-token predicate as maybe_compile_and_run_step_on_driver:
+        // warmstate.py maybe_compile_and_run enters assembler when this
+        // driver's cell still has a non-temporary procedure token whose
+        // outermost_jitdriver_sd is this driver.
+        let typed = {
+            let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
+            Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                let has = warm_state
+                    .cell_key_for(key)
+                    .and_then(|cell_key| warm_state.get_procedure_token(cell_key))
+                    .is_some_and(|t| {
+                        t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no)
+                    });
+                warm_state.maybe_compile_decision_with_key_nested(
+                    key,
+                    |_| has,
+                    engine_is_tracing,
+                    reds,
+                )
+            })
+        };
+        match typed {
             Some(hot) => hot,
             None => {
-                drop(warm_state);
                 let types = self
                     .staticdata
                     .jitdrivers_sd
                     .get(jd_no)
                     .map(|d| d.green_args_spec())
                     .unwrap_or_default();
+                let has = self.has_this_driver_compiled_procedure(jd_no, green_key);
                 let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
                 warm_state.maybe_compile_decision_with_meta_nested(
                     green_key,
-                    |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                    |_| has,
                     engine_is_tracing,
                     &types,
                     reds,
@@ -7246,7 +7251,6 @@ impl<M: Clone> MetaInterp<M> {
         // back so later steps keep recording.
         self.compile_tracing = self.tracing.take();
         let tracing = self.compile_tracing.as_mut()?;
-        let compiled_loops = &self.compiled_loops;
         let staticdata = &self.staticdata;
         let pending_green_key = self.pending_token.as_ref().map(|(k, _)| *k);
         let runtime_state = std::cell::RefCell::new(&mut *self.backend);
@@ -7353,8 +7357,7 @@ impl<M: Clone> MetaInterp<M> {
             // Without the `get_compiled` disjunct the decision reports "no
             // token" and aborts while `recursive_target` would have resolved
             // one, the exact drift `decide_recursive_inline` is meant to prevent.
-            let callee_compiled = compiled_loops.contains_key(&(jd_index, green_key))
-                || pending_green_key == Some(green_key)
+            let callee_compiled = pending_green_key == Some(green_key)
                 || warm_state.get_compiled(green_key).is_some();
             let can_inline = warm_state.can_inline_callable(green_key);
             let (decision, _should_disable) = decide_recursive_inline(
@@ -13390,8 +13393,8 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `RunCompiled` is `JitCell.get_procedure_token` / `is_compiled` on that
     /// driver's cell (`pyjitpl.py MetaInterp.get_procedure_token`). Cell keys
-    /// are unique only within one `WarmEnterState`; a sibling driver's
-    /// `compiled_loops` entry at the same u64 is not this driver's token.
+    /// are unique only within one `WarmEnterState`; a token whose
+    /// `outermost_jitdriver_sd` is a sibling is not this driver's token.
     pub fn maybe_compile_and_run_step_on_driver(
         &mut self,
         jd_no: usize,
@@ -13400,20 +13403,18 @@ impl<M: Clone> MetaInterp<M> {
         reds: &[Value],
     ) -> (crate::warmstate::HotResult, u64) {
         self.make_enter_function(jd_no);
-        // `compiled_loops` is keyed `(jitdriver_sd.index, cell green_key)`.
-        // `warmstate.py maybe_compile_and_run` enters assembler only when
-        // that driver's cell still has a procedure token *and* this
-        // frontend row is present; ` |_| true` adopted a token whose
-        // compiled_loops entry lived on a sibling driver (or was never
-        // filed), then retraced the portal after an abort that should
-        // have run the already-compiled loop.
-        let compiled_loops = &self.compiled_loops;
         let engine_is_tracing = self.trace_attempt_in_progress();
+        // `warmstate.py maybe_compile_and_run` enters assembler when that
+        // driver's cell still has a non-temporary procedure token whose
+        // outermost_jitdriver_sd is this driver.
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
+            let has = warm_state.get_procedure_token(green_key).is_some_and(|t| {
+                t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no)
+            });
             let step = warm_state.maybe_compile_decision_with_meta_nested(
                 green_key,
-                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                |_| has,
                 engine_is_tracing,
                 &[],
                 reds,
@@ -13421,9 +13422,15 @@ impl<M: Clone> MetaInterp<M> {
             return (step, green_key);
         }
         match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+            let has = warm_state
+                .cell_key_for(key)
+                .and_then(|cell_key| warm_state.get_procedure_token(cell_key))
+                .is_some_and(|t| {
+                    t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no)
+                });
             let step = warm_state.maybe_compile_decision_with_key_nested(
                 key,
-                |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                |_| has,
                 engine_is_tracing,
                 reds,
             );
@@ -13443,11 +13450,12 @@ impl<M: Clone> MetaInterp<M> {
                     .get(jd_no)
                     .map(|d| d.green_args_spec())
                     .unwrap_or_default();
+                let has = self.has_this_driver_compiled_procedure(jd_no, green_key);
                 let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
                 (
                     warm_state.maybe_compile_decision_with_meta_nested(
                         green_key,
-                        |cell_key| compiled_loops.contains_key(&(jd_no, cell_key)),
+                        |_| has,
                         engine_is_tracing,
                         &types,
                         reds,
@@ -13461,11 +13469,10 @@ impl<M: Clone> MetaInterp<M> {
     /// The function-entry door's whole answer, from one walk of the cell chain
     /// — see [`crate::warmstate::WarmEnterState::function_entry_step`].
     ///
-    /// Lives here rather than on `JitDriver` because the two pieces of state it
-    /// joins are separate FIELDS of this struct: `compiled_loops`, borrowed
-    /// into the closure, and `warm_state`, borrowed mutably by the step. The
-    /// closure is what keeps the map out of the cold path, where the cell holds
-    /// no token and there is nothing for the map to confirm. The raw hash and
+    /// Lives here rather than on `JitDriver` because the step joins this
+    /// driver's WarmEnterState with the tracing flag. The closure asks the
+    /// cell's procedure token (`warmstate.py maybe_compile_and_run`) so a
+    /// sibling driver's token is not entered. The raw hash and
     /// `(code, pc)` pair reconstruct a structured key only when the optional
     /// veto is installed; the default path keeps its previous cost.
     ///
@@ -13493,13 +13500,13 @@ impl<M: Clone> MetaInterp<M> {
     ) -> crate::warmstate::FunctionEntryStep {
         self.make_enter_function(jd_no);
         let engine_is_tracing = self.trace_attempt_in_progress();
-        let compiled_loops = &self.compiled_loops;
+        let has_this = self.has_this_driver_compiled_procedure(jd_no, cell_key);
         let mut warm_state = Self::jd_warmstate(&self.staticdata, jd_no);
         if !warm_state.has_confirm_enter_jit() {
             return warm_state.function_entry_step(
                 cell_key,
                 None,
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
+                || has_this,
                 engine_is_tracing,
                 reds,
             );
@@ -13510,7 +13517,7 @@ impl<M: Clone> MetaInterp<M> {
             return warm_state.function_entry_step(
                 cell_key,
                 Some(&key),
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
+                || has_this,
                 engine_is_tracing,
                 reds,
             );
@@ -13519,19 +13526,15 @@ impl<M: Clone> MetaInterp<M> {
             warm_state.function_entry_step(
                 cell_key,
                 Some(key),
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
+                || has_this,
                 engine_is_tracing,
                 reds,
             )
         }) {
             Some(step) => step,
-            None => warm_state.function_entry_step(
-                cell_key,
-                None,
-                || compiled_loops.contains_key(&(jd_no, cell_key)),
-                engine_is_tracing,
-                reds,
-            ),
+            None => {
+                warm_state.function_entry_step(cell_key, None, || has_this, engine_is_tracing, reds)
+            }
         }
     }
 
@@ -15276,6 +15279,14 @@ impl<M: Clone> MetaInterp<M> {
             .filter(|token| token.has_compiled_code())
     }
 
+    /// warmstate.py maybe_compile_and_run: enter when this driver's cell
+    /// still has a non-invalidated procedure token with compiled code,
+    /// and that token's outermost_jitdriver_sd is this driver.
+    fn has_this_driver_compiled_procedure(&self, jd_no: usize, cell_key: u64) -> bool {
+        self.get_procedure_token_on_driver(jd_no, cell_key)
+            .is_some_and(|t| t.has_compiled_code() && t.outermost_jitdriver_index == Some(jd_no))
+    }
+
     /// [`Self::resolve_cell_key`] and [`Self::entry_procedure_token`] from one
     /// walk of the cell chain, reporting the key it resolved beside the token.
     ///
@@ -15284,12 +15295,10 @@ impl<M: Clone> MetaInterp<M> {
     /// hands on enters that same cell's code. Asking for them separately walks
     /// the chain twice; see [`WarmState::resolved_cell_procedure_token`].
     ///
-    /// The key comes back because the remaining conjunct of the runnable
-    /// predicate reads `compiled_loops`, which is indexed by that key and is
-    /// not a cell walk, so the caller still needs it. That conjunct stays with
-    /// the caller rather than being taken here as a gate: a door that enters
-    /// wants the metadata's VALUE, so testing its presence separately would
-    /// probe the same map twice for one entry.
+    /// The key comes back so a door can carry the resolved cell into the
+    /// execute path (`get_compiled_meta` is the VALUE, indexed by that key).
+    /// The runnable predicate itself is the cell's procedure token
+    /// (`warmstate.py maybe_compile_and_run`).
     ///
     /// `greenargs` is `*greenargs` already in hand
     /// (`JitCell.comparekey(*greenargs2)`). A caller that holds no structured
@@ -18331,22 +18340,21 @@ impl<M: Clone> MetaInterp<M> {
         ctx_info: Option<(usize, usize)>,
     ) -> InlineDecision {
         // pyre adaptation: `pending_token` covers the window between
-        // beginning a recursive trace and installing the compiled trace in
-        // `compiled_loops`. RPython closes the same gap through
-        // `get_assembler_token`, which synthesises a `compile_tmp_callback`
-        // token on demand (warmstate.py). Pyre uses the pending-token
-        // entry for inlining-decision purposes only; emitted CALL_ASSEMBLER
-        // descrs resolve to either a compiled token or a tmp-callback token.
-        // The `warm_state.get_compiled` disjunct mirrors the production
-        // `recursive_decision` closure so a callee whose only token lives on a
-        // warm cell (a tmp-callback install `get_assembler_token` performed for
-        // a sibling entry) is still recognised as compiled here.
+        // beginning a recursive trace and installing the compiled trace.
+        // RPython closes the same gap through `get_assembler_token`, which
+        // synthesises a `compile_tmp_callback` token on demand (warmstate.py).
+        // Pyre uses the pending-token entry for inlining-decision purposes
+        // only; emitted CALL_ASSEMBLER descrs resolve to either a compiled
+        // token or a tmp-callback token. The `warm_state.get_compiled`
+        // disjunct mirrors the production `recursive_decision` closure so a
+        // callee whose only token lives on a warm cell (a tmp-callback
+        // install `get_assembler_token` performed for a sibling entry) is
+        // still recognised as compiled here.
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
-        let callee_compiled = self.has_compiled_loop_entry(callee_key)
-            || self
-                .pending_token
-                .as_ref()
-                .is_some_and(|(k, _)| *k == callee_key)
+        let callee_compiled = self
+            .pending_token
+            .as_ref()
+            .is_some_and(|(k, _)| *k == callee_key)
             || self
                 .warm_state_for_driver(jd_no)
                 .get_compiled(callee_key)
@@ -22348,11 +22356,10 @@ pub enum InlineDecision {
 /// pyjitpl.py `dont_trace_here` performs — this returns
 /// `should_disable = true` exactly in that gate.
 ///
-/// `callee_compiled` folds `compiled_loops.contains_key || pending_token ||
-/// warm_state.get_compiled` (the pyre `get_assembler_token` stand-in — the
-/// `get_compiled` disjunct keeps it aligned with the `recursive_target` token
-/// resolver).  `can_inline` is `warm_state.can_inline_callable`
-/// (pyjitpl.py).
+/// `callee_compiled` folds `pending_token || warm_state.get_compiled` (the
+/// pyre `get_assembler_token` stand-in — the `get_compiled` disjunct keeps
+/// it aligned with the `recursive_target` token resolver).  `can_inline` is
+/// `warm_state.can_inline_callable` (pyjitpl.py).
 pub(crate) fn decide_recursive_inline(
     callee_compiled: bool,
     can_inline: bool,
@@ -25445,7 +25452,8 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x7e13);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(73));
+        let token = make_jitcell_token(Some(idx1));
+        token.set_number(73);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx1)
             .memory_manager
@@ -25477,6 +25485,51 @@ mod metainterp_static_data_tests {
         assert!(
             !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
             "portal slot 0 does not return RunCompiled just because compiled_loops contains the key"
+        );
+    }
+
+    #[test]
+    fn maybe_compile_and_run_step_on_driver_ignores_a_sibling_drivers_procedure_token() {
+        // history.py JitCellToken.outermost_jitdriver_sd (pyre:
+        // outermost_jitdriver_index, set by make_jitcell_token) is what
+        // distinguishes a sibling driver's token. A token compiled for
+        // driver 1 and attached to driver 0's cell must not make
+        // maybe_compile_and_run on driver 0 return RunCompiled.
+        // Threshold must be nonzero: `maybe_compile_and_run` returns NotHot
+        // at once when `increment_threshold == 0` ("jit is off").
+        let mut meta = MetaInterp::<()>::new(1);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second);
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = gk(0x7e14);
+        let mut token = majit_backend::JitCellToken::new(74);
+        token.outermost_jitdriver_index = Some(idx1);
+        let token = std::sync::Arc::new(token);
+        token.set_compiled(Box::new(()));
+        meta.warm_state_for_driver(idx0)
+            .memory_manager
+            .keep_loop_alive(&token);
+        let _ = meta.warm_state_for_driver(idx0).ensure_cell_for_key(&key);
+        meta.warm_state_for_driver(idx0)
+            .attach_procedure_to_interp_for_key(&key, std::sync::Arc::clone(&token));
+
+        let (on_portal, _) =
+            meta.maybe_compile_and_run_step_on_driver(0, key.get_uhash(), (0, 0), &[]);
+        assert!(
+            !matches!(on_portal, crate::warmstate::HotResult::RunCompiled),
+            "a token whose outermost_jitdriver_index is a sibling is not entered on driver 0"
         );
     }
 
@@ -27832,7 +27885,8 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x7e11);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(71));
+        let token = make_jitcell_token(Some(idx1));
+        token.set_number(71);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx1)
             .memory_manager
@@ -27893,7 +27947,8 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x7e19);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(79));
+        let token = make_jitcell_token(Some(0));
+        token.set_number(79);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(0)
             .memory_manager
@@ -27946,7 +28001,8 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x7e1a);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(80));
+        let token = make_jitcell_token(Some(idx1));
+        token.set_number(80);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx1)
             .memory_manager
@@ -28011,7 +28067,8 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x7e12);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(72));
+        let token = make_jitcell_token(Some(idx1));
+        token.set_number(72);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx1)
             .memory_manager
@@ -28126,7 +28183,8 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = gk(0x0cc1);
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(75));
+        let token = make_jitcell_token(Some(idx1));
+        token.set_number(75);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx1)
             .memory_manager
@@ -30516,7 +30574,8 @@ mod metainterp_static_data_tests {
 
         meta.abort_trace_live(false);
 
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
+        let token = make_jitcell_token(Some(idx));
+        token.set_number(11);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx)
             .memory_manager
@@ -30600,7 +30659,8 @@ mod metainterp_static_data_tests {
         );
         assert!(matches!(action, crate::BackEdgeAction::StartedTracing));
 
-        let token = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
+        let token = make_jitcell_token(Some(idx));
+        token.set_number(11);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(idx)
             .memory_manager
@@ -36911,7 +36971,8 @@ mod loop_side_table_tests {
             vec![Type::Int, Type::Int, Type::Ref],
         );
         let hash = key.get_uhash();
-        let token = Arc::new(JitCellToken::new(1));
+        let token = make_jitcell_token(Some(0));
+        token.set_number(1);
         token.set_compiled(Box::new(()));
         meta.warm_state_for_driver(0)
             .memory_manager
