@@ -13664,7 +13664,6 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<RawCompileResult<M>> {
-        let meta = self.compiled_entry(green_key)?.meta.clone();
         // `warmstate.py` `maybe_compile_and_run` reads
         // `procedure_token = cell.get_procedure_token()` and enters on THAT:
         // execution must use the cell's current, invalidation-filtered token.
@@ -13782,7 +13781,7 @@ impl<M: Clone> MetaInterp<M> {
             // spelling adopts the buffers rather than re-decoding into them.
             values: ExitRawValues::from_vec(result.outputs),
             typed_values: ExitValues::from_vec(result.typed_outputs),
-            meta,
+            meta: None,
             fail_index,
             trace_id,
             descr_arc,
@@ -13994,14 +13993,10 @@ impl<M: Clone> MetaInterp<M> {
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
         let token = self.get_procedure_token_on_driver(jd_no, green_key)?;
-        let meta = self
-            .compiled_entry_on_driver(jd_no, green_key)?
-            .meta
-            .clone();
         let mut result = self.execute_assembler_at_dispatch_key(
             &token,
             green_key,
-            Some(meta),
+            None,
             live_values,
             dispatch_key,
         );
@@ -15244,9 +15239,8 @@ impl<M: Clone> MetaInterp<M> {
     /// the chain twice; see [`WarmState::resolved_cell_procedure_token`].
     ///
     /// The key comes back so a door can carry the resolved cell into the
-    /// execute path (`get_compiled_meta` is the VALUE, indexed by that key).
-    /// The runnable predicate itself is the cell's procedure token
-    /// (`warmstate.py maybe_compile_and_run`).
+    /// execute path. The runnable predicate itself is the cell's procedure
+    /// token (`warmstate.py maybe_compile_and_run`).
     ///
     /// `greenargs` is `*greenargs` already in hand
     /// (`JitCell.comparekey(*greenargs2)`). A caller that holds no structured

@@ -267,13 +267,12 @@ pub struct CompileResult<M> {
     /// `resume.py ResumeDataDirectReader.decode_int` reads named slots via
     /// `self.cpu.get_int_value(self.deadframe, num)`.
     pub typed_values: ExitValues,
-    /// Snapshot of the compiled entry's metadata taken *before*
-    /// `execute_token`, mirroring `warmstate.py` `execute_assembler`'s hold on
-    /// the `loop_token` object across the run: the exit values being unpacked
-    /// were produced by the code this metadata describes.  A re-lookup
-    /// after the run would read whatever the compiled-loop index holds by
-    /// then, and compiled code re-enters the driver through residual calls,
-    /// so the entry can be recompiled or dropped mid-run.
+    /// Optional frontend snapshot taken *before* `execute_token`. Warm entry
+    /// and restore rebuild from live state (`JitState::build_meta`); this
+    /// field is `None` on that path. A re-lookup after the run would read
+    /// whatever the compiled-loop index holds by then, and compiled code
+    /// re-enters the driver through residual calls, so the entry can be
+    /// recompiled or dropped mid-run.
     ///
     /// The hold is a shared reference, not a copy: upstream keeps the
     /// `loop_token` object itself alive across `execute_assembler`, and an
@@ -352,7 +351,9 @@ pub struct RawCompileResult<M> {
     pub values: ExitRawValues,
     pub typed_values: ExitValues,
     /// Pre-run metadata snapshot — see `CompileResult::meta`.
-    pub meta: std::sync::Arc<M>,
+    /// `None` when the run entered on the procedure token without a
+    /// `compiled_loops` row; restore rebuilds from live state.
+    pub meta: Option<std::sync::Arc<M>>,
     pub fail_index: u32,
     pub trace_id: u64,
     /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
