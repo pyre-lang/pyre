@@ -5,9 +5,10 @@ License
 
 Except when otherwise stated (look for LICENSE files in directories
 or information at the beginning of each file) all software and
-documentation in the 'rpython', 'pypy', 'ctype_configure', 'dotviewer',
-'demo', 'extra_tests', 'include', 'lib_pypy', 'py', and '_pytest'
-directories is licensed as follows:
+documentation in the 'pyre', 'majit', 'scripts', 'tools', 'ci',
+'rpython', 'pypy', 'ctype_configure', 'dotviewer', 'demo', 'extra_tests',
+'include', 'lib_pypy', 'py', and '_pytest' directories is licensed as
+follows:
 
     The MIT License
 
@@ -29,6 +30,17 @@ directories is licensed as follows:
     LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
     FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
     DEALINGS IN THE SOFTWARE.
+
+
+Pyre Copyright holders 2026
+---------------------------
+
+Pyre and MaJIT are ports of PyPy and RPython to Rust. Except when otherwise
+stated (look for LICENSE files or information at the beginning of each file)
+the files in the 'pyre', 'majit', 'scripts', 'tools' and 'ci' directories are
+copyrighted by Jeong YunWon and the other Pyre contributors, as recorded in
+the version control history. Code ported from PyPy or RPython remains
+copyrighted by the PyPy copyright holders listed below as well.
 
 
 PyPy Copyright holders 2003
