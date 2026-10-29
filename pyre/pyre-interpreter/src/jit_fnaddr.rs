@@ -1316,6 +1316,17 @@ macro_rules! cpa5 {
         publish_cpa5($e, $m, $r, |a0, a1, a2, a3, a4| $f(a0, a1, a2, a3, a4), $f);
     };
 }
+macro_rules! cpa7 {
+    ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
+        publish_cpa7(
+            $e,
+            $m,
+            $r,
+            |a0, a1, a2, a3, a4, a5, a6| $f(a0, a1, a2, a3, a4, a5, a6),
+            $f,
+        );
+    };
+}
 macro_rules! cpa8 {
     ($e:expr, $m:expr, $r:expr, $f:path $(,)?) => {
         publish_cpa8(
@@ -3144,7 +3155,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `#[dont_look_inside]` so the descent scan must not enter the body;
     // without a published address the call stays a symbolic hash and the
     // scan declines the whole wrapper after `sys_modules_dict`.
-    cpa8!(
+    cpa7!(
         &mut entries,
         "pyre_interpreter::importing::dunder_import_slow",
         "pyre_interpreter::dunder_import_slow",

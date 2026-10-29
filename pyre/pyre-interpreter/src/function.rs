@@ -635,8 +635,11 @@ pub fn function_new_with_closure(
 
 /// Host `String` / `&str` name → one managed rstr `STR`, then [`function_new_impl`].
 ///
-/// `function.py self.name = forcename or code.co_name` is an RPython `str`.
-/// Runtime names are not interned (`CONST_STR_CACHE` / `prebuilt_str_storage`).
+/// `function.py self.name = forcename or code.co_name` is an RPython `str`:
+/// the `_utf8` of a fresh wrapper (`space.newtext(name)`), the same `STR` a
+/// `co_name` object hands [`function_new_from_code`].  The wrapper is what
+/// rides the shadow stack.  Runtime names are not interned
+/// (`CONST_STR_CACHE` / `prebuilt_str_storage`).
 fn function_new_impl_from_host_name(
     ob_type: &'static PyType,
     code: *const (),
@@ -648,13 +651,13 @@ fn function_new_impl_from_host_name(
     let _roots = pyre_object::gc_roots::push_roots();
     let base =
         pyre_object::gc_roots::pin_roots(&[code as PyObjectRef, w_func_globals_obj, closure]);
-    let name_ptr = alloc_utf8_payload(name.as_bytes(), true);
+    let w_name = pyre_object::w_str_new_managed(name);
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(name_ptr as PyObjectRef);
+    let _ = pyre_object::gc_roots::pin_root(w_name);
     function_new_impl(
         ob_type,
         pyre_object::gc_roots::shadow_stack_get(base) as *const (),
-        pyre_object::gc_roots::shadow_stack_get(name_slot) as *mut Utf8Str,
+        unsafe { w_str_storage(pyre_object::gc_roots::shadow_stack_get(name_slot)) },
         pyre_object::gc_roots::shadow_stack_get(base + 1),
         pyre_object::gc_roots::shadow_stack_get(base + 2),
         can_change_code,
@@ -700,13 +703,18 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     // `Function.name` is an rstr `STR` (`function.py self.name = code.co_name`).
     // UTF-8 wrappers share `_utf8`; a lone-surrogate `co_name` stays on `w_name`
     // as the exact wrapper and the payload is a lossy mirror. `function_new_impl`
-    // pins the header-bearing STR across its collecting calls.
-    let name = if w_name.is_null() {
-        alloc_utf8_payload(&[], true)
-    } else if unsafe { w_str_is_utf8(w_name) } {
+    // pins the header-bearing STR across its collecting calls. A missing or
+    // lone-surrogate `co_name` takes the `_utf8` of a fresh wrapper around the
+    // empty name or the mirror, so every arm yields the same rstr `STR`.
+    let name = if !w_name.is_null() && unsafe { w_str_is_utf8(w_name) } {
         unsafe { w_str_storage(w_name) }
     } else {
-        alloc_utf8_payload(unsafe { name_utf8_mirror(w_name) }.as_bytes(), true)
+        let mirror = if w_name.is_null() {
+            String::new()
+        } else {
+            unsafe { name_utf8_mirror(w_name) }
+        };
+        unsafe { w_str_storage(pyre_object::w_str_new_managed(&mirror)) }
     };
     let func = function_new_impl(
         &FUNCTION_TYPE,
