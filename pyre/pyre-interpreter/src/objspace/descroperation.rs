@@ -2046,18 +2046,19 @@ unsafe fn int_pow(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     // Rust source spelling the MIR front lowers back to `int_mul_ovf`.
     match int_pow_nomod(va, vb) {
         Ok(r) => Ok(w_int_new(r)),
-        Err(_) => Ok(w_long_new(pow_ovf2long(va, vb)?)),
+        Err(_) => pow_ovf2long(va, vb),
     }
 }
 
-/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then
-/// `rbigint.int_pow(iw)`.  The base is built inside this opaque call, so
-/// the traced `int_pow` never passes a stack `BigInt` to the
-/// `jit_bigint_int_pow_nomod` residual, which reads a heap rbigint pointer.
+/// intobject.py `_pow_ovf2long`: `W_LongObject.fromint(iv)` then `descr_pow`,
+/// which returns the wrapped long. The recovery is one opaque residual so
+/// the traced `int_pow` except arm is a bound word-ABI `PyObjectRef` call
+/// (`getfunctionptr` of `_pow_ovf2long`) rather than a `BigInt` payload the
+/// residual ABI cannot publish.
 #[majit_macros::dont_look_inside]
-fn pow_ovf2long(iv: i64, iw: i64) -> Result<BigInt, PyError> {
+fn pow_ovf2long(iv: i64, iw: i64) -> PyResult {
     let base = BigInt::from(iv);
-    bigint_int_pow_nomod(&base, iw)
+    Ok(w_long_new(bigint_int_pow_nomod(&base, iw)?))
 }
 
 /// Negative-exponent `int ** int` float route, kept opaque so `int_pow`

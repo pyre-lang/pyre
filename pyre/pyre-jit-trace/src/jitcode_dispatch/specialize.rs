@@ -5758,7 +5758,6 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         dst_bank,
         &SPECIALISED_TUPLE2_DESCENT,
         Some(&mut produced),
-        false, // not a BinaryOperator tag
     )?;
     if !matches!(outcome, Some(DispatchOutcome::Continue)) {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_body);
@@ -6724,7 +6723,6 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
         dst_bank,
         &TUPLE_GETITEM_DESCENT,
         None,
-        false, // index payload, not a BinaryOperator tag
     )?;
     orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
@@ -7991,7 +7989,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     descent: &HelperDescent,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     try_walker_orthodox_descent_ex(
-        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None, true,
+        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None,
     )
 }
 
@@ -8005,23 +8003,12 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
-    guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
         return Ok(None);
     };
     run_prepared_orthodox_descent(
-        ctx,
-        op_pc,
-        prep,
-        int_args,
-        ref_args,
-        float_args,
-        dst,
-        dst_bank,
-        descent,
-        boxed_out,
-        guard_raising_binop,
+        ctx, op_pc, prep, int_args, ref_args, float_args, dst, dst_bank, descent, boxed_out,
     )
 }
 
@@ -8085,7 +8072,6 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
-    guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // A box that already carries its object is authoritative: the collector
@@ -8197,21 +8183,6 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     if let Some(slot) = boxed_out {
         *slot = Some(result);
     }
-    // `handle_possible_exception`: a successful descent of `//` / `%`
-    // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
-    // deopts instead of dest-writing NULL into the caller's `+=` slot.
-    // The first int concrete is a `BinaryOperator` tag only on
-    // `binary_value_from_tag`: a descent whose ints are payloads
-    // (`w_specialised_tuple_ii_new`) passes `guard_raising_binop` false.
-    // COMPARE tags reuse those integers (`==` is 4, which
-    // `binary_op_from_tag` reads as Remainder).
-    if guard_raising_binop && descent.path == BINARY_OP_DESCENT.path {
-        super::inline_call::maybe_guard_no_exception_after_raising_binop(
-            ctx,
-            op_pc,
-            &int_concretes,
-        )?;
-    }
     Ok(Some(DispatchOutcome::Continue))
 }
 
@@ -8240,7 +8211,6 @@ fn orthodox_helper_boxed<Sym: WalkSym>(
         'v',
         descent,
         Some(&mut boxed),
-        false,
     )? {
         Some(DispatchOutcome::Continue) => {
             if allow_void {
@@ -15415,7 +15385,6 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
         'r',
         &INT_DESCR_STR_DESCENT,
         None,
-        false,
     )?;
     orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
@@ -15448,9 +15417,8 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
     let concrete_len = unsafe {
         (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
     };
-    // The length is a payload, not a `BinaryOperator` tag. Stamp it before
-    // the walk; the shared descent stamps ref operands itself and must not
-    // read this int as a raising operator.
+    // Stamp length before the walk; the shared descent stamps ref operands
+    // itself and leaves int concretes to the caller.
     ctx.trace_ctx
         .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
     let mut produced = None;
@@ -15466,7 +15434,6 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
         'v',
         &NEWUTF8_DESCENT,
         Some(&mut produced),
-        false,
     )?;
     match walked {
         Some(DispatchOutcome::Continue) => {}
@@ -20760,7 +20727,6 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
         dst_bank,
         &GET_W_GLOBALS_DESCENT,
         None,
-        false,
     )?;
     orthodox_descent_unit(ctx, op_pc, walked, None)
 }

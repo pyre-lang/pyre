@@ -379,4 +379,68 @@ assert list(range(-sys.maxsize - 1, sys.maxsize, sys.maxsize)) == [
     sys.maxsize - 1,
 ]
 
+
+# Mixed fit-then-overflow `int ** int`: a trace compiled on an i64-fitting
+# exponent must promote through long (`descr_pow` except OverflowError /
+# `pow_ovf2long`), not raise `OverflowError: integer overflow` at `**`.
+def two_fit_then_ovf(rounds):
+    n = 0
+    for i in range(rounds):
+        d = 20 + (i % 80)
+        n += (2 ** d).bit_length()
+    return n
+
+
+def ten_fit_then_ovf(rounds):
+    n = 0
+    for i in range(rounds):
+        e = 1 + (i % 60)
+        n += (10 ** e).bit_length()
+    return n
+
+
+assert two_fit_then_ovf(1) == (2 ** 20).bit_length()
+assert two_fit_then_ovf(2000) == 121000
+assert ten_fit_then_ovf(2000) == 202304
+
+
+# Warmup compiles `2**d` / `2**-d` on |d| < 63 inside a callee of
+# `try/except OverflowError`, then |d| >= 63 must still return a long
+# (`descr_pow` except OverflowError / `pow_ovf2long`). `two_fit_then_ovf`
+# mixes both magnitudes in one loop so the ovf2long bridge is compiled
+# while tracing; `check_truediv` warms up on tiny |d| then hits overflow
+# under that outer except.
+def power_pos(d):
+    return 2 ** d
+
+
+def power_neg_shape(d):
+    return 2 ** -d
+
+
+def guarded_power(fn, d):
+    try:
+        return fn(d)
+    except OverflowError:
+        return "overflow"
+
+
+def compile_small_then_ovf(fn, small_values, ovf_ds, rounds):
+    for i in range(rounds):
+        got = guarded_power(fn, small_values[i % len(small_values)])
+        assert got != "overflow", (fn, small_values[i % len(small_values)], got)
+    return [guarded_power(fn, d) for d in ovf_ds]
+
+
+assert compile_small_then_ovf(power_pos, tuple(range(20)), (63, 80), ROUNDS) == [
+    1 << 63,
+    1 << 80,
+]
+assert compile_small_then_ovf(
+    power_neg_shape, tuple(range(-20, 0)), (-63, -80), ROUNDS
+) == [
+    1 << 63,
+    1 << 80,
+]
+
 print("OK")

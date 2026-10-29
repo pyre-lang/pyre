@@ -263,8 +263,9 @@ const MAJIT_ONLY: &[&str] = &[
     // / `opimpl_setarrayitem_raw_f` already named. `record_exact_value_i/ii`
     // / `record_exact_value_r/rr` left when the walker gained
     // `pyjitpl.py opimpl_record_exact_value_{i,r}` / `_record_exact_value`.
+    // `goto_if_exception_mismatch/iL` left when the walker gained
+    // `pyjitpl.py opimpl_goto_if_exception_mismatch`.
     "arraybase_vable/rdd>i",
-    "goto_if_exception_mismatch/iL",
     "newlist_clear/idddd>r",
     "rvmprof_code/ii",
     // `opimpl_unreachable` aborts the walk instead of panicking.
