@@ -200,6 +200,33 @@ pub(crate) fn int_binop_residual_for_method(leaf: &str) -> Option<Vec<String>> {
     )
 }
 
+/// Pair residual for `rbigint.int_divmod` / `rbigint.divmod`, both
+/// `@jit.elidable` and returning a tuple.  RPython lowers such a call to one
+/// residual returning the `tuple2` GcStruct; `RBigIntPair` is that struct.
+/// `int_divisor` selects the one-Signed-divisor form.  The MIR caller proves
+/// the receiver (and, for `divmod`, the divisor) is RBigInt.
+pub(crate) fn divmod_pair_residual_for_method(
+    leaf: &str,
+    int_divisor: bool,
+) -> Option<Vec<String>> {
+    let residual = match (leaf, int_divisor) {
+        ("int_divmod", true) => "jit_bigint_int_divmod",
+        ("divmod", false) => "jit_bigint_divmod",
+        _ => return None,
+    };
+    Some(
+        [
+            crate::runtime_names::crates::INTERPRETER,
+            "objspace",
+            "descroperation",
+            residual,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
 /// Scalar-bool counterpart of [`int_binop_residual_for_method`] for PyPy's
 /// mixed W_LongObject/W_IntObject rich comparisons.
 pub(crate) fn int_comparison_residual_for_method(leaf: &str) -> Option<Vec<String>> {

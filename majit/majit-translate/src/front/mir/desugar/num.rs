@@ -828,6 +828,256 @@ impl<'a> Lowering<'a> {
         Ok(true)
     }
 
+    /// Lower the runtime-fallible `i64::try_from(&RBigInt)`
+    /// (a trait shell in the LLBC)
+    /// into its decomposed runtime-discriminant `Result` shape: a
+    /// `__discriminant` tag driven by `rbigint.fits_int()` and a
+    /// `__pos_0` payload holding the narrowed value.  Callers narrow a
+    /// list/str/bytes index or a byte value; overflow raises a Python
+    /// `IndexError`/`ValueError`, so the fallibility must survive the
+    /// lowering — a panic-residual swap would be a bit-exact regression.
+    ///
+    /// The arg type — not the module path — is the robust discriminator
+    /// (same philosophy as the BigInt binary-operator retarget), so this
+    /// guards on the exact `RBigInt` ADT identity rather than hard-matching a
+    /// dependency path spelling.
+    ///
+    /// # Eager-payload panic hazard
+    /// [`Self::emit_tagged_pair_aggregate`] writes `__pos_0 = payload`
+    /// UNCONDITIONALLY in the call's block, before the consumer's
+    /// discriminant switch runs in a successor block.  A
+    /// [`jit_bigint_to_i64_value`] payload PANICS on overflow, so on a
+    /// non-fitting index (`lst[2**100]`) it would panic in the
+    /// walker/blackhole graph BEFORE the switch routes to the `Err` arm —
+    /// panic instead of `IndexError`.  `__pos_0` is read only on the
+    /// fits (`Ok`) path, so its value is dead on the `Err` path; the
+    /// payload op only needs to be TOTAL, not correct-on-overflow.  Hence
+    /// the non-trapping [`jit_bigint_to_i64_value_or_zero`] variant, which
+    /// returns 0 out of range.
+    ///
+    /// `Ok=0`/`Err=1`: `disc = (fits == 0)` is 0 when it fits (`Ok` tag)
+    /// and 1 otherwise (`Err` tag).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    pub(in crate::front::mir) fn try_lower_bigint_i64_try_from(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [.., impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if impl_seg.as_str() != "<Impl>" || leaf.as_str() != "try_from" {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        // Guard on the ARG type (the opaque BigInt ADT), not the module
+        // path — the robust discriminator, so a same-named `try_from`
+        // impl on any other type is never redirected.  The narrowed
+        // operand is the receiver — `try_from(&BigInt)` — so read
+        // `inputs[0]`.
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        let Some(src) = fd.signature.inputs.first() else {
+            return Ok(false);
+        };
+        if !tyref_is_rbigint(src, self.llbc) {
+            return Ok(false);
+        }
+        // The synthesized fits test and payload are specifically the signed
+        // machine-word conversion.  Other BigInt TryFrom impls (notably
+        // `u32::try_from(&value)` in formatting.rs::char_arg) have different
+        // bounds and must keep the ordinary residual call.  Read Result's
+        // success payload from `generics.types[0]`, then apply the same
+        // literal-width atom gate as the other integer conversion lowerings.
+        // RPython keeps signed `toint`/`fits_int` distinct from unsigned
+        // `touint` (`rpython/rlib/rbigint.py, 515-518`).
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.tyref_literal_int_atom(&success_ty),
+            Some("I64" | "Isize")
+        ) {
+            return Ok(false);
+        }
+        self.emit_fallible_rbigint_to_i64(mir_bb, arg.clone(), dest_local, dest_ty, target)
+    }
+
+    /// Lower the exact local `RBigInt::toint() -> Result<i64,
+    /// RBigIntError>` method to the same decomposed Result shape as
+    /// [`Self::try_lower_bigint_i64_try_from`].
+    ///
+    /// RPython's `rbigint.toint` is an elidable, overflow-raising scalar
+    /// operation (`rpython/rlib/rbigint.py`). Rust carries that
+    /// exceptional edge as `Result`; a dependent LLBC cannot translate into
+    /// the pyre-object method body and otherwise leaves a classdef-less
+    /// residual Result. Its subsequent discriminant/`Ok.__pos_0` reads then
+    /// have no enum class to narrow. Preserve the source control flow by
+    /// materializing the runtime Result tag and payload, using the shared
+    /// non-trapping payload rule below.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
+    )]
+    pub(in crate::front::mir) fn try_lower_rbigint_toint(
+        &mut self,
+        mir_bb: usize,
+        kind: &CallKind,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if segments.last().map(String::as_str) != Some("toint") {
+            return Ok(false);
+        }
+        let [arg] = args else {
+            return Ok(false);
+        };
+        let CallKind::Fun(FunId::Regular { id }) = kind else {
+            return Ok(false);
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Ok(false);
+        };
+        if !fd
+            .signature
+            .inputs
+            .first()
+            .is_some_and(|src| tyref_is_rbigint(src, self.llbc))
+        {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        if !matches!(
+            self.tyref_literal_int_atom(&success_ty),
+            Some("I64" | "Isize")
+        ) {
+            return Ok(false);
+        }
+        self.emit_fallible_rbigint_to_i64(mir_bb, arg.clone(), dest_local, dest_ty, target)
+    }
+
+    /// Emit the translated Result for a fallible signed-word RBigInt
+    /// conversion. Shared by Rust's direct `RBigInt::toint` spelling and the
+    /// `i64::try_from(&RBigInt)` trait spelling so their tags, class identity,
+    /// eager-payload safety, and residual ABI cannot drift apart.
+    pub(in crate::front::mir) fn emit_fallible_rbigint_to_i64(
+        &mut self,
+        mir_bb: usize,
+        arg: Variable,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        // Resolve the destination `Result` decl so the FieldWrite owner
+        // matches what `resolve_aggregate_adt` records for a real `Ok(..)`
+        // construction site of the same type.
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        // Route the runtime-discriminant tagged-pair ctor to the SAME
+        // per-instantiation enum root a static `Ok(..)`/`Err(..)` mints,
+        // by suffixing the bare template name with the `<X>` the
+        // destination `Result<X, E>` local carries.
+        // Fail-closed: no splitting generic yields "" → bare owner.
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let bb_id = self.emit_bb(mir_bb);
+
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind,
+            });
+            res
+        };
+        // Non-trapping payload: read only on the fits (`Ok`) path, dead on
+        // the `Err` path, but eagerly evaluated in this block — must not
+        // panic on overflow (see the eager-payload hazard above).
+        let payload = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::runtime_names::crates::OBJECT.to_string(),
+                        "longobject".to_string(),
+                        "jit_bigint_to_i64_value_or_zero".to_string(),
+                    ],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![arg.clone()]),
+                result_ty: ValueType::Int,
+            },
+        );
+        let fits = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: vec![
+                        crate::runtime_names::crates::OBJECT.to_string(),
+                        "longobject".to_string(),
+                        "jit_bigint_to_i64_fits".to_string(),
+                    ],
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![arg]),
+                result_ty: ValueType::Int,
+            },
+        );
+        let zero = push_op(&mut self.graph, OpKind::ConstInt(0));
+        // `disc = (fits == 0)`: 0 when it fits (`Ok` tag), 1 otherwise
+        // (`Err` tag) — matching the `Ok=0`/`Err=1` convention.
+        let disc = push_op(
+            &mut self.graph,
+            OpKind::BinOp {
+                op: "eq".to_string(),
+                lhs: fits,
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        );
+        // Success is the `Ok` variant (discriminant 0).
+        let payload_owner =
+            Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+        self.emit_tagged_pair_aggregate(
+            mir_bb,
+            &owner,
+            &payload_owner,
+            disc,
+            payload,
+            dest_local,
+            target,
+        )?;
+        Ok(true)
+    }
+
     /// Lower `Wtf8::as_str() -> Result<&str, Utf8Error>` to the same
     /// runtime-tagged aggregate a translated RPython validity test followed
     /// by the string value would produce.
@@ -1055,6 +1305,153 @@ impl<'a> Lowering<'a> {
         clippy::too_many_arguments,
         reason = "The parameter order mirrors the corresponding RPython translation routine; grouping arguments into a Rust-only context object would obscure line-by-line parity and ownership"
     )]
+    /// `rbigint.int_divmod` / `rbigint.divmod` return `(div, mod)`.  Both are
+    /// `@jit.elidable`; RPython lowers the call to one residual returning the
+    /// `tuple2` GcStruct and reads its two items.  `RBigIntPair` is that
+    /// struct, so the call becomes the pair residual plus two pure item reads
+    /// packed back into the source-level `(RBigInt, RBigInt)`.  The Rust
+    /// `Result` around it is always `Ok` here -- the residual raises instead
+    /// -- so the destination binds to the tuple the way
+    /// [`Self::try_lower_usize_try_from`] binds an always-`Ok` payload.
+    pub(in crate::front::mir) fn try_lower_rbigint_divmod_pair(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        first_arg_ty: Option<&TyRef>,
+        second_arg_ty: Option<&TyRef>,
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [receiver, divisor] = args else {
+            return Ok(false);
+        };
+        if !segments.iter().any(|s| s == "rbigint")
+            || !first_arg_ty.is_some_and(|ty| tyref_is_rbigint(ty, self.llbc))
+        {
+            return Ok(false);
+        }
+        let Some(second_arg_ty) = second_arg_ty else {
+            return Ok(false);
+        };
+        let int_divisor = if self.tyref_literal_int_atom(second_arg_ty) == Some("I64") {
+            true
+        } else if tyref_is_rbigint(second_arg_ty, self.llbc) {
+            false
+        } else {
+            return Ok(false);
+        };
+        let Some(residual) = segments.last().and_then(|leaf| {
+            crate::front::rbigint_call::divmod_pair_residual_for_method(leaf, int_divisor)
+        }) else {
+            return Ok(false);
+        };
+        if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc) {
+            return Ok(false);
+        }
+        if divmod_result_observed_as_result(self.body, self.llbc, dest_local) {
+            return Ok(false);
+        }
+        let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
+            return Ok(false);
+        };
+        let suffix = tyref_tuple_suffix(&success_ty, self.llbc);
+        if suffix.is_empty() {
+            return Ok(false);
+        }
+        let Some(def_id) = self.tyref_adt_def_id(dest_ty) else {
+            return Ok(false);
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return Ok(false);
+        };
+        let owner = format!(
+            "{}{}",
+            td.item_meta.name_path(),
+            tyref_enum_instantiation_suffix(dest_ty, self.llbc)
+        );
+        let tuple_owner = format!("Tuple{suffix}");
+        let bb_id = self.emit_bb(mir_bb);
+        let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
+            let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(result.clone()),
+                kind,
+            });
+            result
+        };
+        let pair = push_op(
+            &mut self.graph,
+            OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: residual,
+                    fun_decl_id: None,
+                    specialization: crate::parse::GraphSpecialization::Regular,
+                },
+                args: crate::model::call_args(vec![receiver.clone(), divisor.clone()]),
+                result_ty: ValueType::Ref(Some("RBigIntPair".to_string())),
+            },
+        );
+        let pair = push_op(
+            &mut self.graph,
+            crate::model::cast_instance_call("RBigIntPair", pair),
+        );
+        let mut items = Vec::with_capacity(2);
+        for field in ["item0", "item1"] {
+            let item = push_op(
+                &mut self.graph,
+                OpKind::FieldRead {
+                    base: pair.clone(),
+                    field: FieldDescriptor::new(field.to_string(), Some("RBigIntPair".to_string())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+            );
+            items.push(push_op(
+                &mut self.graph,
+                crate::model::cast_instance_call("RBigInt", item),
+            ));
+        }
+        let ctor = AggregateCtor {
+            target: CallTarget::synthetic_transparent_ctor(tuple_owner.clone()),
+            result_owner: tuple_owner.clone(),
+            owner_id: None,
+            owner_path: Vec::new(),
+            ctor_name: tuple_owner,
+            fields: (0..2)
+                .map(|i| AggregateField {
+                    name: format!("__pos_{i}"),
+                    void: false,
+                    narrow_root: None,
+                    window: false,
+                })
+                .collect(),
+        };
+        let payload = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &items);
+        if self.multi_assigned_locals.contains(&dest_local) {
+            let disc = push_op(&mut self.graph, OpKind::ConstInt(0));
+            let payload_owner =
+                Self::tagged_pair_payload_owner(td, &owner, 0).unwrap_or_else(|| owner.clone());
+            self.emit_tagged_pair_aggregate(
+                mir_bb,
+                &owner,
+                &payload_owner,
+                disc,
+                payload,
+                dest_local,
+                target,
+            )?;
+            return Ok(true);
+        }
+        self.const_discriminant_locals.insert(dest_local, 0);
+        self.local_var[dest_local] = Some(LocalValue::One(payload));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
     pub(in crate::front::mir) fn try_lower_usize_try_from(
         &mut self,
         mir_bb: usize,

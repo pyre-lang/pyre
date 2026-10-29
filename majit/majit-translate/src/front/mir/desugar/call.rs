@@ -5428,6 +5428,18 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
+                if self.try_lower_rbigint_divmod_pair(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    first_arg_ty.as_ref(),
+                    second_arg_ty.as_ref(),
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_usize_try_from(
                     mir_bb,
                     &reg.kind,
@@ -5473,6 +5485,28 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 if self.try_lower_num_from(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_rbigint_toint(
+                    mir_bb,
+                    &reg.kind,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_bigint_i64_try_from(
                     mir_bb,
                     &reg.kind,
                     &segments,
