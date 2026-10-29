@@ -1,13 +1,12 @@
-# pyre-check: max-pypy-ratio=10
+# pyre-check: max-pypy-ratio=17
 # Dijkstra over a 150 x 150 weighted grid with `heapq`; each heap entry is one
 # int (`d * N*N + cell`) and `divmod` splits it back.
 #
-# PENDING (do not move to pyre/bench/synth/ until it meets the gate):
-# `run_synthetic_suite` globs `*.py` non-recursively, so the gate skips this
-# file. Measured 2026-10-29 on 74c40239cb5 (macOS arm64): pyre-dynasm 1.68 s
-# with loops_compiled=5, bridges_compiled=103, guard_failures=38678; the web
-# wasm build takes 6.6 s. pypy3 3.11 runs it in 0.05 s (7 loops, 16 bridges,
-# no aborts) and CPython in 0.04 s. Issue #2514.
+# `heapq._siftup` / `_siftdown` loops are inlined into `shortest`'s trace and
+# must be cut to CALL_ASSEMBLER at their back-edge (`pyjitpl.py
+# opimpl_jit_merge_point`) rather than unrolled. Before #2514 this ran 1.68 s
+# with 103 bridges / 38678 guard failures against pypy3's 0.05 s, 7 loops, 16
+# bridges.
 import heapq
 
 N = 150

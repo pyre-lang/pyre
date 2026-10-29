@@ -2352,7 +2352,18 @@ fn inlined_loop_header_without_compiled_token_surfaces_call_assembler() {
     // jumpto (`surface_inline_subloop_after_back_edge`).
     let mut ctx = TraceCtx::for_test(1);
     ctx.seen_loop_header_for_jdindex = 0;
-    let outcome = surface_inline_subloop_after_back_edge(&mut ctx, None, 10, false, 0, 1, false);
+    let frame_state = WalkFrameState::default();
+    let outcome = surface_inline_subloop_after_back_edge(
+        &mut ctx,
+        &frame_state,
+        10,
+        false,
+        0,
+        1,
+        false,
+        false,
+        || None,
+    );
     match outcome {
         Some((DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc }, next_pc)) => {
             assert!(token.is_none());
@@ -2362,6 +2373,59 @@ fn inlined_loop_header_without_compiled_token_surfaces_call_assembler() {
         other => panic!("expected SubLoopCalleeCallAssembler, got {other:?}"),
     }
     assert_eq!(ctx.seen_loop_header_for_jdindex, -1);
+}
+
+#[test]
+fn inlined_loop_header_unrolls_once_then_surfaces_call_assembler() {
+    // `opimpl_jit_merge_point` else (`portal_call_depth`):
+    // `should_unroll_one_iteration` then `MIFrame.unroll_iterations`
+    // (`setup` = 1). One Continue, then `do_recursive_call(
+    // assembler_call=True)`. The generator body uses this same
+    // per-frame counter; there is no second `GeneratorResumeSubwalk`
+    // budget.
+    let mut ctx = TraceCtx::for_test(1);
+    ctx.seen_loop_header_for_jdindex = 0;
+    let frame_state = WalkFrameState::default();
+    assert_eq!(frame_state.borrow().unroll_iterations, 1);
+
+    let first = surface_inline_subloop_after_back_edge(
+        &mut ctx,
+        &frame_state,
+        10,
+        false,
+        0,
+        1,
+        false,
+        true,
+        || None,
+    );
+    match first {
+        Some((DispatchOutcome::Continue, 1)) => {}
+        other => panic!("expected Continue unroll, got {other:?}"),
+    }
+    assert_eq!(frame_state.borrow().unroll_iterations, 0);
+    assert_eq!(ctx.seen_loop_header_for_jdindex, -1);
+
+    ctx.seen_loop_header_for_jdindex = 0;
+    let second = surface_inline_subloop_after_back_edge(
+        &mut ctx,
+        &frame_state,
+        10,
+        false,
+        0,
+        1,
+        false,
+        true,
+        || None,
+    );
+    match second {
+        Some((DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc }, next_pc)) => {
+            assert!(token.is_none());
+            assert_eq!(target_pc, 10);
+            assert_eq!(next_pc, 1);
+        }
+        other => panic!("expected SubLoopCalleeCallAssembler, got {other:?}"),
+    }
 }
 
 /// Build a `done_with_this_frame_descr_ref` for tests. Mirrors the

@@ -2361,6 +2361,10 @@ pub struct GeneratorResumeSubwalk {
     /// resumed from again after this yield.  Durable, so every walk-time write
     /// to it is journalled (`fbw_arm_durable_frame_undo`).
     pub frame: usize,
+    /// The generator body's `w_code`. `walk_generator_resume` passes this
+    /// as the resume walk frame's `WalkFrameStateData.inline_w_code`
+    /// (`MIFrame.setup(jitcode)`); merge points read that per-frame field.
+    pub w_pycode: usize,
     /// The OpRef that names that frame in the trace — a `GetfieldGc` off the
     /// generator, not a baked address — so suspension stores land on the
     /// same box the compiled loop re-reads.
@@ -2372,10 +2376,6 @@ pub struct GeneratorResumeSubwalk {
     /// Python pc of that `yield`.  The coordinate the frame is left suspended
     /// at, so the next resume continues after it.
     pub yield_py_pc: u32,
-    /// `pyjitpl.py` `MIFrame.unroll_iterations = 1`. Nested
-    /// `opimpl_jit_merge_point` (`portal_call_depth > 0`) decrements this
-    /// once when `should_unroll_one_iteration` (`interp_jit.py`) is true.
-    pub unroll_iterations: usize,
 }
 
 impl<Sym: WalkSym> Clone for FbwWalkMode<Sym> {
@@ -3321,14 +3321,20 @@ fn surface_carrier_or_inline_subloop(
 /// assembler_call=True)`. Fall-through onto a loop header is not a crossing;
 /// only `jump_absolute`'s `loop_header` (`can_enter_jit`) is. Reset the flag
 /// here the way that method does before `finishframe` + `do_recursive_call`.
+///
+/// Token lookup (`get_assembler_token`) runs only after
+/// `should_unroll_one_iteration` says this visit is a cut, matching
+/// `MIFrame.opimpl_jit_merge_point`.
 fn surface_inline_subloop_after_back_edge(
     ctx: &mut TraceCtx,
-    token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+    frame_state: &WalkFrameState,
     target_pc: usize,
     carrier_resume: bool,
     op_pc: usize,
     op_next_pc: usize,
     no_loop_header: bool,
+    should_unroll_one_iteration: bool,
+    make_token: impl FnOnce() -> Option<std::sync::Arc<majit_backend::JitCellToken>>,
 ) -> Option<(DispatchOutcome, usize)> {
     // `opimpl_jit_merge_point`: `if not jitdriver_sd.no_loop_header` is
     // the only gate that waits for an explicit `loop_header`. With
@@ -3354,6 +3360,16 @@ fn surface_inline_subloop_after_back_edge(
     // residual.
     ctx.seen_loop_header_for_jdindex = -1;
     ctx.seen_loop_header_jit_pc = None;
+    // pyjitpl.py opimpl_jit_merge_point: `should_unroll_one_iteration` then
+    // `return` before finishframe / do_recursive_call.
+    if should_unroll_one_iteration {
+        let mut data = frame_state.borrow_mut();
+        if data.unroll_iterations > 0 {
+            data.unroll_iterations -= 1;
+            return Some((DispatchOutcome::Continue, op_next_pc));
+        }
+    }
+    let token = make_token();
     Some(surface_carrier_or_inline_subloop(
         token,
         target_pc,
@@ -3361,6 +3377,79 @@ fn surface_inline_subloop_after_back_edge(
         op_pc,
         op_next_pc,
     ))
+}
+
+/// Live pycode of the walk frame executing this merge point.
+///
+/// `WalkFrameStateData.inline_w_code` is the current frame's own code
+/// (inlined Python callee, or the generator body `walk_generator_resume`
+/// seeded). Nested helper walks leave it zero; those fall back to
+/// `framestack.last().w_code` when a Python frame is on the stack.
+fn current_walk_frame_pycode<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+    let inline = ctx.inline_w_code();
+    if inline != 0 {
+        Some(inline)
+    } else {
+        ctx.session
+            .borrow()
+            .framestack
+            .last()
+            .map(|frame| frame.w_code)
+    }
+}
+
+/// Shared inlined-frame loop-cut: unroll via
+/// `jitdriver_sd.warmstate.should_unroll_one_iteration`, and only then
+/// `get_or_make_portal_assembler_token_arc`.
+fn try_surface_inline_subloop_for_pycode<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    callee_code: usize,
+    next_instr: usize,
+    is_being_profiled: bool,
+    carrier_resume: bool,
+    op_pc: usize,
+    op_next_pc: usize,
+    no_loop_header: bool,
+    jdindex: usize,
+) -> Option<(DispatchOutcome, usize)> {
+    let greens = [
+        next_instr as i64,
+        is_being_profiled as i64,
+        callee_code as i64,
+    ];
+    let should_unroll = ctx
+        .trace_ctx
+        .metainterp_sd()
+        .jitdrivers_sd
+        .get(jdindex)
+        .and_then(|jd| jd.warmstate.as_ref())
+        .map(|ws| ws.borrow().should_unroll_one_iteration(&greens))
+        .unwrap_or(false);
+    surface_inline_subloop_after_back_edge(
+        ctx.trace_ctx,
+        &ctx.frame_state,
+        next_instr,
+        carrier_resume,
+        op_pc,
+        op_next_pc,
+        no_loop_header,
+        should_unroll,
+        || {
+            let callee_key = crate::driver::make_green_key_typed(
+                callee_code as *const (),
+                next_instr,
+                is_being_profiled,
+            );
+            let greenboxes = [
+                Value::Int(next_instr as i64),
+                Value::Int(is_being_profiled as i64),
+                Value::Ref(majit_ir::GcRef(callee_code)),
+            ];
+            let red_types = [Type::Ref, Type::Ref];
+            let (driver, _) = crate::driver::driver_pair();
+            driver.get_or_make_portal_assembler_token_arc(&callee_key, &greenboxes, &red_types)
+        },
+    )
 }
 
 fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
@@ -17167,24 +17256,17 @@ fn handle<Sym: WalkSym>(
             record_portal_profilefunc_guard(ctx, op.pc)?;
 
             // `opimpl_jit_merge_point` (`pyjitpl.py`) with
-            // `portal_call_depth > 0`: a generator resume is that nested
-            // portal frame (`should_unroll_one_iteration` is true for
-            // `CO_GENERATOR`). A merge no `loop_header` stamped is inert;
-            // a stamped header unrolls once, then `do_recursive_call(
-            // assembler_call=True)`. The resume sub-walk is a transparent
-            // helper, so the callee-code arm below would otherwise miss
-            // it and close the root loop at the generator's while header.
-            if let Some(resume) = ctx.fbw_mode.generator_resume.as_mut() {
-                if ctx.trace_ctx.seen_loop_header_for_jdindex < 0 {
-                    return Ok((DispatchOutcome::Continue, op.next_pc));
-                }
-                if resume.unroll_iterations > 0 {
-                    resume.unroll_iterations -= 1;
-                    ctx.trace_ctx.seen_loop_header_for_jdindex = -1;
-                    ctx.trace_ctx.seen_loop_header_jit_pc = None;
-                    return Ok((DispatchOutcome::Continue, op.next_pc));
-                }
-            }
+            // `portal_call_depth > 0`: this merge is not the traced loop's
+            // close. A generator resume is that nested portal frame
+            // (`should_unroll_one_iteration` is true for `CO_GENERATOR`).
+            // The resume walk is a transparent helper, so the callee-code
+            // arm admits it through `WalkFrameStateData.inline_w_code`
+            // (`walk_generator_resume` seeds that field on this frame
+            // only, matching `MIFrame.setup(jitcode)`). No stamped header
+            // and no `no_loop_header` / carrier resume: return, the inert
+            // merge. A stamped header unrolls once on this frame's
+            // `unroll_iterations`, then `do_recursive_call(
+            // assembler_call=True)`.
 
             // An inlined callee's own loop
             // header routes to a `CALL_ASSEMBLER` into its already-compiled loop
@@ -17218,20 +17300,14 @@ fn handle<Sym: WalkSym>(
             // caller's post-loop operand stack, which `FOR_ITER` then advances as
             // if it were the iterator (`loop_callee_for_header_resume`).
             //
-            // A transparent helper walk is NOT such a portal frame: it is a
-            // Rust helper body descended into, and `framestack.last()` there
-            // describes the helper's own entry (or, for a root helper walk that
-            // pushes none, an unrelated caller). The arm is reachable from one:
-            // `_unpackiterable_unknown_length` is a second jit driver and the
-            // only helper jitcode in the build that carries a
-            // `jit_merge_point` -- 2 of 2939 do, and the other is the portal
-            // `eval_loop_jit` itself. So exclude it explicitly rather than
-            // relying on the token lookup to miss.
-            //
-            // No corpus program reaches the arm this way today: over the 491
-            // synthetic fixtures the print below never fires while its control
-            // in `inline_call.rs` does, on one fixture and one helper. The
-            // exclusion is the invariant, not a repair of an observed answer.
+            // Every per-fn jitcode carries the loop-header `jit_merge_point`
+            // (`opimpl_jit_merge_point`). A transparent helper walk is a Rust
+            // helper body, and `framestack.last()` there is the helper entry
+            // (or, for a root helper walk that pushes none, an unrelated
+            // caller). Generator resume is tagged as a transparent helper;
+            // `walk_generator_resume` seeds `WalkFrameStateData.inline_w_code`
+            // with the generator body's pycode, so the same per-frame read
+            // works.
             if fbw_debug_abort_enabled() && ctx.fbw_mode.transparent_helper_jitcode_index.is_some()
             {
                 eprintln!(
@@ -17283,47 +17359,47 @@ fn handle<Sym: WalkSym>(
                 .get(jdindex)
                 .map(|jd| jd.no_loop_header)
                 .unwrap_or(false);
+            // `opimpl_jit_merge_point` (`pyjitpl.py`):
+            // `if seen_loop_header_for_jdindex < 0` and
+            // `not jitdriver_sd.no_loop_header` and `portal_call_depth`:
+            // return. Nested portal frames — inlined Python callees and
+            // the generator-resume body — stay inert until a back-edge
+            // stamps the header. `no_loop_header` stamps itself; a
+            // carrier resume stands in for the crossing it consumes.
+            if !ctx.is_top_level
+                && ctx.trace_ctx.seen_loop_header_for_jdindex < 0
+                && !in_carrier_resume
+                && !no_loop_header
+            {
+                return Ok((DispatchOutcome::Continue, op.next_pc));
+            }
+            // Current walk frame's pycode: `inline_w_code` when this frame
+            // owns one (inlined Python callee, generator resume body);
+            // otherwise `framestack.last().w_code`. Nested helpers leave
+            // `inline_w_code` empty (`run_sub_jitcode_walk_from` takes that
+            // argument only from `walk_generator_resume`), so they stay
+            // out of this arm.
             let callee_code = (!ctx.is_top_level
-                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
-            .then(|| {
-                ctx.session
-                    .borrow()
-                    .framestack
-                    .last()
-                    .map(|frame| frame.w_code)
-            })
-            .flatten();
+                && (ctx.fbw_mode.transparent_helper_jitcode_index.is_none()
+                    || ctx.inline_w_code() != 0))
+                .then(|| current_walk_frame_pycode(ctx))
+                .flatten();
             if let Some(callee_code) = callee_code {
                 let carrier_resume = carrier_resume_at(callee_code);
                 if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                     || carrier_resume
                     || no_loop_header
                 {
-                    let callee_key = crate::driver::make_green_key_typed(
-                        callee_code as *const (),
+                    if let Some(outcome) = try_surface_inline_subloop_for_pycode(
+                        ctx,
+                        callee_code,
                         next_instr,
                         is_being_profiled,
-                    );
-                    let (driver, _) = crate::driver::driver_pair();
-                    let greenboxes = [
-                        Value::Int(next_instr as i64),
-                        Value::Int(is_being_profiled as i64),
-                        Value::Ref(majit_ir::GcRef(callee_code)),
-                    ];
-                    let red_types = [Type::Ref, Type::Ref];
-                    let token = driver.get_or_make_portal_assembler_token_arc(
-                        &callee_key,
-                        &greenboxes,
-                        &red_types,
-                    );
-                    if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                        ctx.trace_ctx,
-                        token,
-                        next_instr,
                         carrier_resume,
                         op.pc,
                         op.next_pc,
                         no_loop_header,
+                        jdindex,
                     ) {
                         return Ok(outcome);
                     }
@@ -17351,43 +17427,23 @@ fn handle<Sym: WalkSym>(
                     // assembler`, metainterp.rs).
                     // Same carrier rule as the arm above: a resume with no
                     // token still leaves the loop body via `direct_call_may_force`.
-                    let callee_code = ctx
-                        .session
-                        .borrow()
-                        .framestack
-                        .last()
-                        .map(|frame| frame.w_code);
+                    let callee_code = current_walk_frame_pycode(ctx);
                     if let Some(callee_code) = callee_code {
                         let carrier_resume = carrier_resume_at(callee_code);
                         if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0
                             || carrier_resume
                             || no_loop_header
                         {
-                            let callee_key = crate::driver::make_green_key_typed(
-                                callee_code as *const (),
+                            if let Some(outcome) = try_surface_inline_subloop_for_pycode(
+                                ctx,
+                                callee_code,
                                 next_instr,
                                 is_being_profiled,
-                            );
-                            let (driver, _) = crate::driver::driver_pair();
-                            let greenboxes = [
-                                Value::Int(next_instr as i64),
-                                Value::Int(is_being_profiled as i64),
-                                Value::Ref(majit_ir::GcRef(callee_code)),
-                            ];
-                            let red_types = [Type::Ref, Type::Ref];
-                            let token = driver.get_or_make_portal_assembler_token_arc(
-                                &callee_key,
-                                &greenboxes,
-                                &red_types,
-                            );
-                            if let Some(outcome) = surface_inline_subloop_after_back_edge(
-                                ctx.trace_ctx,
-                                token,
-                                next_instr,
                                 carrier_resume,
                                 op.pc,
                                 op.next_pc,
                                 no_loop_header,
+                                jdindex,
                             ) {
                                 return Ok(outcome);
                             }

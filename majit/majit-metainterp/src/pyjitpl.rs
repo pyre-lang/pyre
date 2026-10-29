@@ -5244,11 +5244,19 @@ impl<M: Clone> MetaInterp<M> {
         {
             return;
         }
-        let state = WarmEnterState::new_for_driver(
+        // warmstate.py WarmEnterState.__init__: wrap
+        // jd._should_unroll_one_iteration_ptr.
+        let ptr = self
+            .staticdata
+            .jitdrivers_sd
+            .get(jd_no)
+            .and_then(|jd| jd.should_unroll_one_iteration_ptr);
+        let mut state = WarmEnterState::new_for_driver(
             self.jitcounter.clone(),
             self.memory_manager.clone(),
             jd_no,
         );
+        state.set_should_unroll_one_iteration_ptr(ptr);
         let sd = std::sync::Arc::get_mut(&mut self.staticdata)
             .expect("make_enter_function: staticdata has other owners");
         let mut pushed_shell = false;
@@ -24475,6 +24483,14 @@ impl MetaInterpStaticData {
                 jd.warmstate = shell.warmstate.clone();
             }
         }
+        if let Some(ws) = &jd.warmstate {
+            // warmstate.py WarmEnterState.__init__ wraps
+            // jd._should_unroll_one_iteration_ptr. A shell's WarmEnterState
+            // may already exist from make_enter_function, so copy the ptr
+            // whenever a descriptor lands on a live state.
+            ws.borrow_mut()
+                .set_should_unroll_one_iteration_ptr(jd.should_unroll_one_iteration_ptr);
+        }
         jd.index = Some(idx); // call.py:46-47 `jd.index = idx`
         if replace_slot {
             self.jitdrivers_sd[idx] = jd;
@@ -26246,6 +26262,7 @@ mod metainterp_static_data_tests {
             vable_token_descr: None,
             frame_value_count_fn: None,
             get_unique_id: None,
+            should_unroll_one_iteration_ptr: None,
             warmstate: None,
         };
         {

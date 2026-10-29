@@ -6060,6 +6060,9 @@ fn build_jit_driver_pair() -> JitDriverPair {
     jd.handle_jitexc_from_bh = Some(pyre_portal_runner);
     // warmstate.py get_unique_id(greenkey) → interp_jit.py get_unique_id.
     jd.get_unique_id = Some(portal_unique_id_from_greens);
+    // warmspot.py jd._should_unroll_one_iteration_ptr → interp_jit.py
+    // should_unroll_one_iteration. WarmEnterState wraps the ptr.
+    jd.should_unroll_one_iteration_ptr = Some(portal_should_unroll_one_iteration);
     d.meta_interp_mut().register_jitdriver_sd(jd);
     // call.py grab_initial_jitcodes binds `jd.mainjitcode` during translation.
     // Production never calls `register_dispatch_jitcode`; without this binding
@@ -7277,6 +7280,21 @@ fn portal_unique_id_from_greens(greens: &[i64]) -> i64 {
             *pycode as pyre_object::PyObjectRef,
         ) as i64,
         _ => 0,
+    }
+}
+
+/// warmstate.py `should_unroll_one_iteration(greenkey)` for the Python portal.
+///
+/// Greens are `['next_instr', 'is_being_profiled', 'pycode']`. The hook
+/// itself ignores the first two and answers the code object's flags.
+fn portal_should_unroll_one_iteration(greens: &[i64]) -> bool {
+    match greens {
+        [next_instr, is_being_profiled, pycode] => should_unroll_one_iteration(
+            *next_instr as usize,
+            *is_being_profiled != 0,
+            *pycode as pyre_object::PyObjectRef,
+        ),
+        _ => false,
     }
 }
 

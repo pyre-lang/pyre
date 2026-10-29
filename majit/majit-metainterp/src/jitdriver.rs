@@ -1407,6 +1407,13 @@ pub struct JitDriverStaticData {
     /// is_being_profiled, bytecode)`. `None` leaves the portal-frame unique
     /// id as the greenkey hash, the previous fallback.
     pub get_unique_id: Option<fn(&[i64]) -> i64>,
+    /// warmspot.py `jd._should_unroll_one_iteration_ptr`.
+    ///
+    /// Raw callable `make_driverhook_graphs` installs on the driver.
+    /// `warmstate.py WarmEnterState.__init__` wraps it as
+    /// `self.should_unroll_one_iteration(greenkey)` (False when the ptr is
+    /// None). Callers use `jitdriver_sd.warmstate.should_unroll_one_iteration`.
+    pub should_unroll_one_iteration_ptr: Option<fn(&[i64]) -> bool>,
     /// warmspot.py `make_enter_function`: `jd.warmstate = WarmEnterState(self, jd)`.
     ///
     /// Absent until `MetaInterp::make_enter_function` runs for this slot.
@@ -1498,6 +1505,7 @@ impl JitDriverStaticData {
             vable_token_descr: None,
             frame_value_count_fn: None,
             get_unique_id: None,
+            should_unroll_one_iteration_ptr: None,
             warmstate: None,
         };
         // warmspot.py:529/538 — keep `index_of_virtualizable` in sync

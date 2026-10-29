@@ -755,6 +755,14 @@ pub struct WarmEnterState {
     /// greens then reds as one portal tuple (`_portal_args_s`). Callers
     /// thread the live portal reds into [`Self::confirm_enter_jit`].
     confirm_enter_jit_ptr: Rc<Cell<Option<fn(&[Value]) -> bool>>>,
+    /// warmspot.py `jd._should_unroll_one_iteration_ptr`.
+    ///
+    /// `warmstate.py WarmEnterState.__init__` wraps this as
+    /// `self.should_unroll_one_iteration(greenkey)` (False when the ptr is
+    /// None). Copied from `JitDriverStaticData` when the state is built
+    /// (`make_enter_function`) and when a real descriptor lands on an
+    /// existing shell state.
+    should_unroll_one_iteration_ptr: Option<fn(&[i64]) -> bool>,
 }
 
 /// Result of checking whether a green key is hot.
@@ -1187,6 +1195,7 @@ impl WarmEnterState {
             cell_generation: 0,
             jitdriver_sd,
             confirm_enter_jit_ptr: Rc::new(Cell::new(None)),
+            should_unroll_one_iteration_ptr: None,
         }
     }
 
@@ -2604,6 +2613,22 @@ impl WarmEnterState {
     /// holds another handle to this same cell.
     pub(crate) fn confirm_enter_jit_handle(&self) -> Rc<Cell<Option<fn(&[Value]) -> bool>>> {
         Rc::clone(&self.confirm_enter_jit_ptr)
+    }
+
+    /// warmstate.py `WarmEnterState.should_unroll_one_iteration(greenkey)`.
+    ///
+    /// False when `_should_unroll_one_iteration_ptr` is None.
+    pub fn should_unroll_one_iteration(&self, greens: &[i64]) -> bool {
+        match self.should_unroll_one_iteration_ptr {
+            Some(hook) => hook(greens),
+            None => false,
+        }
+    }
+
+    /// Bind `jd._should_unroll_one_iteration_ptr` (`warmspot.py
+    /// make_driverhook_graphs`) onto this state.
+    pub(crate) fn set_should_unroll_one_iteration_ptr(&mut self, ptr: Option<fn(&[i64]) -> bool>) {
+        self.should_unroll_one_iteration_ptr = ptr;
     }
 
     /// warmstate.py: get_location(greenkey)
