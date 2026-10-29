@@ -1161,11 +1161,9 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     value_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    // Strict fresh-frame fold: a scalar setfield to the current inline level's
-    // own (unseeded) portal frame is a virtual-field write — `valuestackdepth`
-    // / `last_instr` sync on a branchless leaf that resumes at the caller
-    // boundary — so it folds to a no-op, emitting no SETFIELD_GC.  The
-    // `fresh_virtualizable` OptVirtualize elision (jtransform.py).
+    // Keep the fresh frame's concrete scalar image current. All writes still
+    // pass through `_opimpl_setfield_vable` below: the standard frame updates
+    // virtualizable_boxes, while a nonstandard frame records SETFIELD_GC.
     let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
     if fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg {
         let value = match value_bank {
