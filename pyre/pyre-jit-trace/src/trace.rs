@@ -7359,7 +7359,6 @@ fn full_body_walk_trace<Sym: WalkSym>(
     crate::jitcode_dispatch::fbw_finish_payload_reset();
     crate::jitcode_dispatch::reset_single_frame_blackhole();
     crate::jitcode_dispatch::fbw_executed_nonpure_residual_reset();
-    crate::jitcode_dispatch::fbw_executed_body_residual_reset();
     // Clear the prior walk's store journal + unjournaled-effect flag so
     // dropped (aborted) entries cannot be applied by this walk's commit.
     // A continuation keeps them instead: see [`WalkJournals`].
