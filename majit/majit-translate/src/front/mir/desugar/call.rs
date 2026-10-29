@@ -6331,20 +6331,31 @@ impl<'a> Lowering<'a> {
                     // slot is the rustc method, which reads those words as
                     // `self` and `w_set`. Call the word trampoline that
                     // matches the residual instead. Do not recast the
-                    // receiver before this trampoline.
+                    // receiver before this trampoline. Inside the trampoline
+                    // the vtable call is the operation itself, so it stays
+                    // an `indirect_call` for the effect analysis (the
+                    // trampoline is `dont_look_inside`; its body is
+                    // analyzed, never run as jitcode).
+                    let leaf = match method_name.as_str() {
+                        "add" => "set_strategy_add_key_ptr",
+                        "remove" => "set_strategy_remove_key_ptr",
+                        _ => "set_strategy_has_key_ptr",
+                    };
+                    let trampoline_path = format!("pyre_object::setobject::{leaf}");
+                    let current_fn = self
+                        .graph
+                        .source_identity
+                        .as_deref()
+                        .unwrap_or(self.graph.name.as_str());
                     if trait_root == "SetStrategy"
                         && matches!(method_name.as_str(), "add" | "remove" | "has_key")
                         && (args.len() == 2 || args.len() == 3)
+                        && current_fn != trampoline_path
                     {
                         let key_args = if args.len() == 3 {
                             vec![args[1].clone(), args[2].clone()]
                         } else {
                             vec![args[0].clone(), args[1].clone()]
-                        };
-                        let leaf = match method_name.as_str() {
-                            "add" => "set_strategy_add_key_ptr",
-                            "remove" => "set_strategy_remove_key_ptr",
-                            _ => "set_strategy_has_key_ptr",
                         };
                         OpKind::Call {
                             target: CallTarget::function_path(["pyre_object", "setobject", leaf]),
