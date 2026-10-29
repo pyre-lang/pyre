@@ -659,6 +659,10 @@ pub struct JitframeDescrFacts {
     /// A descr without a gcrootmap never installs one (`CelGc`) and uses
     /// [`JitFrame::resolve_forward`] — `jitframe.py` `jitframe_resolve`.
     chases_forwarding_stubs: bool,
+    /// `gc.py` `GcLLDescr_framework.max_size_of_young_obj`, `nonlarge_max + 1`.
+    /// The GC rewriter fills `max_nursery_size` from the same answer
+    /// (`GcAllocator::max_nursery_object_size`). [`Self::HOST`] is 0.
+    max_size_of_young_obj: usize,
 }
 
 impl JitframeDescrFacts {
@@ -670,6 +674,7 @@ impl JitframeDescrFacts {
         nursery_free_addr: 0,
         nursery_top_addr: 0,
         chases_forwarding_stubs: false,
+        max_size_of_young_obj: 0,
     };
 
     /// Snapshot of `gc`'s `JITFRAME` answers, including this thread's nursery
@@ -683,6 +688,7 @@ impl JitframeDescrFacts {
                 nursery_free_addr: gc.nursery_free_addr(),
                 nursery_top_addr: gc.nursery_top_addr(),
                 chases_forwarding_stubs: gc.has_gcrootmap(),
+                max_size_of_young_obj: gc.max_nursery_object_size(),
             },
             None => Self::HOST,
         }
@@ -728,6 +734,8 @@ static STANDALONE_NURSERY_TOP_ADDR: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static STANDALONE_CHASES_FORWARDING_STUBS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+static STANDALONE_MAX_SIZE_OF_YOUNG_OBJ: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 /// Publish the standalone descr's facts. Always writes the full set.
 pub fn publish_standalone_jitframe_facts(facts: JitframeDescrFacts) {
@@ -739,6 +747,10 @@ pub fn publish_standalone_jitframe_facts(facts: JitframeDescrFacts) {
     STANDALONE_NURSERY_TOP_ADDR.store(facts.nursery_top_addr, std::sync::atomic::Ordering::Relaxed);
     STANDALONE_CHASES_FORWARDING_STUBS.store(
         facts.chases_forwarding_stubs,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    STANDALONE_MAX_SIZE_OF_YOUNG_OBJ.store(
+        facts.max_size_of_young_obj,
         std::sync::atomic::Ordering::Relaxed,
     );
     STANDALONE_DESCR_JITFRAME_IS_GC_OBJECT
@@ -756,6 +768,8 @@ pub fn standalone_jitframe_facts() -> JitframeDescrFacts {
         nursery_free_addr: STANDALONE_NURSERY_FREE_ADDR.load(std::sync::atomic::Ordering::Relaxed),
         nursery_top_addr: STANDALONE_NURSERY_TOP_ADDR.load(std::sync::atomic::Ordering::Relaxed),
         chases_forwarding_stubs: STANDALONE_CHASES_FORWARDING_STUBS
+            .load(std::sync::atomic::Ordering::Relaxed),
+        max_size_of_young_obj: STANDALONE_MAX_SIZE_OF_YOUNG_OBJ
             .load(std::sync::atomic::Ordering::Relaxed),
     }
 }
@@ -795,8 +809,9 @@ fn nursery_jitframe_total(size_bytes: usize) -> Option<usize> {
 /// `execute_token`. `GcLLDescr_framework` leaves it as `JITFRAME.allocate`,
 /// which is `lltype.malloc` and inlines to the nursery bump compiled code
 /// already performs (`rewrite.py` `gen_malloc_nursery_varsize_frame`). The
-/// bump reads the descr's `nursery_free` / `nursery_top` cells; the slow path
-/// is `alloc_nursery_typed` when the nursery cannot satisfy the request.
+/// bump reads the descr's `nursery_free` / `nursery_top` cells and stops at
+/// `max_size_of_young_obj`; the slow path is the collecting
+/// `malloc_varsize` when the nursery cannot satisfy the request.
 ///
 /// Returns `(frame, needs_write_barrier)`. A nursery result is young
 /// (`init_gc_object` leaves `GCFLAG_TRACK_YOUNG_PTRS` clear), so the
@@ -817,6 +832,11 @@ pub fn try_bump_nursery_jitframe(
     size_bytes: usize,
 ) -> Option<*mut JitFrame> {
     let total = nursery_jitframe_total(size_bytes)?;
+    // gc.py `can_use_nursery_malloc`: `size < max_size_of_young_obj`
+    // (exclusive; the field is `nonlarge_max + 1`). 0 therefore never bumps.
+    if total >= facts.max_size_of_young_obj {
+        return None;
+    }
     let free_cell = facts.nursery_free_addr;
     let top_cell = facts.nursery_top_addr;
     if free_cell == 0 || top_cell == 0 {
@@ -839,22 +859,16 @@ pub fn try_bump_nursery_jitframe(
     }
 }
 
-/// `GcLLDescr_framework.malloc_jitframe` through the descr's own nursery
-/// hook. A per-thread box (CelGc) answers from this thread's heap; a
-/// process-global MiniMark answers from `gc_sync`.
+/// `GcLLDescr_framework.malloc_jitframe` through the collecting
+/// `malloc_varsize` (`incminimark.py` `collect_and_reserve` /
+/// `external_malloc`). A per-thread box (CelGc) answers from this thread's
+/// heap; a process-global MiniMark answers from `gc_sync`. The write barrier
+/// stays conservative on this cold arm.
 #[inline]
 pub fn malloc_gc_jitframe_via_descr(type_id: u32, size_bytes: usize) -> (*mut JitFrame, bool) {
-    let mut needs_wb = true;
-    let gcref =
-        unsafe { majit_gc::alloc_nursery_typed_with_placement(type_id, size_bytes, &mut needs_wb) };
-    let gcref = if gcref.is_null() {
-        needs_wb = true;
-        majit_gc::alloc_nursery_typed(type_id, size_bytes)
-    } else {
-        gcref
-    };
+    let gcref = majit_gc::alloc_nursery_collecting_typed(type_id, size_bytes);
     assert!(!gcref.is_null(), "JITFRAME allocation failed");
-    (gcref.0 as *mut JitFrame, needs_wb)
+    (gcref.0 as *mut JitFrame, true)
 }
 
 /// Refuse an install whose descr cannot allocate frames the collector can

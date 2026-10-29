@@ -2942,21 +2942,21 @@ impl WarmEnterState {
         }
         // `lookup_chain` returns the table-slot head. `_get_index` keeps
         // only the high bits of the low 32, so that head can belong to a
-        // different green key. Its compiled / tracing / dead-token /
-        // abort-ceiling / `JC_DONT_TRACE_HERE` state is not ours: the
-        // not-found arm of `maybe_compile_and_run` ticks this hash.
+        // different green key. `maybe_compile_and_run` walks with
+        // `isinstance(cell, JitCell) and cell.comparekey(*greenargs)`
+        // and only on a match reads `cell.flags`.
         if cell.cell_bucket.get() != hash {
             return DoorCell::Empty;
         }
+        if let Some((values, types)) = greenargs
+            && !cell.comparekey(values, types)
+        {
+            return DoorCell::Occupied;
+        }
+        if cell.jitdriver_sd != self.jitdriver_sd {
+            return DoorCell::Occupied;
+        }
         if cell.is_compiled() {
-            if let Some((values, types)) = greenargs
-                && !cell.comparekey(values, types)
-            {
-                return DoorCell::Occupied;
-            }
-            if cell.jitdriver_sd != self.jitdriver_sd {
-                return DoorCell::Occupied;
-            }
             let cell_key = cell.cell_key.get().unwrap_or(hash);
             return match Self::cell_entry_procedure_token(&cell) {
                 Some(token) => DoorCell::Enter { cell_key, token },
@@ -5956,6 +5956,35 @@ mod tests {
         assert!(
             matches!(ws.door_cell(hash, Some(miss)), DoorCell::Occupied),
             "comparekey miss with the same hash is Occupied"
+        );
+    }
+
+    /// A tracing occupant whose comparekey misses is Occupied, not Tracing.
+    /// `maybe_compile_and_run` establishes identity before `cell.flags`.
+    #[test]
+    fn door_cell_tracing_comparekey_miss_is_occupied() {
+        let mut ws = WarmEnterState::new(100);
+        let key_hit = GreenKey::new(vec![1, 0]);
+        let key_miss = GreenKey::new(vec![2, 13080698639]);
+        let hash = key_hit.get_uhash();
+        assert_eq!(
+            hash,
+            key_miss.get_uhash(),
+            "fixture is a full-hash collision"
+        );
+        ws.ensure_cell_for_key(&key_hit);
+        let cell = ws.lookup_chain(hash).expect("installed");
+        assert!(cell.next.borrow().is_none(), "test needs a unique occupant");
+        cell.flags.set(cell.flags.get() | JcFlags::JC_TRACING);
+        let hit = (key_hit.values.as_slice(), key_hit.types.as_slice());
+        let miss = (key_miss.values.as_slice(), key_miss.types.as_slice());
+        assert!(
+            matches!(ws.door_cell(hash, Some(miss)), DoorCell::Occupied),
+            "comparekey miss on a tracing cell is Occupied"
+        );
+        assert!(
+            matches!(ws.door_cell(hash, Some(hit)), DoorCell::Tracing),
+            "comparekey hit on a tracing cell is Tracing"
         );
     }
 

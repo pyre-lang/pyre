@@ -2944,9 +2944,9 @@ pub fn blackhole_resume_via_rd_numb<'df>(
     // resume.py: virtualizable_ptr was read by consume_vable_info
     // from the vable section. Set on the blackhole for vable bytecodes.
     // A novable resume runs no vable opcodes, so both the pointer and the
-    // vinfo handle are null instead of jd0's. Write them: the interp comes
-    // from the shared pool, and `release_interp_plain` keeps whatever the
-    // previous user left in those fields.
+    // vinfo handle are written null instead of jd0's. The interp comes
+    // from the shared pool; `release_interp` already cleared the vable
+    // triple, and this restates the zeros for a novable resume.
     if !novable {
         if virtualizable_ptr != 0 {
             bh.virtualizable_ptr = virtualizable_ptr;

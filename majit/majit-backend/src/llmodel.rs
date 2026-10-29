@@ -18,12 +18,12 @@
 //! declares the abstract contract for these accessors; all entries
 //! below match those signatures.
 
-use majit_gc::shadow_stack::ShadowRoot;
-use majit_ir::{FailDescr, GcRef};
+use majit_gc::shadow_stack::{ShadowRoot, ShadowStackSlot, shadow_stack_slot};
+use majit_ir::{FailDescr, GcRef, Type};
 
 use crate::jitframe::{
-    FIRST_ITEM_OFFSET, JitFrame, JitframeDescrFacts, malloc_gc_jitframe, malloc_host_jitframe,
-    reuse_off_gc_jitframe,
+    FIRST_ITEM_OFFSET, JitFrame, JitframeDescrFacts, malloc_gc_jitframe_via_descr,
+    malloc_host_jitframe, reuse_off_gc_jitframe, try_bump_nursery_jitframe,
 };
 
 /// llmodel.py — get_latest_descr.
@@ -615,7 +615,7 @@ pub unsafe fn set_savedata_ref(ptr: *mut JitFrame, value: usize) {
 /// `llmodel.py` `AbstractLLCPU.make_execute_token` always allocates through
 /// `self.gc_ll_descr.malloc_jitframe` (`GcLLDescription.malloc_jitframe`).
 /// The raw path does that too: a descr with a `JITFRAME` type id bumps a
-/// nursery frame (`malloc_gc_jitframe`); `HostHeapGc` keeps the
+/// nursery frame (`try_bump_nursery_jitframe`); `HostHeapGc` keeps the
 /// host-block arm, which is what its `malloc_jitframe` is. `diag` is the
 /// remaining reason to leave that path — exec logging and dumps walk the
 /// typed `execute_token` frame.
@@ -684,6 +684,67 @@ pub fn done_ref_slot0(tip: *mut JitFrame) -> usize {
     unsafe { get_ref_value_direct(tip, 0) }
 }
 
+/// REF argument words of one raw `execute_token`, rooted across the
+/// collecting `malloc_jitframe` fallback.
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` stores each live GCREF at
+/// `root_stack_top` and bumps it. `walk_stack_root` writes a moved object
+/// back into that slot. `pop_roots` (`Drop`) restores the top recorded
+/// before the pushes. Int-only re-entry leaves this inactive.
+struct RawEntryArgRoots {
+    slot: Option<ShadowStackSlot>,
+    depth: usize,
+}
+
+impl RawEntryArgRoots {
+    const fn inactive() -> Self {
+        Self {
+            slot: None,
+            depth: 0,
+        }
+    }
+
+    /// Push every `Type::Ref` word, in argument order. No ref means no
+    /// thread-local resolve and a `Drop` that does not touch the stack.
+    fn push_ref_words(args: &[i64], kinds: &[Type]) -> Self {
+        let mut roots = Self::inactive();
+        for (i, &word) in args.iter().enumerate() {
+            if kinds.get(i).copied() == Some(Type::Ref) {
+                roots.push_one(GcRef(word as usize));
+            }
+        }
+        roots
+    }
+
+    fn push_one(&mut self, value: GcRef) {
+        let slot = match self.slot {
+            Some(slot) => slot,
+            None => {
+                let slot = shadow_stack_slot();
+                self.depth = slot.depth();
+                self.slot = Some(slot);
+                slot
+            }
+        };
+        slot.push(value);
+    }
+
+    /// The ref at `ref_index` among the pushed refs, after any forwarding.
+    #[inline]
+    fn get(&self, ref_index: usize) -> Option<GcRef> {
+        let slot = self.slot?;
+        Some(slot.get(self.depth + ref_index))
+    }
+}
+
+impl Drop for RawEntryArgRoots {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.pop_to(self.depth);
+        }
+    }
+}
+
 /// Frame setup for a raw finish. `llmodel.py` `AbstractLLCPU.make_execute_token`.
 ///
 /// A descr that owns jitframes allocates through `gc_ll_descr.malloc_jitframe`
@@ -716,17 +777,35 @@ pub unsafe fn prepare_done_raw_entry_frame(
     let clt = unsafe { &*token.compiled_loop_token_ptr() };
     let fi_ptr = clt.frame_info.data_ptr() as *const crate::JitFrameInfo;
     let frame_bytes = JitFrame::alloc_size(num_slots);
+    let kinds = token.inputarg_types();
+    // Bump first; `ShadowStackFrameworkGCTransformer.push_roots` only
+    // around the collecting fallback (`alloc_entry_jitframe`).
+    let mut arg_roots = RawEntryArgRoots::inactive();
     let (jf_ptr, needs_wb) = if facts.is_gc_object {
-        malloc_gc_jitframe(facts, frame_bytes)
+        if let Some(frame) = try_bump_nursery_jitframe(facts, frame_bytes) {
+            (frame, false)
+        } else {
+            arg_roots = RawEntryArgRoots::push_ref_words(args, kinds);
+            malloc_gc_jitframe_via_descr(facts.type_id(), frame_bytes)
+        }
     } else {
         (take_or_alloc_parked_entry_frame(token, frame_bytes), false)
     };
     unsafe {
         JitFrame::init(jf_ptr, fi_ptr, num_slots);
+        let mut ref_index = 0;
         for (i, &word) in args.iter().enumerate() {
-            set_int_value(jf_ptr, first_slot + i, word as isize);
+            let stored = if kinds.get(i).copied() == Some(Type::Ref) {
+                let current = arg_roots.get(ref_index).map(|g| g.0 as i64).unwrap_or(word);
+                ref_index += 1;
+                current
+            } else {
+                word
+            };
+            set_int_value(jf_ptr, first_slot + i, stored as isize);
         }
     }
+    drop(arg_roots);
     if needs_wb {
         majit_gc::gc_write_barrier(GcRef(jf_ptr as usize));
     }

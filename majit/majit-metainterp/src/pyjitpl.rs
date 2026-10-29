@@ -2578,6 +2578,9 @@ pub struct MetaInterp<M: Clone> {
     /// six Vec capacities on the pooled interpreter; exits that never enter
     /// the blackhole reuse this buffer the same way.
     portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
+    /// Recycled terminal blackhole banks for guard-failure resume.
+    /// Capacity reuse for the terminal banks, same role as the CRN scratch.
+    pub(crate) blackhole_terminal_scratch: Option<crate::blackhole::BlackholeTerminalImage>,
     /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
@@ -2670,10 +2673,6 @@ pub struct MetaInterp<M: Clone> {
     /// does not move an `ExitValues` buffer. `take_back_edge_finish_int`
     /// drains this first.
     pub(crate) back_edge_finish_word: Option<i64>,
-    /// Stashed when [`Self::poll_raw_int_finish`] ran the trace and the exit
-    /// was not the int finish singleton. The caller takes the deadframe and
-    /// dispatches `fail_descr.handle_fail` (`warmstate.py execute_assembler`).
-    pub(crate) raw_int_fallback: Option<majit_backend::DeadFrame>,
     /// Single-pass tracing: the walk-final scalar state-field values captured
     /// off the still-live sym at the CloseLoop point (scalar state-field index
     /// order, idx `0..num_scalars`), BEFORE the CloseLoop arm clears the sym.
@@ -4614,6 +4613,7 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
             portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
+            blackhole_terminal_scratch: None,
             cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
             tracing: None,
@@ -4623,7 +4623,6 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_finish_values: None,
             back_edge_finish: None,
             back_edge_finish_word: None,
-            raw_int_fallback: None,
             single_pass_scalar_values: None,
             single_pass_ref_scalar_values: None,
             single_pass_virt_array_values: None,
@@ -15024,28 +15023,31 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `warmstate.py execute_assembler` int fast path.
     ///
-    /// `Some` is `DoneWithThisFrameDescrInt.get_result`: slot 0, frame
-    /// released. `None` means the trace already ran and
-    /// [`Self::raw_int_fallback`] holds the deadframe; the caller
+    /// `Ok` is `DoneWithThisFrameDescrInt.get_result`: slot 0, frame
+    /// released. `Err` is the deadframe from any other exit; the caller
     /// dispatches `fail_descr.handle_fail`.
+    ///
+    /// `keep_loop_alive(loop_token)` runs after `func_execute_token` on
+    /// both arms (`warmstate.py execute_assembler`).
     pub fn poll_raw_int_finish(
         &mut self,
-        procedure_token: &JitCellToken,
+        procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
         _green_key: u64,
         live_values: &[Value],
-    ) -> Option<i64> {
+    ) -> Result<i64, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
         match self
             .backend
             .execute_token_done_int(procedure_token, live_values)
         {
             Ok(value) => {
+                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
-                Some(value)
+                Ok(value)
             }
             Err(frame) => {
-                self.raw_int_fallback = Some(frame);
-                None
+                self.keep_compiled_token_alive(procedure_token);
+                Err(frame)
             }
         }
     }
@@ -15057,50 +15059,54 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn poll_raw_int_finish_raw(
         &mut self,
-        procedure_token: &JitCellToken,
+        procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
         _green_key: u64,
         raw_reds: &[i64],
-    ) -> Option<i64> {
+    ) -> Result<i64, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
         match self
             .backend
             .execute_token_done_int_raw(procedure_token, raw_reds)
         {
             Ok(value) => {
+                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
-                Some(value)
+                Ok(value)
             }
             Err(frame) => {
-                self.raw_int_fallback = Some(frame);
-                None
+                self.keep_compiled_token_alive(procedure_token);
+                Err(frame)
             }
         }
     }
 
     /// `warmstate.py execute_assembler` ref fast path.
     ///
-    /// `Some` is `compile.py DoneWithThisFrameDescrRef.get_result`: slot 0,
-    /// frame released. `None` means the trace already ran and
-    /// [`Self::raw_int_fallback`] holds the deadframe; the caller
+    /// `Ok` is `compile.py DoneWithThisFrameDescrRef.get_result`: slot 0,
+    /// frame released. `Err` is the deadframe from any other exit; the caller
     /// dispatches `fail_descr.handle_fail`.
+    ///
+    /// `keep_loop_alive(loop_token)` runs after `func_execute_token` on
+    /// both arms (`warmstate.py execute_assembler`).
     pub fn poll_raw_ref_finish(
         &mut self,
-        procedure_token: &JitCellToken,
+        procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
         _green_key: u64,
         live_values: &[Value],
-    ) -> Option<usize> {
+    ) -> Result<usize, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
         match self
             .backend
             .execute_token_done_ref(procedure_token, live_values)
         {
             Ok(value) => {
+                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
-                Some(value)
+                Ok(value)
             }
             Err(frame) => {
-                self.raw_int_fallback = Some(frame);
-                None
+                self.keep_compiled_token_alive(procedure_token);
+                Err(frame)
             }
         }
     }
@@ -15109,22 +15115,23 @@ impl<M: Clone> MetaInterp<M> {
     #[inline]
     pub fn poll_raw_ref_finish_raw(
         &mut self,
-        procedure_token: &JitCellToken,
+        procedure_token: &std::sync::Arc<majit_backend::JitCellToken>,
         _green_key: u64,
         raw_reds: &[i64],
-    ) -> Option<usize> {
+    ) -> Result<usize, majit_backend::DeadFrame> {
         Self::prepare_compiled_run_io();
         match self
             .backend
             .execute_token_done_ref_raw(procedure_token, raw_reds)
         {
             Ok(value) => {
+                self.keep_compiled_token_alive(procedure_token);
                 Self::finish_compiled_run_io();
-                Some(value)
+                Ok(value)
             }
             Err(frame) => {
-                self.raw_int_fallback = Some(frame);
-                None
+                self.keep_compiled_token_alive(procedure_token);
+                Err(frame)
             }
         }
     }
@@ -20473,7 +20480,10 @@ impl<M: Clone> MetaInterp<M> {
                 majit_ir::resumedata::RebuiltValue::Box(_, k) => *k,
                 majit_ir::resumedata::RebuiltValue::Const(c) => c.get_type(),
                 majit_ir::resumedata::RebuiltValue::ConstRef(_) => majit_ir::Type::Ref,
-                majit_ir::resumedata::RebuiltValue::Virtual(_) => majit_ir::Type::Ref,
+                majit_ir::resumedata::RebuiltValue::Virtual(_) => tracing
+                    .as_deref()
+                    .and_then(|ctx| ctx.get_opref_type(opref))
+                    .expect("resume.py decode_box: materialized virtual has a box type"),
                 majit_ir::resumedata::RebuiltValue::Unassigned => {
                     unreachable!("resume.py decode_box: UNINITIALIZED is not a live-register box")
                 }

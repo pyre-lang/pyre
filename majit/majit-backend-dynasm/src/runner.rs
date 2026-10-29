@@ -442,7 +442,7 @@ fn alloc_entry_jitframe(
             return (f, true, false, EntryArgRoots::inactive());
         }
         // Nursery full: `ShadowStackFrameworkGCTransformer.push_roots`
-        // around the collecting call only.
+        // around the collecting `malloc_gc_jitframe_via_descr` only.
         let roots = EntryArgRoots::push_refs(args);
         let (f, needs_wb) = malloc_gc_jitframe_via_descr(facts.type_id(), size_bytes);
         return (f, true, needs_wb, roots);
