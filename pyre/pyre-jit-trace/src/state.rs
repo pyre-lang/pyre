@@ -12250,7 +12250,10 @@ impl JitState for PyreJitState {
             // (in `virtualref.rs`) — the outer virt_ptr guard masked
             // exactly the case RPython asserts on, so do not pre-gate here.
             unsafe {
-                vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
+                vrefinfo.continue_tracing(
+                    vref_ptr as majit_gc::header::GCREF,
+                    virt_ptr as majit_gc::header::GCREF,
+                );
             }
         }
         // `ExecutionContext.topframeref` is a live heap field, so unlike the
@@ -12284,7 +12287,9 @@ impl JitState for PyreJitState {
             // in the slot is worth overwriting.
             let stale_scope = !restored_virtualref_boxes.is_empty()
                 || unsafe {
-                    majit_metainterp::virtualref::ptr_is_virtual_ref(published as *const u8)
+                    majit_metainterp::virtualref::ptr_is_virtual_ref(
+                        published as majit_gc::header::GCREF,
+                    )
                 };
             if published as usize != restored_top && stale_scope {
                 unsafe {

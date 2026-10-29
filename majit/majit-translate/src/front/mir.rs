@@ -35,7 +35,9 @@
 //!   - `Assign(Local, Rvalue)` — primary lowering site.
 //!   - `Assign(Projection(.., Field|Deref|Index), ...)` — emits a
 //!     side-effectful `FieldWrite` / `ArrayWrite` / `__deref_write`.
-//!   - `StorageLive` / `StorageDead` / `PlaceMention` — skipped.
+//!   - `StorageLive` / `PlaceMention` — skipped. `StorageDead` of a
+//!     window local emits `objectmodel.keepalive_until_here`
+//!     (`rtype_keepalive_until_here`).
 //!   - `Assert` — stripped (overflow asserts collapse into success
 //!     edge; see the `TermKind::Assert` lowering note below).
 //!
@@ -3038,8 +3040,10 @@ pub(crate) fn tuple_field_value_type(type_name: &str) -> ValueType {
     // primitive is `'int'`. `Tuple<*mut usize, …>` intern's `__pos_0` from
     // this spelling (`rtuple.py` `TupleRepr`); a `Ref` seed makes
     // `raw_load` see `SomeInstance` (`ann_direct_ptradd` needs a pointer,
-    // `rffi.py` `ptradd`). A byte pointer stays `Ref`: pyre erases a GC
-    // reference to `*mut u8`.
+    // `rffi.py` `ptradd`). A raw `*u8` is `rffi.CCHARP` (int-banked).
+    if type_name == "*mut u8" || type_name == "*const u8" {
+        return ValueType::Unsigned;
+    }
     if let Some(raw) = spelling_raw_scalar_address_value_type(type_name) {
         return raw;
     }

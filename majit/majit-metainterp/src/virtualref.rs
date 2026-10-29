@@ -15,6 +15,8 @@
 
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
+use majit_gc::header::GCREF;
+
 /// The value [`VREF_GC_TYPE_ID`] holds before `set_vref_gc_type_id` runs.  Zero
 /// is a legitimate id, so the sentinel has to be a value the registry never
 /// hands out.
@@ -62,11 +64,9 @@ pub struct ObjectHeader {
 /// starts with the typeptr slot at offset 0, matching the runtime
 /// layout `is_virtual_ref` reads through.
 ///
-/// `virtual_token` and `forced` are both `llmemory.GCREF`/`OBJECTPTR`
-/// upstream — pointer fields, not int.  Pyre stores them as `*mut
-/// u8` so the runtime layout and the optimizer-side
-/// `make_vref_field_descr` (`Type::Ref` per
-/// `optimizeopt/virtualize.rs`) agree on the slot type.
+/// `virtual_token` is `llmemory.GCREF`. `forced` is upstream
+/// `rclass.OBJECTPTR`, held as the `GCREF` view `cast_opaque_ptr` gives.
+/// Both are GC references (`history.py` `getkind` `'ref'`).
 ///
 /// Both fields are traced GC slots. `virtual_token` contains null, the
 /// prebuilt `JITFRAME_DUMMY`, or a JITFRAME GCREF, matching
@@ -75,8 +75,9 @@ pub struct ObjectHeader {
 pub struct JitVirtualRef {
     /// `('super', rclass.OBJECT)` — typeptr slot at offset 0.
     pub super_: ObjectHeader,
-    pub virtual_token: *mut u8,
-    pub forced: *mut u8,
+    pub virtual_token: GCREF,
+    /// Upstream `rclass.OBJECTPTR`; held as the `GCREF` view `cast_opaque_ptr` gives.
+    pub forced: GCREF,
 }
 
 /// `virtualref.py:21-23` `jit_virtual_ref_vtable = lltype.malloc(
@@ -100,7 +101,7 @@ pub const JIT_VIRTUAL_REF_VTABLE: usize = 0x4A56_5221; // "JVR!"
 /// `ptr` must be null or point to a valid object whose leading
 /// pointer-sized word is the `('super', rclass.OBJECT)` typeptr.
 #[inline]
-pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
+pub unsafe fn ptr_is_virtual_ref(ptr: GCREF) -> bool {
     unsafe {
         if ptr.is_null() {
             return false;
@@ -122,7 +123,7 @@ pub unsafe fn ptr_is_virtual_ref(ptr: *const u8) -> bool {
 /// # Safety
 /// `ptr` must satisfy [`ptr_is_virtual_ref`], which the caller checks first.
 #[inline]
-pub unsafe fn vref_forced(ptr: *const u8) -> *mut u8 {
+pub unsafe fn vref_forced(ptr: GCREF) -> GCREF {
     unsafe { (*(ptr as *const JitVirtualRef)).forced }
 }
 
@@ -160,7 +161,7 @@ pub use crate::jit::InvalidVirtualRef;
 /// leaked, and reclamation is what it gives up.  Once the id is set the
 /// allocation stays collector-owned or fails loudly — a host box past that
 /// point would silently drop the `forced` edge this object exists to hold.
-fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
+fn alloc_virtual_ref(real_object: GCREF) -> GCREF {
     let vref = JitVirtualRef {
         super_: ObjectHeader {
             typeptr: JIT_VIRTUAL_REF_VTABLE,
@@ -178,14 +179,14 @@ fn alloc_virtual_ref(real_object: *mut u8) -> *mut u8 {
         unsafe { std::ptr::write(gcref.0 as *mut JitVirtualRef, vref) };
         // Creation write barrier: an old-gen vref may point at a young frame.
         majit_gc::gc_write_barrier(gcref);
-        return gcref.0 as *mut u8;
+        return gcref.0 as GCREF;
     }
-    Box::into_raw(Box::new(vref)) as *mut u8
+    Box::into_raw(Box::new(vref)) as GCREF
 }
 
 /// Token value indicating no JIT frame is active.
 /// `virtualizable.py TOKEN_NONE = lltype.nullptr(llmemory.GCREF.TO)`.
-pub const TOKEN_NONE: *mut u8 = std::ptr::null_mut();
+pub const TOKEN_NONE: GCREF = std::ptr::null_mut();
 
 /// `virtualizable.py:326`:
 /// ```python
@@ -223,7 +224,7 @@ pub fn set_tracing_rescall_dummy_gc_type_id(type_id: u32) {
 /// tracing sentinel. The object is allocated in the GC old generation with a
 /// registered leaf type and held by a program-lifetime root, giving it the
 /// prebuilt lifetime of `_dummy` while remaining a legal GCREF.
-fn allocate_tracing_rescall_dummy() -> *mut u8 {
+fn allocate_tracing_rescall_dummy() -> GCREF {
     let value = ObjectHeader {
         typeptr: JITFRAME_DUMMY_VTABLE,
     };
@@ -236,7 +237,7 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
         // address stable and unique for the process while staying outside the
         // managed heap, where `is_managed_heap_object` rejects it before any
         // tracing path reads its header.
-        return Box::into_raw(Box::new(value)) as *mut u8;
+        return Box::into_raw(Box::new(value)) as GCREF;
     }
     let dummy = majit_gc::alloc_oldgen_typed(type_id, std::mem::size_of::<ObjectHeader>());
     assert!(!dummy.is_null(), "JITFRAME_DUMMY old-gen allocation failed");
@@ -246,7 +247,7 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
     // collector the same lifetime; old-gen makes its identity stable.
     let root = Box::into_raw(Box::new(dummy));
     unsafe { majit_gc::gc_add_root(root) };
-    dummy.0 as *mut u8
+    dummy.0 as GCREF
 }
 
 /// Token value used during tracing when a residual call is in progress.
@@ -257,10 +258,10 @@ fn allocate_tracing_rescall_dummy() -> *mut u8 {
 /// The returned address is a registered, rooted GC leaf, and stays the same for
 /// as long as the heap it was minted in is the current one.
 #[inline]
-pub fn token_tracing_rescall() -> *mut u8 {
+pub fn token_tracing_rescall() -> GCREF {
     let minted = TRACING_RESCALL_DUMMY_PTR.load(Ordering::Relaxed);
     if minted != 0 {
-        return minted as *mut u8;
+        return minted as GCREF;
     }
     let fresh = allocate_tracing_rescall_dummy() as usize;
     // Racing minters both produce a valid sentinel, but the token protocol
@@ -268,8 +269,8 @@ pub fn token_tracing_rescall() -> *mut u8 {
     // object is immortal either way — upstream's `_dummy` is prebuilt.
     match TRACING_RESCALL_DUMMY_PTR.compare_exchange(0, fresh, Ordering::Relaxed, Ordering::Relaxed)
     {
-        Ok(_) => fresh as *mut u8,
-        Err(published) => published as *mut u8,
+        Ok(_) => fresh as GCREF,
+        Err(published) => published as GCREF,
     }
 }
 
@@ -320,7 +321,7 @@ impl crate::resume::VRefInfo for VirtualRefInfo {
         // `assert vref.virtual_token != TOKEN_TRACING_RESCALL`
         // post-conditions.
         unsafe {
-            self.continue_tracing(vref as *mut u8, virtual_ref as *mut u8);
+            self.continue_tracing(vref as GCREF, virtual_ref as GCREF);
         }
     }
 }
@@ -402,9 +403,9 @@ impl VirtualRefInfo {
     /// `vref_ptr` must point to a valid JitVirtualRef object.
     pub unsafe fn force_virtual(
         &self,
-        vref_ptr: *mut u8,
+        vref_ptr: GCREF,
         force_now: impl FnOnce(*mut JitVirtualRef),
-    ) -> Result<*mut u8, InvalidVirtualRef> {
+    ) -> Result<GCREF, InvalidVirtualRef> {
         unsafe {
             let vref = &mut *(vref_ptr as *mut JitVirtualRef);
             let token = vref.virtual_token;
@@ -439,7 +440,7 @@ impl VirtualRefInfo {
     ///
     /// Allocates a concrete JitVirtualRef on the heap with
     /// virtual_token = TOKEN_NONE, forced = real_object.
-    pub fn virtual_ref_during_tracing(&self, real_object: *mut u8) -> *mut u8 {
+    pub fn virtual_ref_during_tracing(&self, real_object: GCREF) -> GCREF {
         alloc_virtual_ref(real_object)
     }
 
@@ -452,7 +453,7 @@ impl VirtualRefInfo {
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
     /// whose leading pointer-sized word is the type-tag.
-    pub unsafe fn tracing_before_residual_call(&self, vref_ptr: *mut u8) {
+    pub unsafe fn tracing_before_residual_call(&self, vref_ptr: GCREF) {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
                 return;
@@ -473,7 +474,7 @@ impl VirtualRefInfo {
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
     /// whose leading pointer-sized word is the type-tag.
-    pub unsafe fn tracing_after_residual_call(&self, vref_ptr: *mut u8) -> bool {
+    pub unsafe fn tracing_after_residual_call(&self, vref_ptr: GCREF) -> bool {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
                 return false;
@@ -506,7 +507,7 @@ impl VirtualRefInfo {
     /// # Safety
     /// `vref_ptr` must be null or point to a valid GCREF object
     /// whose leading pointer-sized word is the type-tag.
-    pub unsafe fn continue_tracing(&self, vref_ptr: *mut u8, real_object: *mut u8) {
+    pub unsafe fn continue_tracing(&self, vref_ptr: GCREF, real_object: GCREF) {
         unsafe {
             if !self.is_virtual_ref(vref_ptr) {
                 return;
@@ -534,17 +535,17 @@ impl VirtualRefInfo {
     /// Check if a virtual reference is currently active (has a JIT frame token).
     ///
     /// virtualref.py: token != TOKEN_NONE and token != TOKEN_TRACING_RESCALL
-    pub fn is_active(token: *mut u8) -> bool {
+    pub fn is_active(token: GCREF) -> bool {
         token != TOKEN_NONE && token != token_tracing_rescall()
     }
 
     /// Check if a virtual reference is forced (token == TOKEN_NONE).
-    pub fn is_forced(token: *mut u8) -> bool {
+    pub fn is_forced(token: GCREF) -> bool {
         token == TOKEN_NONE
     }
 
     /// Check if a virtual reference is in a residual call.
-    pub fn is_in_residual_call(token: *mut u8) -> bool {
+    pub fn is_in_residual_call(token: GCREF) -> bool {
         token == token_tracing_rescall()
     }
 
@@ -563,7 +564,7 @@ impl VirtualRefInfo {
     /// # Safety
     /// `ptr` must point to a valid GCREF object whose leading
     /// pointer-sized word is the typeptr, or be null.
-    pub unsafe fn is_virtual_ref(&self, ptr: *const u8) -> bool {
+    pub unsafe fn is_virtual_ref(&self, ptr: GCREF) -> bool {
         unsafe { ptr_is_virtual_ref(ptr) }
     }
 }
@@ -571,6 +572,7 @@ impl VirtualRefInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_gc::header::{GCREF, GCREFOpaque};
 
     #[test]
     fn test_token_constants() {
@@ -616,7 +618,7 @@ mod tests {
             virtual_token: TOKEN_NONE,
             forced: std::ptr::null_mut(),
         };
-        let vref_ptr = &mut vref as *mut JitVirtualRef as *mut u8;
+        let vref_ptr = (&mut vref as *mut JitVirtualRef).cast::<GCREFOpaque>();
         let err = unsafe {
             info.force_virtual(vref_ptr, |_| {
                 panic!("force_now must not be called when token == TOKEN_NONE")
@@ -635,7 +637,7 @@ mod tests {
     #[test]
     fn force_virtual_tracing_rescall_resets_token() {
         let info = VirtualRefInfo::new();
-        let real_obj: *mut u8 = 0xCAFE_F00Du64 as *mut u8;
+        let real_obj: GCREF = 0xCAFE_F00Du64 as GCREF;
         let mut vref = JitVirtualRef {
             super_: ObjectHeader {
                 typeptr: JIT_VIRTUAL_REF_VTABLE,
@@ -643,7 +645,7 @@ mod tests {
             virtual_token: token_tracing_rescall(),
             forced: real_obj,
         };
-        let vref_ptr = &mut vref as *mut JitVirtualRef as *mut u8;
+        let vref_ptr = (&mut vref as *mut JitVirtualRef).cast::<GCREFOpaque>();
         let result = unsafe {
             info.force_virtual(vref_ptr, |_| {
                 panic!("force_now must not be called for TOKEN_TRACING_RESCALL branch")
@@ -667,8 +669,8 @@ mod tests {
     #[test]
     fn force_virtual_active_frame_invokes_force_now_with_vref_mutation() {
         let info = VirtualRefInfo::new();
-        let active_token: *mut u8 = 0xABCDu64 as *mut u8;
-        let materialized: *mut u8 = 0xCAFEu64 as *mut u8;
+        let active_token: GCREF = 0xABCDu64 as GCREF;
+        let materialized: GCREF = 0xCAFEu64 as GCREF;
         let mut vref = JitVirtualRef {
             super_: ObjectHeader {
                 typeptr: JIT_VIRTUAL_REF_VTABLE,
@@ -676,7 +678,7 @@ mod tests {
             virtual_token: active_token,
             forced: std::ptr::null_mut(),
         };
-        let vref_ptr = &mut vref as *mut JitVirtualRef as *mut u8;
+        let vref_ptr = (&mut vref as *mut JitVirtualRef).cast::<GCREFOpaque>();
         let result = unsafe {
             info.force_virtual(vref_ptr, |v| {
                 // Equivalent of `cpu.force(token)` writeback +
@@ -701,7 +703,7 @@ mod tests {
     fn tracing_before_residual_call_skips_non_vref() {
         let info = VirtualRefInfo::new();
         let mut not_a_vref: u64 = 0x1234_5678_9ABC_DEF0;
-        let ptr = &mut not_a_vref as *mut u64 as *mut u8;
+        let ptr = (&mut not_a_vref as *mut u64).cast::<GCREFOpaque>();
         unsafe {
             info.tracing_before_residual_call(ptr);
         }
@@ -717,7 +719,7 @@ mod tests {
     fn tracing_after_residual_call_returns_false_for_non_vref() {
         let info = VirtualRefInfo::new();
         let mut not_a_vref: u64 = 0x1234_5678_9ABC_DEF0;
-        let ptr = &mut not_a_vref as *mut u64 as *mut u8;
+        let ptr = (&mut not_a_vref as *mut u64).cast::<GCREFOpaque>();
         let forced = unsafe { info.tracing_after_residual_call(ptr) };
         assert!(!forced, "non-vref input must surface as not-forced");
         assert_eq!(
@@ -732,8 +734,8 @@ mod tests {
     fn continue_tracing_skips_non_vref() {
         let info = VirtualRefInfo::new();
         let mut not_a_vref: u64 = 0x1234_5678_9ABC_DEF0;
-        let ptr = &mut not_a_vref as *mut u64 as *mut u8;
-        let real_obj: *mut u8 = 0xDEADBEEFu64 as *mut u8;
+        let ptr = (&mut not_a_vref as *mut u64).cast::<GCREFOpaque>();
+        let real_obj: GCREF = 0xDEADBEEFu64 as GCREF;
         unsafe {
             info.continue_tracing(ptr, real_obj);
         }
@@ -749,7 +751,7 @@ mod tests {
     #[test]
     fn tracing_before_residual_call_mutates_real_vref() {
         let info = VirtualRefInfo::new();
-        let real_obj: *mut u8 = 0xCAFE_F00Du64 as *mut u8;
+        let real_obj: GCREF = 0xCAFE_F00Du64 as GCREF;
         let mut vref = JitVirtualRef {
             super_: ObjectHeader {
                 typeptr: JIT_VIRTUAL_REF_VTABLE,
@@ -757,7 +759,7 @@ mod tests {
             virtual_token: TOKEN_NONE,
             forced: real_obj,
         };
-        let vref_ptr = &mut vref as *mut JitVirtualRef as *mut u8;
+        let vref_ptr = (&mut vref as *mut JitVirtualRef).cast::<GCREFOpaque>();
         unsafe {
             info.tracing_before_residual_call(vref_ptr);
         }

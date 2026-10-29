@@ -445,4 +445,95 @@ mod tests {
         // the conversion.
         compute_liveness(&mut flat, &regallocs);
     }
+
+    /// A `-live-` at a call between window formation and keepalive lists
+    /// the owner (`liveness.py` `compute_liveness` / `-live-` args).
+    #[test]
+    fn keepalive_forces_owner_live_at_preceding_call() {
+        use crate::flatten::RegOrConst;
+        use crate::model::{CallTarget, ConcreteType, FunctionGraph, SpaceOperation};
+
+        let owner = crate::flowspace::model::Variable::new();
+        FunctionGraph::set_concretetype_of_inline(&owner, ConcreteType::GcRef);
+        let window = crate::flowspace::model::Variable::new();
+        FunctionGraph::set_concretetype_of_inline(&window, ConcreteType::Signed);
+        let owner_reg = Register::new(RegKind::Ref, 0);
+        let window_reg = Register::new(RegKind::Int, 0);
+        let mut ref_coloring = crate::regalloc::Coloring::default();
+        ref_coloring.insert(owner.clone(), 0);
+        let mut int_coloring = crate::regalloc::Coloring::default();
+        int_coloring.insert(window.clone(), 0);
+        let mut regallocs = HashMap::new();
+        regallocs.insert(
+            RegKind::Ref,
+            crate::regalloc::RegAllocator {
+                coloring: ref_coloring,
+                num_regs: 1,
+            },
+        );
+        regallocs.insert(
+            RegKind::Int,
+            crate::regalloc::RegAllocator {
+                coloring: int_coloring,
+                num_regs: 1,
+            },
+        );
+        let mut flat = SSARepr {
+            name: "window_keepalive".into(),
+            insns: vec![
+                FlatOp::Label(Label(0)),
+                FlatOp::op(SpaceOperation {
+                    result: Some(owner.clone()),
+                    kind: OpKind::Input {
+                        name: "owner".into(),
+                        ty: ValueType::Ref(None),
+                        class_root: None,
+                    },
+                }),
+                FlatOp::op(SpaceOperation {
+                    result: Some(window.clone()),
+                    kind: OpKind::ConstInt(0),
+                }),
+                FlatOp::Live {
+                    live_values: vec![],
+                },
+                FlatOp::op(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Call {
+                        target: CallTarget::function_path(["window_param"]),
+                        args: crate::model::call_args(vec![window.clone()]),
+                        result_ty: ValueType::Void,
+                    },
+                }),
+                FlatOp::Live {
+                    live_values: vec![owner_reg],
+                },
+                FlatOp::IntReturn(RegOrConst::Reg(window_reg)),
+            ],
+            num_blocks: 1,
+            insns_pos: None,
+        };
+        compute_liveness(&mut flat, &regallocs);
+        let call_idx = flat
+            .insns
+            .iter()
+            .position(|op| {
+                matches!(
+                    op,
+                    FlatOp::Op(inner) if matches!(inner.kind, OpKind::Call { .. })
+                )
+            })
+            .expect("call");
+        let FlatOp::Live { live_values } = &flat.insns[call_idx - 1] else {
+            panic!(
+                "expected -live- immediately before the call; insns={:?}",
+                flat.insns
+            );
+        };
+        assert!(
+            live_values.contains(&owner_reg),
+            "owner must be live at the call -live-; insns={:?}",
+            flat.insns
+        );
+    }
 }

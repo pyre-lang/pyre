@@ -878,10 +878,14 @@ impl<'a> GraphFlattener<'a> {
     pub fn serialize_op(&mut self, op: &SpaceOperation) {
         match &op.kind {
             crate::model::OpKind::Input { .. } => {}
-            crate::model::OpKind::Live => {
-                self.emitline(FlatOp::Live {
-                    live_values: Vec::new(),
-                });
+            crate::model::OpKind::Live { forced } => {
+                // `liveness.py` `compute_liveness`: `-live-` args seed the
+                // live set, then the backward walk adds the rest.
+                let live_values = forced
+                    .iter()
+                    .filter_map(|var| self.kind_color_of(var).map(|_| self.getcolor(var)))
+                    .collect();
+                self.emitline(FlatOp::Live { live_values });
             }
             crate::model::OpKind::ConstNone | crate::model::OpKind::ConstRefAddr(_)
                 if op.result.as_ref().is_some_and(|result| {
@@ -1259,7 +1263,7 @@ impl<'a> GraphFlattener<'a> {
         let exitswitch = block.exitswitch.clone();
         let last_op_is_live = matches!(
             block.operations.last().map(|op| &op.kind),
-            Some(crate::model::OpKind::Live)
+            Some(crate::model::OpKind::Live { .. })
         );
         let last_op_kind = block.operations.last().map(|op| op.kind.clone());
 
@@ -1770,6 +1774,82 @@ mod tests {
         assert!(matches!(flat.insns[0], FlatOp::Label(Label(0))));
     }
 
+    /// `serialize_op` of `OpKind::Live { forced }` seeds `-live-` with those
+    /// registers (`liveness.py` `-live-` args).
+    #[test]
+    fn flatten_live_seeds_forced_operands() {
+        use crate::model::{ConcreteType, SpaceOperation, ValueType};
+        let mut graph = FunctionGraph::new("keepalive_live");
+        let entry = graph.startblock;
+        let owner = graph
+            .push_op_var(
+                entry,
+                OpKind::Input {
+                    name: "owner".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&owner, ConcreteType::GcRef);
+        graph.push_inputarg_var(entry, owner.clone());
+        graph.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Live {
+                forced: vec![owner.clone()],
+            },
+        });
+        graph.set_return(entry, None);
+
+        let mut int_c = crate::regalloc::Coloring::default();
+        let mut ref_c = crate::regalloc::Coloring::default();
+        for var in graph.iter_variables() {
+            match FunctionGraph::concretetype_of(&var) {
+                ConcreteType::Signed => {
+                    let n = int_c.len();
+                    int_c.entry(var).or_insert(n);
+                }
+                ConcreteType::GcRef => {
+                    let n = ref_c.len();
+                    ref_c.entry(var).or_insert(n);
+                }
+                _ => {}
+            }
+        }
+        let mut regallocs = std::collections::HashMap::new();
+        if !int_c.is_empty() {
+            let n = int_c.len();
+            regallocs.insert(
+                RegKind::Int,
+                crate::regalloc::RegAllocator {
+                    coloring: int_c,
+                    num_regs: n.max(1),
+                },
+            );
+        }
+        let owner_color = ref_c[&owner];
+        let n = ref_c.len();
+        regallocs.insert(
+            RegKind::Ref,
+            crate::regalloc::RegAllocator {
+                coloring: ref_c,
+                num_regs: n.max(1),
+            },
+        );
+        let flat = flatten_graph(&graph, &mut regallocs);
+        let owner_reg = Register::new(RegKind::Ref, owner_color);
+        let seeded = flat.insns.iter().any(|op| match op {
+            FlatOp::Live { live_values } => live_values.contains(&owner_reg),
+            _ => false,
+        });
+        assert!(
+            seeded,
+            "serialize_op must seed Live with the forced owner; insns={:?}",
+            flat.insns
+        );
+    }
+
     #[test]
     fn flatten_if_else_produces_jumps() {
         let mut graph = FunctionGraph::new("branch");
@@ -2237,7 +2317,7 @@ mod tests {
         let mut graph = FunctionGraph::new("canraise");
         let entry = graph.startblock;
         let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op_var(entry, OpKind::live(), false);
         let continuation = graph.create_block();
         let phi_var = graph.alloc_value_var();
         graph.push_inputarg_var(continuation, phi_var.clone());
@@ -2282,7 +2362,7 @@ mod tests {
         let mut graph = FunctionGraph::new("typed_canraise");
         let entry = graph.startblock;
         let call_result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op_var(entry, OpKind::live(), false);
 
         let handler = graph.create_block();
         let handler_exc_type_var = graph.alloc_value_var();
@@ -2294,7 +2374,7 @@ mod tests {
         // Upstream invariant: typed catch handlers are not empty blocks.
         // Keep one op in the handler so the bare-reraise collapse remains
         // reserved for the empty exception block shape from flatten.py.
-        graph.push_op_var(handler, OpKind::Live, false);
+        graph.push_op_var(handler, OpKind::live(), false);
         graph.set_goto(handler, graph.returnblock, vec![handler_exc_value_var]);
 
         let (exc_block, last_exception_var, last_exc_value_var) = graph.exceptblock_arg_vars();
@@ -2437,7 +2517,7 @@ mod tests {
         let entry = graph.startblock;
         let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op_var(entry, OpKind::live(), false);
         let lhs_handle = lhs_var.clone();
         let rhs_handle = rhs_var.clone();
         let sum_var = graph
@@ -2519,7 +2599,7 @@ mod tests {
         let entry = graph.startblock;
         let lhs_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs_var = graph.push_op_var(entry, OpKind::ConstInt(2), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op_var(entry, OpKind::live(), false);
         let sum_var = graph
             .push_op_var(
                 entry,
@@ -3119,7 +3199,7 @@ mod tests {
         let mut graph = FunctionGraph::new("exc_chain");
         let entry = graph.startblock;
         let result_var = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op_var(entry, OpKind::live(), false);
 
         let make_handler = |graph: &mut FunctionGraph, marker_value: i64| {
             let block = graph.create_block();

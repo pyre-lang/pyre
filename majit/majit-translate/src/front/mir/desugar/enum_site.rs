@@ -1303,6 +1303,10 @@ impl<'a> Lowering<'a> {
             err_owner,
             ok_ty,
             err_ty,
+            ok_is_raw_u8: crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                .is_some_and(|ty| tyref_is_raw_u8_ptr(&ty, self.llbc)),
+            err_is_raw_u8: crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                .is_some_and(|ty| tyref_is_raw_u8_ptr(&ty, self.llbc)),
             err_class,
             recv_err_ast: crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
                 .map(|ty| tyref_to_ast_string(&ty, self.llbc))
@@ -1598,6 +1602,8 @@ impl<'a> Lowering<'a> {
             payload1_ty: ValueType::Ref(None),
             payload0_class: None,
             payload1_class: None,
+            payload0_is_raw_u8: false,
+            payload1_is_raw_u8: false,
             result_owner: String::new(),
             result_tag0_owner: String::new(),
             result_tag1_owner: String::new(),
@@ -1637,6 +1643,9 @@ impl<'a> Lowering<'a> {
                 payload_ty = kind;
             }
             site.payload1_ty = payload_ty;
+            site.payload1_is_raw_u8 =
+                crate::front::result_exc::tyref_option_payload(&recv_ty, self.llbc)
+                    .is_some_and(|ty| tyref_is_raw_u8_ptr(&ty, self.llbc));
             site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
             site.int_null = self.option_niche_int_null(&recv_ty);
         } else {
@@ -1647,6 +1656,12 @@ impl<'a> Lowering<'a> {
             site.recv_tag1_owner = err_owner;
             site.payload0_ty = ok_ty;
             site.payload1_ty = err_ty;
+            site.payload0_is_raw_u8 =
+                crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
+                    .is_some_and(|ty| tyref_is_raw_u8_ptr(&ty, self.llbc));
+            site.payload1_is_raw_u8 =
+                crate::front::result_exc::tyref_result_err(&recv_ty, self.llbc)
+                    .is_some_and(|ty| tyref_is_raw_u8_ptr(&ty, self.llbc));
             site.payload0_class = crate::front::result_exc::tyref_result_ok(&recv_ty, self.llbc)
                 .and_then(|ty| {
                     enum_payload_instance_class_root(&ty, self.llbc, self.tombstoned_leaves)
@@ -2721,6 +2736,11 @@ impl<'a> Lowering<'a> {
         // or `llmemory.NULL` when the payload has no named type.
         if let Some(int_null) = self.option_niche_int_null(option_ty) {
             return int_null.push(&mut self.graph, bb_id);
+        }
+        // `null()` / `null_mut()` of `*u8` is `lltype.nullptr(CCHARP.TO)`
+        // (`rffi.py` `CCHARP`), a typed null Ptr constant.
+        if tyref_is_raw_u8_ptr(option_ty, self.llbc) {
+            return emit_ccharp_nullptr(&mut self.graph, bb_id);
         }
         self.graph
             .push_niche_null(bb_id, self.option_niche_null_cast(option_ty).as_ref())

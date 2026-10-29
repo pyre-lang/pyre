@@ -1815,9 +1815,11 @@ pub enum OpKind {
 
     /// Liveness marker — RPython `-live-` operation.
     /// Inserted by jtransform after calls that may need guard resumption.
-    /// Expanded by compute_liveness() to include all values alive at
-    /// this point. RPython: jtransform.py:469,481,533.
-    Live,
+    /// `forced` are `-live-` args (`liveness.py` `compute_liveness` starts
+    /// the live set from those operands, then adds the rest).
+    Live {
+        forced: Vec<crate::flowspace::model::Variable>,
+    },
 
     /// JitDriver merge-point marker — RPython `jit_merge_point` opname.
     /// Emitted by `handle_jit_marker__jit_merge_point` (jtransform.py)
@@ -1962,6 +1964,11 @@ pub enum OpKind {
 }
 
 impl OpKind {
+    /// Empty `-live-` marker (`jtransform.py` residual-call live).
+    pub fn live() -> Self {
+        OpKind::Live { forced: Vec::new() }
+    }
+
     /// `lltype.malloc(..., flavor='raw')` with the defaults
     /// `_rewrite_raw_malloc` uses: `track_allocation=True`,
     /// `add_memory_pressure=False`, no leftover flags.

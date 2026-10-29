@@ -1072,19 +1072,21 @@ impl<'a> Lowering<'a> {
                                 self.gc_struct_ids,
                                 self.immutable_fields,
                             );
+                            let field_dest_ty =
+                                tyref_subst_bound_typevar(dest_ty, &field_base_ty, self.llbc);
                             let ty =
                                 crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
                                     &owner_root,
                                     &field_name,
                                     raw_field_address_value_type(
-                                        dest_ty,
-                                        dest_ty,
+                                        &field_dest_ty,
+                                        &field_dest_ty,
                                         owner_declared_gc,
                                         self.llbc,
                                     )
                                     .unwrap_or_else(|| {
                                         tyref_to_value_type_with(
-                                            dest_ty,
+                                            &field_dest_ty,
                                             self.llbc,
                                             self.tombstoned_leaves,
                                             self.gc_struct_ids,
@@ -2264,6 +2266,27 @@ impl<'a> Lowering<'a> {
                         let raw = self.emit_rffi_cast_to_raw_scalar_ptr(bb_id, arg, dest_ty);
                         return Ok((None, raw));
                     }
+                    // Dest `*u8` from an int-kind / CCHARP source is the same
+                    // CCHARP value (`rffi.py` `CCHARP`). A GC-ref source is
+                    // `rffi.cast` onto CCHARP (`cast_ptr_to_adr` then
+                    // `cast_int_to_ptr`), not the classdef-less CAST_ADDRESS
+                    // Instance `ann_direct_ptradd` rejects.
+                    if tyref_is_raw_u8_ptr(dest_ty, self.llbc)
+                        && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                    {
+                        if arg.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+                            return Ok((None, arg));
+                        }
+                        let bb_id = self.emit_bb(mir_bb);
+                        let raw = emit_cast_int_to_ccharp(&mut self.graph, bb_id, arg);
+                        return Ok((None, raw));
+                    }
+                    if tyref_is_raw_u8_ptr(dest_ty, self.llbc)
+                        && matches!(src_kind, Some(ValueType::Ref(_)))
+                        && !graph_is_items_block_base_accessor(&self.graph.name)
+                    {
+                        return Ok((None, self.emit_gc_ref_as_ccharp(mir_bb, arg)));
+                    }
                     let dst_kind = if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
                         && let Some(raw) = raw_scalar_address_value_type(dest_ty, self.llbc)
                     {
@@ -2552,6 +2575,25 @@ impl<'a> Lowering<'a> {
                     &self.raw_alloc_flavor_structs,
                 )
                 .is_some();
+                // Dest `*u8` from an int-kind / CCHARP source is the same
+                // CCHARP value. A GC-ref source is `rffi.cast` onto CCHARP
+                // except inside an items-base accessor (`cast_ptr_to_adr`).
+                if tyref_is_raw_u8_ptr(&ty, self.llbc)
+                    && matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                {
+                    if v.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+                        return Ok((None, v));
+                    }
+                    let bb_id = self.emit_bb(mir_bb);
+                    let raw = emit_cast_int_to_ccharp(&mut self.graph, bb_id, v);
+                    return Ok((None, raw));
+                }
+                if tyref_is_raw_u8_ptr(&ty, self.llbc)
+                    && matches!(src_kind, Some(ValueType::Ref(_)))
+                    && !graph_is_items_block_base_accessor(&self.graph.name)
+                {
+                    return Ok((None, self.emit_gc_ref_as_ccharp(mir_bb, v)));
+                }
                 if (cast_kind_is_raw_ptr(&kind) || dest_flavor_raw)
                     && let Some((op, res)) = self
                         .ptr_cast_marker(src_kind.as_ref(), src_root.as_deref(), &ty, &v)
@@ -2922,7 +2964,7 @@ impl<'a> Lowering<'a> {
                             &ctor,
                             &arg_vars,
                             &pair_lens,
-                        );
+                        )?;
                         // Capture an exclusive int `Range` aggregate
                         // (`for _ in a..b`) so `front::range_iter`
                         // can divert it to the orthodox `range()` builtin +
@@ -3936,6 +3978,57 @@ impl<'a> Lowering<'a> {
         ))
     }
 
+    /// GC object start as `*u8` is `rffi.cast` onto CCHARP (`rffi.py`
+    /// `CCHARP`): `cast_ptr_to_int` then `cast_int_to_ptr`.
+    pub(in crate::front::mir) fn emit_gc_ref_as_ccharp(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+    ) -> Variable {
+        // Already CCHARP (`rffi.py` `CCHARP`): `ensure_window_ccharp` aliases.
+        // A GC start still `rffi.cast`s (`cast_ptr_to_int` then `cast_int_to_ptr`).
+        if ptr.concretetype().as_ref().is_some_and(lltype_is_ccharp)
+            && !self.var_is_gc_ref_value(&ptr)
+        {
+            return ptr;
+        }
+        let bb_id = self.emit_bb(mir_bb);
+        let ccharp = emit_rffi_cast_to_carray_ptr(
+            &mut self.graph,
+            bb_id,
+            ptr,
+            &crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Char,
+        );
+        stamp_as_ccharp(&ccharp);
+        ccharp
+    }
+
+    /// Dest `*u8` is CCHARP (`rffi.py` `CCHARP`). An int-kind source is
+    /// already that word. Anything else (GC start or raw `*c_char`)
+    /// `rffi.cast`s except inside an items-base accessor (`cast_ptr_to_adr`).
+    pub(in crate::front::mir) fn bind_raw_u8_dest(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        dest_ty: &TyRef,
+    ) {
+        if !tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            return;
+        }
+        let dest_var = self
+            .local_var
+            .get(dest_local)
+            .and_then(|slot| slot.as_ref().and_then(|value| value.one().ok()));
+        if let Some(var) = dest_var {
+            if self.var_is_int_kind(&var) {
+                stamp_as_ccharp(&var);
+            } else if !graph_is_items_block_base_accessor(&self.graph.name) {
+                let ccharp = self.emit_gc_ref_as_ccharp(mir_bb, var);
+                self.local_var[dest_local] = Some(LocalValue::One(ccharp));
+            }
+        }
+    }
+
     /// The marker call a same-bank pointer-to-pointer reinterpret lowers
     /// to, or `None` when the cast simply aliases its operand.
     ///
@@ -4675,6 +4768,53 @@ impl<'a> Lowering<'a> {
             }
         )
     }
+
+    /// True when `var` is already the CCHARP int word: the producer
+    /// `result_ty` is Int/Unsigned, or else `getkind(concretetype)` is
+    /// Signed (`rffi.py` `CCHARP`). A Ref-banked producer (`*c_char` /
+    /// GC start) stays false even with a CCHARP stamp, so a dest `*u8`
+    /// still `rffi.cast`s (`lltype.py` `cast_ptr_to_int`).
+    pub(in crate::front::mir) fn var_is_int_kind(&self, var: &Variable) -> bool {
+        if let Some((block_id, idx)) = resolve_to_producer_op(&self.graph, var) {
+            let op = self
+                .graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .and_then(|block| block.operations.get(idx));
+            if let Some(op) = op {
+                let result_ty = match &op.kind {
+                    OpKind::FieldRead { ty, .. } => Some(ty),
+                    OpKind::Call { result_ty, .. }
+                    | OpKind::Input { ty: result_ty, .. }
+                    | OpKind::UnaryOp { result_ty, .. }
+                    | OpKind::BinOp { result_ty, .. }
+                    | OpKind::LoadStatic { ty: result_ty, .. } => Some(result_ty),
+                    OpKind::ConstInt(_)
+                    | OpKind::ConstUInt(_)
+                    | OpKind::ConstBool(_)
+                    | OpKind::ConstFnAddr { .. } => return true,
+                    _ => None,
+                };
+                if let Some(ty) = result_ty {
+                    if matches!(ty, ValueType::Int | ValueType::Unsigned) {
+                        return true;
+                    }
+                    if matches!(
+                        ty,
+                        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder
+                    ) {
+                        return false;
+                    }
+                }
+            }
+        }
+        matches!(
+            var.concretetype().as_ref().map(crate::model::getkind),
+            Some(crate::model::ConcreteType::Signed)
+        )
+    }
+
     /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
     /// would `RawLoad` a primitive.
     ///
@@ -5129,7 +5269,7 @@ impl<'a> Lowering<'a> {
                     self.local_var
                         .get(i as usize)
                         .and_then(|slot| slot.as_ref()),
-                    Some(LocalValue::Pair(_, _))
+                    Some(LocalValue::Pair(_, _, _))
                 ) =>
             {
                 // A window's one-word consumer sees the `CCHARP` data
@@ -5271,6 +5411,12 @@ impl<'a> Lowering<'a> {
                     && let Some((owner_root, field_name, field_ty, owner_id, host_index)) =
                         self.resolve_adt_field(&inner.ty, field_payload)
                 {
+                    // Decl field / Charon Field `place.ty` stay the binder
+                    // TypeVar (`Result<T,E>::Ok.0`). Substitute from the
+                    // container's `Adt.generics.types` so a `*mut u8`
+                    // payload is `rffi.py` `CCHARP`, not `Ref(None)`.
+                    let field_ty = tyref_subst_bound_typevar(&field_ty, &inner.ty, self.llbc);
+                    let place_ty = tyref_subst_bound_typevar(&place_ty, &inner.ty, self.llbc);
                     // Projecting the sized field of a `repr(transparent)`
                     // wrapper is the identity on its low-level value, including
                     // through a borrow: the borrow carries no representation of
@@ -5633,6 +5779,8 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
+                    stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
+                    stamp_raw_u8_ccharp(&res, &field_ty, self.llbc);
                     if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
                         || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
                         || tyref_is_u8_window(&field_ty, self.llbc)
@@ -5870,6 +6018,7 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
+                    stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
                     return Ok(res);
                 }
                 // A `Field` projection whose base is a genuine Ref tuple
@@ -5984,6 +6133,7 @@ impl<'a> Lowering<'a> {
                                 pure: false,
                             },
                         });
+                        stamp_raw_u8_ccharp(&res, &place_ty, self.llbc);
                         return Ok(res);
                     }
                 }
@@ -6855,6 +7005,9 @@ impl<'a> Lowering<'a> {
                     window: declared_ty.is_some_and(|ty| tyref_is_u8_window(ty, self.llbc))
                         || majit_ir::descr::is_shared_u8_slice_spelling(&field_ty)
                         || majit_ir::descr::is_option_of_u8_window_spelling(&field_ty),
+                    raw_u8: declared_ty.is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc))
+                        || field_ty == "*mut u8"
+                        || field_ty == "*const u8",
                 }
             })
             .collect();
@@ -7260,7 +7413,7 @@ impl<'a> Lowering<'a> {
                 .name
                 .clone()
                 .unwrap_or_else(|| majit_charon_reader::ullbc::positional_field_name(field_idx));
-            let ty = clone_tyref(&f.ty);
+            let ty = tyref_subst_bound_typevar(&f.ty, base_ty, self.llbc);
             let template = majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(
                 &name_path,
                 self.tombstoned_leaves,
@@ -7275,7 +7428,7 @@ impl<'a> Lowering<'a> {
                 let name = f.name.clone().unwrap_or_else(|| {
                     majit_charon_reader::ullbc::positional_field_name(field_idx)
                 });
-                let ty = clone_tyref(&f.ty);
+                let ty = tyref_subst_bound_typevar(&f.ty, base_ty, self.llbc);
                 // owner_root = the variant subclass `{enum_leaf}::{variant}`
                 // — the read resolves the variant's own field at its exact
                 // enum-relative offset (`variant_layouts[vidx].field_offsets`,
@@ -8764,6 +8917,39 @@ pub(in crate::front::mir) fn emit_cast_int_to_ccharp(
     )
 }
 
+/// Null CCHARP: `lltype.nullptr(rffi.CCHARP.TO)` (`lltype.py` `nullptr`).
+/// `cast_int_to_ptr(CCHARP, 0)` is that nullptr (`lltype.py`
+/// `cast_int_to_ptr` when `oddint == 0`). Integer 0, not `null_raw`
+/// Address. `ann_cast_int_to_ptr` returns `SomePtr(CCHARP)`.
+pub(in crate::front::mir) fn emit_ccharp_nullptr(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+) -> Variable {
+    use crate::flowspace::model::ConstValue;
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    let ptr_ty = lltype_for_direct_ptradd_pointer(None, &LowLevelType::Char);
+    let raw = graph.alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+    raw.set_concretetype(Some(ptr_ty.clone()));
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(raw.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::function_path([
+                "rpython",
+                "rtyper",
+                "lltypesystem",
+                "lltype",
+                "cast_int_to_ptr",
+            ]),
+            args: vec![
+                crate::model::LinkArg::from(ConstValue::LowLevelType(Box::new(ptr_ty))),
+                crate::model::LinkArg::from(ConstValue::Int(0)),
+            ],
+            result_ty: ValueType::Int,
+        },
+    });
+    raw
+}
+
 /// Emit `simple_call(lltype.direct_ptradd, p, n)` and return the raw
 /// pointer.  `ann_direct_ptradd` returns `s_p`.  `n` is an unscaled item
 /// count.  `item` is `TO.OF`: a `Char` builds `CCHARP` (byte shift);
@@ -8908,10 +9094,6 @@ pub(in crate::front::mir) fn restore_offset_pointer_type(
     result
 }
 
-/// Operand `direct_ptradd` annotates. `__cast_address_intrinsic` drops the
-/// pointee class and answers `SomeInstance`; peel it so `rffi.cast` sees
-/// the pointer that was erased. A GC header that remains an Instance is
-/// then `rffi.cast` onto `CArrayPtr` in [`push_direct_ptradd`].
 pub(in crate::front::mir) fn direct_ptradd_pointer_operand(
     graph: &FunctionGraph,
     ptr: Variable,

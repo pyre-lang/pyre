@@ -19,13 +19,13 @@ use crate::front::mir::tests::{
     adt_node, adt_ty, as_usize_cast_fixture, assert_cast_ptr_to_int_then_r_uint, call_leafs,
     code_struct, empty_llbc, fixture_item_meta, fixture_llbc, fixture_span, fixture_ty, graph_ops,
     i64_field, i64_ty, ident_path, item_meta_json, kwargs_unerase_cast_llbc,
-    kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field, named_adt,
-    option_adt_node, option_adt_node_from_types, option_enum, option_int_arg,
-    range_contains_fixture, span_json, struct_decl, trait_clone_call_fixture,
-    trait_clone_kind_payload, transparent_layout, type_decl_meta, type_decl_struct,
-    tyref_to_attr_value_type, usize_ty, vec_decl_json, vec_of, vec_type_decls, vec_usize_ty_json,
-    window_const_slice_ptr, window_empty_generics, window_llbc, window_meta, window_mut_slice,
-    window_shared_slice, window_slice,
+    kwargs_unerase_ptr_tys, llbc_with_trait_impls, llbc_with_types, mut_ref_value_field,
+    mut_u8_ty_json, named_adt, option_adt_node, option_adt_node_from_types, option_enum,
+    option_int_arg, range_contains_fixture, result_adt_node, result_enum, span_json, struct_decl,
+    trait_clone_call_fixture, trait_clone_kind_payload, transparent_layout, type_decl_meta,
+    type_decl_struct, tyref_to_attr_value_type, usize_ty, vec_decl_json, vec_of, vec_type_decls,
+    vec_usize_ty_json, window_const_slice_ptr, window_empty_generics, window_llbc, window_meta,
+    window_mut_slice, window_shared_slice, window_slice,
 };
 
 mod slice_or_vec_container_root_spelling_tests {
@@ -5369,11 +5369,11 @@ fn raw_mut_i8() -> TyRef {
 }
 
 #[test]
-fn adt_field_read_raw_owner_byte_ptr_is_int() {
-    // `history.py` `getkind` of a raw `Ptr` is `'int'`. A GC owner's
-    // `*mut u8` stays the erased GCREF; a raw owner banks the same
-    // spelling as the address word (`fat_part_value_type`,
-    // `field_spelling_lltype`).
+fn adt_field_read_raw_byte_ptr_bank() {
+    // `rffi.py` `CCHARP`: a raw `*mut u8` field is CCHARP (Unsigned bank) in
+    // any owner. `history.py` `getkind` of a raw `Ptr` is `'int'`: a raw
+    // owner's `*mut i8` is the address word; a GC owner's stays the erased
+    // GCREF.
     let llbc = llbc_with_ordinary_and_closure_env();
     let gc_ids = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
     let tomb = no_tombstoned_leaves();
@@ -5391,8 +5391,8 @@ fn adt_field_read_raw_owner_byte_ptr_is_int() {
             &gc_ids,
             &std::collections::HashSet::<String>::new()
         ),
-        ValueType::Ref(None),
-        "a GC owner's *mut u8 stays the erased GCREF"
+        ValueType::Unsigned,
+        "a GC owner's *mut u8 is CCHARP"
     );
     assert_eq!(
         adt_field_read_value_type(
@@ -5406,8 +5406,8 @@ fn adt_field_read_raw_owner_byte_ptr_is_int() {
             &gc_ids,
             &std::collections::HashSet::<String>::new()
         ),
-        ValueType::Ref(None),
-        "an unknown owner keeps the *mut u8 GCREF spelling"
+        ValueType::Unsigned,
+        "an unknown owner's *mut u8 is CCHARP"
     );
     assert_eq!(
         adt_field_read_value_type(
@@ -5421,8 +5421,8 @@ fn adt_field_read_raw_owner_byte_ptr_is_int() {
             &gc_ids,
             &std::collections::HashSet::<String>::new()
         ),
-        ValueType::Int,
-        "a raw owner's *mut u8 is the address word"
+        ValueType::Unsigned,
+        "a raw owner's *mut u8 is CCHARP"
     );
     assert_eq!(
         adt_field_read_value_type(
@@ -5439,6 +5439,21 @@ fn adt_field_read_raw_owner_byte_ptr_is_int() {
         ValueType::Int,
         "a raw owner's *mut i8 is the address word"
     );
+    assert_eq!(
+        adt_field_read_value_type(
+            &raw_i8,
+            &raw_i8,
+            false,
+            false,
+            Some(true),
+            &llbc,
+            tomb,
+            &gc_ids,
+            &std::collections::HashSet::<String>::new()
+        ),
+        ValueType::Ref(None),
+        "a GC owner's *mut i8 stays the erased GCREF"
+    );
 }
 
 #[test]
@@ -5447,18 +5462,19 @@ fn raw_field_address_value_type_matches_field_read() {
     let raw_u8 = raw_mut_u8();
     assert_eq!(
         raw_field_address_value_type(&raw_u8, &raw_u8, Some(false), &llbc),
-        Some(ValueType::Int),
-        "a raw owner's *mut u8 is the address word"
+        Some(ValueType::Unsigned),
+        "a raw owner's *mut u8 is CCHARP in any owner"
     );
     assert_eq!(
         raw_field_address_value_type(&raw_u8, &raw_u8, Some(true), &llbc),
-        None,
-        "a GC owner's *mut u8 is not the raw-address bank"
+        Some(ValueType::Unsigned),
+        "a GC owner's *mut u8 is CCHARP in any owner"
     );
-}
-
-fn mut_u8_ty_json() -> serde_json::Value {
-    serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]})
+    assert_eq!(
+        raw_field_address_value_type(&raw_mut_i8(), &raw_mut_i8(), Some(true), &llbc),
+        None,
+        "a GC owner's *mut i8 is not the raw-address bank"
+    );
 }
 
 /// `*mut u8 as usize` is the type-erased address (`tyref_is_raw_byte_ptr`);
@@ -5753,56 +5769,6 @@ fn option_integer_instantiations_paint_distinct_class_roots() {
         crate::model::ValueType::Ref(Some("option::Option<i64>".into()))
     );
     assert_ne!(usize_ty, i64_ty);
-}
-
-fn result_enum(def_id: u64) -> serde_json::Value {
-    let span = serde_json::json!({"data": {
-        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
-    }});
-    serde_json::json!({
-        "def_id": def_id,
-        "item_meta": {
-            "name": [
-                {"Ident": ["core", 0]},
-                {"Ident": ["result", 0]},
-                {"Ident": ["Result", 0]}
-            ],
-            "span": span,
-            "source_text": null,
-            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
-            "is_local": false
-        },
-        "kind": {"Enum": [
-            {
-                "name": "Ok",
-                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
-                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
-            },
-            {
-                "name": "Err",
-                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
-                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
-            }
-        ]}
-    })
-}
-
-fn result_adt_node(
-    def_id: u64,
-    ok: serde_json::Value,
-    err: serde_json::Value,
-) -> serde_json::Value {
-    serde_json::json!({
-        "Adt": {
-            "id": def_id,
-            "generics": {
-                "regions": [],
-                "types": [ok, err],
-                "const_generics": [],
-                "trait_refs": []
-            }
-        }
-    })
 }
 
 fn raw_mut_u8_arg() -> serde_json::Value {

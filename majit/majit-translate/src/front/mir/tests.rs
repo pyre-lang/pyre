@@ -173,7 +173,7 @@ fn rust_vec_header_pointer_tuple_field_is_int_banked() {
 }
 
 /// `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
-/// `'int'`. A byte pointer stays `Ref` (GC erasure to `*mut u8`).
+/// `'int'`. A raw `*u8` is `rffi.CCHARP` (int-banked).
 #[test]
 fn raw_scalar_pointer_tuple_field_is_int_banked() {
     use crate::model::ValueType;
@@ -184,7 +184,14 @@ fn raw_scalar_pointer_tuple_field_is_int_banked() {
             "{spelling}"
         );
     }
-    for spelling in ["*mut u8", "*const u8", "*mut *mut usize"] {
+    for spelling in ["*mut u8", "*const u8"] {
+        assert_eq!(
+            super::tuple_field_value_type(spelling),
+            ValueType::Unsigned,
+            "{spelling}"
+        );
+    }
+    for spelling in ["*mut *mut usize"] {
         assert_eq!(
             super::tuple_field_value_type(spelling),
             ValueType::Ref(None),
@@ -3469,6 +3476,250 @@ fn str_view_borrows_window_at_window_param() {
     );
 }
 
+fn str_window_keepalive_fixture(goto_before_call: bool) -> crate::model::FunctionGraph {
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+    let shared = window_shared_slice();
+    let unit = serde_json::json!({"Tuple": []});
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let as_bytes = window_opaque_fun(
+        1,
+        &["core", "str", "<Impl>", "as_bytes"],
+        vec![utf8_ref.clone()],
+        shared.clone(),
+    );
+    let callee = window_opaque_fun(
+        2,
+        &["fixture", "window_param"],
+        vec![shared.clone()],
+        unit.clone(),
+    );
+    let (unwind, _) = window_unwind_and_return_blocks();
+    let dead = serde_json::json!({
+        "span": window_span(),
+        "kind": {"StorageDead": 2}
+    });
+    let ret = serde_json::json!({
+        "statements": [dead],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": "Return"}
+    });
+    let as_bytes_block = serde_json::json!({
+        "statements": [],
+        "kind": "Regular",
+        "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+            "func": {"Regular": {
+                "kind": {"Fun": 1},
+                "generics": window_empty_generics()
+            }},
+            "args": [{"Copy": window_place(serde_json::json!({"Local": 1}), &utf8_ref)}],
+            "dest": window_place(serde_json::json!({"Local": 2}), &shared)
+        }, "target": 2, "on_unwind": 1}}}
+    });
+    let window_call = |target: u64| {
+        serde_json::json!({
+            "statements": [],
+            "kind": "Regular",
+            "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                "func": {"Regular": {
+                    "kind": {"Fun": 2},
+                    "generics": window_empty_generics()
+                }},
+                "args": [{"Copy": window_place(serde_json::json!({"Local": 2}), &shared)}],
+                "dest": window_place(serde_json::json!({"Local": 0}), &unit)
+            }, "target": target, "on_unwind": 1}}}
+        })
+    };
+    let body = if goto_before_call {
+        serde_json::json!([
+            as_bytes_block,
+            unwind,
+            {
+                "statements": [],
+                "kind": "Regular",
+                "terminator": {"span": window_span(), "kind": {"Goto": {"target": 3}}}
+            },
+            window_call(4),
+            ret
+        ])
+    } else {
+        serde_json::json!([as_bytes_block, unwind, window_call(3), ret])
+    };
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "str_view_window_param"], true),
+        "signature": {"is_unsafe": false, "inputs": [utf8_ref], "output": unit},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 1, "locals": [
+                window_local(0, &unit),
+                window_local(1, &utf8_ref),
+                window_local(2, &shared)
+            ]},
+            "body": body
+        }}
+    });
+    let llbc = window_llbc(vec![utf8], vec![caller, as_bytes, callee]);
+    super::lower_function(&llbc, "str_view_window_param")
+        .expect("lower STR window keepalive fixture")
+}
+
+fn window_keepalive_operand(
+    op: &crate::model::OpKind,
+) -> Option<&crate::flowspace::model::Variable> {
+    use crate::model::{CallTarget, OpKind};
+    match op {
+        OpKind::UnaryOp { op, operand, .. } if op == "keepalive" => Some(operand),
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.iter().any(|s| {
+            s == "keepalive" || s == "keepalive_until_here" || s.ends_with("keepalive_until_here")
+        }) =>
+        {
+            args.iter().find_map(crate::model::LinkArg::as_variable)
+        }
+        _ => None,
+    }
+}
+
+fn str_header_family(graph: &crate::model::FunctionGraph) -> std::collections::HashSet<u64> {
+    use crate::model::{CallTarget, OpKind};
+    let mut family = std::collections::HashSet::new();
+    for op in window_graph_ops(graph) {
+        if let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+            && segments.last().map(String::as_str)
+                == Some(crate::runtime_names::shims::GET_RAW_ADDRESS_OF_STRING)
+        {
+            for arg in args.iter().filter_map(crate::model::LinkArg::as_variable) {
+                family.insert(arg.id());
+            }
+        }
+    }
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    if family.contains(&arg.id()) && family.insert(input.id()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    family
+}
+
+fn window_param_block_index(graph: &crate::model::FunctionGraph) -> Option<usize> {
+    use crate::model::{CallTarget, OpKind};
+    graph.blocks.iter().position(|block| {
+        block.operations.iter().any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("window_param"),
+            _ => false,
+        })
+    })
+}
+
+/// Converting a STR view to `(data, len)` for a window callee plants
+/// `keepalive` (`objectmodel.keepalive_until_here`) on the STR header
+/// after that call (`get_raw_address_of_string`).
+#[test]
+fn str_window_storagedead_emits_keepalive_after_call() {
+    let graph = str_window_keepalive_fixture(false);
+    let family = str_header_family(&graph);
+    assert!(
+        !family.is_empty(),
+        "GET_RAW_ADDRESS_OF_STRING must name the STR header; graph={}",
+        graph.dump()
+    );
+    let call_idx =
+        window_param_block_index(&graph).expect("window_param call is in the lowered graph");
+    let call_block = &graph.blocks[call_idx];
+    let mut after_call = call_block
+        .operations
+        .iter()
+        .skip_while(|op| match &op.kind {
+            crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) != Some("window_param"),
+            _ => true,
+        })
+        .skip(1);
+    let found = after_call
+        .any(|op| window_keepalive_operand(&op.kind).is_some_and(|v| family.contains(&v.id())));
+    assert!(
+        found,
+        "keepalive of the STR header must appear after window_param; graph={}",
+        graph.dump()
+    );
+}
+
+/// A STR view live across a `Goto` reaches the call block as an inputarg;
+/// converting it to `(data, len)` keepalives that header after the call.
+#[test]
+fn str_window_owner_threads_across_goto_to_storagedead() {
+    let graph = str_window_keepalive_fixture(true);
+    let family = str_header_family(&graph);
+    let call_idx =
+        window_param_block_index(&graph).expect("window_param call is in the lowered graph");
+    let call_block = &graph.blocks[call_idx];
+    let owner_on_call = call_block
+        .inputargs
+        .iter()
+        .any(|v| family.contains(&v.id()));
+    assert!(
+        owner_on_call,
+        "STR owner reaches the call block as an inputarg; inputargs={:?} family={family:?} graph={}",
+        call_block
+            .inputargs
+            .iter()
+            .map(|v| v.id())
+            .collect::<Vec<_>>(),
+        graph.dump()
+    );
+    let mut after_call = call_block
+        .operations
+        .iter()
+        .skip_while(|op| match &op.kind {
+            crate::model::OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) != Some("window_param"),
+            _ => true,
+        })
+        .skip(1);
+    let keepalive_here = after_call
+        .any(|op| window_keepalive_operand(&op.kind).is_some_and(|v| family.contains(&v.id())));
+    assert!(
+        keepalive_here,
+        "keepalive of the threaded owner is after window_param; graph={}",
+        graph.dump()
+    );
+}
+
 /// `as_bytes().iter()` of a STR view is identity then the
 /// `("slice","iter")` bridge (`fun_decl_id: None`). The FunDecl input
 /// is generic `&[T]`; keeping that id would annotate the STR as List.
@@ -4344,6 +4595,261 @@ fn str_view_index_is_strgetitem() {
     assert!(
         !raw_load,
         "as_bytes()[i] is not a 1-byte RawLoad; graph={}",
+        graph.dump()
+    );
+}
+
+/// `w_str_codepoint_at` ASCII arm: getfield STR, `as_bytes()`,
+/// `*bytes.as_ptr().add(i)`. The byte read's first operand is the STR
+/// (ref-kind). A one-word view has no owner (`ll_stritem_nonneg`).
+#[test]
+fn str_view_ptr_add_getitem_keeps_str_ref_kind() {
+    use crate::model::{CallTarget, ConcreteType, OpKind};
+
+    let utf8_adt = serde_json::json!({
+        "Adt": {"id": 0, "builtin": null, "generics": window_empty_generics()}
+    });
+    let holder_adt = serde_json::json!({
+        "Adt": {"id": 1, "builtin": null, "generics": window_empty_generics()}
+    });
+    let utf8_ref = serde_json::json!({"Ref": ["Erased", utf8_adt, "Shared"]});
+    let holder_ref = serde_json::json!({"Ref": ["Erased", holder_adt, "Shared"]});
+    let shared = window_shared_slice();
+    let u8_ty = window_u8();
+    let n = window_usize();
+    let ptr_ty = window_const_u8_ptr();
+    let utf8 = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "Utf8Str"], true),
+        "kind": {"Struct": [
+            {"name": "hash", "ty": {"Scalar": {"Integer": {"Signed": "Isize"}}}, "attr_info": null},
+            {"name": "length", "ty": window_usize(), "attr_info": null}
+        ]}
+    });
+    let holder = serde_json::json!({
+        "def_id": 1,
+        "item_meta": window_meta(&["pyre_object", "unicodeobject", "W_UnicodeObject"], true),
+        "kind": {"Struct": [{
+            "name": "value",
+            "ty": utf8_ref,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+        }]}
+    });
+    let field_place = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Projection": [
+                window_place(serde_json::json!({"Local": 1}), &holder_ref),
+                "Deref"
+            ]}), &holder_adt),
+            {"Field": [null, 0]}
+        ]}),
+        &utf8_ref,
+    );
+    let add_deref = window_place(
+        serde_json::json!({"Projection": [
+            window_place(serde_json::json!({"Local": 6}), &ptr_ty),
+            "Deref"
+        ]}),
+        &u8_ty,
+    );
+    let (unwind, _) = window_unwind_and_return_blocks();
+    let as_bytes = window_opaque_fun(
+        1,
+        &["core", "str", "<Impl>", "as_bytes"],
+        vec![utf8_ref.clone()],
+        shared.clone(),
+    );
+    let generic_slice = serde_json::json!({
+        "Ref": ["Erased", {"Slice": [{"TypeVar": {"Bound": [0, 0]}}, null]}, "Shared"]
+    });
+    let as_ptr = window_opaque_fun(
+        2,
+        &["core", "slice", "<Impl>", "as_ptr"],
+        vec![generic_slice],
+        ptr_ty.clone(),
+    );
+    let add = window_opaque_fun(
+        3,
+        &["core", "ptr", "const_ptr", "<Impl>", "add"],
+        vec![ptr_ty.clone(), n.clone()],
+        ptr_ty.clone(),
+    );
+    let caller = serde_json::json!({
+        "def_id": 0,
+        "item_meta": window_meta(&["fixture", "ascii_codepoint_at"], true),
+        "signature": {"is_unsafe": true, "inputs": [holder_ref, n], "output": u8_ty},
+        "body": {"Unstructured": {
+            "span": window_span(),
+            "locals": {"arg_count": 2, "locals": [
+                window_local(0, &u8_ty),
+                window_local(1, &holder_ref),
+                window_local(2, &n),
+                window_local(3, &utf8_ref),
+                window_local(4, &shared),
+                window_local(5, &ptr_ty),
+                window_local(6, &ptr_ty)
+            ]},
+            "body": [
+                {
+                    "statements": [{
+                        "span": window_span(),
+                        "kind": {"Assign": [
+                            window_place(serde_json::json!({"Local": 3}), &utf8_ref),
+                            {"Use": [{"Copy": field_place}, "No"]}
+                        ]}
+                    }],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 1},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 3}), &utf8_ref)}],
+                        "dest": window_place(serde_json::json!({"Local": 4}), &shared)
+                    }, "target": 2, "on_unwind": 1}}}
+                },
+                unwind,
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 2},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [{"Copy": window_place(serde_json::json!({"Local": 4}), &shared)}],
+                        "dest": window_place(serde_json::json!({"Local": 5}), &ptr_ty)
+                    }, "target": 3, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": {"Call": {"call": {
+                        "func": {"Regular": {
+                            "kind": {"Fun": 3},
+                            "generics": window_empty_generics()
+                        }},
+                        "args": [
+                            {"Copy": window_place(serde_json::json!({"Local": 5}), &ptr_ty)},
+                            {"Copy": window_place(serde_json::json!({"Local": 2}), &n)}
+                        ],
+                        "dest": window_place(serde_json::json!({"Local": 6}), &ptr_ty)
+                    }, "target": 4, "on_unwind": 1}}}
+                },
+                {
+                    "statements": [
+                        {
+                            "span": window_span(),
+                            "kind": {"Assign": [
+                                window_place(serde_json::json!({"Local": 0}), &u8_ty),
+                                {"Use": [{"Copy": add_deref}, "No"]}
+                            ]}
+                        },
+                        {
+                            "span": window_span(),
+                            "kind": {"StorageDead": 4}
+                        }
+                    ],
+                    "kind": "Regular",
+                    "terminator": {"span": window_span(), "kind": "Return"}
+                }
+            ]
+        }}
+    });
+    let llbc = window_llbc(vec![utf8, holder], vec![caller, as_bytes, as_ptr, add]);
+    let graph = super::lower_function(&llbc, "ascii_codepoint_at")
+        .expect("lower ASCII getfield STR as_bytes ptr::add");
+    let ops = window_graph_ops(&graph);
+    let mut str_ids: std::collections::HashSet<u64> = ops
+        .iter()
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "value" => {
+                op.result.as_ref().map(|v| v.id())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !str_ids.is_empty(),
+        "getfield of value is the STR; graph={}",
+        graph.dump()
+    );
+    // Identity-elided `as_bytes` / `as_ptr` forward the STR as a block
+    // inputarg (`ll_stritem_nonneg` reads that header).
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    if str_ids.contains(&arg.id()) && str_ids.insert(input.id()) {
+                        grew = true;
+                    }
+                }
+            }
+        }
+    }
+    let getitem = ops.iter().find(|op| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            ..
+        } => segments.as_slice() == ["__string_byte_getitem"],
+        _ => false,
+    });
+    let Some(getitem) = getitem else {
+        panic!(
+            "*as_ptr().add(i) is __string_byte_getitem; leafs={:?} graph={}",
+            window_call_leafs(&graph),
+            graph.dump()
+        );
+    };
+    let OpKind::Call { args, .. } = &getitem.kind else {
+        unreachable!("getitem is a Call");
+    };
+    let a0 = args
+        .first()
+        .and_then(crate::model::LinkArg::as_variable)
+        .expect("byte getitem has a base");
+    assert!(
+        str_ids.contains(&a0.id()),
+        "byte getitem arg0 is the getfield STR; arg0={} str={str_ids:?} graph={}",
+        a0.id(),
+        graph.dump()
+    );
+    assert_eq!(
+        crate::model::FunctionGraph::concretetype_of(a0),
+        ConcreteType::GcRef,
+        "byte getitem arg0 is ref-kind; graph={}",
+        graph.dump()
+    );
+    let cast_of_str = ops.iter().any(|op| match &op.kind {
+        OpKind::UnaryOp { op, operand, .. } if op == "cast_ptr_to_int" => {
+            str_ids.contains(&operand.id())
+        }
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } if segments.iter().any(|s| s.contains("cast_ptr_to_int")) => args
+            .iter()
+            .filter_map(crate::model::LinkArg::as_variable)
+            .any(|v| str_ids.contains(&v.id())),
+        _ => false,
+    });
+    assert!(
+        !cast_of_str,
+        "one-word STR view is not rffi.cast to CCHARP; graph={}",
+        graph.dump()
+    );
+    let keepalive_of_str = ops
+        .iter()
+        .any(|op| window_keepalive_operand(&op.kind).is_some_and(|v| str_ids.contains(&v.id())));
+    assert!(
+        !keepalive_of_str,
+        "one-word STR view has no keepalive; graph={}",
         graph.dump()
     );
 }
@@ -7543,6 +8049,147 @@ fn null_or_offset_pointer_return_arms_share_one_value_type() {
     assert!(
         return_merge_arm_kinds_agree(&arm_tys),
         "null_mut and the offset arm must share one ValueType; got {arm_tys:?}"
+    );
+}
+
+/// `typed_items_block_items_base` returns `*mut u8` (`rlist.py` `ll_items`
+/// is `l.items`). The translator collapses that body onto the GC block,
+/// so both return arms and a caller's result stay `Ref`, not `CCHARP`.
+#[test]
+fn typed_items_block_items_base_stays_ref_bank() {
+    use crate::model::{CallTarget, LinkArg};
+
+    let path = crate::runtime_names::artifacts::MAJIT_RLIB_ULLBC;
+    let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+    let graph = super::lower_function(&llbc, "typed_items_block_items_base")
+        .expect("lower typed_items_block_items_base");
+    let arm_tys = return_merge_arm_value_types(&graph);
+    assert_eq!(
+        arm_tys.len(),
+        2,
+        "typed_items_block_items_base returns through two arms; got {arm_tys:?}"
+    );
+    assert!(
+        arm_tys.iter().all(|ty| matches!(ty, ValueType::Ref(_))),
+        "both return arms must be Ref; got {arm_tys:?} graph={}",
+        graph.dump()
+    );
+    let returnblock = graph.returnblock;
+    let mut arm_vars = Vec::new();
+    for block in &graph.blocks {
+        for link in &block.exits {
+            if link.target != returnblock {
+                continue;
+            }
+            for arg in &link.args {
+                if let LinkArg::Value(v) = arg {
+                    arm_vars.push(v.clone());
+                }
+            }
+        }
+    }
+    assert_eq!(
+        arm_vars.len(),
+        2,
+        "typed_items_block_items_base returns two values; graph={}",
+        graph.dump()
+    );
+    for var in &arm_vars {
+        let ct = var.concretetype();
+        assert!(
+            !ct.as_ref().is_some_and(super::lltype_is_ccharp),
+            "return arm must not be CCHARP; ct={ct:?} graph={}",
+            graph.dump()
+        );
+    }
+
+    let u8_ptr = mut_u8_ty_json();
+    let block_ptr = interior_raw_mut(interior_adt(0));
+    let items_block = interior_struct(
+        0,
+        &["lltypesystem", "rlist", "TypedItemsBlock"],
+        &[],
+        8,
+        &[],
+        false,
+    );
+    let caller = interior_caller(
+        "call_typed_items_base",
+        1,
+        vec![block_ptr.clone()],
+        u8_ptr.clone(),
+        vec![
+            interior_local(0, None, &u8_ptr),
+            interior_local(1, Some("block"), &block_ptr),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &block_ptr))],
+                    interior_place(0, &u8_ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let callee = interior_opaque(
+        1,
+        &[
+            "majit_rlib",
+            "lltypesystem",
+            "rlist",
+            "typed_items_block_items_base",
+        ],
+        vec![block_ptr],
+        u8_ptr,
+    );
+    let caller_llbc = llbc_with_types("fixture", vec![items_block], vec![caller, callee]);
+    let caller_graph = lower_interior(&caller_llbc, "call_typed_items_base");
+    let mut found = false;
+    for op in caller_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+    {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("typed_items_block_items_base") {
+            continue;
+        }
+        found = true;
+        assert!(
+            matches!(result_ty, ValueType::Ref(_)),
+            "call result_ty is Ref; result_ty={result_ty:?} graph={}",
+            caller_graph.dump()
+        );
+        let Some(var) = op.result.as_ref() else {
+            panic!(
+                "typed_items_block_items_base produces a result; graph={}",
+                caller_graph.dump()
+            );
+        };
+        let ct = var.concretetype();
+        assert!(
+            !ct.as_ref().is_some_and(super::lltype_is_ccharp),
+            "call result must not be CCHARP; ct={ct:?} graph={}",
+            caller_graph.dump()
+        );
+    }
+    assert!(
+        found,
+        "caller calls typed_items_block_items_base; graph={}",
+        caller_graph.dump()
     );
 }
 
@@ -11246,6 +11893,28 @@ pub(in crate::front::mir) fn vec_usize_ty_json() -> serde_json::Value {
     })
 }
 
+pub(in crate::front::mir) fn mut_u8_ty_json() -> serde_json::Value {
+    serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}, "Mut"]})
+}
+
+pub(in crate::front::mir) fn mut_i8_ty_json() -> serde_json::Value {
+    serde_json::json!({"RawPtr": [{"Scalar": {"Integer": {"Signed": "I8"}}}, "Mut"]})
+}
+
+pub(in crate::front::mir) fn vec_u8_ty_json() -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [{"Scalar": {"Integer": {"Unsigned": "U8"}}}],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    })
+}
+
 pub(in crate::front::mir) fn as_usize_cast_fixture(
     name: &str,
     src_ty: serde_json::Value,
@@ -11504,6 +12173,56 @@ pub(in crate::front::mir) fn option_enum(def_id: u64) -> serde_json::Value {
                 "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
             }
         ]}
+    })
+}
+
+pub(in crate::front::mir) fn result_enum(def_id: u64) -> serde_json::Value {
+    let span = serde_json::json!({"data": {
+        "file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}
+    }});
+    serde_json::json!({
+        "def_id": def_id,
+        "item_meta": {
+            "name": [
+                {"Ident": ["core", 0]},
+                {"Ident": ["result", 0]},
+                {"Ident": ["Result", 0]}
+            ],
+            "span": span,
+            "source_text": null,
+            "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+            "is_local": false
+        },
+        "kind": {"Enum": [
+            {
+                "name": "Ok",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 0]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "0"]}}
+            },
+            {
+                "name": "Err",
+                "fields": [{"name": null, "ty": {"TypeVar": {"Bound": [0, 1]}}, "attr_info": null}],
+                "discriminant": {"Scalar": {"Signed": ["Isize", "1"]}}
+            }
+        ]}
+    })
+}
+
+pub(in crate::front::mir) fn result_adt_node(
+    def_id: u64,
+    ok: serde_json::Value,
+    err: serde_json::Value,
+) -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {
+            "id": def_id,
+            "generics": {
+                "regions": [],
+                "types": [ok, err],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
     })
 }
 
@@ -20554,6 +21273,1072 @@ fn charpsize2str_cp_input_is_ccharp() {
     );
 }
 
+/// `str2charp` `copy_bytes` dst is CCHARP (`rffi.py` `CCHARP`).
+#[test]
+fn str2charp_copy_bytes_dst_is_ccharp() {
+    use crate::model::{CallTarget, ConcreteType, OpKind, getkind};
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/llbc/majit-rlib.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load majit-rlib.ullbc");
+    let graph = super::lower_function(&llbc, "str2charp").expect("lower str2charp");
+    let mut found = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("copy_bytes") {
+            continue;
+        }
+        found = true;
+        assert_eq!(args.len(), 3, "copy_bytes arity; graph={}", graph.dump());
+        for (i, arg) in args.iter().enumerate() {
+            if i == 2 {
+                continue;
+            }
+            let var = arg.as_variable().unwrap_or_else(|| {
+                panic!("copy_bytes arg {i} is a pointer; graph={}", graph.dump())
+            });
+            let ct = var.concretetype();
+            assert!(
+                ct.as_ref().is_some_and(super::lltype_is_ccharp),
+                "copy_bytes arg {i} is CCHARP; ct={ct:?} graph={}",
+                graph.dump()
+            );
+            assert_eq!(
+                ct.as_ref().map(getkind),
+                Some(ConcreteType::Signed),
+                "CCHARP getkind is int; arg {i} graph={}",
+                graph.dump()
+            );
+        }
+    }
+    assert!(found, "str2charp calls copy_bytes; graph={}", graph.dump());
+}
+
+/// A unit-returning fn's raw `*u8` parameter is still `CCHARP`
+/// (`rffi.py` `CCHARP`); `getkind` of that raw Ptr is int.
+#[test]
+fn raw_u8_param_of_non_list_fn_is_ccharp() {
+    let span = fixture_span();
+    let p_ty = mut_u8_ty_json();
+    let n_ty = usize_ty();
+    let unit_ty = serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": {"types": []}}
+    });
+    let f = serde_json::json!({
+        "def_id": 0,
+        "item_meta": fixture_item_meta(ident_path(&["fixture", "f"])),
+        "signature": {
+            "is_unsafe": false,
+            "inputs": [p_ty, n_ty],
+            "output": unit_ty
+        },
+        "body": {"Unstructured": {
+            "span": span,
+            "locals": {
+                "arg_count": 2,
+                "locals": [
+                    {"index": 0, "name": null, "span": span, "ty": unit_ty},
+                    {"index": 1, "name": "p", "span": span, "ty": p_ty},
+                    {"index": 2, "name": "n", "span": span, "ty": n_ty}
+                ]
+            },
+            "body": [{
+                "statements": [],
+                "terminator": {"span": span, "kind": "Return"}
+            }]
+        }}
+    });
+    let file = serde_json::json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "fixture",
+            "type_decls": [],
+            "fun_decls": [f],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+    let graph = super::lower_function(&llbc, "f").expect("lower f");
+    let mut p_root = None;
+    let mut p_input_ty = None;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        if let OpKind::Input {
+            name,
+            ty,
+            class_root,
+            ..
+        } = &op.kind
+            && name == "p"
+        {
+            p_root = class_root.clone();
+            p_input_ty = Some(ty.clone());
+        }
+    }
+    assert_eq!(
+        p_root.as_deref(),
+        Some("CCHARP"),
+        "raw *u8 param of a unit-returning fn is CCHARP; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        p_input_ty,
+        Some(ValueType::Unsigned),
+        "CCHARP getkind is int; graph={}",
+        graph.dump()
+    );
+}
+
+fn interior_unit_ty() -> serde_json::Value {
+    serde_json::json!({
+        "Adt": {"builtin": "Tuple", "generics": {"types": []}}
+    })
+}
+
+fn interior_goto(target: u64) -> serde_json::Value {
+    serde_json::json!({"span": interior_span(), "kind": {"Goto": {"target": target}}})
+}
+
+fn interior_variant_field(
+    index: u64,
+    adt_ty: &serde_json::Value,
+    field_ty: &serde_json::Value,
+    variant_idx: u64,
+    field_idx: u64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": {
+            "Projection": [
+                interior_place(index, adt_ty),
+                {"Field": [variant_idx, field_idx]}
+            ]
+        },
+        "ty": field_ty
+    })
+}
+
+fn assert_h_call_actual_is_ccharp(graph: &FunctionGraph) {
+    use crate::model::{CallTarget, ConcreteType, LinkArg, OpKind, getkind};
+    let mut found = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some("h") {
+            continue;
+        }
+        found = true;
+        let var = args
+            .first()
+            .and_then(LinkArg::as_variable)
+            .unwrap_or_else(|| panic!("h takes a *u8 actual; graph={}", graph.dump()));
+        let ct = var.concretetype();
+        assert!(
+            ct.as_ref().is_some_and(super::lltype_is_ccharp),
+            "h actual is CCHARP; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            ct.as_ref().map(getkind),
+            Some(ConcreteType::Signed),
+            "CCHARP getkind is int; graph={}",
+            graph.dump()
+        );
+    }
+    assert!(found, "g calls h; graph={}", graph.dump());
+}
+
+fn value_type_is_ccharp_bank(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Unsigned | ValueType::Int)
+}
+
+fn assert_raw_u8_call_result_is_ccharp_bank(graph: &FunctionGraph, callee: &str) {
+    use crate::model::{CallTarget, ConcreteType, OpKind, getkind};
+    let mut found = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            result_ty,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if segments.last().map(String::as_str) != Some(callee) {
+            continue;
+        }
+        found = true;
+        assert!(
+            value_type_is_ccharp_bank(result_ty),
+            "{callee} result_ty is CCHARP int-bank; result_ty={result_ty:?} graph={}",
+            graph.dump()
+        );
+        let Some(var) = op.result.as_ref() else {
+            panic!("{callee} produces a *u8; graph={}", graph.dump());
+        };
+        let ct = var.concretetype();
+        assert!(
+            ct.as_ref().is_some_and(super::lltype_is_ccharp),
+            "{callee} result is CCHARP; graph={}",
+            graph.dump()
+        );
+        assert_eq!(
+            ct.as_ref().map(getkind),
+            Some(ConcreteType::Signed),
+            "CCHARP getkind is int; graph={}",
+            graph.dump()
+        );
+    }
+    assert!(found, "g calls {callee}; graph={}", graph.dump());
+}
+
+fn assert_raw_u8_field_ops_are_ccharp_bank(graph: &FunctionGraph) {
+    use crate::model::{ConcreteType, OpKind, getkind};
+    let mut saw_read = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        match &op.kind {
+            OpKind::FieldRead { field, ty, .. } if field.name == "p" || field.name == "__pos_0" => {
+                saw_read = true;
+                assert!(
+                    value_type_is_ccharp_bank(ty),
+                    "raw *u8 FieldRead ty is CCHARP int-bank; ty={ty:?} graph={}",
+                    graph.dump()
+                );
+                let Some(var) = op.result.as_ref() else {
+                    panic!("FieldRead produces a *u8; graph={}", graph.dump());
+                };
+                let ct = var.concretetype();
+                assert!(
+                    ct.as_ref().is_some_and(super::lltype_is_ccharp),
+                    "raw *u8 FieldRead is CCHARP; graph={}",
+                    graph.dump()
+                );
+                assert_eq!(
+                    ct.as_ref().map(getkind),
+                    Some(ConcreteType::Signed),
+                    "CCHARP getkind is int; graph={}",
+                    graph.dump()
+                );
+            }
+            OpKind::FieldWrite { field, ty, .. }
+                if field.name == "p" || field.name == "__pos_0" =>
+            {
+                assert!(
+                    value_type_is_ccharp_bank(ty),
+                    "raw *u8 FieldWrite ty is CCHARP int-bank; ty={ty:?} graph={}",
+                    graph.dump()
+                );
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        saw_read,
+        "raw *u8 FieldRead is present; graph={}",
+        graph.dump()
+    );
+}
+
+/// `f() -> *mut u8` called from `g`, result passed to `h(p: *mut u8)`:
+/// the `h` actual is `CCHARP` (`rffi.py` `CCHARP`).
+#[test]
+fn raw_u8_call_result_is_ccharp() {
+    let p_ty = mut_u8_ty_json();
+    let unit = interior_unit_ty();
+    let caller = interior_caller(
+        "g",
+        0,
+        vec![],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &p_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(1, &p_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(1, &p_ty))],
+                    interior_place(0, &unit),
+                    3,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let f = interior_opaque(1, &["fixture", "f"], vec![], p_ty.clone());
+    let h = interior_opaque(2, &["fixture", "h"], vec![p_ty], unit);
+    let llbc = llbc_with_types("fixture", vec![], vec![caller, f, h]);
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_call_result_is_ccharp_bank(&graph, "f");
+    assert_h_call_actual_is_ccharp(&graph);
+}
+
+/// `f() -> *mut i8`, `.cast::<u8>()`, then `h(p: *mut u8) -> Vec<u8>`:
+/// the `h` actual is CCHARP produced by `rffi.cast` (`cast_ptr_to_int`
+/// then `cast_int_to_ptr`), not a stamp on `f`'s Ref-banked result.
+#[test]
+fn raw_i8_cast_to_u8_emits_rffi_cast() {
+    let i8_ty = mut_i8_ty_json();
+    let u8_ty = mut_u8_ty_json();
+    let vec_ty = vec_u8_ty_json();
+    let caller = interior_caller(
+        "g",
+        0,
+        vec![],
+        vec_ty.clone(),
+        vec![
+            interior_local(0, None, &vec_ty),
+            interior_local(1, Some("q"), &i8_ty),
+            interior_local(2, Some("p"), &u8_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(1, &i8_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(1, &i8_ty))],
+                    interior_place(2, &u8_ty),
+                    3,
+                    1,
+                ),
+            ),
+            interior_bb(
+                vec![],
+                interior_call(
+                    3,
+                    vec![interior_copy(interior_place(2, &u8_ty))],
+                    interior_place(0, &vec_ty),
+                    4,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let f = interior_opaque(1, &["fixture", "f"], vec![], i8_ty.clone());
+    let cast = interior_opaque(
+        2,
+        &["core", "ptr", "mut_ptr", "<Impl>", "cast"],
+        vec![i8_ty],
+        u8_ty.clone(),
+    );
+    let h = interior_opaque(3, &["fixture", "h"], vec![u8_ty], vec_ty);
+    let vec_decl = serde_json::json!({
+        "def_id": 0,
+        "item_meta": interior_meta(&["alloc", "vec", "Vec"], false),
+        "kind": "Opaque"
+    });
+    let llbc = llbc_with_types("fixture", vec![vec_decl], vec![caller, f, cast, h]);
+    let graph = lower_interior(&llbc, "g");
+    assert_h_call_actual_is_ccharp(&graph);
+    assert_h_actual_from_rffi_cast_not_f_result(&graph);
+}
+
+/// `fn f(p: *mut i8) -> *mut u8 { p.cast::<u8>() }`: the return is
+/// CCHARP produced by `rffi.cast` (`cast_ptr_to_int` then
+/// `cast_int_to_ptr`), not a Ref alias of `p`.
+#[test]
+fn raw_i8_method_cast_to_u8_returns_ccharp() {
+    use crate::model::{CallTarget, ConcreteType, LinkArg, OpKind, getkind};
+    let i8_ty = mut_i8_ty_json();
+    let u8_ty = mut_u8_ty_json();
+    let f = interior_caller(
+        "f",
+        1,
+        vec![i8_ty.clone()],
+        u8_ty.clone(),
+        vec![
+            interior_local(0, None, &u8_ty),
+            interior_local(1, Some("p"), &i8_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &i8_ty))],
+                    interior_place(0, &u8_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let cast = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "cast"],
+        vec![i8_ty],
+        u8_ty,
+    );
+    let llbc = llbc_with_types("fixture", vec![], vec![f, cast]);
+    let graph = lower_interior(&llbc, "f");
+    let input = graph
+        .block(graph.startblock)
+        .inputargs
+        .first()
+        .cloned()
+        .expect("f takes p");
+    let returned = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.exits.iter())
+        .find(|link| link.target == graph.returnblock)
+        .and_then(|link| link.args.first())
+        .and_then(LinkArg::as_variable)
+        .cloned()
+        .unwrap_or_else(|| panic!("f returns a value; graph={}", graph.dump()));
+    assert_ne!(
+        returned,
+        input,
+        "return is not a ref alias of p; graph={}",
+        graph.dump()
+    );
+    let ct = returned.concretetype();
+    assert!(
+        ct.as_ref().is_some_and(super::lltype_is_ccharp),
+        "return is CCHARP; graph={}",
+        graph.dump()
+    );
+    assert_eq!(
+        ct.as_ref().map(getkind),
+        Some(ConcreteType::Signed),
+        "CCHARP getkind is int; graph={}",
+        graph.dump()
+    );
+    let produced_by_rffi_cast = super::resolve_to_producer_op(&graph, &returned)
+        .and_then(|(block_id, idx)| {
+            graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .and_then(|block| block.operations.get(idx))
+        })
+        .is_some_and(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                result_ty,
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                (leaf == Some("cast_int_to_ptr") || leaf == Some("cast"))
+                    && value_type_is_ccharp_bank(result_ty)
+            }
+            _ => false,
+        });
+    assert!(
+        produced_by_rffi_cast,
+        "return is rffi.cast / cast_int_to_ptr onto CCHARP; graph={}",
+        graph.dump()
+    );
+    let saw_cast_ptr_to_int = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_ptr_to_int"),
+            _ => false,
+        });
+    assert!(
+        saw_cast_ptr_to_int,
+        "cast_ptr_to_int in f (p is a Ref *mut i8); graph={}",
+        graph.dump()
+    );
+}
+
+/// Tuple `(p as *mut usize, 0usize)` stores `__pos_0` as Int
+/// (`rtuple.py` `TupleRepr.newtuple`: `r_item.lowleveltype`).
+#[test]
+fn tuple_ctor_of_cast_ccharp_writes_field_type() {
+    use crate::model::{OpKind, ValueType};
+    let u8_ty = mut_u8_ty_json();
+    let usize_t = interior_usize();
+    let usize_ptr = interior_raw_mut(usize_t.clone());
+    let tuple_ty = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "builtin": "Tuple",
+            "generics": {
+                "regions": [],
+                "types": [usize_ptr.clone(), usize_t.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let g = interior_caller(
+        "g",
+        1,
+        vec![u8_ty.clone()],
+        tuple_ty.clone(),
+        vec![
+            interior_local(0, None, &tuple_ty),
+            interior_local(1, Some("p"), &u8_ty),
+            interior_local(2, Some("q"), &usize_ptr),
+        ],
+        vec![interior_bb(
+            vec![
+                interior_assign(
+                    interior_place(2, &usize_ptr),
+                    serde_json::json!({
+                        "UnaryOp": [
+                            {"Cast": {"RawPtr": [u8_ty.clone(), usize_ptr.clone()]}},
+                            {"Copy": interior_place(1, &u8_ty)}
+                        ]
+                    }),
+                ),
+                interior_assign(
+                    interior_place(0, &tuple_ty),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [
+                                {
+                                    "id": 0,
+                                    "builtin": "Tuple",
+                                    "generics": {
+                                        "regions": [],
+                                        "types": [usize_ptr.clone(), usize_t.clone()],
+                                        "const_generics": [],
+                                        "trait_refs": []
+                                    }
+                                },
+                                null,
+                                null
+                            ]},
+                            [
+                                {"Move": interior_place(2, &usize_ptr)},
+                                interior_const_usize("0", &usize_t)
+                            ]
+                        ]
+                    }),
+                ),
+            ],
+            interior_return(),
+        )],
+    );
+    let g_llbc = llbc_with_types("fixture", vec![], vec![g]);
+    let g_graph = lower_interior(&g_llbc, "g");
+    let pos0: Vec<&ValueType> = g_graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, ty, .. } if field.name == "__pos_0" => Some(ty),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        pos0,
+        [&ValueType::Int],
+        "tuple (p as *mut usize, 0) writes __pos_0 as Int; graph={}",
+        g_graph.dump()
+    );
+}
+
+fn assert_h_actual_from_rffi_cast_not_f_result(graph: &FunctionGraph) {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    let mut f_result = None;
+    let mut h_actual = None;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        match segments.last().map(String::as_str) {
+            Some("f") => f_result = op.result.clone(),
+            Some("h") => {
+                h_actual = args.first().and_then(LinkArg::as_variable).cloned();
+            }
+            _ => {}
+        }
+    }
+    let f_result = f_result.unwrap_or_else(|| panic!("g calls f; graph={}", graph.dump()));
+    let h_actual = h_actual.unwrap_or_else(|| panic!("g calls h; graph={}", graph.dump()));
+    assert_ne!(
+        f_result,
+        h_actual,
+        "h actual is not a stamp on f's result; graph={}",
+        graph.dump()
+    );
+    // Identity-cast dest conversion emits `rffi.cast` in the cast block;
+    // `h`'s actual may be that result threaded as the next block's inputarg.
+    let produced_by_rffi_cast = super::resolve_to_producer_op(graph, &h_actual)
+        .and_then(|(block_id, idx)| {
+            graph
+                .blocks
+                .iter()
+                .find(|block| block.id == block_id)
+                .and_then(|block| block.operations.get(idx))
+        })
+        .is_some_and(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                let leaf = segments.last().map(String::as_str);
+                leaf == Some("cast_int_to_ptr") || leaf == Some("cast")
+            }
+            _ => false,
+        });
+    assert!(
+        produced_by_rffi_cast,
+        "h actual is rffi.cast / cast_int_to_ptr; graph={}",
+        graph.dump()
+    );
+    let saw_cast_ptr_to_int = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .any(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().map(String::as_str) == Some("cast_ptr_to_int"),
+            _ => false,
+        });
+    assert!(
+        saw_cast_ptr_to_int,
+        "cast_ptr_to_int in g (f's Ref result may be a block inputarg); graph={}",
+        graph.dump()
+    );
+}
+
+/// `match f() { Ok(p) => h(p), Err(_) => () }` with
+/// `f() -> Result<*mut u8, E>`: the `h` actual is `CCHARP`.
+#[test]
+fn raw_u8_result_payload_is_ccharp() {
+    let p_ty = mut_u8_ty_json();
+    let err_ty = interior_i64();
+    let unit = interior_unit_ty();
+    let result_ty = result_adt_node(0, p_ty.clone(), err_ty);
+    let isize_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "Isize"}}});
+    let caller = interior_caller(
+        "g",
+        0,
+        vec![],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("r"), &result_ty),
+            interior_local(2, Some("p"), &p_ty),
+            interior_local(3, Some("discr"), &isize_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &unit),
+                    serde_json::json!({"Aggregate": ["Tuple", []]}),
+                )],
+                interior_call(1, vec![], interior_place(1, &result_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(3, &isize_ty),
+                    serde_json::json!({"Discriminant": interior_place(1, &result_ty)}),
+                )],
+                serde_json::json!({
+                    "span": interior_span(),
+                    "kind": {"Switch": {
+                        "discr": {"Copy": interior_place(3, &isize_ty)},
+                        "targets": {"SwitchInt": [
+                            isize_ty,
+                            [
+                                [{"Scalar": {"Signed": ["Isize", "0"]}}, 3],
+                                [{"Scalar": {"Signed": ["Isize", "1"]}}, 4]
+                            ],
+                            4
+                        ]}
+                    }}
+                }),
+            ),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(2, &p_ty),
+                    interior_use(interior_variant_field(1, &result_ty, &p_ty, 0, 0)),
+                )],
+                interior_call(
+                    2,
+                    vec![interior_copy(interior_place(2, &p_ty))],
+                    interior_place(0, &unit),
+                    5,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_goto(5)),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let f = interior_opaque(1, &["fixture", "f"], vec![], result_ty);
+    let h = interior_opaque(2, &["fixture", "h"], vec![p_ty], unit);
+    let llbc = llbc_with_types("fixture", vec![result_enum(0)], vec![caller, f, h]);
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_field_ops_are_ccharp_bank(&graph);
+    assert_h_call_actual_is_ccharp(&graph);
+}
+
+/// Store a `*mut u8` param into a struct field and load it back into `h`.
+#[test]
+fn raw_u8_struct_field_roundtrip_is_ccharp() {
+    let p_ty = mut_u8_ty_json();
+    let unit = interior_unit_ty();
+    let holder = interior_adt(0);
+    let holder_ptr = interior_raw_mut(holder.clone());
+    let caller = interior_caller(
+        "g",
+        2,
+        vec![p_ty.clone(), holder_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("p"), &p_ty),
+            interior_local(2, Some("s"), &holder_ptr),
+            interior_local(3, Some("tmp"), &p_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![
+                    interior_assign(
+                        interior_field(2, &holder_ptr, &holder, &p_ty, 0),
+                        interior_use(interior_place(1, &p_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(3, &p_ty),
+                        interior_use(interior_field(2, &holder_ptr, &holder, &p_ty, 0)),
+                    ),
+                ],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(3, &p_ty))],
+                    interior_place(0, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let h = interior_opaque(1, &["fixture", "h"], vec![p_ty.clone()], unit);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "Holder"],
+            &[("p", p_ty)],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, h],
+    );
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_field_ops_are_ccharp_bank(&graph);
+    assert_h_call_actual_is_ccharp(&graph);
+}
+
+fn assert_raw_u8_field_write_is_ccharp_unsigned(graph: &FunctionGraph, field_name: &str) {
+    use crate::model::OpKind;
+    let mut found = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldWrite {
+            field, value, ty, ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        if field.name != field_name {
+            continue;
+        }
+        found = true;
+        assert_eq!(
+            ty,
+            &ValueType::Unsigned,
+            "{field_name} store is Unsigned; graph={}",
+            graph.dump()
+        );
+        let var = value.as_variable().unwrap_or_else(|| {
+            panic!(
+                "{field_name} store is a value; {value:?} graph={}",
+                graph.dump()
+            )
+        });
+        assert!(
+            var.concretetype()
+                .as_ref()
+                .is_some_and(super::lltype_is_ccharp),
+            "{field_name} operand is CCHARP; ct={:?} graph={}",
+            var.concretetype(),
+            graph.dump()
+        );
+    }
+    assert!(
+        found,
+        "{field_name} FieldWrite is present; graph={}",
+        graph.dump()
+    );
+}
+
+/// `Holder { p: *mut u8 }` built from `<*mut u8 as Default>::default()`.
+/// The stored operand is CCHARP (`rffi.py` `CCHARP`); the store is Unsigned.
+#[test]
+fn raw_u8_default_is_ccharp_null() {
+    let p_ty = mut_u8_ty_json();
+    let holder = interior_adt(0);
+    let caller = interior_caller(
+        "g",
+        0,
+        vec![],
+        holder.clone(),
+        vec![
+            interior_local(0, None, &holder),
+            interior_local(1, Some("p"), &p_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(1, vec![], interior_place(1, &p_ty), 2, 1),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &holder),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [{"Move": interior_place(1, &p_ty)}]
+                        ]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let default = interior_opaque(
+        1,
+        &["core", "ptr", "mut_ptr", "<Impl>", "default"],
+        vec![],
+        p_ty.clone(),
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "Holder"],
+            &[("p", p_ty)],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, default],
+    );
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_field_write_is_ccharp_unsigned(&graph, "p");
+}
+
+/// `S { address: *mut u8, length: usize }` from `data.as_mut_ptr()` of
+/// a `&mut [u8]` parameter. The stored address is CCHARP.
+#[test]
+fn slice_as_mut_ptr_into_raw_u8_field_is_ccharp() {
+    let data_ty = window_mut_slice();
+    let addr_ty = mut_u8_ty_json();
+    let len_ty = interior_usize();
+    let s_ty = interior_adt(0);
+    let caller = interior_caller(
+        "g",
+        1,
+        vec![data_ty.clone()],
+        s_ty.clone(),
+        vec![
+            interior_local(0, None, &s_ty),
+            interior_local(1, Some("data"), &data_ty),
+            interior_local(2, Some("address"), &addr_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, &data_ty))],
+                    interior_place(2, &addr_ty),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(0, &s_ty),
+                    serde_json::json!({
+                        "Aggregate": [
+                            {"Adt": [0, 0, null]},
+                            [
+                                {"Move": interior_place(2, &addr_ty)},
+                                interior_const_usize("0", &len_ty)
+                            ]
+                        ]
+                    }),
+                )],
+                interior_return(),
+            ),
+        ],
+    );
+    let as_mut_ptr = interior_opaque(
+        1,
+        &["core", "slice", "<Impl>", "as_mut_ptr"],
+        vec![data_ty],
+        addr_ty.clone(),
+    );
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "S"],
+            &[("address", addr_ty), ("length", len_ty)],
+            16,
+            &[0, 8],
+            false,
+        )],
+        vec![caller, as_mut_ptr],
+    );
+    let graph = lower_interior(&llbc, "g");
+    assert_raw_u8_field_write_is_ccharp_unsigned(&graph, "address");
+}
+
+/// `Holder<T> { p: &'static T }` with `T = i64`: substitution keeps the
+/// `Ref` (`PtrRepr.rtype_getattr`). The `p` read is pointer-kind, not Signed.
+#[test]
+fn generic_ref_field_keeps_ref_wrapper() {
+    let i64_ty = interior_i64();
+    let field_ty = serde_json::json!({
+        "Ref": ["Static", {"TypeVar": {"Bound": [0, 0]}}, "Shared"]
+    });
+    let holder = serde_json::json!({
+        "Adt": {
+            "id": 0,
+            "generics": {
+                "regions": [],
+                "types": [i64_ty.clone()],
+                "const_generics": [],
+                "trait_refs": []
+            }
+        }
+    });
+    let subst_llbc = empty_llbc();
+    let subst = super::tyref_subst_bound_typevar(
+        &TyRef::Other(field_ty.clone()),
+        &TyRef::Other(holder.clone()),
+        &subst_llbc,
+    );
+    let node = super::tyref_node(&subst, &subst_llbc).expect("substituted field ty");
+    assert!(
+        node.get("Ref").is_some(),
+        "substituted &'static T keeps Ref; node={node}"
+    );
+    let pointee = node
+        .get("Ref")
+        .and_then(|r| super::ref_inner_and_kind(r).0)
+        .expect("Ref pointee");
+    assert_eq!(pointee, &i64_ty, "pointee is the generic arg i64");
+
+    let unit = interior_unit_ty();
+    let holder_ptr = interior_raw_mut(holder.clone());
+    let caller = interior_caller(
+        "g",
+        1,
+        vec![holder_ptr.clone()],
+        unit.clone(),
+        vec![
+            interior_local(0, None, &unit),
+            interior_local(1, Some("s"), &holder_ptr),
+            interior_local(2, Some("p"), &field_ty),
+        ],
+        vec![
+            interior_bb(
+                vec![interior_assign(
+                    interior_place(2, &field_ty),
+                    interior_use(interior_field(1, &holder_ptr, &holder, &field_ty, 0)),
+                )],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(2, &field_ty))],
+                    interior_place(0, &unit),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(vec![], interior_return()),
+        ],
+    );
+    let h = interior_opaque(1, &["fixture", "h"], vec![field_ty.clone()], unit);
+    let llbc = llbc_with_types(
+        "fixture",
+        vec![interior_struct(
+            0,
+            &["fixture", "Holder"],
+            &[("p", field_ty)],
+            8,
+            &[0],
+            false,
+        )],
+        vec![caller, h],
+    );
+    let graph = lower_interior(&llbc, "g");
+    let mut saw = false;
+    for op in graph.blocks.iter().flat_map(|block| &block.operations) {
+        let OpKind::FieldRead { field, ty, .. } = &op.kind else {
+            continue;
+        };
+        if field.name != "p" {
+            continue;
+        }
+        saw = true;
+        assert!(
+            matches!(ty, ValueType::Ref(_)),
+            "Holder<T>.p read is pointer-kind, not Signed; ty={ty:?} graph={}",
+            graph.dump()
+        );
+    }
+    assert!(saw, "g reads Holder.p; graph={}", graph.dump());
+}
+
 /// `rbigint.py` `ptwotable` is a prebuilt list. `_x_mul` must read that
 /// array, not a residual accessor named `PTWOTABLE`.
 #[test]
@@ -20713,6 +22498,8 @@ pub(in crate::front::mir) fn disc_site(
         payload1_ty: ValueType::Int,
         payload0_class: None,
         payload1_class: None,
+        payload0_is_raw_u8: false,
+        payload1_is_raw_u8: false,
         result_owner: "core::result::Result".into(),
         result_tag0_owner: "core::result::Result::Ok".into(),
         result_tag1_owner: "core::result::Result::Err".into(),
@@ -21185,6 +22972,7 @@ pub(in crate::front::mir) fn some_ctor_shape() -> super::AggregateShape {
             void: false,
             narrow_root: None,
             window: false,
+            raw_u8: false,
         }],
     })
 }
@@ -21231,6 +23019,7 @@ pub(in crate::front::mir) fn ok_ctor_shape() -> super::AggregateShape {
             void: false,
             narrow_root: None,
             window: false,
+            raw_u8: false,
         }],
     })
 }

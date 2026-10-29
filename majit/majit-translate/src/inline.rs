@@ -1031,7 +1031,9 @@ pub(crate) fn remap_op_kind(
             class_carrier: remap_var(class_carrier),
             result_ty: result_ty.clone(),
         },
-        OpKind::Live => OpKind::Live,
+        OpKind::Live { forced } => OpKind::Live {
+            forced: forced.iter().map(&remap_var).collect(),
+        },
         OpKind::JitMergePoint {
             jitdriver_index,
             greens_i,
@@ -1235,7 +1237,6 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
-        | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
@@ -1243,6 +1244,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::NewWithVtable { .. } => {
             vec![]
         }
+        OpKind::Live { forced } => forced.iter().map(clone_var).collect(),
         OpKind::RawMalloc { length, .. } => length.iter().map(clone_var).collect(),
         OpKind::RawFree { ptr } => vec![clone_var(ptr)],
         OpKind::NewTuple { args } => args.iter().map(clone_var).collect(),
@@ -1629,7 +1631,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::JitDebug { .. }
         | OpKind::JitMergePoint { .. }
         | OpKind::LoopHeader { .. }
-        | OpKind::Live
+        | OpKind::Live { .. }
         | OpKind::VableForce { .. }
         | OpKind::Hint { .. }
         | OpKind::Abort { .. } => false,

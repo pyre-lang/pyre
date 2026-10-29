@@ -613,7 +613,7 @@ fn infer_op_type(kind: &OpKind) -> ValueType {
             }
         }
         OpKind::VableForce { .. }
-        | OpKind::Live
+        | OpKind::Live { .. }
         | OpKind::GuardValue { .. }
         | OpKind::JitDebug { .. }
         | OpKind::AssertGreen { .. }

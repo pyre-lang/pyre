@@ -59,6 +59,7 @@ pub(in crate::front::mir) enum LocalValue {
     Pair(
         crate::flowspace::model::Variable,
         crate::flowspace::model::Variable,
+        Option<crate::flowspace::model::Variable>,
     ),
     SliceIter {
         items: crate::flowspace::model::Variable,
@@ -79,7 +80,7 @@ impl LocalValue {
             LocalValue::One(var) | LocalValue::ItemAddr(var) => Ok(var.clone()),
             // The cursor, never the item pointer.
             LocalValue::SliceIter { index, .. } => Ok(index.clone()),
-            LocalValue::Pair(_, _) => Err(LowerError::Unsupported(
+            LocalValue::Pair(_, _, _) => Err(LowerError::Unsupported(
                 "pair-slice local read as one word".to_string(),
             )),
         }
@@ -97,7 +98,7 @@ impl LocalValue {
         LowerError,
     > {
         match self {
-            LocalValue::Pair(ptr, len) => Ok((ptr.clone(), len.clone())),
+            LocalValue::Pair(ptr, len, _) => Ok((ptr.clone(), len.clone())),
             LocalValue::SliceIter { index, items, .. } => Ok((index.clone(), items.clone())),
             LocalValue::One(_) | LocalValue::ItemAddr(_) => Err(LowerError::Unsupported(
                 "one-word local read as a pair slice".to_string(),
@@ -110,7 +111,7 @@ impl LocalValue {
     /// in the shadow slot.
     pub(in crate::front::mir) fn link_word(&self) -> crate::flowspace::model::Variable {
         match self {
-            LocalValue::One(var) | LocalValue::Pair(var, _) | LocalValue::ItemAddr(var) => {
+            LocalValue::One(var) | LocalValue::Pair(var, _, _) | LocalValue::ItemAddr(var) => {
                 var.clone()
             }
             LocalValue::SliceIter { index, .. } => index.clone(),
@@ -121,7 +122,13 @@ impl LocalValue {
     pub(in crate::front::mir) fn words(&self) -> Vec<crate::flowspace::model::Variable> {
         match self {
             LocalValue::One(var) | LocalValue::ItemAddr(var) => vec![var.clone()],
-            LocalValue::Pair(ptr, len) => vec![ptr.clone(), len.clone()],
+            LocalValue::Pair(ptr, len, owner) => {
+                let mut words = vec![ptr.clone(), len.clone()];
+                if let Some(owner) = owner {
+                    words.push(owner.clone());
+                }
+                words
+            }
             LocalValue::SliceIter { items, index } => vec![items.clone(), index.clone()],
         }
     }
@@ -138,9 +145,12 @@ impl LocalValue {
         };
         match self {
             LocalValue::One(var) | LocalValue::ItemAddr(var) => map_word(var),
-            LocalValue::Pair(ptr, len) => {
+            LocalValue::Pair(ptr, len, owner) => {
                 map_word(ptr);
                 map_word(len);
+                if let Some(owner) = owner {
+                    map_word(owner);
+                }
             }
             LocalValue::SliceIter { items, index } => {
                 map_word(items);
@@ -381,6 +391,27 @@ pub(in crate::front::mir) fn compute_interior_field_extra_live(
             if block_has_struct_field_value_use(llbc, use_bb, dest as usize) {
                 extra[use_idx].push(header_local);
                 extra[use_idx].push(traced.index_local);
+            }
+        }
+    }
+    extra
+}
+
+/// `StorageDead` of a window local is a use of that local so its GC owner
+/// reaches the block as an inputarg (`rtype_keepalive_until_here`).
+pub(in crate::front::mir) fn window_owner_storage_dead_extra_live(
+    body: &Unstructured,
+    owner_shadow: &[Option<usize>],
+) -> Vec<Vec<usize>> {
+    let mut extra = vec![Vec::new(); body.body.len()];
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        for stmt in &bb.statements {
+            let Ok(StmtKind::StorageDead(local)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            let local = *local as usize;
+            if owner_shadow.get(local).copied().flatten().is_some() {
+                extra[bb_idx].push(local);
             }
         }
     }

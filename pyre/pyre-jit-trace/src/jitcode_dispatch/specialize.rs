@@ -1399,19 +1399,20 @@ fn walker_immediate_inline_caller_box<Sym: WalkSym>(
     if raw.is_null() {
         return None;
     }
-    let caller_ptr =
-        if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) } {
-            let referent = unsafe {
-                majit_metainterp::virtualref::vref_forced(raw as *const u8)
-                    as *mut pyre_interpreter::PyFrame
-            };
-            if referent.is_null() {
-                return None;
-            }
-            referent as usize
-        } else {
-            raw as usize
+    let caller_ptr = if unsafe {
+        majit_metainterp::virtualref::ptr_is_virtual_ref(raw as majit_gc::header::GCREF)
+    } {
+        let referent = unsafe {
+            majit_metainterp::virtualref::vref_forced(raw as majit_gc::header::GCREF)
+                as *mut pyre_interpreter::PyFrame
         };
+        if referent.is_null() {
+            return None;
+        }
+        referent as usize
+    } else {
+        raw as usize
+    };
     if let (Some(vable_box), Some(vable_ptr)) = (
         ctx.trace_ctx.standard_virtualizable_box(),
         ctx.trace_ctx.standard_virtualizable_ptr(),
@@ -13410,9 +13411,11 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             if raw.is_null() {
                 return Ok(None);
             }
-            if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8) } {
+            if unsafe {
+                majit_metainterp::virtualref::ptr_is_virtual_ref(raw as majit_gc::header::GCREF)
+            } {
                 let referent = unsafe {
-                    majit_metainterp::virtualref::vref_forced(raw as *const u8)
+                    majit_metainterp::virtualref::vref_forced(raw as majit_gc::header::GCREF)
                         as *mut pyre_interpreter::PyFrame
                 };
                 if referent.is_null()
@@ -13532,8 +13535,9 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             majit_ir::Value::Ref(majit_ir::GcRef(raw_ptr as usize)),
         );
 
-        let raw_is_vref =
-            unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(raw_ptr as *const u8) };
+        let raw_is_vref = unsafe {
+            majit_metainterp::virtualref::ptr_is_virtual_ref(raw_ptr as majit_gc::header::GCREF)
+        };
         let (next_op, next_ptr) = if raw_is_vref {
             // `_do_jit_force_virtual` sees the vref box as a known
             // non-standard virtualizable and returns None, so
@@ -13545,7 +13549,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             // of materialising a vref whose `forced` field is null.
             let live_pair = ctx.trace_ctx.live_virtualref_pair_for_ptr(raw_ptr as usize);
             let referent = unsafe {
-                majit_metainterp::virtualref::vref_forced(raw_ptr as *const u8)
+                majit_metainterp::virtualref::vref_forced(raw_ptr as majit_gc::header::GCREF)
                     as *mut pyre_interpreter::PyFrame
             };
             let virtual_op = live_pair.map(|pair| pair.0).unwrap_or_else(|| {

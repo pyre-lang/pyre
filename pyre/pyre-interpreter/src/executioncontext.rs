@@ -295,8 +295,11 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
 /// read as a callee escape.
 #[inline]
 pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
-    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
-        unsafe { majit_metainterp::virtualref::vref_forced(ptr as *const u8) as *mut PyFrame }
+    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as majit_gc::header::GCREF) } {
+        unsafe {
+            majit_metainterp::virtualref::vref_forced(ptr as majit_gc::header::GCREF)
+                as *mut PyFrame
+        }
     } else {
         ptr
     }
@@ -359,7 +362,7 @@ impl PinnedResult {
 #[inline]
 #[majit_macros::dont_look_inside]
 pub fn force_vref(ptr: *mut PyFrame) -> *mut PyFrame {
-    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as *const u8) } {
+    if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(ptr as majit_gc::header::GCREF) } {
         // Only the tracer stores a `JitVirtualRef` here, and it registers the
         // hook when the driver comes up, so an unset hook means the slot was
         // misidentified.  Returning `ptr` would hand a vref out as a frame.
@@ -3842,9 +3845,12 @@ mod tests {
         assert!(SEEN_VREF.load(Ordering::SeqCst).is_null());
 
         let info = VirtualRefInfo::new();
-        let vref = info.virtual_ref_during_tracing(0x1000 as *mut u8) as *mut PyFrame;
+        let vref =
+            info.virtual_ref_during_tracing(0x1000 as majit_gc::header::GCREF) as *mut PyFrame;
         assert!(
-            unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(vref as *const u8) },
+            unsafe {
+                majit_metainterp::virtualref::ptr_is_virtual_ref(vref as majit_gc::header::GCREF)
+            },
             "virtual_ref_during_tracing must produce a JitVirtualRef"
         );
         register_force_vref_hook(record_vref);

@@ -1872,7 +1872,10 @@ pub(crate) fn reconnect_virtualrefs(
         live_boxes.push((virt_op, virt_ptr));
         live_boxes.push((vref_op, vref_ptr));
         unsafe {
-            vrefinfo.continue_tracing(vref_ptr as *mut u8, virt_ptr as *mut u8);
+            vrefinfo.continue_tracing(
+                vref_ptr as majit_gc::header::GCREF,
+                virt_ptr as majit_gc::header::GCREF,
+            );
         }
     }
     ctx.restore_virtualref_boxes(live_boxes);

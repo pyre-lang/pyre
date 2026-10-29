@@ -212,16 +212,17 @@ pub fn w_pytraceback_new(
     let Some(tb_slot) = tb_slot else {
         return pyre_object::lltype::malloc_typed(value) as PyObjectRef;
     };
-    let raw = pyre_object::gc_roots::shadow_stack_get(tb_slot) as *mut u8;
+    let raw = pyre_object::gc_roots::shadow_stack_get(tb_slot) as *mut PyTraceback;
     unsafe {
-        std::ptr::write(raw as *mut PyTraceback, value);
+        std::ptr::write(raw, value);
     }
     // The node may point at a still-young `w_next` / `w_code` (and, once
     // GC-owned, the frame); remember it if this alloc spilled old.
     if needs_write_barrier {
         pyre_object::gc_hook::try_gc_write_barrier(raw as pyre_object::gc_hook::GCREF);
     }
-    raw as PyObjectRef
+    // `try_gc_write_barrier` is a `gc_op`; the slot is the live copy.
+    pyre_object::gc_roots::shadow_stack_get(tb_slot)
 }
 
 /// # Safety

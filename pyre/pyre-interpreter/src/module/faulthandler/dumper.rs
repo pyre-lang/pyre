@@ -181,7 +181,9 @@ pub unsafe extern "C" fn _dump_callback(fd: INT, ec: *const pyre_interpreter::Py
         if depth >= MAX_FRAME_DEPTH {
             break;
         }
-        if unsafe { majit_metainterp::virtualref::ptr_is_virtual_ref(frame as *const u8) } {
+        if unsafe {
+            majit_metainterp::virtualref::ptr_is_virtual_ref(frame as majit_gc::header::GCREF)
+        } {
             pypy_faulthandler_write(fd, b"  <invalid frame>\n");
             break;
         }

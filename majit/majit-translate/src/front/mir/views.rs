@@ -129,13 +129,105 @@ impl<'a> Lowering<'a> {
         local: usize,
         ptr: Variable,
         len: Variable,
+        owner: Option<Variable>,
     ) {
         let len_slot = self.len_shadow[local].expect("pair slice local has a length slot");
-        self.local_var[local] = Some(LocalValue::Pair(ptr, len.clone()));
+        self.local_var[local] = Some(LocalValue::Pair(ptr, len.clone(), owner.clone()));
         self.local_var[len_slot] = Some(LocalValue::One(len));
+        if let Some(owner_slot) = self.owner_shadow.get(local).copied().flatten() {
+            self.local_var[owner_slot] = owner.map(LocalValue::One);
+        }
         self.positional_aggregate_locals.remove(&local);
         self.string_byte_view_locals.retain(|&l| l != local);
         self.list_view_locals.retain(|&l| l != local);
+    }
+
+    /// GC owner of a pair window whose data word is `ptr`, if this frame
+    /// still holds one (`rffi.get_raw_address_of_string` / list header).
+    pub(in crate::front::mir) fn pair_owner_of_ptr(&self, ptr: &Variable) -> Option<Variable> {
+        self.local_var.iter().find_map(|slot| match slot.as_ref() {
+            Some(LocalValue::Pair(data, _, owner)) if data == ptr => owner.clone(),
+            _ => None,
+        })
+    }
+
+    pub(in crate::front::mir) fn bind_window_owner_shadow(
+        &mut self,
+        local: usize,
+        owner: Option<Variable>,
+    ) {
+        if let Some(LocalValue::Pair(_, _, slot)) =
+            self.local_var.get_mut(local).and_then(Option::as_mut)
+        {
+            *slot = owner.clone();
+        }
+        if let Some(owner_slot) = self.owner_shadow.get(local).copied().flatten() {
+            self.local_var[owner_slot] = owner.map(LocalValue::One);
+        }
+    }
+
+    /// GC owner of a pair window local `local`, if any.
+    /// A one-word STR/list view is the header itself (`ll_stritem_nonneg`)
+    /// and has no owner (`keepalive_until_here` protects a raw `char *`).
+    pub(in crate::front::mir) fn window_owner_of_local(&self, local: usize) -> Option<Variable> {
+        match self.local_var.get(local).and_then(|slot| slot.as_ref()) {
+            Some(LocalValue::Pair(_, _, Some(owner))) => Some(owner.clone()),
+            _ => self
+                .owner_shadow
+                .get(local)
+                .copied()
+                .flatten()
+                .and_then(|slot| {
+                    self.local_var
+                        .get(slot)
+                        .and_then(|entry| entry.as_ref())
+                        .and_then(|value| value.one().ok())
+                }),
+        }
+    }
+
+    /// Owner of a window source word: the Pair's third field, a STR/list
+    /// header, or the owner_shadow of the local that holds `source`.
+    pub(in crate::front::mir) fn owner_for_window_source(
+        &self,
+        source: &Variable,
+    ) -> Option<Variable> {
+        if let Some(owner) = self.pair_owner_of_ptr(source) {
+            return Some(owner);
+        }
+        for (i, slot) in self.local_var.iter().enumerate() {
+            if let Some(LocalValue::One(v)) = slot.as_ref()
+                && v == source
+                && let Some(owner) = self.window_owner_of_local(i)
+            {
+                return Some(owner);
+            }
+        }
+        if self.var_is_str_repr(source) || self.list_view_local_of_var(source).is_some() {
+            Some(source.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Stamp `owner` onto every pair window whose data word is `source`.
+    pub(in crate::front::mir) fn capture_window_owner_of_var(
+        &mut self,
+        source: &Variable,
+        owner: Option<Variable>,
+    ) {
+        let locals: Vec<usize> = self
+            .local_var
+            .iter()
+            .enumerate()
+            .filter_map(|(i, slot)| match slot.as_ref() {
+                Some(LocalValue::Pair(data, _, _)) if data == source => Some(i),
+                _ => None,
+            })
+            .collect();
+        for local in locals {
+            self.bind_window_owner_shadow(local, owner.clone());
+        }
     }
 
     /// One-word `Ptr(STR)` view (`space.bytes_w`). No window, no
@@ -165,9 +257,9 @@ impl<'a> Lowering<'a> {
                 .get(dest_local)
                 .is_some_and(|loc| tyref_is_u8_window(&loc.ty, self.llbc));
         if window_dest {
-            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header);
             let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-            self.bind_pair_local(dest_local, ptr, len);
+            self.bind_pair_local(dest_local, ptr, len, Some(owner));
         } else {
             self.bind_str_view_local(dest_local, header);
         }
@@ -264,9 +356,10 @@ impl<'a> Lowering<'a> {
             self.bind_str_source_to_dest(mir_bb, dest, var);
             return Ok(());
         }
+        let owner = self.owner_for_window_source(&var);
         let (ptr, len) = self.owner_to_window(mir_bb, var, src_ty)?;
         let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-        self.bind_pair_local(dest, ptr, len);
+        self.bind_pair_local(dest, ptr, len, owner);
         Ok(())
     }
 
@@ -1489,9 +1582,9 @@ impl<'a> Lowering<'a> {
                     )));
                 }
             };
-            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header);
             let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-            self.bind_pair_local(dest, ptr, len);
+            self.bind_pair_local(dest, ptr, len, Some(owner));
             return Ok(());
         }
         // A reference to a pair slice aliases the pair it borrows.
@@ -1554,7 +1647,23 @@ impl<'a> Lowering<'a> {
         } else {
             ptr
         };
-        self.bind_pair_local(dest, ptr, len);
+        let owner = self
+            .owner_for_window_source(&ptr)
+            .or_else(|| match &rvalue {
+                Rvalue::Use(op, _) | Rvalue::Cast(_, op, _) => {
+                    operand_local(Some(op)).and_then(|l| self.window_owner_of_local(l))
+                }
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+                    PlaceKind::Local(l) => self.window_owner_of_local(*l as usize),
+                    PlaceKind::Projection(inner, _) => match &inner.kind {
+                        PlaceKind::Local(l) => self.window_owner_of_local(*l as usize),
+                        _ => None,
+                    },
+                    _ => None,
+                },
+                _ => None,
+            });
+        self.bind_pair_local(dest, ptr, len, owner);
         Ok(())
     }
 
@@ -2249,7 +2358,10 @@ impl<'a> Lowering<'a> {
                     arg_is_range_full,
                 )?;
                 let ptr = self.ensure_window_ccharp(mir_bb, ptr);
-                self.bind_pair_local(dest_local, ptr, len);
+                let owner = self
+                    .owner_for_window_source(&ptr)
+                    .or_else(|| args.first().and_then(|v| self.owner_for_window_source(v)));
+                self.bind_pair_local(dest_local, ptr, len, owner);
             }
         } else if self.len_shadow[dest_local].is_some() {
             // `<[T; N]>::index(&a, range)` over a raw-buffer array.
@@ -2260,6 +2372,7 @@ impl<'a> Lowering<'a> {
                 ) if args.len() == 2 => self.raw_array_unsize_source(mir_bb, place),
                 _ => None,
             };
+            let src_owner = args.first().and_then(|v| self.owner_for_window_source(v));
             let (ptr, len) = match (name.as_str(), vec_kind) {
                 _ if let Some((ptr, len, kind)) = array_receiver => {
                     self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full, true)?
@@ -2477,7 +2590,8 @@ impl<'a> Lowering<'a> {
                     (ptr, len)
                 }
             };
-            self.bind_pair_local(dest_local, ptr, len);
+            let owner = self.owner_for_window_source(&ptr).or(src_owner);
+            self.bind_pair_local(dest_local, ptr, len, owner);
         } else {
             let Some((0, len)) = pair_lens.first().cloned() else {
                 return Err(LowerError::Schema(format!(
@@ -2577,7 +2691,9 @@ impl<'a> Lowering<'a> {
                     )
                 }
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
-                    args[0].clone()
+                    let data = args[0].clone();
+                    self.stamp_pair_window_as_ptr_ccharp(&dest_ty, &data);
+                    data
                 }
                 "core::slice::index::<Impl>::index"
                 | "core::slice::index::<Impl>::index_mut"
@@ -2916,9 +3032,12 @@ impl<'a> Lowering<'a> {
         }
         let zero = self.emit_const_uint(mir_bb, 0);
         let is_some = self.emit_uint_binop(mir_bb, "ne", opt_ptr.clone(), zero);
+        let owner = self
+            .owner_for_window_source(&opt_ptr)
+            .or_else(|| self.owner_for_window_source(&def_ptr));
         let ptr = self.emit_uint_select(mir_bb, is_some.clone(), opt_ptr, def_ptr);
         let len = self.emit_uint_select(mir_bb, is_some, opt_len, def_len);
-        self.bind_pair_local(dest_local, ptr, len);
+        self.bind_pair_local(dest_local, ptr, len, owner);
         let bb_id = self.emit_bb(mir_bb);
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -5186,6 +5305,25 @@ pub(in crate::front::mir) fn pair_len_shadows_of(
                 return None;
             }
             PAIR_SLICE_ITEM_KINDS.contains(&kind).then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
+/// Extra SSA slot for a pair window's GC owner. Same locals as
+/// `pair_len_shadows_of` (a length shadow): a one-word STR/list view is
+/// the header itself (`ll_stritem_nonneg`) and needs no owner.
+pub(in crate::front::mir) fn pair_owner_shadows_of(
+    len_shadow: &[Option<usize>],
+    start_slot: usize,
+) -> Vec<Option<usize>> {
+    let mut next = start_slot;
+    len_shadow
+        .iter()
+        .map(|len| {
+            len.is_some().then(|| {
                 next += 1;
                 next - 1
             })

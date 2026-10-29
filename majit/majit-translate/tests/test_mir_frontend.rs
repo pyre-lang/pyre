@@ -107,13 +107,14 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
                 // pair (`simple_call(const(exc_class))` + `type(evalue)`)
                 // into its block; exclude those raise-machinery ops so
                 // the count characterizes the body's own calls.
+                // `keepalive_until_here` is `objectmodel.keepalive_until_here`.
                 OpKind::Call {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if matches!(
                     segments.first().map(String::as_str),
                     Some("simple_call" | "type")
-                ) => {}
+                ) || segments.iter().any(|s| s == "keepalive_until_here") => {}
                 OpKind::Call { .. } => call_count += 1,
                 OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
                     discr_count += 1

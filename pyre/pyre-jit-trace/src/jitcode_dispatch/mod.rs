@@ -2727,9 +2727,12 @@ impl<Sym: WalkSym> WalkContext<'_, '_, Sym> {
             let raw = unsafe { (*(inline as *const pyre_interpreter::PyFrame)).f_backref };
             if !raw.is_null() {
                 let caller = if unsafe {
-                    majit_metainterp::virtualref::ptr_is_virtual_ref(raw as *const u8)
+                    majit_metainterp::virtualref::ptr_is_virtual_ref(raw as majit_gc::header::GCREF)
                 } {
-                    unsafe { majit_metainterp::virtualref::vref_forced(raw as *const u8) as usize }
+                    unsafe {
+                        majit_metainterp::virtualref::vref_forced(raw as majit_gc::header::GCREF)
+                            as usize
+                    }
                 } else {
                     raw as usize
                 };

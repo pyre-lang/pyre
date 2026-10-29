@@ -609,7 +609,7 @@ mod tests {
             .unwrap();
         let tag = graph.push_op_var(entry, OpKind::ConstInt(7), true).unwrap();
         FunctionGraph::set_concretetype_of_inline(&tag, crate::model::ConcreteType::Signed);
-        graph.push_op_var(entry, OpKind::Live, false);
+        graph.push_op_var(entry, OpKind::live(), false);
         graph.push_op_var(
             entry,
             OpKind::JitMergePoint {

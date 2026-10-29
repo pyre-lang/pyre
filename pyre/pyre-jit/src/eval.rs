@@ -6292,7 +6292,7 @@ unsafe extern "C" fn force_pyframe_vref(
         eprintln!("[jit][force-hook] vref-entry vref={vref:p}");
     }
     let forced = unsafe {
-        vrefinfo.force_virtual(vref as *mut u8, |v| {
+        vrefinfo.force_virtual(vref as majit_gc::header::GCREF, |v| {
             // `compile.py force_now(cpu, token)` — force the JIT frame
             // the vref names, then run the guard's async forcing, which is
             // what writes `virtual_token = TOKEN_NONE` and `forced` back.

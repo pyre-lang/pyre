@@ -11,8 +11,8 @@ use super::{
 use crate::flowspace::model::Variable;
 
 use crate::model::{
-    CallTarget, FieldDescriptor, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType,
-    VecFieldPart,
+    CallTarget, FieldDescriptor, FrameState, FunctionGraph, LinkArg, OpKind, SpaceOperation,
+    ValueType, VecFieldPart,
 };
 
 use majit_charon_reader::{Llbc, ullbc::TyRef};
@@ -1875,6 +1875,8 @@ fn declined_disc_combinator_leaves_disconnected_blocks_that_cleanup_removes() {
         payload1_ty: ValueType::Int,
         payload0_class: None,
         payload1_class: None,
+        payload0_is_raw_u8: false,
+        payload1_is_raw_u8: false,
         result_owner: "core::result::Result".into(),
         result_tag0_owner: "core::result::Result::Ok".into(),
         result_tag1_owner: "core::result::Result::Err".into(),
@@ -10271,4 +10273,70 @@ fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
 
 fn interior_bool() -> serde_json::Value {
     serde_json::json!({"Scalar": "Bool"})
+}
+
+/// A merge phi inherits `concretetype` only when both predecessors agree
+/// (`unionof` of equal lowleveltypes).
+#[test]
+fn merge_phi_concretetype_requires_predecessor_agreement() {
+    let mut graph = FunctionGraph::new("merge_phi_ct_disagree");
+    let v_ccharp = Variable::new();
+    super::stamp_as_ccharp(&v_ccharp);
+    let v_plain = Variable::new();
+    let prev = FrameState {
+        entries: vec![Some(v_ccharp.clone())],
+        ..Default::default()
+    };
+    let ex = FrameState {
+        entries: vec![Some(v_plain.clone())],
+        ..Default::default()
+    };
+    let merged = prev
+        .union(&ex, &mut graph)
+        .expect("disagreeing-Variable union must succeed");
+    super::copy_agreed_concretetypes(&prev, &ex, &merged);
+    let phi = merged.entries[0]
+        .as_ref()
+        .expect("disagreement mints a fresh phi");
+    assert!(
+        phi.id() != v_ccharp.id() && phi.id() != v_plain.id(),
+        "fresh phi is distinct from both predecessors"
+    );
+    assert!(
+        phi.concretetype().is_none(),
+        "disagreeing concretetypes leave the merge phi unset; ct={:?}",
+        phi.concretetype()
+    );
+
+    let mut graph = FunctionGraph::new("merge_phi_ct_agree");
+    let v_a = Variable::new();
+    super::stamp_as_ccharp(&v_a);
+    let v_b = Variable::new();
+    super::stamp_as_ccharp(&v_b);
+    let prev = FrameState {
+        entries: vec![Some(v_a.clone())],
+        ..Default::default()
+    };
+    let ex = FrameState {
+        entries: vec![Some(v_b.clone())],
+        ..Default::default()
+    };
+    let merged = prev
+        .union(&ex, &mut graph)
+        .expect("disagreeing-Variable union must succeed");
+    super::copy_agreed_concretetypes(&prev, &ex, &merged);
+    let phi = merged.entries[0]
+        .as_ref()
+        .expect("disagreement mints a fresh phi");
+    assert!(
+        phi.id() != v_a.id() && phi.id() != v_b.id(),
+        "fresh phi is distinct from both predecessors"
+    );
+    assert!(
+        phi.concretetype()
+            .as_ref()
+            .is_some_and(super::lltype_is_ccharp),
+        "agreeing CCHARP stamps the merge phi; ct={:?}",
+        phi.concretetype()
+    );
 }

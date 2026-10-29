@@ -14644,7 +14644,7 @@ fn op_can_raise(op: &OpKind, cc: &CallControl) -> RaiseClass {
         // that the metainterp converts into a guard; cannot raise.
         | OpKind::RecordQuasiImmutField { .. }
         | OpKind::JitForceQuasiImmutable { .. }
-        | OpKind::Live
+        | OpKind::Live { .. }
         // jtransform.py:1707 `jit_merge_point` / :1718 `loop_header` — pure
         // markers consumed by the metainterp; cannot raise.
         | OpKind::JitMergePoint { .. }
@@ -16086,10 +16086,17 @@ fn effect_transduce_op(
         "keepalive" => {
             // `jtransform.py rewrite_op_keepalive` renames to `-live-`.
             // `lloperation.py`: `LLOp()` so `canraise=()`.
-            for arg in &op.args {
-                let _ = effect_materialize(out, block, arg);
-            }
-            out.push_op_var(block, OpKind::Live, false);
+            let forced: Vec<_> = op
+                .args
+                .iter()
+                .map(|arg| effect_materialize(out, block, arg))
+                .collect();
+            out.block_mut(block)
+                .operations
+                .push(crate::model::SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live { forced },
+                });
         }
         other => panic!("effect_graph_from_rtyped_helper: unsupported opname {other:?}"),
     }
@@ -28912,7 +28919,7 @@ mod tests {
         assert!(
             converted
                 .iter_block_ops()
-                .any(|(_, op)| matches!(op.kind, OpKind::Live)),
+                .any(|(_, op)| matches!(op.kind, OpKind::Live { .. })),
             "keepalive: {:?}",
             converted
                 .iter_block_ops()

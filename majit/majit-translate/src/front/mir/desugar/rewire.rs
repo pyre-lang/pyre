@@ -176,6 +176,8 @@ pub(in crate::front::mir) struct DiscCombinatorSite {
     pub(in crate::front::mir) payload1_ty: ValueType,
     pub(in crate::front::mir) payload0_class: Option<String>,
     pub(in crate::front::mir) payload1_class: Option<String>,
+    pub(in crate::front::mir) payload0_is_raw_u8: bool,
+    pub(in crate::front::mir) payload1_is_raw_u8: bool,
     pub(in crate::front::mir) result_owner: String,
     pub(in crate::front::mir) result_tag0_owner: String,
     pub(in crate::front::mir) result_tag1_owner: String,
@@ -226,6 +228,8 @@ pub(in crate::front::mir) struct ResultTrySite {
     pub(in crate::front::mir) err_owner: String,
     pub(in crate::front::mir) ok_ty: ValueType,
     pub(in crate::front::mir) err_ty: ValueType,
+    pub(in crate::front::mir) ok_is_raw_u8: bool,
+    pub(in crate::front::mir) err_is_raw_u8: bool,
     pub(in crate::front::mir) err_class: Option<String>,
     pub(in crate::front::mir) recv_err_ast: String,
 }
@@ -301,6 +305,8 @@ pub(in crate::front::mir) struct AggregateField {
     /// Shared `&[u8]` field: store `{data, len}` via `FatData`/`FatLen`,
     /// not `pair_len_field_name`.
     pub(in crate::front::mir) window: bool,
+    /// Declared field type is `*mut u8` / `*const u8` (`rffi.py` `CCHARP`).
+    pub(in crate::front::mir) raw_u8: bool,
 }
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
@@ -312,7 +318,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
     ctor: &AggregateCtor,
     args: &[Variable],
     pair_lens: &[Option<Variable>],
-) -> Variable {
+) -> Result<Variable, LowerError> {
     if pair_lens.iter().all(Option::is_none) {
         return emit_aggregate_ctor(graph, block, ctor, args);
     }
@@ -384,18 +390,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             }
             continue;
         }
-        let value = match &field.narrow_root {
-            Some(root) => {
-                let narrowed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                graph.block_mut(block).operations.push(SpaceOperation {
-                    result: Some(narrowed.clone()),
-                    kind: crate::model::cast_instance_call(root, value.clone()),
-                });
-                narrowed
-            }
-            None => value.clone(),
-        };
-        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
+        let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -419,7 +414,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor_with_pairs(
             },
         });
     }
-    res
+    Ok(res)
 }
 
 pub(in crate::front::mir) fn emit_aggregate_ctor(
@@ -427,7 +422,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
     block: BlockId,
     ctor: &AggregateCtor,
     args: &[Variable],
-) -> Variable {
+) -> Result<Variable, LowerError> {
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     graph.block_mut(block).operations.push(SpaceOperation {
         result: Some(res.clone()),
@@ -441,18 +436,7 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
         if field.void {
             continue;
         }
-        let value = match &field.narrow_root {
-            Some(root) => {
-                let narrowed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                graph.block_mut(block).operations.push(SpaceOperation {
-                    result: Some(narrowed.clone()),
-                    kind: crate::model::cast_instance_call(root, value.clone()),
-                });
-                narrowed
-            }
-            None => value.clone(),
-        };
-        let ty = positional_ctor_field_value_type(&ctor.result_owner, &field.name);
+        let (value, ty) = ctor_ccharp_field_store(graph, block, ctor, field, value)?;
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -476,7 +460,73 @@ pub(in crate::front::mir) fn emit_aggregate_ctor(
             },
         });
     }
-    res
+    Ok(res)
+}
+
+/// Store a CCHARP operand as the int-banked field (`rffi.py` `CCHARP`).
+/// `rptr.py` `PtrRepr.rtype_setattr` / `rtuple.py` `newtuple` take the
+/// operand with `hop.inputarg` (converted to the field repr); a missing
+/// conversion is a `TyperError`. CCHARP paints Unsigned only for a raw `*u8`
+/// field. A `cast_instance` Ref retype would union `SomePtr` with
+/// `SomeInstance`.
+fn ctor_ccharp_field_store(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    ctor: &AggregateCtor,
+    field: &AggregateField,
+    value: &Variable,
+) -> Result<(Variable, ValueType), LowerError> {
+    if ctor_field_is_raw_u8(ctor, field) {
+        if value.concretetype().as_ref().is_some_and(lltype_is_ccharp) {
+            return Ok((value.clone(), ValueType::Unsigned));
+        }
+        if ctor_operand_is_int_or_untyped(value) {
+            stamp_as_ccharp(value);
+            return Ok((value.clone(), ValueType::Unsigned));
+        }
+        return Err(LowerError::Unsupported(format!(
+            "raw *u8 field {}.{} store of {:?} (PtrRepr.rtype_setattr / newtuple hop.inputarg)",
+            ctor.result_owner,
+            field.name,
+            value.concretetype(),
+        )));
+    }
+    let stored = match &field.narrow_root {
+        Some(root) => {
+            let narrowed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(block).operations.push(SpaceOperation {
+                result: Some(narrowed.clone()),
+                kind: crate::model::cast_instance_call(root, value.clone()),
+            });
+            narrowed
+        }
+        None => value.clone(),
+    };
+    Ok((
+        stored,
+        positional_ctor_field_value_type(&ctor.result_owner, &field.name),
+    ))
+}
+
+/// Untyped (`concretetype` missing) or int-kind (`history.py` `getkind` int).
+fn ctor_operand_is_int_or_untyped(value: &Variable) -> bool {
+    let Some(ct) = value.concretetype() else {
+        return true;
+    };
+    crate::model::try_getkind(&ct, true, true, true)
+        .is_ok_and(|kind| matches!(kind, crate::model::ConcreteType::Signed))
+}
+
+/// Tuple intern spelling `*mut u8` / `*const u8`, or a struct field whose
+/// declared type is that raw byte pointer.
+fn ctor_field_is_raw_u8(ctor: &AggregateCtor, field: &AggregateField) -> bool {
+    if field.raw_u8 {
+        return true;
+    }
+    positional_shape_metadata(&ctor.result_owner).is_some_and(|(rows, _)| {
+        rows.iter()
+            .any(|row| row.name == field.name && (row.ty == "*mut u8" || row.ty == "*const u8"))
+    })
 }
 
 /// `TupleRepr` field bank of a positional ctor write (`rtuple.py`).
@@ -523,7 +573,7 @@ pub(crate) fn emit_aggregate_value(
             .cloned()
             .ok_or_else(|| format!("constructor call has no operand {index}")),
         AggregateShape::Ctor(ctor) if ctor.fields.len() == args.len() => {
-            Ok(emit_aggregate_ctor(graph, block, ctor, args))
+            emit_aggregate_ctor(graph, block, ctor, args).map_err(|e| e.to_string())
         }
         other => Err(format!("constructor call cannot build {other:?}")),
     }
@@ -1116,6 +1166,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 recv,
                 &site.recv_tag0_owner,
                 site.payload0_ty.clone(),
+                site.payload0_is_raw_u8,
             );
             let mapped = emit_disc_callable(
                 graph,
@@ -1155,6 +1206,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 recv,
                 &site.recv_tag1_owner,
                 site.payload1_ty.clone(),
+                site.payload1_is_raw_u8,
             );
             let payload = emit_narrow(graph, block, payload, &site.payload1_class);
             Ok(emit_sum_variant(
@@ -1182,6 +1234,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                     recv,
                     &site.recv_tag0_owner,
                     site.payload0_ty.clone(),
+                    site.payload0_is_raw_u8,
                 ))
             }
         }
@@ -1195,6 +1248,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 recv,
                 &site.recv_tag1_owner,
                 site.payload1_ty.clone(),
+                site.payload1_is_raw_u8,
             );
             emit_disc_callable(
                 graph,
@@ -1217,6 +1271,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 recv,
                 &site.recv_tag0_owner,
                 site.payload0_ty.clone(),
+                site.payload0_is_raw_u8,
             );
             let payload = emit_narrow(graph, block, payload, &site.payload0_class);
             Ok(emit_option_variant(
@@ -1247,6 +1302,7 @@ pub(in crate::front::mir) fn build_disc_arm(
                 recv,
                 &site.recv_tag1_owner,
                 site.payload1_ty.clone(),
+                site.payload1_is_raw_u8,
             );
             let payload = emit_narrow(graph, block, payload, &site.payload1_class);
             Ok(emit_option_variant(
@@ -1392,6 +1448,7 @@ pub(in crate::front::mir) fn rewire_result_map_last_exception(
         recv_ok,
         &site.recv_tag0_owner,
         site.payload0_ty.clone(),
+        site.payload0_is_raw_u8,
     );
     let env = disc_callable_env(site, &ok_sources, &ok_inputs, extra.as_ref(), &name)?;
     arm.close_with_callable(graph, site, ok_bb, env, payload, &|v| {
@@ -1407,6 +1464,7 @@ pub(in crate::front::mir) fn rewire_result_map_last_exception(
         recv_err,
         &site.recv_tag1_owner,
         site.payload1_ty.clone(),
+        site.payload1_is_raw_u8,
     );
     crate::front::result_map_err::raise_carrier_on_exception_edge(
         graph,
@@ -1822,6 +1880,7 @@ pub(in crate::front::mir) fn option_recv_payload(
             recv,
             &site.recv_tag1_owner,
             site.payload1_ty.clone(),
+            site.payload1_is_raw_u8,
         )
     }
 }
@@ -1934,6 +1993,7 @@ pub(in crate::front::mir) fn emit_payload_read(
     recv: Variable,
     owner: &str,
     ty: ValueType,
+    field_is_raw_u8: bool,
 ) -> Variable {
     let payload = graph.alloc_value_var();
     graph.block_mut(block).operations.push(SpaceOperation {
@@ -1952,10 +2012,13 @@ pub(in crate::front::mir) fn emit_payload_read(
                 host_index: None,
                 scalar_word: None,
             },
-            ty,
+            ty: ty.clone(),
             pure: true,
         },
     });
+    if field_is_raw_u8 {
+        stamp_as_ccharp(&payload);
+    }
     payload
 }
 
@@ -2121,6 +2184,7 @@ pub(in crate::front::mir) fn push_enum_field_read(
     owner: &str,
     field: &str,
     ty: ValueType,
+    field_is_raw_u8: bool,
 ) -> Variable {
     let read = graph.alloc_value_var();
     graph.block_mut(block).operations.push(SpaceOperation {
@@ -2139,10 +2203,13 @@ pub(in crate::front::mir) fn push_enum_field_read(
                 host_index: None,
                 scalar_word: None,
             },
-            ty,
+            ty: ty.clone(),
             pure: true,
         },
     });
+    if field_is_raw_u8 {
+        stamp_as_ccharp(&read);
+    }
     read
 }
 
@@ -2282,6 +2349,7 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
         result_owner,
         "__discriminant",
         ValueType::Int,
+        false,
     );
 
     let mut arm_ids = Vec::new();
@@ -2307,6 +2375,7 @@ pub(in crate::front::mir) fn lower_result_branch_as_match(
                     &format!("{result_owner}::{result_variant}"),
                     "__pos_0",
                     read_ty.clone(),
+                    false,
                 );
                 // Kinds differ: `Break` holds `Result<Infallible, E>`, so
                 // store `Err(e)` rather than the bare `E`.
@@ -2528,8 +2597,14 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
     if let Some(continue_link) = &continue_link {
         let res_in_ok = map_source(&ok_sources, &ok_inputs, &res_a)
             .ok_or_else(|| format!("{name}: Result value not threaded into Ok arm"))?;
-        let payload =
-            emit_payload_read(graph, ok_bb, res_in_ok, &site.ok_owner, site.ok_ty.clone());
+        let payload = emit_payload_read(
+            graph,
+            ok_bb,
+            res_in_ok,
+            &site.ok_owner,
+            site.ok_ty.clone(),
+            site.ok_is_raw_u8,
+        );
         let ok_link_args = continue_specs
             .iter()
             .map(|spec| match spec {
@@ -2558,6 +2633,7 @@ pub(in crate::front::mir) fn rewire_one_result_try_site(
         res_in_err,
         &site.err_owner,
         site.err_ty.clone(),
+        site.err_is_raw_u8,
     );
     let err_payload = emit_narrow(graph, err_bb, err_payload, &site.err_class);
     let err_shell = emit_sum_variant(

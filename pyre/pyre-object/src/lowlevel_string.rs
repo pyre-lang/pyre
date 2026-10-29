@@ -231,7 +231,12 @@ pub fn bh_free_lowlevel_string(string: i64, base_size: usize, item_size: usize) 
     let Some(payload_size) = base_size.checked_add(items_size) else {
         return;
     };
-    unsafe { majit_gc::header::dealloc_varsize_with_gc_header(string as *mut u8, payload_size) };
+    unsafe {
+        majit_gc::header::dealloc_varsize_with_gc_header(
+            string as majit_gc::header::GCREF,
+            payload_size,
+        )
+    };
 }
 
 /// STR / UNICODE width `(base_size, item_size)` of the low-level string at

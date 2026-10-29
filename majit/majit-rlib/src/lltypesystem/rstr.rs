@@ -83,7 +83,12 @@ pub(crate) fn alloc_immortal_str(bytes: &[u8]) -> majit_ir::GcRef {
 #[cfg(test)]
 pub(crate) unsafe fn free_immortal_str(llobj: majit_ir::GcRef, nbytes: usize) {
     let payload = STR_CHARS_OFFSET + nbytes + 1;
-    unsafe { majit_gc::header::dealloc_varsize_with_gc_header(llobj.0 as *mut u8, payload) };
+    unsafe {
+        majit_gc::header::dealloc_varsize_with_gc_header(
+            llobj.0 as majit_gc::header::GCREF,
+            payload,
+        )
+    };
 }
 
 /// `rstr.py` `mallocstr` for the host-side `dont_look_inside` rffi helpers.

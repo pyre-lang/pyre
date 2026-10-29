@@ -569,6 +569,13 @@ pub(in crate::front::mir) fn stamp_as_ccharp(var: &Variable) {
     )));
 }
 
+/// `Variable.copy` (`flowspace/model.py`) keeps `concretetype`.
+pub(in crate::front::mir) fn copy_concretetype(from: &Variable, to: &Variable) {
+    if let Some(ct) = from.concretetype() {
+        to.set_concretetype(Some(ct));
+    }
+}
+
 /// `rutf8.unichr_as_utf8(code, allow_surrogates=True)` for a Unicode
 /// scalar constant.  Surrogates are left to the runtime helper (Rust
 /// `String` cannot hold them).

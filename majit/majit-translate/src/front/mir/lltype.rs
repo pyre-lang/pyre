@@ -2810,8 +2810,9 @@ pub(in crate::front::mir) fn tyref_deref_value_type_with(
     )
 }
 
-/// The `'int'` bank of a raw owner's address field: `history.py`
-/// `getkind` of a raw `Ptr` is `'int'`. Shared by the field read, the
+/// The register bank of a raw address field. A raw `*u8` is CCHARP in
+/// any owner (`rffi.py` `CCHARP`); a raw owner's `*mut i8` is `'int'`
+/// (`history.py` `getkind` of a raw `Ptr`). Shared by the field read, the
 /// field write and a cast of the read value, so all three agree.
 pub(in crate::front::mir) fn raw_field_address_value_type(
     place_ty: &TyRef,
@@ -2819,6 +2820,13 @@ pub(in crate::front::mir) fn raw_field_address_value_type(
     owner_declared_gc: Option<bool>,
     llbc: &Llbc,
 ) -> Option<ValueType> {
+    // `rffi.py` `CCHARP`: a raw `*u8` field is CCHARP in any owner,
+    // Int-banked so overlay Signed keeps the stamp.
+    if let Some(ccharp) =
+        raw_u8_ccharp_bank(place_ty, llbc).or_else(|| raw_u8_ccharp_bank(field_ty, llbc))
+    {
+        return Some(ccharp);
+    }
     // `history.py` `getkind` of a raw `Ptr` to a non-byte primitive is
     // `'int'`. Kept out of [`tyref_to_value_type_with`]: an items-base
     // adapter spells the same `*mut i64` and must stay the GC header
@@ -2829,8 +2837,8 @@ pub(in crate::front::mir) fn raw_field_address_value_type(
         return Some(raw);
     }
     // Same raw-owner gate as [`fat_part_value_type`] / `field_spelling_lltype`.
-    // `tyref_scalar_pointee_value_type` leaves a raw `*mut u8`/`*mut i8` as
-    // the erased GCREF spelling; only a raw owner banks that word as `'int'`.
+    // `tyref_scalar_pointee_value_type` leaves a raw `*mut i8` as the
+    // erased GCREF spelling; only a raw owner banks that word as `'int'`.
     if owner_declared_gc == Some(false)
         && (tyref_is_raw_byte_ptr(place_ty, llbc) || tyref_is_raw_byte_ptr(field_ty, llbc))
     {
@@ -2852,11 +2860,11 @@ pub(in crate::front::mir) fn raw_field_address_value_type(
 /// as `int_add/ri>i`.  An ordinary struct's `&P` field is a pointer the
 /// program stores and compares, so it keeps the Ref bank.
 ///
-/// A raw owner's (`owner_declared_gc == Some(false)`) raw `*mut u8` /
-/// `*mut i8` field is an address: `history.py` `getkind` of a raw `Ptr`
-/// is `'int'`. [`fat_part_value_type`] (`FatData` of a raw owner) and
-/// `field_spelling_lltype` (`parent_gckind == Raw` → `Address`) apply
-/// the same gate. A GC owner's `*mut u8` stays `Ref`.
+/// A raw `*u8` field is CCHARP in any owner; a raw owner's
+/// (`owner_declared_gc == Some(false)`) `*mut i8` field is an address:
+/// `history.py` `getkind` of a raw `Ptr` is `'int'`. [`fat_part_value_type`]
+/// (`FatData` of a raw owner) and `field_spelling_lltype`
+/// (`parent_gckind == Raw` → `Address`) apply the same gate.
 pub(in crate::front::mir) fn adt_field_read_value_type(
     place_ty: &TyRef,
     field_ty: &TyRef,
@@ -2930,6 +2938,13 @@ pub(in crate::front::mir) fn tuple_element_field_value_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
+    if let Some(ccharp) = raw_u8_ccharp_bank(place_ty, llbc).or_else(|| {
+        element_ty
+            .as_ref()
+            .and_then(|ty| raw_u8_ccharp_bank(ty, llbc))
+    }) {
+        return ccharp;
+    }
     if let Some(raw) = raw_scalar_address_value_type(place_ty, llbc).or_else(|| {
         element_ty
             .as_ref()
@@ -3074,6 +3089,10 @@ pub(in crate::front::mir) fn tyref_enum_payload_value_type(
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     raw_alloc_flavor_structs: &std::collections::HashSet<String>,
 ) -> ValueType {
+    // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
+    if let Some(ccharp) = raw_u8_ccharp_bank(ty, llbc) {
+        return ccharp;
+    }
     if let Some(pointee) = tyref_shared_borrow_primitive_pointee(ty, llbc) {
         return tyref_to_value_type_with(
             &TyRef::Other(pointee),
@@ -4445,6 +4464,9 @@ pub(in crate::front::mir) fn tyref_to_attr_value_type_with(
     if let Some(root) = tyref_payload_enum_class_root_with(ty, llbc, tombstoned) {
         return ValueType::Ref(Some(root));
     }
+    // A raw `*u8` / `CCHARP` field stays `Ref(None)` here so FORCE is
+    // the untyped shell `project_struct_field_type` replaces with
+    // `lltype_to_annotation(CCHARP)`. Unsigned would seed `SomeInteger`.
     ValueType::Ref(None)
 }
 
@@ -6407,15 +6429,129 @@ pub(in crate::front::mir) fn tyref_returns_u8_list(ret_ty: &TyRef, llbc: &Llbc) 
     tyref_is_u8_list(ok.as_ref().unwrap_or(ret_ty), llbc)
 }
 
-/// `rffi.charpsize2str(cp, size) -> Vec<u8>` or `Result<Vec<u8>, _>`: a raw `*mut u8` argument of a
-/// function that returns a byte list is `CCHARP`, not GCREF-erasure.
+/// Every raw `*u8` parameter is `CCHARP` (`rffi.py` `CCHARP`).
 /// `getkind` of that raw Ptr is int.
 pub(in crate::front::mir) fn tyref_raw_u8_ptr_param_is_ccharp(
     param_ty: &TyRef,
-    ret_is_u8_list: bool,
     llbc: &Llbc,
 ) -> bool {
-    ret_is_u8_list && tyref_is_raw_u8_ptr(param_ty, llbc)
+    tyref_is_raw_u8_ptr(param_ty, llbc)
+}
+
+/// Int-bank of a raw `*u8` value (`rffi.py` `CCHARP`). Overlay Signed
+/// preserves `getkind(CCHARP)` when the producer is also stamped.
+pub(in crate::front::mir) fn raw_u8_ccharp_bank(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    tyref_is_raw_u8_ptr(ty, llbc).then_some(ValueType::Unsigned)
+}
+
+/// Stamp a raw `*u8` cell `CCHARP`. The producing op must be Int-banked.
+pub(in crate::front::mir) fn stamp_raw_u8_ccharp(var: &Variable, ty: &TyRef, llbc: &Llbc) {
+    if tyref_is_raw_u8_ptr(ty, llbc) {
+        stamp_as_ccharp(var);
+    }
+}
+
+/// Clone a Charon `Ref` / `RawPtr` node with `pointee` in the inner slot.
+fn retarget_pointer_wrapper(
+    wrapper: &serde_json::Value,
+    pointee: serde_json::Value,
+) -> serde_json::Value {
+    let mut obj = wrapper.clone();
+    let Some(map) = obj.as_object_mut() else {
+        return obj;
+    };
+    if let Some(r) = map.get_mut("Ref") {
+        if let Some(arr) = r.as_array_mut() {
+            if arr.len() > 1 {
+                arr[1] = pointee;
+            }
+        } else if let Some(inner) = r.as_object_mut() {
+            inner.insert("ty".to_string(), pointee);
+        }
+    } else if let Some(arr) = map.get_mut("RawPtr").and_then(|v| v.as_array_mut())
+        && !arr.is_empty()
+    {
+        arr[0] = pointee;
+    }
+    obj
+}
+
+/// Bound TypeVar at `ty` replaced by `container`'s `Adt.generics.types`
+/// (`substitute_field_type`). A `Result<T,E>::Ok.0` decl is `T`; the
+/// use-site container carries `*mut u8`. `PtrRepr.rtype_getattr` keeps
+/// the field's declared pointer wrappers; only the type variable is
+/// replaced (`&T` with `T = i64` stays `&i64`).
+pub(in crate::front::mir) fn tyref_subst_bound_typevar(
+    ty: &TyRef,
+    container: &TyRef,
+    llbc: &Llbc,
+) -> TyRef {
+    let Some(mut cur) = tyref_node(ty, llbc) else {
+        return clone_tyref(ty);
+    };
+    let mut wrappers: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..24 {
+        let Some(peeled) = strip_ty_indirections(cur, llbc) else {
+            return clone_tyref(ty);
+        };
+        cur = peeled;
+        let Some(obj) = cur.as_object() else {
+            return clone_tyref(ty);
+        };
+        if let Some(r) = obj.get("Ref") {
+            wrappers.push(cur.clone());
+            let (inner, _) = ref_inner_and_kind(r);
+            let Some(inner) = inner else {
+                return clone_tyref(ty);
+            };
+            cur = inner;
+            continue;
+        }
+        if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+            wrappers.push(cur.clone());
+            let Some(inner) = arr.first() else {
+                return clone_tyref(ty);
+            };
+            cur = inner;
+            continue;
+        }
+        break;
+    }
+    let Some(idx) = typevar_bound_index(cur) else {
+        return clone_tyref(ty);
+    };
+    let Some(arg) = tyref_adt_generics_type_arg(container, idx as usize, llbc) else {
+        return clone_tyref(ty);
+    };
+    if wrappers.is_empty() {
+        return arg;
+    }
+    let Some(mut node) = tyref_node(&arg, llbc).cloned() else {
+        return clone_tyref(ty);
+    };
+    for wrapper in wrappers.iter().rev() {
+        node = retarget_pointer_wrapper(wrapper, node);
+    }
+    TyRef::Other(node)
+}
+
+/// One `Adt.generics.types[index]` from `container`, peeling `Ref`.
+pub(in crate::front::mir) fn tyref_adt_generics_type_arg(
+    container: &TyRef,
+    index: usize,
+    llbc: &Llbc,
+) -> Option<TyRef> {
+    let adt = tyref_node(container, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))?
+        .as_object()?
+        .get("Adt")?
+        .as_object()?;
+    let node = type_decl_ref_generics(adt, llbc)?
+        .as_object()?
+        .get("types")?
+        .as_array()?
+        .get(index)?;
+    serde_json::from_value(node.clone()).ok()
 }
 
 /// Shared immutable `&[u8]` / `*const [u8]` (Charon `Ref`/`RawPtr` of

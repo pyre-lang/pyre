@@ -1032,11 +1032,11 @@ unsafe fn forward_virtual_ref_forced(
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
 ) -> bool {
     unsafe {
-        if !majit_metainterp::virtualref::ptr_is_virtual_ref(value as *const u8) {
+        if !majit_metainterp::virtualref::ptr_is_virtual_ref(value) {
             return false;
         }
         let vref = value as *mut majit_metainterp::virtualref::JitVirtualRef;
-        visitor(&mut *(&mut (*vref).forced as *mut *mut u8 as *mut majit_ir::GcRef));
+        visitor(&mut *(&mut (*vref).forced as *mut GCREF as *mut majit_ir::GcRef));
         true
     }
 }
@@ -6705,7 +6705,7 @@ mod tests {
                 typeptr: JIT_VIRTUAL_REF_VTABLE,
             },
             virtual_token: std::ptr::null_mut(),
-            forced: 0x1000usize as *mut u8,
+            forced: 0x1000usize as pyre_object::GCREF,
         };
         let mut slot = majit_ir::GcRef(&mut vref as *mut JitVirtualRef as usize);
         let slot_address = &mut slot as *mut majit_ir::GcRef as usize;

@@ -130,11 +130,16 @@ impl<'a> Lowering<'a> {
         // `*mut f64`, then [`is_items_block_base_ptr_add`] collapses the
         // body onto the GC block header. `getkind` of a GC pointer is
         // `ref`, so the call keeps the `Ref` [`tyref_to_value_type_with`]
-        // already recorded for that header.
+        // already recorded for that header. The items-block accessors
+        // ([`items_block_accessor_returns_its_block`]) collapse onto their
+        // block too (`rlist.py` `ll_items` is `l.items`), so their `*mut u8`
+        // result keeps that `Ref` record, not `CCHARP`.
         let callee_returns_gc_block = match &call.func {
             CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
                 .as_deref()
-                .is_some_and(is_typed_array_base_adapter),
+                .is_some_and(|p| {
+                    is_typed_array_base_adapter(p) || items_block_accessor_returns_its_block(p)
+                }),
             _ => false,
         };
         // The destination place sometimes carries a bare `Option` type_id
@@ -159,6 +164,12 @@ impl<'a> Lowering<'a> {
         };
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
+        } else if !callee_returns_gc_block
+            && !graph_is_items_block_base_accessor(&self.graph.name)
+            && let Some(ccharp) = raw_u8_ccharp_bank(&call.dest.ty, self.llbc)
+        {
+            // `rffi.py` `CCHARP`. Int-banked so overlay Signed keeps the stamp.
+            ccharp
         } else if !callee_returns_gc_block
             && let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc)
         {
@@ -306,6 +317,10 @@ impl<'a> Lowering<'a> {
         // Resolve arguments before deciding the call shape so receiver
         // resolution and `dyn` operand handling share the same path.
         let mut args: Vec<Variable> = Vec::with_capacity(call.args.len());
+        // STR/list views converted to `(data, len)` for this call
+        // (`emit_str_to_window` / `emit_list_view_to_window`). Keepalive
+        // after the last use of that raw `char *` (`keepalive_until_here`).
+        let mut converted_window_owners: Vec<Variable> = Vec::new();
         // MIR local index behind each plain-local argument, kept
         // alongside the resolved Variables so call intercepts can
         // consult per-local lowering state
@@ -544,6 +559,7 @@ impl<'a> Lowering<'a> {
                 && !tyref_is_string_value(&call.dest.ty, self.llbc)
             {
                 let var = self.resolve_operand(mir_bb, op.clone())?;
+                converted_window_owners.push(var.clone());
                 let (ptr, len) = self.owner_to_window(mir_bb, var, operand_tyref(&op))?;
                 pair_lens.push((index, len));
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
@@ -555,6 +571,7 @@ impl<'a> Lowering<'a> {
                 && !keep_list_view_arg
             {
                 let var = self.resolve_operand(mir_bb, op)?;
+                converted_window_owners.push(var.clone());
                 let (ptr, len) = self.emit_list_view_to_window(mir_bb, var)?;
                 pair_lens.push((index, len));
                 args.push(self.ensure_window_ccharp(mir_bb, ptr));
@@ -771,6 +788,8 @@ impl<'a> Lowering<'a> {
                 // The `?`-site capture below keys the callee's scope on it.
                 callee_name_path = Some(name);
                 let target = self.pair_call_target(mir_bb, &reg, &args, &pair_lens)?;
+                // Stamp before splice so FunDecl input indices still match.
+                let args = self.coerce_ccharp_call_args(mir_bb, &reg, args, &call_arg_tys);
                 let args = splice_pair_lens(args, pair_lens);
                 OpKind::Call {
                     target,
@@ -785,7 +804,22 @@ impl<'a> Lowering<'a> {
             }
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
-                let mut args = self.coerce_ccharp_byte_list_call_args(mir_bb, &reg, args);
+                // One-word STR view `*as_ptr().add(i)` is `ll_stritem_nonneg`.
+                // Coerce to CCHARP first would `rffi.cast` the header
+                // (`coerce_ccharp_call_args`) and plant the marker on int-kind.
+                if self.try_lower_byte_view_ptr_add(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    arg_operands.get(1),
+                    first_arg_ty.as_ref(),
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
+                let mut args = self.coerce_ccharp_call_args(mir_bb, &reg, args, &call_arg_tys);
                 // A boundary the consumer declared as one scalar field
                 // store ([`crate::ScalarFieldStore`]).  Emit the
                 // `setfield_gc_<bank>` its body performs instead of
@@ -1676,21 +1710,6 @@ impl<'a> Lowering<'a> {
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
-                // `*(p.add(i))` where `p` is `<[u8]>::as_ptr` is one byte of
-                // that string (`rstr.py` `ll_stritem_nonneg`). A miss stays
-                // `direct_ptradd`.
-                if self.try_lower_byte_view_ptr_add(
-                    mir_bb,
-                    &reg,
-                    &args,
-                    &arg_locals,
-                    arg_operands.get(1),
-                    first_arg_ty.as_ref(),
-                    dest_local,
-                    target,
-                )? {
                     return Ok(());
                 }
                 // `<*mut T>::add` / `<*const T>::add` / `::sub` is
@@ -3354,6 +3373,11 @@ impl<'a> Lowering<'a> {
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
+                    // Dest `*u8` is CCHARP (`rffi.py` `CCHARP`). An int-kind
+                    // source is already that word. A Ref receiver
+                    // (`p.cast::<u8>()` of `*mut i8`) `rffi.cast`s except
+                    // inside an items-base accessor (`cast_ptr_to_adr`).
+                    self.bind_raw_u8_dest(mir_bb, dest_local, &call.dest.ty);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -4905,13 +4929,15 @@ impl<'a> Lowering<'a> {
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
                     // A fat `Box<[T]>` receiver's data word is not the box
                     // variable. `arraylen_gc` on that word reads a constant.
-                    if let Some(data) =
+                    let data = if let Some(data) =
                         self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData)
                     {
-                        self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
+                        data
                     } else {
-                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
-                    }
+                        args[0].clone()
+                    };
+                    self.stamp_pair_window_as_ptr_ccharp(&call.dest.ty, &data);
+                    self.alias_dest_to_arg0_inherit(dest_local, data, &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -7315,6 +7341,11 @@ impl<'a> Lowering<'a> {
         if result_var.concretetype().is_none() {
             stamp_rust_vec_header(&result_var, &call.dest.ty, self.llbc);
         }
+        // A Ref-banked items-block result (`rlist.py` `ll_items`) keeps
+        // the `tyref_to_value_type_with` record; CCHARP is Int-banked.
+        if !callee_returns_gc_block && !graph_is_items_block_base_accessor(&self.graph.name) {
+            stamp_raw_u8_ccharp(&result_var, &call.dest.ty, self.llbc);
+        }
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
         // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of
@@ -8535,6 +8566,7 @@ impl<'a> Lowering<'a> {
                 let arg_is_range_full = second_arg_ty
                     .as_ref()
                     .is_some_and(|ty| tyref_to_ast_string(ty, self.llbc) == "RangeFull");
+                let owner = self.owner_for_window_source(&ptr);
                 let (ptr, len) = self.window_subslice(
                     mir_bb,
                     ptr,
@@ -8551,7 +8583,7 @@ impl<'a> Lowering<'a> {
                 if self.len_shadow.get(dest_local).copied().flatten().is_some()
                     && tyref_is_u8_window(&call.dest.ty, self.llbc)
                 {
-                    self.bind_pair_local(dest_local, ptr, len);
+                    self.bind_pair_local(dest_local, ptr, len, owner);
                 } else {
                     self.local_var[dest_local] = Some(LocalValue::One(ptr));
                 }
@@ -8582,6 +8614,9 @@ impl<'a> Lowering<'a> {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
+        for owner in converted_window_owners {
+            self.emit_keepalive(mir_bb, owner);
+        }
         if let Some(slot) = window_ret_slot {
             let len = self.emit_path_call(
                 mir_bb,
@@ -8593,7 +8628,7 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
             if self.len_shadow.get(dest_local).copied().flatten().is_some() {
-                self.bind_pair_local(dest_local, ptr, len);
+                self.bind_pair_local(dest_local, ptr, len, None);
             } else {
                 self.local_var[dest_local] = Some(LocalValue::One(ptr));
             }

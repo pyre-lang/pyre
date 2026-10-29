@@ -630,11 +630,20 @@ fn transduce_op(
                 result,
             );
         }
-        // `Transformer`'s rename table maps `keepalive` to `-live-`; the
-        // operand list is intentionally discarded because flatten computes
-        // the variables live at the marker from control-flow liveness.
+        // `jtransform.py` `('keepalive', '-live-')`: keep the operands as
+        // forced live values (`liveness.py` `-live-` args).
         "keepalive" => {
-            out.push_op_var(block, OpKind::Live, false);
+            let forced: Vec<_> = op
+                .args
+                .iter()
+                .map(|arg| materialize(out, block, arg))
+                .collect();
+            out.block_mut(block)
+                .operations
+                .push(crate::model::SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live { forced },
+                });
         }
         // `jtransform.py Transformer.rewrite_op_jit_record_exact_value`:
         // int → `record_exact_value_i`, ref → `record_exact_value_r`.
@@ -2315,7 +2324,7 @@ mod tests {
                 OpKind::UnaryOp { op, .. } => unary.push(op.as_str()),
                 OpKind::BinOp { op, .. } => binary.push(op.as_str()),
                 OpKind::LoweredBlackholeOp { opname, .. } => lowered.push(opname.as_str()),
-                OpKind::Live => live += 1,
+                OpKind::Live { .. } => live += 1,
                 OpKind::ConstInt(_) | OpKind::ConstUInt(_) | OpKind::ConstFnAddr { .. } => {}
                 other => panic!("unexpected lowered integer-fragment op: {other:?}"),
             }

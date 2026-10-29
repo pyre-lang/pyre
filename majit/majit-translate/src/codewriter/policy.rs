@@ -627,7 +627,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         | OpKind::RecordKnownResult { .. }
         | OpKind::RecordQuasiImmutField { .. }
         | OpKind::JitForceQuasiImmutable { .. }
-        | OpKind::Live
+        | OpKind::Live { .. }
         | OpKind::JitMergePoint { .. }
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }

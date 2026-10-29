@@ -4463,6 +4463,28 @@ impl<'a> Transformer<'a> {
             OpKind::Call { target, args, .. } if is_record_exact_value_helper(target) => {
                 self.rewrite_op_jit_record_exact_value(args, graph, graph_name, op.result.clone())
             }
+            // `jtransform.py` `('keepalive', '-live-')`.
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "keepalive" => RewriteResult::Replace(vec![SpaceOperation {
+                result: None,
+                kind: OpKind::Live {
+                    forced: vec![operand.clone()],
+                },
+            }]),
+            OpKind::Call { target, args, .. } if call_is_keepalive_until_here(target) => {
+                let forced: Vec<_> = args
+                    .iter()
+                    .filter_map(crate::model::LinkArg::as_variable)
+                    .cloned()
+                    .collect();
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live { forced },
+                }])
+            }
             // RPython `Transformer.rewrite_op_same_as` / `rewrite_op_cast_*`
             // drop the op and alias the result to the operand. `deref` is
             // the `&mut *p` reborrow of the same pointer.
@@ -4877,7 +4899,7 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Replace(vec![
                     SpaceOperation {
                         result: None,
-                        kind: OpKind::Live,
+                        kind: OpKind::live(),
                     },
                     op.clone(),
                 ])
@@ -4996,7 +5018,7 @@ impl<'a> Transformer<'a> {
                 });
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
                 RewriteResult::Replace(ops)
             }
@@ -5046,7 +5068,7 @@ impl<'a> Transformer<'a> {
                 });
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
                 RewriteResult::Replace(ops)
             }
@@ -5091,7 +5113,7 @@ impl<'a> Transformer<'a> {
                     });
                     ops.push(SpaceOperation {
                         result: None,
-                        kind: OpKind::Live,
+                        kind: OpKind::live(),
                     });
                     RewriteResult::Replace(ops)
                 } else {
@@ -5580,7 +5602,7 @@ impl<'a> Transformer<'a> {
                 });
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
                 RewriteResult::Replace(ops)
             }
@@ -5639,7 +5661,7 @@ impl<'a> Transformer<'a> {
                 });
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
                 RewriteResult::Replace(ops)
             }
@@ -5836,7 +5858,7 @@ impl<'a> Transformer<'a> {
                 });
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
                 RewriteResult::Replace(ops)
             }
@@ -6875,7 +6897,7 @@ impl<'a> Transformer<'a> {
                 },
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
             ],
         )
@@ -7554,7 +7576,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(vec![
             SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             },
             SpaceOperation {
                 result: None,
@@ -7785,7 +7807,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(vec![
             SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             },
             SpaceOperation {
                 result: None,
@@ -7858,7 +7880,7 @@ impl<'a> Transformer<'a> {
         });
         ops.push(SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         });
         ops.push(SpaceOperation {
             result: None,
@@ -7934,7 +7956,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
                 SpaceOperation {
                     result: op.result.clone(),
@@ -8230,7 +8252,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
                 SpaceOperation {
                     result: op.result.clone(),
@@ -8315,7 +8337,7 @@ impl<'a> Transformer<'a> {
                 return RewriteResult::Replace(vec![
                     SpaceOperation {
                         result: None,
-                        kind: OpKind::Live,
+                        kind: OpKind::live(),
                     },
                     SpaceOperation {
                         result: None,
@@ -8545,7 +8567,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
                 SpaceOperation {
                     result: op.result.clone(),
@@ -8729,7 +8751,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
                 SpaceOperation {
                     result: op.result.clone(),
@@ -8857,7 +8879,7 @@ impl<'a> Transformer<'a> {
         RewriteResult::Replace(vec![
             SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             },
             SpaceOperation {
                 result: op.result.clone(),
@@ -8907,7 +8929,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
                 SpaceOperation {
                     result: op.result.clone(),
@@ -8943,6 +8965,76 @@ impl<'a> Transformer<'a> {
             }]);
         }
         RewriteResult::Keep
+    }
+
+    /// Skip-spine `__string_byte_getitem`: STRPTR / ref-kind is
+    /// `strgetitem` (`bhimpl_strgetitem` `("r","i")`). CCHARP is the raw
+    /// `rewrite_op_getarrayitem` branch (`ARRAY._gckind != 'gc'`).
+    fn rewrite_string_byte_getitem(
+        &mut self,
+        op: &SpaceOperation,
+        base: &crate::flowspace::model::Variable,
+        index: &crate::flowspace::model::Variable,
+        graph_name: &str,
+        graph: &FunctionGraph,
+    ) -> RewriteResult {
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+        use crate::translator::rtyper::lltypesystem::rffi::{CArray, CCHARP};
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
+
+        let arg0_ct = base.concretetype();
+        let is_ccharp = arg0_ct.as_ref().is_some_and(|t| {
+            t == &*CCHARP
+                || matches!(
+                    t,
+                    LowLevelType::Ptr(ptr)
+                        if matches!(
+                            &ptr.TO,
+                            PtrTarget::Array(arr)
+                                if arr.OF == LowLevelType::Char && arr._gckind != GcKind::Gc
+                        )
+                )
+        });
+        if is_ccharp {
+            let array_read = SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::ArrayRead {
+                    base: base.clone(),
+                    index: index.clone(),
+                    item_ty: ValueType::Int,
+                    array_type_id: Some(crate::codewriter::call::array_type_id_of_lltype(&CArray(
+                        LowLevelType::Char,
+                    ))),
+                    nolength: true,
+                    pure: false,
+                },
+            };
+            return match self.rewrite_op_getarrayitem(
+                &array_read,
+                base,
+                index,
+                &ValueType::Int,
+                graph_name,
+                graph,
+            ) {
+                RewriteResult::Keep => RewriteResult::Replace(vec![array_read]),
+                other => other,
+            };
+        }
+        if arg0_ct.as_ref().is_some_and(|t| t == &*STRPTR) || self.get_value_kind_var(base) == 'r' {
+            return RewriteResult::Replace(vec![SpaceOperation {
+                result: op.result.clone(),
+                kind: OpKind::LoweredBlackholeOp {
+                    opname: "strgetitem".into(),
+                    args: vec![base.clone().into(), index.clone().into()],
+                },
+            }]);
+        }
+        panic!(
+            "__string_byte_getitem graph {graph_name} arg0 concretetype {:?} \
+             is not STRPTR or CCHARP",
+            arg0_ct
+        );
     }
 
     /// RPython: `Transformer.rewrite_op_direct_call(op)`.
@@ -9256,7 +9348,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![
                 SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 },
                 SpaceOperation {
                     result: op.result.clone(),
@@ -9410,19 +9502,15 @@ impl<'a> Transformer<'a> {
         }
         // `as_bytes()[i]` on a string-byte-view is `ord(s[i])`.  The
         // rtyper path expands `__string_byte_getitem` to `getitem`+`ord`;
-        // a Skip-spine graph keeps the marker.  `pyre_cpu.bh_strgetitem`
-        // reads the `W_UnicodeObject` (`rstring.py` `u_self[i]`).
+        // a Skip-spine graph keeps the marker.  `blackhole.py`
+        // `bhimpl_strgetitem` is `("r","i")`. CCHARP is
+        // `jtransform.py` `rewrite_op_getarrayitem` raw
+        // (`ARRAY._gckind != 'gc'`) → `getarrayitem_raw_i`.
         if let CallTarget::FunctionPath { segments, .. } = target
             && segments.as_slice() == ["__string_byte_getitem"]
             && args.len() == 2
         {
-            return RewriteResult::Replace(vec![SpaceOperation {
-                result: op.result.clone(),
-                kind: OpKind::LoweredBlackholeOp {
-                    opname: "strgetitem".into(),
-                    args: vec![args[0].clone().into(), args[1].clone().into()],
-                },
-            }]);
+            return self.rewrite_string_byte_getitem(op, &args[0], &args[1], graph_name, graph);
         }
         // `len(s)` / `Wtf8::len` / `as_bytes().len()` on a string-byte-view
         // is `ll_strlen`.  The rtyper path routes `__len` / `__strlen`
@@ -12557,7 +12645,7 @@ impl<'a> Transformer<'a> {
             },
             SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             },
         ])
     }
@@ -12637,7 +12725,7 @@ impl<'a> Transformer<'a> {
         });
         ops.push(SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         });
         RewriteResult::Replace(ops)
     }
@@ -12668,7 +12756,7 @@ impl<'a> Transformer<'a> {
             // RPython: -live- then {kind}_guard_value
             ops.push(SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             });
             ops.push(SpaceOperation {
                 result: None,
@@ -13015,7 +13103,7 @@ impl<'a> Transformer<'a> {
         if descriptor.extra_info.check_can_raise(false) {
             ops.push(SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             });
         }
         RewriteResult::Replace(ops)
@@ -13359,11 +13447,11 @@ impl<'a> Transformer<'a> {
         // `ops + [op3, op1, op2]`.
         let live_preamble = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         let live_recursive = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         vec![live_preamble, merge, live_recursive]
     }
@@ -13461,7 +13549,7 @@ impl<'a> Transformer<'a> {
         if descriptor.extra_info.check_can_raise(false) {
             ops.push(SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             });
         }
         RewriteResult::Replace(ops)
@@ -13645,7 +13733,7 @@ impl<'a> Transformer<'a> {
         if can_raise {
             ops.push(SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             });
         }
         RewriteResult::Replace(ops)
@@ -13739,7 +13827,7 @@ impl<'a> Transformer<'a> {
                 }
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
                 ops.push(SpaceOperation {
                     result: None,
@@ -13764,7 +13852,7 @@ impl<'a> Transformer<'a> {
                 // because `may_call_jitcodes=True` for the regular-indirect path.
                 ops.push(SpaceOperation {
                     result: None,
-                    kind: OpKind::Live,
+                    kind: OpKind::live(),
                 });
 
                 self.calls_classified += 1;
@@ -13810,7 +13898,7 @@ impl<'a> Transformer<'a> {
                 if can_raise {
                     ops.push(SpaceOperation {
                         result: None,
-                        kind: OpKind::Live,
+                        kind: OpKind::live(),
                     });
                 }
                 RewriteResult::Replace(ops)
@@ -13914,7 +14002,7 @@ impl<'a> Transformer<'a> {
             },
             SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             },
         ])
     }
@@ -15362,12 +15450,14 @@ fn remap_op(
         | OpKind::ConstNone
         | OpKind::ConstRefAddr(_)
         | OpKind::CurrentTraceLength
-        | OpKind::Live
         | OpKind::LoopHeader { .. }
         | OpKind::Abort { .. }
         | OpKind::LoadStatic { .. }
         | OpKind::New { .. }
         | OpKind::NewWithVtable { .. } => op.kind.clone(),
+        OpKind::Live { forced } => OpKind::Live {
+            forced: forced.iter().map(|v| remap_value(v, aliases)).collect(),
+        },
         OpKind::RawMalloc {
             owner,
             TYPE: malloc_type,
@@ -16318,6 +16408,16 @@ fn is_jit_record_exact_value_llop(target: &CallTarget) -> bool {
 fn is_record_exact_value_helper(target: &CallTarget) -> bool {
     matches!(target, CallTarget::FunctionPath { segments, .. }
         if segments.as_slice() == ["majit_rlib", "jit", "record_exact_value"])
+}
+
+/// `objectmodel.keepalive_until_here` / `rtype_keepalive_until_here`.
+fn call_is_keepalive_until_here(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments
+            .iter()
+            .any(|s| s == "keepalive_until_here" || s.ends_with("keepalive_until_here")),
+        _ => false,
+    }
 }
 
 /// Match a `CallEffectOverride` pattern against a call target.
@@ -17656,9 +17756,57 @@ mod tests {
         let transformer = Transformer::new(&config);
         let op = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         assert_eq!(keep_operation_unchanged(&transformer, &op), op);
+    }
+
+    /// `jtransform.py` `('keepalive', '-live-')`: the operand is forced live.
+    #[test]
+    fn keepalive_lowers_to_live_with_forced_operand() {
+        use crate::model::SpaceOperation;
+        let mut graph = FunctionGraph::new("keepalive");
+        let owner = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: Some(owner.clone()),
+                kind: OpKind::Input {
+                    name: "owner".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+            });
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::UnaryOp {
+                    op: "keepalive".into(),
+                    operand: owner.clone(),
+                    result_ty: ValueType::Void,
+                },
+            });
+        graph.set_return(graph.startblock, None);
+        let out = Transformer::new(&GraphTransformConfig::default()).transform(&graph);
+        let ops: Vec<_> = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        let live = ops.iter().find(|op| matches!(op.kind, OpKind::Live { .. }));
+        match &live.expect("keepalive becomes Live").kind {
+            OpKind::Live { forced } => {
+                assert!(
+                    forced.iter().any(|v| v == &owner),
+                    "Live.forced must keep the keepalive operand; ops={ops:?}"
+                );
+            }
+            other => panic!("expected Live, got {other:?}"),
+        }
     }
 
     #[test]
@@ -20197,7 +20345,7 @@ mod tests {
                     "fatlen"
                 }
                 OpKind::FieldRead { field, .. } if field.is_vtable_method_slot() => "method",
-                OpKind::Live => "live",
+                OpKind::Live { .. } => "live",
                 OpKind::GuardValue { kind_char: 'i', .. } => "guard_i",
                 other => panic!("unexpected op {other:?}"),
             })
@@ -20543,7 +20691,7 @@ mod tests {
             }
             other => panic!("expected CallResidual, got {other:?}"),
         }
-        assert!(matches!(ops[5].kind, OpKind::Live));
+        assert!(matches!(ops[5].kind, OpKind::Live { .. }));
     }
 
     #[test]
@@ -20608,7 +20756,7 @@ mod tests {
             }
             other => panic!("expected CallResidual, got {other:?}"),
         }
-        assert!(matches!(ops[3].kind, OpKind::Live));
+        assert!(matches!(ops[3].kind, OpKind::Live { .. }));
     }
 
     #[test]
@@ -20686,7 +20834,7 @@ mod tests {
             }
             other => panic!("expected CallResidual, got {other:?}"),
         }
-        assert!(matches!(ops[4].kind, OpKind::Live));
+        assert!(matches!(ops[4].kind, OpKind::Live { .. }));
         assert_no_int_mod_with_ref_operand(&transformed.graph);
     }
 
@@ -20993,7 +21141,7 @@ mod tests {
             }
             other => panic!("expected CallResidual, got {other:?}"),
         }
-        assert!(matches!(ops[3].kind, OpKind::Live));
+        assert!(matches!(ops[3].kind, OpKind::Live { .. }));
     }
 
     /// `str(int)` over an Int operand, as one graph, for the two tests below.
@@ -21253,7 +21401,7 @@ mod tests {
             }
             other => panic!("expected CallResidual, got {other:?}"),
         }
-        assert!(matches!(ops[3].kind, OpKind::Live));
+        assert!(matches!(ops[3].kind, OpKind::Live { .. }));
     }
 
     #[test]
@@ -21681,7 +21829,7 @@ mod tests {
             .expect("ll_find is an inline_call");
         assert_eq!(inline, (2, 2, 'i'), "ll_find(s1, s2, 0, end): {ops:?}");
         assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
             "inline_call is followed by -live-: {ops:?}",
         );
         assert!(
@@ -21939,7 +22087,7 @@ mod tests {
         // (`jtransform.py:845-847`).
         let ops = &result.graph.block(graph.startblock).operations;
         assert!(
-            matches!(ops[0].kind, OpKind::Live),
+            matches!(ops[0].kind, OpKind::Live { .. }),
             "virtualizable read must be led by -live-, got {:?}",
             ops[0].kind
         );
@@ -22050,7 +22198,7 @@ mod tests {
         );
         // `jtransform.py:764-767` — `-live-` leads the vable array read.
         assert!(
-            matches!(ops[0].kind, OpKind::Live),
+            matches!(ops[0].kind, OpKind::Live { .. }),
             "virtualizable array read must be led by -live-, got {:?}",
             ops[0].kind
         );
@@ -22307,7 +22455,7 @@ mod tests {
         );
         // `jtransform.py:814` — `-live-` leads the vable array length read.
         assert!(
-            matches!(ops[0].kind, OpKind::Live),
+            matches!(ops[0].kind, OpKind::Live { .. }),
             "vable array length must be led by -live-, got {:?}",
             ops[0].kind
         );
@@ -23378,7 +23526,7 @@ mod tests {
         assert_eq!(inline.1, 'i');
         assert_eq!(inline.0, &vec![lhs_var, rhs_var]);
         assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
             "inline_call is followed by -live-: {ops:?}"
         );
         assert!(
@@ -23454,7 +23602,7 @@ mod tests {
         assert_eq!(inline.1, 'i');
         assert_eq!(inline.0, &vec![operand]);
         assert!(
-            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
             "inline_call is followed by -live-: {ops:?}"
         );
         assert!(
@@ -23509,7 +23657,7 @@ mod tests {
             } => {}
             other => panic!("expected CallResidual with runtime funcptr, got {other:?}"),
         }
-        assert!(matches!(ops[3].kind, OpKind::Live));
+        assert!(matches!(ops[3].kind, OpKind::Live { .. }));
     }
 
     fn rewrite_direct_call(
@@ -24866,7 +25014,7 @@ mod tests {
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
         assert!(
-            matches!(ops[0].kind, OpKind::Live),
+            matches!(ops[0].kind, OpKind::Live { .. }),
             "virtualizable read must be led by -live-, got {:?}",
             ops[0].kind
         );
@@ -24927,7 +25075,7 @@ mod tests {
         };
         assert_eq!(base, &frame_var);
         assert!(
-            matches!(ops[1].kind, OpKind::Live),
+            matches!(ops[1].kind, OpKind::Live { .. }),
             "virtualizable read must be led by -live-, got {:?}",
             ops[1].kind
         );
@@ -25099,7 +25247,7 @@ mod tests {
             .collect();
         let live_idx = ops
             .iter()
-            .position(|k| matches!(k, OpKind::Live))
+            .position(|k| matches!(k, OpKind::Live { .. }))
             .expect("Live marker present");
         assert!(
             matches!(
@@ -25157,7 +25305,7 @@ mod tests {
             .collect();
         let live_idx = ops
             .iter()
-            .position(|k| matches!(k, OpKind::Live))
+            .position(|k| matches!(k, OpKind::Live { .. }))
             .expect("Live marker present");
         assert!(
             matches!(
@@ -25270,7 +25418,7 @@ mod tests {
             .collect();
         let live_idx = ops
             .iter()
-            .position(|k| matches!(k, OpKind::Live))
+            .position(|k| matches!(k, OpKind::Live { .. }))
             .expect("Live marker present");
         assert!(
             matches!(
@@ -25333,7 +25481,7 @@ mod tests {
             "jit_force_virtualizable must be deleted, not residualized or kept as VableForce: {ops:?}"
         );
         assert!(
-            matches!(ops[0].kind, OpKind::Live),
+            matches!(ops[0].kind, OpKind::Live { .. }),
             "virtualizable read must be led by -live-, got {:?}",
             ops[0].kind
         );
@@ -26364,7 +26512,7 @@ mod tests {
                 .position(|o| matches!(&o.kind, OpKind::BinOp { op, .. } if op == opname))
                 .unwrap_or_else(|| panic!("{opname} did not survive the rewrite: {ops:?}"));
             assert!(
-                ovf_idx > 0 && matches!(ops[ovf_idx - 1].kind, OpKind::Live),
+                ovf_idx > 0 && matches!(ops[ovf_idx - 1].kind, OpKind::Live { .. }),
                 "{opname} must be led by -live-, got {ops:?}"
             );
         }
@@ -26715,7 +26863,7 @@ mod tests {
     /// input arg.  In pyre's `RewriteResult` model the alias is applied
     /// by `optimize_block` from `self.aliases.insert(result, base)` and
     /// the two emitted ops show up at the call site as
-    /// `[OpKind::Live, OpKind::GuardValue { kind_char }]`.
+    /// `[OpKind::live(), OpKind::GuardValue { kind_char }]`.
     #[test]
     fn transform_graph_rewrites_hint_promote() {
         let mut graph = FunctionGraph::new("demo");
@@ -26764,7 +26912,7 @@ mod tests {
         let ops = &result.graph.block(graph.startblock).operations;
         // Expected post-rewrite shape: [Live, GuardValue, FieldRead].
         assert_eq!(ops.len(), 3, "got {ops:?}");
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::GuardValue {
                 value, kind_char, ..
@@ -26880,7 +27028,7 @@ mod tests {
         // order, preceded by the Input op.
         let live_idx = ops
             .iter()
-            .position(|k| matches!(k, OpKind::Live))
+            .position(|k| matches!(k, OpKind::Live { .. }))
             .expect("Live marker present");
         assert!(matches!(
             ops[live_idx + 1],
@@ -27313,7 +27461,7 @@ mod tests {
             "iir".to_string(),
         );
         assert_eq!(ops.len(), 3, "expect live + merge + live");
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::JitMergePoint {
                 jitdriver_index,
@@ -27329,7 +27477,7 @@ mod tests {
             }
             other => panic!("expected OpKind::JitMergePoint, got {other:?}"),
         }
-        assert!(matches!(ops[2].kind, OpKind::Live));
+        assert!(matches!(ops[2].kind, OpKind::Live { .. }));
     }
 
     #[test]
@@ -27811,7 +27959,7 @@ mod tests {
         assert_eq!(ops.len(), 6, "expect 2 ops per green");
         for i in 0..greens.len() {
             assert!(
-                matches!(ops[i * 2].kind, OpKind::Live),
+                matches!(ops[i * 2].kind, OpKind::Live { .. }),
                 "slot {i} should start with Live"
             );
             match &ops[i * 2 + 1].kind {
@@ -27980,7 +28128,7 @@ mod tests {
         assert_eq!(ops.len(), 7, "promote_greens(2 greens)*2 + merge*3 = 7");
 
         // promote_greens prefix: -live-, int_guard_value(g1), -live-, int_guard_value(g2)
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::GuardValue {
                 value, kind_char, ..
@@ -27990,7 +28138,7 @@ mod tests {
             }
             other => panic!("ops[1] expected GuardValue(g1, 'i'), got {other:?}"),
         }
-        assert!(matches!(ops[2].kind, OpKind::Live));
+        assert!(matches!(ops[2].kind, OpKind::Live { .. }));
         match &ops[3].kind {
             OpKind::GuardValue {
                 value, kind_char, ..
@@ -28001,7 +28149,7 @@ mod tests {
             other => panic!("ops[3] expected GuardValue(g2, 'i'), got {other:?}"),
         }
         // live_preamble + merge + live_recursive
-        assert!(matches!(ops[4].kind, OpKind::Live));
+        assert!(matches!(ops[4].kind, OpKind::Live { .. }));
         match &ops[5].kind {
             OpKind::JitMergePoint {
                 jitdriver_index,
@@ -28023,7 +28171,7 @@ mod tests {
             }
             other => panic!("ops[5] expected JitMergePoint, got {other:?}"),
         }
-        assert!(matches!(ops[6].kind, OpKind::Live));
+        assert!(matches!(ops[6].kind, OpKind::Live { .. }));
         assert!(
             ops[5].result.is_none(),
             "jit_merge_point produces no result"
@@ -28719,7 +28867,7 @@ mod tests {
         match rewritten {
             RewriteResult::Replace(ops) => {
                 assert_eq!(ops.len(), 2);
-                assert!(matches!(ops[0].kind, OpKind::Live));
+                assert!(matches!(ops[0].kind, OpKind::Live { .. }));
                 match &ops[1].kind {
                     OpKind::BinOp { op, result_ty, .. } => {
                         assert_eq!(op, "add_ovf");
@@ -29129,10 +29277,12 @@ mod tests {
 
     #[test]
     fn string_byte_getitem_marker_lowers_to_strgetitem() {
+        use crate::translator::rtyper::lltypesystem::rstr::STRPTR;
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
         let mut graph = FunctionGraph::new("string_byte_getitem");
         let s = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+        s.set_concretetype(Some((*STRPTR).clone()));
         let i = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
         let target = CallTarget::function_path(["__string_byte_getitem"]);
@@ -29163,6 +29313,63 @@ mod tests {
                 assert_eq!(args, &[s, i]);
             }
             other => panic!("expected LoweredBlackholeOp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn string_byte_getitem_ccharp_lowers_to_getarrayitem_raw() {
+        use crate::codewriter::call::array_type_id_of_lltype;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rffi::{CArray, CCHARP};
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let mut graph = FunctionGraph::new("string_byte_getitem_ccharp");
+        let s = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        s.set_concretetype(Some((*CCHARP).clone()));
+        let i = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let target = CallTarget::function_path(["__string_byte_getitem"]);
+        let result_ty = ValueType::Int;
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![s.clone(), i.clone()]),
+                result_ty: result_ty.clone(),
+            },
+        };
+        let RewriteResult::Replace(ops) = transformer.rewrite_op_direct_call(
+            &op,
+            &target,
+            &[s.clone(), i.clone()],
+            &result_ty,
+            "string_byte_getitem_ccharp",
+            &mut graph,
+        ) else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].result, Some(result));
+        match &ops[0].kind {
+            OpKind::ArrayRead {
+                base,
+                index,
+                item_ty,
+                array_type_id,
+                nolength,
+                pure,
+            } => {
+                assert_eq!(base, &s);
+                assert_eq!(index, &i);
+                assert_eq!(item_ty, &ValueType::Int);
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(array_type_id_of_lltype(&CArray(LowLevelType::Char)).as_str())
+                );
+                assert!(*nolength);
+                assert!(!*pure);
+            }
+            other => panic!("expected ArrayRead (getarrayitem_raw_i), got {other:?}"),
         }
     }
 
@@ -31694,7 +31901,10 @@ mod tests {
             OopSpecIndex::RawMallocVarsizeChar
         );
         assert_eq!(descriptor.extra_info.extraeffect, ExtraEffect::CanRaise);
-        assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+        assert!(matches!(
+            ops.last().map(|op| &op.kind),
+            Some(OpKind::Live { .. })
+        ));
     }
 
     /// `_rewrite_raw_malloc` `TYPE = op.args[0].value`: CHAR is the malloc
@@ -33330,7 +33540,10 @@ mod tests {
             descriptor.extra_info.extraeffect,
             majit_ir::descr::ExtraEffect::ElidableCanRaise
         );
-        assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+        assert!(matches!(
+            ops.last().map(|op| &op.kind),
+            Some(OpKind::Live { .. })
+        ));
         assert!(
             transformed
                 .notes
@@ -33384,7 +33597,7 @@ mod tests {
             majit_ir::descr::ExtraEffect::ElidableCannotRaise
         );
         assert!(
-            !ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            !ops.iter().any(|op| matches!(op.kind, OpKind::Live { .. })),
             "ElidableCannotRaise must not append a trailing -live-: {ops:?}"
         );
         assert!(
@@ -33438,7 +33651,10 @@ mod tests {
             descriptor.extra_info.extraeffect,
             majit_ir::descr::ExtraEffect::RandomEffects
         );
-        assert!(matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)));
+        assert!(matches!(
+            ops.last().map(|op| &op.kind),
+            Some(OpKind::Live { .. })
+        ));
         assert!(cc.has_libffi_call);
     }
 
@@ -33453,7 +33669,7 @@ mod tests {
         let result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let op = SpaceOperation {
             result: Some(result.clone()),
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
 
         let RewriteResult::Replace(ops) =
@@ -33483,7 +33699,7 @@ mod tests {
         let value = graph.alloc_value_var_with_type(ConcreteType::GcRef);
         let op = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
 
         let RewriteResult::Replace(ops) =
@@ -33539,7 +33755,7 @@ mod tests {
         let args = stroruni_copy_contents_args(STRPTR.clone());
         let op = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         let result = transformer
@@ -33579,7 +33795,7 @@ mod tests {
         let args = stroruni_copy_contents_args(UNICODEPTR.clone());
         let op = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         let result = transformer
@@ -33613,7 +33829,7 @@ mod tests {
         let args = stroruni_copy_contents_args(BYTEARRAYPTR.clone());
         let op = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         let (mut graph, target, result_ty) = stroruni_call_dummy_extras();
         assert!(
@@ -33915,7 +34131,7 @@ mod tests {
         );
         // CanRaise → trailing -live-.
         assert!(
-            matches!(ops.last().map(|o| &o.kind), Some(OpKind::Live)),
+            matches!(ops.last().map(|o| &o.kind), Some(OpKind::Live { .. })),
             "CanRaise oopspec call must append a trailing -live-"
         );
     }
@@ -34284,7 +34500,7 @@ mod tests {
         let args = vec![variable_with_lltype("x", LowLevelType::Signed)];
         let op = SpaceOperation {
             result: None,
-            kind: OpKind::Live,
+            kind: OpKind::live(),
         };
         assert!(
             transformer
@@ -34812,7 +35028,7 @@ mod tests {
             post_input[0].kind
         );
         assert!(
-            matches!(post_input[1].kind, OpKind::Live),
+            matches!(post_input[1].kind, OpKind::Live { .. }),
             "expected Live second, got {:?}",
             post_input[1].kind
         );
@@ -34833,7 +35049,7 @@ mod tests {
         // jtransform.py handle_residual_call(..., may_call_jitcodes=True)
         // forces a trailing `-live-`.
         assert!(
-            matches!(post_input[4].kind, OpKind::Live),
+            matches!(post_input[4].kind, OpKind::Live { .. }),
             "expected trailing Live, got {:?}",
             post_input[4].kind
         );
@@ -35072,7 +35288,7 @@ mod tests {
             post_input[0].kind,
         );
         assert!(
-            matches!(post_input[1].kind, OpKind::Live),
+            matches!(post_input[1].kind, OpKind::Live { .. }),
             "expected Live second, got {:?}",
             post_input[1].kind,
         );
@@ -35105,7 +35321,7 @@ mod tests {
             }
         }
         assert!(
-            matches!(post_input[4].kind, OpKind::Live),
+            matches!(post_input[4].kind, OpKind::Live { .. }),
             "expected trailing Live (may_call_jitcodes=true), got {:?}",
             post_input[4].kind,
         );
@@ -35392,7 +35608,7 @@ mod tests {
         let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::GuardValue { kind_char, .. } => {
                 assert_eq!(
@@ -35428,7 +35644,7 @@ mod tests {
         let config = GraphTransformConfig::default();
         let result = Transformer::new(&config).transform(&graph);
         let ops = &result.graph.block(graph.startblock).operations;
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::GuardValue { kind_char, .. } => {
                 assert_eq!(
@@ -35463,7 +35679,7 @@ mod tests {
         let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::GuardValue { kind_char, .. } => {
                 assert_eq!(
@@ -35498,7 +35714,7 @@ mod tests {
         let result = transform_graph(&graph, &GraphTransformConfig::default());
         let ops = &result.graph.block(graph.startblock).operations;
         assert_eq!(ops.len(), 2);
-        assert!(matches!(ops[0].kind, OpKind::Live));
+        assert!(matches!(ops[0].kind, OpKind::Live { .. }));
         match &ops[1].kind {
             OpKind::GuardValue { kind_char, .. } => {
                 assert_eq!(
@@ -38072,7 +38288,7 @@ mod tests {
                 "`rewrite_op_int_add_ovf` runs `_rewrite_symmetric`: {ops:?}"
             );
             assert!(
-                ops.iter().any(|o| matches!(o.kind, OpKind::Live)),
+                ops.iter().any(|o| matches!(o.kind, OpKind::Live { .. })),
                 "the swapped ovf op must still be led by -live-: {ops:?}"
             );
         }

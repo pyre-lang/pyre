@@ -23,6 +23,7 @@ use crate::heapcache::{HeapCache, HeapCacheView, HeapCacheViewMut};
 use crate::opencoder::Box as OcBox;
 use crate::recorder::Trace;
 use indexmap::IndexMap;
+use majit_gc::header::GCREF;
 use majit_ir::{DescrRef, GcRef, GreenKey, GreenType, OpCode, OpRef, Type, Value};
 
 use majit_backend::JitCellToken;
@@ -2037,7 +2038,7 @@ impl TraceCtx {
         &mut self,
         virtual_obj: OpRef,
         virtual_obj_ptr: usize,
-    ) -> (OpRef, *mut u8) {
+    ) -> (OpRef, GCREF) {
         // virtualref.py `virtual_ref_during_tracing(real_object)` starts with
         // `assert real_object`: the tracing-time vref exists to name a live
         // object, and one built over a null would carry a null `forced` that
@@ -2050,7 +2051,7 @@ impl TraceCtx {
         let vref_ptr = self
             .metainterp_sd
             .virtualref_info
-            .virtual_ref_during_tracing(virtual_obj_ptr as *mut u8);
+            .virtual_ref_during_tracing(virtual_obj_ptr as GCREF);
         // pyjitpl.py:1805 `cindex = ConstInt(len(virtualref_boxes) // 2)`.
         let cindex = self.const_int((self.virtualref_boxes.len() / 2) as i64);
         // pyjitpl.py:1806-1807 `record2(VIRTUAL_REF, box, cindex)` +
@@ -2122,7 +2123,7 @@ impl TraceCtx {
             && unsafe {
                 self.metainterp_sd
                     .virtualref_info
-                    .is_virtual_ref(vref_ptr as *const u8)
+                    .is_virtual_ref(vref_ptr as GCREF)
             };
         if is_vref {
             // pyjitpl.py:1831-1832 `VIRTUAL_REF_FINISH(vrefbox, nullbox)`.
@@ -2214,7 +2215,7 @@ impl TraceCtx {
             unsafe {
                 self.metainterp_sd
                     .virtualref_info
-                    .tracing_before_residual_call(vref_ptr as *mut u8);
+                    .tracing_before_residual_call(vref_ptr as GCREF);
             }
             i += 2;
         }
@@ -2242,7 +2243,7 @@ impl TraceCtx {
             let forced = unsafe {
                 self.metainterp_sd
                     .virtualref_info
-                    .tracing_after_residual_call(vref_ptr as *mut u8)
+                    .tracing_after_residual_call(vref_ptr as GCREF)
             };
             if forced {
                 forced_pairs.push(i);

@@ -1178,12 +1178,12 @@ fn alloc_exception_nursery<T: crate::lltype::GcType>(mut value: T) -> PyObjectRe
         }
         let slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
-        let raw = crate::gc_roots::shadow_stack_get(slot) as *mut u8;
+        let raw = crate::gc_roots::shadow_stack_get(slot) as crate::gc_hook::GCREF;
         // A nursery header needs no creation barrier. The collecting
         // allocator can still spill old (pinned nursery gap); only that
         // placement remembers the `w_class` edge.
         if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(raw as crate::gc_hook::GCREF);
+            crate::gc_hook::try_gc_write_barrier(raw);
         }
         return crate::gc_roots::shadow_stack_get(slot);
     }

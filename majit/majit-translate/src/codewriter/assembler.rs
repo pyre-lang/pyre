@@ -3817,7 +3817,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::RecordKnownResult { .. } => "RecordKnownResult",
                 OpKind::RecordQuasiImmutField { .. } => "RecordQuasiImmutField",
                 OpKind::JitForceQuasiImmutable { .. } => "JitForceQuasiImmutable",
-                OpKind::Live => "Live",
+                OpKind::Live { .. } => "Live",
                 OpKind::JitMergePoint { .. } => "JitMergePoint",
                 OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Abort { .. } => "Abort",
@@ -6941,7 +6941,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         OpKind::ConditionalCallValue { result_kind, .. } => {
             format!("conditional_call_value_ir_{result_kind}")
         }
-        OpKind::Live => "live".into(),
+        OpKind::Live { .. } => "live".into(),
         // jtransform.py:1707,1718 — jit_merge_point / loop_header markers.
         OpKind::JitMergePoint { .. } => "jit_merge_point".into(),
         OpKind::LoopHeader { .. } => "loop_header".into(),

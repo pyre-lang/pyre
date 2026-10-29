@@ -380,7 +380,7 @@ impl<'a> Lowering<'a> {
             };
             let bound = match value {
                 LocalValue::One(v) | LocalValue::ItemAddr(v) => v,
-                LocalValue::Pair(v, _) => v,
+                LocalValue::Pair(v, _, _) => v,
                 LocalValue::SliceIter { items, .. } => items,
             };
             if bound == var {
@@ -2781,7 +2781,8 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         header: Variable,
-    ) -> (Variable, Variable) {
+    ) -> (Variable, Variable, Variable) {
+        let owner = header.clone();
         let bb_id = self.emit_bb(mir_bb);
         let data = self
             .graph
@@ -2816,7 +2817,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         });
-        (data, len)
+        (data, len, owner)
     }
 
     /// Items address of a resizable byte list
@@ -2890,6 +2891,7 @@ impl<'a> Lowering<'a> {
                     .to_string(),
             ));
         }
+        let owner = list.clone();
         let data = self.emit_list_items_ccharp(mir_bb, list.clone());
         let bb_id = self.emit_bb(mir_bb);
         // `<Vec<u8>>::len()` on a `SomeList` receiver is `__len`
@@ -2909,6 +2911,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         });
+        self.capture_window_owner_of_var(&owner, Some(owner.clone()));
         Ok((data, len))
     }
 
@@ -2995,7 +2998,7 @@ impl<'a> Lowering<'a> {
                 continue;
             };
             match value {
-                LocalValue::Pair(ptr, len) if ptr == var => return Some(len.clone()),
+                LocalValue::Pair(ptr, len, _) if ptr == var => return Some(len.clone()),
                 LocalValue::One(ptr) if ptr == var => {
                     let shadow = self.len_shadow.get(local).copied().flatten()?;
                     match self.local_var.get(shadow).and_then(|slot| slot.as_ref()) {
@@ -3047,32 +3050,59 @@ impl<'a> Lowering<'a> {
         header
     }
 
-    /// `rffi.charpsize2str` / `charp2str`: a raw `*mut u8` argument of a
-    /// function that returns a byte list or a `Result` whose `Ok` payload is one
-    /// is `CCHARP`, using the same predicate the callee's Input uses
-    /// (`tyref_raw_u8_ptr_param_is_ccharp`). Stamp the actual so
-    /// `getcalldescr` sees Int-kind, matching the unique graph Input.
-    pub(in crate::front::mir) fn coerce_ccharp_byte_list_call_args(
+    /// A raw `*u8` argument is `CCHARP`. Stamp an already-int actual so
+    /// `getcalldescr` sees Int-kind, matching the callee Input.
+    /// FunDecl inputs and the operand place type both count: a
+    /// `monomorphize:false` TypeVar on the decl still has a `*mut u8`
+    /// place, and a residual whose `CallKind` is not `FunId::Regular`
+    /// still has that place.
+    ///
+    /// A GC-ref actual (`cast_ptr_to_adr` / `__cast_address_intrinsic`)
+    /// stays that Address: `<*mut u8>::add` inside an items-base accessor
+    /// aliases to the header, and converting it to CCHARP would make the
+    /// return arm Int beside a GC `null_mut`. Window callees that return
+    /// `Vec<u8>` (`charpsize2str`) still `rffi.cast` the header.
+    pub(in crate::front::mir) fn coerce_ccharp_call_args(
         &mut self,
         mir_bb: usize,
         reg: &RegularCall,
         mut args: Vec<Variable>,
+        arg_tys: &[Option<TyRef>],
     ) -> Vec<Variable> {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return args;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return args;
-        };
-        let ret_is_u8_list = tyref_returns_u8_list(&fd.signature.output, self.llbc);
-        if !ret_is_u8_list {
-            return args;
+        let mut stamp = vec![false; args.len()];
+        let mut convert_window = false;
+        if let CallKind::Fun(FunId::Regular { id }) = &reg.kind
+            && let Some(fd) = self.llbc.fn_by_id(*id)
+        {
+            convert_window = tyref_returns_u8_list(&fd.signature.output, self.llbc);
+            for (i, ty) in fd.signature.inputs.iter().enumerate() {
+                if i < stamp.len() && tyref_is_raw_u8_ptr(ty, self.llbc) {
+                    stamp[i] = true;
+                }
+            }
         }
-        for (i, ty) in fd.signature.inputs.iter().enumerate() {
-            if i < args.len() && tyref_raw_u8_ptr_param_is_ccharp(ty, ret_is_u8_list, self.llbc) {
+        for (i, ty) in arg_tys.iter().enumerate() {
+            if i < stamp.len()
+                && ty
+                    .as_ref()
+                    .is_some_and(|ty| tyref_is_raw_u8_ptr(ty, self.llbc))
+            {
+                stamp[i] = true;
+            }
+        }
+        for (i, should) in stamp.iter().enumerate() {
+            if !*should {
+                continue;
+            }
+            // Stamp only an int-kind source (`rffi.py` `CCHARP`). A
+            // Ref-banked actual (`*c_char` / GC start) `rffi.cast`s,
+            // even if a CCHARP stamp was applied without converting.
+            if self.var_is_int_kind(&args[i]) {
                 let coerced = self.ensure_window_ccharp(mir_bb, args[i].clone());
                 stamp_as_ccharp(&coerced);
                 args[i] = coerced;
+            } else if convert_window || !graph_is_items_block_base_accessor(&self.graph.name) {
+                args[i] = self.emit_gc_ref_as_ccharp(mir_bb, args[i].clone());
             }
         }
         args
@@ -3226,7 +3256,8 @@ impl<'a> Lowering<'a> {
         if let PlaceKind::Local(local) = place.kind {
             let var = self.resolve_place(mir_bb, place.clone())?;
             if self.local_holds_str_view(local as usize) || self.var_is_str_repr(&var) {
-                let (ptr, len) = self.emit_str_to_window(mir_bb, var);
+                let (ptr, len, owner) = self.emit_str_to_window(mir_bb, var);
+                self.bind_window_owner_shadow(local as usize, Some(owner));
                 return Ok(Some((self.ensure_window_ccharp(mir_bb, ptr), len)));
             }
             return Ok(Some(self.owner_to_window(mir_bb, var, Some(&place.ty))?));
@@ -3376,7 +3407,8 @@ impl<'a> Lowering<'a> {
             || self.var_has_str_value_type(&var)
             || src_ty.is_some_and(|ty| tyref_is_w1_str(ty, self.llbc))
         {
-            let (ptr, len) = self.emit_str_to_window(mir_bb, var);
+            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, var.clone());
+            self.capture_window_owner_of_var(&var, Some(owner));
             return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
         }
         if self.list_view_local_of_var(&var).is_some() {
@@ -3644,7 +3676,9 @@ impl<'a> Lowering<'a> {
             } else {
                 args[0].clone()
             };
-            let (ptr, len) = self.emit_str_to_window(mir_bb, header);
+            let (ptr, len, owner) = self.emit_str_to_window(mir_bb, header.clone());
+            self.capture_window_owner_of_var(&args[0], Some(owner.clone()));
+            self.capture_window_owner_of_var(&header, Some(owner));
             return Ok((self.ensure_window_ccharp(mir_bb, ptr), len));
         }
         if args.len() == 1
@@ -4244,7 +4278,8 @@ impl<'a> Lowering<'a> {
                 if let Some(len) = self.window_len_companion(bytes) {
                     (self.ensure_window_ccharp(mir_bb, bytes.clone()), len, None)
                 } else if self.var_is_str_repr(bytes) || self.var_has_str_value_type(bytes) {
-                    let (data, len) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    let (data, len, owner) = self.emit_str_to_window(mir_bb, bytes.clone());
+                    self.capture_window_owner_of_var(bytes, Some(owner));
                     (data, len, Some(bytes.clone()))
                 } else {
                     return Ok(false);
@@ -4420,6 +4455,7 @@ impl<'a> Lowering<'a> {
                     mapped[0].clone(),
                     &ok_owner,
                     ValueType::Str,
+                    false,
                 );
                 stamp_as_rstr_str(&payload);
                 payload
@@ -4680,6 +4716,7 @@ impl<'a> Lowering<'a> {
                 pure: false,
             },
         });
+        stamp_raw_u8_ccharp(&res, elem_ty, self.llbc);
         res
     }
 
@@ -5464,9 +5501,10 @@ impl<'a> Lowering<'a> {
             || self
                 .typed_items_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
                 .is_some()
-            || self
-                .u8_slice_elem_ptr_add(reg, args_len, arg_locals, first_arg_ty, dest_local)
-                .is_some()
+        // `u8_slice_elem_ptr_add` also matches a STR-view `as_ptr().add`.
+        // `try_lower_byte_view_ptr_add` plants `__string_byte_getitem` on
+        // the STR (`ll_stritem_nonneg`); that intercept must win so the
+        // header is not `rffi.cast` to CCHARP first.
     }
 
     /// `core::ptr::write` of a Copy scalar or thin pointer.  An aggregate
@@ -6684,6 +6722,31 @@ impl<'a> Lowering<'a> {
                 "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr"
             )
         })
+    }
+
+    /// Window `as_ptr` / `as_mut_ptr` of a raw `*u8` dest is CCHARP
+    /// (`rffi.py` `CCHARP`). A one-word STR view stays STR
+    /// (`__string_byte_getitem`).
+    pub(in crate::front::mir) fn stamp_pair_window_as_ptr_ccharp(
+        &self,
+        dest_ty: &TyRef,
+        value: &Variable,
+    ) {
+        if !tyref_is_raw_u8_ptr(dest_ty, self.llbc) {
+            return;
+        }
+        let untyped = value.concretetype().is_none();
+        if !(untyped || self.var_is_int_kind(value)) {
+            return;
+        }
+        if !self
+            .local_var
+            .iter()
+            .any(|slot| matches!(slot.as_ref(), Some(LocalValue::Pair(ptr, _, _)) if ptr == value))
+        {
+            return;
+        }
+        stamp_as_ccharp(value);
     }
 
     /// `core::hint::must_use(value)` — the identity wrapper

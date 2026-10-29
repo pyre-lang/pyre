@@ -404,12 +404,12 @@ fn alloc_varsize_with_gc_header_immortal_zeroed_flag(
 /// `payload` must be a live pointer from that allocator, and `payload_size`
 /// must be the size passed at allocation.
 #[majit_macros::dont_look_inside]
-pub unsafe fn dealloc_varsize_with_gc_header(payload: *mut u8, payload_size: usize) {
+pub unsafe fn dealloc_varsize_with_gc_header(payload: GCREF, payload_size: usize) {
     if payload.is_null() {
         return;
     }
     let layout = varsize_immortal_layout(payload_size).expect("dealloc_varsize_with_gc_header");
-    unsafe { std::alloc::dealloc(payload.sub(GcHeader::SIZE), layout) };
+    unsafe { std::alloc::dealloc((payload as *mut u8).sub(GcHeader::SIZE), layout) };
 }
 
 fn alloc_with_gc_header_flags<T>(value: T, header: GcHeader) -> *mut T {
@@ -569,7 +569,7 @@ mod tests {
             assert!((*hdr).has_flag(GcFlags::GCFLAG_NO_HEAP_PTRS));
             assert!((*hdr).has_flag(GcFlags::GCFLAG_TRACK_YOUNG_PTRS));
             assert_eq!(*(p as *const u64), 0x1111_2222_3333_4444);
-            dealloc_varsize_with_gc_header(p, 16);
+            dealloc_varsize_with_gc_header(p.cast(), 16);
         }
     }
 

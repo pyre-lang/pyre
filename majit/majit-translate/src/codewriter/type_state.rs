@@ -2081,7 +2081,7 @@ mod tests {
             .operations
             .push(SpaceOperation {
                 result: None,
-                kind: OpKind::Live,
+                kind: OpKind::live(),
             });
         let _input = link_to_signed_successor(&mut graph, &src);
         graph.block_mut(graph.startblock).exitswitch =
@@ -2091,7 +2091,7 @@ mod tests {
 
         let ops = &graph.block(graph.startblock).operations;
         assert!(
-            matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)),
+            matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live { .. })),
             "the trailing live op stays last so flatten still emits catch_exception"
         );
         let cast_at = ops

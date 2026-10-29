@@ -925,13 +925,14 @@ fn field_spelling_lltype(
         return fat;
     }
     if let Some(pointee) = peel_one_pointer(spelling) {
-        // `get_type_flag("*const u8")` is an unsigned int word. A `*mut u8`
-        // or `*mut i8` inside a Raw owner is that same address
-        // (`addrinfo.ai_canonname`). A mutable byte pointer in a managed
-        // owner stays the Ref erasure below.
-        if matches!(pointee.as_str(), "u8" | "i8")
-            && (spelling.starts_with("*const ") || parent_gckind == GcKind::Raw)
-        {
+        // `rffi.py` `CCHARP`: a raw `*u8` field is `Ptr(Array(Char,
+        // nolength))` in any owner. A GC struct may hold a raw `char *`.
+        // Size stays one word. `*mut i8` inside a Raw owner stays Address
+        // (`addrinfo.ai_canonname`).
+        if pointee == "u8" {
+            return crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone();
+        }
+        if pointee == "i8" && (spelling.starts_with("*const ") || parent_gckind == GcKind::Raw) {
             return LowLevelType::Address;
         }
         return pointer_field_lltype(registry, layouts, &pointee, building);
@@ -980,10 +981,10 @@ fn pointer_field_lltype(
     if is_string_spelling(pointee) {
         return crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
     }
-    // `*mut u8` / `*mut i8` in a managed owner stay the Ref erasure.
-    // Raw owners and `*const` byte pointers return Address above.
+    // `*mut i8` in a managed owner stays the Ref erasure. `*mut u8` is
+    // `rffi.py` `CCHARP` in `field_spelling_lltype` for any owner.
     // A wider scalar pointer is the raw address word.
-    if matches!(pointee, "u8" | "i8") {
+    if pointee == "i8" {
         return crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
     }
     if let Some(scalar) = scalar_lltype(pointee) {
@@ -4174,9 +4175,15 @@ impl Bookkeeper {
         // and `_get_mapdict_map` `raw_load`s item 0. A classdef-less
         // Instance here made `getitem` of that tuple feed `SomeInstance`
         // into `raw_load`, and `pairtype.rs` has no InstanceRepr→Signed
-        // convert. A byte pointer (`*mut u8` / `*mut i8`) stays the
-        // classdef-less Ref instance: pyre erases a GC reference to
-        // `*mut u8`.
+        // convert.
+        // `rffi.py` `CCHARP`: a raw `*u8` / `CCHARP` field is
+        // `lltype_to_annotation(CCHARP)`, same seed `derive_subject_inputcells`
+        // uses for a CCHARP Input.
+        if t == "CCHARP" || t.ends_with("::CCHARP") || t == "*mut u8" || t == "*const u8" {
+            return crate::translator::rtyper::llannotation::lltype_to_annotation(
+                crate::translator::rtyper::lltypesystem::rffi::CCHARP.clone(),
+            );
+        }
         if let Some(pointee) = t
             .strip_prefix("*const ")
             .or_else(|| t.strip_prefix("*mut "))
@@ -9263,6 +9270,92 @@ mod tests {
     }
 
     #[test]
+    fn gc_owner_mut_u8_field_lays_out_as_ccharp() {
+        use crate::front::StructFieldRegistry;
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+        use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+
+        let owner = "c3survey::GcHolder";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields
+            .insert(owner.to_string(), vec![("data".into(), "*mut u8".into())]);
+        let registry = Rc::new(reg);
+        bk.set_struct_fields(Rc::clone(&registry));
+
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Gc,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "data".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let layouts = cc.struct_layouts_handle();
+        bk.set_struct_layouts(layouts.clone());
+
+        let mut building = HashMap::new();
+        let container = owner_ll_container(&registry, &layouts, owner, &mut building)
+            .expect("GC owner lays out");
+        let LowLevelType::Struct(st) = container else {
+            panic!("GC owner is a Struct, got {container:?}");
+        };
+        assert_eq!(st._gckind, GcKind::Gc);
+        assert_eq!(
+            st.getattr_field_type("data").as_ref(),
+            Some(&*CCHARP),
+            "GC-owner *mut u8 field lays out as rffi.CCHARP"
+        );
+
+        let projected = bk.project_struct_field_type("*mut u8");
+        let SomeValue::Ptr(p) = &projected else {
+            panic!("*mut u8 annotates as SomePtr(CCHARP), got {projected:?}");
+        };
+        assert_eq!(
+            LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone())),
+            *CCHARP,
+            "*mut u8 annotates as SomePtr(CCHARP)"
+        );
+
+        let cd = bk
+            .getuniqueclassdef_for_struct_root(owner)
+            .expect("GC owner registers");
+        let attr = cd
+            .borrow()
+            .attrs
+            .get("data")
+            .expect("data attr")
+            .s_value
+            .clone();
+        let SomeValue::Ptr(p) = &attr else {
+            panic!("GC-owner data attr is SomePtr(CCHARP), got {attr:?}");
+        };
+        assert_eq!(
+            LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone())),
+            *CCHARP,
+            "GC-owner data attr is SomePtr(CCHARP)"
+        );
+    }
+
+    #[test]
     fn option_some_payload_of_pointer_raw_struct_stays_ptr() {
         use crate::front::StructFieldRegistry;
         use crate::translator::rtyper::lltypesystem::lltype::GcKind;
@@ -12978,7 +13071,20 @@ mod tests {
                 bk.project_struct_field_type(spelling)
             );
         }
-        for spelling in ["*mut u8", "*const u8", "*mut i8"] {
+        for spelling in ["*mut u8", "*const u8"] {
+            use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+            use crate::translator::rtyper::lltypesystem::rffi::CCHARP;
+            let projected = bk.project_struct_field_type(spelling);
+            let SomeValue::Ptr(p) = &projected else {
+                panic!("{spelling} is CCHARP, got {projected:?}");
+            };
+            assert_eq!(
+                LowLevelType::Ptr(Box::new(p.ll_ptrtype.clone())),
+                *CCHARP,
+                "{spelling} is CCHARP"
+            );
+        }
+        for spelling in ["*mut i8"] {
             assert!(
                 matches!(
                     bk.project_struct_field_type(spelling),

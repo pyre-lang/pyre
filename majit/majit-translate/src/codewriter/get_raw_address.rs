@@ -477,7 +477,7 @@ mod tests {
         );
         assert!(
             copy.iter_block_ops()
-                .any(|(_, op)| matches!(op.kind, OpKind::Live)),
+                .any(|(_, op)| matches!(op.kind, OpKind::Live { .. })),
             "copy_string_to_raw keepalive"
         );
 
