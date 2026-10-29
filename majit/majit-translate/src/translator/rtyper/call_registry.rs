@@ -658,8 +658,8 @@ impl CallRegistry {
     /// module segment that is never a registry root, so the
     /// membership gate filters them out.
     ///
-    /// Called once from `dual_gate_registry` after
-    /// `populate_call_registry_from_call_graphs`.
+    /// `populate_call_registry_from_call_graphs` calls this after
+    /// registering every entry (stubs included).
     pub fn seed_struct_root_method_members(&self) {
         let guard = self.bookkeeper.struct_fields.borrow();
         let Some(reg) = guard.as_ref() else {

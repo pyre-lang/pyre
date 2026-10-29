@@ -20,7 +20,10 @@ use crate::parse::CallPath;
 #[derive(Serialize, Deserialize)]
 pub struct JitCodeIndex {
     pub names: Vec<String>,
-    pub paths: Vec<String>,
+    /// Graph identity: `call.py CallControl.get_jitcode` keys by graph,
+    /// `description.py FunctionDesc.cachedgraph` by specialization.
+    /// `None` is a jitcode minted without a graph key.
+    pub paths: Vec<Option<CallPath>>,
     pub offsets: Vec<u32>,
     pub reachable_symbolic_residuals: Vec<i64>,
     pub reachable_symbolic_offsets: Vec<u32>,
@@ -40,7 +43,7 @@ pub struct ReachableSymbolicResidualTable {
 impl JitCodeIndex {
     pub fn encode(
         jitcodes: &[Arc<JitCode>],
-        paths: Vec<String>,
+        paths: Vec<Option<CallPath>>,
         reachable: ReachableSymbolicResidualTable,
     ) -> bincode::Result<(Self, Vec<u8>)> {
         assert_eq!(paths.len(), jitcodes.len());
@@ -172,10 +175,11 @@ pub struct CompiledJitDriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parse::GraphSpecialization;
 
     fn index_bytes(
         names: Vec<String>,
-        paths: Vec<String>,
+        paths: Vec<Option<CallPath>>,
         offsets: Vec<u32>,
         residuals: Vec<i64>,
         residual_offsets: Vec<u32>,
@@ -184,18 +188,30 @@ mod tests {
         bincode::serialize(&(names, paths, offsets, residuals, residual_offsets, visited)).unwrap()
     }
 
+    fn empty_reachable(len: usize) -> ReachableSymbolicResidualTable {
+        ReachableSymbolicResidualTable {
+            values: Vec::new(),
+            offsets: vec![0; len + 1],
+            visited: vec![0; len],
+        }
+    }
+
     #[test]
     fn indexed_format_preserves_existing_tuple_wire_format() {
+        let paths = vec![
+            Some(CallPath::from_segments(["a", "same"])),
+            Some(CallPath::from_segments(["b", "same"])),
+        ];
         let old = index_bytes(
             vec!["same".to_string(); 2],
-            vec!["a::same".to_string(), "b::same".to_string()],
+            paths.clone(),
             vec![0_u32, 1, 2],
             vec![4, 9],
             vec![0, 2, 2],
             vec![3, 1],
         );
         let index = JitCodeIndex::decode(&old, &[0, 0]).unwrap();
-        assert_eq!(index.paths, ["a::same", "b::same"]);
+        assert_eq!(index.paths, paths);
         assert_eq!(index.reachable_symbolic_residuals, [4, 9]);
         assert_eq!(index.reachable_symbolic_visited, [3, 1]);
         assert_eq!(
@@ -207,10 +223,45 @@ mod tests {
     }
 
     #[test]
+    fn encode_keeps_regular_and_access_direct_paths_distinct() {
+        let regular = CallPath::from_segments(["owner", "f"]);
+        let access_direct = CallPath {
+            segments: regular.segments.clone(),
+            specialization: GraphSpecialization::AccessDirect,
+        };
+        // Same segments, different FunctionDesc.cachedgraph keys. A Regular
+        // graph whose last segment is already the alt_name spelling shares
+        // display_name with the AccessDirect copy; the frozen column stores
+        // the CallPath pair so they stay distinct.
+        assert_eq!(
+            access_direct.display_name(),
+            CallPath::from_segments(["owner", "f__AccessDirect_None"]).display_name()
+        );
+        assert_ne!(regular, access_direct);
+
+        let a = Arc::new(JitCode::new("f"));
+        a.set_index(0);
+        let b = Arc::new(JitCode::new("f__AccessDirect_None"));
+        b.set_index(1);
+        let (index, bodies) = JitCodeIndex::encode(
+            &[a, b],
+            vec![Some(regular.clone()), Some(access_direct.clone())],
+            empty_reachable(2),
+        )
+        .unwrap();
+        let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
+        assert_eq!(decoded.paths, [Some(regular), Some(access_direct)]);
+        assert_ne!(decoded.paths[0], decoded.paths[1]);
+    }
+
+    #[test]
     fn stale_index_without_residual_table_is_rejected() {
         let old = bincode::serialize(&(
             vec!["same".to_string(); 2],
-            vec!["a::same".to_string(), "b::same".to_string()],
+            vec![
+                Some(CallPath::from_segments(["a", "same"])),
+                Some(CallPath::from_segments(["b", "same"])),
+            ],
             vec![0_u32, 1, 2],
         ))
         .unwrap();
@@ -222,7 +273,7 @@ mod tests {
         for offsets in [vec![], vec![1_u32, 2], vec![0, 3], vec![0, 2, 1]] {
             let bytes = index_bytes(
                 vec!["one".to_string()],
-                vec![String::new()],
+                vec![None],
                 offsets,
                 Vec::new(),
                 vec![0, 0],
@@ -234,7 +285,7 @@ mod tests {
         // constant while the flat table holds two.
         let mismatched_len = index_bytes(
             vec!["one".to_string()],
-            vec![String::new()],
+            vec![None],
             vec![0, 0],
             vec![7, 9],
             vec![0, 1],
@@ -244,7 +295,7 @@ mod tests {
         // `last == values.len()`, but the span is not monotonic.
         let non_monotonic = index_bytes(
             vec!["a".to_string(), "b".to_string()],
-            vec![String::new(), String::new()],
+            vec![None, None],
             vec![0, 0, 0],
             vec![9],
             vec![0, 2, 1],
@@ -253,7 +304,7 @@ mod tests {
         assert!(JitCodeIndex::decode(&non_monotonic, &[]).is_err());
         let bad_origin = index_bytes(
             vec!["one".to_string()],
-            vec![String::new()],
+            vec![None],
             vec![0, 0],
             vec![5],
             vec![1, 1],
@@ -262,7 +313,7 @@ mod tests {
         assert!(JitCodeIndex::decode(&bad_origin, &[]).is_err());
         let bad_visited = index_bytes(
             vec!["one".to_string()],
-            vec![String::new()],
+            vec![None],
             vec![0, 0],
             Vec::new(),
             vec![0, 0],

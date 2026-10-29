@@ -17,7 +17,9 @@ pub use majit_jitcode::artifacts::{JitCodeIndex, ReachableSymbolicResidualTable}
 /// has no such table and is rejected rather than decoded as garbage.
 /// Version 3 moves `JitCode.calldescr` to the header (`jitcode.py`
 /// `__init__`), so a version-2 body blob is a different bincode layout.
-const ARTIFACT_VERSION: u32 = 3;
+/// Version 4 freezes each jitcode's `CallPath` (segments + specialization)
+/// instead of its display name.
+const ARTIFACT_VERSION: u32 = 4;
 
 /// Encoded bodies remain bytes until requested, so this envelope is Send+Sync
 /// without publishing translation-time graphs across threads.
@@ -35,9 +37,9 @@ impl EmbeddedArtifacts {
     pub fn from_pipeline(
         pipeline: &crate::pipeline::ProgramPipelineResult,
     ) -> bincode::Result<Self> {
-        let mut paths = vec![String::new(); pipeline.jitcodes.len()];
+        let mut paths = vec![None; pipeline.jitcodes.len()];
         for (path, jitcode) in &pipeline.jitcodes_by_path {
-            paths[jitcode.index()] = path.display_name();
+            paths[jitcode.index()] = Some(path.clone());
         }
         let reachable = reachable_symbolic_residual_table(&pipeline.jitcodes, &pipeline.descrs);
         let (index, bodies) = JitCodeIndex::encode(&pipeline.jitcodes, paths, reachable)?;
@@ -222,8 +224,14 @@ mod tests {
             ..Default::default()
         });
         let reachable = reachable_symbolic_residual_table(std::slice::from_ref(&code), &[]);
-        let (index, bodies) =
-            JitCodeIndex::encode(&[code], vec!["module::helper".into()], reachable).unwrap();
+        let (index, bodies) = JitCodeIndex::encode(
+            &[code],
+            vec![Some(crate::parse::CallPath::from_segments([
+                "module", "helper",
+            ]))],
+            reachable,
+        )
+        .unwrap();
         let mut original = EmbeddedArtifacts {
             version: ARTIFACT_VERSION,
             index,
@@ -237,7 +245,12 @@ mod tests {
         assert_eq!(codes[0].name, "helper");
         assert_eq!(codes[0].index(), 0);
         assert_eq!(codes[0].body().constants_i, [17, -4]);
-        assert_eq!(loaded.index.paths, ["module::helper"]);
+        assert_eq!(
+            loaded.index.paths,
+            [Some(crate::parse::CallPath::from_segments([
+                "module", "helper"
+            ]))]
+        );
         assert_eq!(loaded.index.reachable_symbolic_visited, [1]);
         assert!(loaded.index.reachable_symbolic_residuals.is_empty());
         assert_eq!(loaded.symbolic_fnaddrs, original.symbolic_fnaddrs);
@@ -404,7 +417,7 @@ mod tests {
         assert_eq!(row(4), (Vec::<i64>::new(), 1));
         assert_eq!(row(5), (Vec::<i64>::new(), 1));
 
-        let paths = vec![String::new(); jitcodes.len()];
+        let paths = vec![None; jitcodes.len()];
         let (index, bodies) = JitCodeIndex::encode(&jitcodes, paths, table.clone()).unwrap();
         let decoded = JitCodeIndex::decode(&bincode::serialize(&index).unwrap(), &bodies).unwrap();
         assert_eq!(

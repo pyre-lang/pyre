@@ -27,6 +27,7 @@ use majit_jitcode::artifacts::CompiledJitDriver;
 use majit_jitcode::jitcode::{BhDescr, DescrTable, JitCode};
 
 use majit_jitcode::artifacts::JitCodeIndex;
+use majit_jitcode::parse::{CallPath, GraphSpecialization};
 
 /// Runtime-frozen canonical JitCode.
 ///
@@ -303,7 +304,12 @@ static INDIRECTCALLTARGET_BY_FNADDR: LazyLock<indexmap::IndexMap<usize, usize>> 
         });
         let mut by_fnaddr = indexmap::IndexMap::with_capacity(entries.len());
         let mut declined: Vec<usize> = Vec::new();
-        let paths = &jitcode_index().paths;
+        let path_names: Vec<String> = jitcode_index()
+            .paths
+            .iter()
+            .map(|path| path.as_ref().map(|p| p.display_name()).unwrap_or_default())
+            .collect();
+        let paths = path_names.as_slice();
         let impls = pyre_interpreter::dyn_impl_vtables();
         let slot_offsets = vtable_method_slot_offsets();
         for (index, build_fnaddr) in entries {
@@ -683,18 +689,19 @@ fn compute_named_jitcode_index(name: &str) -> Option<usize> {
     first
 }
 
-/// Resolve a JitCode by the graph key the codewriter allocated it under,
-/// spelled as `CallPath::display_name` — the `::`-joined segments, with
-/// `ACCESS_DIRECT_ALT_SUFFIX` on an AccessDirect copy so it stays distinct
-/// from its Regular origin, e.g. `pyre_interpreter::opcode_ops::compare_value`.
+/// Resolve a JitCode by the Regular graph's `CallPath::canonical_key` —
+/// the `::`-joined segments. Production `pathed_*` literals name Regular
+/// graphs; AccessDirect copies of the same segments live in a sibling map,
+/// matching `description.py FunctionDesc.cachedgraph`
+/// (`FunctionDesc._cache[key]`).
 ///
 /// `CallControl::get_jitcode` keys `self.jitcodes` by `CallPath`, mirroring
 /// `call.py get_jitcode`'s graph-keyed dict, and takes the JitCode's `name`
 /// from the path's last segment only so dumps stay readable. Two graphs may
 /// therefore share a name — 238 groups do — and the by-name resolver has no
 /// way to tell them apart, so it panics rather than pick a body. Resolving by
-/// the allocation key has no such ambiguity: `IndexMap<CallPath, _>` makes it
-/// unique by construction.
+/// the allocation key has no such ambiguity: each specialization map is unique
+/// by construction.
 ///
 /// `None` when the pipeline holds no such graph, so a caller can decline
 /// rather than assume the helper was compiled.
@@ -702,37 +709,60 @@ pub(crate) fn compute_pathed_jitcode_index(canonical_path: &str) -> Option<usize
     if canonical_path.is_empty() {
         return None;
     }
-    PATHED_JITCODE_INDEX.get(canonical_path).copied()
+    PATHED_JITCODE_INDEX.regular.get(canonical_path).copied()
 }
 
-/// Process-wide reverse lookup of `CallControl.jitcodes` by
-/// `CallPath::display_name`.
-///
-/// RPython keeps one dict on `CallControl` (`call.py get_jitcode`); pyre's
-/// frozen `jitcode_index().paths` is that dict's key column, allocation-aligned
-/// with `ALL_JITCODES`. This map is the reverse lookup, built once, shared by
-/// every thread. Empty paths are omitted: those jitcodes were minted without a
-/// graph key. A duplicate path is a broken `IndexMap<CallPath, _>` invariant.
-static PATHED_JITCODE_INDEX: LazyLock<indexmap::IndexMap<&'static str, usize>> =
-    LazyLock::new(|| {
-        let paths = &jitcode_index().paths;
-        let mut by_path = indexmap::IndexMap::with_capacity(paths.len());
-        for (index, path) in paths.iter().enumerate() {
-            if path.is_empty() {
-                continue;
+/// Reverse map of frozen `JitCodeIndex.paths`, one `IndexMap` per
+/// `GraphSpecialization`. Keys are `CallPath::canonical_key()`.
+struct PathedJitcodeIndex {
+    regular: indexmap::IndexMap<String, usize>,
+    /// Split from `regular` the way `FunctionDesc._cache[key]` splits
+    /// `(AccessDirect, None)` from every other key. Production `pathed_*`
+    /// lookups read `regular`; this map keeps the AccessDirect copy of
+    /// `owner::f` from colliding with a Regular last segment of the same
+    /// spelling.
+    #[cfg_attr(not(test), allow(dead_code))]
+    access_directly: indexmap::IndexMap<String, usize>,
+}
+
+fn build_pathed_jitcode_index(paths: &[Option<CallPath>]) -> PathedJitcodeIndex {
+    let mut index = PathedJitcodeIndex {
+        regular: indexmap::IndexMap::with_capacity(paths.len()),
+        access_directly: indexmap::IndexMap::with_capacity(paths.len()),
+    };
+    for (jitcode_index, path) in paths.iter().enumerate() {
+        let Some(path) = path else {
+            continue;
+        };
+        let map = match path.specialization {
+            GraphSpecialization::Regular => &mut index.regular,
+            GraphSpecialization::AccessDirect => &mut index.access_directly,
+        };
+        match map.entry(path.canonical_key()) {
+            indexmap::map::Entry::Vacant(slot) => {
+                slot.insert(jitcode_index);
             }
-            match by_path.entry(path.as_str()) {
-                indexmap::map::Entry::Vacant(slot) => {
-                    slot.insert(index);
-                }
-                indexmap::map::Entry::Occupied(_) => panic!(
-                    "pyre-jit-trace: build-time pipeline has more than one jitcode \
-                     under path `{path}`; CallControl.jitcodes keys each graph once"
-                ),
-            }
+            indexmap::map::Entry::Occupied(_) => panic!(
+                "pyre-jit-trace: build-time pipeline has more than one jitcode \
+                 under path `{}`; CallControl.jitcodes keys each graph once",
+                path.display_name()
+            ),
         }
-        by_path
-    });
+    }
+    index
+}
+
+/// Process-wide reverse lookup of `CallControl.jitcodes`.
+///
+/// RPython keeps one dict on `CallControl` (`call.py get_jitcode`);
+/// `description.py FunctionDesc.cachedgraph` splits the same segments under
+/// different specialization keys. Frozen `jitcode_index().paths` is that pair,
+/// allocation-aligned with `ALL_JITCODES`. This map is the reverse lookup,
+/// built once, shared by every thread. `None` paths are omitted: those jitcodes
+/// were minted without a graph key. A duplicate key in one specialization map
+/// is a broken `IndexMap` invariant.
+static PATHED_JITCODE_INDEX: LazyLock<PathedJitcodeIndex> =
+    LazyLock::new(|| build_pathed_jitcode_index(&jitcode_index().paths));
 
 /// The JitCode allocated under `canonical_path`, or `None` when the build-time
 /// pipeline does not contain that graph. See [`compute_pathed_jitcode_index`].
@@ -4504,30 +4534,58 @@ mod tests {
 
     #[test]
     fn pathed_lookup_is_the_process_wide_callcontrol_dict() {
-        let path: &'static str = jitcode_index()
+        let path = jitcode_index()
             .paths
             .iter()
-            .find(|path| !path.is_empty())
-            .expect("at least one graph-backed JitCode")
-            .as_str();
-        let first = pathed_runtime_jitcode_cached(path).expect("canonical path");
-        let again = pathed_runtime_jitcode_cached(path).expect("same path again");
+            .find_map(|path| {
+                let path = path.as_ref()?;
+                (path.specialization == GraphSpecialization::Regular).then(|| path.canonical_key())
+            })
+            .expect("at least one Regular graph-backed JitCode");
+        let first = pathed_runtime_jitcode_cached(&path).expect("canonical path");
+        let again = pathed_runtime_jitcode_cached(&path).expect("same path again");
+        let lookup = path.clone();
         let other = std::thread::spawn(move || {
-            pathed_runtime_jitcode_cached(path).expect("canonical path on another thread")
+            pathed_runtime_jitcode_cached(&lookup).expect("canonical path on another thread")
         })
         .join()
         .unwrap();
         assert!(Arc::ptr_eq(&first, &again));
         assert!(Arc::ptr_eq(&first, &other));
         assert_eq!(
-            compute_pathed_jitcode_index(path),
-            jitcode_index()
-                .paths
-                .iter()
-                .position(|candidate| candidate == path)
+            compute_pathed_jitcode_index(&path),
+            jitcode_index().paths.iter().position(|candidate| {
+                candidate.as_ref().is_some_and(|p| {
+                    p.specialization == GraphSpecialization::Regular && p.canonical_key() == path
+                })
+            })
         );
         assert!(pathed_runtime_jitcode_cached("__missing_jitcode_path__").is_none());
         assert!(compute_pathed_jitcode_index("").is_none());
+    }
+
+    #[test]
+    fn pathed_index_keeps_a_regular_access_direct_suffix_name_apart_from_the_access_direct_copy() {
+        let regular_suffix = CallPath::from_segments(["owner", "f__AccessDirect_None"]);
+        let mut access_direct = CallPath::from_segments(["owner", "f"]);
+        access_direct.specialization = GraphSpecialization::AccessDirect;
+        let regular = CallPath::from_segments(["owner", "f"]);
+        let index = build_pathed_jitcode_index(&[
+            Some(regular_suffix),
+            Some(access_direct),
+            None,
+            Some(regular),
+        ]);
+        assert_eq!(index.regular.get("owner::f__AccessDirect_None"), Some(&0));
+        assert_eq!(index.regular.get("owner::f"), Some(&3));
+        assert_eq!(index.access_directly.get("owner::f"), Some(&1));
+    }
+
+    #[test]
+    #[should_panic(expected = "more than one jitcode")]
+    fn pathed_index_panics_on_duplicate_regular_path() {
+        let path = CallPath::from_segments(["owner", "f"]);
+        let _ = build_pathed_jitcode_index(&[Some(path.clone()), Some(path)]);
     }
 
     #[test]

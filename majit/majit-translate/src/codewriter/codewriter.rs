@@ -226,9 +226,9 @@ impl CodeWriter {
         registry.set_trait_unique_impls(callcontrol.trait_unique_impls().clone());
         // Opt-in receiver-driven dispatch families (issue #346): mint
         // each registered trait's base ClassDef + impl subclasses BEFORE
-        // `seed_struct_root_method_members` below, so the method seeding
-        // attaches the impl methods onto the base-linked subclass and a
-        // `dyn Trait` receiver getattr resolves the impl MethodDesc
+        // populate's `seed_struct_root_method_members`, so the method
+        // seeding attaches the impl methods onto the base-linked subclass
+        // and a `dyn Trait` receiver getattr resolves the impl MethodDesc
         // family (attrfamily merge).  Empty for pyre production.
         registry.register_trait_families(callcontrol.trait_family_registrations());
         // PyPy's `Bookkeeper.compute_at_fixpoint` raises through to
@@ -264,17 +264,11 @@ impl CodeWriter {
                 panic!("populate_call_registry_from_call_graphs failed: {msg}");
             }
         }
-        // Mirror classdesc.py:606-618 — methods live in the class
-        // `__dict__`.  Install each registered `[.., Owner, method]`
-        // entry's function host on the interned `Owner` class object so
-        // `SomeInstance.getattr(method)` resolves to a bound MethodDesc
-        // instead of blocking.  AFTER populate (which seeds the unsafe-fn
-        // stubs internally) so the entry set is complete.
-        registry.seed_struct_root_method_members();
         // Issue #346: register the just-seeded impl-subclass methods into
-        // their ClassDef attr sources so a family-base / `dyn Trait`
-        // receiver getattr resolves the impl MethodDesc family via the
-        // attrfamily merge.  No-op for pyre production (no families).
+        // their ClassDef attr sources (`classdesc.py ClassDesc.find_source_for`)
+        // so a family-base / `dyn Trait` receiver getattr resolves the impl
+        // MethodDesc family via the attrfamily merge.  No-op for pyre
+        // production (no families).
         registry.populate_trait_family_base_attrs(callcontrol.trait_family_registrations());
         // RPython parity: `Translator.buildannotator()` /
         // `Translator.buildrtyper()` (`translator.py`) construct

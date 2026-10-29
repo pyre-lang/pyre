@@ -2588,7 +2588,7 @@ pub(crate) fn populate_call_registry_from_call_graphs(
     // and the caller Skips.  Seeding here — not before Pass 1 — keeps Pass 1's
     // `registry.alias()` invariant ("alias key already a canonical entry")
     // intact: the alias explosion has already landed, and neither Pass 2
-    // (lift) nor Pass 3 (class-member binding) calls `alias()`, so a
+    // (lift) nor `seed_struct_root_method_members` calls `alias()`, so a
     // verbatim single-key stub cannot collide.  `register_unsafe_fn_stubs`
     // is non-overwriting (skips keys the `function_graphs` pass already
     // registered) and idempotent.
@@ -2681,46 +2681,11 @@ pub(crate) fn populate_call_registry_from_call_graphs(
         }
         install_source_graph(registry, key, graph, entry, signature, body);
     }
-    // Pass 3 — make impl methods visible in their owner's class dict.
-    // RPython's ClassDesc reads methods straight off the class object
-    // (`classdesc.py find_source_for` → `cls.__dict__[name]`):
-    // a Python class object already carries its functions as members
-    // when annotation starts.  Pyre's struct-root class objects are
-    // minted with no members (`Bookkeeper::intern_class_by_qualname`),
-    // so a receiver method call — `CallTarget::Method` lowers to
-    // `getattr(recv, name)` + `simple_call`
-    // (`flowspace_adapter.rs:1357`) — found no attribute source and
-    // blocked.  Registering each `[owner, method]` registry entry's
-    // user-function HostObject as a class member completes the
-    // analogue: `find_source_for` imports it into the classdict as a
-    // Constant, and `s_get_value` binds it under the classdef
-    // (`bind_callables_under` → MethodDesc) whose `cachedgraph` hits
-    // the pass-2 prefill.  Owner names are gated on the struct-field
-    // registry (module and trait leaves are never type roots), and a
-    // same-named instance field wins — a function source for a field
-    // attribute would union-conflict in `generalize_attr`.
-    let bk = registry.bookkeeper();
-    for (key, _graph, entry, _signature, _body) in &pending {
-        // `CallPath::for_impl_method` splits the module-qualified owner
-        // ("pyframe::PyFrame" → [pyframe, PyFrame, method]), so the
-        // owner is the second-to-last segment.  Free-function paths
-        // ([module, foo]) put a module there, and modules are never
-        // type roots — the struct-field-registry gate filters them.
-        let segs = key.segments();
-        let [.., owner, method] = segs else {
-            continue;
-        };
-        if !bk.is_known_struct_root(owner) || bk.struct_root_has_field(owner, method) {
-            continue;
-        }
-        let class_host = bk.intern_class_by_qualname(owner);
-        if class_host.class_get(method).is_none() {
-            class_host.class_set(
-                method.clone(),
-                crate::flowspace::model::ConstValue::HostObject(entry.host_object.clone()),
-            );
-        }
-    }
+    // Methods live on the declaring class's dict
+    // (`classdesc.py ClassDesc.find_source_for` reads `cls.__dict__`).
+    // Each method is installed only on its declaration's class;
+    // `seed_struct_root_method_members` is the one place that does that.
+    registry.seed_struct_root_method_members();
     let store = function_graphs.clone();
     let globals = Rc::downgrade(registry);
     registry.set_getdesc(Rc::new(move |key| {
@@ -8457,7 +8422,6 @@ mod tests {
             Rc::ptr_eq(&inherent_entry, &identity_entry),
             "GraphStore aliases of one funcobj must share one FunctionDesc"
         );
-        registry.seed_struct_root_method_members();
         let class_host = registry.bookkeeper().intern_class_by_qualname(
             "pyre_object::dictmultiobject::object_key_for_checked::closure",
         );
@@ -8465,6 +8429,58 @@ mod tests {
             class_host.class_get("call_once").is_some(),
             "closure classdict must carry call_once after GraphStore alias sharing"
         );
+    }
+
+    /// Unrelated structs that share a leaf keep their own methods on
+    /// their own class (`classdesc.py ClassDesc.find_source_for` reads
+    /// `cls.__dict__`). The surviving bare-leaf field alias is a lookup
+    /// spelling, not a class to seed.
+    #[test]
+    fn populate_installs_each_same_leaf_struct_method_on_its_own_class() {
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let registry = std::rc::Rc::new(CallRegistry::new(ann.bookkeeper.clone()));
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "a::Foo".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
+        fields.fields.insert(
+            "b::Foo".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
+        fields.fields.insert(
+            "Foo".to_string(),
+            Vec::<crate::front::semantic::FieldRow>::new(),
+        );
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        let mut graphs = crate::codewriter::call::GraphStore::default();
+        let a_path = crate::parse::CallPath::for_impl_method("a::Foo", "m");
+        let b_path = crate::parse::CallPath::for_impl_method("b::Foo", "m");
+        graphs.insert(a_path.clone(), empty_return_graph("m"));
+        graphs.insert(b_path.clone(), empty_return_graph("m"));
+        populate_call_registry_from_call_graphs(&graphs, &[], &[], &[], &registry).unwrap();
+        let a_entry = registry
+            .lookup(&FunctionPathKey::from(&a_path))
+            .expect("a::Foo::m");
+        let b_entry = registry
+            .lookup(&FunctionPathKey::from(&b_path))
+            .expect("b::Foo::m");
+        let a_class = registry.bookkeeper().intern_class_by_qualname("a::Foo");
+        let b_class = registry.bookkeeper().intern_class_by_qualname("b::Foo");
+        assert_eq!(
+            a_class.class_get("m"),
+            Some(crate::flowspace::model::ConstValue::HostObject(
+                a_entry.host_object.clone()
+            )),
+        );
+        assert_eq!(
+            b_class.class_get("m"),
+            Some(crate::flowspace::model::ConstValue::HostObject(
+                b_entry.host_object.clone()
+            )),
+        );
+        let leaf = registry.bookkeeper().intern_class_by_qualname("Foo");
+        assert!(leaf.class_get("m").is_none());
     }
 
     /// An unsafe fn whose body never lowered still needs a FunctionDesc

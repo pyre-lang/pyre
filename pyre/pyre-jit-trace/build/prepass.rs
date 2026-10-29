@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v24";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v25";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -1777,9 +1777,9 @@ fn real_main() {
         // MetaInterpStaticData jitcodes store — same single-store model as
         // RPython warmspot.py `WarmRunnerDesc.__init__` `self.metainterp_sd.jitcodes =
         // codewriter.make_jitcodes()`.
-        let mut paths = vec![String::new(); frozen_jitcodes.len()];
+        let mut paths = vec![None; frozen_jitcodes.len()];
         for (path, jitcode) in &pipeline.jitcodes_by_path {
-            paths[jitcode.index()] = path.display_name();
+            paths[jitcode.index()] = Some(path.clone());
         }
         let reachable = majit_translate::artifacts::reachable_symbolic_residual_table(
             &frozen_jitcodes,
