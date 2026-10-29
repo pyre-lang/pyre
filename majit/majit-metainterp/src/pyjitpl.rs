@@ -3434,6 +3434,29 @@ impl<M: Clone> MetaInterp<M> {
         &self.staticdata.virtualref_info
     }
 
+    /// MiniMark traces `MemoryManager.alive_loops` dict values and,
+    /// from each live `JitCellToken`, `_keepalive_jitcell_tokens`.
+    fn live_jitcell_tokens(&self) -> Vec<Arc<JitCellToken>> {
+        let mut tokens = Vec::new();
+        self.memory_manager.for_each_alive(|token| {
+            tokens.push(Arc::clone(token));
+        });
+        // `history.py JitCellToken.record_jump_to` keeps the JUMP
+        // target alive through `_keepalive_jitcell_tokens` even after
+        // its own cell row is gone; follow that set to a fixed point.
+        let mut next = 0;
+        while next < tokens.len() {
+            let kept: Vec<Arc<JitCellToken>> = tokens[next].keepalive_tokens.lock().clone();
+            for token in kept {
+                if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
+                    tokens.push(token);
+                }
+            }
+            next += 1;
+        }
+        tokens
+    }
+
     /// framework.py `root_walker.walk_roots` parity for the JIT-side
     /// constant pool.
     ///
@@ -3480,30 +3503,24 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
             }
-            let tokens = entry.live_token().into_iter().chain(
-                entry
-                    .previous_tokens
-                    .iter()
-                    .filter_map(std::sync::Weak::upgrade),
-            );
-            for token in tokens {
-                let Some(clt) = token.compiled_loop_token() else {
-                    continue;
+        }
+        for token in self.live_jitcell_tokens() {
+            let Some(clt) = token.compiled_loop_token() else {
+                continue;
+            };
+            for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                    if let Some(fd) = descr.as_fail_descr() {
+                        fd.visit_rd_numb(&mut visitor);
+                    }
                 };
-                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
-                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
-                        if let Some(fd) = descr.as_fail_descr() {
-                            fd.visit_rd_numb(&mut visitor);
-                        }
-                    };
-                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
-                        for cell in store.iter() {
-                            visit_descr(&*cell.descr);
-                        }
-                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
-                        for descr in descrs {
-                            visit_descr(&**descr);
-                        }
+                if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                    for cell in store.iter() {
+                        visit_descr(&*cell.descr);
+                    }
+                } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                    for descr in descrs {
+                        visit_descr(&**descr);
                     }
                 }
             }
@@ -3612,79 +3629,55 @@ impl<M: Clone> MetaInterp<M> {
                         visit_pool(descr_pool, generation, is_minor, &mut visitor);
                     }
                 }
-                // `compile.py:ResumeGuardDescr._attrs_` traces `rd_consts` on
-                // every guard descr, and a bridge's descrs are reachable only
-                // through the backend: `assembler.py gcreftracers.append(tracer)`
-                // pins them on the loop token's `asmmemmgr_gcreftracers`
-                // (`model.py CompiledLoopToken`).  Walk those tracers so a
-                // bridge guard's pool is a root for the token's lifetime,
-                // the same way the root loop's descrs are reached above.
-                // Dynasm registers `FailDescrStore` (shared via
-                // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
-                // the other tracer kinds (GcTables) are rooted through
-                // the gcreftracer registry.
-                let mut tokens: Vec<std::sync::Arc<JitCellToken>> = entry
-                    .live_token()
-                    .into_iter()
-                    .chain(
-                        entry
-                            .previous_tokens
-                            .iter()
-                            .filter_map(std::sync::Weak::upgrade),
-                    )
-                    .collect();
-                // `history.py JitCellToken.record_jump_to` keeps the target
-                // of a JUMP alive through `_keepalive_jitcell_tokens` even
-                // after its own cell row is gone; follow that set to a fixed
-                // point so those tokens are walked with the ones above.
-                let mut next = 0;
-                while next < tokens.len() {
-                    let kept: Vec<std::sync::Arc<JitCellToken>> =
-                        tokens[next].keepalive_tokens.lock().clone();
-                    for token in kept {
-                        if !tokens.iter().any(|seen| Arc::ptr_eq(seen, &token)) {
-                            tokens.push(token);
-                        }
-                    }
-                    next += 1;
-                }
-                for token in &tokens {
-                    let Some(clt) = token.compiled_loop_token() else {
-                        continue;
+            }
+            // `compile.py ResumeGuardDescr._attrs_` traces `rd_consts` on
+            // every guard descr, and a bridge's descrs are reachable only
+            // through the backend: `assembler.py gcreftracers.append(tracer)`
+            // pins them on the loop token's `asmmemmgr_gcreftracers`
+            // (`model.py CompiledLoopToken`).  Walk those tracers so a
+            // bridge guard's pool is a root for the token's lifetime,
+            // the same way the root loop's descrs are reached above.
+            // Dynasm registers `FailDescrStore` (shared via
+            // `Arc`, not cloned), cranelift and wasm `Vec<DescrRef>`;
+            // the other tracer kinds (GcTables) are rooted through
+            // the gcreftracer registry.
+            let tokens = self.live_jitcell_tokens();
+            for token in &tokens {
+                let Some(clt) = token.compiled_loop_token() else {
+                    continue;
+                };
+                for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
+                    let mut visit_descr = |descr: &dyn majit_ir::Descr| {
+                        let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
+                        visit_pool(pool, generation, is_minor, &mut visitor);
                     };
-                    for tracer in clt.asmmemmgr_gcreftracers.lock().iter() {
-                        let mut visit_descr = |descr: &dyn majit_ir::Descr| {
-                            let pool = descr.as_fail_descr().and_then(|fd| fd.rd_consts_pool());
-                            visit_pool(pool, generation, is_minor, &mut visitor);
-                        };
-                        if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
-                            for cell in store.iter() {
-                                visit_descr(&*cell.descr);
-                            }
-                        } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
-                            for descr in descrs {
-                                visit_descr(&**descr);
-                            }
+                    if let Some(store) = tracer.downcast_ref::<majit_ir::FailDescrStore>() {
+                        for cell in store.iter() {
+                            visit_descr(&*cell.descr);
+                        }
+                    } else if let Some(descrs) = tracer.downcast_ref::<Vec<DescrRef>>() {
+                        for descr in descrs {
+                            visit_descr(&**descr);
                         }
                     }
                 }
-                // A displaced token stays alive while a JUMP still enters it
-                // (`history.py JitCellToken.record_jump_to`), and its
-                // `TargetToken.virtual_state` / `short_preamble` graphs with
-                // it, so the walk covers the same live-plus-previous set as
-                // the descr pools above.
-                let target_tokens = tokens
-                    .iter()
-                    .flat_map(|token| crate::history::target_tokens_of(token));
-                for tt in target_tokens {
-                    // `history.TargetToken` is a GC object upstream. MiniMark
-                    // visits it in a minor only while its write barrier is
-                    // dirty; after forwarding its graph, clean tokens stay out
-                    // of later minor walks until another traced-field store. A
-                    // major must still see every token graph.
-                    if !is_minor || tt.take_minor_scan_pending() {
-                        walk_target_token_const_ptrs(&tt, &mut visitor);
-                    }
+            }
+            // A displaced token stays alive while a JUMP still enters it
+            // (`history.py JitCellToken.record_jump_to`), and its
+            // `TargetToken.virtual_state` / `short_preamble` graphs with
+            // it, so the walk covers the same alive_loops + keepalive set
+            // as the descr pools above.
+            let target_tokens = tokens
+                .iter()
+                .flat_map(|token| crate::history::target_tokens_of(token));
+            for tt in target_tokens {
+                // `history.TargetToken` is a GC object upstream. MiniMark
+                // visits it in a minor only while its write barrier is
+                // dirty; after forwarding its graph, clean tokens stay out
+                // of later minor walks until another traced-field store. A
+                // major must still see every token graph.
+                if !is_minor || tt.take_minor_scan_pending() {
+                    walk_target_token_const_ptrs(&tt, &mut visitor);
                 }
             }
         }
@@ -4486,16 +4479,7 @@ impl<M: Clone> MetaInterp<M> {
                         .find(|layout| layout.fail_index == fail_index)
                 })
         };
-        compiled
-            .live_token()
-            .as_deref()
-            .and_then(lookup)
-            .or_else(|| {
-                compiled
-                    .previous_tokens
-                    .iter()
-                    .find_map(|weak| weak.upgrade().and_then(|t| lookup(&t)))
-            })
+        compiled.live_token().as_deref().and_then(lookup)
     }
 
     fn compiled_exit_layout_from_backend(
@@ -15929,11 +15913,11 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Check whether a bridge was actually compiled and attached for a guard.
     /// Used by jit_bridge_compile_for_guard to distinguish successful bridge
-    /// compilation from trace abort (RPython pyjitpl.py:2906-2907 parity).
+    /// compilation from trace abort (`pyjitpl.py` handle_guard_failure).
     ///
-    /// Searches the current token AND previous_tokens, since bridge
-    /// compilation may have attached to an earlier token that was replaced
-    /// by a retrace/recompile.
+    /// The failing descr is in hand (`bridge_info().source_descr`); callers
+    /// already try `bridge_attached` on it. The live procedure token is the
+    /// remaining backend query (`get_procedure_token`).
     pub fn bridge_was_compiled(&self, green_key: u64, trace_id: u64, fail_index: u32) -> bool {
         // The guard being asked about is the trace session's own origin, and
         // its descr is in hand (`pyjitpl.py handle_guard_failure`'s
@@ -15954,26 +15938,7 @@ impl<M: Clone> MetaInterp<M> {
         {
             return true;
         }
-        // TODO: previous_tokens is a pyre-specific approach
-        // field on `CompiledEntry` that compensates for cross-recompile
-        // bridge attachments. Upstream `JitCellToken.target_tokens`
-        // (`history.py:501-540`) keeps every retraced loop's code alive
-        // naturally; pyre stores it on the compiled_loops side until the
-        // field migrates onto JitCellToken. The
-        // probe stays here so the residual compiled_loops touch stays
-        // visible.
-        let Some(compiled) = self.compiled_entry(green_key) else {
-            return false;
-        };
-        compiled.previous_tokens.iter().any(|prev_token| {
-            prev_token
-                .upgrade()
-                .map(|prev| {
-                    self.backend
-                        .bridge_was_compiled(&prev, trace_id, fail_index)
-                })
-                .unwrap_or(false)
-        })
+        false
     }
 
     /// pyjitpl.py:3195 finally: self.history.cut(cut_at) — undo tentative JUMP/FINISH.
@@ -17726,9 +17691,11 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `descr` is the forced guard's own `ResumeGuardDescr`
-    /// (`compile.py handle_async_forcing(self, deadframe)` is a method on
-    /// it); the test entry passes `None` and resolves through the root
-    /// loop's frontend record.
+    /// (`compile.py ResumeGuardForcedDescr.handle_async_forcing` reads
+    /// `self`). When present, the layout is `exit_layout_for_descr` /
+    /// `get_resumestorage` and `compiled_loops` is not consulted. The
+    /// test entry passes `None` and resolves through the root loop's
+    /// frontend record.
     fn handle_async_forcing_with_allocator(
         &mut self,
         descr: Option<&majit_ir::DescrRef>,
@@ -17747,38 +17714,29 @@ impl<M: Clone> MetaInterp<M> {
                 fail_values.len()
             );
         }
-        // compile.py:988-991: resolve metainterp_sd, vinfo, ginfo
-        // `compile.py handle_async_forcing` is a method on the failed
-        // `ResumeGuardDescr`; the loop token is that descr's
-        // (`rd_loop_token.outermost_jitdriver_sd`). A leftover
-        // `active_jitdriver_sd` from a later driver misses the forcing
-        // loop's `compiled_loops` row and drops AllVirtuals. When
-        // `descr` is None the test entry keeps the compiling/active
-        // driver.
-        let jd_no = match descr.and_then(|descr| descr.as_fail_descr()) {
-            Some(descr) => self.jitdriver_index_for_failed_token(
-                majit_backend::descr_owning_jct(descr).as_deref(),
-            ),
-            None => self.active_jitdriver_sd.unwrap_or(0),
-        };
-        let compiled = self.compiled_loops.get(&(jd_no, green_key))?;
-        let norm_tid = trace_id;
-        let exit_layout = if let Some((resolved_trace_id, trace)) =
-            Self::trace_for_exit(compiled, norm_tid)
-            && let Some(layout) = Self::compiled_exit_layout_from_trace(
-                trace,
-                green_key,
-                resolved_trace_id,
-                fail_index,
-            ) {
-            layout
-        } else if let Some(layout) = descr
-            .map(crate::compile::exit_layout_for_descr)
-            .filter(|layout| layout.storage.is_some())
-        {
-            layout
+        // `compile.py ResumeGuardForcedDescr.handle_async_forcing` is a
+        // method on the failed descr and reads `self` (`rd_numb` /
+        // `rd_consts` / ...). Production `force_now` already passes that
+        // descr. When `descr` is None the test entry keeps the
+        // compiling/active driver's frontend record.
+        let exit_layout = if let Some(descr) = descr {
+            crate::compile::exit_layout_for_descr(descr)
         } else {
-            self.compiled_exit_layout_from_backend(compiled, green_key, norm_tid, fail_index)?
+            let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+            let compiled = self.compiled_loops.get(&(jd_no, green_key))?;
+            let norm_tid = trace_id;
+            if let Some((resolved_trace_id, trace)) = Self::trace_for_exit(compiled, norm_tid)
+                && let Some(layout) = Self::compiled_exit_layout_from_trace(
+                    trace,
+                    green_key,
+                    resolved_trace_id,
+                    fail_index,
+                )
+            {
+                layout
+            } else {
+                self.compiled_exit_layout_from_backend(compiled, green_key, norm_tid, fail_index)?
+            }
         };
 
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
@@ -17821,8 +17779,22 @@ impl<M: Clone> MetaInterp<M> {
         // The layout resolved above already carries them; `get_recovery_slot_
         // types` is `exit_types.to_vec()` off a second resolution of the same
         // key, so re-asking can only lose them.
-        // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
-        let vinfo = self.virtualizable_info();
+        // compile.py ResumeGuardForcedDescr.handle_async_forcing:
+        // vinfo = self.jitdriver_sd.virtualizable_info
+        // (`self.jitdriver_sd` is the failed descr's
+        // `rd_loop_token.outermost_jitdriver_sd`).
+        let vinfo = match descr.and_then(|descr| descr.as_fail_descr()) {
+            Some(fail_descr) => {
+                let jd_no = self.jitdriver_index_for_failed_token(
+                    majit_backend::descr_owning_jct(fail_descr).as_deref(),
+                );
+                self.staticdata
+                    .jitdrivers_sd
+                    .get(jd_no)
+                    .and_then(|jd| jd.virtualizable_info.as_ref())
+            }
+            None => self.virtualizable_info(),
+        };
         let all_liveness_bytes = self.staticdata.liveness_info.snapshot_arc();
         let all_liveness = all_liveness_bytes.as_ref();
         let (all_virtuals_ptr, all_virtuals_int, virtualizable_ptr) =
@@ -18146,6 +18118,7 @@ impl<M: Clone> MetaInterp<M> {
         self.try_to_free_some_loops();
         let trace_id = self.compiled_entry(green_key)?.root_trace_id;
         self.recover_guard_state(
+            None,
             green_key,
             trace_id,
             fail_index,
@@ -18171,6 +18144,7 @@ impl<M: Clone> MetaInterp<M> {
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
         self.recover_guard_state(
+            None,
             green_key,
             trace_id,
             fail_index,
@@ -18183,8 +18157,11 @@ impl<M: Clone> MetaInterp<M> {
 
     /// `recover_guard_state_in_trace()` variant that also carries backend savedata.
     ///
+    /// `descr` is the failed guard (`compile.py AbstractResumeGuardDescr.handle_fail`
+    /// reads `self`). When present, the layout is `exit_layout_for_descr`.
     pub fn recover_guard_state(
         &mut self,
+        descr: Option<&majit_ir::DescrRef>,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
@@ -18193,38 +18170,35 @@ impl<M: Clone> MetaInterp<M> {
         savedata: Option<GcRef>,
         exception: ExceptionState,
     ) -> Option<GuardRecovery> {
-        let compiled = self.compiled_entry(green_key)?;
-        let exit_layout = Self::trace_for_exit(compiled, trace_id)
-            .and_then(|(resolved_trace_id, trace)| {
-                Self::compiled_exit_layout_from_trace(
-                    trace,
-                    green_key,
-                    resolved_trace_id,
-                    fail_index,
-                )
-            })
-            // `compile.py send_bridge_to_backend` retains no frontend trace
-            // for a bridge.  Its failing descr is backend-owned, so the public
-            // recovery helper must reach that descr before considering the
-            // trace absent; otherwise every bridge guard returned `None` here.
-            .or_else(|| {
-                self.compiled_exit_layout_from_backend(compiled, green_key, trace_id, fail_index)
-            })
-            .unwrap_or_else(|| {
-                let exit_types: ExitTypes = typed_fail_values
-                    .map(|values| values.iter().map(Value::get_type).collect())
-                    .unwrap_or_default();
-                CompiledExitLayout {
-                    rd_loop_token: green_key, // from trace context
-                    trace_id,
-                    fail_index,
-                    source_op_index: None,
-                    is_finish: false,
-                    is_exception_exit: false,
-                    exit_types,
-                    storage: None,
-                }
-            });
+        let exit_layout = if let Some(descr) = descr {
+            crate::compile::exit_layout_for_descr(descr)
+        } else {
+            let compiled = self.compiled_entry(green_key)?;
+            Self::trace_for_exit(compiled, trace_id)
+                .and_then(|(resolved_trace_id, trace)| {
+                    Self::compiled_exit_layout_from_trace(
+                        trace,
+                        green_key,
+                        resolved_trace_id,
+                        fail_index,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    let exit_types: ExitTypes = typed_fail_values
+                        .map(|values| values.iter().map(Value::get_type).collect())
+                        .unwrap_or_default();
+                    CompiledExitLayout {
+                        rd_loop_token: green_key, // from trace context
+                        trace_id,
+                        fail_index,
+                        source_op_index: None,
+                        is_finish: false,
+                        is_exception_exit: false,
+                        exit_types,
+                        storage: None,
+                    }
+                })
+        };
 
         Some(GuardRecovery {
             trace_id,
@@ -18272,6 +18246,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // Guard failure — recover
         let recovery = self.recover_guard_state(
+            None,
             green_key,
             trace_id,
             fail_index,
@@ -32324,9 +32299,8 @@ mod tests {
 
     /// `history.py TargetToken` is a GC object on
     /// `JitCellToken.target_tokens`. MiniMark traces it whenever the cell
-    /// token is alive, including a predecessor listed on
-    /// `CompiledEntry.previous_tokens`. The off-GC walker visits the same
-    /// live-plus-previous set it already uses for descr pools.
+    /// token is in `MemoryManager.alive_loops`. The off-GC walker visits
+    /// the same alive_loops + keepalive set it already uses for descr pools.
     #[test]
     fn compiled_graph_root_walk_visits_predecessor_target_token_attrs() {
         let _const_ptr_table = crate::CONST_PTR_TABLE_TEST_LOCK.lock();
@@ -32343,6 +32317,7 @@ mod tests {
         pred.set_target_tokens(vec![pred_tt.as_jump_target_descr()]);
 
         let mut meta = MetaInterp::<()>::new(1);
+        meta.memory_manager.keep_loop_alive(&pred);
         meta.insert_compiled_loop(
             8,
             CompiledEntry {
@@ -32350,7 +32325,7 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
+                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -32390,6 +32365,7 @@ mod tests {
         jumper.record_jump_to(kept);
 
         let mut meta = MetaInterp::<()>::new(1);
+        meta.memory_manager.keep_loop_alive(&jumper);
         meta.insert_compiled_loop(
             8,
             CompiledEntry {
@@ -32410,7 +32386,7 @@ mod tests {
             seen,
             vec![0x94_0000_4000],
             "a JUMP target kept only through keepalive_tokens is a root \
-             the same way a previous_tokens predecessor is"
+             the same way an alive_loops token is"
         );
     }
 
@@ -32439,6 +32415,7 @@ mod tests {
         pred.set_target_tokens(vec![pred_tt.as_jump_target_descr()]);
 
         let mut meta = MetaInterp::<()>::new(1);
+        meta.memory_manager.keep_loop_alive(&pred);
         meta.insert_compiled_loop(
             8,
             CompiledEntry {
@@ -32446,7 +32423,7 @@ mod tests {
                 meta: std::sync::Arc::new(()),
                 root_trace_id: 1,
                 traces: crate::FxIndexMap::default(),
-                previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
+                previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
             },
@@ -33148,74 +33125,11 @@ mod tests {
         assert_eq!(ints, vec![0]);
     }
 
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    #[cfg(target_arch = "x86_64")]
-    type DynasmCompiledCode = majit_backend_dynasm::x86::assembler::CompiledCode;
-
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    #[cfg(target_arch = "aarch64")]
-    type DynasmCompiledCode = majit_backend_dynasm::aarch64::assembler::CompiledCode;
-
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
-    fn patch_dynasm_fail_descr_resume_data(
-        backend: &majit_backend_dynasm::runner::DynasmBackend,
-        token: &std::sync::Weak<JitCellToken>,
-        fail_index: u32,
-        rd_numb: majit_ir::NumberingRef,
-        rd_consts: Vec<majit_ir::Const>,
-    ) {
-        // `CompiledEntry.token` is `Weak`; upgrade for the
-        // duration of the patch.  Test-only: the strong ref is held by
-        // `warm_state.attach_procedure_to_interp` registered earlier in
-        // the fixture, so the upgrade is guaranteed to succeed here.
-        let token = token
-            .upgrade()
-            .expect("compiled entry token must outlive the patch helper");
-        // Test-only: same single-threaded JIT scheduler invariant the
-        // sibling `descr` cast below relies on — bypass `Arc::get_mut`
-        // because the runtime keeps a second strong ref via the warm
-        // cell / memmgr / `compiled_loops`.
-        let token: &mut JitCellToken =
-            unsafe { &mut *(std::sync::Arc::as_ptr(&token) as *mut JitCellToken) };
-        let compiled = token
-            .compiled
-            .get_mut()
-            .expect("compiled token")
-            .downcast_mut::<DynasmCompiledCode>()
-            .expect("dynasm compiled code");
-        let descr_ref = compiled
-            .fail_descrs
-            .iter()
-            .find(|descr| {
-                descr
-                    .as_fail_descr()
-                    .is_some_and(|fd| fd.fail_index_per_trace() == fail_index)
-            })
-            .expect("fail descr");
-        // The `fail_descrs` vec stores
-        // `Arc<FailDescrCell>` thin wrappers (the cell is the JIT-baked
-        // identity in `jf_descr`).  The inner descr is reached via
-        // `FailDescrCell::Deref<Target = dyn Descr>`, so `.as_fail_descr()`
-        // auto-derefs to the trait surface on the metainterp's
-        // `Arc<ResumeGuardDescr>` (production: op.descr; test scaffolds
-        // where op.descr is None mint a fresh ResumeGuardDescr at codegen
-        // time).
-        let descr_fd = descr_ref
-            .as_fail_descr()
-            .expect("descr must implement FailDescr");
-        descr_fd.set_rd_numb_arc(Some(rd_numb));
-        descr_fd.set_rd_consts(Some(rd_consts));
-        descr_fd.set_rd_virtuals(Some(vec![]));
-        descr_fd.set_rd_pendingfields(Some(vec![]));
-        let fail_descrs = compiled.fail_descrs.clone();
-        backend.register_fail_descrs(token, &fail_descrs);
-    }
-
-    #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
     #[test]
-    fn test_handle_async_forcing_falls_back_to_previous_token_backend_exit_layout() {
+    fn test_handle_async_forcing_reads_descr_exit_layout_after_live_token_replace() {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
+        meta.active_jitdriver_sd = Some(0);
         let green_key = gk(30);
         let inputargs = vec![InputArg::new_int_rc(0)];
         let mut guard = mk_op(
@@ -33241,14 +33155,20 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let (trace_id, fail_index) = {
+        let (trace_id, fail_index, descr, old_token) = {
             let entry = meta
                 .compiled_entry(green_key.get_uhash())
                 .expect("compiled entry");
             let trace_id = entry.root_trace_id;
             let trace = entry.traces.get(&trace_id).expect("compiled trace");
             let fail_index = guard_fail_index(trace);
-            (trace_id, fail_index)
+            let descr = trace
+                .exit_layouts
+                .get(&fail_index)
+                .and_then(|layout| layout.descr.clone())
+                .expect("fail descr");
+            let old_token = entry.live_token().expect("live token");
+            (trace_id, fail_index, descr, old_token)
         };
 
         let mut writer = crate::resumecode::Writer::new(4);
@@ -33258,6 +33178,12 @@ mod tests {
         writer.append_int(0); // vref_size
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
+        fd.set_rd_numb_arc(Some(rd_numb));
+        fd.set_rd_consts(Some(vec![]));
+        fd.set_rd_virtuals(Some(vec![]));
+        fd.set_rd_pendingfields(Some(vec![]));
 
         let _fresh_token_keepalive = {
             let map_key = (meta.active_jitdriver_sd.unwrap_or(0), green_key.get_uhash());
@@ -33265,31 +33191,30 @@ mod tests {
                 .compiled_loops
                 .get_mut(&map_key)
                 .expect("compiled entry");
-            patch_dynasm_fail_descr_resume_data(
-                &meta.backend,
-                &entry.token,
-                fail_index,
-                rd_numb,
-                vec![],
-            );
             let mut fresh_token = JitCellToken::new(9003);
             fresh_token.green_key = std::cell::Cell::new(green_key.get_uhash());
             let fresh_arc = std::sync::Arc::new(fresh_token);
-            let old_token =
+            let _old_weak =
                 std::mem::replace(&mut entry.token, std::sync::Arc::downgrade(&fresh_arc));
-            entry.previous_tokens.push(old_token);
             entry
                 .traces
                 .get_mut(&trace_id)
                 .expect("compiled trace")
                 .exit_layouts
                 .swap_remove(&fail_index);
-            fresh_arc
+            (old_token, fresh_arc)
         };
 
         let (ptrs, ints) = meta
-            .handle_async_forcing(green_key.get_uhash(), trace_id, fail_index, &[42])
-            .expect("async forcing should fall back to previous token backend layout");
+            .handle_async_forcing_with_allocator(
+                Some(&descr),
+                green_key.get_uhash(),
+                trace_id,
+                fail_index,
+                (&[42i64] as &[i64]).into(),
+                &crate::resume::NullAllocator,
+            )
+            .expect("async forcing should read descr storage after the live token is replaced");
         assert_eq!(ptrs, Vec::<i64>::new());
         assert_eq!(ints, Vec::<i64>::new());
     }
@@ -33486,7 +33411,7 @@ mod tests {
     // override" to test.
 
     #[test]
-    fn guard_failure_recovery_uses_previous_token_backend_exit_layout() {
+    fn guard_failure_recovery_reads_descr_exit_layout_after_live_token_replace() {
         let mut meta = MetaInterp::<()>::new(1);
         meta.finish_setup_descrs_for_jitdrivers();
         let green_key = gk(88);
@@ -33514,7 +33439,7 @@ mod tests {
             majit_ir::ConstMap::default(),
         );
 
-        let (trace_id, fail_index, expected_source_op_index, expected_rd_numb, expected_exit_types) = {
+        let (trace_id, fail_index, descr, old_token, source_op_index) = {
             let entry = meta
                 .compiled_entry(green_key.get_uhash())
                 .expect("compiled entry");
@@ -33525,19 +33450,22 @@ mod tests {
                 .exit_layouts
                 .get(&fail_index)
                 .expect("stored exit layout");
+            let descr = layout.descr.clone().expect("fail descr");
+            let old_token = entry.live_token().expect("live token");
             (
                 trace_id,
                 fail_index,
+                descr,
+                old_token,
                 layout.source_op_index,
-                layout
-                    .descr
-                    .as_ref()
-                    .and_then(|descr| descr.as_fail_descr())
-                    .and_then(|fd| fd.rd_numb_arc())
-                    .map(|numb| numb.as_ref().to_vec()),
-                layout.resolve_exit_types().to_vec(),
             )
         };
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.set_rd_loop_token_clt(old_token.compiled_loop_token_expect());
+        if let Some(idx) = source_op_index {
+            fd.set_source_op_index(idx);
+        }
+        let expected = crate::compile::exit_layout_for_descr(&descr);
 
         let _fresh_token_keepalive = {
             let entry = meta
@@ -33546,20 +33474,20 @@ mod tests {
             let mut fresh_token = JitCellToken::new(9002);
             fresh_token.green_key = std::cell::Cell::new(green_key.get_uhash());
             let fresh_arc = std::sync::Arc::new(fresh_token);
-            let old_token =
+            let _old_weak =
                 std::mem::replace(&mut entry.token, std::sync::Arc::downgrade(&fresh_arc));
-            entry.previous_tokens.push(old_token);
             entry
                 .traces
                 .get_mut(&trace_id)
                 .expect("compiled trace")
                 .exit_layouts
                 .swap_remove(&fail_index);
-            fresh_arc
+            (old_token, fresh_arc)
         };
 
         let recovery = meta
             .recover_guard_state(
+                Some(&descr),
                 green_key.get_uhash(),
                 trace_id,
                 fail_index,
@@ -33568,23 +33496,26 @@ mod tests {
                 None,
                 ExceptionState::default(),
             )
-            .expect("guard recovery should fall back to previous token backend layout");
+            .expect("guard recovery should read descr storage after the live token is replaced");
 
         assert_eq!(
             recovery.exit_layout.source_op_index,
-            expected_source_op_index
+            expected.source_op_index
         );
         assert_eq!(
             recovery
                 .exit_layout
                 .storage
                 .as_ref()
-                .map(|storage| storage.rd_numb().expect("rd_numb").to_vec()),
-            expected_rd_numb
+                .and_then(|storage| storage.rd_numb().map(|numb| numb.to_vec())),
+            expected
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.rd_numb().map(|numb| numb.to_vec()))
         );
         assert_eq!(
             recovery.exit_layout.exit_types.as_slice(),
-            expected_exit_types
+            expected.exit_types.as_slice()
         );
     }
 
@@ -37224,67 +37155,6 @@ mod loop_side_table_tests {
         let _keep = token;
     }
 
-    fn compiled_entry_with_forced_virtual(
-        root_trace_id: u64,
-        fail_index: u32,
-        token: std::sync::Weak<JitCellToken>,
-    ) -> CompiledEntry<()> {
-        let mut writer = crate::resumecode::Writer::new(4);
-        writer.append_int(0); // items_resume_section (patched below)
-        writer.append_int(0); // count
-        writer.append_int(0); // vable_size
-        writer.append_int(0); // vref_size
-        writer.patch_current_size(0);
-        let rd_numb = writer.create_numbering();
-
-        let mut exit_layouts: crate::FxIndexMap<u32, StoredExitLayout> = Default::default();
-        exit_layouts.insert(
-            fail_index,
-            StoredExitLayout {
-                source_op_index: Some(0),
-                recovery_layout: None,
-                resume_layout: None,
-                descr: Some({
-                    let descr = crate::compile::make_resume_guard_descr_typed(vec![]);
-                    let fd = descr.as_fail_descr().expect("resume guard");
-                    fd.set_rd_numb_arc(Some(rd_numb));
-                    fd.set_rd_consts(Some(vec![]));
-                    fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
-                        majit_ir::RdVirtualInfo::VRawBufferInfo {
-                            func: 77,
-                            size: 0,
-                            offsets: vec![],
-                            descrs: vec![],
-                            fieldnums: vec![],
-                        },
-                    )]));
-                    descr
-                }),
-                op_arg_types_for_jump: None,
-            },
-        );
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            root_trace_id,
-            CompiledTrace {
-                inputargs: vec![],
-                ops: vec![],
-                constants: majit_ir::ConstMap::default(),
-                exit_layouts,
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
-        CompiledEntry {
-            token,
-            meta: std::sync::Arc::new(()),
-            root_trace_id,
-            traces,
-            previous_tokens: Vec::new(),
-            loop_header_pc: None,
-            next_global_opref: 0,
-        }
-    }
-
     #[test]
     fn handle_async_forcing_reads_failed_token_driver() {
         // compile.py handle_async_forcing is a method on the failed
@@ -37304,13 +37174,6 @@ mod loop_side_table_tests {
         let trace_id = 31;
         let fail_index = 7;
 
-        meta.insert_compiled_loop_on_driver(jd0, green_key.get_uhash(), compiled_entry(1));
-        meta.insert_compiled_loop_on_driver(
-            jd1,
-            green_key.get_uhash(),
-            compiled_entry_with_forced_virtual(trace_id, fail_index, std::sync::Weak::new()),
-        );
-
         let mut token = majit_backend::JitCellToken::new(91);
         token.outermost_jitdriver_index = Some(jd1);
         token.green_key.set(green_key.get_uhash());
@@ -37318,11 +37181,28 @@ mod loop_side_table_tests {
         token
             .compiled_loop_token_expect()
             .set_loop_token_wref(std::sync::Arc::downgrade(&token));
+
+        let mut writer = crate::resumecode::Writer::new(4);
+        writer.append_int(0); // items_resume_section (patched below)
+        writer.append_int(0); // count
+        writer.append_int(0); // vable_size
+        writer.append_int(0); // vref_size
+        writer.patch_current_size(0);
+        let rd_numb = writer.create_numbering();
         let descr = crate::compile::make_resume_guard_descr_typed(vec![majit_ir::Type::Int]);
-        descr
-            .as_fail_descr()
-            .expect("resume guard")
-            .set_rd_loop_token_clt(token.compiled_loop_token_expect());
+        let fd = descr.as_fail_descr().expect("resume guard");
+        fd.set_rd_loop_token_clt(token.compiled_loop_token_expect());
+        fd.set_rd_numb_arc(Some(rd_numb));
+        fd.set_rd_consts(Some(vec![]));
+        fd.set_rd_virtuals(Some(vec![std::rc::Rc::new(
+            majit_ir::RdVirtualInfo::VRawBufferInfo {
+                func: 77,
+                size: 0,
+                offsets: vec![],
+                descrs: vec![],
+                fieldnums: vec![],
+            },
+        )]));
 
         meta.active_jitdriver_sd = Some(jd0);
         let (ptrs, ints) = meta
@@ -37335,7 +37215,7 @@ mod loop_side_table_tests {
                 &crate::resume::NullAllocator,
             )
             .expect(
-                "async forcing must use the jd1 compiled_loops row while leftover active_jitdriver_sd is 0",
+                "async forcing must read the failed descr while leftover active_jitdriver_sd is 0",
             );
         assert_eq!(ptrs, vec![0]);
         assert_eq!(ints, vec![0]);

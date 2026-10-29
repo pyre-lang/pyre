@@ -493,6 +493,17 @@ impl MemoryManager {
         self.inner.borrow().contains(looptoken)
     }
 
+    /// MiniMark traces `MemoryManager.alive_loops` dict values. Clone
+    /// the Arcs out of the `RefCell` borrow so the caller can re-enter
+    /// the manager.
+    pub fn for_each_alive(&self, mut f: impl FnMut(&Arc<JitCellToken>)) {
+        let tokens: Vec<Arc<JitCellToken>> =
+            self.inner.borrow().alive_loops.values().cloned().collect();
+        for token in &tokens {
+            f(token);
+        }
+    }
+
     /// `warmstate.py` `set_param_retrace_limit` target.
     pub fn retrace_limit(&self) -> u32 {
         self.inner.borrow().retrace_limit
