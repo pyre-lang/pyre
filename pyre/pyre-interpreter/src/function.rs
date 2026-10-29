@@ -9,7 +9,7 @@
 use pyre_object::pyobject::*;
 use pyre_object::quasiimmut::QuasiImmutField;
 use pyre_object::unicodeobject::{
-    UnicodeValueStorage, alloc_utf8_payload, as_str_unchecked, utf8_payload_bytes,
+    UnicodeValueStorage, Utf8Str, alloc_utf8_payload, as_str_unchecked, utf8_payload_bytes,
     utf8_payload_wtf8, w_str_is_utf8, w_str_storage,
 };
 use rustpython_wtf8::Wtf8Buf;
@@ -603,7 +603,7 @@ impl pyre_object::lltype::GcType for Function {
 /// Allocate a new `Function`.
 ///
 /// `code` is a pointer to a Code object (PyCode) cast to `*const ()`.
-/// `name` is the function name string stored in an off-GC Box.
+/// `name` is the function name (`function.py self.name`, an rstr `STR`).
 /// `w_func_globals_obj` is the defining module's namespace dict object
 /// (shared), or `PY_NULL` for a globals-less carrier.
 pub fn function_new(code: *const (), name: String, w_func_globals_obj: PyObjectRef) -> PyObjectRef {
@@ -623,31 +623,42 @@ pub fn function_new_with_closure(
     w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(
+    function_new_impl_from_host_name(
         &FUNCTION_TYPE,
         code,
-        FunctionName::Owned(name),
+        &name,
         w_func_globals_obj,
         closure,
         true,
     )
 }
 
-/// Where a new function's `name` slot points.
+/// Host `String` / `&str` name → one managed rstr `STR`, then [`function_new_impl`].
 ///
-/// `function.py self.name = forcename or code.co_name` copies the code
-/// object's own string; RPython strings are immutable and shared, so no second
-/// allocation exists upstream. `Owned` allocates an rstr `STR` from a caller
-/// string; `Borrowed` names the code object's already-realized name `STR`.
-pub enum FunctionName {
-    /// Allocate an rstr `STR` (`alloc_utf8_payload`) from this UTF-8.
-    Owned(String),
-    /// Share the `_utf8` payload of this wrapped string (`PyCode.w_name`) —
-    /// `function.py self.name = code.co_name`. That payload is a
-    /// header-bearing `rstr.STR` leaf. The wrapper, not the payload, is what
-    /// crosses the constructor's collecting calls: a managed payload moves
-    /// with its wrapper, so the slot is read off the reloaded wrapper.
-    Borrowed(PyObjectRef),
+/// `function.py self.name = forcename or code.co_name` is an RPython `str`.
+/// Runtime names are not interned (`CONST_STR_CACHE` / `prebuilt_str_storage`).
+fn function_new_impl_from_host_name(
+    ob_type: &'static PyType,
+    code: *const (),
+    name: &str,
+    w_func_globals_obj: PyObjectRef,
+    closure: PyObjectRef,
+    can_change_code: bool,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base =
+        pyre_object::gc_roots::pin_roots(&[code as PyObjectRef, w_func_globals_obj, closure]);
+    let name_ptr = alloc_utf8_payload(name.as_bytes(), true);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(name_ptr as PyObjectRef);
+    function_new_impl(
+        ob_type,
+        pyre_object::gc_roots::shadow_stack_get(base) as *const (),
+        pyre_object::gc_roots::shadow_stack_get(name_slot) as *mut Utf8Str,
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        can_change_code,
+    )
 }
 
 /// `pyopcode.py MAKE_FUNCTION` construction: both the name and the
@@ -674,7 +685,7 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     // wrapped name first so Function.name can name its `STR` payload (a
     // header-bearing rstr leaf), not an interior pointer into
     // `CodeObject.obj_name`. `w_code_qualname_obj` may collect, so the
-    // `Borrowed` capture below reloads the wrapper and reads `_utf8` off
+    // `w_str_storage` read below reloads the wrapper and reads `_utf8` off
     // that forwarded object.
     let _ = unsafe { crate::pycode::w_code_name_obj(w_code) };
     // `function.py self.qualname = qualname or self.name`.  The code object
@@ -686,21 +697,20 @@ pub fn function_new_from_code(w_code: PyObjectRef, w_func_globals_obj: PyObjectR
     unsafe { crate::pycode::w_code_qualname_obj(roots.get(root_base)) };
     let w_code = roots.get(root_base);
     let w_name = unsafe { crate::pycode::w_code_name_obj(w_code) };
-    // `Function.name` is an rstr `STR` and `function_get_name` hands it out as
-    // `&str`, so the payload must be valid UTF-8. `function_set_func_name`
-    // shares a valid-UTF-8 wrapper's `_utf8` (`text_w`) and only the
-    // lone-surrogate case builds the lossy mirror. A `co_name` that carries a
-    // lone surrogate stays on `w_name` as the exact wrapper.
+    // `Function.name` is an rstr `STR` (`function.py self.name = code.co_name`).
+    // UTF-8 wrappers share `_utf8`; a lone-surrogate `co_name` stays on `w_name`
+    // as the exact wrapper and the payload is a lossy mirror. `function_new_impl`
+    // pins the header-bearing STR across its collecting calls.
     let name = if w_name.is_null() {
-        FunctionName::Owned(String::new())
+        alloc_utf8_payload(&[], true)
     } else if unsafe { w_str_is_utf8(w_name) } {
-        FunctionName::Borrowed(w_name)
+        unsafe { w_str_storage(w_name) }
     } else {
-        FunctionName::Owned(unsafe { name_utf8_mirror(w_name) })
+        alloc_utf8_payload(unsafe { name_utf8_mirror(w_name) }.as_bytes(), true)
     };
     let func = function_new_impl(
         &FUNCTION_TYPE,
-        w_code as *const (),
+        roots.get(root_base) as *const (),
         name,
         roots.get(root_base + 1),
         PY_NULL,
@@ -786,40 +796,28 @@ fn function_object_value(
 pub(crate) fn function_new_impl(
     ob_type: &'static PyType,
     code: *const (),
-    name: FunctionName,
+    name: *mut Utf8Str,
     w_func_globals_obj: PyObjectRef,
     closure: PyObjectRef,
     can_change_code: bool,
 ) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`) for
-    // the `lltype::malloc_typed` call below. `closure`, `code`, and
-    // `w_func_globals_obj` are PyObjectRef-shaped GC roots across the
-    // alloc — `BuiltinCode` lives in the GC heap (`gateway.rs`'s
+    // the `lltype::malloc_typed` call below. `closure`, `code`,
+    // `w_func_globals_obj`, and the name `STR` (`function.py self.name =
+    // forcename or code.co_name`) are GCREF roots across the alloc —
+    // `BuiltinCode` lives in the GC heap (`gateway.rs`'s
     // `builtin_code_new_full` malloc_typed) and `PyCode` is movable; the
     // walker's `is_in_nursery` filter (`majit-gc/src/collector.rs`)
-    // is what makes the heterogeneous case safe. The name `STR` is
-    // allocated before the Function: `rstr.mallocstr` is a nursery bump
-    // (`incminimark.py malloc_varsize`) and can collect, while
-    // `try_gc_alloc_stable_raw` does not.
+    // is what makes the heterogeneous case safe. The name `STR` is a
+    // residual argument (`Ptr(STR)`); `try_gc_alloc_stable_raw` does not
+    // collect.
     let _roots = pyre_object::gc_roots::push_roots();
-    let closure_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(closure);
-    let code_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(code as PyObjectRef);
-    // `function.py self.w_func_globals = w_globals` stores the dict
-    // object directly as the function's sole globals carrier.
-    let globals_slot = pyre_object::gc_roots::shadow_stack_len();
-    let w_func_globals_obj = pyre_object::gc_roots::pin_root(w_func_globals_obj);
-    // Pin a Borrowed `co_name` wrapper with the other live refs. Builtins
-    // resolution can run user `__eq__` and collect (`gct_fv_gc_malloc`).
-    let name_slot = match &name {
-        FunctionName::Borrowed(w_name) => {
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(*w_name);
-            slot
-        }
-        FunctionName::Owned(_) => usize::MAX,
-    };
+    let base = pyre_object::gc_roots::pin_roots(&[
+        name as PyObjectRef,
+        closure,
+        code as PyObjectRef,
+        w_func_globals_obj,
+    ]);
     // CPython 3.14 `_PyDict_LoadBuiltinsFromGlobals` at function construction:
     // retain the selected mapping identity even if the globals entry changes
     // later.  Its `_Py_dict_lookup_threadsafe_stackref` reads the native dict
@@ -830,6 +828,7 @@ pub(crate) fn function_new_impl(
     // the observable `function.__builtins__` field.
     //
     // Builtin/gateway carriers have no globals and keep a null slot.
+    let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(base + 3);
     let w_builtins = if w_func_globals_obj.is_null() {
         PY_NULL
     } else {
@@ -860,30 +859,14 @@ pub(crate) fn function_new_impl(
     let builtins_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_builtins);
 
-    // `function.py self.name = forcename or code.co_name`. Allocate the
-    // name `STR` before the Function so a collection at `mallocstr` cannot
-    // sweep an uninitialized carrier. A published STR tid takes the nursery
-    // path; otherwise the payload is an immortal leaf
-    // (`init_gc_object_immortal`). Both carry a header.
-    let name_ptr = match name {
-        FunctionName::Borrowed(_) => std::ptr::null_mut(),
-        FunctionName::Owned(name) => alloc_utf8_payload(
-            name.as_bytes(),
-            pyre_object::lowlevel_string::lowlevel_str_gc_type_id() != 0,
-        ),
-    };
-    // Resolving builtins and `mallocstr` may collect. Reload every pinned
-    // input before embedding it in the new Function; the original raw locals
-    // are not rewritten when the shadow-stack slots are forwarded.
-    let closure = pyre_object::gc_roots::shadow_stack_get(closure_slot);
-    let code = pyre_object::gc_roots::shadow_stack_get(code_slot) as *const ();
-    let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(globals_slot);
+    // Resolving builtins may collect. Reload every pinned input before
+    // embedding it in the new Function; the original raw locals are not
+    // rewritten when the shadow-stack slots are forwarded.
+    let name_ptr = pyre_object::gc_roots::shadow_stack_get(base) as *mut UnicodeValueStorage;
+    let closure = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let code = pyre_object::gc_roots::shadow_stack_get(base + 2) as *const ();
+    let w_func_globals_obj = pyre_object::gc_roots::shadow_stack_get(base + 3);
     let w_builtins = pyre_object::gc_roots::shadow_stack_get(builtins_slot);
-    let name_ptr = if name_slot == usize::MAX {
-        name_ptr
-    } else {
-        unsafe { w_str_storage(pyre_object::gc_roots::shadow_stack_get(name_slot)) }
-    };
 
     // `function.py` `Function` is one GC object whether or not its code is a
     // `BuiltinCode`. `try_gc_alloc_stable_raw` returns null only when no
@@ -942,10 +925,10 @@ pub fn function_new_with_fixed_code(
     name: String,
     w_func_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(
+    function_new_impl_from_host_name(
         &FUNCTION_TYPE,
         code,
-        FunctionName::Owned(name),
+        &name,
         w_func_globals_obj,
         PY_NULL,
         false,
@@ -980,10 +963,10 @@ pub fn function_new_builtin(
     name: String,
     w_func_globals_obj: PyObjectRef,
 ) -> PyObjectRef {
-    function_new_impl(
+    function_new_impl_from_host_name(
         &BUILTIN_FUNCTION_TYPE,
         code,
-        FunctionName::Owned(name),
+        &name,
         w_func_globals_obj,
         PY_NULL,
         false,
@@ -992,14 +975,7 @@ pub fn function_new_builtin(
 
 /// Allocate an immutable slot-wrapper descriptor backed by `BuiltinCode`.
 pub fn function_new_slot_wrapper(code: *const (), name: String) -> PyObjectRef {
-    function_new_impl(
-        &SLOT_WRAPPER_TYPE,
-        code,
-        FunctionName::Owned(name),
-        PY_NULL,
-        PY_NULL,
-        false,
-    )
+    function_new_impl_from_host_name(&SLOT_WRAPPER_TYPE, code, &name, PY_NULL, PY_NULL, false)
 }
 
 /// Retag a freshly materialised `FunctionWithFixedCode` as the public
@@ -1030,10 +1006,10 @@ pub unsafe fn function_retag_slot_wrapper(obj: PyObjectRef) {
 
 /// Allocate an immutable ordinary method descriptor backed by `BuiltinCode`.
 pub fn function_new_method_descriptor(code: *const (), name: String) -> PyObjectRef {
-    function_new_impl(
+    function_new_impl_from_host_name(
         &METHOD_DESCRIPTOR_TYPE,
         code,
-        FunctionName::Owned(name),
+        &name,
         PY_NULL,
         PY_NULL,
         false,
@@ -2679,7 +2655,7 @@ unsafe fn name_utf8_mirror(w_name: PyObjectRef) -> String {
 ///
 /// `function.py fset_func_name` stores `space.text_w(w_name)` — an rstr `STR`.
 /// `W_UnicodeObject.text_w` returns `self._utf8` directly, so a valid-UTF-8
-/// wrapper shares that payload (`FunctionName::Borrowed`). A lone surrogate
+/// wrapper shares that payload (`w_str_storage`). A lone surrogate
 /// has no UTF-8 form and allocates the lossy mirror instead. The old payload
 /// is not freed here: a GC `STR` is reclaimed on sweep once unreachable, and
 /// an immortal leaf was never collector-freed.

@@ -21,10 +21,11 @@ use majit_translate::{
 };
 
 /// `dunder_import_absolute_head` is the empty-fromlist arm that holds
-/// `name.find('.')` and `name[:dotindex]`; `dunder_import` itself delegates
-/// to it and carries neither call.
+/// `modulename.find('.')` and `modulename[:dotindex]` on a `Ptr(STR)`
+/// (`rstr.py` `LLHelpers.ll_find_char` / `ll_stringslice_startstop`);
+/// `dunder_import` itself delegates to it and carries neither call.
 #[test]
-fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
+fn dunder_import_lowers_str_find_and_slice_to_rpython_ops() {
     let interpreter_llbc = load_llbc(INTERPRETER_LLBC);
     // The tuple decl is owned by pyre-object.
     let object_llbc = load_llbc(OBJECT_LLBC);
@@ -63,20 +64,26 @@ fn dunder_import_lowers_rust_string_find_and_slices_to_rpython_ops() {
         .iter()
         .flat_map(|block| &block.operations)
         .collect::<Vec<_>>();
-    assert!(ops.iter().any(|op| matches!(
-        &op.kind,
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            ..
-        } if segments == &["__getslice_rangeto".to_string()]
-    )));
-    assert!(ops.iter().any(|op| matches!(
-        &op.kind,
-        OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            ..
-        } if name == "find"
-    )));
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.last().map(String::as_str) == Some("ll_stringslice_startstop")
+        )),
+        "dotted head is rstr LLHelpers.ll_stringslice_startstop of the name STR"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } if name == "find"
+        )),
+        "dot search is the STR find method (rstr LLHelpers.ll_find_char)"
+    );
     assert!(!ops.iter().any(|op| matches!(
         &op.kind,
         OpKind::Call {

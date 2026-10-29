@@ -2261,7 +2261,10 @@ impl ExecutionContext {
         for (key, _) in entries {
             keys.push(key);
         }
-        let module = pyre_object::w_module_new_aliasing_dict("builtins", self.builtins_module);
+        let module = pyre_object::w_module_new_aliasing_dict(
+            pyre_object::w_str_new("builtins"),
+            self.builtins_module,
+        );
         // function.py BuiltinFunction.w_moduleobj. The defining
         // module object does not exist while `new_builtin_module_dict` fills
         // the namespace, so bind each builtin's `__self__` now.

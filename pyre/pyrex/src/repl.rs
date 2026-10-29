@@ -115,8 +115,10 @@ pub fn run_repl(quiet: bool, no_site: bool, resume: Option<crate::MainSession>) 
             // matches that, so detaching `sys.modules` can make the module/dict
             // cycle unreachable. The allocation can collect: the dict is already
             // on `_root`, and the result is pinned before `set_sys_module`.
-            let main_module =
-                pyre_object::module::w_module_new_aliasing_dict_managed("__main__", canonical);
+            let main_module = pyre_object::module::w_module_new_aliasing_dict_managed(
+                pyre_object::w_str_new("__main__"),
+                canonical,
+            );
             let main_module = pyre_object::gc_roots::pin_root(main_module);
             importing::set_sys_module("__main__", main_module);
 
@@ -826,7 +828,10 @@ mod tests {
         unsafe {
             pyre_object::w_dict_setitem_str(canonical, "ps1", pyre_object::w_str_new("py> "));
         }
-        let sys_module = pyre_object::module::w_module_new_aliasing_dict("sys", canonical);
+        let sys_module = pyre_object::module::w_module_new_aliasing_dict(
+            pyre_object::w_str_new("sys"),
+            canonical,
+        );
 
         assert_eq!(read_prompt(sys_module, "ps1").as_deref(), Some("py> "));
     }

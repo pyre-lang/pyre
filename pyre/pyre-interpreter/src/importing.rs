@@ -2222,12 +2222,12 @@ fn new_builtin_module(
     // native/JIT caches have been migrated to traced owners.
     let module = if !managed_holder {
         pyre_object::w_module_new_aliasing_dict(
-            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
             pyre_object::gc_roots::shadow_stack_get(save_point),
         )
     } else {
         pyre_object::w_module_new_aliasing_dict_managed(
-            name,
+            pyre_object::gc_roots::shadow_stack_get(save_point + 1),
             pyre_object::gc_roots::shadow_stack_get(save_point),
         )
     };
@@ -3591,12 +3591,42 @@ pub fn add_sys_path_0() {
 // ── check_sys_modules ────────────────────────────────────────────────
 // PyPy equivalent: importing.py `check_sys_modules(space, w_modulename)`
 
+/// Convert a nullable object word (`PY_NULL` = miss) back to `Option`.
+///
+/// `AbstractTypedStrategy.getitem` / `ll_dict_lookup` answer a miss as
+/// null; callers that still want `Option` convert at this boundary.
+fn nullable_to_option(w: PyObjectRef) -> Option<PyObjectRef> {
+    if w.is_null() { None } else { Some(w) }
+}
+
+/// UTF-8 view of an rstr `STR` argument (`rstr.py` `STR.chars`).
+///
+/// The view is not a root: re-derive it after any allocation from a rooted
+/// owner, or copy what is needed before allocating.
+unsafe fn utf8_str_as_str(name: *mut Utf8Str) -> &'static str {
+    unsafe { std::str::from_utf8_unchecked(utf8_payload_bytes(name)) }
+}
+
+/// Managed `STR` for a host `&str` that has no `W_UnicodeObject` owner.
+///
+/// Runtime names are not `CONST_STR_CACHE` / [`prebuilt_str_storage`]: that
+/// cache is the immortal intern of string literals.
+fn utf8_str_from_host(name: &str) -> *mut Utf8Str {
+    alloc_utf8_payload(name.as_bytes(), true)
+}
+
 /// PyPy `importing.py:check_sys_modules` is an ordinary traceable lookup.
 /// The mutable `sys.modules` dictionary supplies the invalidation boundary;
 /// hiding this whole function behind `dont_look_inside` turns the cached
 /// import fast path into an `EF_RANDOM_EFFECTS` residual and prevents the
 /// optimizer from seeing the dictionary read at all.
 pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
+    check_sys_modules_str(utf8_str_from_host(name))
+}
+
+/// [`check_sys_modules`] with the name already an rstr `STR`
+/// (`interp_import.py` `_gcd_import` `space.finditem_str(w_modules, name)`).
+fn check_sys_modules_str(name: *mut Utf8Str) -> Option<PyObjectRef> {
     // Once installed, the Python-visible dict is the sole semantic module
     // cache.  PyPy's `check_sys_modules` reads `space.sys.get('modules')` and
     // a deleted key is genuinely absent; the process-owned registry below is
@@ -3607,15 +3637,16 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
     if !dict.is_null() {
         // No `Option::filter`: the closure is an un-lowered synthetic ctor
         // and is the descent-scan blocker on `__import__`.
-        let Some(m) = sys_modules_dict_entry(dict, name) else {
+        let m = sys_modules_finditem_str(dict, name);
+        if m.is_null() {
             return None;
-        };
+        }
         if unsafe { pyre_object::is_none(m) } {
             return None;
         }
         return Some(m);
     }
-    sys_modules_registry_get(name)
+    nullable_to_option(sys_modules_registry_get(name))
 }
 
 /// `PyImport_GetModule` — whatever `sys.modules` holds under `name`, sentinel
@@ -3627,14 +3658,14 @@ pub(crate) fn check_sys_modules(name: &str) -> Option<PyObjectRef> {
 pub(crate) fn sys_modules_entry(name: &str) -> Option<PyObjectRef> {
     let dict = sys_modules_dict();
     if dict.is_null() {
-        return sys_modules_registry_get(name);
+        return nullable_to_option(sys_modules_registry_get(utf8_str_from_host(name)));
     }
-    sys_modules_dict_entry(dict, name)
+    sys_modules_dict_entry(dict, utf8_str_from_host(name))
 }
 
 /// The `sys.modules` dict read both readers above share: a missing key and a
 /// null are the same absence.
-fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> {
+fn sys_modules_dict_entry(dict: PyObjectRef, name: *mut Utf8Str) -> Option<PyObjectRef> {
     // `interp_import.py _gcd_import` uses `space.finditem_str`.  Spell that
     // here so the jitted arm of `finditem_str_named` (no DictOperationGuard)
     // is the one the `__import__` walk records.  No `Option::filter`: the
@@ -3644,16 +3675,22 @@ fn sys_modules_dict_entry(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> 
     // probe itself look-inside-adjacent: this wrapper is the one
     // residual, so the exception conversion is not on the
     // `__import__` look-inside graph.
-    sys_modules_finditem_str(dict, name)
+    nullable_to_option(sys_modules_finditem_str(dict, name))
 }
 
 /// `finditem_str` plus the miss/`Err` swallow.  Hidden so
 /// `from_exc_object` stays off the look-inside `__import__` body.
+///
+/// A miss is `PY_NULL`, the `ll_dict_lookup` shape, so traced and residual
+/// calls share one ABI.
 #[majit_macros::dont_look_inside]
-pub(crate) fn sys_modules_finditem_str(dict: PyObjectRef, name: &str) -> Option<PyObjectRef> {
-    match crate::baseobjspace::finditem_str(dict, name) {
-        Ok(Some(m)) if !m.is_null() => Some(m),
-        _ => None,
+pub(crate) fn sys_modules_finditem_str(dict: PyObjectRef, name: *mut Utf8Str) -> PyObjectRef {
+    // `finditem_str` may wrap the key. Copy the chars first: an interior
+    // `&str` into `STR.chars` is not a root.
+    let owned = unsafe { utf8_str_as_str(name) }.to_owned();
+    match crate::baseobjspace::finditem_str(dict, &owned) {
+        Ok(Some(m)) if !m.is_null() => m,
+        _ => pyre_object::PY_NULL,
     }
 }
 
@@ -3743,10 +3780,12 @@ fn check_sys_modules_import(w_name: PyObjectRef) -> Result<Option<PyObjectRef>, 
         }
         return Ok(Some(m));
     }
-    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
+    let Some(_) = (unsafe { pyre_object::w_str_get_value_opt(w_name) }) else {
         return Ok(None);
     };
-    Ok(sys_modules_registry_get(name))
+    Ok(nullable_to_option(sys_modules_registry_get(unsafe {
+        pyre_object::w_str_storage(w_name)
+    })))
 }
 
 /// Look `name` up in `SYS_MODULES`, the process-owned name→module registry.
@@ -3772,8 +3811,10 @@ pub(crate) fn check_sys_modules_w(w_name: PyObjectRef) -> Option<PyObjectRef> {
         // Before the Python-visible dict exists the process registry is the
         // cache, and it is keyed by `&str`; a name with no UTF-8 spelling
         // cannot be in it.
-        let name = unsafe { pyre_object::w_str_get_value_opt(w_name) }?;
-        return sys_modules_registry_get(name);
+        unsafe { pyre_object::w_str_get_value_opt(w_name) }?;
+        return nullable_to_option(sys_modules_registry_get(unsafe {
+            pyre_object::w_str_storage(w_name)
+        }));
     }
     unsafe { pyre_object::w_dict_lookup(dict, w_name) }
         .filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) })
@@ -3784,12 +3825,14 @@ pub(crate) fn check_sys_modules_w(w_name: PyObjectRef) -> Option<PyObjectRef> {
 /// cache.  Residualise the `HashMap` so a red `sys_modules_dict()` null
 /// check does not drag lock/hash helpers into `__import__`.
 #[majit_macros::dont_look_inside]
-pub(crate) fn sys_modules_registry_get(name: &str) -> Option<PyObjectRef> {
+pub(crate) fn sys_modules_registry_get(name: *mut Utf8Str) -> PyObjectRef {
+    let name = unsafe { utf8_str_as_str(name) };
     SYS_MODULES
         .lock()
         .get(name)
         .copied()
         .map(|module| module as PyObjectRef)
+        .unwrap_or(pyre_object::PY_NULL)
 }
 
 /// Whether `sys.modules[name]` is bound to `None`, the sentinel that marks
@@ -3872,7 +3915,7 @@ pub fn get_builtin_module(name: &str) -> Option<PyObjectRef> {
 /// module registry and is independently walked as a GC root, so its original
 /// `sys` entry is the corresponding owner.
 pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
-    sys_modules_registry_get("sys")
+    nullable_to_option(sys_modules_registry_get(prebuilt_str_storage("sys")))
 }
 
 /// Return the interpreter-owned `builtins` module, bypassing the
@@ -3886,7 +3929,7 @@ pub fn get_interpreter_sys_module() -> Option<PyObjectRef> {
 /// `builtin_modules_get`, and finalization wants the one whose dict
 /// `sys.modules` published.
 pub fn get_interpreter_builtins_module() -> Option<PyObjectRef> {
-    sys_modules_registry_get("builtins")
+    nullable_to_option(sys_modules_registry_get(prebuilt_str_storage("builtins")))
 }
 
 /// The Python-visible `sys.modules` dict, or `PY_NULL` before it is
@@ -5304,8 +5347,12 @@ fn load_source_module(
     // matches that, so detaching `sys.modules` can make the module/dict
     // cycle unreachable. The allocation can collect: the dict is already on
     // `roots`, and the result is pinned before `set_sys_module`.
-    let canonical = roots.get(globals_slot);
-    let module = pyre_object::w_module_new_aliasing_dict_managed(modulename, canonical);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(modulename));
+    let module = pyre_object::w_module_new_aliasing_dict_managed(
+        roots.get(name_slot),
+        roots.get(globals_slot),
+    );
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
     set_sys_module(modulename, roots.get(module_slot));
@@ -5757,8 +5804,12 @@ fn load_namespace_package(
         pyre_object::w_dict_setitem_str(roots.get(globals_slot), "__path__", path_list);
     }
 
-    let module =
-        pyre_object::w_module_new_aliasing_dict_managed(modulename, roots.get(globals_slot));
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(modulename));
+    let module = pyre_object::w_module_new_aliasing_dict_managed(
+        roots.get(name_slot),
+        roots.get(globals_slot),
+    );
     let module_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(module);
     set_sys_module(modulename, roots.get(module_slot));
@@ -6299,19 +6350,6 @@ enum GcdCache {
     Initializing(PyObjectRef),
 }
 
-fn gcd_import_cache_probe(name: &str) -> Result<GcdCache, crate::PyError> {
-    // `interp_import.py _gcd_import` — `space.sys.get('modules')` then
-    // `finditem_str`.  No shadow-stack pin: the probe must stay free of
-    // effects so a look-inside of `__import__` can record the dict read
-    // and the two getattrs.  A Python `None` sentinel is FastPathGiveUp
-    // (`getattr(None, "__spec__")` is AttributeError) and the slow path
-    // raises `import of {name} halted; None in sys.modules`.
-    let Some(w_module) = check_sys_modules(name) else {
-        return Ok(GcdCache::Miss);
-    };
-    gcd_import_cache_probe_after(w_module)
-}
-
 /// Object-keyed cache probe for the look-inside `__import__` body.
 ///
 /// The wrapper already holds the name object; looking it up with
@@ -6376,30 +6414,33 @@ fn gcd_import_cache_probe_after(mut w_module: PyObjectRef) -> Result<GcdCache, c
 /// `None` means the slow path must run — a missing `sys.modules` entry, a
 /// missing `__spec__`, or an entry removed/replaced while we waited.  A
 /// `__spec__` without `_initializing` counts as initialised (a builtin module).
-fn gcd_import_fast(name: &str) -> Result<Option<PyObjectRef>, crate::PyError> {
-    match gcd_import_cache_probe(name)? {
+fn gcd_import_fast(name: *mut Utf8Str) -> Result<Option<PyObjectRef>, crate::PyError> {
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    let _roots = push_roots();
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(name as PyObjectRef);
+    match gcd_import_cache_probe_str(shadow_stack_get(name_slot) as *mut Utf8Str)? {
         GcdCache::Miss => Ok(None),
         GcdCache::Ready(w_module) => Ok(Some(w_module)),
         GcdCache::Initializing(w_module) => {
             // The wait is a Python call into `_lock_unlock_module`.  Keep it
             // off the look-inside graph so `test_import.test_import_in_function`
             // can see only the initialized-module arm (`guard_not_invalidated`).
-            wait_initializing_module(name, w_module)
+            Ok(nullable_to_option(wait_initializing_module(
+                shadow_stack_get(name_slot) as *mut Utf8Str,
+                w_module,
+            )?))
         }
     }
 }
 
-/// Look-inside `_gcd_import` fast path: same as [`gcd_import_fast`] but
-/// the `sys.modules` probe is keyed by the name object.
-fn gcd_import_fast_w(
-    name: &str,
-    w_name: PyObjectRef,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
-    match gcd_import_cache_probe_w(w_name)? {
-        GcdCache::Miss => Ok(None),
-        GcdCache::Ready(w_module) => Ok(Some(w_module)),
-        GcdCache::Initializing(w_module) => wait_initializing_module(name, w_module),
-    }
+/// `_gcd_import` cache probe with the name already an rstr `STR`.
+fn gcd_import_cache_probe_str(name: *mut Utf8Str) -> Result<GcdCache, crate::PyError> {
+    let Some(w_module) = check_sys_modules_str(name) else {
+        return Ok(GcdCache::Miss);
+    };
+    gcd_import_cache_probe_after(w_module)
 }
 
 /// JIT residual view of `_gcd_import`: initialized `sys.modules` entry,
@@ -6585,7 +6626,9 @@ pub fn module_is_package_no_callback(w_module: PyObjectRef) -> Option<bool> {
 fn check_sys_modules_no_callback(name: &str) -> Option<Option<PyObjectRef>> {
     let dict = sys_modules_dict();
     if dict.is_null() {
-        return Some(sys_modules_registry_get(name));
+        return Some(nullable_to_option(sys_modules_registry_get(
+            utf8_str_from_host(name),
+        )));
     }
     let entry = dict_getitem_str_no_callback(dict, name)?;
     Some(entry.filter(|m| !m.is_null() && !unsafe { pyre_object::is_none(*m) }))
@@ -6606,18 +6649,22 @@ fn sys_modules_blocks_no_callback(name: &str) -> Option<bool> {
 /// `interp_import.py _gcd_import` raises `FastPathGiveUp` when `_initializing`
 /// is true.  The 3.14 `import_ensure_initialized` wait lives here instead, as
 /// a residual, so the initialized arm stays a small look-inside body.
+///
+/// A miss after the wait is `PY_NULL`, so the residual result is one word.
 #[majit_macros::dont_look_inside]
 pub(crate) fn wait_initializing_module(
-    name: &str,
+    name: *mut Utf8Str,
     w_module: PyObjectRef,
-) -> Result<Option<PyObjectRef>, crate::PyError> {
+) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
 
     let _roots = push_roots();
+    let name_str_slot = shadow_stack_len();
+    let _ = pin_root(name as PyObjectRef);
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_module);
     let Some(w_bootstrap) = importlib_bootstrap_module() else {
-        return Ok(None);
+        return Ok(pyre_object::PY_NULL);
     };
     let bootstrap_slot = shadow_stack_len();
     let _ = pin_root(w_bootstrap);
@@ -6626,24 +6673,44 @@ pub(crate) fn wait_initializing_module(
         "_lock_unlock_module",
     )?
     else {
-        return Ok(None);
+        return Ok(pyre_object::PY_NULL);
     };
     let lock_unlock_slot = shadow_stack_len();
     let _ = pin_root(w_lock_unlock);
     let name_slot = shadow_stack_len();
-    let _ = pin_root(pyre_object::w_str_new_managed(name));
+    let _ = pin_root(pyre_object::w_str_from_storage(
+        shadow_stack_get(name_str_slot) as *mut Utf8Str,
+    ));
     crate::call::call_function_impl_result(
         shadow_stack_get(lock_unlock_slot),
         &[shadow_stack_get(name_slot)],
     )?;
 
-    let Some(w_current) = check_sys_modules(name) else {
-        return Ok(None);
+    let Some(w_current) = check_sys_modules_str(shadow_stack_get(name_str_slot) as *mut Utf8Str)
+    else {
+        return Ok(pyre_object::PY_NULL);
     };
     if w_current != shadow_stack_get(mod_slot) {
-        return Ok(None);
+        return Ok(pyre_object::PY_NULL);
     }
-    Ok(Some(shadow_stack_get(mod_slot)))
+    Ok(shadow_stack_get(mod_slot))
+}
+
+/// One-word residual-call ABI for [`wait_initializing_module`].
+///
+/// `Ok(p)` is `p` (null for the miss arm); an error is published then
+/// answered as [`import_lookup_err_ptr`].
+pub extern "C" fn wait_initializing_module_jit_abi(
+    name: *mut Utf8Str,
+    w_module: PyObjectRef,
+) -> PyObjectRef {
+    match wait_initializing_module(name, w_module) {
+        Ok(result) => result,
+        Err(error) => {
+            crate::runtime_ops::jit_publish_residual_error(error);
+            import_lookup_err_ptr()
+        }
+    }
 }
 
 /// `interp_import.py interp___import__` — the `except OperationError` arm:
@@ -6693,23 +6760,6 @@ fn rpython_str_find_char(value: &str, needle: char, start: i64) -> i64 {
         return -1;
     };
     i64::try_from(start + offset).unwrap_or(-1)
-}
-
-/// Native counterpart of RPython `s[:stop]`.
-///
-/// `interp_import.py` slices the dotted name as `name[:dotindex]`.  The
-/// caller has just proved that `stop` is a non-negative byte index returned by
-/// `rpython_str_find_char`, so translation replaces this exact helper with the
-/// existing post-annotation `getslice(s, 0, stop)` marker.
-fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
-    // No `expect`: the panic formatter is `__majit_stringbuilder_new`.
-    let Ok(stop) = usize::try_from(stop) else {
-        return value;
-    };
-    match value.get(..stop) {
-        Some(prefix) => prefix,
-        None => value,
-    }
 }
 
 /// `space.getbuiltinmodule('_frozen_importlib')` then that module's
@@ -6936,7 +6986,7 @@ pub fn dunder_import(
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     dunder_import_inner(
-        name,
+        utf8_str_from_host(name),
         pyre_object::PY_NULL,
         w_globals,
         w_locals,
@@ -6950,8 +7000,9 @@ pub fn dunder_import(
 ///
 /// Same body as [`dunder_import`], but the cache probe is keyed by
 /// `w_name` so the executed residual is [`sys_modules_finditem_w`].
+/// The name `STR` is `w_str_storage(w_name)` (`interp___import__`
+/// `space.text_w(w_name)`); the wrapper does not keep an interior `&str`.
 pub(crate) fn dunder_import_w(
-    name: &str,
     w_name: PyObjectRef,
     w_globals: PyObjectRef,
     w_locals: PyObjectRef,
@@ -6960,7 +7011,7 @@ pub(crate) fn dunder_import_w(
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
     dunder_import_inner(
-        name,
+        unsafe { pyre_object::w_str_storage(w_name) },
         w_name,
         w_globals,
         w_locals,
@@ -6971,7 +7022,7 @@ pub(crate) fn dunder_import_w(
 }
 
 fn dunder_import_inner(
-    name: &str,
+    name: *mut Utf8Str,
     w_name: PyObjectRef,
     w_globals: PyObjectRef,
     w_locals: PyObjectRef,
@@ -6979,20 +7030,25 @@ fn dunder_import_inner(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // `name` is borrowed from a managed `str` payload (`w_str_get_value_opt`).
-    // Pinning `w_name` forwards the header, not this slice. A minor collection
-    // reuses the nursery under the slice, and the next `sys.modules` probe
-    // hashes bytes that are no longer WTF-8. Copy before any collecting call.
-    let name_owned = name.to_owned();
-    let name = name_owned.as_str();
     // Captured before any Python can run below (`is_true` may call a
     // `__bool__`).  `gcd_import_fast` can collect; the caller's natives
     // (`w_fromlist` / `w_mod` / globals / locals / name) are not rewritten
-    // by that callee.
+    // by that callee.  The name `STR` is the residual argument; pinning
+    // it with `w_name` roots it across collecting calls, so the
+    // look-inside body does not copy the chars (`interp___import__`
+    // `space.text_w(w_name)`).
     let fromlist_missing = w_fromlist.is_null() || unsafe { is_none(w_fromlist) };
     let _import_roots = pyre_object::gc_roots::push_roots();
-    let import_base = pyre_object::gc_roots::pin_roots(&[w_name, w_globals, w_locals, w_fromlist]);
-    let reload_import = |index: usize| pyre_object::gc_roots::shadow_stack_get(import_base + index);
+    let import_base = pyre_object::gc_roots::pin_roots(&[
+        name as PyObjectRef,
+        w_name,
+        w_globals,
+        w_locals,
+        w_fromlist,
+    ]);
+    let reload_name = || pyre_object::gc_roots::shadow_stack_get(import_base) as *mut Utf8Str;
+    let reload_import =
+        |index: usize| pyre_object::gc_roots::shadow_stack_get(import_base + 1 + index);
 
     if level == 0 {
         // `interp_import.py:66-92` — the fast path is only for absolute
@@ -7001,10 +7057,17 @@ fn dunder_import_inner(
         // imports whatever the list adds.  No import lock is taken here:
         // `interp_import.py:19` records that CPython's fast path does not
         // take one either.
-        let w_mod = if reload_import(0).is_null() {
-            gcd_import_fast(name)?
+        let cache = if reload_import(0).is_null() {
+            gcd_import_cache_probe_str(reload_name())?
         } else {
-            gcd_import_fast_w(name, reload_import(0))?
+            gcd_import_cache_probe_w(reload_import(0))?
+        };
+        let w_mod = match cache {
+            GcdCache::Miss => None,
+            GcdCache::Ready(w_module) => Some(w_module),
+            GcdCache::Initializing(w_module) => {
+                nullable_to_option(wait_initializing_module(reload_name(), w_module)?)
+            }
         };
         if let Some(w_mod) = w_mod {
             let w_mod_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7024,7 +7087,7 @@ fn dunder_import_inner(
                 // (this branch is not taken) is not declined for helpers
                 // only the empty-fromlist dotted name needs.
                 return dunder_import_absolute_head(
-                    name,
+                    reload_name(),
                     w_mod(),
                     reload_import(1),
                     reload_import(2),
@@ -7036,7 +7099,7 @@ fn dunder_import_inner(
             // `findattr` (`getattr_str_impl` starts with `force` + `pin_root`
             // and is the `__majit_stringbuilder_new` descent wall).  A
             // non-module with a fromlist is FastPathGiveUp, same cut as
-            // `gcd_import_cache_probe`.
+            // `gcd_import_cache_probe_after`.
             if unsafe { pyre_object::is_module(w_mod()) } {
                 let dict = unsafe { pyre_object::w_module_get_w_dict(w_mod()) };
                 let w_path = if dict.is_null() {
@@ -7074,7 +7137,7 @@ fn dunder_import_inner(
                     return Ok(w_result);
                 }
                 return dunder_import_package_fromlist(
-                    name,
+                    reload_name(),
                     w_mod(),
                     reload_import(1),
                     reload_import(2),
@@ -7092,7 +7155,7 @@ fn dunder_import_inner(
     // `dont_look_inside` so a cached `import math` does not drag the
     // bootstrap into the look-inside body.
     dunder_import_slow(
-        name,
+        reload_name(),
         reload_import(0),
         reload_import(1),
         reload_import(2),
@@ -7362,19 +7425,35 @@ pub extern "C" fn take_published_residual_error_jit_abi() -> i64 {
 /// the undotted `import math` return — stays off the look-inside graph.
 #[majit_macros::dont_look_inside]
 pub(crate) fn dunder_import_absolute_head(
-    name: &str,
+    name: *mut Utf8Str,
     w_mod: PyObjectRef,
-    mut w_globals: PyObjectRef,
-    mut w_locals: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
-    // `import a.b` answers `a`.
-    let dotindex = rpython_str_find_char(name, '.', 0);
+    use pyre_object::gc_roots::{pin_root, push_roots, shadow_stack_get, shadow_stack_len};
+
+    // `import a.b` answers `a`.  `name.find(".")` does not allocate.
+    let dotindex = rpython_str_find_char(unsafe { utf8_str_as_str(name) }, '.', 0);
     if dotindex < 0 {
         return Ok(w_mod);
     }
-    let head = rpython_str_slice_prefix(name, dotindex);
-    if let Some(w_head) = pyre_object::with_roots!(w_globals, w_locals => gcd_import_fast(head))? {
+    let _roots = push_roots();
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(name as PyObjectRef);
+    let globals_slot = shadow_stack_len();
+    let _ = pin_root(w_globals);
+    let locals_slot = shadow_stack_len();
+    let _ = pin_root(w_locals);
+    // `name[:dotindex]` — `rstr.py` `ll_stringslice_startstop`.
+    let head = pyre_object::lowlevel_string::ll_stringslice_startstop(
+        shadow_stack_get(name_slot) as *mut Utf8Str,
+        0,
+        dotindex,
+    );
+    let head_slot = shadow_stack_len();
+    let _ = pin_root(head as PyObjectRef);
+    if let Some(w_head) = gcd_import_fast(shadow_stack_get(head_slot) as *mut Utf8Str)? {
         return Ok(w_head);
     }
     // An uncached head is what `_bootstrap.__import__`'s own
@@ -7383,14 +7462,29 @@ pub(crate) fn dunder_import_absolute_head(
     // with no list reaches that same import while leaving the
     // caller's list alone: the one truth test `__import__` owes a
     // stateful `__bool__` has already been made here.
-    dunder_import(
-        head,
-        w_globals,
-        w_locals,
+    let w_head_name = pyre_object::w_str_from_storage(shadow_stack_get(head_slot) as *mut Utf8Str);
+    dunder_import_w(
+        w_head_name,
+        shadow_stack_get(globals_slot),
+        shadow_stack_get(locals_slot),
         pyre_object::w_none(),
         0,
         execution_context,
     )
+}
+
+/// One-word residual-call ABI for [`dunder_import_absolute_head`].
+pub extern "C" fn dunder_import_absolute_head_jit_abi(
+    name: *mut Utf8Str,
+    w_mod: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    execution_context: *const PyExecutionContext,
+) -> PyObjectRef {
+    match dunder_import_absolute_head(name, w_mod, w_globals, w_locals, execution_context) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
 }
 
 /// Cached-package fromlist arm of `interp___import__`: pin, then
@@ -7401,7 +7495,7 @@ pub(crate) fn dunder_import_absolute_head(
 /// with the same arguments the look-inside caller used to pass.
 #[majit_macros::dont_look_inside]
 pub(crate) fn dunder_import_package_fromlist(
-    name: &str,
+    name: *mut Utf8Str,
     w_mod: PyObjectRef,
     w_globals: PyObjectRef,
     w_locals: PyObjectRef,
@@ -7414,6 +7508,8 @@ pub(crate) fn dunder_import_package_fromlist(
 
     let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
+    let name_str_slot = shadow_stack_len();
+    let _ = pin_root(name as PyObjectRef);
     let mod_slot = shadow_stack_len();
     let _ = pin_root(w_mod);
     let fromlist_slot = shadow_stack_len();
@@ -7454,7 +7550,7 @@ pub(crate) fn dunder_import_package_fromlist(
     // slow path and let that error be the one `__import__`
     // reports rather than answering from the native handler.
     dunder_import_slow(
-        name,
+        shadow_stack_get(name_str_slot) as *mut Utf8Str,
         pyre_object::PY_NULL,
         shadow_stack_get(globals_slot),
         shadow_stack_get(locals_slot),
@@ -7469,6 +7565,32 @@ pub(crate) fn dunder_import_package_fromlist(
     )
 }
 
+/// One-word residual-call ABI for [`dunder_import_package_fromlist`].
+pub extern "C" fn dunder_import_package_fromlist_jit_abi(
+    name: *mut Utf8Str,
+    w_mod: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    fromlist_missing: bool,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> PyObjectRef {
+    match dunder_import_package_fromlist(
+        name,
+        w_mod,
+        w_globals,
+        w_locals,
+        w_fromlist,
+        fromlist_missing,
+        level,
+        execution_context,
+    ) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
+}
+
 /// Miss / relative / bootstrap half of `interp___import__`.
 ///
 /// PyPy's `space.call_function(FrozenCache.w_frozen_import, ...)` is one
@@ -7477,7 +7599,7 @@ pub(crate) fn dunder_import_package_fromlist(
 /// is 300+ un-lowered helpers and the descent scan refuses the whole builtin.
 #[majit_macros::dont_look_inside]
 pub(crate) fn dunder_import_slow(
-    name: &str,
+    name: *mut Utf8Str,
     w_name: PyObjectRef,
     w_globals: PyObjectRef,
     w_locals: PyObjectRef,
@@ -7491,6 +7613,8 @@ pub(crate) fn dunder_import_slow(
     let globals_is_null = w_globals.is_null();
     let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
+    let name_str_slot = shadow_stack_len();
+    let _ = pin_root(name as PyObjectRef);
     let name_slot = shadow_stack_len();
     let _ = pin_root(w_name);
     let globals_slot = shadow_stack_len();
@@ -7516,9 +7640,12 @@ pub(crate) fn dunder_import_slow(
     // `_install_external_importers` imports `_frozen_importlib_external`
     // while installing PathFinder, so no finder can serve it yet —
     // `absolute_import` execs the on-disk bootstrap source under that name.
-    if matches!(name, "_frozen_importlib" | "_frozen_importlib_external") {
+    let name = shadow_stack_get(name_str_slot) as *mut Utf8Str;
+    let name_s = unsafe { utf8_str_as_str(name) };
+    if matches!(name_s, "_frozen_importlib" | "_frozen_importlib_external") {
+        let name_wtf8 = unsafe { utf8_payload_wtf8(name) }.to_owned();
         return importhook(
-            Wtf8::new(name),
+            &name_wtf8,
             if globals_is_null {
                 pyre_object::PY_NULL
             } else {
@@ -7550,26 +7677,28 @@ pub(crate) fn dunder_import_slow(
             // `module.__name__`, so a `sys.modules` entry that is not a module
             // raises AttributeError there instead of the KeyError the
             // interpreter entry point reports.
+            let name = shadow_stack_get(name_str_slot) as *mut Utf8Str;
+            let name_owned = unsafe { utf8_str_as_str(name) }.to_owned();
             if level > 0
-                && !name.is_empty()
+                && !name_owned.is_empty()
                 && !(!fromlist_missing
                     && crate::baseobjspace::is_true(shadow_stack_get(fromlist_slot))?)
             {
                 return relative_import_head(
                     shadow_stack_get(bootstrap_slot),
-                    name,
+                    &name_owned,
                     shadow_stack_get(globals_slot),
                     level,
                 );
             }
             // `interp_import.py` `interp___import__` passes the caller's
-            // `w_modulename` into the frozen import. Allocate only when
-            // this entry has no string object (a `&str` head name).
+            // `w_modulename` into the frozen import. Wrap the STR when this
+            // entry has no string object.
             let pinned_name = shadow_stack_get(name_slot);
             let w_name = if !pinned_name.is_null() && unsafe { pyre_object::is_str(pinned_name) } {
                 pinned_name
             } else {
-                pyre_object::w_str_new_managed(name)
+                pyre_object::w_str_from_storage(shadow_stack_get(name_str_slot) as *mut Utf8Str)
             };
             return call_bootstrap_import(
                 shadow_stack_get(import_slot),
@@ -7585,8 +7714,10 @@ pub(crate) fn dunder_import_slow(
             );
         }
     }
+    let name = shadow_stack_get(name_str_slot) as *mut Utf8Str;
+    let name_wtf8 = unsafe { utf8_payload_wtf8(name) }.to_owned();
     importhook(
-        Wtf8::new(name),
+        &name_wtf8,
         if globals_is_null {
             pyre_object::PY_NULL
         } else {
@@ -7600,6 +7731,32 @@ pub(crate) fn dunder_import_slow(
         level,
         execution_context,
     )
+}
+
+/// One-word residual-call ABI for [`dunder_import_slow`].
+pub extern "C" fn dunder_import_slow_jit_abi(
+    name: *mut Utf8Str,
+    w_name: PyObjectRef,
+    w_globals: PyObjectRef,
+    w_locals: PyObjectRef,
+    w_fromlist: PyObjectRef,
+    fromlist_missing: bool,
+    level: i64,
+    execution_context: *const PyExecutionContext,
+) -> PyObjectRef {
+    match dunder_import_slow(
+        name,
+        w_name,
+        w_globals,
+        w_locals,
+        w_fromlist,
+        fromlist_missing,
+        level,
+        execution_context,
+    ) {
+        Ok(result) => result,
+        Err(error) => crate::runtime_ops::jit_publish_residual_error_ref(error),
+    }
 }
 
 /// The `builtins.__import__` binding, or the error a missing one raises.
@@ -9534,7 +9691,6 @@ mod tests {
         assert_eq!(rpython_str_find_char("pkg.child.leaf", '.', 4), 9);
         assert_eq!(rpython_str_find_char("pkg.child.leaf", '.', 10), -1);
         assert_eq!(rpython_str_find_char("plain", '.', 0), -1);
-        assert_eq!(rpython_str_slice_prefix("pkg.child", 3), "pkg");
     }
 
     #[cfg(all(

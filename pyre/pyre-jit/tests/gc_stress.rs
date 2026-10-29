@@ -250,7 +250,8 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
     // `globals()` / `function.__globals__` share one identity
     // (`run_source` parity).
     let canonical = frame.get_w_globals();
-    let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);
+    let main_module =
+        pyre_object::w_module_new_aliasing_dict(pyre_object::w_str_new("__main__"), canonical);
     importing::set_sys_module("__main__", main_module);
 
     // An uncaught `assert` in the program surfaces here as `Err`, so a

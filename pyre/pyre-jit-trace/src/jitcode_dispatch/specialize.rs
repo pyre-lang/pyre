@@ -6212,7 +6212,7 @@ fn walker_const_bool<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, observed:
 ///
 /// * `name` — `Function.__init__` `self.name = code.co_name`, the rstr `STR`
 ///   payload of the realized `co_name` wrapper (`w_str_storage`).  The
-///   residual (`function_new_from_code` `FunctionName::Borrowed`) stores
+///   residual (`function_new_from_code` `w_str_storage`) stores
 ///   that same payload, so a materialized function is indistinguishable
 ///   from an interpreted one.
 /// * `w_name` / `w_qualname` — the code object's single realized `co_name` and

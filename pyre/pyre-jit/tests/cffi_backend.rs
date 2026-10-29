@@ -45,7 +45,8 @@ fn run_harness(program: &str, name: &str) -> Result<(), String> {
         .map_err(|e| format!("frame setup error: {}", e.message_text()))?;
 
     let canonical = frame.get_w_globals();
-    let main_module = pyre_object::w_module_new_aliasing_dict("__main__", canonical);
+    let main_module =
+        pyre_object::w_module_new_aliasing_dict(pyre_object::w_str_new("__main__"), canonical);
     importing::set_sys_module("__main__", main_module);
 
     // An `AssertionError` a program raises is object-backed, so its `message`

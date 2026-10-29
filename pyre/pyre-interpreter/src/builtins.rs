@@ -28219,13 +28219,12 @@ fn import_bound_objects(
         } else {
             unsafe { pyre_object::w_int_get_value(level_obj) }
         };
-        let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
+        if unsafe { pyre_object::w_str_get_value_opt(name_obj) }.is_none() {
             return crate::importing::dunder_import_name_obj(
                 name_obj, w_globals, w_locals, w_fromlist, level,
             );
-        };
+        }
         return crate::importing::dunder_import_w(
-            name,
             name_obj,
             w_globals,
             w_locals,
@@ -28306,21 +28305,22 @@ pub(crate) fn import_bound_objects_index_level(
     // while that anchor can still name the caller.  The established
     // object-space analogue owns the shared execution context directly.
     let exec_ctx = crate::call::getexecutioncontext();
-    // The native importer keys every lookup by `&str`, so a name that has no
-    // such spelling goes straight to the app-level bootstrap.  Re-read the
-    // name through its root: `space_index_w` above may have moved it.
+    // A name with no UTF-8 spelling goes to the app-level bootstrap.
+    // Re-read the name through its root: `space_index_w` above may have
+    // moved it. The live object is the residual name (`text_w`); do not
+    // keep an interior `&str` across the importer.
     let name_obj = pyre_object::gc_roots::shadow_stack_get(name_slot);
     let read = |slot: Option<usize>| match slot {
         Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
         None => pyre_object::PY_NULL,
     };
     let (globals, locals, fromlist) = (read(globals_slot), read(locals_slot), read(fromlist_slot));
-    let Some(name) = (unsafe { pyre_object::w_str_get_value_opt(name_obj) }) else {
+    if unsafe { pyre_object::w_str_get_value_opt(name_obj) }.is_none() {
         return crate::importing::dunder_import_name_obj(
             name_obj, globals, locals, fromlist, level,
         );
-    };
-    crate::importing::dunder_import_w(name, name_obj, globals, locals, fromlist, level, exec_ctx)
+    }
+    crate::importing::dunder_import_w(name_obj, globals, locals, fromlist, level, exec_ctx)
 }
 
 /// One-word residual-call ABI for [`import_bound_objects_index_level`].

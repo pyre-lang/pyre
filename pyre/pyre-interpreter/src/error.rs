@@ -576,7 +576,7 @@ impl pyre_object::lltype::GcType for PyErrorObject {
 /// One-word handle to [`PyErrorObject`]. `Clone` aliases the pointer, which is
 /// `OperationError` semantics.
 #[repr(transparent)]
-pub struct PyError(pyre_object::PyObjectRef);
+pub struct PyError(pub(crate) pyre_object::PyObjectRef);
 
 impl Clone for PyError {
     fn clone(&self) -> Self {

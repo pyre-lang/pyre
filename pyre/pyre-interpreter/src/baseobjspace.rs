@@ -18200,14 +18200,20 @@ pub fn pick_builtin_obj_checked(
                 );
                 let w_builtin = pyre_object::gc_roots::shadow_stack_get(builtin_slot);
                 if !backing.is_null() {
-                    return Ok(pyre_object::w_module_new_aliasing_dict("", w_builtin));
+                    return Ok(pyre_object::w_module_new_aliasing_dict(
+                        pyre_object::PY_NULL,
+                        w_builtin,
+                    ));
                 }
                 // Python 3.14 keeps any other supplied object as the frame's
                 // builtin mapping too.  A later LOAD_GLOBAL dispatches
                 // `obj[name]`, so a non-mapping value raises its native
                 // TypeError instead of silently becoming PyPy's default
                 // empty builtin Module.
-                return Ok(pyre_object::w_module_new_aliasing_dict("", w_builtin));
+                return Ok(pyre_object::w_module_new_aliasing_dict(
+                    pyre_object::PY_NULL,
+                    w_builtin,
+                ));
             }
             // `__builtins__` absent — moduledef.py:106-108 default Module.
             Ok(_) => {}
@@ -18236,8 +18242,7 @@ pub fn pick_builtin_obj(
 
 /// Allocate the `moduledef.py:106-108` default Module — empty backing
 /// storage with `None=w_None`, anonymous (PyPy passes `name=None` to
-/// `Module.__init__`; pyre's `w_module_new` requires a `&str` so use
-/// the empty string as the anonymous-name sentinel).
+/// `Module.__init__`; `PY_NULL` is that sentinel).
 fn build_default_pick_builtin_module() -> PyObjectRef {
     // `pypy/module/__builtin__/moduledef.py:106-108` constructs the
     // default Module backed by a `W_ModuleDictObject` whose strategy
@@ -18256,7 +18261,10 @@ fn build_default_pick_builtin_module() -> PyObjectRef {
             pyre_object::w_none(),
         );
     }
-    pyre_object::w_module_new_aliasing_dict("", pyre_object::gc_roots::shadow_stack_get(dict_slot))
+    pyre_object::w_module_new_aliasing_dict(
+        pyre_object::PY_NULL,
+        pyre_object::gc_roots::shadow_stack_get(dict_slot),
+    )
 }
 
 /// pypy/interpreter/baseobjspace.py:1031-1053

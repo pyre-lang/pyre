@@ -1108,12 +1108,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let _ = pyre_object::gc_roots::pin_root(w_globals);
                 // The name string is allocated before the store so the mapping
                 // it writes into is read after that allocation, not before it.
-                let w_name = pyre_object::w_str_new_managed(&name);
+                let name_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&name));
                 unsafe {
                     pyre_object::w_dict_setitem_str(
                         pyre_object::gc_roots::shadow_stack_get(globals_slot),
                         "__name__",
-                        w_name,
+                        pyre_object::gc_roots::shadow_stack_get(name_slot),
                     );
                 };
                 // `PyImport_ImportFrozenModuleObject` leaves the source-table
@@ -1148,7 +1149,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 let module_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(pyre_object::w_module_new_aliasing_dict(
-                    &name,
+                    pyre_object::gc_roots::shadow_stack_get(name_slot),
                     pyre_object::gc_roots::shadow_stack_get(globals_slot),
                 ));
                 // `set_sys_module` inserts into `sys.modules` and so allocates:

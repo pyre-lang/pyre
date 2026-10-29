@@ -1634,8 +1634,10 @@ fn run_module(module: &str, no_site: bool, run_code: bool) -> Option<MainSession
     // matches that, so detaching `sys.modules` can make the module/dict
     // cycle unreachable. The allocation can collect: the dict is already
     // on `_root`, and the result is pinned before `set_sys_module`.
-    let main_module =
-        pyre_object::module::w_module_new_aliasing_dict_managed("__main__", canonical);
+    let main_module = pyre_object::module::w_module_new_aliasing_dict_managed(
+        pyre_object::w_str_new("__main__"),
+        canonical,
+    );
     let main_module = pyre_object::gc_roots::pin_root(main_module);
     importing::set_sys_module("__main__", main_module);
 

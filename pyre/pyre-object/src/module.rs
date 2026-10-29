@@ -205,18 +205,14 @@ pub fn w_module_user_new(w_class: PyObjectRef) -> PyObjectRef {
 /// `LOAD_GLOBAL` falls through to `space.finditem_str(module.w_dict,
 /// name)` so subclass `__getitem__` overrides are not bypassed.
 ///
-/// `name` seeding (`pypy/interpreter/module.py`): when `name` is a
-/// non-empty string, set `w_dict["__name__"] = name` so
-/// `module.__name__` resolves and `from module import *`,
-/// `import_from` submodule fallback work.  PyPy's
-/// `Module.__init__(space, w_name, w_dict)` does `space.setitem(w_dict,
-/// space.newtext("__name__"), w_name)` when `w_name is not None`; pyre
-/// honours the same contract here so every caller gets `__name__`
-/// without duplicating the seeding step at each callsite.  When
-/// `w_dict` is a non-`W_DictObject` (dict subclass instance), the
-/// setitem is skipped — the subclass's own `__init__` is responsible
-/// for seeding `__name__` (matching PyPy `moduledef.py:102-103
-/// Module(space, None, w_builtin)` where `w_name=None`).
+/// `w_name` seeding (`Module.__init__`): `self.w_name = w_name`, and when
+/// `w_name is not None` `space.setitem(w_dict, space.new_interned_str('__name__'),
+/// w_name)`.  Callers that have only a host string mint a wrapped name first
+/// (`space.newtext` / `w_str_new`); `PY_NULL` is the anonymous sentinel
+/// (`Module(space, None, w_builtin)`).  When `w_dict` is a non-`W_DictObject`
+/// (dict subclass instance), the setitem is skipped — the subclass's own
+/// `__init__` is responsible for seeding `__name__` (matching
+/// `moduledef.py Module(space, None, w_builtin)` where `w_name=None`).
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`):
 /// the body performs a `lltype::malloc_typed_immortal` allocation (`Module`)
@@ -224,9 +220,17 @@ pub fn w_module_user_new(w_class: PyObjectRef) -> PyObjectRef {
 /// call to a stable runtime fnaddr instead of tracing the allocation. The
 /// `-> PyObjectRef` result is a plain GCREF with no discriminant to erase.
 #[majit_macros::dont_look_inside]
-pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
-    let obj = crate::lltype::malloc_typed_immortal(module_aliasing_dict_value(name, w_dict_object))
-        as PyObjectRef;
+pub fn w_module_new_aliasing_dict(w_name: PyObjectRef, w_dict_object: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[w_name, w_dict_object]);
+    seed_module_dunder_name(
+        crate::gc_roots::shadow_stack_get(base),
+        crate::gc_roots::shadow_stack_get(base + 1),
+    );
+    let obj = crate::lltype::malloc_typed_immortal(module_aliasing_dict_value(
+        crate::gc_roots::shadow_stack_get(base),
+        crate::gc_roots::shadow_stack_get(base + 1),
+    )) as PyObjectRef;
     // Construction wrote the pointer fields with no per-store barrier.
     // One barrier behind the bulk write enrolls the immortal module in
     // `prebuilt_root_objects` (`incminimark.py` `remember_young_pointer`),
@@ -244,23 +248,36 @@ pub fn w_module_new_aliasing_dict(name: &str, w_dict_object: PyObjectRef) -> PyO
 /// module -> dict -> builtin function -> module cycle is not a process root.
 /// Stable allocation preserves the address assumptions of promoted module
 /// constants while still letting a major collection reclaim the cycle.
+/// Shares [`module_aliasing_dict_value`] with the immortal constructor, so the
+/// wrapped-name parameter is the same (`Module.__init__` `w_name`).
 #[majit_macros::dont_look_inside]
-pub fn w_module_new_aliasing_dict_managed(name: &str, w_dict_object: PyObjectRef) -> PyObjectRef {
-    let value = module_aliasing_dict_value(name, w_dict_object);
+pub fn w_module_new_aliasing_dict_managed(
+    w_name: PyObjectRef,
+    w_dict_object: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[w_name, w_dict_object]);
+    seed_module_dunder_name(
+        crate::gc_roots::shadow_stack_get(base),
+        crate::gc_roots::shadow_stack_get(base + 1),
+    );
+    let value = module_aliasing_dict_value(
+        crate::gc_roots::shadow_stack_get(base),
+        crate::gc_roots::shadow_stack_get(base + 1),
+    );
     crate::lltype::malloc_typed_stable(value) as PyObjectRef
 }
 
-fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module {
-    let w_name = if name.is_empty() {
-        PY_NULL
-    } else {
-        crate::w_str_new(name)
-    };
+/// `Module.__init__` `if w_name is not None: space.setitem(w_dict, '__name__', w_name)`.
+fn seed_module_dunder_name(w_name: PyObjectRef, w_dict_object: PyObjectRef) {
     if !w_name.is_null() && !w_dict_object.is_null() && unsafe { crate::is_dict(w_dict_object) } {
         unsafe {
             crate::dictmultiobject::w_dict_setitem_str(w_dict_object, "__name__", w_name);
         }
     }
+}
+
+fn module_aliasing_dict_value(w_name: PyObjectRef, w_dict_object: PyObjectRef) -> Module {
     Module {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
