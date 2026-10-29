@@ -575,7 +575,8 @@ pub(crate) struct MapCollectSite {
     /// `(x,)` args-tuple payload the synthesized `call_once` writes.
     pub payload_ty: ValueType,
     /// Concrete class of a reference payload, matching
-    /// `option_closure_select::ClosureSelectSite::payload_class_root`.
+    /// `InstanceRepr._setup_repr` (`rclass.py`) on the synthesized
+    /// `(x,)` tuple field.
     pub payload_class_root: Option<String>,
     /// `<X>` suffix for the closure `Args` tuple `(payload,)`.
     pub args_tuple_suffix: String,

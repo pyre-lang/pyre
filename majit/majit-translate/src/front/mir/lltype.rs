@@ -5366,6 +5366,9 @@ pub(in crate::front::mir) fn tyref_input_class_root(
         return tyref_input_class_root(&option_ty, llbc, tombstoned)
             .or_else(|| tyref_split_core_enum_param_root(&option_ty, llbc, tombstoned));
     }
+    if let Some(root) = niche_option_storage_raw_struct_root(ty, llbc, tombstoned) {
+        return Some(root);
+    }
     if let Some(ValueType::Ref(root)) = tyref_niche_option_payload_paint(ty, llbc, tombstoned) {
         return root;
     }
@@ -7082,12 +7085,62 @@ pub(in crate::front::mir) fn tyref_is_option_of_string_value(ty: &TyRef, llbc: &
         .is_some_and(|payload| tyref_is_string_value(&payload, llbc))
 }
 
-/// Paint of a niche `Option<P>` whose payload is a rust-heap `String`.
+/// Class root of a pointer-niche `Option<&RawStruct>` whose pointee is a
+/// storage-raw struct (`payload_storage_raw_pointee_is_struct` /
+/// `raw_struct_ptr_lltype`: `declared_raw_adt_node` + `TypeDeclKind::Struct`
+/// + a known layout). `Input.class_root` of that Option seeds `SomePtr`
+/// (`raw_struct_ptr_annotation`). A generic TypeDecl without a layout,
+/// an Enum pointee, a flavor-raw class, a GC struct, or a guard is `None`.
+pub(in crate::front::mir) fn niche_option_storage_raw_struct_root(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let peeled = tyref_shared_borrow_option_pointee(ty, llbc);
+    let option_ty = peeled.as_ref().unwrap_or(ty);
+    if option_nonzero_word_kind(option_ty, llbc).is_some() {
+        return None;
+    }
+    if !tyref_is_niche_option(option_ty, llbc) {
+        return None;
+    }
+    let payload = crate::front::result_exc::tyref_option_payload(option_ty, llbc)?;
+    if owner_root_guard::tyref_is_option_of_guard(option_ty, llbc)
+        || owner_root_guard::tyref_is_guard(&payload, llbc)
+    {
+        return None;
+    }
+    let payload_node = tyref_node(&payload, llbc).and_then(|n| type_node_peel_aliases(n, llbc))?;
+    let pointee = one_level_pointer_pointee(payload_node, llbc)?;
+    let pointee = strip_ty_indirections(pointee, llbc).unwrap_or(pointee);
+    if owner_root_guard::type_node_is_guard(pointee, llbc) {
+        return None;
+    }
+    let inputs = value_type_inputs(llbc);
+    let adt = declared_raw_adt_node(pointee, llbc, &inputs.gc_struct_ids, no_immutable_fields())?;
+    let id = adt_node_def_id(adt)?;
+    let decl = llbc.type_by_id(id)?;
+    if !matches!(decl.kind, TypeDeclKind::Struct(_)) || decl.layout.is_none() {
+        return None;
+    }
+    raw_address_owner_root(
+        &payload,
+        llbc,
+        tombstoned,
+        &inputs.gc_struct_ids,
+        &inputs.raw_alloc_flavor_structs,
+    )
+}
+
+/// Paint of a niche `Option<P>` whose payload is a rust-heap `String`,
+/// a nullable list, or a storage-raw struct borrow.
 ///
 /// The niche is one pointer word: `Some` is the payload, `None` is null.
 /// `annotator/model.py` `SomeInstance(can_be_None=True)` / `SomePtr`
 /// nullable uses the payload's paint, so this Option intern's as that
 /// `Ref` made nullable rather than as the `Option<String>` enum class.
+/// A storage-raw struct borrow is the int-bank `SomePtr` (`history.py`
+/// `getkind` of `Ptr(TO)` when `TO._gckind == raw`).
 pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
     ty: &TyRef,
     llbc: &Llbc,
@@ -7113,6 +7166,24 @@ pub(in crate::front::mir) fn tyref_niche_option_payload_paint(
     let rendered = tyref_to_ast_string(&payload, llbc);
     if rendered.starts_with("Vec<") || rendered.starts_with("VecDeque<") {
         return Some(ValueType::Ref(Some(rendered)));
+    }
+    // Pointer-niche `Option<&RawStruct>` is the nullable `Ptr(Struct)`
+    // (`raw_struct_ptr_annotation` / `Bookkeeper::raw_struct_ptr_from_layout`).
+    // Painting it `Ref` left the overlay a classdef-less GCREF; Discriminant
+    // recast GC→raw is refused (`pairtype(GCRefRepr, Repr).convert_from_to`
+    // / `rgcref.py`) and identity-folds, so `is_` mixed `ri`. The overlay
+    // is the int-bank SomePtr; `Input.class_root` still names the pointee
+    // so `derive_subject_inputcells` seeds that `SomePtr`.
+    // `Option<OwnerRootGuard>` stays the nullable GCREF word
+    // (`owner_root_guard.rs`). A borrow of a raw enum is Int
+    // (`ty_is_raw_address`) and never reaches this paint.
+    if owner_root_guard::tyref_is_option_of_guard(ty, llbc)
+        || owner_root_guard::tyref_is_guard(&payload, llbc)
+    {
+        return None;
+    }
+    if niche_option_storage_raw_struct_root(ty, llbc, tombstoned).is_some() {
+        return Some(ValueType::Int);
     }
     None
 }
@@ -10013,6 +10084,13 @@ pub(crate) fn charon_type_value_to_ast_string(
         return "??deep".to_string();
     }
     let Some(obj) = v.as_object() else {
+        // Charon hash-cons `{"Value":[id,"Never"]}`: the payload is a
+        // type-name string (`Never` / `Infallible`), not a nested
+        // object. `??scalar` is not an instantiation
+        // (`type_arg_is_concrete`); `Never` is (`is_uninhabited_ok`).
+        if let Some(s) = v.as_str() {
+            return s.to_string();
+        }
         return "??scalar".to_string();
     };
     // Indirections — follow the dedup table / inline hash-cons one hop.
@@ -10090,6 +10168,21 @@ pub(crate) fn charon_type_value_to_ast_string(
             "[{}]",
             charon_type_value_to_ast_string(elem, llbc, depth + 1)
         );
+    }
+    // FnPtr `output` / a field of type `()` serializes as `{"Tuple": []}`,
+    // not the Adt-shaped `builtin: "Tuple"` unit. The fallback `??{key}`
+    // would spell `??Tuple` and `type_arg_is_concrete` would drop a tagged
+    // Option that leaked a hasher `fn() -> ()` Instantiated arg.
+    if let Some(items) = obj.get("Tuple").and_then(serde_json::Value::as_array) {
+        if items.is_empty() {
+            return "()".to_string();
+        }
+        let inner = items
+            .iter()
+            .map(|ty| charon_type_value_to_ast_string(ty, llbc, depth + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!("({inner})");
     }
     // Trait associated-type projections (`C::Name`).  The decl-level
     // type cannot spell a concrete type, but the program-level
@@ -11012,6 +11105,10 @@ pub(in crate::front::mir) fn enum_instantiation_suffix_from_args(
         || !type_args
             .iter()
             .any(|a| type_arg_splits_per_instantiation(a))
+        // Nested `??` / `TypeVar` (`ControlFlow<Option<??scalar>, i64>`)
+        // is not an instantiation (`type_arg_is_concrete`). Prefix-only
+        // `starts_with("??")` still lets `Option<??scalar>` split.
+        || type_args.iter().any(|a| !type_arg_is_concrete(a))
     {
         return None;
     }

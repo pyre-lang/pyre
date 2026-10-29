@@ -236,13 +236,12 @@ fn residual_spec_type_name(v: &Value, llbc: &Llbc, depth: usize) -> String {
     spec_type_name(v, llbc, depth, true)
 }
 
-/// `generics.types` / `generics.const_generics` when neither list contains
-/// a depth-0 type or const-generic variable. `None` leaves the callee
-/// unspecialized.
-pub(crate) fn concrete_type_args(
-    generics: &Value,
-    llbc: &Llbc,
-) -> Option<(Vec<Value>, Vec<Value>)> {
+/// `generics.types` / `generics.const_generics`, peeling a region binder.
+/// Unlike [`concrete_type_args`], a nested TypeVar (a closure `F` whose
+/// trait-ref JSON still names a variable) does not drop the lists: intern
+/// still substitutes `Option<T>` from `types[0]` (`specialize.py`
+/// `FunctionDesc.cachedgraph`).
+pub(crate) fn generic_args_lists(generics: &Value) -> (Vec<Value>, Vec<Value>) {
     let generics = peel_generic_args(generics);
     let types = generics
         .get("types")
@@ -254,6 +253,17 @@ pub(crate) fn concrete_type_args(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    (types, const_generics)
+}
+
+/// `generics.types` / `generics.const_generics` when neither list contains
+/// a depth-0 type or const-generic variable. `None` leaves the callee
+/// unspecialized.
+pub(crate) fn concrete_type_args(
+    generics: &Value,
+    llbc: &Llbc,
+) -> Option<(Vec<Value>, Vec<Value>)> {
+    let (types, const_generics) = generic_args_lists(generics);
     let open = |items: &[Value], space: Space| {
         items
             .iter()
@@ -577,7 +587,12 @@ pub(crate) fn substituted_signature(
     }
 }
 
-fn subst_tyref(ty: &TyRef, llbc: &Llbc, types: &[Value], const_generics: &[Value]) -> TyRef {
+pub(crate) fn subst_tyref(
+    ty: &TyRef,
+    llbc: &Llbc,
+    types: &[Value],
+    const_generics: &[Value],
+) -> TyRef {
     let mut value = match ty {
         TyRef::Dedup { id } => serde_json::json!({ "Deduplicated": id }),
         TyRef::Inline { value: (id, body) } => {

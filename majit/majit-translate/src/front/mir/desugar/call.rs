@@ -8362,54 +8362,12 @@ impl<'a> Lowering<'a> {
         {
             self.result_map_err_sites.push(site);
         }
-        // Capture `Option::map`/`and_then`/`unwrap_or_else(opt, callable)` sites
-        // for the discriminant closure-select `front::option_closure_select`
-        // synthesizes.  All five combinators are Opaque (foreign `core`) with
-        // the `Option` ADT receiver, so `first_is_self` routes them to a
-        // two-arg `CallTarget::Method` (receiver `args[0]`, callable
-        // `args[1]`).  The callable is a closure ADT (`second_arg_ty` →
-        // `call_once`) or a function item (`second_arg_fn_item` → a direct
-        // `Call(FunctionPath)`).  Resolving the `Option` field owners plus
-        // the callable needs the receiver type, the env type or `FnDef`
-        // path, and the result type (`call.dest.ty`), all in hand here;
-        // `recognize_closure_select_site` also confirms the receiver is an
-        // `Option`.  A resolution miss leaves the residual call.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && let Some(kind) = match name.as_str() {
-                "map" => Some(crate::front::option_closure_select::ClosureCombinator::Map),
-                "and_then" => Some(crate::front::option_closure_select::ClosureCombinator::AndThen),
-                "unwrap_or_else" => {
-                    Some(crate::front::option_closure_select::ClosureCombinator::UnwrapOrElse)
-                }
-                "or_else" => Some(crate::front::option_closure_select::ClosureCombinator::OrElse),
-                "is_some_and" => {
-                    Some(crate::front::option_closure_select::ClosureCombinator::IsSomeAnd)
-                }
-                _ => None,
-            }
-            && let Some(site) = self.recognize_closure_select_site(
-                kind,
-                first_arg_ty.as_ref(),
-                second_arg_ty.as_ref(),
-                second_arg_fn_item.clone(),
-                second_arg_fn_decl,
-                &call.dest.ty,
-                &result_var,
-            )
-        {
-            self.closure_select_sites.push(site);
-        }
         // Discriminant-switch combinators whose opaque core body is an
         // if/else on the receiver tag (plus `call_once` of a closure
         // argument when there is one).  Option `map`/`and_then`/
-        // `unwrap_or_else`/`or_else`/`is_some_and` already have
-        // their own capture above; this records the remaining Option/Result
-        // methods whose semantics are the same shape.
+        // `unwrap_or_else`/`or_else`/`is_some_and` are extracted core
+        // bodies (`CHARON_CORE_INCLUDE`); this records the remaining
+        // Option/Result methods whose semantics are the same shape.
         if let OpKind::Call {
             target: CallTarget::Method { name, .. },
             args,

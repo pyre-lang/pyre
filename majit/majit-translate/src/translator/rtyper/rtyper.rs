@@ -2367,15 +2367,19 @@ impl RPythonTyper {
             }
             "cmp" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_cmp),
             "coerce" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_coerce),
-            // `front::checked_arith_uint` emits these unsigned overflow-test
-            // ops with the low-level opname already fixed (not the generic
-            // `mul`/`lt` the pairtype dispatch lowers by repr): the widening
-            // multiply's high word (`checked_mul`) and the wrapped-sum carry
-            // compare (`checked_add`).  Both operands are Unsigned, so the
-            // integer templates rebuild the identical `uint_` opname and emit
-            // it once — `uint_mul_high` (Unsigned result) through
-            // `rtype_template`, `uint_lt` (Bool result) through
-            // `rtype_compare_template`, exactly as `mul` / `lt` route.
+            // `front::checked_arith_uint` / `front::saturating_mul` emit these
+            // unsigned overflow-test ops with the low-level opname already
+            // fixed (not the generic `mul`/`lt` the pairtype dispatch lowers
+            // by repr): wrapping product (`saturating_mul` low word), the
+            // widening multiply's high word (`checked_mul` / saturating high
+            // half), and the wrapped-sum carry compare (`checked_add`).  Both
+            // operands are Unsigned, so the integer templates rebuild the
+            // identical `uint_` opname and emit it once — `uint_mul` /
+            // `uint_mul_high` (Unsigned result) through `rtype_template`
+            // (`rint.py` `_rtype_template` / `IntegerRepr.rtype_mul`),
+            // `uint_lt` (Bool result) through `rtype_compare_template`,
+            // exactly as `mul` / `lt` route.
+            "uint_mul" => super::rint::rtype_template(hop, "mul"),
             "uint_mul_high" => super::rint::rtype_template(hop, "mul_high"),
             "uint_lt" => super::rint::rtype_compare_template(hop, "lt"),
             "uint_le" => super::rint::rtype_compare_template(hop, "le"),
@@ -7263,6 +7267,51 @@ mod tests {
         let ops = llops.borrow();
         assert_eq!(ops.ops.len(), 1);
         assert_eq!(ops.ops[0].opname, "getarrayitem");
+    }
+
+    #[test]
+    fn highlevelop_dispatch_routes_uint_mul_through_integer_template() {
+        // saturating_mul / checked_arith_uint emit the already-prefixed
+        // `uint_mul` opname.  `rint.py` `_rtype_template(..., 'mul')` on
+        // Unsigned rebuilds `uint_mul` (`IntegerRepr.opprefix`).
+        let (_ann, rtyper) = make_live_rtyper();
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let v_lhs = Variable::new();
+        v_lhs.set_concretetype(Some(LowLevelType::Unsigned));
+        let v_rhs = Variable::new();
+        v_rhs.set_concretetype(Some(LowLevelType::Unsigned));
+        let result = Variable::new();
+        result
+            .annotation
+            .replace(Some(Rc::new(SomeValue::Integer(SomeInteger::new(
+                true, true,
+            )))));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "uint_mul".to_string(),
+                vec![Hlvalue::Variable(v_lhs), Hlvalue::Variable(v_rhs)],
+                Hlvalue::Variable(result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        let r_unsigned = rtyper.getprimitiverepr(&LowLevelType::Unsigned).unwrap();
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s.borrow_mut().extend([
+            SomeValue::Integer(SomeInteger::new(true, true)),
+            SomeValue::Integer(SomeInteger::new(true, true)),
+        ]);
+        hop.args_r
+            .borrow_mut()
+            .extend([Some(r_unsigned.clone()), Some(r_unsigned.clone())]);
+        *hop.r_result.borrow_mut() = Some(r_unsigned);
+
+        let out = hop.dispatch().unwrap().unwrap();
+        assert!(matches!(out, Hlvalue::Variable(_)));
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "uint_mul");
     }
 
     #[test]

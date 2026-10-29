@@ -127,6 +127,16 @@ CHARON_CORE_INCLUDE = [
     "core::result::_::as_ref",
     "--include",
     "core::option::_::map_or",
+    "--include",
+    "core::option::_::map",
+    "--include",
+    "core::option::_::and_then",
+    "--include",
+    "core::option::_::unwrap_or_else",
+    "--include",
+    "core::option::_::or_else",
+    "--include",
+    "core::option::_::is_some_and",
     # Deref of a refcounted handle is a field read of `data` past the
     # counts; the body must be visible. Pattern shape matches
     # `core::option::_::map_or`. Chain from extracted bodies:

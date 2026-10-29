@@ -455,6 +455,10 @@ fn result_flow_llbc() -> Llbc {
                 // `ControlFlow<B, C>`: Continue(C) is variant 0 (type var 1),
                 // Break(B) is variant 1 (type var 0).
                 enum_decl(1, &["core", "ops", "control_flow", "ControlFlow"], &[("Continue", 0, 1), ("Break", 1, 0)]),
+                // Charon `type_by_id` indexes `type_decls` (`Llbc::type_by_id`).
+                // `Result<Infallible, i64>` at id 2 so the Ok arg is a
+                // named empty enum, not `??adt#99`.
+                enum_decl(2, &["core", "convert", "Infallible"], &[]),
             ],
             "fun_decls": [],
             "global_decls": [],
@@ -577,7 +581,7 @@ fn result_branch_break_of_infallible_result_builds_err() {
     let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
     let llbc = result_flow_llbc();
     let infallible = serde_json::json!({
-        "Adt": {"id": 99, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
+        "Adt": {"id": 2, "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}}
     });
     let residual = serde_json::json!({
         "Adt": {

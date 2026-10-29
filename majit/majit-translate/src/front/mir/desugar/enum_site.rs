@@ -2084,207 +2084,6 @@ impl<'a> Lowering<'a> {
         })
     }
 
-    /// Resolve a recognized `Option::map`/`and_then`/`unwrap_or_else(opt,
-    /// callable)` call into a
-    /// [`crate::front::option_closure_select::ClosureSelectSite`] — the `Option`
-    /// enum root + `Some` variant owners, the callable (closure env
-    /// `call_once` owner, or function-item `FunctionPath` segments), the
-    /// payload type `T`, and the call result type (`U` for `map`, `Option<U>`
-    /// for `and_then`, `T` for `unwrap_or_else`).  `None` (leaving the residual
-    /// call) when the receiver is not a resolvable `Option`, the callable is
-    /// neither a closure ADT nor a named function item, or (for `map`) the
-    /// result is not an `Option`.
-    pub(in crate::front::mir) fn recognize_closure_select_site(
-        &self,
-        kind: crate::front::option_closure_select::ClosureCombinator,
-        recv_ty: Option<&TyRef>,
-        env_ty: Option<&TyRef>,
-        fn_item_segments: Option<Vec<String>>,
-        fn_item_decl: Option<&FunDecl>,
-        dest_ty: &TyRef,
-        result_var: &Variable,
-    ) -> Option<crate::front::option_closure_select::ClosureSelectSite> {
-        use crate::front::option_closure_select::ClosureCombinator;
-        let recv_ty = recv_ty?;
-        let recv_ty = self
-            .tyref_peel_ref_to_pointee(recv_ty)
-            .unwrap_or_else(|| clone_tyref(recv_ty));
-        if !crate::front::result_exc::tyref_is_option(&recv_ty, self.llbc) {
-            return None;
-        }
-        let def_id = self.tyref_adt_def_id(&recv_ty)?;
-        let td = self.llbc.type_by_id(def_id)?;
-        // Suffix the enum root with the receiver `Option<X>`'s `<X>` so the
-        // per-instantiation root a static `Some(..)` mints is reused here;
-        // `some_owner` then derives `Option<X>::Some`.
-        let option_owner = format!(
-            "{}{}",
-            td.item_meta.name_path(),
-            tyref_enum_instantiation_suffix(&recv_ty, self.llbc)
-        );
-        let some_owner = Self::tagged_pair_payload_owner(td, &option_owner, 1)?;
-        let mut payload_ty = self.tyref_option_payload_value_type(&recv_ty)?;
-        let recv_scalar = option_nonzero_word_kind(&recv_ty, self.llbc);
-        let recv_is_scalar = recv_scalar.is_some();
-        if let Some(kind) = recv_scalar {
-            payload_ty = kind;
-        }
-        let payload_class_root = self.option_payload_instance_class_root(&recv_ty);
-        // Prefer a closure ADT (`call_once(env, (x,))`).  A function item has
-        // no ADT def id — `tyref_ref_adt_def_id` misses — so fall through to
-        // the `FnDef` path captured from the operand (or from `env_ty` when
-        // the item was spilled to a local).
-        let fn_item_segments = fn_item_segments
-            .or_else(|| env_ty.and_then(|ty| tyref_fn_def_call_segments(ty, self.llbc)));
-        let (call_once_owner, args_tuple_suffix, fn_item_segments) =
-            if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
-                let env_td = self.llbc.type_by_id(env_def_id)?;
-                (
-                    closure_env_call_once_owner(env_td),
-                    option_payload_tuple_suffix(&recv_ty, self.llbc),
-                    None,
-                )
-            } else {
-                let segments = fn_item_segments.filter(|s| !s.is_empty())?;
-                (String::new(), String::new(), Some(segments))
-            };
-        // The type the closure's `call_once` returns: `map`'s dest is
-        // `Option<U>` and its closure returns `U` (the dest payload);
-        // `and_then`'s dest is `Option<U>` returned directly; `or_else`'s dest
-        // is `Option<T>` and its closure returns that same `Option<T>`;
-        // `unwrap_or_else`'s dest is the bare `T`; `is_some_and` closures and
-        // dests are both `bool`.
-        let call_result_tyref = match kind {
-            ClosureCombinator::Map => {
-                crate::front::result_exc::tyref_option_payload(dest_ty, self.llbc)?
-            }
-            ClosureCombinator::AndThen
-            | ClosureCombinator::OrElse
-            | ClosureCombinator::UnwrapOrElse
-            | ClosureCombinator::IsSomeAnd => clone_tyref(dest_ty),
-        };
-        let mut call_result_ty = tyref_to_value_type_with(
-            &call_result_tyref,
-            self.llbc,
-            self.tombstoned_leaves,
-            self.gc_struct_ids,
-            &self.raw_alloc_flavor_structs,
-        );
-        // A constructor function item builds its aggregate in the arm; one
-        // whose shape does not resolve declines the rewrite.
-        let fn_item_ctor = match fn_item_decl {
-            Some(fd) if fn_item_segments.is_some() && fd.is_adt_constructor() => {
-                Some(self.constructor_fn_item_shape(fd, &call_result_tyref)?)
-            }
-            _ => None,
-        };
-        // A constructor builds its `Result` value; it never raises.
-        let call_once_result_exc = (fn_item_ctor.is_none()
-            && crate::front::result_exc::tyref_is_result_of_carrier(
-                &call_result_tyref,
-                self.llbc,
-                self.static_addrs.error_carrier,
-            ))
-        .then(|| {
-            let suffix = crate::front::result_exc::tyref_result_instantiation_suffix(
-                &call_result_tyref,
-                self.llbc,
-            );
-            let payload_ty =
-                crate::front::result_exc::tyref_result_ok(&call_result_tyref, self.llbc)
-                    .map(|ty| {
-                        tyref_to_value_type_with(
-                            &ty,
-                            self.llbc,
-                            self.tombstoned_leaves,
-                            self.gc_struct_ids,
-                            &self.raw_alloc_flavor_structs,
-                        )
-                    })
-                    .unwrap_or(ValueType::Ref(None));
-            (suffix, payload_ty)
-        });
-        let niche = self.tyref_is_niche_option_ptr(&recv_ty);
-        let mut fieldless_none_tag =
-            tyref_option_fieldless_niche(&recv_ty, self.llbc).map(|niche| niche.none_tag);
-        if recv_is_scalar {
-            fieldless_none_tag = Some(0);
-        }
-        // `map`/`and_then` BUILD their result `Option<U>`; the other combinators
-        // build none.  `U` is the dest payload, not the receiver's `T`, so the
-        // built variant must key the dest's own classdef — otherwise two `map`s
-        // over the same receiver type with different closure results share one
-        // `__pos_0` slot, the collision `recognize_from_size_align_ok_site`
-        // documents at its own site.  `resolve_option_consumer_owners` is the
-        // derivation every downstream reader of the built value (`unwrap_or`,
-        // `?`, `expect`) uses, so producing anything else payload-erases the
-        // read; a dest that is not a resolvable `Option` declines the whole
-        // rewrite and leaves the residual call.
-        let (result_option_owner, result_some_owner, result_niche) = match kind {
-            ClosureCombinator::Map | ClosureCombinator::AndThen => {
-                let (owner, some, _payload) = self.resolve_option_consumer_owners(dest_ty)?;
-                (owner, some, self.tyref_is_niche_option_ptr(dest_ty))
-            }
-            _ => (option_owner.clone(), some_owner.clone(), niche),
-        };
-        let dest_scalar = match kind {
-            ClosureCombinator::Map | ClosureCombinator::AndThen => {
-                option_nonzero_word_kind(dest_ty, self.llbc)
-            }
-            _ if recv_is_scalar => Some(payload_ty.clone()),
-            _ => None,
-        };
-        let dest_is_scalar = dest_scalar.is_some();
-        if matches!(kind, ClosureCombinator::Map)
-            && let Some(kind) = dest_scalar
-        {
-            call_result_ty = kind;
-        }
-        let result_fieldless_none_tag = match kind {
-            ClosureCombinator::Map | ClosureCombinator::AndThen if dest_is_scalar => Some(0),
-            ClosureCombinator::Map | ClosureCombinator::AndThen => {
-                tyref_option_fieldless_niche(dest_ty, self.llbc).map(|niche| niche.none_tag)
-            }
-            _ => fieldless_none_tag,
-        };
-        let niche_null_cast = self.option_niche_null_cast(&recv_ty);
-        let result_niche_null_cast = match kind {
-            ClosureCombinator::Map | ClosureCombinator::AndThen => {
-                self.option_niche_null_cast(dest_ty)
-            }
-            _ => niche_null_cast.clone(),
-        };
-        Some(crate::front::option_closure_select::ClosureSelectSite {
-            kind,
-            result_var: result_var.clone(),
-            option_owner,
-            some_owner,
-            result_option_owner,
-            result_some_owner,
-            result_niche,
-            result_int_null: match kind {
-                ClosureCombinator::Map | ClosureCombinator::AndThen => {
-                    self.option_niche_int_null(dest_ty)
-                }
-                _ => None,
-            },
-            result_niche_null_cast,
-            result_fieldless_none_tag,
-            call_once_owner,
-            fn_item_segments,
-            fn_item_ctor,
-            payload_ty,
-            payload_class_root,
-            call_result_ty,
-            args_tuple_suffix,
-            niche,
-            int_null: self.option_niche_int_null(&recv_ty),
-            niche_null_cast,
-            fieldless_none_tag,
-            call_once_result_exc,
-        })
-    }
-
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
     /// one variant and every variant carrying zero payload fields.  Such
     /// an enum is represented by-value as its discriminant integer, so
@@ -2314,8 +2113,9 @@ impl<'a> Lowering<'a> {
     /// `rnone.py` `rtype_is_None` compares an operand against a null of its
     /// own lltype (`Ptr` → `ptr_iszero`, Address / non-GC funcptr →
     /// `int_is_zero`); `rmodel.py` `rtype_is_` never mixes a GC pointer with
-    /// an Address. [`tyref_to_value_type_with`] already puts `Option<fn>` and
-    /// a raw-address niche ([`ty_is_raw_address`], e.g. `Option<&RawEnum>`)
+    /// an Address. [`tyref_to_value_type_with`] already puts `Option<fn>`,
+    /// a raw-address niche ([`ty_is_raw_address`], e.g. `Option<&RawEnum>`),
+    /// and a pointer-niche `Option<&RawStruct>` ([`tyref_niche_option_payload_paint`])
     /// in `Int`; a GC pointer / `SomeString` niche stays `Ref`.
     pub(in crate::front::mir) fn option_niche_is_int_bank(&self, option_ty: &TyRef) -> bool {
         if !self.tyref_is_niche_option_ptr(option_ty) {
@@ -2335,34 +2135,45 @@ impl<'a> Lowering<'a> {
 
     /// Int-bank null of a niche `Option`: `null_fn` with the `fn(..)`
     /// spelling, or `null_raw` with the raw pointee's class root
-    /// (`lltype.nullptr` / `llmemory.NULL`). `None` when the niche is
-    /// ref-banked (`push_niche_null`).
+    /// (`lltype.nullptr` / `llmemory.NULL`). A storage-raw struct
+    /// borrow Option is Int (`tyref_niche_option_payload_paint`) and
+    /// takes the first arm; the struct arm is the fallback when that
+    /// paint is not yet the Option's value type. `null_mut` is a GC
+    /// Instance and recasting it to `Ptr(Struct)` is refused
+    /// (`pairtype(GCRefRepr, Repr).convert_from_to` / `rgcref.py`;
+    /// `try_lower_raw_adt_ptr_null`). `None` when the
+    /// niche is a GC / string Ref (`push_niche_null`).
     pub(in crate::front::mir) fn option_niche_int_null(
         &self,
         option_ty: &TyRef,
     ) -> Option<crate::model::NicheIntNull> {
-        if !self.option_niche_is_int_bank(option_ty) {
-            return None;
+        if self.option_niche_is_int_bank(option_ty) {
+            if tyref_option_payload_is_fn_ptr(option_ty, self.llbc)
+                || tyref_node(option_ty, self.llbc)
+                    .is_some_and(|node| type_node_is_fn_ptr(node, self.llbc))
+            {
+                return Some(crate::model::NicheIntNull::FnPtr(tyref_fn_ptr_spelling(
+                    option_ty, self.llbc,
+                )));
+            }
+            let seed = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
+                .unwrap_or_else(|| option_ty.clone());
+            return Some(crate::model::NicheIntNull::RawAddress(
+                raw_address_owner_root(
+                    &seed,
+                    self.llbc,
+                    self.tombstoned_leaves,
+                    self.gc_struct_ids,
+                    &self.raw_alloc_flavor_structs,
+                ),
+            ));
         }
-        if tyref_option_payload_is_fn_ptr(option_ty, self.llbc)
-            || tyref_node(option_ty, self.llbc)
-                .is_some_and(|node| type_node_is_fn_ptr(node, self.llbc))
+        if self.payload_storage_raw_pointee_is_struct(option_ty)
+            && let Some(root) = self.payload_storage_raw_struct_root(option_ty)
         {
-            return Some(crate::model::NicheIntNull::FnPtr(tyref_fn_ptr_spelling(
-                option_ty, self.llbc,
-            )));
+            return Some(crate::model::NicheIntNull::RawAddress(Some(root)));
         }
-        let seed = crate::front::result_exc::tyref_option_payload(option_ty, self.llbc)
-            .unwrap_or_else(|| option_ty.clone());
-        Some(crate::model::NicheIntNull::RawAddress(
-            raw_address_owner_root(
-                &seed,
-                self.llbc,
-                self.tombstoned_leaves,
-                self.gc_struct_ids,
-                &self.raw_alloc_flavor_structs,
-            ),
-        ))
+        None
     }
 
     /// `true` when `ty` is represented as a one-word nullable `Option` in

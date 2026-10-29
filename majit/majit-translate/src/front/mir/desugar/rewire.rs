@@ -1064,7 +1064,7 @@ pub(in crate::front::mir) fn emit_disc_callable(
     } else {
         site.call_result_ty.clone()
     };
-    crate::front::option_closure_select::emit_callable(
+    crate::front::result_exc::emit_callable(
         graph,
         block,
         env,
@@ -1131,7 +1131,7 @@ pub(in crate::front::mir) fn build_disc_arm(
         }
         (DiscCombinator::OptionOkOrElse, false) => {
             let env = disc_callable_env(site, sources, inputs, extra, name)?;
-            let err = crate::front::option_closure_select::emit_callable(
+            let err = crate::front::result_exc::emit_callable(
                 graph,
                 block,
                 env,
@@ -1515,7 +1515,7 @@ impl CombinatorArmExits<'_> {
         } else {
             site.call_result_ty.clone()
         };
-        let value = crate::front::option_closure_select::emit_callable(
+        let value = crate::front::result_exc::emit_callable(
             graph,
             block,
             env,

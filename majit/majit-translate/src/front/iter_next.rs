@@ -64,7 +64,7 @@
 use crate::flowspace::model::{ConstValue, Constant, Variable};
 use crate::front::result_exc::{
     assert_block_pure_besides, assert_single_pred, back_substitute, collapse_pos0_read,
-    follow_single_exit, op_operand_vars, split_diamond_exits,
+    field_read_named_of_image, follow_single_exit, op_operand_vars, split_diamond_exits,
 };
 use crate::model::{
     BlockId, CallTarget, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, OpKind,
@@ -1201,19 +1201,14 @@ fn rewire_one_next_site(
     // front folds the niche before this post-pass runs, so accepting both
     // shapes here is required for one list-iterator representation rather
     // than a separate Rust-specific iterator path.
+    //
+    // A tagged `Option<T>` Discriminant recasts the forwarded `opt` onto
+    // the interned class (`cast_instance_call` of `owner_root`) so
+    // `getattr __discriminant` hits the classdef. The Option still
+    // escapes on the diamond exits, so `peel_recast_chain_from` of
+    // `opt_c` aborts; the FieldRead is of the recast dest.
     let aggregate_disc =
-        graph.blocks[c]
-            .operations
-            .iter()
-            .enumerate()
-            .find_map(|(i, op)| match &op.kind {
-                OpKind::FieldRead { base, field, .. }
-                    if *base == opt_c && field.name == "__discriminant" =>
-                {
-                    op.result.clone().map(|r| (i, r))
-                }
-                _ => None,
-            });
+        field_read_named_of_image(&graph.blocks[c].operations, &opt_c, "__discriminant");
     let (none_link, some_link, aggregate_payload, branch_value_vars) = if let Some((
         disc_idx,
         disc_var,

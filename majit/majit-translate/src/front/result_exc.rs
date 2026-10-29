@@ -107,6 +107,7 @@ use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
 use crate::flowspace::model::{ConstValue, Constant, Variable};
+use crate::front::option_variant::emit_narrow;
 use crate::model::{
     BlockId, CallFuncPtr, CallTarget, ConcreteType, ExitCase, ExitSwitch, FieldDescriptor,
     FunctionGraph, Link, LinkArg, OpKind, SpaceOperation, ValueType,
@@ -2619,6 +2620,235 @@ fn block_reachable_from_start(graph: &FunctionGraph, block: usize) -> bool {
     false
 }
 
+/// Run a combinator's callable on `arg` (or on nothing) in `block`.  A
+/// constructor function item builds its aggregate from `arg`; any other
+/// function item is a direct `Call(FunctionPath)`; a closure is
+/// `call_once(env, (arg,))`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_callable(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    env: Option<Variable>,
+    call_once_owner: &str,
+    fn_item_segments: Option<&[String]>,
+    fn_item_ctor: Option<&crate::front::mir::AggregateShape>,
+    arg: Option<(Variable, ValueType, Option<String>)>,
+    result_ty: ValueType,
+    args_tuple_suffix: &str,
+) -> Result<Variable, String> {
+    if let Some(shape) = fn_item_ctor {
+        let args: Vec<Variable> = arg.into_iter().map(|(value, _, _)| value).collect();
+        return crate::front::mir::emit_aggregate_value(graph, block, shape, &args);
+    }
+    if let Some(segments) = fn_item_segments {
+        return Ok(emit_fn_item_call(
+            graph,
+            block,
+            segments,
+            arg.map(|(value, _, class_root)| (value, class_root)),
+            result_ty,
+        ));
+    }
+    let env = env.ok_or_else(|| "closure env not threaded".to_string())?;
+    Ok(emit_call_once(
+        graph,
+        block,
+        env,
+        arg,
+        call_once_owner,
+        result_ty,
+        args_tuple_suffix,
+    ))
+}
+
+/// Emit `f(x)` / `f()` in `block` as a direct `Call(FunctionPath)` — the
+/// same op an ordinary free-function call site lowers to.  `arg` is the
+/// payload for `map`/`and_then`/`is_some_and`, or `None` for a niladic
+/// `unwrap_or_else`/`or_else`.
+fn emit_fn_item_call(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    segments: &[String],
+    arg: Option<(Variable, Option<String>)>,
+    result_ty: ValueType,
+) -> Variable {
+    let call_result = graph.alloc_value_var();
+    let args = match arg {
+        Some((payload, class_root)) => {
+            // Same class narrow the closure arm applies before writing
+            // `Tuple<*mut T>.__pos_0`: the callee parameter must not widen
+            // to OBJECTPTR.
+            let payload = emit_narrow(graph, block, payload, &class_root);
+            crate::model::call_args(vec![payload])
+        }
+        None => crate::model::call_args(vec![]),
+    };
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(call_result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::FunctionPath {
+                segments: segments.to_vec(),
+                fun_decl_id: None,
+                specialization: crate::parse::GraphSpecialization::Regular,
+            },
+            args,
+            result_ty,
+        },
+    });
+    call_result
+}
+
+/// Emit `call_once(env, args)` in `block`, returning the call result.  `arg` is
+/// the single closure argument (a `(x,)` tuple) or `None` for a niladic closure
+/// (an empty tuple the opaque body ignores) — the same `Args`-tuple shape
+/// `Rvalue::Aggregate` emits.
+pub(crate) fn emit_call_once(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    env: Variable,
+    arg: Option<(Variable, ValueType, Option<String>)>,
+    call_once_owner: &str,
+    result_ty: ValueType,
+    args_tuple_suffix: &str,
+) -> Variable {
+    // The `(payload,)` Args tuple keys under the per-shape `Tuple<X>` leaf the
+    // extracted `call_once` reads `.0` from at `resolve_place`; a niladic
+    // closure's `()` tuple has no `.0` and stays bare `Tuple` (empty types →
+    // "" on both sides), so the suffix applies only when an argument is written.
+    let tuple_owner = if arg.is_some() {
+        format!("Tuple{args_tuple_suffix}")
+    } else {
+        "Tuple".to_string()
+    };
+    let args_tuple = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(args_tuple.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::synthetic_transparent_ctor(&tuple_owner),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some(tuple_owner.clone())),
+        },
+    });
+    if let Some((value, value_ty, class_root)) =
+        arg.filter(|_| majit_ir::descr::is_shaped_tuple_name(&tuple_owner))
+    {
+        // RPython derives an instance field's low-level repr from the concrete
+        // annotation stored on that field (`rclass.py` `InstanceRepr._setup_repr`).
+        // Preserve the source payload class before this synthetic tuple write
+        // instead of widening every `Tuple<*mut T>.__pos_0` reader to OBJECTPTR.
+        // Bare `Tuple` is unit `()`: `TupleRepr.newtuple` of zero items is
+        // `inputconst(Void, ())`, so `getattr(Tuple, __pos_0)` raises.
+        let value = emit_narrow(graph, block, value, &class_root);
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: args_tuple.clone(),
+                field: FieldDescriptor {
+                    name: "__pos_0".to_string(),
+                    owner_root: Some(tuple_owner.clone()),
+                    owner_id: None,
+                    base_is_deref: None,
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
+                    scalar_word: None,
+                },
+                value: LinkArg::Value(value),
+                ty: value_ty,
+            },
+        });
+    }
+    let call_result = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(call_result.clone()),
+        kind: OpKind::Call {
+            target: CallTarget::method("call_once", Some(call_once_owner.to_string())),
+            args: crate::model::call_args(vec![env, args_tuple]),
+            result_ty,
+        },
+    });
+    call_result
+}
+
+#[cfg(test)]
+mod emit_callable_tests {
+    use super::*;
+
+    #[test]
+    fn call_once_tuple_write_preserves_reference_payload_class() {
+        let mut g = FunctionGraph::new("test_call_once_payload_class");
+        let block = g.startblock;
+        let env = g.push_op_var(block, OpKind::ConstInt(7), true).unwrap();
+        let payload = g.push_op_var(block, OpKind::ConstRefNull, true).unwrap();
+
+        emit_call_once(
+            &mut g,
+            block,
+            env,
+            Some((payload, ValueType::Ref(None), Some("PyObject".to_string()))),
+            "test::closure",
+            ValueType::Int,
+            "<*mut PyObject>",
+        );
+
+        let written = g.blocks[block.0]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, value, .. }
+                    if field.owner_root.as_deref() == Some("Tuple<*mut PyObject>") =>
+                {
+                    value.as_variable().cloned()
+                }
+                _ => None,
+            })
+            .expect("closure Args tuple payload write");
+        assert!(g.blocks[block.0].operations.iter().any(|op| {
+            op.result.as_ref() == Some(&written)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { .. },
+                        ..
+                    } if crate::model::cast_instance_root(&op.kind) == Some("PyObject")
+                )
+        }));
+    }
+
+    #[test]
+    fn call_once_does_not_write_pos0_on_unit_tuple() {
+        let mut g = FunctionGraph::new("test_call_once_unit_tuple");
+        let block = g.startblock;
+        let env = g.push_op_var(block, OpKind::ConstInt(7), true).unwrap();
+        let payload = g.push_op_var(block, OpKind::ConstInt(1), true).unwrap();
+
+        emit_call_once(
+            &mut g,
+            block,
+            env,
+            Some((payload, ValueType::Int, None)),
+            "test::closure",
+            ValueType::Int,
+            "",
+        );
+
+        let wrote_unit = g.blocks[block.0].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldWrite { field, .. }
+                    if field.name == "__pos_0"
+                        && field.owner_root.as_deref() == Some("Tuple")
+            )
+        });
+        assert!(
+            !wrote_unit,
+            "unit Tuple has no __pos_0 (getattr(Tuple, __pos_0) raises)"
+        );
+    }
+}
+
 /// A `From::from` call spliced in front of a foreign `from_residual`.
 ///
 /// `segments` is the path [`crate::front::mir::trait_impl_identity_path`]
@@ -3371,8 +3601,8 @@ pub(crate) fn rewire_result_exc_call_sites(
 /// forwards `T` and whose `None` arm calls the niladic error closure and
 /// raises through the graph's native exception edge.
 ///
-/// This is deliberately a combined rewrite.  Treating `ok_or_else` as an
-/// ordinary Option closure-select would build a `Result`, while treating it
+/// This is deliberately a combined rewrite.  Translating `ok_or_else` as an
+/// ordinary Option helper graph would build a `Result`, while treating it
 /// only as an ordinary scoped Result call would leave the foreign method as a
 /// residual.  RPython's flow graph has neither shell: it carries the value on
 /// the normal edge and the exception object on the exceptional edge
@@ -3583,7 +3813,7 @@ fn rewire_one_option_ok_or_else_try_site(
     close_goto_mixed(graph, some_bb, normal.target, some_args);
 
     let env_in_none = none_inputs[0].clone();
-    let error = crate::front::option_closure_select::emit_call_once(
+    let error = emit_call_once(
         graph,
         none_bb,
         env_in_none,
@@ -9383,6 +9613,32 @@ fn recast_images_of(ops: &[crate::model::SpaceOperation], start: &Variable) -> V
         }
     }
     images
+}
+
+/// `FieldRead` of `field` whose base is `origin` or a recast image of it.
+///
+/// A tagged Option Discriminant recasts the forwarded scrutinee onto the
+/// interned class (`cast_instance_call` of `owner_root`) while that same
+/// value still escapes on the diamond exits. [`peel_recast_chain_from`]
+/// aborts on the escape, so a FieldRead of the recast dest would miss
+/// `base == origin`. [`recast_images_of`] is the dual walk that does
+/// not require the origin to be dead.
+pub(crate) fn field_read_named_of_image(
+    ops: &[crate::model::SpaceOperation],
+    origin: &Variable,
+    field: &str,
+) -> Option<(usize, Variable)> {
+    let images = recast_images_of(ops, origin);
+    ops.iter().enumerate().find_map(|(i, op)| match &op.kind {
+        OpKind::FieldRead {
+            base,
+            field: read_field,
+            ..
+        } if read_field.name == field && images.iter().any(|image| image == base) => {
+            op.result.clone().map(|var| (i, var))
+        }
+        _ => None,
+    })
 }
 
 /// True when `kind` is a GC-erasure identity whose first argument is the
@@ -19981,6 +20237,45 @@ mod live_mut_gc_erasure_tests {
                 "sandwich image missing from recast_images_of"
             );
         }
+    }
+
+    #[test]
+    fn field_read_of_recast_dest_finds_discriminant_when_origin_escapes() {
+        use crate::model::FieldDescriptor;
+        let mut graph = FunctionGraph::new("disc_recast_escape");
+        let entry = graph.startblock;
+        let opt = graph.alloc_value_var();
+        graph.blocks[entry.0].inputargs = vec![opt.clone()];
+        let narrowed = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("option::Option<i64>", opt.clone()),
+                true,
+            )
+            .expect("recast");
+        let disc = graph
+            .push_op_var(
+                entry,
+                OpKind::FieldRead {
+                    base: narrowed,
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("option::Option<i64>".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("disc");
+        let (succ, _) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(entry, succ, vec![opt.clone()]);
+        let found =
+            field_read_named_of_image(&graph.blocks[entry.0].operations, &opt, "__discriminant");
+        assert_eq!(found, Some((1, disc)));
+        let (peeled, recast_idx) = peel_recast_chain_from(&graph, entry.0, &opt);
+        assert_eq!(peeled, opt);
+        assert!(recast_idx.is_empty());
     }
 }
 

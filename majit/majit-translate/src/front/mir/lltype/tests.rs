@@ -1547,6 +1547,44 @@ fn enum_suffix_keeps_unit_ok_when_err_splits() {
         None
     );
     assert_eq!(enum_instantiation_suffix_from_args(&["()".into()]), None);
+    // Nested unresolved args are not an instantiation: `Option<??scalar>`
+    // does not start with `??`, so prefix-only splitting interned
+    // `ControlFlow<Option<??scalar>, i64>` and getattr `from_residual`
+    // blocked on that classdef (`w_range_fields_i64` `?`).
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Option<??scalar>".into(), "i64".into()]),
+        None
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["i64".into(), "Option<??scalar>".into()]),
+        None
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Result<TypeVar, E>".into()]),
+        None
+    );
+    // A leaked hasher `fn() -> ()` Instantiated arg is concrete (the
+    // `{"Tuple": []}` unit, not `??Tuple`).
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["WordHasher".into(), "fn() -> ()".into()]).as_deref(),
+        Some("<WordHasher,fn() -> ()>")
+    );
+    // Charon hash-cons `{"Value":[id,"Never"]}` is a type-name string.
+    // `??scalar` is not an instantiation; `Never` is.
+    let llbc = empty_llbc();
+    assert_eq!(
+        charon_type_value_to_ast_string(&serde_json::json!({"Value": [0, "Never"]}), &llbc, 0),
+        "Never"
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Never".into(), "BytecodeCorruption".into()])
+            .as_deref(),
+        Some("<Never,BytecodeCorruption>")
+    );
+    assert_eq!(
+        enum_instantiation_suffix_from_args(&["Option<Never>".into(), "i64".into()]).as_deref(),
+        Some("<Option<Never>,i64>")
+    );
 }
 
 #[test]
@@ -6441,6 +6479,112 @@ fn option_map_or_keeps_regular_call_to_core_body() {
     );
 }
 
+/// `Option::{map, and_then, unwrap_or_else, or_else, is_some_and}` stay
+/// regular calls to the extracted core bodies. The Option repr is
+/// unchanged; only the caller rewrite is gone (`guess_call_kind`
+/// regular). Each body matches on the receiver tag and calls `f(x)` /
+/// `f()`.
+#[test]
+fn option_map_family_keeps_regular_call_to_core_body() {
+    use crate::model::{CallTarget, ExitSwitch, OpKind};
+    let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+    if !std::path::Path::new(path).is_file() {
+        eprintln!("skipping: {path} is missing; run scripts/extract-llbc.py");
+        return;
+    }
+    let llbc = Llbc::load(path).expect("load interpreter LLBC");
+    let ctx = super::LowerContext::new(&llbc);
+    let leaves = [
+        "map",
+        "and_then",
+        "unwrap_or_else",
+        "or_else",
+        "is_some_and",
+    ];
+    for leaf in leaves {
+        let suffix = format!("::option::<Impl>::{leaf}");
+        let mut lowered_core_bodies = 0usize;
+        for fd in llbc.iter_fun_decls() {
+            if !fd.has_unstructured_body() {
+                continue;
+            }
+            let name_path = fd.item_meta.name_path();
+            if !name_path.ends_with(&suffix) {
+                continue;
+            }
+            let graph = super::lower_fun_decl(&ctx, fd)
+                .unwrap_or_else(|e| panic!("lower {name_path}: {e}"));
+            let has_disc = graph.blocks.iter().any(|block| {
+                matches!(block.exitswitch, Some(ExitSwitch::Value(_)))
+                    || block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                        )
+                    })
+                    || block.operations.iter().any(
+                        |op| matches!(&op.kind, OpKind::BinOp { op, .. } if op == "is_" || op == "ne"),
+                    )
+            });
+            assert!(has_disc, "{name_path}: core body matches on the Option tag");
+            let has_ft = graph.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| match &op.kind {
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } => name == "call_once" || name == "call" || name == "call_mut",
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } => {
+                        let leaf = segments.last().map(String::as_str);
+                        leaf == Some("call_once")
+                            || leaf == Some("call")
+                            || leaf == Some("call_mut")
+                    }
+                    _ => false,
+                })
+            });
+            assert!(
+                has_ft,
+                "{name_path}: core body calls f(x)/f(); ops={:?}",
+                graph_ops(&graph)
+            );
+            lowered_core_bodies += 1;
+        }
+        assert_eq!(
+            lowered_core_bodies, 1,
+            "extracted {leaf} FunDecl bodies must lower, got {lowered_core_bodies}"
+        );
+    }
+
+    let caller = super::lower_function(&llbc, "install_applevel_builtins")
+        .expect("lower install_applevel_builtins");
+    let is_some_and_calls = caller
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .filter(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "is_some_and",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("is_some_and")
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        is_some_and_calls, 2,
+        "caller keeps two regular calls to the core is_some_and body, got {is_some_and_calls}"
+    );
+}
+
 #[test]
 fn result_with_pointer_like_err_still_paints_class_root() {
     // Result keeps its tag even when `E` is pointer-like
@@ -8263,7 +8407,14 @@ fn policy_opaque_nullable_pointer_option_is_a_residual_stub() {
         "elidable_nullable",
     ] {
         let row = leaf_of(&policy, leaf).unwrap_or_else(|| panic!("{leaf} must be registered"));
-        let token = if leaf == "word_result" { "i64" } else { "ref" };
+        // `sized_nullable` is `Option<*mut storage-raw Struct>`: overlay
+        // paint is int-bank SomePtr (`history.py` `getkind` of
+        // `Ptr(Struct Raw)`), so the residual token is `i64`. A Vec
+        // field keeps Nominal off that path (`adt_path_is_gc_container`).
+        let token = match leaf {
+            "word_result" | "sized_nullable" => "i64",
+            _ => "ref",
+        };
         assert_eq!(row.2.as_deref(), Some(token), "{leaf}");
     }
     for leaf in [

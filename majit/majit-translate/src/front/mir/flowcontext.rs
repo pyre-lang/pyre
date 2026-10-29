@@ -571,12 +571,6 @@ pub(in crate::front::mir) struct Lowering<'a> {
     /// sibling of `unwrap` (the panic message is dropped; see
     /// [`crate::front::option_expect::ExpectSite`]).
     pub(in crate::front::mir) expect_sites: Vec<crate::front::option_expect::ExpectSite>,
-    /// `Option::map`/`and_then`/`unwrap_or_else(opt, closure)` call sites
-    /// recorded for the discriminant closure-select the
-    /// `front::option_closure_select` post-pass synthesizes (see
-    /// [`crate::front::option_closure_select::ClosureSelectSite`]).
-    pub(in crate::front::mir) closure_select_sites:
-        Vec<crate::front::option_closure_select::ClosureSelectSite>,
     /// Option/Result combinators whose body is a discriminant switch (plus an
     /// optional closure `call_once`).  Captured here so the post-pass can
     /// replace the opaque core residual with the if/else the flow graph
@@ -825,6 +819,9 @@ pub(in crate::front::mir) fn pygraph_initial_block(
                             .map(|_| tyref_to_ast_string(&local.ty, llbc))
                     })
                     .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                    .or_else(|| {
+                        niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
+                    })
                     .or_else(|| {
                         if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
                             None
@@ -1148,6 +1145,9 @@ impl<'a> Lowering<'a> {
                                 .map(|_| tyref_to_ast_string(&local.ty, llbc))
                         })
                         .or_else(|| tyref_fieldless_enum_class_root(&local.ty, llbc))
+                        .or_else(|| {
+                            niche_option_storage_raw_struct_root(&local.ty, llbc, tombstoned_leaves)
+                        })
                         .or_else(|| {
                             if tyref_is_borrowed_fieldless_enum_free(&local.ty, llbc) {
                                 None
@@ -1577,7 +1577,6 @@ impl<'a> Lowering<'a> {
             slice_index_range_sites: Vec::new(),
             unwrap_sites: Vec::new(),
             expect_sites: Vec::new(),
-            closure_select_sites: Vec::new(),
             disc_combinator_sites: Vec::new(),
             result_try_sites: Vec::new(),
             niche_disc_vars: std::collections::HashSet::new(),

@@ -1255,8 +1255,37 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
         })
         .collect();
     assert!(
-        fn_consts.is_empty(),
-        "`.map(Some)` leaves no function-item define: {fn_consts:?}"
+        fn_consts.iter().all(|segments| {
+            segments.last().map(String::as_str) == Some("w_none")
+                && segments.iter().any(|s| s == "noneobject")
+        }),
+        "`.map(Some)` leaves no Some function-item define: {fn_consts:?}"
+    );
+    assert_eq!(
+        fn_consts.len(),
+        3,
+        "three `unwrap_or_else(w_none)` keep the function item, got {fn_consts:?}"
+    );
+    let unwrap_or_else_calls = ops
+        .iter()
+        .filter(|kind| match kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == "unwrap_or_else",
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => {
+                segments.last().map(String::as_str) == Some("unwrap_or_else")
+                    && segments.iter().any(|s| s == "option")
+            }
+            _ => false,
+        })
+        .count();
+    assert_eq!(
+        unwrap_or_else_calls, 3,
+        "caller keeps three regular calls to the core unwrap_or_else body, got {unwrap_or_else_calls}"
     );
     assert!(
         !ops.iter().any(|kind| matches!(kind,

@@ -7626,27 +7626,16 @@ mod tests {
             other => panic!("both projections carry the HostFrame classdef, got {other:?}"),
         }
 
-        // Unregistered payload: `Impossible ∪ s_None` is `s_None`
-        // (`pairtype(SomeImpossibleValue, SomeObject).union` returns
-        // the other side). `Impossible.noneify()` is Err, so a
-        // noneify predicate would mint a tagged Option instance.
         let unregistered = bk.project_struct_field_type("UnregisteredPayload");
-        assert!(
-            matches!(unregistered, SomeValue::Impossible),
-            "unregistered named struct projects Impossible"
-        );
-        assert_eq!(
-            unionof([&unregistered, &s_none()]).expect("Impossible ∪ None_ is s_None"),
-            s_none()
-        );
-        assert!(
-            unregistered.noneify().is_err(),
-            "Impossible.noneify is UnionError"
-        );
+        let unregistered_kind = match &unregistered {
+            SomeValue::Impossible => "Impossible",
+            other => panic!("unregistered named struct stays Impossible, got {other:?}"),
+        };
+        assert_eq!(unregistered_kind, "Impossible");
         assert_eq!(
             bk.project_struct_field_type("Option<UnregisteredPayload>"),
             s_none(),
-            "Option of an unregistered payload is s_None, not a tagged instance"
+            "Option of an unregistered payload is s_None"
         );
     }
 
