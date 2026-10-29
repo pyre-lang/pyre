@@ -7124,6 +7124,9 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     // identity here prevents a bridge-resumed callee from emitting
     // `GUARD_VALUE(root.w_globals, callee.w_globals)`.
     if ctx.inline_callee_consts.is_some() {
+        // `inline_w_globals` is the function's globals object, which is the
+        // `FrameDebugData` override when `frame_stores_global` held at
+        // construction — not `pycode.w_globals`.
         return Ok(ctx.inline_w_globals() == expected_globals as usize);
     }
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -7226,16 +7229,43 @@ fn guard_current_frame_globals_identity<Sym: WalkSym>(
     Ok(true)
 }
 
+/// `pyframe.py get_w_globals` for an inlined LOAD_GLOBAL: read `frame.debugdata`,
+/// emit `GuardIsnull` / `GuardNonnull` with the portal arm's helper, then pick
+/// `debugdata.w_globals` or `promote(pycode).w_globals`.
+fn walker_inline_frame_get_w_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame: OpRef,
+) -> Result<OpRef, DispatchError> {
+    let debugdata = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        frame,
+        crate::descr::pyframe_debugdata_descr(),
+    );
+    let present = crate::state::frame_debugdata_box_is_known_non_null(ctx.trace_ctx, debugdata);
+    let known_null = crate::state::frame_debugdata_box_is_known_null(ctx.trace_ctx, debugdata);
+    if present || known_null {
+        let opcode = if present {
+            OpCode::GuardNonnull
+        } else {
+            OpCode::GuardIsnull
+        };
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, opcode, &[debugdata])?;
+    }
+    Ok(crate::state::frame_get_globals_obj(ctx.trace_ctx, frame))
+}
+
 fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
     runtime_helper: majit_ir::RuntimeHelperKind,
     r_args: &mut [OpRef],
-) {
+) -> Result<(), DispatchError> {
     if runtime_helper != majit_ir::RuntimeHelperKind::LoadGlobal {
-        return;
+        return Ok(());
     }
     let Some(ns_box) = r_args.first_mut() else {
-        return;
+        return Ok(());
     };
 
     // `pyframe.py get_w_globals LOAD_GLOBAL` asks the current MIFrame for
@@ -7248,7 +7278,7 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
     // caller's globals.
     if let Some(consts) = ctx.inline_callee_consts {
         let Some(jitcode) = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index) else {
-            return;
+            return Ok(());
         };
         let Some(frame) = ctx
             .registers_r
@@ -7272,31 +7302,30 @@ fn replace_movable_load_global_namespace_with_frame_globals<Sym: WalkSym>(
             if w_globals != 0 {
                 *ns_box = ctx.trace_ctx.const_ref(w_globals as i64);
             }
-            return;
+            return Ok(());
         };
-        // `pyframe.py get_w_globals` on a debugdata-less frame is
-        // `jit.promote(self.pycode).w_globals`: GETFIELD_GC_R of this
-        // callee red, not a ConstRef of the dict word.
-        let w_globals = crate::state::frame_get_globals_obj(ctx.trace_ctx, frame);
-        // Recording-time residual execution needs the same concrete shadow;
-        // the compiled value remains the GETFIELD_GC_R result above and is
-        // therefore still sourced from the live callee frame.
+        // `pyframe.py get_w_globals`: debugdata payload or promote(pycode).
+        // `inline_w_globals` is the function's globals, which is the
+        // `FrameDebugData` override when `frame_stores_global` held at
+        // construction, so the concrete stamp matches the box this returns.
+        let w_globals = walker_inline_frame_get_w_globals(ctx, op_pc, frame)?;
         ctx.trace_ctx.try_set_opref_concrete(
             w_globals,
             Value::Ref(majit_ir::GcRef(ctx.inline_w_globals())),
         );
         *ns_box = w_globals;
-        return;
+        return Ok(());
     }
 
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
-        return;
+        return Ok(());
     }
     let w_globals_op = unsafe { (&*sym_ptr).frame_w_globals() };
     if !w_globals_op.is_none() {
         *ns_box = w_globals_op;
     }
+    Ok(())
 }
 
 /// Line-by-line port of `pyjitpl.py MetaInterp._build_allboxes`.

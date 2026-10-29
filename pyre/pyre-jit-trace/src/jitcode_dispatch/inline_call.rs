@@ -572,14 +572,51 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
     }
 }
 
+/// Whether a fresh inlined callee frame stores PY_NULL `debugdata` or a
+/// constructor `FrameDebugData` (`frame_stores_global` override).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FreshFrameDebugdata {
+    Null,
+    NonNull,
+}
+
+fn fresh_frame_debugdata_for_callee(
+    w_code: *const (),
+    callable: pyre_object::PyObjectRef,
+) -> FreshFrameDebugdata {
+    if callable.is_null() {
+        return FreshFrameDebugdata::Null;
+    }
+    let globals = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
+    if unsafe {
+        pyre_interpreter::w_code_frame_stores_global(w_code as pyre_object::PyObjectRef, globals)
+    } {
+        FreshFrameDebugdata::NonNull
+    } else {
+        FreshFrameDebugdata::Null
+    }
+}
+
+/// Successor a folded `goto_if_not_ptr_iszero` keeps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FreshFrameGotoFold {
+    None,
+    Fallthrough,
+    Label,
+}
+
 /// Callee-body ops a fresh inlined frame would execute.
 ///
 /// The inlined callee frame is a virtual whose `debugdata` is None
-/// (`PyFrame.__init__`). `dispatch_bytecode`'s `_d is not None` therefore
+/// (`PyFrame.__init__`) unless `frame_stores_global` installed a
+/// `FrameDebugData`. `dispatch_bytecode`'s `_d is not None` therefore
 /// folds (`pyjitpl.py` `_establish_nullity` records nothing for a known-null
-/// box), so a `goto_if_not_ptr_iszero` of that `getfield_vable_r` follows only
-/// its fallthrough and is itself not yielded. Ops reachable only through the
-/// non-null arm are dropped.
+/// or known-non-null box), so a `goto_if_not_ptr_iszero` of that
+/// `getfield_vable_r` follows only the arm the constructor takes and is
+/// itself not yielded. Ops reachable only through the other arm are dropped.
+///
+/// [`decoded_ops_on_fresh_frame`] is the null-`debugdata` fold. A callee
+/// built with a non-null payload uses [`decoded_ops_on_fresh_frame_kind`].
 ///
 /// `None` when a reachable instruction cannot be decoded. Walks the CFG from
 /// pc 0: fallthrough, `goto` targets, both successors of every other
@@ -588,6 +625,14 @@ pub(crate) fn diagnose_inline_recognition(arg_concretes: &[ConcreteValue], op_pc
 pub(crate) fn decoded_ops_on_fresh_frame(
     body_code: &[u8],
     descr_refs: &[DescrRef],
+) -> Option<Vec<DecodedOp>> {
+    decoded_ops_on_fresh_frame_kind(body_code, descr_refs, FreshFrameDebugdata::Null)
+}
+
+pub(crate) fn decoded_ops_on_fresh_frame_kind(
+    body_code: &[u8],
+    descr_refs: &[DescrRef],
+    debugdata: FreshFrameDebugdata,
 ) -> Option<Vec<DecodedOp>> {
     if body_code.is_empty() {
         return Some(Vec::new());
@@ -614,8 +659,8 @@ pub(crate) fn decoded_ops_on_fresh_frame(
         };
         let d = &ops[idx];
         let pred = previous_non_live_op(&ops, idx);
-        let folded = is_fresh_frame_debugdata_null_goto(body_code, d, pred, descr_refs);
-        if folded {
+        let folded = fresh_frame_goto_fold(body_code, d, pred, descr_refs, debugdata);
+        if folded != FreshFrameGotoFold::None {
             folded_goto[pc] = true;
         }
         for succ in fresh_frame_successors(body_code, d, descr_refs, folded, &starts) {
@@ -699,13 +744,11 @@ fn debugdata_field_name(name: &str) -> bool {
     name == "debugdata" || name.rsplit(['.', ':']).next() == Some("debugdata")
 }
 
-/// `goto_if_not_ptr_iszero` of the `debugdata` virtualizable static field
-/// written by the immediately preceding `getfield_vable_r`.
-fn is_fresh_frame_debugdata_null_goto(
+fn ptr_iszero_goto_of_pred(
     code: &[u8],
     op: &DecodedOp,
     pred: Option<&DecodedOp>,
-    descr_refs: &[DescrRef],
+    pred_opname_prefix: &str,
 ) -> bool {
     if op.opname != "goto_if_not_ptr_iszero" {
         return false;
@@ -713,10 +756,10 @@ fn is_fresh_frame_debugdata_null_goto(
     let Some(pred) = pred else {
         return false;
     };
-    // Assembler may emit `live/` between the vable read and the null test
-    // (`dispatch_bytecode`'s jitted arm). The producer is still that
-    // `getfield_vable_r`; adjacency of the two pcs is not required.
-    if !pred.opname.starts_with("getfield_vable_r") {
+    // Assembler may emit `live/` between the field read and the null test
+    // (`dispatch_bytecode`'s jitted arm). Adjacency of the two pcs is not
+    // required.
+    if !pred.opname.starts_with(pred_opname_prefix) {
         return false;
     }
     let Some(&cond) = code.get(op.pc + 1) else {
@@ -725,15 +768,85 @@ fn is_fresh_frame_debugdata_null_goto(
     let Some(&dst) = code.get(pred.next_pc.wrapping_sub(1)) else {
         return false;
     };
-    if cond != dst {
+    cond == dst
+}
+
+/// `goto_if_not_ptr_iszero` of the `debugdata` virtualizable static field
+/// written by the immediately preceding `getfield_vable_r`.
+fn is_fresh_frame_debugdata_null_goto(
+    code: &[u8],
+    op: &DecodedOp,
+    pred: Option<&DecodedOp>,
+    descr_refs: &[DescrRef],
+) -> bool {
+    if !ptr_iszero_goto_of_pred(code, op, pred, "getfield_vable_r") {
         return false;
     }
+    let Some(pred) = pred else {
+        return false;
+    };
     let Some(descr_index) = descr_operand_index(code, pred) else {
         return false;
     };
     body_descr_at(descr_refs, descr_index)
         .as_ref()
         .is_some_and(descr_is_vable_debugdata)
+}
+
+fn descr_is_debugdata_w_f_trace(descr: &DescrRef) -> bool {
+    if std::sync::Arc::ptr_eq(descr, &crate::descr::frame_debug_data_w_f_trace_descr()) {
+        return true;
+    }
+    descr.as_field_descr().is_some_and(|field| {
+        field.offset() == pyre_interpreter::pyframe::FRAME_DEBUG_DATA_W_F_TRACE_OFFSET && {
+            let name = field.field_name();
+            name == "w_f_trace" || name.rsplit(['.', ':']).next() == Some("w_f_trace")
+        }
+    })
+}
+
+/// `goto_if_not_ptr_iszero` of `debugdata.w_f_trace` after a non-null
+/// `debugdata` arm. A constructor payload stores PY_NULL there
+/// (`FrameDebugData::init`).
+fn is_fresh_frame_w_f_trace_null_goto(
+    code: &[u8],
+    op: &DecodedOp,
+    pred: Option<&DecodedOp>,
+    descr_refs: &[DescrRef],
+) -> bool {
+    if !ptr_iszero_goto_of_pred(code, op, pred, "getfield_gc_r") {
+        return false;
+    }
+    let Some(pred) = pred else {
+        return false;
+    };
+    let Some(descr_index) = descr_operand_index(code, pred) else {
+        return false;
+    };
+    body_descr_at(descr_refs, descr_index)
+        .as_ref()
+        .is_some_and(descr_is_debugdata_w_f_trace)
+}
+
+fn fresh_frame_goto_fold(
+    code: &[u8],
+    op: &DecodedOp,
+    pred: Option<&DecodedOp>,
+    descr_refs: &[DescrRef],
+    debugdata: FreshFrameDebugdata,
+) -> FreshFrameGotoFold {
+    if is_fresh_frame_debugdata_null_goto(code, op, pred, descr_refs) {
+        return match debugdata {
+            FreshFrameDebugdata::Null => FreshFrameGotoFold::Fallthrough,
+            FreshFrameDebugdata::NonNull => FreshFrameGotoFold::Label,
+        };
+    }
+    if debugdata == FreshFrameDebugdata::NonNull
+        && is_fresh_frame_w_f_trace_null_goto(code, op, pred, descr_refs)
+    {
+        return FreshFrameGotoFold::Fallthrough;
+    }
+    FreshFrameGotoFold::None
 }
 
 fn switch_targets_for_body(descr_refs: &[DescrRef], descr_index: usize) -> Option<Vec<usize>> {
@@ -750,7 +863,7 @@ fn fresh_frame_successors(
     code: &[u8],
     d: &DecodedOp,
     descr_refs: &[DescrRef],
-    folded_debugdata_goto: bool,
+    folded_goto: FreshFrameGotoFold,
     all_starts: &[usize],
 ) -> Vec<usize> {
     let label = label_operand_offset(d.argcodes).map(|off| read_label(code, d, off));
@@ -777,10 +890,10 @@ fn fresh_frame_successors(
             }
             None => all_starts.to_vec(),
         },
-        name if name.starts_with("goto_if") => {
-            if folded_debugdata_goto {
-                vec![d.next_pc]
-            } else {
+        name if name.starts_with("goto_if") => match folded_goto {
+            FreshFrameGotoFold::Fallthrough => vec![d.next_pc],
+            FreshFrameGotoFold::Label => label.into_iter().collect(),
+            FreshFrameGotoFold::None => {
                 let mut succs = Vec::new();
                 if let Some(target) = label {
                     succs.push(target);
@@ -788,7 +901,7 @@ fn fresh_frame_successors(
                 succs.push(d.next_pc);
                 succs
             }
-        }
+        },
         _ => {
             let mut succs = Vec::new();
             if let Some(target) = label {
@@ -829,8 +942,9 @@ pub(crate) fn callee_fast_path_inlinable<Sym: WalkSym>(
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
+    debugdata: FreshFrameDebugdata,
 ) -> bool {
-    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+    let Some(ops) = decoded_ops_on_fresh_frame_kind(body_code, callee_descr_refs, debugdata) else {
         // Undecodable reachable op — be conservative and decline the fast path.
         return false;
     };
@@ -924,8 +1038,9 @@ pub(crate) fn callee_fast_path_inlinable_allowing_forward_branch<Sym: WalkSym>(
     callee_descr_refs: &[DescrRef],
     ctx: &WalkContext<'_, '_, Sym>,
     callee_frame_reg: u16,
+    debugdata: FreshFrameDebugdata,
 ) -> bool {
-    let Some(ops) = decoded_ops_on_fresh_frame(body_code, callee_descr_refs) else {
+    let Some(ops) = decoded_ops_on_fresh_frame_kind(body_code, callee_descr_refs, debugdata) else {
         if fbw_strict_diag_enabled() {
             eprintln!("[strict-reject-mf] (undecodable reachable)");
         }
@@ -1113,6 +1228,16 @@ mod seeded_frame_op_tests {
         assert_eq!(names, ["getfield_vable_r", "live", "int_return"]);
         assert!(!callee_body_contains_raise(&code, &descrs));
         assert!(exception_string_override_straight_line(&code, &descrs));
+    }
+
+    #[test]
+    fn fresh_frame_ops_non_null_debugdata_keeps_the_payload_arm() {
+        let raise = insn("raise/r");
+        let (code, descrs) = debugdata_null_goto_body(raise, 0);
+        let ops = decoded_ops_on_fresh_frame_kind(&code, &descrs, FreshFrameDebugdata::NonNull)
+            .expect("body must decode");
+        let names: Vec<&str> = ops.iter().map(|op| op.opname).collect();
+        assert_eq!(names, ["getfield_vable_r", "live", "raise"]);
     }
 
     #[test]
@@ -3684,17 +3809,10 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         None
     };
     let w_code = pyre_object::gc_roots::shadow_stack_get(assembler_code_slot) as *const ();
-    // The callee's globals OBJECT (`function.w_func_globals_obj`) for the
-    // `frame_stores_global` stamp.
+    // The callee's globals OBJECT (`function.w_func_globals_obj`). A
+    // `frame_stores_global` mismatch is stored on the inline frame as
+    // `FrameDebugData.w_globals`, so this fold no longer declines it.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(callable) };
-    if unsafe {
-        pyre_interpreter::w_code_frame_stores_global(
-            w_code as pyre_object::PyObjectRef,
-            callee_globals_obj,
-        )
-    } {
-        return Ok(None);
-    }
     // Resolve the callee's own loop or trace-in-progress marker with the live
     // W_Code object used by `PyFrame.pycode`, the portal greens, and
     // `JitCell.comparekey`, at `pc = 0` (function entry).  A pending token
@@ -3843,9 +3961,9 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
     // local, no cells, constant code / globals.
     let pycode_const = ctx.trace_ctx.const_ref(w_code as i64);
     let w_globals_obj_const = ctx.trace_ctx.const_ref(callee_globals_obj as i64);
-    // The `frame_stores_global` decline above is what makes this frame shape
-    // able to answer for `callee_globals_obj`; emission has already started, so
-    // a disagreement here is an aborted walk rather than a residual.
+    // The frame builder stores a `FrameDebugData` override when this callee's
+    // globals object is not the code's first-seen namespace. `None` here is
+    // only when that operand is not a constant Ref.
     let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
         ctx.trace_ctx,
         &param_boxes,
@@ -9354,8 +9472,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         .filter(|&jc| crate::state::built_as_portal_at(jc))
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
-    let strict_inlinable =
-        callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_portal_frame_reg);
+    let fresh_debugdata = fresh_frame_debugdata_for_callee(w_code, live_callable());
+    let strict_inlinable = callee_fast_path_inlinable(
+        body.code,
+        callee_descr_refs,
+        ctx,
+        callee_portal_frame_reg,
+        fresh_debugdata,
+    );
     // #68: a forward-branch-bearing callee is inlinable with a multi-frame
     // guard snapshot (its in-callee branch
     // guard resumes through `walker_capture_multi_frame_inline_snapshot` rather
@@ -9432,6 +9556,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             callee_descr_refs,
             ctx,
             callee_frame_reg,
+            fresh_debugdata,
         );
     // `can_inline_callable` (`warmstate.py`) tests only `can_never_inline` /
     // `JC_DONT_TRACE_HERE`; `perform_call` (`pyjitpl.py`) pushes an MIFrame.
@@ -9625,17 +9750,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Nursery-born `Function.__globals__` / `W_Code` must survive the
     // allocations below (a specialised pair's `wrapint`, the kwargs dict)
     // until they land in `WalkFrameState`, which `InlineFrameStateGuard`
-    // walks. `PyCode.frame_stores_global` has no frame field in this
-    // encoder, so that rare shape stays residual.
+    // walks. A `frame_stores_global` mismatch is stored on the inline
+    // frame as `FrameDebugData.w_globals`.
     let callee_globals_obj = unsafe { pyre_interpreter::function_get_globals_obj(live_callable()) };
-    if unsafe {
-        pyre_interpreter::w_code_frame_stores_global(
-            w_code as pyre_object::PyObjectRef,
-            callee_globals_obj,
-        )
-    } {
-        return resolved_inline_decline(op.pc, line!());
-    }
     let _inline_const_roots = pyre_object::gc_roots::push_roots();
     let inline_globals_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(callee_globals_obj);
@@ -10761,9 +10878,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         cell_slots.extend_from_slice(&freevar_cell_ops);
-        // Same pairing as the Branch A site: the `frame_stores_global`
-        // decline earlier in this walk is what lets a `debugdata`-less
-        // frame answer for `inline_w_globals`.
+        // Same pairing as the Branch A site: the frame builder stores a
+        // `FrameDebugData` override when `inline_w_globals` is not the
+        // code's first-seen namespace.
         let Some(callee_frame) = crate::helpers::emit_new_pyframe_inline_with_params(
             ctx.trace_ctx,
             &param_boxes,
@@ -15083,7 +15200,13 @@ pub(crate) fn prepare_walker_inline_index<Sym: WalkSym>(
         .filter(|&jc| crate::state::built_as_portal_at(jc))
         .map(|jc| crate::state::portal_red_regs_at(jc).0)
         .unwrap_or(u16::MAX);
-    if !callee_fast_path_inlinable(body.code, callee_descr_refs, ctx, callee_frame_reg) {
+    if !callee_fast_path_inlinable(
+        body.code,
+        callee_descr_refs,
+        ctx,
+        callee_frame_reg,
+        fresh_frame_debugdata_for_callee(w_code, method),
+    ) {
         index_prepare_diag("fast-path");
         return None;
     }

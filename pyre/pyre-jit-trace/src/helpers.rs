@@ -4,7 +4,9 @@
 //! Each wraps a pyre-object or pyre-interpreter operation with the
 //! correct calling convention and integer-based parameter passing.
 
-use majit_ir::{EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type, Value};
+use majit_ir::{
+    DescrRef, EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type, Value,
+};
 use majit_metainterp::{TraceCtx, default_effect_info};
 
 use pyre_interpreter::{
@@ -1808,13 +1810,12 @@ pub fn emit_box_float_inline(
 /// of the body are cleared by the GC rewriter, exactly as they are initialized
 /// in a frame the interpreter builds.
 ///
-/// `None` when `w_globals` is not the namespace this frame would answer with:
-/// the emitted frame stores PY_NULL into `debugdata`, so `get_w_globals` on it
-/// reads the code object's published namespace (`pyframe.py get_w_globals`),
-/// and a callee running under a different dictionary needs the override
-/// `createframe_obj` allocates. Callers already decline a global-storing callee
-/// (`pycode.py frame_stores_global`) before they get here; this is the frame
-/// shape's own statement of what it can represent.
+/// `None` when `w_globals` is not a constant Ref, so the namespace check
+/// cannot be decided. A published match (or unpublished / null operands)
+/// stores PY_NULL into `debugdata` and `get_w_globals` reads the code
+/// object's namespace. A published mismatch stores a `FrameDebugData`
+/// whose `w_globals` is this operand (`createframe_obj` /
+/// `set_w_globals`).
 pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
@@ -1826,9 +1827,7 @@ pub fn emit_new_pyframe_inline_with_params(
     pycode: OpRef,
     w_globals: OpRef,
 ) -> Option<OpRef> {
-    if !inline_frame_answers_this_namespace(ctx, pycode, w_globals) {
-        return None;
-    }
+    let debugdata_kind = inline_frame_debugdata_kind(ctx, pycode, w_globals)?;
     use crate::descr::{
         pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
         pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
@@ -1937,11 +1936,11 @@ pub fn emit_new_pyframe_inline_with_params(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
-    // `pyframe.py` leaves `debugdata` unset (lazily allocated). Store
-    // PY_NULL so a `getfield_vable_r` of that slot on this virtual folds
-    // to the constructor value (`dispatch_bytecode`'s jitted arm) and
-    // `get_w_globals` still takes the null-`debugdata` arm.
-    store_inline_frame_debugdata_null(ctx, new_frame);
+    // `pyframe.py` leaves `debugdata` unset unless `frame_stores_global`
+    // installs the rare namespace override. Store PY_NULL or a New
+    // `FrameDebugData` so a `getfield_vable_r` of that slot on this virtual
+    // folds to the constructor value (`dispatch_bytecode`'s jitted arm).
+    store_inline_frame_debugdata(ctx, new_frame, pycode, w_globals, debugdata_kind);
 
     let zero = ctx.const_int(0);
     let flags_descr = pyframe_flags_descr();
@@ -1979,43 +1978,133 @@ pub fn emit_new_pyframe_inline_with_params(
     Some(new_frame)
 }
 
-/// `pyframe.py` leaves `debugdata` unset. Record PY_NULL so a later
-/// `getfield_vable_r` of that slot on this virtual folds to the constructor
-/// value (`dispatch_bytecode`'s jitted arm / `goto_if_not_ptr_iszero`).
-fn store_inline_frame_debugdata_null(ctx: &mut TraceCtx, new_frame: OpRef) {
-    let null_ref = ctx.const_ref(0);
+/// Store the constructor `debugdata` pointer on `new_frame` and cache it.
+fn store_inline_frame_debugdata(
+    ctx: &mut TraceCtx,
+    new_frame: OpRef,
+    pycode: OpRef,
+    w_globals: OpRef,
+    kind: InlineFrameDebugdata,
+) {
+    let debugdata = match kind {
+        InlineFrameDebugdata::Null => ctx.const_ref(0),
+        InlineFrameDebugdata::Override => emit_new_frame_debug_data_inline(ctx, pycode, w_globals),
+    };
     let debugdata_descr = crate::descr::pyframe_debugdata_descr();
     let debugdata_idx = debugdata_descr.index();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, null_ref], debugdata_descr);
-    ctx.heapcache_setfield_cached(new_frame, debugdata_idx, null_ref);
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, debugdata], debugdata_descr);
+    ctx.heapcache_setfield_cached(new_frame, debugdata_idx, debugdata);
 }
 
-/// Whether a `debugdata`-less frame for `pycode` answers `w_globals` from
-/// `get_w_globals`, i.e. whether the code object has published that very
-/// dictionary as its first namespace (`pycode.py frame_stores_global`).
-///
-/// Both operands are trace-time constants at every emission site. A namespace
-/// that is not constant, or a code object whose slot is still unpublished,
-/// leaves the question unanswered rather than answered `false`: the emission
-/// sites establish the invariant themselves, and this check is here to stop a
-/// later one that does not, not to close a shape that already works.
-fn inline_frame_answers_this_namespace(ctx: &TraceCtx, pycode: OpRef, w_globals: OpRef) -> bool {
+fn store_debugdata_field(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef, value: OpRef) {
+    let idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, value], descr);
+    ctx.heapcache_setfield_cached(obj, idx, value);
+}
+
+/// Trace-allocate a `FrameDebugData` whose fields match `FrameDebugData::init`
+/// (`pyframe.py FrameDebugData.__init__`) with `init_lineno = -1` (the
+/// lineno `set_w_globals` / `createframe_obj` pass to `getorcreatedebug`),
+/// except `w_globals` is `w_globals_op`.
+pub fn emit_new_frame_debug_data_inline(
+    ctx: &mut TraceCtx,
+    _w_code: OpRef,
+    w_globals_op: OpRef,
+) -> OpRef {
+    use crate::descr::{
+        frame_debug_data_alloc_size_descr, frame_debug_data_f_lineno_descr,
+        frame_debug_data_f_trace_lines_descr, frame_debug_data_f_trace_opcodes_descr,
+        frame_debug_data_hidden_operationerr_descr, frame_debug_data_instr_prev_plus_one_descr,
+        frame_debug_data_is_being_profiled_descr, frame_debug_data_is_in_line_tracing_descr,
+        frame_debug_data_w_extra_locals_descr, frame_debug_data_w_f_trace_descr,
+        frame_debug_data_w_globals_descr, frame_debug_data_w_locals_descr,
+    };
+
+    let new_op = ctx.record_op_with_descr(OpCode::New, &[], frame_debug_data_alloc_size_descr());
+    ctx.heap_cache_mut().new_object(new_op);
+
+    let null_ref = ctx.const_ref(0);
+    let zero = ctx.const_int(0);
+    let one = ctx.const_int(1);
+    let neg_one = ctx.const_int(-1);
+
+    store_debugdata_field(
+        ctx,
+        new_op,
+        frame_debug_data_w_globals_descr(),
+        w_globals_op,
+    );
+    store_debugdata_field(ctx, new_op, frame_debug_data_w_locals_descr(), null_ref);
+    store_debugdata_field(
+        ctx,
+        new_op,
+        frame_debug_data_w_extra_locals_descr(),
+        null_ref,
+    );
+    store_debugdata_field(ctx, new_op, frame_debug_data_w_f_trace_descr(), null_ref);
+    store_debugdata_field(
+        ctx,
+        new_op,
+        frame_debug_data_is_being_profiled_descr(),
+        zero,
+    );
+    store_debugdata_field(
+        ctx,
+        new_op,
+        frame_debug_data_is_in_line_tracing_descr(),
+        zero,
+    );
+    store_debugdata_field(ctx, new_op, frame_debug_data_f_trace_lines_descr(), one);
+    store_debugdata_field(ctx, new_op, frame_debug_data_f_trace_opcodes_descr(), zero);
+    store_debugdata_field(
+        ctx,
+        new_op,
+        frame_debug_data_instr_prev_plus_one_descr(),
+        zero,
+    );
+    store_debugdata_field(ctx, new_op, frame_debug_data_f_lineno_descr(), neg_one);
+    store_debugdata_field(
+        ctx,
+        new_op,
+        frame_debug_data_hidden_operationerr_descr(),
+        null_ref,
+    );
+    new_op
+}
+
+/// Whether this frame stores PY_NULL `debugdata` or a `FrameDebugData`
+/// override for `w_globals`. `None` when either operand is not a constant
+/// Ref, so the namespace check cannot be decided.
+enum InlineFrameDebugdata {
+    Null,
+    Override,
+}
+
+fn inline_frame_debugdata_kind(
+    ctx: &TraceCtx,
+    pycode: OpRef,
+    w_globals: OpRef,
+) -> Option<InlineFrameDebugdata> {
     let (Some(majit_ir::Value::Ref(code)), Some(majit_ir::Value::Ref(globals))) =
         (ctx.box_value(pycode), ctx.box_value(w_globals))
     else {
-        return true;
+        return None;
     };
     if code.as_usize() == 0 || globals.as_usize() == 0 {
-        return true;
+        return Some(InlineFrameDebugdata::Null);
     }
     let published = unsafe {
         pyre_interpreter::w_code_get_w_globals(code.as_usize() as pyre_object::PyObjectRef)
     };
-    published.is_null() || published as usize == globals.as_usize()
+    if published.is_null() || published as usize == globals.as_usize() {
+        Some(InlineFrameDebugdata::Null)
+    } else {
+        Some(InlineFrameDebugdata::Override)
+    }
 }
 
-/// `None` on the same namespace disagreement as
-/// [`emit_new_pyframe_inline_with_params`], whose doc states the rule.
+/// `None` when the namespace check cannot be decided, matching
+/// [`emit_new_pyframe_inline_with_params`].
 pub fn emit_new_pyframe_inline_self_recursive(
     ctx: &mut TraceCtx,
     arg_box: OpRef,
@@ -2024,9 +2113,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     pycode: OpRef,
     w_globals: OpRef,
 ) -> Option<OpRef> {
-    if !inline_frame_answers_this_namespace(ctx, pycode, w_globals) {
-        return None;
-    }
+    let debugdata_kind = inline_frame_debugdata_kind(ctx, pycode, w_globals)?;
     use crate::descr::{
         pyframe_code_descr, pyframe_failed_attr_cleanup_descr, pyframe_flags_descr,
         pyframe_locals_cells_stack_descr, pyframe_next_instr_descr, pyframe_size_descr,
@@ -2104,7 +2191,7 @@ pub fn emit_new_pyframe_inline_self_recursive(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_frame, neg_one], last_instr_descr);
     ctx.heapcache_setfield_cached(new_frame, last_instr_idx, neg_one);
 
-    store_inline_frame_debugdata_null(ctx, new_frame);
+    store_inline_frame_debugdata(ctx, new_frame, pycode, w_globals, debugdata_kind);
 
     let zero = ctx.const_int(0);
     let flags_descr = pyframe_flags_descr();

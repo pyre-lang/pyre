@@ -6509,8 +6509,8 @@ fn walker_pin_pycode_w_globals_records_quasiimmut_from_mutate_descr() {
 
 #[test]
 fn pycode_w_globals_pin_on_stamped_getfield_gcr_is_quasi_immut_descr() {
-    // `frame_get_globals_obj` records GetfieldGcR of PyFrame.pycode then
-    // pins `w_globals?`. `pyjitpl.py opimpl_record_quasiimmut_field`
+    // `frame_get_globals_obj`'s published-pycode arm records GetfieldGcR of
+    // PyFrame.pycode then pins `w_globals?`. `pyjitpl.py opimpl_record_quasiimmut_field`
     // reads `box.getref_base()`; after execute (or the pin's stamp)
     // writes `_resref`, `quasiimmut.py QuasiImmutDescr` must be the
     // recorded descr so `heap.py OptHeap.optimize_QUASIIMMUT_FIELD`
