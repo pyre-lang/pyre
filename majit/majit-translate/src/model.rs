@@ -7972,6 +7972,9 @@ struct LazyGraphCell {
     /// startblock with the parameters, and the header fields. `None` for a
     /// graph that was built from the start.
     header: Option<std::rc::Rc<FunctionGraph>>,
+    /// Declared with no graph (`rffi.llexternal`), as opposed to a
+    /// `build` that ran and produced none.
+    external: bool,
 }
 
 impl LazyGraph {
@@ -7981,6 +7984,7 @@ impl LazyGraph {
             graph: std::cell::OnceCell::from(Some(graph.into())),
             build: std::cell::Cell::new(None),
             header: None,
+            external: false,
         }))
     }
 
@@ -7995,6 +7999,7 @@ impl LazyGraph {
             graph: std::cell::OnceCell::new(),
             build: std::cell::Cell::new(Some(Box::new(build))),
             header: Some(header.into()),
+            external: false,
         }))
     }
 
@@ -8005,6 +8010,7 @@ impl LazyGraph {
             graph: std::cell::OnceCell::from(None),
             build: std::cell::Cell::new(None),
             header: Some(header.into()),
+            external: true,
         }))
     }
 
@@ -8012,6 +8018,12 @@ impl LazyGraph {
     /// one.
     pub fn is_graphless(&self) -> bool {
         matches!(self.0.graph.get(), Some(None))
+    }
+
+    /// Whether the funcobj was declared with no graph: an external
+    /// function object (`rffi.llexternal`), not a body whose build failed.
+    pub fn is_external(&self) -> bool {
+        self.0.external
     }
 
     /// The funcobj identity, read without building the graph.
@@ -8228,6 +8240,10 @@ pub struct FunctionGraph {
     /// `return_type` is only `ref`, and that shell is a classdef-less
     /// instance, which cannot union with the `GcArray` list.
     pub return_container_root: Option<String>,
+    /// `FUNC.RESULT` token of the declared Rust signature, kept even where
+    /// `return_type` stays unstamped. A funcobj whose body cannot be built
+    /// is called through this declared result (`rffi.llexternal`).
+    pub residual_return_type: Option<String>,
     /// Per-graph JIT hints — the `_jit_*_` / `_elidable_function_`
     /// attributes RPython `policy.py look_inside_graph` reads off
     /// `graph.func`. Pyre carries them on the graph itself so
@@ -8394,6 +8410,7 @@ pub fn copygraph(graph: &FunctionGraph) -> FunctionGraph {
         return_class_root: graph.return_class_root.clone(),
         return_is_str: graph.return_is_str,
         return_container_root: graph.return_container_root.clone(),
+        residual_return_type: graph.residual_return_type.clone(),
         hints: graph.hints.clone(),
         access_directly: graph.access_directly,
         specialization: graph.specialization,
@@ -8515,6 +8532,7 @@ impl FunctionGraph {
             return_class_root: None,
             return_is_str: false,
             return_container_root: None,
+            residual_return_type: None,
             owner_root: None,
             source_identity: None,
             fun_decl_id: None,

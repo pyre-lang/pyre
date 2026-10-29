@@ -443,11 +443,12 @@ fn merge_flat(var: &Variable, ty: ValueType, bookkeeper: Option<&Rc<Bookkeeper>>
 fn const_value_type(value: &ConstValue) -> ValueType {
     match value {
         ConstValue::Int(_)
-        | ConstValue::Bool(_)
         | ConstValue::SpecTag(_)
         | ConstValue::AddressOffset(_)
         | ConstValue::InheritanceId { .. }
         | ConstValue::LLAddress(_) => ValueType::Int,
+        // `bookkeeper.py immutablevalue`: a bool constant is `SomeBool`.
+        ConstValue::Bool(_) => ValueType::Bool,
         ConstValue::UInt(_) => ValueType::Unsigned,
         ConstValue::Int128(_) => ValueType::Int128,
         ConstValue::UInt128(_) => ValueType::UInt128,
@@ -976,6 +977,11 @@ mod tests {
         );
         assert_eq!(
             union_type(&ValueType::Int, &ValueType::Bool),
+            ValueType::Int
+        );
+        assert_eq!(const_value_type(&ConstValue::Bool(true)), ValueType::Bool);
+        assert_eq!(
+            union_type(&const_value_type(&ConstValue::Bool(false)), &ValueType::Int),
             ValueType::Int
         );
     }

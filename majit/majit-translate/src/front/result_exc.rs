@@ -6053,6 +6053,15 @@ fn rewire_one_call_site(
         separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
+    // `let _ = f()`: nothing reads the `Result`, so the call block's exit
+    // does not carry it. The site still swallows the error, so it takes
+    // the catch-and-rewrap edge: its exception arm rejoins the normal
+    // successor, the flow shape of `try: f() except: pass`
+    // (`flowcontext.py FlowContext.guessexception`).
+    if allow_fallback && !variable_is_used(graph, r) {
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        return Ok(SiteOutcome::Rewrapped);
+    }
     let (r_forwarded, _recast_a) = peel_recast_chain_from(graph, a, r);
     let (b, r_b) = follow_single_exit(graph, a, &r_forwarded)
         .map_err(|e| format!("{name}: call block exit: {e}"))?;
@@ -13430,6 +13439,47 @@ mod rewire_dead_arm_tests {
             Err(msg) => msg,
         };
         assert!(err.contains("scoped call result var has no producer block"));
+    }
+
+    #[test]
+    fn unused_result_dest_is_rewrapped() {
+        let mut graph = FunctionGraph::new("unused_result_dest");
+        let a = graph.startblock;
+        let r = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (tail, _) = graph.create_block_with_arg_vars(0);
+        graph.set_return(tail, None);
+        graph.set_goto(a, tail, vec![]);
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(r.clone(), Some("<(),PyError>".to_string()), ValueType::Void)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("unused dest is rewrapped");
+        assert_eq!(outcome.rewrapped, 1);
+        assert!(
+            matches!(
+                graph.blocks[a.0].exitswitch,
+                Some(ExitSwitch::LastException)
+            ),
+            "unused dest takes the catch-and-rewrap edge"
+        );
+        assert_eq!(graph.blocks[a.0].exits.len(), 2);
+        for link in &graph.blocks[a.0].exits {
+            let arm = &graph.blocks[link.target.0];
+            assert_eq!(arm.exits.len(), 1);
+            assert_eq!(arm.exits[0].target, tail);
+        }
     }
 }
 

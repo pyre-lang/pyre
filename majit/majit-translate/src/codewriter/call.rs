@@ -2728,24 +2728,41 @@ impl StoreCore {
     /// the built graph, or the header the funcobj was declared with under
     /// this registration's stamps and the attributes written onto it. The
     /// store passes rewrite operations only, so the header needs none of
-    /// them. `None` when the build produced no graph.
+    /// them. A funcobj whose build produced no graph is offered as an
+    /// opaque funcobj with its declared result; `None` when it has none.
     fn slot_declaration(&self, slot: &GraphSlot) -> Option<std::rc::Rc<FunctionGraph>> {
         if slot.building.get() {
             return None;
         }
         match slot.graph.get() {
-            Some(built) => built.as_ref().map(|built| built.graph.clone()),
-            None => {
+            Some(Some(built)) => Some(built.graph.clone()),
+            built => {
                 let source = slot.source.as_ref()?;
-                if source.graph.is_graphless() {
+                if source.graph.is_external() {
                     return None;
                 }
-                let mut header = FunctionGraph::clone(source.graph.header());
-                source.transform.apply(&mut header);
-                slot.attrs.apply(&mut header);
+                let mut header = Self::slot_header(slot)?;
+                // `bookkeeper.py getdesc` keeps the `FunctionDesc` of a
+                // funcobj whose `buildgraph` fails. A body the front end
+                // cannot lower is called the way an `rffi.llexternal` is:
+                // residually, through its declared result.
+                if built.is_some() || source.graph.is_graphless() {
+                    header.return_type = Some(header.residual_return_type.clone()?);
+                    header.push_hint("dont_look_inside");
+                }
                 Some(std::rc::Rc::new(header))
             }
         }
+    }
+
+    /// The header the slot's funcobj was declared with, under this
+    /// registration's stamps and the attributes written onto it.
+    fn slot_header(slot: &GraphSlot) -> Option<FunctionGraph> {
+        let source = slot.source.as_ref()?;
+        let mut header = FunctionGraph::clone(source.graph.header());
+        source.transform.apply(&mut header);
+        slot.attrs.apply(&mut header);
+        Some(header)
     }
 
     fn apply_pass(&self, pass: &StorePass, graph: &mut FunctionGraph) {
@@ -2978,11 +2995,7 @@ impl StoreCore {
         if let Some(header) = self.slot_declaration(&slot) {
             return Some(header);
         }
-        let source = slot.source.as_ref()?;
-        let mut header = FunctionGraph::clone(source.graph.header());
-        source.transform.apply(&mut header);
-        slot.attrs.apply(&mut header);
-        Some(std::rc::Rc::new(header))
+        Self::slot_header(&slot).map(std::rc::Rc::new)
     }
 
     /// `GraphKey` of the funcobj `path` names. Alias spellings of one
@@ -3011,8 +3024,8 @@ impl StoreCore {
     /// declared header (`pygraph.py` `PyGraph.__init__`).
     pub(crate) fn signature(&self, path: &CallPath) -> Option<Signature> {
         let slot = self.slot_for(path)?;
-        if let Some(built) = slot.graph.get() {
-            return built.as_ref().map(|built| built.signature.clone());
+        if let Some(Some(built)) = slot.graph.get() {
+            return Some(built.signature.clone());
         }
         let header = self.slot_declaration(&slot)?;
         Some(Self::signature_from_graph(&header))
