@@ -1881,6 +1881,11 @@ fn caller_operand_slots<Sym: WalkSym>(
         // inlines each bound's `__index__` from this residual; with no arm
         // `CallStack::NoOperandShape` left the body a residual `BinarySlice`.
         pyre_interpreter::Instruction::BinarySlice => 3,
+        // `[elem0 .. elem_{count-1}]`. `build_set` pops count items and
+        // pushes one set. `set_add_value` is inlined from that residual;
+        // with no arm `CallStack::NoOperandShape` left the helper with no
+        // paused caller, so `helper_chain` stayed `NoHelper`.
+        pyre_interpreter::Instruction::BuildSet { count } => count.get(op_arg) as usize,
         other => {
             if fbw_debug_abort_enabled() {
                 let jit_op = crate::jitcode_runtime::decode_op_at(
@@ -3211,35 +3216,31 @@ enum NumberedHelperGuard {
     CallerBoundary,
 }
 
-/// Resume of a guard at `op_pc` inside a numbered helper chain:
-/// `parent_frames` plus the innermost helper section at the guard.
-///
-/// The blackhole runs every helper section from its resume pc to its return,
-/// and `reject_unresolved_call` bails at a residual call it cannot resolve;
-/// a helper section has no Python coordinate the interpreter could continue
-/// from. When a section can reach one
-/// ([`helper_resume_reaches_blocker`]), the guard resumes at the CALL that
-/// entered the outermost helper level instead ([`HelperCallEntry`]), which
-/// re-runs that call. That is refused once a heap-writing residual (live
-/// heap or a user frame, or an unjournaled `ForIterNext`) or a journaled
-/// live-heap effect (a list pop or append, a store) has executed since the
-/// level was entered, since the re-run would apply it twice; the refusal is
-/// the one an unlowered helper gets, so the descent is cut back to a residual
-/// call when it applied nothing and the trace aborts otherwise. A residual
-/// the executed-effect odometer counts only for its void result (an
-/// allocation, `make_pyerror`) keeps the CALL-entry resume.
-fn numbered_helper_guard_resume<Sym: WalkSym>(
+/// Assemble the numbered helper frames at `op_pc` and whether they are
+/// runnable: `capture_resumedata` can number the helper section at this
+/// guard, so the blackhole resumes inside the helper rather than at the
+/// CALL that entered it.
+fn numbered_helper_runnable_frames<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     after_residual_call: bool,
     scope: GuardCaptureScope,
     mut parent_frames: Vec<InlineParentFrame>,
-) -> Result<NumberedHelperGuard, DispatchError> {
+    live_after_jit_pc: usize,
+) -> Result<
+    (
+        Vec<InlineParentFrame>,
+        bool, /* runnable */
+        bool, /* python_chain_complete */
+    ),
+    DispatchError,
+> {
     parent_frames.push(helper_innermost_resume_frame(
         ctx,
         op_pc,
         after_residual_call,
         scope,
+        live_after_jit_pc,
     )?);
     let runs_from = |frame: &InlineParentFrame, entry_array_len: Option<usize>| {
         frame.resume_marker_jit_pc.is_some_and(|pc| {
@@ -3282,6 +3283,42 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
             .zip(levels.iter().rev())
             .all(|(frame, level)| runs_from(frame, level.helper_entry_array_len))
     };
+    Ok((parent_frames, runnable, python_chain_complete))
+}
+
+/// Resume of a guard at `op_pc` inside a numbered helper chain:
+/// `parent_frames` plus the innermost helper section at the guard.
+///
+/// The blackhole runs every helper section from its resume pc to its return,
+/// and `reject_unresolved_call` bails at a residual call it cannot resolve;
+/// a helper section has no Python coordinate the interpreter could continue
+/// from. When a section can reach one
+/// ([`helper_resume_reaches_blocker`]), the guard resumes at the CALL that
+/// entered the outermost helper level instead ([`HelperCallEntry`]), which
+/// re-runs that call. That is refused once a heap-writing residual (live
+/// heap or a user frame, or an unjournaled `ForIterNext`) or a journaled
+/// live-heap effect (a list pop or append, a store) has executed since the
+/// level was entered, since the re-run would apply it twice; the refusal is
+/// the one an unlowered helper gets, so the descent is cut back to a residual
+/// call when it applied nothing and the trace aborts otherwise. A residual
+/// the executed-effect odometer counts only for its void result (an
+/// allocation, `make_pyerror`) keeps the CALL-entry resume.
+fn numbered_helper_guard_resume<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    after_residual_call: bool,
+    scope: GuardCaptureScope,
+    parent_frames: Vec<InlineParentFrame>,
+) -> Result<NumberedHelperGuard, DispatchError> {
+    let live_after_jit_pc = ctx.live_after_jit_pc;
+    let (parent_frames, runnable, python_chain_complete) = numbered_helper_runnable_frames(
+        ctx,
+        op_pc,
+        after_residual_call,
+        scope,
+        parent_frames,
+        live_after_jit_pc,
+    )?;
     if runnable {
         return Ok(NumberedHelperGuard::Frames(parent_frames));
     }
@@ -3322,6 +3359,73 @@ fn numbered_helper_guard_resume<Sym: WalkSym>(
     }
 }
 
+/// True when a may-force residual at `op_pc` inside a numbered transparent
+/// helper will have its post-call `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION`
+/// take [`NumberedHelperGuard::Frames`] through the `runnable` condition.
+///
+/// The decline in `try_execute_residual_call_via_executor_inner` is a
+/// pre-check: it must agree with the capture that follows the recorded call
+/// (`capture_resumedata` on the helper `MIFrame`), or the callback runs
+/// twice. `post_call_pc` is the residual's next jitcode pc — the same value
+/// the later `ctx.live_after_jit_pc = op.next_pc` assigns before those
+/// guards are captured — so this numbers the helper section at the
+/// post-call `-live-` (`do_residual_call` captures with `MIFrame.pc`
+/// already there). Any `Err` is false. Reads the walk; does not write the
+/// trace or session.
+pub(crate) fn helper_may_force_resumes_in_frame<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    post_call_pc: usize,
+) -> bool {
+    if !(ctx.fbw_mode.inline_subwalk && ctx.fbw_mode.transparent_helper_subwalk) {
+        return false;
+    }
+    if ctx.session.borrow().helper_chain() != HelperChain::Numbered {
+        return false;
+    }
+    if !ctx.trace_ctx.vable_snapshot_buildable() {
+        return false;
+    }
+    let parent_frames = {
+        let session = ctx.session.borrow();
+        session
+            .framestack
+            .iter()
+            .flat_map(|frame| frame.parents.iter().cloned())
+            .collect::<Vec<_>>()
+    };
+    if parent_frames.is_empty() {
+        return false;
+    }
+    // Same Python-portal check `walker_capture_transparent_helper_snapshot`
+    // makes on the outermost numbered section.
+    if !parent_frames.first().is_some_and(|outer| {
+        crate::state::pyjitcode_for_jitcode_index(outer.jitcode_index as i32)
+            .is_some_and(|pjc| !pjc.code_ptr.is_null())
+    }) {
+        return false;
+    }
+    // Scope `walker_capture_snapshot_for_last_guard` builds for the
+    // `GUARD_NOT_FORCED` after a recorded `CALL_MAY_FORCE_*`: default, then
+    // `residual_call_catch_resume` because that guard opcode is in the
+    // after-residual family (`walker_capture_snapshot_for_last_guard_scoped`).
+    let scope = GuardCaptureScope {
+        residual_call_catch_resume: true,
+        ..GuardCaptureScope::default()
+    };
+    match numbered_helper_runnable_frames(
+        ctx,
+        op_pc,
+        /*after_residual_call=*/ true,
+        scope,
+        parent_frames,
+        post_call_pc,
+    ) {
+        Ok((_, runnable, _)) => runnable,
+        Err(_) => false,
+    }
+}
+
 /// Innermost helper section at the guard's own jitcode coordinate.
 ///
 /// Same coordinate rule as the Python path: `carried_resume_jit_pc`, else
@@ -3333,6 +3437,7 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     op_pc: usize,
     after_residual_call: bool,
     scope: GuardCaptureScope,
+    live_after_jit_pc: usize,
 ) -> Result<InlineParentFrame, DispatchError> {
     let Some(jitcode_index) = ctx.fbw_mode.transparent_helper_jitcode_index else {
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
@@ -3348,11 +3453,11 @@ fn helper_innermost_resume_frame<Sym: WalkSym>(
     } else if after_residual_call {
         after_residual_guard_marker(&pjc, op_pc, None)
             .or_else(|| {
-                (ctx.live_after_jit_pc != usize::MAX
+                (live_after_jit_pc != usize::MAX
                     && pjc
                         .jitcode
-                        .can_decode_live_vars(ctx.live_after_jit_pc, crate::state::op_live()))
-                .then_some(ctx.live_after_jit_pc)
+                        .can_decode_live_vars(live_after_jit_pc, crate::state::op_live()))
+                .then_some(live_after_jit_pc)
             })
             .ok_or(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc })?
     } else {
