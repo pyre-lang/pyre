@@ -1343,7 +1343,6 @@ pub struct PreviewShortState {
         crate::optimizeopt::virtualstate::VirtualState,
         Vec<OpRef>,
         Vec<OpRef>,
-        Vec<usize>,
         Vec<majit_ir::operand::Operand>,
     )>,
 }
@@ -10041,7 +10040,7 @@ impl OptContext {
                 for r in &state.2 {
                     r.trace_const_ptr(visitor);
                 }
-                for operand in &state.4 {
+                for operand in &state.3 {
                     operand.walk_const_ptr_refs(visitor);
                 }
             }

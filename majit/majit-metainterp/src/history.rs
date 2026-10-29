@@ -60,8 +60,7 @@ pub fn get_const_ptr_for_unicode(
 /// and short preamble needed for bridge entry. Multiple TargetTokens can exist
 /// per loop (from retracing with different virtual states).
 /// `history.py TargetToken` attributes the optimizer writes after the token
-/// is minted (`virtual_state`, `short_preamble`) and pyre's LABEL/JUMP
-/// vable contract (`label_source_positions`). Behind one lock because the
+/// is minted (`virtual_state`, `short_preamble`). Behind one lock because the
 /// token is shared through `JitCellToken.target_tokens` and mutated by
 /// `unroll.py` passes.
 #[derive(Debug, Default)]
@@ -70,13 +69,6 @@ pub struct TargetTokenAttrs {
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     pub vable_label_arg_recipes: Vec<(majit_ir::OpCode, majit_ir::DescrRef)>,
     pub label_tail_unrebuildable: bool,
-    /// Compact LABEL source-position map for the cranelift host entry.
-    /// `history.py TargetToken._ll_loop_code` is the per-token backend sink;
-    /// `compile.py compile_loop` `jitcell_token.target_tokens = [start_descr]`
-    /// is the list compile-time selection scans; `warmstate.py
-    /// execute_assembler` consumes the selected token stored on the
-    /// compiled-loop record.
-    pub label_source_positions: Option<Vec<usize>>,
     minor_scan_pending: bool,
 }
 
