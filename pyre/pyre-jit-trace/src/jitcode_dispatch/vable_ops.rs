@@ -1313,6 +1313,25 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Flatten's shared `dispatch_bytecode` jitted arm: `-live-` then
+/// `setfield_vable_i` of `last_instr` from the `next_instr` register
+/// (`pyopcode.py dispatch_bytecode`). Distinct from [`is_shared_pmg_block`],
+/// which starts with `-live-` + `getfield_vable_r` of debugdata.
+pub(crate) fn is_shared_arm_block(code: &[u8], target: usize) -> bool {
+    let Some(live) = crate::jitcode_runtime::decode_op_at(code, target) else {
+        return false;
+    };
+    if live.opname != "live" {
+        return false;
+    }
+    let Some(setfield) = crate::jitcode_runtime::decode_op_at(code, live.next_pc) else {
+        return false;
+    };
+    // Register form `setfield_vable_i/rid`. The per-pc valuestackdepth
+    // store is `setfield_vable_i_imm` and must not match.
+    setfield.opname == "setfield_vable_i"
+}
+
 /// Flatten's shared `get_is_being_profiled` + `promote_greens` block:
 /// `-live-`, `getfield debugdata`, `goto_if_not_ptr_iszero`, then the
 /// profiled diamond and `{int,ref}_guard_value` before `switch next_instr`.
@@ -1354,13 +1373,13 @@ pub(crate) fn is_shared_pmg_block(code: &[u8], target: usize) -> bool {
 /// own `debugdata` test has the same prefix (`pyframe.py get_w_globals`)
 /// returns or raises instead and is not the copy.
 fn merge_greens_reach_switch(code: &[u8], mut pc: usize) -> bool {
-    let mut int_green = false;
+    let mut int_greens = 0usize;
     let mut ref_green = false;
     while let Some(op) = crate::jitcode_runtime::decode_op_at(code, pc) {
         match op.opname {
-            "int_guard_value" => int_green = true,
+            "int_guard_value" => int_greens += 1,
             "ref_guard_value" => ref_green = true,
-            "switch" => return int_green && ref_green,
+            "switch" => return int_greens >= 2 || (int_greens > 0 && ref_green),
             name if name.ends_with("_return") || name == "raise" || name == "reraise" => {
                 return false;
             }
@@ -1375,25 +1394,30 @@ fn merge_greens_reach_switch(code: &[u8], mut pc: usize) -> bool {
 }
 
 /// Freeze the entering opcode's banks when `pc` is flatten's shared
-/// portal merge-greens copy.
+/// `dispatch_bytecode` arm or the factored portal merge-greens copy.
 ///
-/// `pmg_shared` does not store `last_instr` (`interp_jit.py
-/// PyFrame.dispatch` greens only). Orgpc for a pmg-internal guard
-/// therefore stays on the entering opcode's `live_before` py, not the
-/// vable field.
+/// `arm_shared` stores `last_instr` (`pyopcode.py dispatch_bytecode`);
+/// `pmg_shared` does not (`interp_jit.py PyFrame.dispatch` greens only).
+/// Orgpc for a pmg-internal guard therefore stays on the entering
+/// opcode's `live_before` py, not the vable field. Prefixes do not
+/// overlap: arm is setfield-first, pmg is getfield-first.
 pub(crate) fn begin_hold_if_shared_hook<Sym: WalkSym>(
     code: &[u8],
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
 ) {
-    if !is_shared_pmg_block(code, pc) {
+    let uses_vable_last_instr = if is_shared_arm_block(code, pc) {
+        true
+    } else if is_shared_pmg_block(code, pc) {
+        false
+    } else {
         return;
-    }
+    };
     ctx.session.borrow_mut().begin_hold_opcode_live_before(
         ctx.registers_i,
         ctx.registers_r,
         ctx.registers_f,
-        false, // pmg_shared does not store last_instr
+        uses_vable_last_instr,
         pc,
     );
 }
@@ -1962,6 +1986,8 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
     // Fold-frame slots live in `callee_shadow`, including `ConstPtr(0)`
     // from `PyFrame.__init__` / `PUSH_NULL`. Portal `virtualizable_boxes`
     // at the same numeric index is a different frame.
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
+    let names_callee_frame = fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg;
     let (result, shadow_value) = if dst_bank == 'r' && names_callee_frame && index_value >= 0 {
         let slot_opref = ctx
             .frame_state
@@ -3026,7 +3052,7 @@ mod callee_ref_owner_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::is_shared_pmg_block;
+    use super::{is_shared_arm_block, is_shared_pmg_block};
     use crate::jitcode_runtime::insns_opname_to_byte;
 
     fn insn(key: &str) -> u8 {
@@ -3050,20 +3076,57 @@ mod tests {
             ("live/", &[0, 0]),
             ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
             ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
             ("int_guard_value/i", &[0]),
             ("ref_guard_value/r", &[0]),
             ("switch/id", &[0, 0, 0]),
         ]);
         assert!(is_shared_pmg_block(&pmg_shape, 0));
+        assert!(!is_shared_arm_block(&pmg_shape, 0));
+
+        // `promote_greens` skips the per-code Constant pycode green.
+        let const_pycode_shape = encode(&[
+            ("live/", &[0, 0]),
+            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
+            ("live/", &[0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
+            ("int_guard_value/i", &[0]),
+            ("live/", &[0, 0]),
+            ("int_guard_value/i", &[1]),
+            ("switch/id", &[0, 0, 0]),
+        ]);
+        assert!(is_shared_pmg_block(&const_pycode_shape, 0));
+        assert!(!is_shared_arm_block(&const_pycode_shape, 0));
 
         let helper_debugdata_diamond = encode(&[
             ("live/", &[0, 0]),
             ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
             ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
             ("ref_return/r", &[0]),
         ]);
         assert!(!is_shared_pmg_block(&helper_debugdata_diamond, 0));
+        assert!(!is_shared_arm_block(&helper_debugdata_diamond, 0));
+    }
+
+    #[test]
+    fn shared_arm_block_is_setfield_first() {
+        let arm_shape = encode(&[
+            ("live/", &[0, 0]),
+            ("setfield_vable_i/rid", &[0, 0, 0, 0]),
+            ("live/", &[0, 0]),
+            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
+            ("live/", &[0, 0]),
+            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0, 0]),
+        ]);
+        assert!(is_shared_arm_block(&arm_shape, 0));
+        assert!(!is_shared_pmg_block(&arm_shape, 0));
+
+        let vsd_imm = encode(&[
+            ("live/", &[0, 0]),
+            ("setfield_vable_i_imm/rdd", &[0, 0, 0, 0, 0]),
+        ]);
+        assert!(!is_shared_arm_block(&vsd_imm, 0));
+        assert!(!is_shared_pmg_block(&vsd_imm, 0));
     }
 }

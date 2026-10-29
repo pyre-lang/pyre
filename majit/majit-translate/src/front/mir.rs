@@ -3568,7 +3568,15 @@ impl SemanticFunctionHeader {
         // `func_result_kind` follows the CFG (`flatten.py` `make_return`).
         // Residual and trait-method callees take `stamp_return_token` and
         // keep the token, so a stub matches the call result.
-        let return_type = if stamp_return_token {
+        // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+        // `jtransform.py` `getkind` of a GC pointer is `'ref'`. Stamp
+        // FUNC.RESULT as that kind so the signature matches the CFG
+        // (`func_result_kind`); the Rust field is `usize` and would
+        // otherwise leave a scalar token.
+        let frame_anchor_result = tyref_is_frame_anchor(&signature.output, llbc);
+        let return_type = if frame_anchor_result {
+            Some("ref".to_string())
+        } else if stamp_return_token {
             signature_token
         } else if signature_token.as_deref().is_some_and(scalar_result_token)
             && !output_is_raw_address_word(
@@ -3583,14 +3591,23 @@ impl SemanticFunctionHeader {
         } else {
             None
         };
-        let return_class_root = dont_look_inside_return_class_root(
-            &signature.output,
-            llbc,
-            error_carrier,
-            tombstoned_leaves,
-            gc_struct_ids,
-            raw_alloc_flavor_structs,
-        );
+        let residual_return_type = if frame_anchor_result {
+            Some("ref".to_string())
+        } else {
+            residual_return_type
+        };
+        let return_class_root = if frame_anchor_result {
+            None
+        } else {
+            dont_look_inside_return_class_root(
+                &signature.output,
+                llbc,
+                error_carrier,
+                tombstoned_leaves,
+                gc_struct_ids,
+                raw_alloc_flavor_structs,
+            )
+        };
         let return_can_be_none = dont_look_inside_return_can_be_none(
             &signature.output,
             llbc,
@@ -7604,10 +7621,11 @@ use self::simplify::*;
 use self::strformat::*;
 use self::views::*;
 
+#[cfg(any(test, feature = "mir-frontend"))]
+pub(crate) use self::consteval::register_ambiguous_impl_foldable_const_lits;
 pub(crate) use self::consteval::{
     attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
-    harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
-    register_foldable_const_lits,
+    harvest_named_const_folds, push_named_const_folds, register_foldable_const_lits,
 };
 pub(crate) use self::desugar::callee::{
     discover_eval_hook_graphs, release_declared_vable_array_address,

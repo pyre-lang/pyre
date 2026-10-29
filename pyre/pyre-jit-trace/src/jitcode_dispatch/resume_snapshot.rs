@@ -32,19 +32,99 @@ fn vable_static_int<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, name: &str) ->
 }
 
 /// `dispatch_bytecode` stored `self.last_instr = next_instr` at the
-/// shared we_are_jitted head (`setfield_vable_i`).  That next_instr is
-/// the Python opcode whose `goto` entered the copy; use it as orgpc
-/// when the walk is still inside that copy
-/// (`hold_uses_vable_last_instr`).  `pmg_shared` does not write
-/// `last_instr`, so a pmg hold leaves orgpc on the entering opcode's
-/// `live_before` py.
-fn shared_hook_next_instr<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
+/// shared arm (`setfield_vable_i` from the `next_instr` register).
+/// That next_instr is the Python opcode whose `goto` entered the copy;
+/// use it as orgpc when the walk is still inside that copy.
+/// `pmg_shared` does not write `last_instr` (`interp_jit.py`
+/// `PyFrame.dispatch`), so a pmg hold names the entering opcode from
+/// the merge-point green only.
+pub(super) fn shared_hook_next_instr<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<usize> {
     let session = ctx.session.borrow();
-    if !session.hold_opcode_live_before || !session.hold_uses_vable_last_instr {
+    if !session.hold_opcode_live_before {
         return None;
     }
+    // The shared copy has no single Python PC. The active MIFrame's
+    // merge green names its entering instruction, including inlined frames;
+    // the root virtualizable's last_instr belongs only to the root frame.
+    let entering_pc = session.current_debug_merge_point_py_pc();
+    let uses_vable_last_instr = session.hold_uses_vable_last_instr;
     drop(session);
-    vable_static_int(ctx, "last_instr").map(|n| n as usize)
+    entering_pc.map(|pc| pc as usize).or_else(|| {
+        if uses_vable_last_instr {
+            vable_static_int(ctx, "last_instr").map(|n| n as usize)
+        } else {
+            None
+        }
+    })
+}
+
+fn shared_hook_orgpc_offset(payload: &crate::PyJitCode, py: usize) -> Option<usize> {
+    let op_live = crate::state::op_live();
+    let decodable = |off: usize| payload.jitcode.can_decode_live_vars(off, op_live);
+    payload
+        .merge_entry_for(py)
+        .filter(|&off| decodable(off))
+        .or_else(|| {
+            payload
+                .portal_merge_op3_live_for_py_pc(py as u32)
+                .filter(|&off| decodable(off))
+        })
+}
+
+/// Jitcode resume word for a guard inside flatten's shared
+/// `dispatch_bytecode` / `portal_merge_greens` copy.
+///
+/// `pyjitpl.py` `_establish_nullity` / `generate_guard(resumepc=orgpc)`
+/// snapshots the opcode that is running. PyPy inlines `dispatch_bytecode`
+/// per instruction, so that orgpc's jitcode pc names the opcode. The
+/// shared copy's own `-live-` is one physical location;
+/// `forward_py_pc_for_jitcode_pc` of it is the first emission-run owner
+/// (often the function's first `LOAD_FAST`). Prefer the entering
+/// opcode's `-live-`, then that opcode's portal merge marker.
+fn shared_hook_orgpc_jitcode_pc<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    payload: &crate::PyJitCode,
+    op_pc: usize,
+) -> i32 {
+    let op_live = crate::state::op_live();
+    if ctx.live_before_jit_pc != usize::MAX
+        && payload
+            .jitcode
+            .can_decode_live_vars(ctx.live_before_jit_pc, op_live)
+    {
+        return ctx.live_before_jit_pc as i32;
+    }
+    if let Some(py) = shared_hook_next_instr(ctx)
+        && let Some(off) = shared_hook_orgpc_offset(payload, py)
+    {
+        return off as i32;
+    }
+    plain_guard_resume_jitcode_pc(payload, op_pc)
+}
+
+/// A loop trace starts at `jit_merge_point`, so the predecessor
+/// `-live-` was never walked and `live_before_jit_pc` is still
+/// `MAX`. Seed it from that opcode's portal merge so
+/// `generate_guard(resumepc=orgpc)` names the entering instruction
+/// while the hold is up.
+pub(super) fn seed_shared_hook_live_before<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
+    if !ctx.session.borrow().hold_opcode_live_before {
+        return;
+    }
+    if ctx.live_before_jit_pc != usize::MAX {
+        return;
+    }
+    let Some(jc) = walked_snapshot_jitcode(ctx) else {
+        return;
+    };
+    let Some(py) = ctx.session.borrow().current_debug_merge_point_py_pc() else {
+        return;
+    };
+    if let Some(off) = shared_hook_orgpc_offset(&jc.payload, py as usize) {
+        ctx.live_before_jit_pc = off;
+    }
 }
 
 /// Register banks frozen when the walk entered the shared
@@ -1319,8 +1399,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
             // `snapshot_pc != residual_pc`).
             let map_pc = if after_residual_call {
                 op_pc
-            } else if in_shared_hook && ctx.live_before_jit_pc != usize::MAX {
-                ctx.live_before_jit_pc
+            } else if in_shared_hook {
+                let orgpc = shared_hook_orgpc_jitcode_pc(ctx, &walked_owned.payload, op_pc);
+                if orgpc >= 0 { orgpc as usize } else { op_pc }
             } else {
                 op_pc
             };
@@ -1688,19 +1769,12 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                     };
                 if live_before_decodable {
                     ctx.live_before_jit_pc as i32
+                } else if in_shared_hook {
+                    shared_hook_orgpc_jitcode_pc(ctx, &walked_owned.payload, op_pc)
                 } else {
                     plain_guard_resume_jitcode_pc(&walked_owned.payload, op_pc)
                 }
-            } else if !after_residual_call
-                && in_shared_hook
-                && ctx.live_before_jit_pc != usize::MAX
-                && unsafe {
-                    walked_owned
-                        .payload
-                        .jitcode
-                        .can_decode_live_vars(ctx.live_before_jit_pc, crate::state::op_live())
-                }
-            {
+            } else if !after_residual_call && in_shared_hook {
                 // Every guard recorded while walking the shared
                 // `dispatch_bytecode` copy (`_establish_nullity` on
                 // `debugdata`, the switch `GUARD_VALUE` on the reloaded
@@ -1711,9 +1785,9 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
                 // false when snapshot_pc != residual_pc).  The
                 // GuardValue/Class/True/False allow-list above already
                 // carries `live_before` for those opcodes; this arm is
-                // the remaining hook guards (GuardIsnull) without adding
-                // them to that list.
-                ctx.live_before_jit_pc as i32
+                // the remaining hook guards without adding them to that
+                // list.
+                shared_hook_orgpc_jitcode_pc(ctx, &walked_owned.payload, op_pc)
             } else if after_residual_call {
                 // #366: extend the direct-pc carry to the after-residual-call
                 // guard family (`GuardException`/`GuardNoException`/
@@ -5445,8 +5519,13 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     // before pops). Hook residuals already pass after_residual_call=false.
     let callee_resume_op_pc = if after_residual_call {
         callee_op_pc
-    } else if in_shared_hook && ctx.live_before_jit_pc != usize::MAX {
-        ctx.live_before_jit_pc
+    } else if in_shared_hook {
+        let orgpc = shared_hook_orgpc_jitcode_pc(ctx, &callee_pjc, callee_op_pc);
+        if orgpc >= 0 {
+            orgpc as usize
+        } else {
+            callee_op_pc
+        }
     } else {
         callee_op_pc
     };
@@ -5472,18 +5551,8 @@ pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
             false => {
                 if in_shared_hook {
                     // Shared `dispatch_bytecode` records the opcode that
-                    // entered the copy. Publish that pc only when it is a
-                    // `-live-`; otherwise the same preceding-live walk the
-                    // plain path uses (`generate_guard(resumepc=orgpc)`).
-                    let op_live = crate::state::op_live();
-                    if callee_pjc
-                        .jitcode
-                        .can_decode_live_vars(callee_resume_op_pc, op_live)
-                    {
-                        callee_resume_op_pc as i32
-                    } else {
-                        plain_guard_resume_jitcode_pc(&callee_pjc, callee_op_pc)
-                    }
+                    // entered the copy (`generate_guard(resumepc=orgpc)`).
+                    callee_resume_op_pc as i32
                 } else {
                     plain_guard_resume_jitcode_pc(&callee_pjc, callee_op_pc)
                 }

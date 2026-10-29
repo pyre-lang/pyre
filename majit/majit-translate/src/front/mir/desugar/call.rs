@@ -1073,6 +1073,20 @@ impl<'a> Lowering<'a> {
                         .expect("a materialized GC root stays a Variable")
                         .clone();
                 }
+                // `FrameAnchor` is a GC-local keepalive (`gc_push_roots` of
+                // `frame`), not a residual shadow-stack push/get/pop.
+                if let Some(name) = regular_call_name_path(&reg, self.llbc)
+                    && self.try_lower_frame_anchor_call(
+                        mir_bb,
+                        &name,
+                        &args,
+                        dest_local,
+                        &call.dest.ty,
+                        target,
+                    )?
+                {
+                    return Ok(());
+                }
                 // `rarithmetic.r_uint`: the unique graph's `usize` input is
                 // Unsigned. `cast_ptr_to_int` callers otherwise merge
                 // `r_uint ∪ int` (`annrpython.py` `mergeinputargs`).

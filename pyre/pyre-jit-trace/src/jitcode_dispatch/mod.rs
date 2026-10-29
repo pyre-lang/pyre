@@ -1018,14 +1018,16 @@ pub struct WalkSession {
     /// outside every region rather than inheriting one.
     pub binop_rewind_depth: usize,
     /// The unrolled portal joins every instruction at one
-    /// `dispatch_bytecode` copy.  `liveness.py` `follow_label` on the
-    /// `SwitchDictDescr` unions every body's SSA into that copy's
-    /// `-live-`.  `resume.py` `rebuild_from_resumedata` names this
-    /// opcode's slots, so a `goto` into the copy keeps the predecessor
-    /// opcode's `live_before` until the switch leaves it.
+    /// `dispatch_bytecode` / `portal_merge_greens` copy.  `liveness.py`
+    /// `follow_label` on the `SwitchDictDescr` would union every body's
+    /// SSA into that copy's `-live-` if the `goto` were visible during
+    /// liveness; flatten keeps the graph op until after that pass.
+    /// `resume.py` `rebuild_from_resumedata` names this opcode's slots,
+    /// so a `goto` into the copy keeps the predecessor opcode's
+    /// `live_before` until the switch leaves it.
     pub hold_opcode_live_before: bool,
     /// `dispatch_bytecode` stored `self.last_instr = next_instr` at the
-    /// shared we_are_jitted copy.  `pmg_shared` only reads debugdata and
+    /// shared `arm_shared` copy.  `pmg_shared` only reads debugdata and
     /// promotes greens (`interp_jit.py` `PyFrame.dispatch`); it does not
     /// write `last_instr`.  `shared_hook_next_instr` reads that field
     /// only when this is set.
@@ -1258,7 +1260,7 @@ impl WalkSession {
     /// The raise that owns the snapshot is the pre-step `goto/L` into
     /// `pmg_shared`, before `step_vstack_mirror`: `py_exact` of that
     /// goto floors to RETURN and would overlay NULL stack slots.
-    /// Mixing two `pmg_shared` `uses_vable_last_instr` values on
+    /// Mixing `arm_shared` / `pmg_shared` `uses_vable_last_instr` on
     /// one hold is a walk bug.
     pub(crate) fn begin_hold_opcode_live_before(
         &mut self,
@@ -3615,7 +3617,7 @@ fn surface_inline_subloop_after_back_edge(
 /// `WalkFrameStateData.inline_w_code` is the current frame's own code
 /// (inlined Python callee, or the generator body `walk_generator_resume`
 /// seeded). Nested helper walks leave it zero; those fall back to
-/// `framestack.last().w_code` when a Python frame is on the stack.
+/// the innermost Python inline frame (`WalkSession::last_python_inline`), which skips transparent helper frames.
 fn current_walk_frame_pycode<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
     let inline = ctx.inline_w_code();
     if inline != 0 {
@@ -3623,8 +3625,7 @@ fn current_walk_frame_pycode<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Op
     } else {
         ctx.session
             .borrow()
-            .framestack
-            .last()
+            .last_python_inline()
             .map(|frame| frame.w_code)
     }
 }
@@ -5590,20 +5591,25 @@ pub fn step<Sym: WalkSym>(
     // `self.pc - SIZE_LIVE_OP`).  `op.pc` is the genuine jitcode offset of
     // the `-live-` byte.  Side-data only — read under a debug audit gate.
     // The first instruction may land on flatten's shared
-    // `pmg_shared` copy (`getfield debugdata`) with no `goto/L`.
+    // `pmg_shared` / `arm_shared` copy with no `goto/L`.
     // Hold the predecessor opcode's live across that copy's `-live-`.
     // Raise the hold before synthesizing DEBUG_MERGE_POINT: the
     // copy's first op would otherwise floor to py_pc 0.
     vable_ops::begin_hold_if_shared_hook(code, ctx, op.pc);
-    // `pmg_shared` sits after the body (`emitline`), so `py_exact` of
-    // `goto pmg_shared` floors to the last opcode (RETURN) and would
-    // overlay NULL stack slots.  This is the one hold-raise for that
-    // goto: it must precede `step_vstack_mirror`.  The `"goto/L"` arm
-    // does not raise again (that arm runs after the mirror).
+    seed_shared_hook_live_before(ctx);
+    // `pmg_shared` / `arm_shared` sit after the body (`emitline`), so
+    // `py_exact` of `goto pmg_shared` / `goto arm_shared` floors to
+    // the last opcode (RETURN) and would overlay NULL stack slots.
+    // This is the one hold-raise for that goto: it must precede
+    // `step_vstack_mirror`.  The `"goto/L"` arm does not raise again
+    // (that arm runs after the mirror).
     if op.key == "goto/L" {
         let target = read_label(code, &op, 0);
-        if vable_ops::is_shared_pmg_block(code, target) {
+        if vable_ops::is_shared_pmg_block(code, target)
+            || vable_ops::is_shared_arm_block(code, target)
+        {
             vable_ops::begin_hold_if_shared_hook(code, ctx, target);
+            seed_shared_hook_live_before(ctx);
         }
     }
     if op.opname != "live"
@@ -5653,7 +5659,17 @@ pub fn step<Sym: WalkSym>(
             // block-entry marker re-anchors at once, a marker-less one (the
             // `dispatch_bytecode` jitted arm's blocks) falls back to the opcode-start
             // marker in `plain_guard_resume_jitcode_pc`.
-            ctx.live_before_jit_pc = usize::MAX;
+            //
+            // The shared `arm_shared` / `pmg_shared` copy raises hold on the
+            // `goto` that enters it and skips re-anchoring on the copy's own
+            // `-live-`. Clearing here would drop the entering opcode's
+            // `-live-` (`generate_guard(resumepc=orgpc)`), and
+            // `plain_guard_resume_jitcode_pc` of a copy-internal guard then
+            // names the copy's floor Python pc. Keep the entering `-live-`
+            // until the switch drops the hold.
+            if !ctx.session.borrow().hold_opcode_live_before {
+                ctx.live_before_jit_pc = usize::MAX;
+            }
         }
     }
     result
@@ -10492,6 +10508,23 @@ thread_local! {
     /// (`cffi_lib_attr_cell`).
     static FBW_HEAP_WRITING_EFFECT_COUNT: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+
+    /// [`FBW_EXECUTED_EFFECT_COUNT`] sampled as the walk ENTERED the Python
+    /// opcode it is currently inside, as `(py_pc, odometer)`.
+    ///
+    /// A leg that resumes the interpreter at a Python opcode re-executes that
+    /// whole opcode — `flush_walk_end_state_to_frame` sets `last_instr = pc - 1`
+    /// — so it owes a proof that the opcode has applied nothing yet.  This is
+    /// that proof's sample point, and it must be the OPCODE boundary: a
+    /// per-`-live-` or per-jitcode-op sample would read zero for an opcode whose
+    /// earlier ops already ran effects.
+    ///
+    /// Recorded only on the top-level walk (`reconcile_vstack_at_boundary`, the
+    /// boundary detector).  A callee sub-walk's `py_pc` names a different code
+    /// object, so leaving the sample absent there makes the gate decline rather
+    /// than compare coordinates from two universes.
+    static FBW_OPCODE_ENTRY_EFFECTS: std::cell::Cell<Option<(usize, usize)>> =
+        const { std::cell::Cell::new(None) };
 
     /// `ABORT_FORCE_QUASIIMMUT` resume carrier: `(py_pc, operand-stack OpRef
     /// mirror)` taken at the abort, for the flush leg that resumes the
@@ -19121,7 +19154,7 @@ fn handle<Sym: WalkSym>(
             }
             // Current walk frame's pycode: `inline_w_code` when this frame
             // owns one (inlined Python callee, generator resume body);
-            // otherwise `framestack.last().w_code`. Nested helpers leave
+            // otherwise `WalkSession::last_python_inline`'s `w_code`. Nested helpers leave
             // `inline_w_code` empty (`run_sub_jitcode_walk_from` takes that
             // argument only from `walk_generator_resume`).
             let callee_code = (!ctx.is_top_level

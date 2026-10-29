@@ -18771,59 +18771,22 @@ mod tests {
         crate::jit::codewriter::register_portal_jitdriver(canonical_code);
     }
 
-    /// Find the first JitCode `-live-` offset where every requested local
-    /// slot and operand-stack depth carries a color AND the compiled live set
-    /// contains all of those colors AND the Int and Float liveness banks are
-    /// both empty. Returns that JitCode offset, its full live set, and the
-    /// mapped colors (locals first, then stack depths in order).
-    fn live_pc_with_slot_colors(
-        jitcode_index: i32,
-        code: &pyre_interpreter::CodeObject,
-        local_slots: &[u32],
-        stack_depths: &[usize],
-    ) -> (usize, Vec<u32>, Vec<u32>) {
-        let stack_base = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+    /// Locate a real resume marker by its Python operand depth. Stack
+    /// slots are restored through the virtualizable, independently of the
+    /// MIFrame register colors (`resume.py consume_vref_and_vable`).
+    fn live_pc_at_stack_depth(jitcode_index: i32, depth: u16) -> (usize, Vec<u32>) {
         let payload = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)
             .expect("compiled trace-side jitcode must be registered");
-        let op_live = pyre_jit_trace::state::op_live();
-        (0..payload.jitcode.body().code.len())
-            .filter(|&jit_pc| payload.jitcode.can_decode_live_vars(jit_pc, op_live))
-            .find_map(|jit_pc| {
-                let pcdep = payload.pcdep_for_jitcode_pc(jit_pc)?;
-                let colors: Vec<u32> = local_slots
-                    .iter()
-                    .map(|&slot| {
-                        pcdep
-                            .iter()
-                            .find(|&&(b, _, s)| b == 1 && s as usize == slot as usize)
-                            .map(|&(_, c, _)| u32::from(c))
-                    })
-                    .chain(stack_depths.iter().map(|&d| {
-                        pcdep
-                            .iter()
-                            .find(|&&(b, _, s)| b == 1 && s as usize == stack_base + d)
-                            .map(|&(_, c, _)| u32::from(c))
-                    }))
-                    .collect::<Option<Vec<u32>>>()?;
-                let live_by_bank = pyre_jit_trace::state::frame_liveness_reg_indices_by_bank_at(
-                    jitcode_index,
-                    jit_pc as i32,
-                );
-                if !live_by_bank.int.is_empty() || !live_by_bank.float.is_empty() {
-                    return None;
-                }
-                let live = live_by_bank.flattened();
-                colors
-                    .iter()
-                    .all(|c| live.contains(c))
-                    .then_some((jit_pc, live, colors))
+        let pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&payload.jitcode.code)
+            .find(|op| {
+                op.opname == "live" && payload.depth_trivia_for_jitcode_pc(op.pc) == Some(depth)
             })
-            .unwrap_or_else(|| {
-                panic!(
-                    "no JitCode -live- offset carries colors for local slots \
-                     {local_slots:?} + stack depths {stack_depths:?} with empty Int/Float banks"
-                )
-            })
+            .expect("fixture must have a live marker at the requested stack depth")
+            .pc;
+        (
+            pc,
+            pyre_jit_trace::state::frame_liveness_reg_indices_at(jitcode_index, pc as i32),
+        )
     }
 
     /// F4 removed `register_color = nlocals + depth`. A branch guard's
@@ -18838,6 +18801,8 @@ mod tests {
     /// sibling semantic index and clobbers the seeded stack slot.
     /// Fill those locals first so that path does not run.
     fn seed_branch_guard_live_colors(
+        ctx: &mut majit_metainterp::TraceCtx,
+        frame: &PyFrame,
         sym: &mut pyre_jit_trace::state::PyreSym,
         jitcode_index: i32,
         resume_pc: usize,
@@ -18845,10 +18810,6 @@ mod tests {
         lower_stack: majit_ir::OpRef,
         truth: majit_ir::OpRef,
     ) {
-        assert!(
-            !mapped_stack_colors.is_empty(),
-            "live_pc_with_slot_colors must map at least one stack depth"
-        );
         let banks = pyre_jit_trace::state::frame_liveness_reg_indices_by_bank_at(
             jitcode_index,
             resume_pc as i32,
@@ -18861,6 +18822,20 @@ mod tests {
         let int_colors: Vec<(u32, majit_ir::OpRef)> =
             banks.int.iter().copied().map(|c| (c, truth)).collect();
         pyre_jit_trace::state::seed_live_register_colors(sym, &ref_colors, &int_colors);
+        // Production snapshots read the operand stack from the virtualizable,
+        // not from the MIFrame's SSA register bank. Seed that independent
+        // stream as `resume.py consume_virtualizable_boxes` does.
+        use pyre_jit_trace::state::WalkSym;
+        let info = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
+        let mut boxes = vec![
+            sym.vable_last_instr(),
+            ctx.const_ref(frame.pycode as usize as i64),
+            sym.vable_valuestackdepth(),
+            ctx.const_ref(frame.debugdata as usize as i64),
+        ];
+        boxes.extend(sym.registers_r().iter().take(sym.valuestackdepth()));
+        boxes.push(sym.frame());
+        ctx.set_virtualizable_boxes_with_info(boxes, Vec::new(), &info, &[sym.valuestackdepth()]);
     }
 
     /// Stack-depth-based variant of `compiled_trace_fixture`. Locates the
@@ -18935,8 +18910,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs, _) =
-            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
+        let (resume_pc, live_regs) = live_pc_at_stack_depth(jitcode_index, 2);
         let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test(2);
@@ -19039,8 +19013,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs, stack_colors) =
-            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
+        let (resume_pc, live_regs) = live_pc_at_stack_depth(jitcode_index, 2);
 
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
@@ -19090,9 +19063,6 @@ mod tests {
 
         let fail_args = state.capture_current_fail_args();
 
-        for &color in &stack_colors {
-            assert!(live_regs.contains(&color));
-        }
         assert_eq!(
             fail_args.len(),
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
@@ -19105,7 +19075,7 @@ mod tests {
         // `registers_r` remains the semantic frame mirror: stack values
         // stay at `nlocals + depth`. Guard capture materializes the
         // color-indexed bank separately from this mirror/vable state.
-        for depth in 0..stack_colors.len() {
+        for depth in 0..2 {
             let stack_value = [stack0, stack1][depth];
             let semantic_idx = 2 + depth;
             assert_eq!(
@@ -19149,8 +19119,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs, _) =
-            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
+        let (resume_pc, live_regs) = live_pc_at_stack_depth(jitcode_index, 2);
         let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
@@ -19225,8 +19194,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs, _) =
-            live_pc_with_slot_colors(jitcode_index, &code, &[], &[0, 1]);
+        let (resume_pc, live_regs) = live_pc_at_stack_depth(jitcode_index, 2);
         let max_color = live_regs.iter().copied().max().unwrap_or(0) as usize;
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
@@ -19343,9 +19311,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        // Operand stack depths 1 and 2 carry the two observable Ref slots.
-        let (resume_pc, live_regs, mapped_colors) =
-            live_pc_with_slot_colors(jitcode_index, &code, &[], &[1, 2]);
+        let (resume_pc, live_regs) = live_pc_at_stack_depth(jitcode_index, 4);
 
         let run_case = || {
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
@@ -19394,10 +19360,12 @@ mod tests {
                 ],
             );
             seed_branch_guard_live_colors(
+                &mut ctx,
+                &frame,
                 &mut sym,
                 jitcode_index,
                 resume_pc,
-                &mapped_colors,
+                &[],
                 lower_stack,
                 truth,
             );
@@ -19452,16 +19420,15 @@ mod tests {
                 .map(|f| f.boxes.as_slice())
                 .unwrap_or(&[]);
             assert_eq!(active_boxes.len(), live_regs.len());
-            // `get_list_of_active_boxes` (`pyjitpl.py`) walks live colors,
-            // not `nlocals + depth`. F4 removed that identity; the order
-            // is kind-segregated liveness (Int then Ref).
+            // The pre-pop stack lives in the virtualizable; the active
+            // register bank carries only the SSA values live at this marker.
             assert!(
-                active_boxes.iter().any(|b| matches!(
+                snapshot.vable_boxes.iter().any(|b| matches!(
                     b,
                     SnapshotTagged::Box(li, _) if *li == lower_stack
                 )),
                 "pre-pop snapshot must capture lower stack slot: {:?}",
-                active_boxes
+                snapshot.vable_boxes
             );
             let banks =
                 trace_state::frame_liveness_reg_indices_by_bank_at(jitcode_index, resume_pc as i32);
@@ -19514,9 +19481,7 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        // Operand stack depths 1 and 2 carry the two observable Ref slots.
-        let (resume_pc, live_regs, mapped_colors) =
-            live_pc_with_slot_colors(jitcode_index, &code, &[], &[1, 2]);
+        let (resume_pc, live_regs) = live_pc_at_stack_depth(jitcode_index, 4);
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int, Type::Ref, Type::Ref]);
         let lower_stack = OpRef::input_arg_ref(0);
@@ -19561,10 +19526,12 @@ mod tests {
             ],
         );
         seed_branch_guard_live_colors(
+            &mut ctx,
+            &frame,
             &mut sym,
             jitcode_index,
             resume_pc,
-            &mapped_colors,
+            &[],
             lower_stack,
             truth,
         );
@@ -19602,17 +19569,15 @@ mod tests {
             .map(|f| f.boxes.as_slice())
             .unwrap_or(&[]);
         assert_eq!(active_boxes.len(), live_regs.len());
-        // See note on the sibling test
-        // `test_branch_guard_preserves_pre_pop_stack_shape_*`: snapshot
-        // boxes are live colors (`pyjitpl.py get_list_of_active_boxes`),
-        // not `nlocals + depth`.
+        // `resume.py consume_vref_and_vable` restores the pre-pop stack
+        // from the virtualizable section, independent of active SSA colors.
         assert!(
-            active_boxes.iter().any(|b| matches!(
+            snapshot.vable_boxes.iter().any(|b| matches!(
                 b,
                 SnapshotTagged::Box(li, _) if *li == lower_stack
             )),
             "mixed-bank guard must capture lower stack slot: {:?}",
-            active_boxes
+            snapshot.vable_boxes
         );
         let banks =
             trace_state::frame_liveness_reg_indices_by_bank_at(jitcode_index, resume_pc as i32);

@@ -423,6 +423,7 @@ pub(crate) fn fbw_store_journal_reset() {
     // forward-flush carrier a prior aborted walk latched.
     FBW_EXECUTED_EFFECT_COUNT.with(|c| c.set(0));
     FBW_HEAP_WRITING_EFFECT_COUNT.with(|c| c.set(0));
+    FBW_OPCODE_ENTRY_EFFECTS.with(|c| c.set(None));
     FBW_QMUT_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_BRANCH_ABORT_STACK.with(|c| *c.borrow_mut() = None);
     FBW_STRUCTURAL_ABORT_OPCODE_EFFECTS.with(|c| c.set(None));

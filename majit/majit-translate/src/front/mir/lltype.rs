@@ -1806,6 +1806,13 @@ pub(in crate::front::mir) fn input_param_value_type(
     is_first_param: bool,
     tombstoned_leaves: &std::collections::HashSet<String>,
 ) -> ValueType {
+    // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+    // Keep the Input bank `ref` even when a later peel would treat the
+    // transparent `usize` field as a scalar pointee (`jtransform.py`
+    // `getkind` of a GC pointer is `'ref'`).
+    if tyref_is_frame_anchor(local_ty, llbc) {
+        return ValueType::Ref(None);
+    }
     if matches!(ty, ValueType::Ref(None))
         && tyref_is_void_zst(local_ty, llbc)
         && !tyref_keeps_empty_class_instance(local_ty, llbc, tombstoned_leaves)
@@ -3006,6 +3013,16 @@ pub(in crate::front::mir) fn tyref_to_value_type_with(
         && let Some(kind) = scalar_value_type(scalar)
     {
         return kind;
+    }
+    // `FrameAnchor` is the frame GCREF (`try_lower_frame_anchor_call`).
+    // By value, `&FrameAnchor`, `&mut FrameAnchor`, and `Self::Anchor`
+    // are that word (`pyframe.py` / `pyopcode.py`: one red GC reference;
+    // `jtransform.py` `getkind` of a GC pointer is `'ref'`). Checked
+    // before the transparent peel: the Rust field is `usize`, which
+    // would otherwise bank the parameter as `'int'` and make `live()`'s
+    // identity alias disagree with a `*mut PyFrame` `FUNC.RESULT`.
+    if tyref_is_frame_anchor(ty, llbc) {
+        return ValueType::Ref(None);
     }
     // A trait associated-type projection (`Self::Truth`) has no
     // representation of its own — it is whatever the selected impl binds
@@ -4971,6 +4988,12 @@ pub(in crate::front::mir) fn dont_look_inside_return_class_root(
     let payload = crate::front::result_exc::result_exc_projected_ok(output, llbc, spec);
     let ty = payload.as_ref().unwrap_or(output);
     if tyref_is_gcref_spelling(ty, llbc) {
+        return None;
+    }
+    // FrameAnchor is the frame GCREF, not an interned instance. A class
+    // root here would let `declared_graph_result_type` flip the `"ref"`
+    // FUNC.RESULT token to Int via a raw-struct layout.
+    if tyref_is_frame_anchor(ty, llbc) {
         return None;
     }
     if let Some(root) =
@@ -7249,6 +7272,9 @@ pub(in crate::front::mir) fn tyref_ref_param_class_root(
     tombstoned: &std::collections::HashSet<String>,
     generics: Option<&FunGenerics>,
 ) -> Option<String> {
+    if tyref_is_frame_anchor(ty, llbc) {
+        return None;
+    }
     let spelling = tyref_to_ast_string(ty, llbc);
     if majit_ir::descr::is_list_container_spelling(&spelling) {
         return Some(spelling);
