@@ -614,6 +614,7 @@ fn default_spec_lower_hex_collapses_to_mod_pct_x() {
     .expect("lower hex-format production graphs");
     let mut found = Vec::new();
     let mut leftover_fmt = Vec::new();
+    let mut leftover_spill = Vec::new();
     let mut missing_pct_x = Vec::new();
     let mut unrolled = Vec::new();
     for function in &program.functions {
@@ -628,6 +629,16 @@ fn default_spec_lower_hex_collapses_to_mod_pct_x() {
                 && segments[segments.len() - 2..] == ["fmt".to_string(), "format".to_string()]
         }) {
             leftover_fmt.push(function.name.clone());
+        }
+        if graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::RawMalloc { owner, .. } if owner == "Tuple<i64>"
+                )
+            })
+        }) {
+            leftover_spill.push(function.name.clone());
         }
         let getslice = paths
             .iter()
@@ -676,6 +687,10 @@ fn default_spec_lower_hex_collapses_to_mod_pct_x() {
     assert!(
         leftover_fmt.is_empty(),
         "alloc::fmt::format must be consumed, leftover {leftover_fmt:?}"
+    );
+    assert!(
+        leftover_spill.is_empty(),
+        "collapsed Argument::new_* must delete its call-scoped Tuple<i64> cell, leftover {leftover_spill:?}"
     );
     assert!(
         missing_pct_x.is_empty(),

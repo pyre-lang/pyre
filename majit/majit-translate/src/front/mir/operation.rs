@@ -972,7 +972,12 @@ impl<'a> Lowering<'a> {
                             }
                         }
                         PlaceKind::Local(i) => {
-                            self.local_var[i as usize] = Some(LocalValue::One(value_var(&value)));
+                            let i = i as usize;
+                            if self.is_cell_local(i) {
+                                self.emit_cell_store(mir_bb, i, value_var(&value))?;
+                                return Ok(());
+                            }
+                            self.local_var[i] = Some(LocalValue::One(value_var(&value)));
                             return Ok(());
                         }
                         _ => {}
@@ -2705,6 +2710,10 @@ impl<'a> Lowering<'a> {
             // itself. Aliasing the dest local to the referent Variable
             // keeps the IR small, treating `&x` as a same-Variable copy.
             Rvalue::Ref { place, kind, .. } => {
+                if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    let v = self.defined_local(mir_bb, cell)?;
+                    return Ok((None, v));
+                }
                 // `&mut *p` of a cell parameter is that cell. The reborrow
                 // does not load `value`.
                 if borrow_kind_is_exclusive(&kind)
@@ -2744,6 +2753,10 @@ impl<'a> Lowering<'a> {
             // `&raw const *p` is the address `p`. Resolving the deref
             // would `RawLoad` the pointee (`rewrite_op_raw_load`).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(cell) = self.cell_local_of_address_place(&place) {
+                    let v = self.defined_local(mir_bb, cell)?;
+                    return Ok((None, v));
+                }
                 if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
@@ -6092,6 +6105,9 @@ impl<'a> Lowering<'a> {
                 Err(LowerError::Unsupported(format!(
                     "bb{mir_bb}: const struct local {i} read as one word"
                 )))
+            }
+            PlaceKind::Local(i) if self.is_cell_local(i as usize) => {
+                self.emit_cell_load(mir_bb, i as usize)
             }
             PlaceKind::Local(i) => self
                 .local_var

@@ -70,7 +70,14 @@ fn liveness_marks_loop_carried_index_local_as_live_in() {
     // Base dataflow only: this case is closed by
     // `mark_projection_index_offset_use` in the statement scan, not by
     // the index-write `extra_live` set, so pass an empty extra_live.
-    let live = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &bit_set::BitSet::new());
+    let no_cells = bit_set::BitSet::new();
+    let live = super::compute_mir_liveness(
+        &fixture_llbc(),
+        &body,
+        &[],
+        &bit_set::BitSet::new(),
+        &no_cells,
+    );
     assert!(
         live[1].contains(2),
         "loop-carried index local _2 must be live-in at the loop block bb1"
@@ -145,7 +152,14 @@ fn liveness_marks_offset_bytes_local_as_live_in() {
     });
     let body: Unstructured =
         serde_json::from_value(body_json).expect("fixture Unstructured parses");
-    let live = super::compute_mir_liveness(&fixture_llbc(), &body, &[], &bit_set::BitSet::new());
+    let no_cells = bit_set::BitSet::new();
+    let live = super::compute_mir_liveness(
+        &fixture_llbc(),
+        &body,
+        &[],
+        &bit_set::BitSet::new(),
+        &no_cells,
+    );
     assert!(
         live[1].contains(2),
         "Offset.bytes local _2 must be live-in at bb1"

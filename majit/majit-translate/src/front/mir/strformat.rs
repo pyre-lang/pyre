@@ -408,17 +408,294 @@ pub(in crate::front::mir) fn fmt_argument_ctor_kind(segments: &[String]) -> Opti
     }
 }
 
+/// Residual `&T` spill wrapping a fmt `Argument::new_*` operand. Residual
+/// ABI for `&T` of a copy word stores the aliased FieldRead in a
+/// Char-varsize cell (`RAW_SCALAR_CELL_OWNER`) that lives for the
+/// source's storage scope, or a leftover per-call `Tuple<i64>` cell
+/// (`RAW_SCALAR_SPILL_OWNER`). The collapser's recognized chain still
+/// starts at that FieldRead; this recovers it when the cell's only op
+/// users are the store, the `new_*` call, and at least one RawFree.
+/// Link / exitswitch threading of the pointer is SSA of the cell, not
+/// another consumer.
+///
+/// Returns `(field_read, extra_dead_result_ids)` — the malloc pointer and,
+/// when they have no other user, the store's offset const and the
+/// Char-varsize length const. Collapse deletes those results together
+/// with RawStore / RawFree of the malloc pointer (including aliases
+/// threaded as inputargs). A shape outside this idiom returns `None` so
+/// a residual `&T` keeps its cell.
+pub(in crate::front::mir) fn peel_call_scoped_fmt_arg_spill(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<(crate::flowspace::model::Variable, Vec<u64>)> {
+    use crate::model::{CallTarget, LinkArg, OpKind};
+    // `new_*` takes the extra-slot inputarg of its block. That name is
+    // a join / loop phi when the cell is live-in everywhere except bb0
+    // (`scoped_alloc`); `resolve_to_producer_op` has no single producer.
+    let (malloc_block, malloc_idx) = find_raw_cell_malloc_op(graph, var)?;
+    let malloc_block_ref = graph.blocks.iter().find(|b| b.id == malloc_block)?;
+    let malloc_op = malloc_block_ref.operations.get(malloc_idx)?;
+    let OpKind::RawMalloc { length, .. } = &malloc_op.kind else {
+        return None;
+    };
+    let ptr = malloc_op.result.as_ref()?;
+    let ptr_id = ptr.id();
+    let length = length.clone();
+    let cell_ids = collect_raw_cell_ptr_ids(graph, ptr_id);
+
+    let mut store: Option<(Variable, Variable, crate::model::BlockId, usize)> = None;
+    let mut free_count = 0usize;
+    let mut new_star_count = 0usize;
+    let mut other_uses = 0usize;
+    for block in &graph.blocks {
+        for (oi, op) in block.operations.iter().enumerate() {
+            if block.id == malloc_block && oi == malloc_idx {
+                continue;
+            }
+            let refs = crate::inline::op_variable_refs(&op.kind);
+            if !refs.iter().any(|used| cell_ids.contains(&used.id())) {
+                continue;
+            }
+            match &op.kind {
+                OpKind::RawStore {
+                    base,
+                    offset,
+                    value,
+                    ..
+                } if cell_ids.contains(&base.id()) => {
+                    if store.is_some() {
+                        return None;
+                    }
+                    store = Some((value.clone(), offset.clone(), block.id, oi));
+                }
+                OpKind::RawFree { ptr: freed } if cell_ids.contains(&freed.id()) => {
+                    free_count += 1;
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } if fmt_argument_ctor_kind(segments).is_some()
+                    && args
+                        .first()
+                        .and_then(LinkArg::as_variable)
+                        .is_some_and(|arg| cell_ids.contains(&arg.id())) =>
+                {
+                    new_star_count += 1;
+                }
+                _ => other_uses += 1,
+            }
+        }
+    }
+    if store.is_none() || free_count < 1 || new_star_count != 1 || other_uses != 0 {
+        return None;
+    }
+    let (stored, offset, store_block, store_idx) = store?;
+    let (fr_block, fr_idx) = resolve_to_producer_op(graph, &stored)?;
+    let frb = graph.blocks.iter().find(|b| b.id == fr_block)?;
+    match &frb.operations.get(fr_idx)?.kind {
+        OpKind::FieldRead { .. } => {}
+        _ => return None,
+    }
+    let mut extra_dead = vec![ptr_id];
+    if var_only_used_by_op(graph, &offset, store_block, store_idx) {
+        extra_dead.push(offset.id());
+    }
+    if let Some(len) = length
+        && var_only_used_by_op(graph, &len, malloc_block, malloc_idx)
+    {
+        extra_dead.push(len.id());
+    }
+    Some((stored, extra_dead))
+}
+
+/// The RawMalloc of a residual `&T` cell that `var` names: the malloc
+/// result itself, or an extra-slot inputarg that forwards it, including
+/// a join / loop phi `resolve_to_producer_op` cannot follow.
+fn find_raw_cell_malloc_op(
+    graph: &FunctionGraph,
+    var: &crate::flowspace::model::Variable,
+) -> Option<(crate::model::BlockId, usize)> {
+    use crate::model::OpKind;
+    if let Some((block, idx)) = resolve_to_producer_op(graph, var)
+        && raw_cell_malloc_owner(graph, block, idx)
+    {
+        return Some((block, idx));
+    }
+    for block in &graph.blocks {
+        for (idx, op) in block.operations.iter().enumerate() {
+            let OpKind::RawMalloc { owner, .. } = &op.kind else {
+                continue;
+            };
+            if owner != super::RAW_SCALAR_SPILL_OWNER && owner != super::RAW_SCALAR_CELL_OWNER {
+                continue;
+            }
+            let Some(ptr) = op.result.as_ref() else {
+                continue;
+            };
+            if collect_raw_cell_ptr_ids(graph, ptr.id()).contains(&var.id()) {
+                return Some((block.id, idx));
+            }
+        }
+    }
+    None
+}
+
+fn raw_cell_malloc_owner(
+    graph: &FunctionGraph,
+    block_id: crate::model::BlockId,
+    idx: usize,
+) -> bool {
+    use crate::model::OpKind;
+    let Some(block) = graph.blocks.iter().find(|b| b.id == block_id) else {
+        return false;
+    };
+    let Some(op) = block.operations.get(idx) else {
+        return false;
+    };
+    matches!(
+        &op.kind,
+        OpKind::RawMalloc { owner, .. }
+            if owner == super::RAW_SCALAR_SPILL_OWNER || owner == super::RAW_SCALAR_CELL_OWNER
+    )
+}
+
+/// Every SSA name of one raw cell pointer: the malloc result and every
+/// inputarg that receives it along a link, including a join phi and a
+/// loop-carried extra slot (`scoped_alloc` live-in on later blocks).
+/// Floods forward from the malloc so a back-edge does not block the
+/// header the way "all incoming already aliases" would.
+fn collect_raw_cell_ptr_ids(graph: &FunctionGraph, ptr_id: u64) -> std::collections::HashSet<u64> {
+    use crate::model::LinkArg;
+    let mut ids = std::collections::HashSet::new();
+    ids.insert(ptr_id);
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for pred in &graph.blocks {
+            for exit in &pred.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == exit.target) else {
+                    continue;
+                };
+                for (pos, arg) in exit.args.iter().enumerate() {
+                    let LinkArg::Value(v) = arg else {
+                        continue;
+                    };
+                    if !ids.contains(&v.id()) {
+                        continue;
+                    }
+                    let Some(targ) = target.inputargs.get(pos) else {
+                        continue;
+                    };
+                    if ids.insert(targ.id()) {
+                        changed = true;
+                    }
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn var_only_used_by_op(
+    graph: &FunctionGraph,
+    var: &Variable,
+    use_block: crate::model::BlockId,
+    use_idx: usize,
+) -> bool {
+    use crate::model::{ExitSwitch, LinkArg};
+    let oid = var.id();
+    for block in &graph.blocks {
+        for (oi, op) in block.operations.iter().enumerate() {
+            if block.id == use_block && oi == use_idx {
+                continue;
+            }
+            if op.result.as_ref().is_some_and(|r| r.id() == oid) {
+                continue;
+            }
+            if crate::inline::op_variable_refs(&op.kind)
+                .iter()
+                .any(|used| used.id() == oid)
+            {
+                return false;
+            }
+        }
+        for link in &block.exits {
+            if link
+                .args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v.id() == oid))
+            {
+                return false;
+            }
+        }
+        if matches!(&block.exitswitch, Some(ExitSwitch::Value(v)) if v.id() == oid) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Delete residual fmt-chain ops whose result is dead, FieldWrites into a
+/// dead aggregate, and RawStore / RawFree of a dead call-scoped spill
+/// pointer (those ops have no result var).
+fn retain_live_fmt_chain_ops(
+    graph: &mut FunctionGraph,
+    dead_results: &std::collections::HashSet<u64>,
+    dead_bases: &std::collections::HashSet<u64>,
+) {
+    use crate::model::OpKind;
+    let dead_results = expand_dead_raw_cell_aliases(graph, dead_results);
+    for block in &mut graph.blocks {
+        block.operations.retain(|op| {
+            if op
+                .result
+                .as_ref()
+                .is_some_and(|r| dead_results.contains(&r.id()))
+            {
+                return false;
+            }
+            match &op.kind {
+                OpKind::FieldWrite { base, .. } if dead_bases.contains(&base.id()) => false,
+                OpKind::RawStore { base, .. } if dead_results.contains(&base.id()) => false,
+                OpKind::RawFree { ptr } if dead_results.contains(&ptr.id()) => false,
+                _ => true,
+            }
+        });
+    }
+}
+
+/// Inputargs of a dead malloc are the same cell pointer (`scoped_alloc`
+/// extra slot threaded to later blocks, including join phis).
+fn expand_dead_raw_cell_aliases(
+    graph: &FunctionGraph,
+    dead_results: &std::collections::HashSet<u64>,
+) -> std::collections::HashSet<u64> {
+    let mut dead = dead_results.clone();
+    let seeds: Vec<u64> = dead.iter().copied().collect();
+    for ptr_id in seeds {
+        dead.extend(collect_raw_cell_ptr_ids(graph, ptr_id));
+    }
+    dead
+}
+
 /// Unwrap the `format_args!` argument tuple-ref. Each Display/Debug
 /// argument reaches `Argument::new_display(&v)` as a `FieldRead` off the
 /// on-stack argument `Tuple` aggregate (`&(v,).0`); follow it back to the
-/// value written into that tuple field. Returns `var` unchanged when it
-/// is not produced by a `FieldRead` (value passed directly), and `None`
-/// when the tuple field has conflicting writers.
+/// value written into that tuple field. A call-scoped residual `&T` spill
+/// around that FieldRead is peeled first ([`peel_call_scoped_fmt_arg_spill`]).
+/// Returns `var` unchanged when it is not produced by a `FieldRead` (value
+/// passed directly), and `None` when the tuple field has conflicting writers.
 pub(in crate::front::mir) fn unwrap_fmt_arg_tuple_ref(
     graph: &FunctionGraph,
     var: &crate::flowspace::model::Variable,
 ) -> Option<crate::flowspace::model::Variable> {
     use crate::model::OpKind;
+    let peeled = peel_call_scoped_fmt_arg_spill(graph, var);
+    let var = peeled
+        .as_ref()
+        .map(|(field_read, _)| field_read)
+        .unwrap_or(var);
     let (block_id, idx) = resolve_to_producer_op(graph, var)?;
     let block = graph.blocks.iter().find(|b| b.id == block_id)?;
     let (base, field_name) = match &block.operations.get(idx)?.kind {
@@ -1281,24 +1558,30 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
         return None;
     }
     let block_0 = graph.blocks.iter().find(|b| b.id == b0)?;
-    let (arg_ref, tuple_var) = block_0.operations.iter().find_map(|op| match &op.kind {
-        OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } if op.result.as_ref().map(|r| r.id()) == Some(new_arg_var.id())
-            && fmt_argument_ctor_kind(segments).is_some() =>
-        {
-            let arg_ref = args.first()?.clone();
-            let (fr_block, fr_idx) = resolve_to_producer_op(graph, &arg_ref)?;
-            let frb = graph.blocks.iter().find(|b| b.id == fr_block)?;
-            match &frb.operations.get(fr_idx)?.kind {
-                OpKind::FieldRead { base, .. } => Some((arg_ref.clone(), base.clone())),
-                _ => None,
+    let (arg_ref, tuple_var, extra_spill_dead) =
+        block_0.operations.iter().find_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if op.result.as_ref().map(|r| r.id()) == Some(new_arg_var.id())
+                && fmt_argument_ctor_kind(segments).is_some() =>
+            {
+                let arg_ref = args.first()?.clone().into_variable();
+                let (field_read, extra_dead) = match peel_call_scoped_fmt_arg_spill(graph, &arg_ref)
+                {
+                    Some(pair) => pair,
+                    None => (arg_ref, Vec::new()),
+                };
+                let (fr_block, fr_idx) = resolve_to_producer_op(graph, &field_read)?;
+                let frb = graph.blocks.iter().find(|b| b.id == fr_block)?;
+                match &frb.operations.get(fr_idx)?.kind {
+                    OpKind::FieldRead { base, .. } => Some((field_read, base.clone(), extra_dead)),
+                    _ => None,
+                }
             }
-        }
-        _ => None,
-    })?;
+            _ => None,
+        })?;
     // The rendered value written into the argument tuple field.
     let context = unwrap_fmt_arg_tuple_ref(graph, &arg_ref)?;
     let tuple_ctor_name = block_0.operations.iter().find_map(|op| match &op.kind {
@@ -1338,6 +1621,7 @@ pub(in crate::front::mir) fn navigate_single_arg_fmt_chain(
         args_var.id(),
     ];
     dead_results.extend(piece_byte_vars.iter().map(|v| v.id()));
+    dead_results.extend(extra_spill_dead);
     let dead_bases = vec![tuple_var.id(), pieces_var.id(), args_var.id()];
 
     Some(SingleArgFmtChainNav {
@@ -1635,21 +1919,7 @@ pub(in crate::front::mir) fn collapse_fmt_chains(graph: &mut FunctionGraph) -> u
         .iter()
         .flat_map(|s| s.dead_bases.iter().copied())
         .collect();
-    for block in &mut graph.blocks {
-        block.operations.retain(|op| {
-            if let Some(r) = &op.result
-                && dead_results.contains(&r.id())
-            {
-                return false;
-            }
-            if let OpKind::FieldWrite { base, .. } = &op.kind
-                && dead_bases.contains(&base.id())
-            {
-                return false;
-            }
-            true
-        });
-    }
+    retain_live_fmt_chain_ops(graph, &dead_results, &dead_bases);
     // 3. Replace each `alloc::fmt::format` op (now reading the threaded
     //    rendered value) with the orthodox `str(value)` + `ll_strconcat`
     //    expansion, reusing the format result var.
@@ -1772,18 +2042,7 @@ pub(in crate::front::mir) fn collapse_lower_hex_byte_fmt_chains(
         .iter()
         .flat_map(|site| site.dead_bases.iter().copied())
         .collect();
-    for block in &mut graph.blocks {
-        block.operations.retain(|op| {
-            if op
-                .result
-                .as_ref()
-                .is_some_and(|result| dead_results.contains(&result.id()))
-            {
-                return false;
-            }
-            !matches!(&op.kind, OpKind::FieldWrite { base, .. } if dead_bases.contains(&base.id()))
-        });
-    }
+    retain_live_fmt_chain_ops(graph, &dead_results, &dead_bases);
     for site in &sites {
         let Some((idx, value, result)) = graph
             .blocks
@@ -2318,8 +2577,11 @@ pub(in crate::front::mir) fn collect_fmt_collapse_multi(
     }
 
     // Each args-array element traces back to a `new_display` ctor; record it
-    // for the in-place `→ str` rewrite.
+    // for the in-place `→ str` rewrite.  A call-scoped residual `&T` spill
+    // around the FieldRead is peeled so `str` reads the interpolant and the
+    // now-dead cell is deleted with the chain.
     let mut new_display_ops = Vec::with_capacity(arg_elem_vars.len());
+    let mut spill_dead = Vec::new();
     for elem in &arg_elem_vars {
         let (b_i, idx_i) = resolve_to_producer_op(graph, elem)?;
         let blk = graph.blocks.iter().find(|b| b.id == b_i)?;
@@ -2333,11 +2595,17 @@ pub(in crate::front::mir) fn collect_fmt_collapse_multi(
             }
             _ => return None,
         };
+        let (inner, extra) = match peel_call_scoped_fmt_arg_spill(graph, &inner) {
+            Some(pair) => pair,
+            None => (inner, Vec::new()),
+        };
+        spill_dead.extend(extra);
         new_display_ops.push((b_i, idx_i, inner));
     }
 
     let mut dead_results = vec![arguments_var, pieces_var.id(), args_var.id()];
     dead_results.extend(piece_byte_vars.iter().map(|v| v.id()));
+    dead_results.extend(spill_dead);
     let mut dead_bases = vec![pieces_var.id(), args_var.id()];
 
     // Also delete the `format_args!` argument-Tuple round-trip when the shape
@@ -2506,21 +2774,7 @@ pub(in crate::front::mir) fn collapse_fmt_chains_multi(graph: &mut FunctionGraph
         .iter()
         .flat_map(|s| s.dead_bases.iter().copied())
         .collect();
-    for block in &mut graph.blocks {
-        block.operations.retain(|op| {
-            if let Some(r) = &op.result
-                && dead_results.contains(&r.id())
-            {
-                return false;
-            }
-            if let OpKind::FieldWrite { base, .. } = &op.kind
-                && dead_bases.contains(&base.id())
-            {
-                return false;
-            }
-            true
-        });
-    }
+    retain_live_fmt_chain_ops(graph, &dead_results, &dead_bases);
     sites.len()
 }
 
@@ -2745,21 +2999,7 @@ pub(in crate::front::mir) fn collapse_debug_enum_fmt_chains(
         .iter()
         .flat_map(|s| s.dead_bases.iter().copied())
         .collect();
-    for block in &mut graph.blocks {
-        block.operations.retain(|op| {
-            if let Some(r) = &op.result
-                && dead_results.contains(&r.id())
-            {
-                return false;
-            }
-            if let OpKind::FieldWrite { base, .. } = &op.kind
-                && dead_bases.contains(&base.id())
-            {
-                return false;
-            }
-            true
-        });
-    }
+    retain_live_fmt_chain_ops(graph, &dead_results, &dead_bases);
     // 3. Replace each `alloc::fmt::format` op with the discriminant switch of
     //    per-variant constant messages.
     let mut lowered = 0;

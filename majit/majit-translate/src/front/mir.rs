@@ -35,9 +35,11 @@
 //!   - `Assign(Local, Rvalue)` — primary lowering site.
 //!   - `Assign(Projection(.., Field|Deref|Index), ...)` — emits a
 //!     side-effectful `FieldWrite` / `ArrayWrite` / `__deref_write`.
-//!   - `StorageLive` / `PlaceMention` — skipped. `StorageDead` of a
-//!     window local emits `objectmodel.keepalive_until_here`
-//!     (`rtype_keepalive_until_here`).
+//!   - `StorageLive` / `StorageDead` — honoured for address-taken
+//!     primitive scalar locals that live in a scoped Char-varsize cell
+//!     (`scoped_alloc`). `StorageDead` of a window local emits
+//!     `objectmodel.keepalive_until_here` (`rtype_keepalive_until_here`).
+//!     Other locals still skip them. `PlaceMention` — skipped.
 //!   - `Assert` — stripped (overflow asserts collapse into success
 //!     edge; see the `TermKind::Assert` lowering note below).
 //!
@@ -53,17 +55,22 @@
 //!     (`neg`, `invert`, `cast_int_to_float`, …) per `binop_label` /
 //!     `unary_op_label`.
 //!   - `Ref` / `RawPtr` — same-Variable alias (JIT does not model
-//!     lifetimes). A call that passes that alias into a raw
-//!     scalar-pointer parameter materializes an address first
-//!     (`RawMalloc` / `RawStore`): `history.py` `getkind` of a raw
-//!     `Ptr` is the address, not the pointee word. Aliases of one
-//!     place share that address. A mutable parameter writes the word
-//!     back into the place, including a field or element projection.
-//!     The spill is freed at the call. A result that carries a pointer
-//!     or a reference is not lowered: the result itself, a payload, a
-//!     field, or an opaque body whose layout is not zero-sized. A generic
-//!     argument counts when a field stores it. That address would outlive
-//!     the free.
+//!     lifetimes), except an address-taken primitive local whose
+//!     address is passed as a raw scalar pointer: that local lives in
+//!     one Char-varsize cell for its storage scope (`scoped_alloc` /
+//!     `OS_RAW_MALLOC_VARSIZE_CHAR`). Reads are `raw_load`, writes
+//!     `raw_store`, and the address is the cell pointer. A residual
+//!     `&T` of a parameter or field uses one extra Char-varsize cell
+//!     for the enclosing function, freed on every modeled exit. A raw
+//!     `*const T` of a parameter or projection still materializes a
+//!     per-call `Tuple<i64>` spill. The local cell is freed at
+//!     `StorageDead` and at each modeled scope exit. A result that
+//!     carries a pointer or a reference is
+//!     not lowered: the result itself, a payload, a field, or an
+//!     opaque body whose layout is not zero-sized. A generic argument
+//!     counts when a field stores it. That address would outlive the
+//!     free. An uninspectable callee is not itself a refusal: the cell
+//!     outlives the call.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -1771,6 +1778,12 @@ pub(crate) struct CrateLoweringState {
     /// GC-schema path uses (leaf and crate-stripped path).
     immutable_fields: ImmutableFieldsTable,
     dont_look_inside: std::collections::HashSet<String>,
+    /// Harvested `oopspec:jit.*` paths from `func_hints` (the
+    /// whole-program union when the provider filled that map). Residual
+    /// `&Scalar` spills skip those callees: jtransform rewrites them to
+    /// a box query (`jit.isconstant`) instead of the rustc pointer ABI.
+    /// `ordereddict.lookup` still residual-executes the rustc trampoline.
+    oopspec_fns: std::collections::HashSet<String>,
     elidable_residual: std::collections::HashSet<String>,
     not_rpython: std::collections::HashSet<String>,
     /// The `func._jit_*_` / `_elidable_function_` attributes of every
@@ -2010,6 +2023,16 @@ impl CrateLoweringState {
         } else {
             func_hints
         };
+        let oopspec_fns = func_hints
+            .iter()
+            .filter(|(_, hints)| {
+                hints.iter().any(|hint| {
+                    hint.strip_prefix("oopspec:")
+                        .is_some_and(|spec| spec.starts_with("jit."))
+                })
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
         for fd in llbc.iter_local_fns() {
             note_body_crate_root_into(fd, &mut struct_fields);
         }
@@ -2030,6 +2053,7 @@ impl CrateLoweringState {
             exception_class_hints,
             immutable_fields,
             dont_look_inside,
+            oopspec_fns,
             elidable_residual,
             not_rpython,
             func_hints,
@@ -2385,6 +2409,7 @@ impl<'l> CrateLowering<'l> {
             immutable_fields,
             raw_alloc_flavor_structs,
             dont_look_inside,
+            oopspec_fns,
             spec,
             ..
         } = self.state;
@@ -2423,6 +2448,7 @@ impl<'l> CrateLowering<'l> {
             struct_field_attrs,
             struct_fields,
             dont_look_inside,
+            oopspec_fns,
             tombstoned_leaves,
             gc_struct_ids,
             immutable_fields,
@@ -2626,6 +2652,7 @@ impl<'l> CrateLowering<'l> {
             immutable_fields,
             raw_alloc_flavor_structs,
             dont_look_inside,
+            oopspec_fns,
             spec: spec_queue,
             skipped,
             ..
@@ -2652,6 +2679,7 @@ impl<'l> CrateLowering<'l> {
             struct_field_attrs,
             struct_fields,
             dont_look_inside,
+            oopspec_fns,
             tombstoned_leaves,
             gc_struct_ids,
             immutable_fields,
@@ -6388,6 +6416,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         struct_field_attrs,
         struct_fields,
         dont_look_inside,
+        &std::collections::HashSet::new(),
         tombstoned_leaves,
         gc_struct_ids,
         immutable_fields,
@@ -6759,6 +6788,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     struct_fields: &crate::front::semantic::StructFieldRegistry,
     dont_look_inside: &std::collections::HashSet<String>,
+    program_oopspec: &std::collections::HashSet<String>,
     tombstoned_leaves: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
     immutable_fields: &ImmutableFieldsTable,
@@ -7047,10 +7077,27 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 .into_iter()
                 .partition(|site| site.kind == DiscCombinator::OptionOkOrElse);
         let option_ok_or_else_disc = !option_ok_or_else_sites.is_empty();
-        if !option_ok_or_else_sites.is_empty() {
+        // Try-sites already consumed `ok_or_else()?`. Rebuild the remaining
+        // tail-return `Ok`/`Err` shells with `__pos_0` before
+        // `classify_slot_value` walks a merged continue
+        // (`exceptiontransform.py` `transform_completely`). A sibling
+        // Result tail-forward (`simplequeue_wait_and_pop`, `dir1`) joins
+        // the same returnblock; classifying the residual combinator Call
+        // there panics. Only `checked_*(..).ok_or_else` with a signed Int
+        // Ok payload stays residual for `rewire_checked_arith_ok_or_else`
+        // (`checked_arith.rs`); a closure `ok_or_else` that is merely
+        // recorded for type ownership is not that shape.
+        let (late_option_ok_or_else, early_option_ok_or_else): (Vec<_>, Vec<_>) =
+            option_ok_or_else_sites.into_iter().partition(|site| {
+                lo.checked_arith_ok_or_else_sites.iter().any(|checked| {
+                    checked.result_var == site.result_var
+                        && checked.ok_payload_ty == crate::model::ValueType::Int
+                })
+            });
+        if !early_option_ok_or_else.is_empty() {
             rewire_disc_combinator_sites(
                 &mut lo.graph,
-                &option_ok_or_else_sites,
+                &early_option_ok_or_else,
                 static_addrs.error_carrier,
             );
         }
@@ -7438,6 +7485,13 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 static_addrs.error_carrier,
             );
         }
+        if !late_option_ok_or_else.is_empty() {
+            rewire_disc_combinator_sites(
+                &mut lo.graph,
+                &late_option_ok_or_else,
+                static_addrs.error_carrier,
+            );
+        }
         // `OptionOkOrElse` rebuilds `Result::Ok` / `Result::Err` after the
         // callee rule above.  A scoped graph whose return was that
         // `ok_or_else` pair therefore had nothing for the callee rule to
@@ -7621,7 +7675,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     // the monotonic one — unless `MAJIT_MIR_FRAMESTATE_STRICT` is set,
     // which propagates the error for debugging.
     if framestate_enabled() {
-        let mut lo = Lowering::new(
+        let mut lo = Lowering::new_with_program_oopspec(
             llbc,
             name.clone(),
             u,
@@ -7637,6 +7691,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             root_stack,
             self_dont_look_inside,
             keep_zst_self,
+            program_oopspec,
         )?;
         lo.struct_fields = Some(struct_fields);
         lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -7680,7 +7735,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             }
         }
     }
-    let mut lo = Lowering::new(
+    let mut lo = Lowering::new_with_program_oopspec(
         llbc,
         name.clone(),
         u,
@@ -7696,6 +7751,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         root_stack,
         self_dont_look_inside,
         keep_zst_self,
+        program_oopspec,
     )?;
     lo.struct_fields = Some(struct_fields);
     lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -7725,7 +7781,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // inputargs), which is order-independent.  RPO only resolves the
         // acyclic forward-reference case above.
         Err(LowerError::Unsupported(msg)) if is_known_lowering_gap(&msg) => {
-            let mut lo = Lowering::new(
+            let mut lo = Lowering::new_with_program_oopspec(
                 llbc,
                 name,
                 u,
@@ -7741,6 +7797,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 root_stack,
                 self_dont_look_inside,
                 keep_zst_self,
+                program_oopspec,
             )?;
             lo.struct_fields = Some(struct_fields);
             lo.raw_alloc_flavor_structs = raw_alloc_flavor_structs.clone();
@@ -7951,7 +8008,7 @@ fn terminator_is_panic_abort(llbc: &Llbc, body: &Unstructured, bb: u64) -> bool 
 /// A normal successor may be a cleanup block:
 /// `kept_block_normal_successor_is_cleanup` is why `strip_cleanup_blocks`
 /// left those bodies unchanged.
-fn successor_blocks(
+pub(in crate::front::mir) fn successor_blocks(
     llbc: &Llbc,
     body: &Unstructured,
     mir_bb: usize,

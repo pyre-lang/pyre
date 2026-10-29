@@ -1228,6 +1228,17 @@ fn real_main() {
                     "eval",
                     "store_global_value_w",
                 ]),
+                // `_send_ex` finished-arm `frame_is_finished` (`generator.py`).
+                // The walker descends this body by path
+                // (`walk_send_ex_finished_tail`). Production callers are
+                // `dont_look_inside` (`genentry_raise_returned`) or residual,
+                // so the portal closure never names it. Upstream looks
+                // inside the method (no `@dont_look_inside`).
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "generator_frame_is_finished",
+                ]),
             ],
             // `support.py` `builtin_func_for_spec` / `inline_calls_to`
             // look the helper up under the single-segment impl name.

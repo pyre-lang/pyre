@@ -7013,6 +7013,15 @@ impl<'a> Transformer<'a> {
             }
             _ => unreachable!("rewrite_op_raw_malloc"),
         };
+        // Without a `CallControl` there is no calldescr to build; the op
+        // stays `RawMalloc`, as `rewrite_op_direct_call` leaves a plain
+        // `Call` when tests pass `callcontrol is None` (`jtransform.py`
+        // `get_vinfo`: `if self.callcontrol is None: return None  # for tests`).
+        // Varsizes (`Array(Char)` scoped cells) would otherwise unwrap in
+        // `_handle_oopspec_call`.
+        if self.callcontrol.is_none() {
+            return RewriteResult::Keep;
+        }
         if let Some(n) = length {
             return self._rewrite_raw_malloc_varsize(
                 op,
@@ -7248,6 +7257,11 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
         ptr: crate::flowspace::model::Variable,
     ) -> RewriteResult {
+        // Same test skip as `rewrite_op_raw_malloc`: `OS_RAW_FREE` needs a
+        // calldescr, and `getcalldescr` is behind `CallControl`.
+        if self.callcontrol.is_none() {
+            return RewriteResult::Keep;
+        }
         let target = CallTarget::function_path(["majit_rlib", "rffi", "ll_raw_free"]);
         let call = SpaceOperation {
             result: None,
