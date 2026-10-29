@@ -1791,61 +1791,56 @@ impl Optimizer {
         // (`unroll.rs`'s
         // `optimize_trace_with_constants_and_inputs_vable_out`) catches
         // and reroutes instead of crashing the worker thread.
-        let (preview_label_args, preview_virtuals, preview_label_source_positions) =
-            match preview_virtual_state
-                .make_inputargs_and_virtuals_with_source_positions(vs_args, self, ctx, false)
-            {
-                Ok(pair) => {
-                    let (label_boxes, virtuals, positions) = pair;
-                    (
-                        label_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
-                        virtuals,
-                        positions,
-                    )
-                }
-                Err(_) => {
-                    // unroll.py:193,207-210: on the BRIDGE path the
-                    // short-preamble/export preview does not exist — VS
-                    // matching is deferred to `jump_to_existing_trace`,
-                    // which catches `VirtualStatesCantMatch` and falls back
-                    // to `jump_to_preamble`. Do not surface the preview
-                    // mismatch as a fatal InvalidLoop; leave
-                    // exported_loop_state = None (the flush + force above
-                    // already committed the bridge's heap writebacks into
-                    // `ctx.new_operations`) and let `optimize_bridge`'s own
-                    // ladder route the bridge to the always-matching
-                    // preamble target (unroll.py:238-242). Only the
-                    // loop/peeled-loop path (optimize_peeled_loop
-                    // unroll.py:135-145) keeps this fatal.
-                    //
-                    // Neither arm is reachable today: the preview exports
-                    // its state from `post_force_args` and re-matches that
-                    // same list, so every `state[i]` was derived from
-                    // `args[i]` and the walk is self-consistent. Probed
-                    // with five virtual-carrying fixtures (escaping tuple,
-                    // escaping instance, aliased list, varying-length
-                    // array, nested virtual), two of which do compile
-                    // bridges — zero hits, as with pyre/bench and
-                    // pyre/extra_tests. Upstream matches
-                    // against a *different* loop's stored state in
-                    // `jump_to_existing_trace` (unroll.py);
-                    // `export_state_re_matched_against_its_own_args_cannot_fail`
-                    // (virtualstate.rs) pins the self-match, so moving the
-                    // preview to the upstream shape breaks that test and
-                    // flags this branch as newly live.
-                    if ctx.building_bridge {
-                        if crate::bridge_debug_enabled() {
-                            eprintln!(
-                                "[bridgeB] preview virtual-state mismatch — leaving the export empty for the jump_to_existing_trace ladder"
-                            );
-                        }
-                        return Ok(());
+        let (preview_label_args, preview_virtuals) = match preview_virtual_state
+            .make_inputargs_and_virtuals(vs_args, self, ctx, false)
+        {
+            Ok((label_boxes, virtuals)) => (
+                label_boxes.iter().map(|b| b.to_opref()).collect::<Vec<_>>(),
+                virtuals,
+            ),
+            Err(_) => {
+                // unroll.py UnrollOptimizer.optimize_bridge: on the BRIDGE path the
+                // short-preamble/export preview does not exist — VS
+                // matching is deferred to `jump_to_existing_trace`,
+                // which catches `VirtualStatesCantMatch` and falls back
+                // to `jump_to_preamble`. Do not surface the preview
+                // mismatch as a fatal InvalidLoop; leave
+                // exported_loop_state = None (the flush + force above
+                // already committed the bridge's heap writebacks into
+                // `ctx.new_operations`) and let `optimize_bridge`'s own
+                // ladder route the bridge to the always-matching
+                // preamble target (unroll.py UnrollOptimizer.jump_to_preamble). Only the
+                // loop/peeled-loop path (`unroll.py UnrollOptimizer.optimize_peeled_loop`)
+                // keeps this fatal.
+                //
+                // Neither arm is reachable today: the preview exports
+                // its state from `post_force_args` and re-matches that
+                // same list, so every `state[i]` was derived from
+                // `args[i]` and the walk is self-consistent. Probed
+                // with five virtual-carrying fixtures (escaping tuple,
+                // escaping instance, aliased list, varying-length
+                // array, nested virtual), two of which do compile
+                // bridges — zero hits, as with pyre/bench and
+                // pyre/extra_tests. Upstream matches
+                // against a *different* loop's stored state in
+                // `jump_to_existing_trace` (unroll.py);
+                // `export_state_re_matched_against_its_own_args_cannot_fail`
+                // (virtualstate.rs) pins the self-match, so moving the
+                // preview to the upstream shape breaks that test and
+                // flags this branch as newly live.
+                if ctx.building_bridge {
+                    if crate::bridge_debug_enabled() {
+                        eprintln!(
+                            "[bridgeB] preview virtual-state mismatch — leaving the export empty for the jump_to_existing_trace ladder"
+                        );
                     }
-                    return Err(crate::optimize::InvalidLoop(
-                        "preview virtual state mismatch (VirtualStatesCantMatch)",
-                    ));
+                    return Ok(());
                 }
-            };
+                return Err(crate::optimize::InvalidLoop(
+                    "preview virtual state mismatch (VirtualStatesCantMatch)",
+                ));
+            }
+        };
         let mut preview_short_args = preview_label_args.clone();
         preview_short_args.extend_from_slice(&preview_virtuals);
         let mut short_boxes =
@@ -1902,7 +1897,6 @@ impl Optimizer {
             preview_virtual_state.clone(),
             preview_label_args.clone(),
             preview_virtuals.clone(),
-            preview_label_source_positions,
             preview_end_arg_boxes,
         ));
         // Single-object carry: each exported entry keeps the preview

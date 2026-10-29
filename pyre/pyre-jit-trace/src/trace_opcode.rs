@@ -2247,10 +2247,10 @@ impl MIFrame {
         //
         // For bridge traces, ctx.inputarg_types() returns the bridge's
         // guard fail_arg types, NOT the root loop's label types. The JUMP
-        // targets the root loop label, so resolve the root loop's LABEL/
-        // inputargs types via `front_target_inputarg_types` (peeled-entry
-        // LABEL when unrolled, root TreeLoop.inputargs otherwise — see
-        // `MetaInterp::front_target_inputarg_types` doc).
+        // targets the root loop label, so resolve JUMP-target types via
+        // `front_target_inputarg_types` (the body LABEL among `root_trace.ops`,
+        // else `root_trace.inputargs` — not the `execute_token` reds
+        // signature; see `MetaInterp::front_target_inputarg_types`).
         //
         // A close reached through the walk targets the merge point that matched
         // (`original_boxes`, pyjitpl.py), whichever kind of trace is

@@ -4088,14 +4088,11 @@ fn rewrite_body(
                                         &#state,
                                         #env,
                                     );
-                                    #driver.arm_single_pass_label_entry_on_next_back_edge(
-                                        &#state,
-                                    );
-                                    // RPython pyjitpl.py raise_if_successful ->
-                                    // 3072-3091 parity: a successful translated
-                                    // CloseLoop raises ContinueRunningNormally,
-                                    // returning to the interpreter. The compiled
-                                    // loop is entered later via can_enter_jit /
+                                    // pyjitpl.py raise_if_successful: a
+                                    // successful translated CloseLoop raises
+                                    // ContinueRunningNormally, returning to
+                                    // the interpreter. The compiled loop is
+                                    // entered later via can_enter_jit /
                                     // warmstate, not by immediate direct entry.
                                     #driver.discard_single_pass_resume();
                                     // `warmspot.py ll_portal_runner` re-enters

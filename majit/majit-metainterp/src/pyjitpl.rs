@@ -2304,12 +2304,6 @@ pub(crate) struct CompiledEntry<M> {
     /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
     /// in `compile_bridge` below).
     pub(crate) next_global_opref: u32,
-    /// Host-entry TargetToken chosen once when the loop is assembled
-    /// (`compile.py` `jitcell_token.target_tokens = [start_descr]`;
-    /// `warmstate.py` `execute_assembler` enters that procedure). A later
-    /// retrace may append to `JitCellToken.target_tokens`; those labels
-    /// live in the bridge and must not become the front door.
-    pub(crate) front_target: Option<std::sync::Arc<crate::history::TargetToken>>,
 }
 
 impl<M> CompiledEntry<M> {
@@ -2670,19 +2664,6 @@ pub struct MetaInterp<M: Clone> {
     /// `blackhole.py convert_and_run_from_pyjitpl` off the stash.  `None`
     /// unless a walk aborted with the conversion enabled.
     pub(crate) pending_abort_blackhole: Option<crate::PendingAbortBlackhole>,
-    /// Single-pass tracing: concrete values for a direct TargetToken LABEL
-    /// entry, in that LABEL's compact argument order.  RPython's backend records
-    /// `TargetToken._x86_arglocs` in `regalloc.py:consider_label` and
-    /// `consider_jump` remaps every JUMP arg into those target locations before
-    /// `assembler.py:closing_jump`; Cranelift's host-side LABEL dispatch must
-    /// receive the same compact per-LABEL vector, not the root-loop inputarg
-    /// vector.
-    pub(crate) single_pass_compact_label_values: Option<(u64, Vec<Value>)>,
-    /// Single-pass tracing: full walk-final `raise_continue_running_normally`
-    /// values in root inputarg order.  Consumed during `compile_loop_body` only
-    /// to resolve `InputArg*` entries in a compact LABEL contract; op-result
-    /// LABEL args still read their concrete value from the recorded Box object.
-    pub(crate) single_pass_full_live_values: Option<Vec<Value>>,
     /// Single-pass tracing: the green key the CloseLoop arm compiled the
     /// (cross-loop-cut) inner loop under, captured after a `Compiled`
     /// outcome so the merge-point hook can publish a CRN/lazy back-edge
@@ -4575,8 +4556,6 @@ impl<M: Clone> MetaInterp<M> {
             single_pass_ref_scalar_values: None,
             single_pass_virt_array_values: None,
             pending_abort_blackhole: None,
-            single_pass_compact_label_values: None,
-            single_pass_full_live_values: None,
             single_pass_compiled_key: None,
             next_trace_id: 1,
             jitlog_trace_id: 0,
@@ -8770,8 +8749,6 @@ impl<M: Clone> MetaInterp<M> {
         );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
-        self.single_pass_compact_label_values = None;
-        let single_pass_full_live_values = self.single_pass_full_live_values.take();
         // pyjitpl.py:2995 `assert len(self.virtualref_boxes) == 0,
         // "missing virtual_ref_finish()?"` — every `opimpl_virtual_ref`
         // must have a matching `opimpl_virtual_ref_finish` before the
@@ -10019,48 +9996,6 @@ impl<M: Clone> MetaInterp<M> {
             target_token.set_original_jitcell_token(&token);
             token.record_target_token(target_token.as_jump_target_descr());
         }
-        // Host LABEL selection is first `!is_preamble_target`, else the first,
-        // among tokens whose LABEL this body emitted (`front_entry_index_for`
-        // over that filtered list). A later retrace appends to
-        // `JitCellToken.target_tokens` (`unroll.py` `finalize_short_preamble`);
-        // those labels live in the bridge, so they must not become the front
-        // door. Hang the compact LABEL source-position map on the selected
-        // TargetToken's attrs (`history.py TargetToken._ll_loop_code`;
-        // `warmstate.py execute_assembler`). Cranelift key 0 is the peeled
-        // preamble; the specialized entry is `label_block_id + 1`.
-        // Store the chosen token on the compiled-loop record so host entry
-        // reads it directly (`warmstate.py execute_assembler` enters the
-        // already published procedure).
-        let selected_front_target =
-            Self::selected_front_target_among(&front_target_tokens, &compiled_ops);
-        if !retried_without_unroll {
-            if let Some(target) = selected_front_target.as_ref() {
-                target.attrs().label_source_positions =
-                    unroll_opt.final_exported_label_source_positions.clone();
-            }
-        }
-        // RPython backend contract: `consider_label` records the compact
-        // TargetToken argument locations, and `consider_jump` feeds each JUMP
-        // arg into the corresponding location.  The Cranelift host direct-entry
-        // path bypasses that in-code closing jump, so stash the same compact
-        // LABEL-ordered concrete values for `execute_token_with_dispatch_key`.
-        self.single_pass_compact_label_values = Self::compact_label_values_for_selected_target(
-            green_key,
-            &front_target_tokens,
-            &compiled_ops,
-            &trace,
-            single_pass_full_live_values.as_deref(),
-        );
-        if crate::callee_rca_enabled() {
-            eprintln!(
-                "[callee-rca][direct-entry-capture] key={green_key} compact_len={:?} \
-                 full_len={:?}",
-                self.single_pass_compact_label_values
-                    .as_ref()
-                    .map(|(_, values)| values.len()),
-                single_pass_full_live_values.as_ref().map(Vec::len),
-            );
-        }
 
         // compile.py send_loop_to_backend — unconditional virtualizable
         // field reload for every loop. Mirrors the FINISH-path call in
@@ -10256,24 +10191,6 @@ impl<M: Clone> MetaInterp<M> {
                         &format!("compiled_loops.insert green_key={green_key}"),
                     );
                 }
-                let front_entry_index = Self::front_entry_index_for(&front_target_tokens);
-                if crate::jitdriver::spdiag_enabled() {
-                    let shape: Vec<String> = front_target_tokens
-                        .iter()
-                        .map(|target| {
-                            format!(
-                                "{}{}",
-                                if target.is_preamble_target { "P" } else { "S" },
-                                target.attrs().virtual_state.is_some() as u8,
-                            )
-                        })
-                        .collect();
-                    eprintln!(
-                        "@@@SPDIAG compiled_loops.insert green_key={green_key} \
-                         tokens=[{}] front_entry_index={front_entry_index:?}",
-                        shape.join(","),
-                    );
-                }
                 token.set_retraced_count(unroll_opt.retraced_count);
                 // `compile.py compile_loop` /
                 // `ResumeFromInterpDescr.compile_and_attach` file the cell
@@ -10296,7 +10213,6 @@ impl<M: Clone> MetaInterp<M> {
                         // TraceIterator (opencoder.py); pyre flat u32
                         // OpRefs need this explicit baseline.
                         next_global_opref,
-                        front_target: selected_front_target,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -11816,9 +11732,7 @@ impl<M: Clone> MetaInterp<M> {
                 // not by republishing its labels as this token's entry.
                 // `compile_retrace` installs a trace that ends in a JUMP to
                 // the previous `TargetToken`; it does not re-emit that
-                // LABEL. No new label: the fresh token's `target_tokens`
-                // holds nothing, so host selection finds no LABEL and
-                // `label_source_positions` stays None.
+                // LABEL.
                 token.set_retraced_count(unroll_opt.retraced_count);
                 self.insert_compiled_loop_on_driver(
                     compiling_jd,
@@ -11833,7 +11747,6 @@ impl<M: Clone> MetaInterp<M> {
                         // Box identity: Phase 2's final OpRef high-water, as at
                         // the main compile site.
                         next_global_opref,
-                        front_target: None,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -12937,7 +12850,6 @@ impl<M: Clone> MetaInterp<M> {
                             traces,
                             previous_tokens,
                             next_global_opref,
-                            front_target: None,
                         },
                     );
                     self.remember_compiled_graph_write();
@@ -13261,7 +13173,6 @@ impl<M: Clone> MetaInterp<M> {
         // `compile.py jitcell_token.target_tokens = [target_token]` —
         // mirror onto JCT for `has_compiled_targets` (`pyjitpl.py`).
         token.record_target_token(target_token.as_jump_target_descr());
-        let selected_front_target = Some(std::sync::Arc::clone(&target_token));
         let mut compiled_ops = optimized_ops.clone();
         if let Some(jump_op) = compiled_ops.last().filter(|op| op.opcode == OpCode::Jump) {
             jump_op.setdescr(target_token.as_jump_target_descr());
@@ -13418,7 +13329,6 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref,
-                        front_target: selected_front_target,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -13813,106 +13723,6 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_artifact_token = None;
     }
 
-    /// Cranelift direct body-entry selector for the first compiled loop LABEL.
-    ///
-    /// PyPy x86 stores each TargetToken's machine-code LABEL address in
-    /// `_ll_loop_code`. Cranelift exposes one function entry instead, so the
-    /// LABEL address is represented as `label_block_id + 1`; key 0 remains the
-    /// peeled preamble host entry.
-    pub fn front_target_dispatch_key(&self, green_key: u64) -> Option<u32> {
-        self.front_target_dispatch_key_on_driver(self.active_jitdriver_sd.unwrap_or(0), green_key)
-    }
-
-    pub fn front_target_dispatch_key_on_driver(&self, jd_no: usize, green_key: u64) -> Option<u32> {
-        let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
-        let target = Self::selected_front_target_token(compiled)?;
-        let target_descr = target.as_jump_target_descr();
-        target_descr
-            .as_loop_target_descr()
-            .map(|target| target.label_block_id() + 1)
-    }
-
-    pub fn pack_front_target_live_values(
-        &self,
-        green_key: u64,
-        full_live_values: &[Value],
-    ) -> Option<Vec<Value>> {
-        self.pack_front_target_live_values_on_driver(
-            self.active_jitdriver_sd.unwrap_or(0),
-            green_key,
-            full_live_values,
-        )
-    }
-
-    pub fn pack_front_target_live_values_on_driver(
-        &self,
-        jd_no: usize,
-        green_key: u64,
-        full_live_values: &[Value],
-    ) -> Option<Vec<Value>> {
-        let types = self.front_target_inputarg_types_on_driver(jd_no, green_key)?;
-        let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
-        let target = Self::selected_front_target_token(compiled)?;
-        let attrs = target.attrs();
-        let source_positions = match attrs.label_source_positions.as_ref() {
-            Some(positions) => positions,
-            None => {
-                if crate::callee_rca_enabled() {
-                    eprintln!(
-                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
-                         missing_source_positions"
-                    );
-                }
-                return None;
-            }
-        };
-        let expected = types.len();
-        if source_positions.len() != expected {
-            if crate::callee_rca_enabled() {
-                eprintln!(
-                    "[callee-rca][direct-entry-pack-detail] key={green_key} \
-                     source_len={} label_len={expected} sources={:?}",
-                    source_positions.len(),
-                    source_positions,
-                );
-            }
-            return None;
-        }
-        let mut packed = Vec::with_capacity(source_positions.len());
-        for (slot, &source) in source_positions.iter().enumerate() {
-            let Some(value) = full_live_values.get(source).copied() else {
-                if crate::callee_rca_enabled() {
-                    eprintln!(
-                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
-                         source_oob={source} full_len={} sources={:?}",
-                        full_live_values.len(),
-                        source_positions,
-                    );
-                }
-                return None;
-            };
-            // The LABEL declares each argument's type, and compiled code reads a
-            // Ref slot as a pointer without checking it. A mapping that lands an
-            // Int in a Ref slot dereferences the integer, so a type disagreement
-            // is refused here rather than executed.
-            if value.get_type() != types[slot] {
-                if crate::callee_rca_enabled() {
-                    eprintln!(
-                        "[callee-rca][direct-entry-pack-detail] key={green_key} \
-                         slot={slot} source={source} value_type={:?} label_type={:?} \
-                         sources={:?}",
-                        value.get_type(),
-                        types[slot],
-                        source_positions,
-                    );
-                }
-                return None;
-            }
-            packed.push(value);
-        }
-        Some(packed)
-    }
-
     /// Whether the loop's own closing JUMP fills a slot the LABEL declares as
     /// a box with a constant, which makes the LABEL a specialized entry.
     ///
@@ -13945,110 +13755,6 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .zip(label_args.iter())
             .any(|(jump_arg, label_arg)| jump_arg.is_constant() && !label_arg.is_constant())
-    }
-
-    fn front_entry_index_for(
-        tokens: &[std::sync::Arc<crate::history::TargetToken>],
-    ) -> Option<usize> {
-        tokens
-            .iter()
-            .position(|target| !target.is_preamble_target)
-            .or(if tokens.is_empty() { None } else { Some(0) })
-    }
-
-    /// Tokens whose LABEL is a `Label` op in `ops` carrying this
-    /// TargetToken object (`x86/assembler.py fixup_target_tokens` walks
-    /// per TargetToken). Index equality is not identity: a retrace token
-    /// can share `Descr::index` with the root preamble.
-    fn target_tokens_with_label_in(
-        tokens: &[std::sync::Arc<crate::history::TargetToken>],
-        ops: &[majit_ir::OpRc],
-    ) -> Vec<std::sync::Arc<crate::history::TargetToken>> {
-        tokens
-            .iter()
-            .filter(|target| {
-                let target_descr = target.as_jump_target_descr();
-                ops.iter().any(|op| {
-                    op.opcode == OpCode::Label
-                        && op.getdescr().is_some_and(|descr| {
-                            majit_ir::descr_identity(&descr)
-                                == majit_ir::descr_identity(&target_descr)
-                        })
-                })
-            })
-            .cloned()
-            .collect()
-    }
-
-    fn selected_front_target_among(
-        tokens: &[std::sync::Arc<crate::history::TargetToken>],
-        ops: &[majit_ir::OpRc],
-    ) -> Option<std::sync::Arc<crate::history::TargetToken>> {
-        let rooted = Self::target_tokens_with_label_in(tokens, ops);
-        rooted.get(Self::front_entry_index_for(&rooted)?).cloned()
-    }
-
-    fn selected_front_target_token(
-        compiled: &CompiledEntry<M>,
-    ) -> Option<&std::sync::Arc<crate::history::TargetToken>> {
-        compiled.front_target.as_ref()
-    }
-
-    fn compact_label_values_for_selected_target(
-        green_key: u64,
-        front_target_tokens: &[std::sync::Arc<crate::history::TargetToken>],
-        compiled_ops: &[majit_ir::OpRc],
-        trace: &TreeLoop,
-        full_live_values: Option<&[Value]>,
-    ) -> Option<(u64, Vec<Value>)> {
-        let front_target = Self::selected_front_target_among(front_target_tokens, compiled_ops)?;
-        let target_descr = front_target.as_jump_target_descr();
-        let label = compiled_ops.iter().find(|op| {
-            op.opcode == OpCode::Label
-                && op.getdescr().is_some_and(|descr| {
-                    majit_ir::descr_identity(&descr) == majit_ir::descr_identity(&target_descr)
-                })
-        })?;
-        let mut values = Vec::with_capacity(label.num_args());
-        for arg in label.getarglist() {
-            let opref = arg.to_opref();
-            let value = opref
-                .inline_const_to_value()
-                .or_else(|| Self::full_live_value_for_inputarg(opref, full_live_values))
-                .or_else(|| Self::compiled_ops_concrete_at(compiled_ops, opref.raw()))
-                .or_else(|| Self::trace_concrete_at(trace, opref.raw()))?;
-            values.push(value);
-        }
-        Some((green_key, values))
-    }
-
-    fn full_live_value_for_inputarg(
-        opref: OpRef,
-        full_live_values: Option<&[Value]>,
-    ) -> Option<Value> {
-        match opref {
-            OpRef::InputArgInt(index) | OpRef::InputArgFloat(index) | OpRef::InputArgRef(index) => {
-                full_live_values.and_then(|values| values.get(index as usize).copied())
-            }
-            _ => None,
-        }
-    }
-
-    fn trace_concrete_at(trace: &TreeLoop, raw: u32) -> Option<Value> {
-        let pos = raw as usize;
-        let n = trace.inputargs.len();
-        if pos < n {
-            trace.inputargs[pos].get_value()
-        } else {
-            trace.ops.get(pos - n).and_then(|op| op.get_value())
-        }
-    }
-
-    fn compiled_ops_concrete_at(compiled_ops: &[majit_ir::OpRc], raw: u32) -> Option<Value> {
-        compiled_ops
-            .iter()
-            .find(|op| op.pos().get().raw() == raw)
-            .and_then(|op| op.get_value())
     }
 
     /// warmstate.py `cell.flags |= JC_TRACING ... try ... finally:
@@ -15330,21 +15036,16 @@ impl<M: Clone> MetaInterp<M> {
         self.get_loop_token_on_driver(0, green_key)
     }
 
-    /// Recover the actual front-target LABEL contract for bridge closes.
+    /// Types of a JUMP into the root loop's body LABEL.
     ///
-    /// RPython bridge closes target the peeled loop entry token recorded in
-    /// `jitcell_token.target_tokens[0]`, not the red-only `JitCellToken`
-    /// entry signature. In majit the equivalent LABEL args live in the root
-    /// trace's saved ops, so rebuild their types from that trace.
+    /// `warmstate.py execute_assembler` / `cpu.execute_token` enter at the
+    /// procedure start (dispatch key 0, jitdriver reds). This helper types a
+    /// compiled JUMP into the body LABEL, not that `execute_token` signature
+    /// (`JitCellToken.inputarg_types`).
     ///
-    /// Two parity paths cover every JUMP target:
-    /// 1. Peeled (unrolled) loops — `target_tokens.first()` names the
-    ///    peeled-entry `TargetToken`; locate its LABEL in the root trace and
-    ///    read each arg's type via `build_trace_value_maps`. RPython:
-    ///    `optimizeopt/unroll.py` peeled-entry LABEL is the JUMP target.
-    /// 2. Non-peeled loops — there is no peeled-entry token; the JUMP target
-    ///    is the loop's `TreeLoop.inputargs` (`history.py`). Their types
-    ///    live on `root_trace.inputargs[i].tp.get()`.
+    /// The LABEL is resolved from `root_trace.ops`: the closing `Jump`'s
+    /// descr, else the first `Label` whose descr is a non-preamble
+    /// `TargetToken` among those ops, else `root_trace.inputargs` types.
     pub fn front_target_inputarg_types(&self, green_key: u64) -> Option<Vec<Type>> {
         self.front_target_inputarg_types_on_driver(self.active_jitdriver_sd.unwrap_or(0), green_key)
     }
@@ -15356,30 +15057,38 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<Vec<Type>> {
         let compiled = self.compiled_entry_on_driver(jd_no, green_key)?;
         let root_trace = compiled.traces.get(&compiled.root_trace_id)?;
-        if let Some(front_target) = Self::selected_front_target_token(compiled) {
-            let target_descr = front_target.as_jump_target_descr();
-            // Rebuild the type index from the stored trace's `inputargs`
-            // and `ops`; the typed `OpRef` operands carry their type, so
-            // there is no separate constant-type map to thread here.
-            let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
-            if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
+        let type_index = majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
+        let label_types = |label_index: usize, label: &majit_ir::OpRc| -> Vec<Type> {
+            label
+                .args_slice()
+                .iter()
+                .map(|arg| {
+                    type_index
+                        .opref_type_at(arg.to_opref(), label_index)
+                        .unwrap_or(Type::Ref)
+                })
+                .collect()
+        };
+        if let Some(jump) = root_trace.ops.last().filter(|op| op.opcode == OpCode::Jump)
+            && let Some(jump_descr) = jump.getdescr()
+            && let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op.getdescr().is_some_and(|descr| {
-                        majit_ir::descr_identity(&descr) == majit_ir::descr_identity(&target_descr)
+                        majit_ir::descr_identity(&descr) == majit_ir::descr_identity(&jump_descr)
                     })
-            }) {
-                return Some(
-                    label
-                        .args_slice()
-                        .iter()
-                        .map(|arg| {
-                            type_index
-                                .opref_type_at(arg.to_opref(), label_index)
-                                .unwrap_or(Type::Ref)
-                        })
-                        .collect(),
-                );
-            }
+            })
+        {
+            return Some(label_types(label_index, label));
+        }
+        if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
+            op.opcode == OpCode::Label
+                && op.getdescr().is_some_and(|descr| {
+                    descr
+                        .as_loop_target_descr()
+                        .is_some_and(|target| !target.is_preamble_target())
+                })
+        }) {
+            return Some(label_types(label_index, label));
         }
         Some(root_trace.inputargs.iter().map(|ia| ia.tp.get()).collect())
     }
@@ -16903,7 +16612,6 @@ impl<M: Clone> MetaInterp<M> {
                         traces,
                         previous_tokens,
                         next_global_opref,
-                        front_target: None,
                     },
                 );
                 self.remember_compiled_graph_write();
@@ -25870,7 +25578,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -28259,7 +27966,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -28322,7 +28028,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -28378,7 +28083,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -28444,7 +28148,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -28561,7 +28264,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -30956,7 +30658,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
         let (step, _) = meta.maybe_compile_and_run_step_on_driver(
@@ -31042,7 +30743,6 @@ mod metainterp_static_data_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -32632,7 +32332,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -32700,7 +32399,6 @@ mod tests {
                 previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -32748,7 +32446,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -32798,7 +32495,6 @@ mod tests {
                 previous_tokens: vec![std::sync::Arc::downgrade(&pred)],
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -32901,7 +32597,6 @@ mod tests {
             CompiledEntry {
                 token: std::sync::Weak::new(),
                 meta: std::sync::Arc::new(()),
-                front_target: None,
                 root_trace_id: 1,
                 traces,
                 previous_tokens: Vec::new(),
@@ -33277,22 +32972,29 @@ mod tests {
         let green_key = gk(7);
         let trace_id = 11;
         let token = std::sync::Arc::new(JitCellToken::new(3));
-        let start_token = crate::history::TargetToken::new_preamble(0);
+        let start_token = crate::history::TargetToken::new_loop(0);
         let start_descr = start_token.as_jump_target_descr();
         let inputargs = [InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
+        let label_args = [
+            OpRef::input_arg_ref(0),
+            OpRef::input_arg_ref(1),
+            OpRef::ref_op(2),
+            OpRef::int_op(3),
+        ];
         let ops = vec![
             mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 2),
             mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
             mk_op_with_descr(
                 OpCode::Label,
-                &[
-                    OpRef::input_arg_ref(0),
-                    OpRef::input_arg_ref(1),
-                    OpRef::ref_op(2),
-                    OpRef::int_op(3),
-                ],
+                &label_args,
                 OpRef::NONE.raw(),
-                start_descr,
+                start_descr.clone(),
+            ),
+            mk_op_with_descr(
+                OpCode::Jump,
+                &label_args,
+                OpRef::NONE.raw(),
+                start_descr.clone(),
             ),
         ];
         let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
@@ -33332,218 +33034,12 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: Some(start_token.clone()),
             },
         );
 
         assert_eq!(
             meta.front_target_inputarg_types(green_key.get_uhash()),
             Some(vec![Type::Ref, Type::Ref, Type::Ref, Type::Int])
-        );
-    }
-
-    /// A `MetaInterp` holding one compiled loop whose front target LABEL takes
-    /// `(Int, Ref, Ref, Ref)`, with `source_positions` as given.
-    fn meta_with_front_label_int_ref_ref_ref(
-        green_key: &majit_ir::GreenKey,
-        source_positions: Option<Vec<usize>>,
-    ) -> (MetaInterp<()>, std::sync::Arc<JitCellToken>) {
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let trace_id = 11;
-        let token = std::sync::Arc::new(JitCellToken::new(3));
-        let start_token = crate::history::TargetToken::new_preamble(0);
-        let start_descr = start_token.as_jump_target_descr();
-        let inputargs = [InputArg::new_ref_rc(0), InputArg::new_ref_rc(1)];
-        let ops = vec![
-            mk_op(OpCode::SameAsR, &[OpRef::input_arg_ref(0)], 2),
-            mk_op(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)], 3),
-            mk_op_with_descr(
-                OpCode::Label,
-                &[
-                    OpRef::int_op(3),
-                    OpRef::input_arg_ref(0),
-                    OpRef::input_arg_ref(1),
-                    OpRef::ref_op(2),
-                ],
-                OpRef::NONE.raw(),
-                start_descr,
-            ),
-        ];
-        let mut constants: majit_ir::ConstMap<majit_ir::Const> = majit_ir::ConstMap::default();
-        constants.insert(100, majit_ir::Const::Int(1));
-        constants.insert(101, majit_ir::Const::Int(2));
-        let mut traces = crate::FxIndexMap::default();
-        traces.insert(
-            trace_id,
-            CompiledTrace {
-                inputargs: inputargs.to_vec(),
-                ops: ops.into_iter().map(OpRc::new).collect(),
-                constants,
-                exit_layouts: crate::FxIndexMap::default(),
-                terminal_exit_layouts: crate::FxIndexMap::default(),
-            },
-        );
-        // `compile.py` — `send_loop_to_backend` registers the token
-        // with `MemoryManager` BEFORE any cell sees it. The cell keeps only a
-        // weak handle (`warmstate.py:188`), so `alive_loops` is what keeps
-        // `token` alive past this fixture's own local.
-        meta.warm_state_for_driver(0)
-            .memory_manager
-            .keep_loop_alive(&token);
-        let _ = meta
-            .warm_state_for_driver(0)
-            .ensure_cell_for_key(&green_key);
-        meta.warm_state_for_driver(0)
-            .attach_procedure_to_interp_for_key(green_key, std::sync::Arc::clone(&token));
-        token.set_target_tokens(vec![start_token.as_jump_target_descr()]);
-        start_token.attrs().label_source_positions = source_positions;
-        meta.insert_compiled_loop(
-            green_key.get_uhash(),
-            CompiledEntry {
-                token: std::sync::Arc::downgrade(&token),
-                meta: std::sync::Arc::new(()),
-                root_trace_id: trace_id,
-                traces,
-                previous_tokens: Vec::new(),
-                loop_header_pc: None,
-                next_global_opref: 0,
-                front_target: Some(start_token.clone()),
-            },
-        );
-        (meta, token)
-    }
-
-    /// The LABEL's argument order is its own, not the frontend's state-field
-    /// order, and the two can agree in length while disagreeing in position.
-    /// A downstream interpreter under the cranelift backend hit exactly that:
-    /// four state values `(Int, Int, Ref, Ref)` entered a four-argument
-    /// `(Int, Ref, Ref, Ref)` LABEL, and compiled code dereferenced the second
-    /// `Int` as a pointer.
-    #[test]
-    fn test_pack_front_target_live_values_reorders_and_refuses_mismatches() {
-        let state_order = vec![
-            Value::Int(23),
-            Value::Int(2),
-            Value::Ref(majit_ir::GcRef(0x1000)),
-            Value::Ref(majit_ir::GcRef(0x2000)),
-        ];
-
-        // Sound mapping: LABEL slot i takes state value `sources[i]`. The
-        // permutation is not the identity, so a pack that silently passed its
-        // input through would fail this assert.
-        let key = gk(7);
-        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(&key, Some(vec![1, 2, 3, 2]));
-        assert_eq!(
-            meta.front_target_inputarg_types(key.get_uhash()),
-            Some(vec![Type::Int, Type::Ref, Type::Ref, Type::Ref])
-        );
-        let packed = meta
-            .pack_front_target_live_values(key.get_uhash(), &state_order)
-            .expect("a complete, type-agreeing mapping packs");
-        assert_eq!(
-            packed,
-            vec![
-                Value::Int(2),
-                Value::Ref(majit_ir::GcRef(0x1000)),
-                Value::Ref(majit_ir::GcRef(0x2000)),
-                Value::Ref(majit_ir::GcRef(0x1000)),
-            ]
-        );
-        assert_ne!(packed, state_order, "the pack must not be a pass-through");
-
-        // Incomplete mapping: three sources for a four-argument LABEL. This is
-        // the `pi.jinseo` shape — the fourth LABEL argument is a trace-internal
-        // value with no state field behind it, so there is nothing to enter with.
-        let key = gk(8);
-        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(&key, Some(vec![1, 2, 3]));
-        assert_eq!(
-            meta.pack_front_target_live_values(key.get_uhash(), &state_order),
-            None
-        );
-
-        // Right arity, wrong types: the identity mapping puts `Int(2)` in the
-        // LABEL's second slot, which is `Ref`.
-        let key = gk(9);
-        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(&key, Some(vec![0, 1, 2, 3]));
-        assert_eq!(
-            meta.pack_front_target_live_values(key.get_uhash(), &state_order),
-            None
-        );
-
-        // No mapping recorded at all.
-        let key = gk(10);
-        let (meta, _token) = meta_with_front_label_int_ref_ref_ref(&key, None);
-        assert_eq!(
-            meta.pack_front_target_live_values(key.get_uhash(), &state_order),
-            None
-        );
-    }
-
-    /// Root compile left only the preamble token. A later retrace
-    /// (`unroll.py` `finalize_short_preamble` appending to
-    /// `jitcell_token.target_tokens`) mints a non-preamble TargetToken whose
-    /// LABEL lives in the bridge, not the root function. Host selection stays
-    /// on the root LABEL (`history.py TargetToken._ll_loop_code`; cranelift
-    /// `label_block_id + 1`).
-    #[test]
-    fn test_front_target_dispatch_key_ignores_appended_retrace_label() {
-        let key = gk(11);
-        let (meta, token) = meta_with_front_label_int_ref_ref_ref(&key, None);
-        let before = meta
-            .front_target_dispatch_key_on_driver(0, key.get_uhash())
-            .expect("root preamble LABEL is the host entry");
-
-        let retrace_token = crate::history::TargetToken::new_loop(99);
-        retrace_token
-            .as_jump_target_descr()
-            .as_loop_target_descr()
-            .expect("TargetToken is a loop target")
-            .set_label_block_id(7);
-        token.record_target_token(retrace_token.as_jump_target_descr());
-
-        let after = meta
-            .front_target_dispatch_key_on_driver(0, key.get_uhash())
-            .expect("root preamble LABEL remains the host entry");
-        assert_eq!(
-            before, after,
-            "appending a retrace TargetToken must not move the front door"
-        );
-        assert_ne!(
-            after, 8,
-            "must not dispatch at the retrace LABEL's label_block_id + 1"
-        );
-
-        // Same index as the root preamble (`new_preamble(0)`), distinct object.
-        // `x86/assembler.py fixup_target_tokens` matches the TargetToken
-        // object, so a retrace that only shares `Descr::index` is not the
-        // host entry.
-        let key = gk(12);
-        let (meta, token) = meta_with_front_label_int_ref_ref_ref(&key, None);
-        let before_same_index = meta
-            .front_target_dispatch_key_on_driver(0, key.get_uhash())
-            .expect("root preamble LABEL is the host entry");
-        let retrace_same_index = crate::history::TargetToken::new_loop(0);
-        assert_eq!(
-            retrace_same_index.token_id, 0,
-            "retrace token_id equals the root preamble Descr::index"
-        );
-        retrace_same_index
-            .as_jump_target_descr()
-            .as_loop_target_descr()
-            .expect("TargetToken is a loop target")
-            .set_label_block_id(7);
-        token.record_target_token(retrace_same_index.as_jump_target_descr());
-        let after_same_index = meta
-            .front_target_dispatch_key_on_driver(0, key.get_uhash())
-            .expect("root preamble LABEL remains the host entry");
-        assert_eq!(
-            before_same_index, after_same_index,
-            "a retrace TargetToken sharing the preamble index must not be selected"
-        );
-        assert_ne!(
-            after_same_index, 8,
-            "must not dispatch at the same-index retrace LABEL's label_block_id + 1"
         );
     }
 
@@ -33688,7 +33184,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -34013,7 +33508,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
     }
@@ -34942,7 +34436,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
         let key = gk(777);
@@ -35533,7 +35026,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
         assert!(
@@ -35662,7 +35154,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: Some(0),
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -35732,7 +35223,6 @@ mod tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
 
@@ -37250,7 +36740,6 @@ mod tests {
         meta.exported_state = Some(crate::optimizeopt::unroll::ExportedState::new(
             Vec::new(),
             Vec::new(),
-            Vec::new(),
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
             indexmap::IndexMap::new(),
             Vec::new(),
@@ -37534,7 +37023,6 @@ mod bridge_cell_token_tests {
                 previous_tokens: Vec::new(),
                 loop_header_pc: None,
                 next_global_opref: 0,
-                front_target: None,
             },
         );
     }
@@ -37587,7 +37075,6 @@ mod loop_side_table_tests {
             previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
-            front_target: None,
         }
     }
 
@@ -37841,7 +37328,6 @@ mod loop_side_table_tests {
             previous_tokens: Vec::new(),
             loop_header_pc: None,
             next_global_opref: 0,
-            front_target: None,
         }
     }
 

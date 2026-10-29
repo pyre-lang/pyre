@@ -5894,8 +5894,7 @@ fn test_single_label_peeled_loop_validates() {
 
 /// Key 0 runs the preamble. Key `label ordinal + 1` enters that LABEL's
 /// resume loader and reads the args from `FRAME_SLOT_BASE`, skipping the
-/// preamble. `build_function`'s `br_table` and `front_target_dispatch_key`
-/// share that numbering.
+/// preamble. `build_function`'s `br_table` uses that numbering.
 #[test]
 fn peeled_loop_dispatch_key_enters_the_label_not_the_preamble() {
     let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
