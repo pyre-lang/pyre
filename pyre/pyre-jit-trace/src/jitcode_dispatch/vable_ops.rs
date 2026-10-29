@@ -936,16 +936,13 @@ pub(crate) fn getfield_vable_via_metainterp<Sym: WalkSym>(
     // with, or the trace and the optimizer could disagree about the constant;
     // `trace.rs` installs this same `shared()` handle via `set_cpu`.
     let cpu = crate::pyre_cpu::shared();
-    // `_opimpl_getfield_vable` returns `virtualizable_boxes[index]` when
-    // `standard_box is box`.  The jitcode `VableField` descr may lack a
-    // vinfo backref, so `walker_nonstandard_virtualizable` would take
-    // `finish_known_nonstandard` and mark the portal frame nonstandard.
+    // `_opimpl_getfield_vable` (`pyjitpl.py`) takes
+    // `_nonstandard_virtualizable` first: Box identity against
+    // `virtualizable_boxes[-1]`, then `vinfo is fielddescr.get_vinfo()`,
+    // then `PTR_EQ` / `GUARD_VALUE` on the PendingEq path. A pointer-equal
+    // copy of the portal frame is still a distinct Box, so it records.
     let (result, shadow_value) = with_replace_frames(ctx, |ctx| {
-        let nonstandard = if vable_is_standard_virtualizable(ctx, obj) {
-            false
-        } else {
-            walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?
-        };
+        let nonstandard = walker_nonstandard_virtualizable(ctx, pc, obj, &descr)?;
         // Seeded virtual callee frame: fold a scalar field through the heapcache
         // `emit_new_pyframe_inline_with_params` and `setfield_vable_*` install
         // under the parent-struct descr (`vable_static_record_descr`). Twin of
@@ -1203,7 +1200,8 @@ pub(crate) fn setfield_vable_via_metainterp<Sym: WalkSym>(
         }
         let vable = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setarrayitem_vable`: only the standard virtualizable
-        // folds SETFIELD_GC away. `_opimpl_setfield_vable` still assigns
+        // Box folds SETFIELD_GC away (`_nonstandard_virtualizable` is
+        // `standard_box is box`). `_opimpl_setfield_vable` still assigns
         // `virtualizable_boxes[index] = valuebox` then
         // `synchronize_virtualizable_at`.
         if ctx.trace_ctx.standard_virtualizable_box() == Some(vable) {
@@ -1403,11 +1401,9 @@ pub(crate) fn setfield_vable_int_imm<Sym: WalkSym>(
         }
         let obj = read_ref_reg_raw(code, op, 0, ctx)?;
         // Same split as `setfield_vable_via_metainterp`: only the standard
-        // virtualizable folds SETFIELD_GC away. `_opimpl_setfield_vable`
+        // virtualizable Box folds SETFIELD_GC away. `_opimpl_setfield_vable`
         // still assigns `virtualizable_boxes[index] = valuebox`.
-        // `_nonstandard_virtualizable` (`pyjitpl.py`) also accepts a copy of
-        // `virtualizable_boxes[-1]` (`vable_is_standard_virtualizable`).
-        if vable_is_standard_virtualizable(ctx, obj) {
+        if ctx.trace_ctx.standard_virtualizable_box() == Some(obj) {
             if obj.is_none() {
                 return Err(DispatchError::VableBoxNotSeeded { pc: op.pc });
             }
@@ -1885,6 +1881,37 @@ pub(crate) fn getarrayitem_vable_via_metainterp<Sym: WalkSym>(
         }
     } else {
         shadow_value
+    };
+    // Fold-frame slots live in `callee_shadow`, including `ConstPtr(0)`
+    // from `PyFrame.__init__` / `PUSH_NULL`. Portal `virtualizable_boxes`
+    // at the same numeric index is a different frame.
+    let fold_frame_reg = fbw_strict_fold_frame_reg(ctx);
+    let names_callee_frame = fold_frame_reg != u16::MAX && code[op.pc + 1] as u16 == fold_frame_reg;
+    let (result, shadow_value) = if dst_bank == 'r' && names_callee_frame && index_value >= 0 {
+        let slot_opref = ctx
+            .frame_state
+            .borrow()
+            .callee_shadow
+            .as_ref()
+            .and_then(|shadow| shadow.opref.get(&index_value).copied());
+        match slot_opref {
+            Some(shadow_op) if shadow_op != OpRef::NONE => {
+                let conc = ctx
+                    .trace_ctx
+                    .concrete_of_opref(shadow_op)
+                    .unwrap_or_else(|| {
+                        if opref_is_null_const_ptr(shadow_op) {
+                            Value::Ref(majit_ir::GcRef(0))
+                        } else {
+                            shadow_value
+                        }
+                    });
+                (shadow_op, conc)
+            }
+            _ => (result, shadow_value),
+        }
+    } else {
+        (result, shadow_value)
     };
     // Mirror `getfield_vable_via_metainterp`: stamp the read result's
     // concrete so `concrete_of_opref(result)` honors the Box.value
@@ -2705,49 +2732,5 @@ mod callee_ref_owner_tests {
                 assert_eq!(shadow_slot(wc, 1), None);
             },
         );
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_shared_pmg_block;
-    use crate::jitcode_runtime::insns_opname_to_byte;
-
-    fn insn(key: &str) -> u8 {
-        *insns_opname_to_byte()
-            .get(key)
-            .unwrap_or_else(|| panic!("`{key}` must be in insns table"))
-    }
-
-    fn encode(ops: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut code = Vec::new();
-        for (key, operands) in ops {
-            code.push(insn(key));
-            code.extend_from_slice(operands);
-        }
-        code
-    }
-
-    #[test]
-    fn shared_pmg_block_requires_promoted_greens_and_switch() {
-        let pmg_shape = encode(&[
-            ("live/", &[0, 0]),
-            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
-            ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
-            ("int_guard_value/i", &[0]),
-            ("ref_guard_value/r", &[0]),
-            ("switch/id", &[0, 0, 0]),
-        ]);
-        assert!(is_shared_pmg_block(&pmg_shape, 0));
-
-        let helper_debugdata_diamond = encode(&[
-            ("live/", &[0, 0]),
-            ("getfield_vable_r/rd>r", &[0, 0, 0, 0]),
-            ("live/", &[0, 0]),
-            ("goto_if_not_ptr_iszero/rL", &[0, 0, 0]),
-            ("ref_return/r", &[0]),
-        ]);
-        assert!(!is_shared_pmg_block(&helper_debugdata_diamond, 0));
     }
 }

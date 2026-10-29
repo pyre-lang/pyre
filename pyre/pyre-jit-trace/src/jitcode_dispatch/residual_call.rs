@@ -10544,18 +10544,7 @@ fn capture_residual_guard_at<Sym: WalkSym>(
     snapshot_pc: usize,
     residual_call_catch_resume: bool,
 ) -> Result<(), DispatchError> {
-    if snapshot_pc != residual_pc {
-        walker_capture_snapshot_for_last_guard_impl(
-            ctx,
-            snapshot_pc,
-            false,
-            GuardCaptureScope {
-                residual_call_catch_resume,
-                preserve_vable_last_instr: true,
-                ..GuardCaptureScope::default()
-            },
-        )
-    } else if residual_call_catch_resume {
+    if residual_call_catch_resume {
         walker_capture_snapshot_for_last_guard_scoped(
             ctx,
             snapshot_pc,
@@ -11822,12 +11811,6 @@ pub(crate) fn dispatch_residual_call_iRd_kind_at<Sym: WalkSym>(
                     snapshot_pc,
                     GuardCaptureScope {
                         residual_call_catch_resume: true,
-                        // Shared `dispatch_bytecode` residual: `snapshot_pc`
-                        // is the `goto L_shared`, not `op.pc`. Keep
-                        // `setfield_vable` last_instr and skip the
-                        // after-residual advance (`capture_residual_guard_at`
-                        // when `snapshot_pc != residual_pc`).
-                        preserve_vable_last_instr: snapshot_pc != op.pc,
                         ..GuardCaptureScope::default()
                     },
                 )?;

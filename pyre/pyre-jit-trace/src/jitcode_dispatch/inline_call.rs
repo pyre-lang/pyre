@@ -8492,7 +8492,9 @@ fn capture_builtin_wrapper_call_site<Sym: WalkSym>(
 /// `Box.value`; `MIFrame.do_residual_call` → `execute_and_record_varargs`
 /// (`executor.py` `execute_varargs`) reads that word. A record-only
 /// `NewArrayClear` leaves the box empty, so a nested residual in the
-/// generated body declines `ValueUnavailable` before execute.
+/// generated body declines `ValueUnavailable` before execute. A
+/// record-only `SETARRAYITEM_GC` leaves the allocated slots NULL, so the
+/// same residual (`int_descr_new`) executes with a null `cls`.
 ///
 /// The pin lives across the helper sub-walk: `record` can collect, and
 /// the generated body reads this array (`arraylen_gc`, residual
@@ -8514,24 +8516,10 @@ fn stamp_wrapper_args_array(
         .as_ref()
         .map(|g| majit_ir::Value::Ref(g.get()))
         .or_else(|| allocated.map(|p| majit_ir::Value::Ref(majit_ir::GcRef(p as usize))));
-    let args_array = match value {
-        Some(value) => ctx.record_new_array_clear(len, array_descr.clone(), value),
-        None => ctx.record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone()),
-    };
-    // `MetaInterp.execute_new_array_clear` stamps `heapcache.new_array`
-    // (`pyjitpl.py`); a record-only `NEW_ARRAY_CLEAR` leaves the cache empty.
-    ctx.heap_cache_mut().new_array(args_array, len, true);
+    let args_array = ctx.execute_new_array_clear(array_descr.clone(), len, value);
     for (index, &item) in wrapper_items.iter().enumerate() {
         let index = ctx.const_int(index as i64);
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[args_array, index, item],
-            array_descr.clone(),
-        );
-        // The wrapper reads its `&[PyObjectRef]` argument through this same
-        // ArrayDescr, so its getarrayitem returns the live CALL operand.
-        // `execute_setarrayitem_gc` (`pyjitpl.py`) publishes that store.
-        ctx.heapcache_setarrayitem(args_array, index, array_descr.index(), item);
+        ctx.execute_setarrayitem_gc(args_array, index, item, array_descr.clone());
     }
     let concrete = if let Some(g) = &pin {
         let live = g.get();
@@ -12153,39 +12141,35 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     .get(callee_portal_frame_reg as usize)
                     .expect("ref register in range");
             }
-            {
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                if !try_multiframe {
-                    shadow.fold_frame_reg = callee_portal_frame_reg;
-                }
-                // The fold's premise (`setarrayitem_vable_via_metainterp`) is
-                // that it writes away from an UNSEEDED portal frame — a pure
-                // SSA mirror with no heap array behind it.  The seed block
-                // above may have materialized a real callee `PyFrame`, whose
-                // `NewArrayClear` locals array is stored into only for the
-                // parameters and freevar cells; folding away the in-callee
-                // STORE_FASTs would leave every other local holding the
-                // zero-fill, and a frame reachable afterwards through a
-                // traceback, `f_locals` or `sys._getframe` reads them as
-                // unbound.  Record that here so the store handler demotes just
-                // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
-                // what `_opimpl_setarrayitem_vable` does for a
-                // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
-                // those stores also emits the promote guard in
-                // `vable_getfield_*` (`pyjitpl.py`), whose resume
-                // image must include the paused caller frame
-                // (`opencoder.py capture_resumedata`). Every admitted inline
-                // now carries one, so the remaining question is only whether
-                // the callee's own frame reds were seeded; an unseeded callee
-                // keeps folding.
-                // A `try_multiframe` level seeds the same real `PyFrame`; its
-                // flag arms the post-residual live-array read in
-                // `getarrayitem_vable_via_metainterp`, the nonstandard
-                // `_opimpl_getarrayitem_vable` executing against the frame the
-                // residual wrote (`pyjitpl.py`).
-                shadow.frame_materialized = callee_frame_materialized_has_resume;
+            if !try_multiframe {
+                shadow.fold_frame_reg = callee_portal_frame_reg;
             }
+            // The fold's premise (`setarrayitem_vable_via_metainterp`) is
+            // that it writes away from an UNSEEDED portal frame — a pure
+            // SSA mirror with no heap array behind it.  The seed block
+            // above may have materialized a real callee `PyFrame`, whose
+            // `NewArrayClear` locals array is stored into only for the
+            // parameters and freevar cells; folding away the in-callee
+            // STORE_FASTs would leave every other local holding the
+            // zero-fill, and a frame reachable afterwards through a
+            // traceback, `f_locals` or `sys._getframe` reads them as
+            // unbound.  Record that here so the store handler demotes just
+            // the LOCAL region to a recorded `SETARRAYITEM_GC`, which is
+            // what `_opimpl_setarrayitem_vable` does for a
+            // `_nonstandard_virtualizable` (`pyjitpl.py`). Recording
+            // those stores also emits the promote guard in
+            // `vable_getfield_*` (`pyjitpl.py`), whose resume
+            // image must include the paused caller frame
+            // (`opencoder.py capture_resumedata`). Every admitted inline
+            // now carries one, so the remaining question is only whether
+            // the callee's own frame reds were seeded; an unseeded callee
+            // keeps folding.
+            // A `try_multiframe` level seeds the same real `PyFrame`; its
+            // flag arms the post-residual live-array read in
+            // `getarrayitem_vable_via_metainterp`, the nonstandard
+            // `_opimpl_getarrayitem_vable` executing against the frame the
+            // residual wrote (`pyjitpl.py`).
+            shadow.frame_materialized = callee_frame_materialized_has_resume;
             // `MIFrame.setup_call` copies argument boxes that already carry
             // values. Look each box up, then seed only when every SOME
             // argument is reconstructable; otherwise decline before any
@@ -12198,17 +12182,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         .unwrap_or(majit_ir::Value::Void)
                 })
                 .collect();
-            {
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
-                seed_inline_param_shadows(
-                    shadow,
-                    concrete_callee_frame as usize,
-                    &callee_args[..seeded_locals],
-                    &concretes,
-                    op.pc,
-                )?;
-            }
+            seed_inline_param_shadows(
+                shadow,
+                concrete_callee_frame as usize,
+                &callee_args[..seeded_locals],
+                &concretes,
+                op.pc,
+            )?;
             // `MIFrame.registers_r` retains cell/freevar slots across a
             // may-force call just like ordinary locals.  The heapcache entry
             // installed by `emit_new_pyframe_inline_with_params` is only a
@@ -12227,8 +12207,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 .enumerate()
             {
                 let slot = (freevar_base + i) as i64;
-                let mut state = sub_wc.frame_state.borrow_mut();
-                let shadow = state.callee_shadow.as_mut().unwrap();
                 shadow.set_opref(slot, value);
                 shadow.set_concrete(
                     concrete_callee_frame as usize,
@@ -25137,6 +25115,12 @@ fn python_portal_callee_shadow<Sym: WalkSym>(
 /// the head `-live-` (null slots as `ConstPtr(0)`). `extra_*_seeds` is
 /// `(reg, box, concrete)` — later entries overwrite earlier ones at the
 /// same color.
+///
+/// [`SubwalkFrameKind::Helper`] is a canonical helper `MIFrame` (`pyjitpl.py`
+/// `newframe` of a translated interp function). A generator body is a
+/// Python `MIFrame` ([`SubwalkFrameKind::PythonPortal`]) whose frame red
+/// is seeded in `extra_ref_seeds`; vable accesses use that box as
+/// `_nonstandard_virtualizable` (`_opimpl_setfield_gc_any`).
 ///
 /// `inline_w_code` is this walk frame's `W_Code`. `walk_generator_resume`
 /// passes the generator body's pycode so merge points read

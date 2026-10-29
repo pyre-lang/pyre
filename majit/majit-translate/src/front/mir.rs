@@ -9761,11 +9761,12 @@ use self::simplify::*;
 use self::strformat::*;
 use self::views::*;
 
+#[cfg(any(test, feature = "mir-frontend"))]
+pub(crate) use self::consteval::register_ambiguous_impl_foldable_const_lits;
 pub(crate) use self::consteval::{
     attach_foldable_const_lits, discover_foldable_const_lits, discover_transparent_scalar_kinds,
-    harvest_named_const_folds, push_named_const_folds, register_ambiguous_impl_foldable_const_lits,
-    register_foldable_const_lits, transparent_scalar_inner_value_for_path,
-    type_flag_for_external_transparent_scalar,
+    harvest_named_const_folds, push_named_const_folds, register_foldable_const_lits,
+    transparent_scalar_inner_value_for_path, type_flag_for_external_transparent_scalar,
 };
 pub use self::desugar::callee::discover_fnptr_field_families;
 pub(crate) use self::desugar::callee::{

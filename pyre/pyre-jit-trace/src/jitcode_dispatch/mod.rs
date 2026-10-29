@@ -3430,7 +3430,7 @@ fn surface_inline_subloop_after_back_edge(
 /// `WalkFrameStateData.inline_w_code` is the current frame's own code
 /// (inlined Python callee, or the generator body `walk_generator_resume`
 /// seeded). Nested helper walks leave it zero; those fall back to
-/// `framestack.last().w_code` when a Python frame is on the stack.
+/// the innermost Python inline frame (`WalkSession::last_python_inline`), which skips transparent helper frames.
 fn current_walk_frame_pycode<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Option<usize> {
     let inline = ctx.inline_w_code();
     if inline != 0 {
@@ -3438,8 +3438,7 @@ fn current_walk_frame_pycode<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>) -> Op
     } else {
         ctx.session
             .borrow()
-            .framestack
-            .last()
+            .last_python_inline()
             .map(|frame| frame.w_code)
     }
 }
@@ -5418,6 +5417,7 @@ pub fn step<Sym: WalkSym>(
             // block-entry marker re-anchors at once, a marker-less one (the
             // `dispatch_bytecode` jitted arm's blocks) falls back to the opcode-start
             // marker in `plain_guard_resume_jitcode_pc`.
+            //
             ctx.live_before_jit_pc = usize::MAX;
         }
     }
@@ -8875,17 +8875,6 @@ pub(crate) struct GuardCaptureScope {
     /// own raise) needs its own catch to receive the raise. Uncovered
     /// residuals fall back to the fallthrough resume even when this is set.
     pub residual_call_catch_resume: bool,
-
-    /// Shared `dispatch_bytecode` residual: keep the `setfield_vable`
-    /// `last_instr` already on the boxes (this opcode's offset) instead of
-    /// publishing `py_pc - 1`.  The out-of-line residual's floor is the last
-    /// opcode, so a capture keyed there writes RETURN and a compiled
-    /// GuardNotForced deopt leaves the loop
-    /// (`settrace_local_tracer_armed_before_entry` acc 576201).  Capture at
-    /// the `goto L_shared` with `after_residual_call=false` so the resume
-    /// marker is a can_decode startpoint; skipping the rewrite leaves the
-    /// switch key the blackhole needs.  Still publish `valuestackdepth`.
-    pub preserve_vable_last_instr: bool,
 
     /// Bridge-entry flavor guard (`_prepare_exception_resumption`,
     /// pyjitpl.py): the walk-entry `position` IS the resume
@@ -18021,7 +18010,7 @@ fn handle<Sym: WalkSym>(
             }
             // Current walk frame's pycode: `inline_w_code` when this frame
             // owns one (inlined Python callee, generator resume body);
-            // otherwise `framestack.last().w_code`. Nested helpers leave
+            // otherwise `WalkSession::last_python_inline`'s `w_code`. Nested helpers leave
             // `inline_w_code` empty (`run_sub_jitcode_walk_from` takes that
             // argument only from `walk_generator_resume`).
             let callee_code = (!ctx.is_top_level

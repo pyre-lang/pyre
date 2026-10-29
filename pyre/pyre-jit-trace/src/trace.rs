@@ -625,66 +625,6 @@ fn abort_force_quasi_immut_action() -> TraceAction {
     })
 }
 
-/// True when this recorded history already contains `CALL_ASSEMBLER`.
-/// `_opimpl_recursive_call` (`pyjitpl.py`) records that op once
-/// `dont_trace_here` has flipped `assembler_call=True`.
-fn trace_recorded_call_assembler(ctx: &TraceCtx) -> bool {
-    (0..ctx.opcode_at_len()).any(|i| {
-        matches!(
-            ctx.opcode_at(i),
-            Some(
-                majit_ir::OpCode::CallAssemblerI
-                    | majit_ir::OpCode::CallAssemblerR
-                    | majit_ir::OpCode::CallAssemblerF
-                    | majit_ir::OpCode::CallAssemblerN
-            )
-        )
-    })
-}
-
-/// `pyjitpl.py blackhole_if_trace_too_long` + `find_biggest_function`:
-/// the inlined frame that owns the most recorded ops is this portal itself.
-///
-/// A recursive Python unroll in FBW finishes (`Terminate`) well under
-/// `trace_limit` — `fib(20)` records ~955 ops here vs PyPy's ~8449 on the
-/// generic eval loop, which does trip `ABORT_TOO_LONG`. Without that abort
-/// the next attempt inlines the same portal again, reconstruction of the
-/// unrolled tree's multi-frame guards fails (`P2Drain::NoRecipes`), and
-/// `abort_ceiling` bans the cell. Naming the same portal here runs the
-/// upstream disable (`disable_noninlinable_function` + `trace_next_iteration`)
-/// so `_opimpl_recursive_call` records `CALL_ASSEMBLER` on the retrace.
-/// A history that already has that op is that retrace; a bridge Terminate is
-/// a specialization of the compiled token and must compile.
-fn recursive_portal_was_inlined(w_code: *const ()) -> bool {
-    let Some((driver, _)) = crate::driver::try_driver_pair() else {
-        return false;
-    };
-    let Some((_, huge_key)) = driver.meta_interp().find_biggest_function() else {
-        return false;
-    };
-    // `PortalGreenKey = (u64, GreenKey)` (`pyjitpl.rs`); the typed half is
-    // the green boxes (`newframe` `greenkey`), not `Option`. values[2] is
-    // the portal `w_code` box compared against this frame's code object.
-    huge_key.1.values.get(2).copied() == Some(w_code as i64)
-}
-
-fn recursive_portal_terminate_without_call_assembler(
-    w_code: *const (),
-    ctx: &TraceCtx,
-) -> Option<TraceAction> {
-    if ctx.is_bridge_trace || trace_recorded_call_assembler(ctx) {
-        return None;
-    }
-    if !recursive_portal_was_inlined(w_code) {
-        return None;
-    }
-    crate::state::note_root_trace_too_long(
-        ctx.current_merge_points_first_green_key_pair(),
-        ctx.resumekey_original_loop_token().cloned(),
-    );
-    Some(abort_too_long_action())
-}
-
 #[derive(Clone, Copy)]
 struct MidBodyFlushWords {
     call_py_pc: usize,
@@ -1291,6 +1231,15 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // `init_symbolic` and the standing-exception seed can collect; read the
     // frame back from `concrete_frame`'s root before the walks take it.
     let cf_addr = &*concrete_frame as *const pyre_interpreter::pyframe::PyFrame as usize;
+    if ctx.is_bridge_trace && ctx.has_virtualizable_boxes() {
+        // `resume.py rebuild_from_resumedata` restores the root virtualizable
+        // independently of each MIFrame's resume PC. The interpreter handoff
+        // can publish an innermost PC on the live frame; bind this recording
+        // copy to the decoded root boxes before resuming the caller. Copying
+        // only its resume PC leaves last_instr disagreeing with those boxes.
+        ctx.set_virtualizable_heap_ptr(cf_addr as *const u8);
+        ctx.synchronize_virtualizable();
+    }
     if let Some(ref carrier) = carrier {
         debug_assert_eq!(
             unsafe { (*sym.jitcode()).index as i32 },
@@ -2125,6 +2074,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         // matches PyPy and `opimpl_jit_merge_point` returns at
         // `if portal_call_depth: return` instead of treating `step` as the portal.
         let _opened = crate::state::note_resume_inline_frames_to_depth(python_recipe_count);
+        let pending_frame_ptr = crate::state::pending_concrete_frame(ctx, &pending);
         crate::jitcode_dispatch::drive_bridge_carrier_subwalk(
             ctx,
             &session,
@@ -2141,7 +2091,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             local_concretes,
             resumed_stack_oprefs,
             resumed_stack_concretes,
-            crate::state::pending_concrete_frame(ctx, &pending),
+            pending_frame_ptr,
             pending.sym.frame(),
             pending.sym.execution_context(),
             paused_parents,
@@ -5707,15 +5657,14 @@ fn run_perfn_walk<Sym: WalkSym>(
         .unwrap_or_else(|| ctx.const_ref(cf_addr as i64));
     // Seed the loop's live INPUT registers so the header merge and the
     // post-merge body resolve their loop-invariant reads. A non-bridge
-    // entry starts at the `pmgN` `-live-` immediately before
-    // `jit_merge_point` (`split_before_jit_merge_point`) and therefore
-    // never walks `pmg_shared`. Decode the merge point's green-int
-    // (`gi` = [next_instr, is_being_profiled]), green-ref (`gr` =
-    // [pycode]) and red (`rr` = [frame, ec], portal jitdriver convention)
-    // register lists and seed each named color from the greenkey / live
-    // frame. `gi[0]` (`next_instr`) and `gi[1]` (`is_being_profiled`) are
-    // the Int greens that `pmg_shared` used to write before the merge;
-    // they are now `const_int` seeds through `argboxes_i`, matching the
+    // entry starts at the dispatch-loop `-live-` immediately before
+    // `jit_merge_point` (`interp_jit.py PyFrame.dispatch`). Decode the
+    // merge point's green-int (`gi` = [next_instr, is_being_profiled]),
+    // green-ref (`gr` = [pycode]) and red (`rr` = [frame, ec], portal
+    // jitdriver convention) register lists and seed each named color from
+    // the greenkey / live frame. `gi[0]` (`next_instr`) and `gi[1]`
+    // (`is_being_profiled`) are the Int greens the loop head writes before
+    // the merge; they are `const_int` seeds through `argboxes_i`, matching the
     // Ref green (`pycode`) and red (`frame`, `ec`) seeds. `frame` is the
     // standard-vable identity box (so the body's vable reads hit the
     // standard fast path); `ec` must remain the second live red box.  PyPy's
@@ -8086,11 +8035,12 @@ fn full_body_walk_trace<Sym: WalkSym>(
                 if portal_finish_too_long {
                     meta.mark_portal_finish_too_long();
                 }
-                if let Some(action) =
-                    recursive_portal_terminate_without_call_assembler(w_code, live_trace_ctx(meta))
-                {
-                    return action;
-                }
+                // pyjitpl.py `blackhole_if_trace_too_long` aborts only when
+                // `history.length() > trace_limit` or
+                // `history.trace_tag_overflow()`. A recursive unroll that
+                // Terminates under that bar compiles; further inlining is
+                // `_opimpl_recursive_call` / `max_unroll_recursion`.
+                //
                 // A loop-free portal exit: the top-level `*_return` reached
                 // `done_with_this_frame` with no back-edge.  The return arm
                 // routed through `fbw_terminate_with_finish`, which re-boxed the
@@ -9037,6 +8987,27 @@ mod tests {
         assert_eq!(entry.pc, 8);
         assert_eq!(code[entry.next_pc], live);
         assert!(super::static_entry_merge_point(&code, &scan, entry.next_pc).is_none());
+    }
+
+    #[test]
+    fn bridge_resume_binds_preceding_merge_point_regs() {
+        let marker = *crate::jitcode_runtime::insns_opname_to_byte()
+            .get("jit_merge_point/cIRFIRF")
+            .expect("jit_merge_point must be registered");
+        let code = [
+            marker, 0, // jdindex
+            2, 7, 8, // gi: next_instr, is_being_profiled
+            1, 9, // gr: pycode
+            0, // gf
+            0, // ri
+            2, 10, 11, // rr: frame, ec
+            0,  // rf
+        ];
+
+        let scan = crate::pyjitcode::LoopScanIndex::build(&code);
+        let regs = super::bridge_resume_merge_point_regs(&code, &scan, code.len())
+            .expect("an entry after the marker binds the preceding marker");
+        assert_eq!(regs, vec![10, 11]);
     }
 
     #[test]

@@ -1199,20 +1199,6 @@ impl PyJitCode {
         Self::predecessor_index(search).and_then(|i| pred[i].1)
     }
 
-    /// op3 `-live-` of the portal merge for `py_pc`.
-    ///
-    /// `jtransform.py Transformer.handle_jit_marker__jit_merge_point` emits
-    /// `[op3=-live-, op1=jit_merge_point, op2=-live-]`. The resume-marker twin
-    /// advances onto op2 for a guard that continues in blackhole.
-    /// `pyframe.py pushvalue` / `popvalue` already wrote the frame.
-    pub fn portal_merge_op3_live_for_py_pc(&self, py_pc: u32) -> Option<usize> {
-        self.metadata
-            .py_floor_by_jit_pc
-            .iter()
-            .find(|&&(_, py)| py == py_pc)
-            .map(|&(off, _)| off as usize)
-    }
-
     /// Forward Python PC paired with a carried resume JitCode PC. This is a
     /// codewriter-built twin of `trivia_normalized_py_pc_for_jitcode_pc`'s result, including its
     /// forward trivia normalization, not an encode-time inverse projection.

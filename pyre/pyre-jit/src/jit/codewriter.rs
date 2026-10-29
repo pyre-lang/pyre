@@ -7414,31 +7414,32 @@ fn filter_liveness_in_place(
             // data then names no box for that color and a bridge resuming
             // there reads it unbound.
             //
-            // `lv_live` below is the converse set — colors that are
+            // `frame_live` is the converse set — colors that are
             // frame-live but SSA-DEAD, which backward liveness cannot
-            // supply.  It feeds the portal reds and the FOR_ITER re-add.
-            let lv_live: std::collections::BTreeSet<u16> = {
-                // #348 Part (2): the per-PC map's entries at this PC are the
-                // live frame colors — each slot's TRUE per-program-point SSA
-                // color, already gated to live + restorable. This is the same
-                // color space the runtime encode/decode invert through, so the
-                // `-live-` markers stay consistent with the inversion.
-                let mut s: std::collections::BTreeSet<u16> = pcdep_color_slots
-                    .get(py_pc)
-                    .map(|entries| {
-                        entries
-                            .iter()
-                            .filter(|&&(b, _, _)| b == 1)
-                            .map(|&(_, color, _)| color)
-                            .collect()
-                    })
-                    .unwrap_or_default();
+            // supply.  It feeds the FOR_ITER re-add.
+            // #348 Part (2): the per-PC map's entries at this PC are the
+            // live frame colors — each slot's TRUE per-program-point SSA
+            // color, already gated to live + restorable. This is the same
+            // color space the runtime encode/decode invert through, so the
+            // `-live-` markers stay consistent with the inversion.
+            let frame_live: std::collections::BTreeSet<u16> = pcdep_color_slots
+                .get(py_pc)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|&&(b, _, _)| b == 1)
+                        .map(|&(_, color, _)| color)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let forced_live: std::collections::BTreeSet<u16> = {
+                let mut s: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
                 // Portal red args (`interp_jit.py PyPyJitDriver.reds`
                 // `['frame', 'ec']`) reach `live_r` through the
                 // RPython force-alive mechanism (`liveness.py`):
                 // `emit_live_placeholder!` emits every PC's `-live-` op
                 // with explicit Register args for `portal_frame_reg` /
-                // `portal_ec_reg`.  Carry the portal colors in `lv_live`
+                // `portal_ec_reg`.  Carry the portal colors in `forced_live`
                 // so the re-add paths below name them.  Portal-bridge
                 // installs sentinel-skip (`u16::MAX`).
                 if portal_frame_reg != u16::MAX {
@@ -10440,7 +10441,7 @@ impl CodeWriter {
         // `getfield_vable_i` production sites call `emit_vable_getfield_int`:
         // the promoted `valuestackdepth` after `jit_merge_point`
         // (`interp_jit.py PyFrame.dispatch`), the `last_instr` reload after
-        // `bytecode_only_trace` (`dispatch_bytecode`
+        // `bytecode_only_trace` at the shared dispatch arm (`dispatch_bytecode`
         // `next_instr = r_uint(self.last_instr)`), and the `last_instr`
         // reload after `bytecode_trace` (`interp_jit.py jump_absolute`
         // `jumpto = r_uint(self.last_instr)`). `int_copy` of the
@@ -11113,6 +11114,13 @@ impl CodeWriter {
                     // the abort is the last instruction (nothing follows to
                     // dispatch).  `merge_entry_by_green` therefore keeps the
                     // loop headers behind an unsupported opcode.
+                    //
+                    // Reuses `block_closed_by_terminator` computed above the
+                    // loop-header `jit_merge_point` gate. The debugdata
+                    // diamond closes the header and switches
+                    // `current_block` to the join, which has no exits, so
+                    // the cached `false` still matches the block opcode
+                    // dispatch writes into.
                     if block_closed_by_terminator {
                         current_state.next_offset = py_pc + 1;
                         current_state.blocklist =
@@ -17380,9 +17388,6 @@ impl CodeWriter {
         // applies, but this assignment replaces the stream wholesale, so a
         // table left out silently keeps its pre-splice contents.
         ssarepr.pc_run_insn_pos = spliced.pc_run_insn_pos;
-        // Marker pass matches `arm_blocks` against this table; twin-range
-        // construction in `finalize_jitcode` reuses the same names against
-        // the final insn stream (`emit_dispatch_bytecode_jitted_trace_arm`).
         ssarepr.label_blocks = spliced.label_blocks;
         // Per-PC `-live-` marker indices feeding `filter_liveness_in_place`
         // (translated through its `remove_repeated_live` remap), and the
@@ -18523,8 +18528,7 @@ impl CodeWriter {
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py as usize);
                 let marker = first_jit_pc_by_py_pc
                     .get(skipped_py)
-                    .and_then(|_| resolve_marker(skipped_py))
-                    .map(|m| guard_resume_live_after_portal_merge(jitcode.code.as_slice(), m));
+                    .and_then(|_| resolve_marker(skipped_py));
                 resume_marker_marker_by_jit_pc.push((off, marker));
             }
             resume_marker_marker_by_jit_pc.sort_unstable_by_key(|&(off, _)| off);
@@ -18536,8 +18540,7 @@ impl CodeWriter {
                     pyre_jit_trace::jitcode_dispatch::skip_python_trivia_forward(code, py);
                 let marker = first_jit_pc_by_py_pc
                     .get(skipped_py)
-                    .and_then(|_| resolve_marker(skipped_py))
-                    .map(|m| guard_resume_live_after_portal_merge(jitcode.code.as_slice(), m));
+                    .and_then(|_| resolve_marker(skipped_py));
                 resume_marker_pred_by_jit_pc.push((pos, marker));
             }
             // Marker tier: exact-match, block-head precedence. Compose the
@@ -18559,8 +18562,7 @@ impl CodeWriter {
                 let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
                 let value = first_jit_pc_by_py_pc
                     .get(ft)
-                    .and_then(|_| resolve_marker(ft))
-                    .map(|m| after_residual_live_before_portal_merge(jitcode.code.as_slice(), m));
+                    .and_then(|_| resolve_marker(ft));
                 after_residual_marker_marker_by_jit_pc.push((off, value));
                 // The retired runtime read took the fallthrough of the RAW
                 // block-head py (no trivia skip); match it exactly so the twin
@@ -18586,8 +18588,7 @@ impl CodeWriter {
                 let ft = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, sk);
                 let value = first_jit_pc_by_py_pc
                     .get(ft)
-                    .and_then(|_| resolve_marker(ft))
-                    .map(|m| after_residual_live_before_portal_merge(jitcode.code.as_slice(), m));
+                    .and_then(|_| resolve_marker(ft));
                 after_residual_marker_pred_by_jit_pc.push((pos, value));
                 let ft_rc = pyre_jit_trace::pyjitpl::semantic_fallthrough_pc(code, py);
                 result_color_after_residual_pred_by_jit_pc
@@ -19976,11 +19977,21 @@ mod tests {
                 if fn_ptr != restore_ptr {
                     continue;
                 }
-                let Some(getitem) = ops
-                    .iter()
-                    .rev()
-                    .find(|op| op.pc < residual.pc && op.opname.starts_with("getarrayitem_vable"))
-                else {
+                // `residual_call_r_v/iRd`: fn at pc+1, r_len at pc+2, refs after.
+                // `emit_popvalue_ref!` also reads the same slot, so the nearest
+                // preceding getarrayitem may be that clear-path load rather
+                // than `prev_value`. Bind the residual's Ref operand first.
+                let r_len = pyjit.jitcode.code[residual.pc + 2];
+                assert!(
+                    r_len >= 1,
+                    "RestoreExcInfo residual has a Ref arg; source={source:?}"
+                );
+                let ref_arg = pyjit.jitcode.code[residual.pc + 3];
+                let Some(getitem) = ops.iter().rev().find(|op| {
+                    op.pc < residual.pc
+                        && op.opname.starts_with("getarrayitem_vable")
+                        && pyjit.jitcode.code[op.next_pc - 1] == ref_arg
+                }) else {
                     panic!(
                         "POP_EXCEPT restore must read the slot before the residual; \
                          source={source:?}"
@@ -19989,13 +20000,6 @@ mod tests {
                 assert_eq!(
                     getitem.key, "getarrayitem_vable_r/ridd>r",
                     "POP_EXCEPT prev read is getarrayitem_vable_r; source={source:?}"
-                );
-                let dest = pyjit.jitcode.code[getitem.next_pc - 1];
-                let ref_arg = pyjit.jitcode.code[residual.pc + 3];
-                assert_eq!(
-                    dest, ref_arg,
-                    "RestoreExcInfo Ref arg is the getarrayitem_vable_r result; \
-                     source={source:?}"
                 );
                 let clear = ops.iter().find(|op| {
                     op.pc > getitem.pc
@@ -20163,9 +20167,6 @@ mod tests {
             "catch_exception must be adjacent to the FOR_ITER residual call"
         );
 
-        // Instruction-start `we_are_jitted` emits `ptr_nonzero` on `debugdata`
-        // before the opcode body.  FOR_ITER's exhaustion split is the one
-        // after its StopIteration catch.
         let ptr_nonzero_index = ops
             .iter()
             .enumerate()
@@ -21477,6 +21478,81 @@ mod tests {
             floats,
             std::collections::BTreeSet::from([4]),
             "splice path must keep live Float registers in -live-",
+        );
+    }
+
+    /// The post-`residual_call` `-live-` is a mid-opcode live-after point
+    /// (`jtransform.py handle_residual_call`, `liveness.py compute_liveness`).
+    /// Opcode-start frame colors — including a call argument that is never
+    /// read after the call — must not be re-added; `get_list_of_active_boxes`
+    /// names the result and the portal reds stay force-alive.
+    #[test]
+    fn filter_liveness_after_residual_omits_opcode_start_frame_colors() {
+        let code = pyre_interpreter::compile_exec("x = 1\n").expect("source must compile");
+        let live_vars = pyre_jit_trace::state::liveness_for(&code as *const _);
+        let reachable_pc = (0..code.instructions.len())
+            .find(|&py_pc| live_vars.is_reachable(py_pc))
+            .expect("compiled code must have a reachable pc");
+
+        const DEAD_ARG: u16 = 3;
+        const RESULT: u16 = 2;
+        const PORTAL_FRAME: u16 = 5;
+        const PORTAL_EC: u16 = 6;
+
+        let mut ssarepr = SSARepr::new("after_residual_frame_live");
+        let mut walker_tracked_pc_live_indices: Vec<usize> =
+            Vec::with_capacity(code.instructions.len());
+        for _py_pc in 0..code.instructions.len() {
+            walker_tracked_pc_live_indices.push(ssarepr.insns.len());
+            ssarepr.insns.push(Insn::live(Vec::new()));
+        }
+        ssarepr.insns.push(
+            super::super::flatten::build_binary_op_residual_call_ir_r_insn(
+                11, 0, DEAD_ARG, 4, RESULT,
+            ),
+        );
+        let after_call_idx = ssarepr.insns.len();
+        ssarepr.insns.push(Insn::live(Vec::new()));
+
+        let mut walker_after_call_pc_indices = vec![None; code.instructions.len()];
+        walker_after_call_pc_indices[reachable_pc] = Some(after_call_idx);
+
+        let pcdep_color_slots: Vec<Vec<(u8, u16, u16)>> =
+            vec![vec![(1, DEAD_ARG, 0)]; code.instructions.len()];
+        let (_, after_call_post_merge, _, _) = filter_liveness_in_place(
+            &mut ssarepr,
+            &code,
+            &pcdep_color_slots,
+            PORTAL_FRAME,
+            PORTAL_EC,
+            Some(&walker_tracked_pc_live_indices),
+            Some(&walker_after_call_pc_indices),
+            false,
+        );
+
+        let live_idx = after_call_post_merge[reachable_pc]
+            .expect("reachable pc must keep a post-residual -live- marker");
+        let live_args = ssarepr.insns[live_idx]
+            .live_args()
+            .expect("post-residual marker must remain a -live-");
+        let refs: std::collections::BTreeSet<u16> = live_args
+            .iter()
+            .filter_map(|op| match op {
+                Operand::Register(reg) if reg.kind == Kind::Ref => Some(reg.index),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !refs.contains(&DEAD_ARG),
+            "post-residual -live- must not contain the call's unread argument color",
+        );
+        assert!(
+            refs.contains(&RESULT),
+            "post-residual -live- must contain the call's Ref result register",
+        );
+        assert!(
+            refs.contains(&PORTAL_FRAME) && refs.contains(&PORTAL_EC),
+            "post-residual -live- must contain the portal reds",
         );
     }
 

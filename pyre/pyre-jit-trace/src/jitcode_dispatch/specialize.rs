@@ -6347,10 +6347,10 @@ pub(crate) fn walker_newbool_guarded<Sym: WalkSym>(
 
 struct NewboolFailResume {
     marker: usize,
-    resume_py: u32,
     nlocals: usize,
-    /// Operand-stack depth at `resume_py`. A `POP_JUMP_IF_*` has already
-    /// consumed the bool; values below it (`COPY` of `a or b`) stay.
+    /// Operand-stack depth at the fail-arm resume pc. A `POP_JUMP_IF_*`
+    /// has already consumed the bool; values below it (`COPY` of `a or b`)
+    /// stay.
     stack_depth: usize,
     /// When true, TOS is the fail singleton. False after skipping a
     /// `POP_JUMP_IF_*` that already popped it.
@@ -6468,22 +6468,23 @@ fn newbool_fail_resume_from_marker(
     if !containing_produces_bool {
         return None;
     }
-    let resume_py_u = resume_py as u32;
+    // `interp_jit.py PyFrame.dispatch` keys the merge by the logical
+    // instruction start; `pyopcode.py dispatch_bytecode` consumes its
+    // EXTENDED_ARG prefix inside that step. Trivia skipping above found the
+    // real opcode, whose PC has no separate merge. Keep the prefix coordinate
+    // or a long fail-arm jump falls back to the completed producer's merge.
+    let resume_py_u = pyre_interpreter::pyopcode::instruction_logical_start(code, resume_py) as u32;
     // Prefer the fail-arm opcode's own op3 `-live-`. A loop-exit LOAD
     // after `JUMP_BACKWARD` can miss `py_floor` when that PC is only
     // reached by the jump arm; blackhole can still CRN from the
     // producer merge (`COMPARE_OP` / `TO_BOOL`) once `last_instr` is
     // the fail arm (`bhimpl_jit_merge_point` + vable `next_instr`).
     let marker = payload
-        .portal_merge_op3_live_for_py_pc(resume_py_u)
-        .or_else(|| {
-            payload
-                .metadata
-                .py_exact_by_jit_pc
-                .iter()
-                .find(|&&(_, py)| py == resume_py_u)
-                .map(|&(off, _)| off as usize)
-        })
+        .metadata
+        .py_exact_by_jit_pc
+        .iter()
+        .find(|&&(_, py)| py == resume_py_u)
+        .map(|&(off, _)| off as usize)
         .or_else(|| {
             payload
                 .metadata
@@ -6492,11 +6493,9 @@ fn newbool_fail_resume_from_marker(
                 .find(|&&(_, py)| py == resume_py_u)
                 .map(|&(off, _)| off)
         })
-        .or_else(|| payload.portal_merge_op3_live_for_py_pc(containing as u32))
         .or(Some(containing_marker));
     Some(NewboolFailResume {
         marker: marker?,
-        resume_py: resume_py_u,
         nlocals,
         stack_depth,
         overlay_fail,
@@ -6628,21 +6627,16 @@ pub(crate) fn walker_capture_newbool_completed_bool<Sym: WalkSym>(
     let saved_marker = ctx.outer_resume_marker_jit_pc;
     let saved_active = ctx.frame_state.borrow().outer_active_boxes.clone();
     // The portal virtualizable is the caller's frame. Overlaying an
-    // inlined *Python* callee's fail bool / last_instr there clobbers
-    // caller locals (`k` → PY_NULL). `run_orthodox_helper_subwalk`
-    // sets `inline_subwalk` even for a portal COMPARE, so that flag
-    // cannot name the producer; `transparent_helper_subwalk` is also
-    // set for `newbool` inside an inlined callee. `WalkSession.at_portal`
-    // is the producer: portal COMPARE / TO_BOOL write the portal
-    // frame. `MIFrame.capture_resumedata` only rewrites `MIFrame.pc` and
+    // inlined *Python* callee's fail bool there clobbers caller locals
+    // (`k` → PY_NULL). `run_orthodox_helper_subwalk` sets
+    // `inline_subwalk` even for a portal COMPARE, so that flag cannot
+    // name the producer; `transparent_helper_subwalk` is also set for
+    // `newbool` inside an inlined callee. `WalkSession.at_portal` is
+    // the producer: portal COMPARE / TO_BOOL write the portal frame.
+    // `MIFrame.capture_resumedata` only rewrites `MIFrame.pc` and
     // snapshots the existing boxes; an inlined Python callee is its own
     // `MIFrame` and must not index the portal array.
     let overlay_portal = ctx.session.borrow().at_portal();
-    let saved_vable = if overlay_portal {
-        crate::trace_opcode::save_vable_resume_scalars(ctx.trace_ctx)
-    } else {
-        Default::default()
-    };
     let nvs = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     let stack0_idx = nvs + retarget.nlocals;
     // `MIFrame._get_arrayitem_vable_index` asserts
@@ -6666,22 +6660,6 @@ pub(crate) fn walker_capture_newbool_completed_bool<Sym: WalkSym>(
         None
     };
     if let Some((fail, fail_val)) = fail {
-        let li = retarget.resume_py as i64 - 1;
-        let li_op = ctx.trace_ctx.const_int(li);
-        crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-            ctx.trace_ctx,
-            "last_instr",
-            li_op,
-            Value::Int(li),
-        );
-        let vsd = (retarget.nlocals + retarget.stack_depth) as i64;
-        let vsd_op = ctx.trace_ctx.const_int(vsd);
-        crate::trace_opcode::mirror_vable_static_to_boxes_nosync(
-            ctx.trace_ctx,
-            "valuestackdepth",
-            vsd_op,
-            Value::Int(vsd),
-        );
         // Live slots are `0..stack_depth`. The old `save_upto =
         // stack_depth.max(1)` inclusive dead tail (`nlocals + stack_depth`)
         // is past TOS; `_get_arrayitem_vable_index` would reject it.
@@ -6703,7 +6681,6 @@ pub(crate) fn walker_capture_newbool_completed_bool<Sym: WalkSym>(
                 Err(err) => {
                     ctx.outer_resume_marker_jit_pc = saved_marker;
                     ctx.frame_state.borrow_mut().outer_active_boxes = saved_active;
-                    crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);
                     for (idx, old) in saved_slots {
                         restore_vable_stack_entry(ctx.trace_ctx, idx, old);
                     }
@@ -6749,7 +6726,6 @@ pub(crate) fn walker_capture_newbool_completed_bool<Sym: WalkSym>(
         ctx,
         op_pc,
         GuardCaptureScope {
-            preserve_vable_last_instr: true,
             carried_resume_jit_pc: Some(retarget.marker),
             ..GuardCaptureScope::default()
         },
@@ -6758,7 +6734,6 @@ pub(crate) fn walker_capture_newbool_completed_bool<Sym: WalkSym>(
     ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.frame_state.borrow_mut().outer_active_boxes = saved_active;
     if overlay_portal {
-        crate::trace_opcode::restore_vable_resume_scalars(ctx.trace_ctx, saved_vable);
         for (idx, old) in saved_slots {
             restore_vable_stack_entry(ctx.trace_ctx, idx, old);
         }
@@ -7389,14 +7364,16 @@ pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
     let Some(obj) = walker_concrete_ref_object(ctx, r_args[0]) else {
         return Ok(None);
     };
-    if unsafe { !pyre_object::functional::is_exact_w_range(obj) } {
+    if obj.is_null() || unsafe { !pyre_object::functional::is_exact_w_range(obj) } {
         return Ok(None);
     }
     // `w_range_iter` is the range arm of `space.iter`, not the dispatching
     // body: the type test that selects it is recorded here.
     let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    let obj_pin = residual_call::owner_root_if_gc(obj as usize);
     walker_guard_fold_class(ctx, op_pc, r_args[0], range_type_addr)?;
-    try_walker_orthodox_descent(
+    let obj = pinned_obj(&obj_pin, obj);
+    let outcome = try_walker_orthodox_descent(
         ctx,
         op_pc,
         &[],
@@ -7405,7 +7382,9 @@ pub(crate) fn try_walker_orthodox_get_iter<Sym: WalkSym>(
         dst,
         dst_bank,
         &GET_ITER_DESCENT,
-    )
+    );
+    drop(obj_pin);
+    outcome
 }
 
 /// Empty BUILD_LIST residual: walk `make_empty_list` (`listobject.py`).
@@ -19711,7 +19690,8 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         concrete_one_past,
         concrete_promote_step,
     ) = unsafe {
-        if !pyre_object::functional::is_w_range(range_obj)
+        if range_obj.is_null()
+            || !pyre_object::functional::is_w_range(range_obj)
             || !pyre_object::functional::is_exact_w_range(range_obj)
         {
             return Ok(None);
@@ -19756,6 +19736,11 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     };
 
     let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
+    // Guards, getfields and `NewWithVtable` append to `opencoder.py
+    // Trace._ops` and can minor-collect. `w_range_iter`
+    // (`functional.py` `W_Range.descr_iter`) still needs this object;
+    // the FOR_ITER step-one fold pins the same way (`owner_root_if_gc`).
+    let range_pin = residual_call::owner_root_if_gc(range_obj as usize);
     walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
@@ -19905,6 +19890,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
 
     ctx.trace_ctx.heap_cache_mut().class_now_known(new);
 
+    let range_obj = pinned_obj(&range_pin, range_obj);
     let real_iter = unsafe { pyre_object::functional::w_range_iter(range_obj) };
     ctx.trace_ctx.set_opref_concrete(
         new,

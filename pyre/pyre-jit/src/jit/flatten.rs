@@ -1144,31 +1144,6 @@ impl Operand {
 /// `opname` field of `Insn::Op`, matching the tuple-shape exactly.
 pub const OPNAME_LIVE: &str = "-live-";
 
-/// Graph op the portal codewriter records for the
-/// `get_is_being_profiled` + `promote_greens` prefix of every
-/// instruction-start `jit_merge_point`.
-///
-/// `interp_jit.py PyFrame.dispatch` holds one loop head:
-/// `jit_merge_point(..., next_instr, pycode, is_being_profiled)` then
-/// `handle_bytecode`, then
-/// `is_being_profiled = self.get_is_being_profiled()`.
-/// `pyframe.py PyFrame.get_is_being_profiled` reads `debugdata` (a
-/// virtualizable field) and, when non-null,
-/// `FrameDebugData.is_being_profiled`. `jtransform.py promote_greens`
-/// then `{kind}_guard_value`s every Variable green.
-///
-/// Pyre unrolls that loop per instruction, so flatten lowers each copy
-/// to `goto pmg_shared` and emits one out-of-line block per jitcode,
-/// matching the single copy in the dispatch loop.
-pub const OPNAME_PORTAL_MERGE_GREENS: &str = "portal_merge_greens";
-
-/// `interp_jit.py PyFrame._virtualizable_`: debugdata is field 3.
-const PMG_DEBUGDATA_FIELD_IDX: u16 = 3;
-
-const SHARED_PMG_LABEL: &str = "pmg_shared";
-const SHARED_PMG_NONNULL_LABEL: &str = "pmg_nonnull";
-const SHARED_PMG_JOIN_LABEL: &str = "pmg_join";
-
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
 /// The three RPython tuple shapes enumerated above: `Label`, `---`
@@ -1315,19 +1290,6 @@ pub struct GraphFlattener<'a> {
     /// `TLabel(link)` shapes emitted at canraise / switch sites.
     link_names: Vec<(LinkRef, String)>,
     next_label_id: usize,
-    /// `(frame, next_instr, pycode, profiled)` registers of the one
-    /// out-of-line `get_is_being_profiled` + `promote_greens` block.
-    /// Recorded from the first `portal_merge_greens` copy; later copies
-    /// must resolve to the same four.
-    portal_merge_regs: Option<(Register, Register, Register, Register)>,
-    /// RED registers of every `jit_merge_point` (Int, Ref, Float lists
-    /// in that order). Recorded from the first copy; later copies must
-    /// share the same list. Forced alive on `pmg_shared` `-live-`
-    /// markers (`liveness.py` args-on-`-live-`).
-    portal_merge_reds: Option<Vec<Register>>,
-    /// `(next_instr, body_label)` so the shared block can switch back
-    /// after promoting the greens.
-    portal_merge_bodies: Vec<(i64, String)>,
     /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
     /// opnames from the four retired families (BINARY_OP / COMPARE_OP
     /// / BOOL / SETITEM) through
@@ -1410,9 +1372,6 @@ impl<'a> GraphFlattener<'a> {
             block_names: Vec::new(),
             link_names: Vec::new(),
             next_label_id: 0,
-            portal_merge_regs: None,
-            portal_merge_reds: None,
-            portal_merge_bodies: Vec::new(),
             lowering_ctx: None,
         }
     }
@@ -1519,14 +1478,7 @@ impl<'a> GraphFlattener<'a> {
                 self.ssarepr.pc_run_insn_pos.push((pos, py_pc));
             }
         }
-        if op.opname == OPNAME_PORTAL_MERGE_GREENS {
-            self.serialize_portal_merge_greens(op);
-            return;
-        }
         let insn = self.flatten_space_operation(op);
-        if op.opname == "jit_merge_point" {
-            self.record_jit_merge_point_reds(&insn);
-        }
         // `jtransform.py:467-482` appends a `-live-` AFTER a call op so the
         // metainterp can snapshot the post-call resume state for
         // `guard_no_exception` (residual) / inline-call boundaries:
@@ -1551,199 +1503,6 @@ impl<'a> GraphFlattener<'a> {
         self.ssarepr.insns.push(insn);
     }
 
-    /// Fresh color past every graph-allocated one.  The assembler freezes
-    /// `num_regs_*` from `num_colors`, so the bump has to happen before
-    /// `try_assemble` (`assembler.py` `Assembler.emit_reg`).
-    fn alloc_scratch_reg(&mut self, kind: Kind) -> Register {
-        let alloc = &mut self.regallocs[kind.index()];
-        let color = alloc.num_colors;
-        alloc.num_colors += 1;
-        Register::new(kind, color)
-    }
-
-    /// Each unrolled instruction jumps to the one
-    /// `get_is_being_profiled` + `promote_greens` copy, then the shared
-    /// block switches on `next_instr` back to op3.  The walker follows
-    /// that `goto` through the generic opimpls (`pyjitpl.py`
-    /// `opimpl_goto`, `opimpl_goto_if_not_ptr_iszero`,
-    /// `implement_guard_value`, `opimpl_switch`); after the three
-    /// promote guards `next_instr` is ConstInt and the switch jumps to
-    /// the body.  Blackhole runs the same switch.
-    fn serialize_portal_merge_greens(&mut self, op: &SpaceOperation) {
-        let frame = match op.args.first() {
-            Some(arg) => self.expect_portal_merge_reg(arg, "frame"),
-            None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing frame"),
-        };
-        let next_instr = match op.args.get(1) {
-            Some(arg) => self.expect_portal_merge_reg(arg, "next_instr"),
-            None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing next_instr"),
-        };
-        let pycode = match op.args.get(2) {
-            Some(arg) => self.expect_portal_merge_reg(arg, "pycode"),
-            None => panic!("{OPNAME_PORTAL_MERGE_GREENS} missing pycode"),
-        };
-        let profiled = match &op.result {
-            Some(FlowValue::Variable(variable)) => self.getcolor_var(*variable),
-            other => panic!(
-                "{OPNAME_PORTAL_MERGE_GREENS} result must be the profiled Variable, got {other:?}"
-            ),
-        };
-        let regs = (frame, next_instr, pycode, profiled);
-        match self.portal_merge_regs {
-            None => self.portal_merge_regs = Some(regs),
-            Some(first) => {
-                assert!(
-                    first == regs,
-                    "{OPNAME_PORTAL_MERGE_GREENS} copies must share \
-                     frame/next_instr/pycode/profiled registers, first={first:?} this={regs:?}"
-                );
-            }
-        }
-        let body_name = format!("pmg{}", self.next_label_id);
-        self.next_label_id += 1;
-        self.portal_merge_bodies
-            .push((op.offset, body_name.clone()));
-        // Stay a regular op through `compute_liveness`.  `goto pmg_shared`
-        // plus `switch` would `follow_label` every body (`liveness.py`)
-        // and union those lives into every instruction-start `-live-`;
-        // the extra Int colors are unbound at trace start
-        // (`GuardResumeCoordinateUnavailable`).  `attach_portal_merge_greens_gotos`
-        // rewrites this op to `goto` + body label after liveness.
-        self.emitline(Insn::op_with_result(
-            OPNAME_PORTAL_MERGE_GREENS,
-            vec![
-                Operand::Register(frame),
-                Operand::Register(next_instr),
-                Operand::Register(pycode),
-                Operand::TLabel(TLabel::new(body_name)),
-            ],
-            profiled,
-        ));
-    }
-
-    fn expect_portal_merge_reg(&mut self, arg: &SpaceOperationArg, what: &str) -> Register {
-        match self.flatten_arg(arg) {
-            Operand::Register(reg) => reg,
-            other => {
-                panic!("{OPNAME_PORTAL_MERGE_GREENS} {what} must be a register, got {other:?}")
-            }
-        }
-    }
-
-    /// `jtransform.py handle_jit_marker__jit_merge_point`: args are
-    /// `jd, greens I/R/F, reds I/R/F`. Collect the RED registers of
-    /// all kinds in that order.
-    fn record_jit_merge_point_reds(&mut self, insn: &Insn) {
-        let Insn::Op { args, .. } = insn else {
-            return;
-        };
-        let mut reds = Vec::new();
-        for list_arg in args.get(4..7).into_iter().flatten() {
-            let Operand::ListOfKind(list) = list_arg else {
-                continue;
-            };
-            for item in &list.content {
-                if let Operand::Register(reg) = *item {
-                    reds.push(reg);
-                }
-            }
-        }
-        match &self.portal_merge_reds {
-            None => self.portal_merge_reds = Some(reds),
-            Some(first) => {
-                assert!(
-                    first == &reds,
-                    "jit_merge_point copies must share reds, first={first:?} this={reds:?}"
-                );
-            }
-        }
-    }
-
-    fn emit_shared_portal_merge_greens(&mut self) {
-        let Some((frame, next_instr, pycode, profiled)) = self.portal_merge_regs.take() else {
-            return;
-        };
-        let reds = self.portal_merge_reds.take();
-        let bodies = std::mem::take(&mut self.portal_merge_bodies);
-        if bodies.is_empty() {
-            return;
-        }
-        let Some(reds) = reds else {
-            panic!(
-                "pmg_shared has bodies but no jit_merge_point reds were recorded; \
-                 every pmgN body reaches jit_merge_point"
-            );
-        };
-        let live_reds: Vec<Operand> = reds.iter().copied().map(Operand::Register).collect();
-        let debugdata_dst = self.alloc_scratch_reg(Kind::Ref);
-        self.emitline(Insn::Label(Label::new(SHARED_PMG_LABEL)));
-        // `liveness.py compute_liveness`: register args on a `-live-` are
-        // forced alive.  `compute_liveness` runs before
-        // `attach_portal_merge_greens_gotos` adds the `switch` targets, so
-        // `follow_label` cannot see the `pmgN` live-in; every body reaches
-        // `jit_merge_point`, whose reds are that shared live-in.
-        self.emitline(Insn::live(live_reds.clone()));
-        self.emitline(Insn::op_with_result(
-            "getfield_vable_r",
-            vec![
-                Operand::Register(frame),
-                Operand::descr_vable_static_field(PMG_DEBUGDATA_FIELD_IDX),
-            ],
-            debugdata_dst,
-        ));
-        // `jtransform.py optimize_goto_if_not`: the graph diamond carried
-        // `-live-before` on the `ptr_iszero` exitswitch, which flatten
-        // emits as a `-live-` immediately before the fused branch.
-        self.emitline(Insn::live(live_reds.clone()));
-        self.emitline(Insn::op(
-            "goto_if_not_ptr_iszero",
-            vec![
-                Operand::Register(debugdata_dst),
-                Operand::TLabel(TLabel::new(SHARED_PMG_NONNULL_LABEL)),
-            ],
-        ));
-        self.emitline(Insn::op_with_result(
-            "int_copy",
-            vec![Operand::ConstInt(0)],
-            profiled,
-        ));
-        self.emitline(Insn::op(
-            "goto",
-            vec![Operand::TLabel(TLabel::new(SHARED_PMG_JOIN_LABEL))],
-        ));
-        self.emitline(Insn::Label(Label::new(SHARED_PMG_NONNULL_LABEL)));
-        let profiled_descr = flatten_descr_by_ptr(&super::flow::DescrByPtr(
-            pyre_jit_trace::descr::frame_debug_data_is_being_profiled_descr(),
-        ));
-        self.emitline(Insn::op_with_result(
-            "getfield_gc_i",
-            vec![Operand::Register(debugdata_dst), profiled_descr],
-            profiled,
-        ));
-        self.emitline(Insn::Label(Label::new(SHARED_PMG_JOIN_LABEL)));
-        for (opname, green) in [
-            ("int_guard_value", Operand::Register(next_instr)),
-            ("int_guard_value", Operand::Register(profiled)),
-            ("ref_guard_value", Operand::Register(pycode)),
-        ] {
-            self.emitline(Insn::live(live_reds.clone()));
-            self.emitline(Insn::op(opname, vec![green]));
-        }
-        let mut switchdict = SwitchDictDescr::new();
-        for (pc, body) in &bodies {
-            switchdict.labels.push((*pc, TLabel::new(body.clone())));
-        }
-        self.emitline(Insn::live(live_reds));
-        self.emitline(Insn::op(
-            "switch",
-            vec![
-                Operand::Register(next_instr),
-                Operand::descr(DescrOperand::SwitchDict(switchdict)),
-            ],
-        ));
-        self.emitline(Insn::op("unreachable", Vec::new()));
-        self.emitline(Insn::Unreachable);
-    }
     /// `flatten.py popline`: pop the most recently emitted
     /// insn off `ssarepr.insns`.  Used by the `_ovf` rewrite at
     /// `flatten.py line = self.popline()` to retract the arithmetic
@@ -2586,7 +2345,11 @@ impl<'a> GraphFlattener<'a> {
     /// stacking one Rust frame per canraise block.
     pub fn generate_ssa_form(&mut self) {
         self.seen_blocks.clear();
-        let mut work = vec![FlattenWork::Block(self.graph.startblock.clone(), false, None)];
+        let mut work = vec![FlattenWork::Block(
+            self.graph.startblock.clone(),
+            false,
+            None,
+        )];
         while let Some(item) = work.pop() {
             match item {
                 FlattenWork::Block(block, handling_ovf, incoming) => {
@@ -2655,7 +2418,6 @@ impl<'a> GraphFlattener<'a> {
                 }
             }
         }
-        self.emit_shared_portal_merge_greens();
     }
 
     /// `flatten.py` `make_bytecode_block`. A user frame with a long
@@ -2945,56 +2707,6 @@ impl<'a> GraphFlattener<'a> {
     fn lower_constant_op(&self, c: &Constant) -> Operand {
         flatten_constant_operand(c)
     }
-}
-
-/// Rewrite each `portal_merge_greens` op to `goto pmg_shared` plus its
-/// body label, after `compute_liveness` has already run.
-///
-/// Flatten keeps the graph op through liveness so `follow_label` on the
-/// shared `switch` cannot union every body's live-in into the
-/// instruction-start `-live-`.  Assembler and the walker still see the
-/// factored `goto`; the walker follows it into `pmg_shared`
-/// (`opimpl_goto`) and the shared `switch` (`opimpl_switch`) jumps
-/// back to the body.
-///
-/// Returns `old_insn_index -> new_insn_index` for side tables built
-/// before the rewrite.
-pub(crate) fn attach_portal_merge_greens_gotos(ssarepr: &mut SSARepr) -> Vec<usize> {
-    let old_len = ssarepr.insns.len();
-    let mut remap = vec![0usize; old_len];
-    let mut new_insns = Vec::with_capacity(old_len);
-    for (i, insn) in ssarepr.insns.iter().cloned().enumerate() {
-        remap[i] = new_insns.len();
-        match &insn {
-            Insn::Op { opname, args, .. } if opname == OPNAME_PORTAL_MERGE_GREENS => {
-                let body_name = args.iter().find_map(|arg| match arg {
-                    Operand::TLabel(label) => Some(label.name.clone()),
-                    _ => None,
-                });
-                let Some(body_name) = body_name else {
-                    panic!("{OPNAME_PORTAL_MERGE_GREENS} missing body TLabel, args={args:?}");
-                };
-                new_insns.push(Insn::op(
-                    "goto",
-                    vec![Operand::TLabel(TLabel::new(SHARED_PMG_LABEL))],
-                ));
-                new_insns.push(Insn::Label(Label::new(body_name)));
-            }
-            _ => new_insns.push(insn),
-        }
-    }
-    ssarepr.insns = new_insns;
-    let map_pos = |pos: usize| remap.get(pos).copied().unwrap_or(pos);
-    for (_, pos) in ssarepr.pc_first_insn_pos.iter_mut() {
-        *pos = map_pos(*pos);
-    }
-    for (pos, _) in ssarepr.abort_permanent_insn_pos.iter_mut() {
-        *pos = map_pos(*pos);
-    }
-    for (pos, _) in ssarepr.pc_run_insn_pos.iter_mut() {
-        *pos = map_pos(*pos);
-    }
-    remap
 }
 
 /// Look up the regalloc color for `v` in the per-Kind `regallocs` table
