@@ -22,7 +22,10 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::codewriter::call::array_type_id_of_lltype;
+use crate::codewriter::call::{
+    array_type_id_of_lltype, effect_malloc_flavor_is_raw, effect_malloc_owner,
+    effect_malloc_raw_flags, effect_malloc_type,
+};
 use crate::flowspace::model::{
     Block, BlockRef, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
     SpaceOperation, Variable,
@@ -6211,19 +6214,16 @@ fn search_non_void_args(args: &[Hlvalue]) -> impl Iterator<Item = &Hlvalue> {
     })
 }
 
-/// Choose the UnaryOp carrier for an llop in the search-helper effect graph.
-///
-/// `GraphAnalyzer.analyze_simple_operation` reads only `op.opname`. The
-/// operand is the last non-Void operand, else the last Variable operand.
-/// Void Constants are never materialised.
-fn search_unaryop_operand(args: &[Hlvalue]) -> Option<(&Hlvalue, Vec<&Hlvalue>)> {
-    let non_void: Vec<&Hlvalue> = search_non_void_args(args).collect();
-    if let Some((last, rest)) = non_void.split_last() {
-        return Some((*last, rest.to_vec()));
-    }
-    args.iter()
-        .rfind(|hlv| matches!(hlv, Hlvalue::Variable(_)))
-        .map(|last| (last, Vec::new()))
+/// AddressOffset in `search_materialize` becomes `ConstInt(0)` with
+/// concretetype Signed. BinOp / ArrayRead / Call still need a Variable
+/// operand. The effect graph is only read by the effect analyzers
+/// (`effectinfo`), never executed.
+fn search_placeholder_operand(out: &mut ModelGraph, block: BlockId) -> Variable {
+    let result = out
+        .push_op_var(block, OpKind::ConstInt(0), true)
+        .expect("constant op produces a result var");
+    result.set_concretetype(Some(LowLevelType::Signed));
+    result
 }
 
 fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Variable {
@@ -6234,11 +6234,7 @@ fn search_materialize(out: &mut ModelGraph, block: BlockId, hlv: &Hlvalue) -> Va
             // (`effectinfo`), never executed, so a symbolic offset contributes
             // no value.
             if matches!(&c.value, ConstValue::AddressOffset(_)) {
-                let result = out
-                    .push_op_var(block, OpKind::ConstInt(0), true)
-                    .expect("constant op produces a result var");
-                result.set_concretetype(Some(LowLevelType::Signed));
-                return result;
+                return search_placeholder_operand(out, block);
             }
             crate::codewriter::jtransform_opname::materialize_constant(
                 out,
@@ -6290,25 +6286,6 @@ fn search_owner_root(base: &Variable) -> Option<String> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn search_malloc_owner(hlv: &Hlvalue) -> String {
-    match hlv {
-        Hlvalue::Constant(c) => match &c.value {
-            ConstValue::LowLevelType(lltype) => match &**lltype {
-                LowLevelType::Struct(s) => s._name.clone(),
-                other => panic!(
-                    "effect_graph_from_search_helper: malloc type operand is not a Struct: {other:?}"
-                ),
-            },
-            other => panic!(
-                "effect_graph_from_search_helper: malloc first operand is not a LowLevelType const: {other:?}"
-            ),
-        },
-        Hlvalue::Variable(_) => {
-            panic!("effect_graph_from_search_helper: malloc first operand is a Variable")
-        }
     }
 }
 
@@ -6445,23 +6422,57 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
         }
         "malloc" => {
-            let owner = search_malloc_owner(&op.args[0]);
+            let owner = effect_malloc_owner(&op.args[0]);
             let result = search_expect_var(&op.result);
-            out.push_op_with_result_var(block, OpKind::New { owner }, result);
+            let raw = op.args.get(1).is_some_and(effect_malloc_flavor_is_raw);
+            let kind = if raw {
+                let (zero, track_allocation, add_memory_pressure, extra_flags) =
+                    effect_malloc_raw_flags(&op.args[1]);
+                OpKind::raw_malloc_with_flags(
+                    owner,
+                    Some(effect_malloc_type(&op.args[0])),
+                    zero,
+                    track_allocation,
+                    add_memory_pressure,
+                    extra_flags,
+                    None,
+                )
+            } else {
+                OpKind::New { owner }
+            };
+            out.push_op_with_result_var(block, kind, result);
         }
         "malloc_varsize" => {
             let length = search_materialize(out, block, &op.args[2]);
             let result = search_expect_var(&op.result);
-            let array_type_id = search_array_type_id(&result);
-            out.push_op_with_result_var(
-                block,
-                OpKind::NewArray {
-                    length,
-                    item_ty: ValueType::Int,
-                    array_type_id,
-                },
-                result,
-            );
+            if op.args.get(1).is_some_and(effect_malloc_flavor_is_raw) {
+                let (zero, track_allocation, add_memory_pressure, extra_flags) =
+                    effect_malloc_raw_flags(&op.args[1]);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::raw_malloc_with_flags(
+                        effect_malloc_owner(&op.args[0]),
+                        Some(effect_malloc_type(&op.args[0])),
+                        zero,
+                        track_allocation,
+                        add_memory_pressure,
+                        extra_flags,
+                        Some(length),
+                    ),
+                    result,
+                );
+            } else {
+                let array_type_id = search_array_type_id(&result);
+                out.push_op_with_result_var(
+                    block,
+                    OpKind::NewArray {
+                        length,
+                        item_ty: ValueType::Int,
+                        array_type_id,
+                    },
+                    result,
+                );
+            }
         }
         "getfield" => {
             let base = search_expect_var(&op.args[0]);
@@ -6499,6 +6510,21 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
                 false,
             );
         }
+        // `FreshMallocs.__init__` (`writeanalyze.py`): `same_as` /
+        // `cast_pointer` of a fresh malloc stays fresh.
+        name @ ("same_as" | "cast_pointer") => {
+            let operand = search_materialize(out, block, &op.args[0]);
+            let result = search_expect_var(&op.result);
+            out.push_op_with_result_var(
+                block,
+                OpKind::UnaryOp {
+                    op: name.to_string(),
+                    operand,
+                    result_ty: search_value_type_of(&result),
+                },
+                result,
+            );
+        }
         name @ ("cast_ptr_to_adr"
         | "cast_adr_to_ptr"
         | "cast_primitive"
@@ -6507,13 +6533,14 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
         | "cast_int_to_char"
         | "cast_unichar_to_int"
         | "cast_int_to_unichar") => {
+            // Keep the llop name: `FreshMallocs.__init__` aliases only
+            // `cast_pointer` / `same_as`, so these results are nonfresh.
             let operand = search_materialize(out, block, &op.args[0]);
             let result = search_expect_var(&op.result);
-            let _ = name;
             out.push_op_with_result_var(
                 block,
                 OpKind::UnaryOp {
-                    op: "same_as".to_string(),
+                    op: name.to_string(),
                     operand,
                     result_ty: search_value_type_of(&result),
                 },
@@ -6553,28 +6580,16 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             );
         }
         name @ ("gc_id" | "gc_fq_register" | "debug_assert" | "gc_writebarrier") => {
-            // `GraphAnalyzer.analyze_simple_operation` reads only the
-            // opname; the UnaryOp operand is the carrier the effect graph
-            // needs, taken from the last non-Void operand, else the last
-            // Variable operand. Void Constants are never materialised.
-            let Some((last, rest)) = search_unaryop_operand(&op.args) else {
-                panic!(
-                    "effect_graph_from_search_helper: {name} has no operand the effect graph can carry"
-                );
-            };
-            for arg in rest {
-                if matches!(arg, Hlvalue::Variable(_)) {
-                    let _ = search_materialize(out, block, arg);
-                }
-            }
-            let operand = search_materialize(out, block, last);
+            // Generic llops keep the original argument list
+            // (`SpaceOperation.args`); analyzers read the opname
+            // (`GraphAnalyzer.analyze_simple_operation`). Void Constants
+            // stay in `args` as `LinkArg::Const`.
             let result = search_expect_var(&op.result);
             out.push_op_with_result_var(
                 block,
-                OpKind::UnaryOp {
-                    op: name.to_string(),
-                    operand,
-                    result_ty: search_value_type_of(&result),
+                OpKind::LoweredBlackholeOp {
+                    opname: name.to_string(),
+                    args: op.args.iter().map(|a| search_linkarg(a)).collect(),
                 },
                 result,
             );
@@ -6583,35 +6598,20 @@ fn search_transduce_op(out: &mut ModelGraph, block: BlockId, op: &SpaceOperation
             // `graphanalyze.py GraphAnalyzer.analyze` follows only
             // `direct_call` / `indirect_call`; every other llop is
             // `analyze_simple_operation` with the `lloperation.py` flags.
-            // UnaryOp keeps the llop name so analyzers consult
-            // `ll_operations()`, matching `effect_graph_from_rtyped_helper`.
-            // `GraphAnalyzer.analyze_simple_operation` reads only the
-            // opname; the UnaryOp operand is the carrier the effect graph
-            // needs, taken from the last non-Void operand, else the last
-            // Variable operand. Void Constants are never materialised.
+            // Generic llops keep the original argument list
+            // (`SpaceOperation.args`); analyzers read the opname
+            // (`GraphAnalyzer.analyze_simple_operation`).
             if other != "direct_call"
                 && other != "indirect_call"
                 && crate::translator::rtyper::lltypesystem::lloperation::ll_operations()
                     .contains_key(other)
             {
-                let Some((last, rest)) = search_unaryop_operand(&op.args) else {
-                    panic!(
-                        "effect_graph_from_search_helper: {other} has no operand the effect graph can carry"
-                    );
-                };
-                for arg in rest {
-                    if matches!(arg, Hlvalue::Variable(_)) {
-                        let _ = search_materialize(out, block, arg);
-                    }
-                }
-                let operand = search_materialize(out, block, last);
                 let result = search_expect_var(&op.result);
                 out.push_op_with_result_var(
                     block,
-                    OpKind::UnaryOp {
-                        op: other.to_string(),
-                        operand,
-                        result_ty: search_value_type_of(&result),
+                    OpKind::LoweredBlackholeOp {
+                        opname: other.to_string(),
+                        args: op.args.iter().map(|a| search_linkarg(a)).collect(),
                     },
                     result,
                 );
@@ -6816,9 +6816,9 @@ mod tests {
         );
     }
 
-    /// `keepalive(v)` with Void-typed Variable `v` still becomes UnaryOp.
-    /// `GraphAnalyzer.analyze_simple_operation` reads only the opname;
-    /// the last Variable is the carrier when every operand is Void.
+    /// `keepalive(v)` with Void-typed Variable `v` keeps the original
+    /// argument list (`SpaceOperation.args`); analyzers read the opname
+    /// (`GraphAnalyzer.analyze_simple_operation`).
     #[test]
     fn search_helper_effect_graph_accepts_void_variable_keepalive() {
         let kept = v("kept", LowLevelType::Void);
@@ -6826,20 +6826,155 @@ mod tests {
         let result = v("v", LowLevelType::Void);
         let graph =
             FunctionGraph::with_return_var("ka_void".to_string(), startblock.clone(), hl(&result));
-        emit(&startblock, "keepalive", vec![hl(&kept)], result.clone());
+        let args = vec![hl(&kept)];
+        emit(&startblock, "keepalive", args.clone(), result.clone());
         ret(&startblock, hl(&result), graph.returnblock.clone());
         let effect = effect_graph_from_search_helper(&graph);
-        assert!(
-            effect.iter_block_ops().any(|(_, op)| matches!(
-                &op.kind,
-                OpKind::UnaryOp { op, .. } if op == "keepalive"
-            )),
+        let got = effect.iter_block_ops().find_map(|(_, op)| match &op.kind {
+            OpKind::LoweredBlackholeOp { opname, args } if opname == "keepalive" => {
+                Some(args.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            Some(args.iter().map(|a| search_linkarg(a)).collect()),
             "keepalive Void Variable: {:?}",
             effect
                 .iter_block_ops()
                 .map(|(_, op)| format!("{:?}", op.kind))
                 .collect::<Vec<_>>()
         );
+        assert!(
+            !effect
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::ConstInt(_))),
+            "no ConstInt(0) placeholder"
+        );
+    }
+
+    /// `keepalive(Constant(Int(1), Void))` keeps the Void Constant in
+    /// `args` as `LinkArg::Const`. Analyzers read the opname
+    /// (`GraphAnalyzer.analyze_simple_operation`); nothing is
+    /// materialised for the llop.
+    #[test]
+    fn search_helper_effect_graph_accepts_all_void_constant_keepalive() {
+        let startblock = blk(vec![]);
+        let result = v("v", LowLevelType::Void);
+        let graph =
+            FunctionGraph::with_return_var("ka_void".to_string(), startblock.clone(), hl(&result));
+        let args = vec![constant_with_lltype(ConstValue::Int(1), LowLevelType::Void)];
+        emit(&startblock, "keepalive", args.clone(), result.clone());
+        ret(&startblock, hl(&result), graph.returnblock.clone());
+        let effect = effect_graph_from_search_helper(&graph);
+        let got = effect.iter_block_ops().find_map(|(_, op)| match &op.kind {
+            OpKind::LoweredBlackholeOp { opname, args } if opname == "keepalive" => {
+                Some(args.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(
+            got,
+            Some(args.iter().map(|a| search_linkarg(a)).collect()),
+            "keepalive Void Constant: {:?}",
+            effect
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !effect
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::ConstInt(_))),
+            "no ConstInt(0) placeholder"
+        );
+    }
+
+    /// `CollectAnalyzer.analyze_simple_operation`: `flavor == 'raw'` is
+    /// not a GC allocation, so the search-helper converter emits
+    /// `RawMalloc` rather than `NewArray`.
+    #[test]
+    fn search_helper_raw_malloc_varsize_is_raw_malloc() {
+        let length = v("n", LowLevelType::Signed);
+        let array_ll = LowLevelType::Array(Box::new(Array::gc(LowLevelType::Char)));
+        let ptr_ll =
+            LowLevelType::from(Ptr::from_container_type(array_ll.clone()).expect("array ptr"));
+        let result = v("buf", ptr_ll);
+        let startblock = blk(vec![length.clone()]);
+        let graph =
+            FunctionGraph::with_return_var("raw_mv".to_string(), startblock.clone(), hl(&result));
+        let flags = constant_with_lltype(
+            ConstValue::Dict(std::sync::Arc::new(indexmap::IndexMap::from([(
+                ConstValue::byte_str("flavor"),
+                ConstValue::byte_str("raw"),
+            )]))),
+            LowLevelType::Void,
+        );
+        emit(
+            &startblock,
+            "malloc_varsize",
+            vec![lowlevel_type_const(array_ll), flags, hl(&length)],
+            result.clone(),
+        );
+        ret(&startblock, hl(&result), graph.returnblock.clone());
+        let effect = effect_graph_from_search_helper(&graph);
+        assert!(
+            effect
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::RawMalloc { .. })),
+            "raw malloc_varsize: {:?}",
+            effect
+                .iter_block_ops()
+                .map(|(_, op)| format!("{:?}", op.kind))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !effect
+                .iter_block_ops()
+                .any(|(_, op)| matches!(op.kind, OpKind::NewArray { .. })),
+            "raw malloc_varsize is not NewArray"
+        );
+    }
+
+    /// `FreshMallocs.__init__` (`writeanalyze.py`): `same_as` / `cast_pointer`
+    /// stay `UnaryOp` aliases (not `LoweredBlackholeOp`).
+    #[test]
+    fn search_helper_same_as_and_cast_pointer_are_unary_aliases() {
+        for alias in ["same_as", "cast_pointer"] {
+            let st = Struct::gc("S", vec![("x".to_string(), LowLevelType::Signed)]);
+            let ptr_ll = LowLevelType::from(
+                Ptr::from_container_type(LowLevelType::Struct(Box::new(st.clone())))
+                    .expect("struct ptr"),
+            );
+            let startblock = blk(vec![]);
+            let void = v("v", LowLevelType::Void);
+            let graph = FunctionGraph::with_return_var(
+                format!("alias_{alias}"),
+                startblock.clone(),
+                hl(&void),
+            );
+            let p = emit_malloc_struct(&startblock, st, ptr_ll.clone(), "p").expect("malloc");
+            let aliased = emit_un(&startblock, alias, hl(&p), "alias", ptr_ll);
+            emit_setfield(
+                &startblock,
+                &aliased,
+                "x",
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+            );
+            ret(&startblock, hl(&void), graph.returnblock.clone());
+            let effect = effect_graph_from_search_helper(&graph);
+            assert!(
+                effect.iter_block_ops().any(|(_, op)| matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, .. } if op == alias
+                )),
+                "{alias} UnaryOp: {:?}",
+                effect
+                    .iter_block_ops()
+                    .map(|(_, op)| format!("{:?}", op.kind))
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

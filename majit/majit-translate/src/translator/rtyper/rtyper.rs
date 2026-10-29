@@ -934,7 +934,9 @@ impl RPythonTyper {
             return Ok(LowLevelFunction::from_pygraph(name, args, result, graph));
         }
 
-        let graph = Rc::new(builder(self, &args, &result)?);
+        let graph = builder(self, &args, &result)?;
+        self.convert_helper_exception_links(&graph)?;
+        let graph = Rc::new(graph);
         self.lowlevel_helper_graphs
             .borrow_mut()
             .insert(key, graph.clone());
@@ -949,6 +951,105 @@ impl RPythonTyper {
             .borrow_mut()
             .push(graph.graph.clone());
         Ok(LowLevelFunction::from_pygraph(name, args, result, graph))
+    }
+
+    /// Synthesized helper graphs skip `RPythonTyper.specialize_block`, so
+    /// exception-handler links keep the host-class `exitcase` that
+    /// `Link::new` stores. `RPythonTyper.specialize_block` →
+    /// `_convert_link` (`rtyper.py`) sets
+    /// `link.llexitcase = rclass.get_type_repr(self).convert_const(link.exitcase)`
+    /// for every exit of a `canraise` block; replay that conversion here.
+    ///
+    /// `insert_link_conversions` also rewrites every Constant link
+    /// argument through `inputconst(r_a2, a1.value)`, where `r_a2` is
+    /// the repr of the target block's inputarg. For a link into the
+    /// graph's `exceptblock`, those reprs are
+    /// `exceptiondata.r_exception_type` (class → vtable pointer) and
+    /// `exceptiondata.r_exception_value` (instance → instance pointer).
+    /// Replay that rewrite for host-object Constants on exceptblock
+    /// links so the helper raises the same low-level pair a converted
+    /// caller catches.
+    ///
+    /// Blocks that are not `canraise` are left untouched for
+    /// `llexitcase`: their Variable exitswitches are not annotated, so
+    /// `_convert_link` cannot run on them. Graphs with neither a
+    /// `canraise` block nor exceptblock host-object Constants still
+    /// construct when `rootclass_repr` is unset.
+    fn convert_helper_exception_links(&self, graph: &PyGraph) -> Result<(), TyperError> {
+        let (exceptblock, blocks) = {
+            let inner = graph.graph.borrow();
+            (inner.exceptblock.clone(), inner.iterblocks())
+        };
+        let mut canraise_exits: Vec<(BlockRef, Vec<LinkRef>)> = Vec::new();
+        let mut exceptblock_host_links: Vec<LinkRef> = Vec::new();
+        for block in &blocks {
+            let (canraise, exits) = {
+                let b = block.borrow();
+                (b.canraise(), b.exits.clone())
+            };
+            if canraise {
+                canraise_exits.push((block.clone(), exits.clone()));
+            }
+            for link in &exits {
+                let targets_except = match link.borrow().target.as_ref() {
+                    Some(t) => Rc::ptr_eq(t, &exceptblock),
+                    None => false,
+                };
+                if !targets_except {
+                    continue;
+                }
+                let args = link.borrow().args.clone();
+                let host_const = |i: usize| {
+                    matches!(
+                        args.get(i).and_then(|a| a.as_ref()),
+                        Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::HostObject(_))
+                    )
+                };
+                if host_const(0) || host_const(1) {
+                    exceptblock_host_links.push(link.clone());
+                }
+            }
+        }
+        if canraise_exits.is_empty() && exceptblock_host_links.is_empty() {
+            return Ok(());
+        }
+        // `RPythonTyper.specialize` (`rtyper.py`) runs
+        // `exceptiondata.finish` and `assign_inheritance_ids` before
+        // `specialize_block` → `_convert_link` / `insert_link_conversions`.
+        // Helper graphs skip that prelude; `ClassRepr.convert_const` and
+        // `inputconst` still need class reprs and inheritance ids to
+        // materialise exception vtables.
+        let exceptiondata_available = self.rootclass_repr.borrow().is_some();
+        if exceptiondata_available {
+            let rtyper = self.self_rc()?;
+            rtyper.finish_exceptiondata()?;
+            if let Some(ann) = self.annotator.upgrade() {
+                crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+            }
+        }
+        for (block, exits) in canraise_exits {
+            for link in exits {
+                self._convert_link(&block, &link)?;
+            }
+        }
+        if exceptiondata_available {
+            let exceptiondata = self.exceptiondata()?;
+            for link in &exceptblock_host_links {
+                let args = link.borrow().args.clone();
+                for (i, repr) in [
+                    (0, &exceptiondata.r_exception_type),
+                    (1, &exceptiondata.r_exception_value),
+                ] {
+                    if let Some(Hlvalue::Constant(c)) = args.get(i).and_then(|a| a.as_ref()) {
+                        if matches!(c.value, ConstValue::HostObject(_)) {
+                            let typed = inputconst(repr.as_ref(), &c.value)?;
+                            link.borrow_mut().args[i] = Some(Hlvalue::Constant(typed));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// RPython `RPythonTyper.annotation(self, var)` (rtyper.py).
@@ -5298,11 +5399,15 @@ fn lowlevel_signed_wide_py_div_helper_graph(
         vec![Hlvalue::Variable(r.clone()), Hlvalue::Variable(y.clone())],
         Hlvalue::Variable(p.clone()),
     ));
+    let zero = match &lltype {
+        LowLevelType::SignedLongLongLong => ConstValue::Int128(0),
+        _ => ConstValue::Int(0),
+    };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         format!("{opprefix}_lt"),
         vec![
             Hlvalue::Variable(y),
-            constant_with_lltype(ConstValue::Int(0), lltype.clone()),
+            constant_with_lltype(zero, lltype.clone()),
         ],
         Hlvalue::Variable(y_is_neg.clone()),
     ));
@@ -5460,11 +5565,15 @@ fn lowlevel_signed_wide_py_mod_helper_graph(
         vec![Hlvalue::Variable(x), Hlvalue::Variable(y.clone())],
         Hlvalue::Variable(r.clone()),
     ));
+    let zero = match &lltype {
+        LowLevelType::SignedLongLongLong => ConstValue::Int128(0),
+        _ => ConstValue::Int(0),
+    };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
         format!("{opprefix}_lt"),
         vec![
             Hlvalue::Variable(y.clone()),
-            constant_with_lltype(ConstValue::Int(0), lltype.clone()),
+            constant_with_lltype(zero, lltype.clone()),
         ],
         Hlvalue::Variable(y_is_neg.clone()),
     ));
@@ -5653,6 +5762,7 @@ fn lowlevel_typed_zero_check_wrapper_graph(
     let zero = match &lltype {
         LowLevelType::Unsigned | LowLevelType::UnsignedLongLong => ConstValue::UInt(0),
         LowLevelType::UnsignedLongLongLong => ConstValue::UInt128(0),
+        LowLevelType::SignedLongLongLong => ConstValue::Int128(0),
         _ => ConstValue::Int(0),
     };
     startblock.borrow_mut().operations.push(SpaceOperation::new(
@@ -7725,6 +7835,131 @@ mod tests {
             })) => Some(*value),
             _ => None,
         }
+    }
+
+    fn tiny_canraise_ovf_helper_graph(
+        name: &str,
+        args: &[LowLevelType],
+        result: &LowLevelType,
+    ) -> Result<PyGraph, TyperError> {
+        use crate::translator::rtyper::lltypesystem::rbuilder::close_ovfcheck_block;
+        if args != [LowLevelType::Signed] || result != &LowLevelType::Void {
+            return Err(TyperError::message(format!(
+                "{name} expects (Signed) -> Void, got ({args:?}) -> {result:?}"
+            )));
+        }
+        let x = variable_with_lltype("x", LowLevelType::Signed);
+        let sum = variable_with_lltype("sum", LowLevelType::Signed);
+        let start = Block::shared(vec![Hlvalue::Variable(x.clone())]);
+        let return_var = variable_with_lltype("result", LowLevelType::Void);
+        let mut graph = FunctionGraph::with_return_var(
+            name.to_string(),
+            start.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "int_add_ovf",
+            vec![
+                Hlvalue::Variable(x),
+                constant_with_lltype(ConstValue::Int(1), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(sum),
+        ));
+        let overflow_error = exception_args("OverflowError")?;
+        let handler = Block::shared(vec![]);
+        handler.closeblock(vec![
+            Link::new(
+                exception_args("MemoryError")?,
+                Some(graph.exceptblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let none_const = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::None,
+            LowLevelType::Void,
+        ));
+        close_ovfcheck_block(
+            &start,
+            &overflow_error,
+            &graph.returnblock,
+            vec![none_const],
+            &handler,
+            vec![],
+        );
+        let func = GraphFunc::new(
+            name.to_string(),
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        graph.func = Some(func.clone());
+        Ok(helper_pygraph_from_graph(
+            graph,
+            vec!["x".to_string()],
+            func,
+        ))
+    }
+
+    fn overflow_link_llexitcase(graph: &PyGraph) -> Option<ConstValue> {
+        for block in graph.graph.borrow().iterblocks() {
+            if !block.borrow().canraise() {
+                continue;
+            }
+            let exits = block.borrow().exits.clone();
+            let Some(exc) = exits.get(1) else {
+                continue;
+            };
+            return match &exc.borrow().llexitcase {
+                Some(Hlvalue::Constant(c)) => Some(c.value.clone()),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    #[test]
+    fn helper_builder_converts_canraise_llexitcase_to_vtable_ptr() {
+        // `RPythonTyper.specialize_block` → `_convert_link` (`rtyper.py`):
+        // a `close_ovfcheck_block` OverflowError link's `llexitcase` is
+        // the low-level vtable, not the host class.
+        let (_ann, rtyper) = make_live_rtyper();
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llfn = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_tiny_ovf",
+                vec![LowLevelType::Signed],
+                LowLevelType::Void,
+                |_, args, result| tiny_canraise_ovf_helper_graph("ll_tiny_ovf", args, result),
+            )
+            .expect("canraise helper with exceptiondata");
+        let pygraph = llfn.graph.expect("helper graph");
+        match overflow_link_llexitcase(&pygraph) {
+            Some(ConstValue::LLPtr(_)) => {}
+            other => panic!("expected ConstValue::LLPtr vtable llexitcase, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn helper_builder_canraise_without_exceptiondata_is_typererror() {
+        // `rclass.get_type_repr` needs `rootclass_repr`; graphs with a
+        // `canraise` block on an uninitialised rtyper surface that
+        // TyperError. Graphs without `canraise` still construct.
+        let (_ann, rtyper) = make_live_rtyper();
+        let err = rtyper
+            .lowlevel_helper_function_with_builder(
+                "ll_tiny_ovf_no_exdata",
+                vec![LowLevelType::Signed],
+                LowLevelType::Void,
+                |_, args, result| {
+                    tiny_canraise_ovf_helper_graph("ll_tiny_ovf_no_exdata", args, result)
+                },
+            )
+            .expect_err("canraise helper without exceptiondata");
+        assert!(
+            err.to_string().contains("initialize_exceptiondata"),
+            "expected initialize_exceptiondata defer; got {err}"
+        );
     }
 
     #[test]

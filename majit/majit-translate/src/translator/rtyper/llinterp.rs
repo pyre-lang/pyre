@@ -20,7 +20,7 @@
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::LazyLock;
 
 use crate::annotator::annrpython::RPythonAnnotator;
@@ -38,6 +38,7 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     Struct, cast_opaque_ptr, cast_pointer, identityhash, isCompatibleType,
     length_of_simple_gcarray_from_opaque, malloc, typeOf,
 };
+use crate::translator::rtyper::lltypesystem::opimpl;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 use crate::translator::tool::taskengine::TaskError;
 
@@ -177,6 +178,10 @@ pub fn checkadr(addr: &LowLevelValue) -> Result<(), TyperError> {
 pub enum LLValue {
     Void,
     Int(i64),
+    /// `SignedLongLongLong` (`r_longlonglong`).
+    Int128(i128),
+    /// `UnsignedLongLongLong` (`r_ulonglonglong`).
+    UInt128(u128),
     Bool(bool),
     Float(u64),
     Str(String),
@@ -190,6 +195,8 @@ impl LLValue {
         match self {
             LLValue::Void => Rc::new(()) as Rc<dyn Any>,
             LLValue::Int(n) => Rc::new(n) as Rc<dyn Any>,
+            LLValue::Int128(n) => Rc::new(n) as Rc<dyn Any>,
+            LLValue::UInt128(u) => Rc::new(u) as Rc<dyn Any>,
             LLValue::Bool(b) => Rc::new(b) as Rc<dyn Any>,
             LLValue::Float(bits) => Rc::new(f64::from_bits(bits)) as Rc<dyn Any>,
             LLValue::Str(s) => Rc::new(s) as Rc<dyn Any>,
@@ -254,6 +261,8 @@ impl LLValue {
         match self {
             LLValue::Void => false,
             LLValue::Int(n) => *n != 0,
+            LLValue::Int128(n) => *n != 0,
+            LLValue::UInt128(u) => *u != 0,
             LLValue::Bool(b) => *b,
             LLValue::Float(bits) => f64::from_bits(*bits) != 0.0,
             LLValue::Str(s) => !s.is_empty(),
@@ -269,13 +278,17 @@ fn const_to_llvalue(c: &Constant) -> LLValue {
     match &c.value {
         ConstValue::Int(n) => LLValue::Int(*n),
         ConstValue::UInt(n) => LLValue::Int(*n as i64),
+        ConstValue::Int128(n) => LLValue::Int128(*n),
+        ConstValue::UInt128(u) => LLValue::UInt128(*u),
         ConstValue::Bool(b) => LLValue::Bool(*b),
         ConstValue::Float(bits) => LLValue::Float(*bits),
         // Item 2 string split: ByteStr is the Python 2 `str` shape and
         // is the only string carrier upstream `LLInterpreter` produces
-        // here. UniStr falls through to the Const carrier so callers
-        // see the type-mismatch shape rather than a silent rewrap.
-        ConstValue::ByteStr(s) => LLValue::Str(String::from_utf8_lossy(s).into_owned()),
+        // here. Each byte maps to the char with the same code (0..=255),
+        // the same carrier `chr` produces. UniStr falls through to the
+        // Const carrier so callers see the type-mismatch shape rather
+        // than a silent rewrap.
+        ConstValue::ByteStr(s) => LLValue::Str(s.iter().map(|&b| b as char).collect()),
         ConstValue::None => LLValue::Void,
         ConstValue::LLPtr(p) => LLValue::Ptr(p.clone()),
         ConstValue::LLAddress(a) => LLValue::Address(a.clone()),
@@ -382,6 +395,8 @@ fn llvalue_to_lowlevel(value: &LLValue, opname: &str) -> Result<LowLevelValue, T
     match value {
         LLValue::Void => Ok(LowLevelValue::Void),
         LLValue::Int(n) => Ok(LowLevelValue::Signed(*n)),
+        LLValue::Int128(n) => Ok(LowLevelValue::SignedLongLongLong(*n)),
+        LLValue::UInt128(u) => Ok(LowLevelValue::UnsignedLongLongLong(*u)),
         LLValue::Bool(b) => Ok(LowLevelValue::Bool(*b)),
         LLValue::Float(bits) => Ok(LowLevelValue::Float(*bits)),
         LLValue::Ptr(p) => Ok(LowLevelValue::Ptr(p.clone())),
@@ -404,6 +419,17 @@ fn llvalue_to_lowlevel_of_type(
 ) -> Result<LowLevelValue, TaskError> {
     match (RESULT, value) {
         (LowLevelType::Unsigned, LLValue::Int(n)) => Ok(LowLevelValue::Unsigned(*n as u64)),
+        (LowLevelType::SignedLongLongLong, LLValue::Int128(n)) => {
+            Ok(LowLevelValue::SignedLongLongLong(*n))
+        }
+        (LowLevelType::UnsignedLongLongLong, LLValue::UInt128(u)) => {
+            Ok(LowLevelValue::UnsignedLongLongLong(*u))
+        }
+        (LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong, other) => {
+            Err(TaskError {
+                message: format!("{opname}: {other:?} is not a {RESULT:?} value"),
+            })
+        }
         (LowLevelType::UniChar, LLValue::Str(s)) if s.chars().count() == 1 => {
             Ok(LowLevelValue::UniChar(s.chars().next().expect("one char")))
         }
@@ -438,9 +464,11 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
         return Ok(match v {
             ConstValue::Int(n) => LLValue::Int(*n),
             ConstValue::UInt(n) => LLValue::Int(*n as i64),
+            ConstValue::Int128(n) => LLValue::Int128(*n),
+            ConstValue::UInt128(u) => LLValue::UInt128(*u),
             ConstValue::Bool(b) => LLValue::Bool(*b),
             ConstValue::Float(bits) => LLValue::Float(*bits),
-            ConstValue::ByteStr(s) => LLValue::Str(String::from_utf8_lossy(s).into_owned()),
+            ConstValue::ByteStr(s) => LLValue::Str(s.iter().map(|&b| b as char).collect()),
             ConstValue::None => LLValue::Void,
             ConstValue::LLPtr(p) => LLValue::Ptr(p.clone()),
             ConstValue::LLAddress(a) => LLValue::Address(a.clone()),
@@ -452,6 +480,8 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
             LowLevelValue::Void => Ok(LLValue::Void),
             LowLevelValue::Signed(n) => Ok(LLValue::Int(*n)),
             LowLevelValue::Unsigned(n) => Ok(LLValue::Int(*n as i64)),
+            LowLevelValue::SignedLongLongLong(n) => Ok(LLValue::Int128(*n)),
+            LowLevelValue::UnsignedLongLongLong(u) => Ok(LLValue::UInt128(*u)),
             LowLevelValue::Bool(b) => Ok(LLValue::Bool(*b)),
             LowLevelValue::Float(bits) => Ok(LLValue::Float(*bits)),
             // `r_singlefloat.__float__` / `LLInterpreter.eval_graph`: the
@@ -481,6 +511,12 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
     if let Some(v) = value.downcast_ref::<i64>() {
         return Ok(LLValue::Int(*v));
     }
+    if let Some(v) = value.downcast_ref::<i128>() {
+        return Ok(LLValue::Int128(*v));
+    }
+    if let Some(v) = value.downcast_ref::<u128>() {
+        return Ok(LLValue::UInt128(*v));
+    }
     if let Some(v) = value.downcast_ref::<bool>() {
         return Ok(LLValue::Bool(*v));
     }
@@ -499,10 +535,28 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
     })
 }
 
+/// The field name is the Constant's byte string (`llinterp.py` `op_getfield`
+/// `getattr(obj, field)`); the lltype layer spells the same name as its UTF-8
+/// `String`.
 fn field_name(val: &LLValue, opname: &str) -> Result<String, TaskError> {
+    let no_field = |s: &str| TaskError {
+        message: format!("{opname}: field name {s:?} names no field"),
+    };
     match val {
-        LLValue::Str(s) => Ok(s.clone()),
-        LLValue::Const(ConstValue::ByteStr(s)) => Ok(String::from_utf8_lossy(s).into_owned()),
+        LLValue::Str(s) => {
+            let mut bytes = Vec::with_capacity(s.len());
+            for c in s.chars() {
+                if c > '\u{ff}' {
+                    return Err(no_field(s));
+                }
+                bytes.push(c as u8);
+            }
+            String::from_utf8(bytes).map_err(|_| no_field(s))
+        }
+        LLValue::Const(ConstValue::ByteStr(b)) => String::from_utf8(b.clone()).map_err(|_| {
+            let s: String = b.iter().map(|&c| c as char).collect();
+            no_field(&s)
+        }),
         LLValue::Const(ConstValue::UniStr(s)) => Ok(s.clone()),
         other => Err(TaskError {
             message: format!("{opname}: expected a field name, got {other:?}"),
@@ -560,6 +614,52 @@ fn unsigned_rshift(x: u64, y: i64) -> Result<u64, TaskError> {
         Ok(0)
     } else {
         Ok(x >> y)
+    }
+}
+
+/// Convert an `LLValue` operand so `opimpl` TypeError text matches
+/// today's `llvalue_python_type_name` mapping.
+fn llvalue_to_constvalue(v: &LLValue) -> ConstValue {
+    match v {
+        LLValue::Int(n) => ConstValue::Int(*n),
+        LLValue::Int128(n) => ConstValue::Int128(*n),
+        LLValue::UInt128(n) => ConstValue::UInt128(*n),
+        LLValue::Bool(b) => ConstValue::Bool(*b),
+        LLValue::Float(bits) => ConstValue::Float(*bits),
+        LLValue::Void => ConstValue::None,
+        LLValue::Str(s) => ConstValue::ByteStr(s.as_bytes().to_vec()),
+        LLValue::Ptr(p) => ConstValue::LLPtr(p.clone()),
+        LLValue::Address(a) => ConstValue::LLAddress(a.clone()),
+        LLValue::Const(ConstValue::UniStr(s)) => ConstValue::UniStr(s.clone()),
+        LLValue::Const(ConstValue::ByteStr(b)) => ConstValue::ByteStr(b.clone()),
+        LLValue::Const(_) => ConstValue::Placeholder,
+    }
+}
+
+fn constvalue_to_llvalue(v: ConstValue) -> Result<LLValue, TaskError> {
+    match v {
+        ConstValue::Int128(n) => Ok(LLValue::Int128(n)),
+        ConstValue::UInt128(n) => Ok(LLValue::UInt128(n)),
+        ConstValue::Bool(b) => Ok(LLValue::Bool(b)),
+        ConstValue::Int(n) => Ok(LLValue::Int(n)),
+        other => Err(TaskError {
+            message: format!(
+                "llinterp.py:273 LLFrame.getoperationhandler — unexpected opimpl result {other:?}"
+            ),
+        }),
+    }
+}
+
+fn call_wide_int_opimpl(opname: &str, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+    let args: Vec<ConstValue> = vals.iter().map(llvalue_to_constvalue).collect();
+    let f = opimpl::lllong_op_impl(opname).ok_or_else(|| TaskError {
+        message: format!(
+            "llinterp.py:273 LLFrame.getoperationhandler — op_{opname} not yet ported"
+        ),
+    })?;
+    match f(&args) {
+        Ok(v) => constvalue_to_llvalue(v),
+        Err(e) => Err(TaskError { message: e.message }),
     }
 }
 
@@ -842,7 +942,7 @@ fn eval_graph_on_funcptr(
         .map(|v| lowlevel_to_llvalue(v, "eval_funcptr"))
         .collect::<Result<_, _>>()?;
     if let Some(interp) = LLInterpreter::current_interpreter() {
-        let frame = Rc::new(RefCell::new(LLFrame::new(graph, ll_args)));
+        let frame = Rc::new(RefCell::new(LLFrame::new(graph, ll_args, interp.clone())));
         let result = frame.borrow_mut().eval(&interp, frame.clone())?;
         Ok(llvalue_to_lowlevel_of_type(
             &result,
@@ -1003,7 +1103,7 @@ impl LLInterpreter {
                         .to_string(),
             })?;
         let args: Vec<LLValue> = args.iter().map(any_to_llvalue).collect::<Result<_, _>>()?;
-        let llframe = Rc::new(RefCell::new(LLFrame::new(graph, args)));
+        let llframe = Rc::new(RefCell::new(LLFrame::new(graph, args, self.clone())));
         // `LLInterpreter.eval_graph`: `self.traceback_frames = []`.
         self.traceback_frames.borrow_mut().clear();
         // `LLInterpreter.eval_graph`: `LLInterpreter.current_interpreter = self`.
@@ -1089,6 +1189,11 @@ impl LLInterpreter {
 pub struct LLFrame {
     pub graph: GraphRef,
     args: Vec<LLValue>,
+    /// `LLFrame.__init__`: `self.llinterpreter = llinterpreter`.
+    /// Weak because `LLInterpreter.traceback_frames` holds frames; an
+    /// owning `Rc` would cycle when a caller catches the exception and
+    /// `eval_graph` never calls `print_traceback`.
+    llinterpreter: Weak<LLInterpreter>,
     /// Upstream `self.bindings = {}` at `:221`.
     bindings: HashMap<Variable, LLValue>,
     pub curr_block: Option<BlockRef>,
@@ -1104,16 +1209,28 @@ pub struct LLFrame {
 impl LLFrame {
     /// Upstream `LLFrame.__init__(graph, args, llinterpreter)` at
     /// `llinterp.py`.
-    fn new(graph: GraphRef, args: Vec<LLValue>) -> Self {
+    fn new(graph: GraphRef, args: Vec<LLValue>, llinterpreter: Rc<LLInterpreter>) -> Self {
         Self {
             graph,
             args,
+            llinterpreter: Rc::downgrade(&llinterpreter),
             bindings: HashMap::new(),
             curr_block: None,
             curr_operation_index: 0,
             alloca_objects: Vec::new(),
             pending_exception: None,
         }
+    }
+
+    fn llinterpreter(&self) -> Rc<LLInterpreter> {
+        self.llinterpreter
+            .upgrade()
+            .expect("LLFrame.llinterpreter: interpreter dropped while a frame is running")
+    }
+
+    /// Upstream `LLFrame.newsubframe`.
+    fn newsubframe(&self, graph: GraphRef, args: Vec<LLValue>) -> LLFrame {
+        LLFrame::new(graph, args, self.llinterpreter())
     }
 
     /// Upstream `clear` at `:233-234`.
@@ -1170,16 +1287,40 @@ impl LLFrame {
     ) -> Result<LLValue, TaskError> {
         match concretetype {
             None | Some(LowLevelType::Void) => Ok(val),
-            Some(LowLevelType::Signed)
-            | Some(LowLevelType::Unsigned)
-            | Some(LowLevelType::SignedLongLong)
-            | Some(LowLevelType::SignedLongLongLong)
-            | Some(LowLevelType::UnsignedLongLong)
-            | Some(LowLevelType::UnsignedLongLongLong) => match val {
+            Some(
+                t @ (LowLevelType::Signed
+                | LowLevelType::Unsigned
+                | LowLevelType::SignedLongLong
+                | LowLevelType::UnsignedLongLong),
+            ) => match val {
                 LLValue::Int(_) => Ok(val),
                 LLValue::Bool(b) => Ok(LLValue::Int(i64::from(b))),
                 other => Err(TaskError {
-                    message: format!("llinterp.py:246 type error: expected integer, got {other:?}"),
+                    message: format!(
+                        "llinterp.py:246 type error: expected {}, got {other:?}",
+                        t.short_name()
+                    ),
+                }),
+            },
+            // `lltype.enforce` / `LowLevelType._enforce`: `typeOf(value)` must
+            // equal the Variable's concretetype (`LLFrame.setvar` / `getval`).
+            // `typeOf(r_longlonglong)` is `SignedLongLongLong`; `typeOf(int)`
+            // is `Signed`; `typeOf(bool)` is `Bool`.
+            Some(LowLevelType::SignedLongLongLong) => match val {
+                LLValue::Int128(_) => Ok(val),
+                other => Err(TaskError {
+                    message: format!(
+                        "llinterp.py:246 type error: expected SignedLongLongLong, got {other:?}"
+                    ),
+                }),
+            },
+            // `typeOf(r_ulonglonglong)` is `UnsignedLongLongLong`.
+            Some(LowLevelType::UnsignedLongLongLong) => match val {
+                LLValue::UInt128(_) => Ok(val),
+                other => Err(TaskError {
+                    message: format!(
+                        "llinterp.py:246 type error: expected UnsignedLongLongLong, got {other:?}"
+                    ),
                 }),
             },
             Some(LowLevelType::Bool) => match val {
@@ -1196,6 +1337,10 @@ impl LLFrame {
                     message: format!("llinterp.py:246 type error: expected Float, got {other:?}"),
                 }),
             },
+            // `typeOf(u"x")` is UniChar: a one-char unicode Constant.
+            Some(LowLevelType::UniChar) if matches!(&val, LLValue::Const(ConstValue::UniStr(s)) if s.chars().count() == 1) => {
+                Ok(val)
+            }
             Some(LowLevelType::Char) | Some(LowLevelType::UniChar) => match val {
                 LLValue::Str(_) => Ok(val),
                 other => Err(TaskError {
@@ -1378,7 +1523,7 @@ impl LLFrame {
                 );
                 l.llexitcase.clone().or_else(|| l.exitcase.clone())
             };
-            if !self.exception_link_matches(exitcase.as_ref(), etype) {
+            if !self.exception_link_matches(exitcase.as_ref(), etype)? {
                 continue;
             }
             let (last_exception, last_exc_value) = {
@@ -1400,25 +1545,52 @@ impl LLFrame {
     }
 
     /// Upstream `LLFrame.eval_block` calls
-    /// `op_direct_call(exdata.fn_exception_match, cls, link.llexitcase)`.
-    /// `exceptiondata.fn_exception_match` is `rclass.py ll_issubclass` over
-    /// rtyped class vtables; etype / `llexitcase` Constants here carry
-    /// HostObject classes, so the same subclass test runs on those.
-    fn exception_link_matches(&self, llexitcase: Option<&Hlvalue>, etype: &LLValue) -> bool {
+    /// `exdata.fn_exception_match(cls, link.llexitcase)` =
+    /// `rclass.ll_issubclass` on rtyped class vtable pointers.
+    /// Pre-rtyper graphs whose handler link still carries a host-class
+    /// exitcase match two host classes with `fn_exception_match`.
+    /// Mixed vtable/host pairs are a representation error;
+    /// `LLInterpreter.find_exception` is diagnostic only.
+    fn exception_link_matches(
+        &self,
+        llexitcase: Option<&Hlvalue>,
+        etype: &LLValue,
+    ) -> Result<bool, FrameError> {
         let Some(llexitcase) = llexitcase else {
-            return false;
+            return Ok(false);
         };
-        let exitcase = match llexitcase {
-            Hlvalue::Constant(c) => host_class_object(&c.value),
+        let exit_const = match llexitcase {
+            Hlvalue::Constant(c) => &c.value,
+            _ => return Ok(false),
+        };
+        let etype_ptr = match etype {
+            LLValue::Ptr(p) => Some(p.as_ref()),
             _ => None,
         };
-        let cls = match etype {
-            LLValue::Const(c) => host_class_object(c),
+        let exit_ptr = match exit_const {
+            ConstValue::LLPtr(q) => Some(q.as_ref()),
             _ => None,
         };
-        match (cls, exitcase) {
-            (Some(cls), Some(exitcase)) => self.fn_exception_match(cls, exitcase),
-            _ => false,
+        match (etype_ptr, exit_ptr) {
+            (Some(p), Some(q)) => crate::translator::rtyper::rclass::ll_issubclass(p, q)
+                .map_err(|e| TaskError {
+                    message: e.to_string(),
+                })
+                .map_err(FrameError::from),
+            (Some(_), None) | (None, Some(_)) => Err(FrameError::from(TaskError {
+                message: "LLFrame.eval_block: raised etype and link.llexitcase have different representations (low-level vtable vs host class)".into(),
+            })),
+            (None, None) => {
+                let cls = match etype {
+                    LLValue::Const(c) => host_class_object(c),
+                    _ => None,
+                };
+                let exitcase = host_class_object(exit_const);
+                match (cls, exitcase) {
+                    (Some(cls), Some(exitcase)) => Ok(self.fn_exception_match(cls, exitcase)),
+                    _ => Ok(false),
+                }
+            }
         }
     }
 
@@ -1468,33 +1640,57 @@ impl LLFrame {
         })
     }
 
-    /// `LLFrame.make_llexception`: store the standard exception
-    /// class/instance as `pending_exception` so `eval_block` routes it
-    /// through `dispatch_exception`. The pair is the same
-    /// `exception_args` HostObject class/instance
-    /// `close_ovfcheck_block` puts on an OverflowError exit, so
-    /// `fn_exception_match` walks the HostObject class hierarchy.
-    /// `opname` is the raising op, used for the `LLFrame.eval_operation`
-    /// canraise check.
+    /// `LLFrame.make_llexception`: materialise the standard exception
+    /// instance via `ExceptionData.get_standard_ll_exc_instance_by_class`
+    /// and take its type pointer with `rclass.ll_type`. Store the pair
+    /// as `pending_exception` so `eval_block` routes it through
+    /// `dispatch_exception`. `opname` is the raising op, used for the
+    /// `LLFrame.eval_operation` canraise check.
     fn make_llexception(&mut self, opname: &str, name: &str) -> Result<(), TaskError> {
-        let args =
-            crate::translator::rtyper::rtyper::exception_args(name).map_err(|e| TaskError {
+        let looked_up = HOST_ENV
+            .lookup_exception_class(name)
+            .ok_or_else(|| TaskError {
+                message: format!("LLFrame.make_llexception: missing host {name} exception class"),
+            })?;
+        let standard = crate::annotator::exception::standard_exception_classes();
+        let cls = if standard.iter().any(|c| c == &looked_up) {
+            looked_up
+        } else {
+            standard
+                .into_iter()
+                .find(|c| c.qualname() == name)
+                .ok_or_else(|| TaskError {
+                    message: format!(
+                        "LLFrame.make_llexception: {name} is not a standard exception"
+                    ),
+                })?
+        };
+        let llinterpreter = self.llinterpreter();
+        let typer = &llinterpreter.typer;
+        let exdata = typer.exceptiondata().map_err(|e| TaskError {
+            message: format!("LLFrame.make_llexception: {e}"),
+        })?;
+        let evalue = exdata
+            .get_standard_ll_exc_instance_by_class(typer, &cls)
+            .map_err(|e| TaskError {
                 message: format!("LLFrame.make_llexception: {e}"),
             })?;
-        let (etype, evalue) = match args.as_slice() {
-            [Hlvalue::Constant(cls), Hlvalue::Constant(inst)] => {
-                (const_to_llvalue(cls), const_to_llvalue(inst))
-            }
-            _ => {
+        let p = match evalue.value {
+            ConstValue::LLPtr(p) => p,
+            other => {
                 return Err(TaskError {
                     message: format!(
-                        "LLFrame.make_llexception: {name} did not yield class/instance"
+                        "LLFrame.make_llexception: expected LLPtr instance, got {other:?}"
                     ),
                 });
             }
         };
-        self.check_operation_canraise(opname, &etype)?;
-        self.pending_exception = Some((etype, evalue));
+        let etype = crate::translator::rtyper::rclass::ll_type(&p).map_err(|e| TaskError {
+            message: format!("LLFrame.make_llexception: {e}"),
+        })?;
+        let etype_llvalue = LLValue::Ptr(Box::new(etype.clone()));
+        self.check_operation_canraise(opname, &etype_llvalue)?;
+        self.pending_exception = Some((LLValue::Ptr(Box::new(etype)), LLValue::Ptr(p)));
         Ok(())
     }
 
@@ -1576,7 +1772,24 @@ impl LLFrame {
                 LLValue::Const(ConstValue::LowLevelType(Box::new(concretetype))),
             );
         }
-        let retval = match self.getoperationhandler(&operation.opname, &vals) {
+        // `LLFrame.getval` does not `lltype.enforce` when concretetype is
+        // Void, so a Void-typed operand can hold any value (e.g.
+        // `Constant(7, Void)` holds the int 7). `lltype.cast_primitive`
+        // takes `ORIG = typeOf(value)` — the runtime type — so pass None
+        // when the operand's concretetype is Void (or absent) and let
+        // `cast_primitive` infer ORIG from the carrier. For every other
+        // operand, concretetype equals `typeOf(value)` and is the only
+        // record of Unsigned vs Signed for the untyped `LLValue::Int`
+        // carrier.
+        let orig_ty = if operation.opname == "cast_primitive" {
+            match operation.args.first().and_then(hlvalue_concretetype) {
+                None | Some(LowLevelType::Void) => None,
+                some => some,
+            }
+        } else {
+            None
+        };
+        let retval = match self.getoperationhandler(&operation.opname, &vals, orig_ty.as_ref()) {
             Ok(v) => v,
             Err(FrameError::LLException { etype, evalue }) => {
                 self.check_operation_canraise(&operation.opname, &etype)?;
@@ -1594,6 +1807,7 @@ impl LLFrame {
         &mut self,
         opname: &str,
         vals: &[LLValue],
+        orig: Option<&LowLevelType>,
     ) -> Result<LLValue, FrameError> {
         match opname {
             "same_as" => vals.first().cloned().ok_or_else(|| TaskError {
@@ -1686,7 +1900,7 @@ impl LLFrame {
             "cast_uint_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
             // `opimpl.py op_cast_primitive(TYPE, value)`:
             // `need_result_type` inserts TYPE as `vals[0]`.
-            "cast_primitive" => self.op_cast_primitive(vals),
+            "cast_primitive" => self.op_cast_primitive(vals, orig),
             // `op_cast_int_to_char(b) = chr(b)` (opimpl.py): the char
             // carrier is the one-char `Str`.
             "cast_int_to_char" => {
@@ -1735,14 +1949,9 @@ impl LLFrame {
                     }
                     .into());
                 };
-                let LLValue::Str(field) = &vals[1] else {
-                    return Err(TaskError {
-                        message: format!("{opname}: arg1 must be a field name"),
-                    }
-                    .into());
-                };
+                let field = field_name(&vals[1], opname)?;
                 let mut ptr = (**p).clone();
-                ptr.setattr(field, llvalue_to_lowlevel(&vals[2], opname)?)
+                ptr.setattr(&field, llvalue_to_lowlevel(&vals[2], opname)?)
                     .map_err(|e| TaskError {
                         message: format!("{opname}: {e}"),
                     })?;
@@ -1755,19 +1964,14 @@ impl LLFrame {
                     }
                     .into());
                 };
-                let LLValue::Str(field) = &vals[1] else {
-                    return Err(TaskError {
-                        message: format!("{opname}: arg1 must be a field name"),
-                    }
-                    .into());
-                };
+                let field = field_name(&vals[1], opname)?;
                 // `op_getsubstruct` = `getattr(obj, field)` on the pointer,
                 // yielding a pointer to the inlined sub-container. `_expose`
                 // returns it as an interior pointer when the field is a Raw
                 // container inlined into a Gc parent (`rpy_string.chars`);
                 // materialise that into a plain container `_ptr` so the
                 // array op handlers can read/write through it.
-                let sub = match p.getattr(field).map_err(|e| TaskError {
+                let sub = match p.getattr(&field).map_err(|e| TaskError {
                     message: format!("{opname}: {e}"),
                 })? {
                     LowLevelValue::Ptr(pt) => *pt,
@@ -1852,7 +2056,7 @@ impl LLFrame {
                 vals[0].as_i64(opname)? as u64,
                 vals[1].as_i64(opname)?,
             )? as i64)),
-            "llong_eq" | "ullong_eq" | "lllong_eq" | "ulllong_eq" => Ok(LLValue::Bool(
+            "llong_eq" | "ullong_eq" => Ok(LLValue::Bool(
                 vals[0].as_i64(opname)? == vals[1].as_i64(opname)?,
             )),
             "llong_and" | "ullong_and" => Ok(LLValue::Int(
@@ -1886,6 +2090,16 @@ impl LLFrame {
                 vals[0].as_i64(opname)? as u64,
                 vals[1].as_i64(opname)?,
             )? as i64)),
+            "lllong_is_true" | "lllong_neg" | "lllong_abs" | "lllong_invert" | "lllong_add"
+            | "lllong_sub" | "lllong_mul" | "lllong_floordiv" | "lllong_mod" | "lllong_lt"
+            | "lllong_le" | "lllong_eq" | "lllong_ne" | "lllong_gt" | "lllong_ge"
+            | "lllong_and" | "lllong_or" | "lllong_lshift" | "lllong_rshift" | "lllong_xor"
+            | "ulllong_is_true" | "ulllong_invert" | "ulllong_add" | "ulllong_sub"
+            | "ulllong_mul" | "ulllong_floordiv" | "ulllong_mod" | "ulllong_lt" | "ulllong_le"
+            | "ulllong_eq" | "ulllong_ne" | "ulllong_gt" | "ulllong_ge" | "ulllong_and"
+            | "ulllong_or" | "ulllong_lshift" | "ulllong_rshift" | "ulllong_xor" => {
+                call_wide_int_opimpl(opname, vals)
+            }
             "float_sub" => Ok(LLValue::Float(
                 (vals[0].as_f64(opname)? - vals[1].as_f64(opname)?).to_bits(),
             )),
@@ -1931,11 +2145,7 @@ impl LLFrame {
             "cast_longlong_to_float" => {
                 Ok(LLValue::Float((vals[0].as_i64(opname)? as f64).to_bits()))
             }
-            "cast_longlong_to_int"
-            | "cast_lllong_to_int"
-            | "cast_ulonglong_to_int"
-            | "cast_ulllong_to_int"
-            | "truncate_longlong_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
+            "truncate_longlong_to_int" => Ok(LLValue::Int(vals[0].as_i64(opname)?)),
             "convert_float_bytes_to_longlong" => {
                 Ok(LLValue::Int(vals[0].as_f64(opname)?.to_bits() as i64))
             }
@@ -2050,11 +2260,10 @@ impl LLFrame {
         let func = func_from_ptr(p, "direct_call")?;
         if let Some(graph) = func.graph_ref() {
             validate_graph_funcptr_type(&graph, ARGS)?;
-            let interp = LLInterpreter::current_interpreter().ok_or_else(|| TaskError {
-                message: "llinterp.py LLFrame.perform_call: no current LLInterpreter".to_string(),
-            })?;
-            let frame = Rc::new(RefCell::new(LLFrame::new(graph, args.to_vec())));
-            frame.borrow_mut().eval(&interp, frame.clone())
+            let frame = Rc::new(RefCell::new(self.newsubframe(graph, args.to_vec())));
+            frame
+                .borrow_mut()
+                .eval(&self.llinterpreter(), frame.clone())
         } else if let Some(name) = &func._callable {
             Ok(invoke_callable(name, args)?)
         } else {
@@ -2135,7 +2344,11 @@ impl LLFrame {
 
     /// `opimpl.py op_cast_primitive(TYPE, value)`:
     /// `return lltype.cast_primitive(TYPE, value)`.
-    fn op_cast_primitive(&self, vals: &[LLValue]) -> Result<LLValue, TaskError> {
+    fn op_cast_primitive(
+        &self,
+        vals: &[LLValue],
+        orig: Option<&LowLevelType>,
+    ) -> Result<LLValue, TaskError> {
         let TYPE = match vals.first() {
             Some(LLValue::Const(ConstValue::LowLevelType(t))) => t.as_ref(),
             _ => {
@@ -2147,7 +2360,7 @@ impl LLFrame {
         let value = vals.get(1).ok_or_else(|| TaskError {
             message: "LLFrame.op_cast_primitive: missing value".to_string(),
         })?;
-        cast_primitive(TYPE, value, "cast_primitive")
+        cast_primitive(TYPE, orig, value, "cast_primitive")
     }
 
     /// `opimpl.py op_cast_pointer`: `checkptr(obj); return lltype.cast_pointer(RESTYPE, obj)`.
@@ -2276,18 +2489,23 @@ fn is_number_type(t: &LowLevelType) -> bool {
     )
 }
 
-/// `lltype.typeOf(value)` for an `LLValue` primitive carrier.
+/// `lltype.typeOf(value)` inferred from an `LLValue` primitive carrier.
 ///
-/// The `Int` carrier does not record which `Number` it is; report
-/// `Signed` (`typeOf` of a Python `int`). A one-char `Str` is `Char`,
-/// or `UniChar` when `TGT` is `UniChar`, so `ORIG == TGT` identity
-/// holds for both character primitives that share the carrier.
+/// Fallback used when the operand's `concretetype` is unavailable
+/// (`lltype.cast_primitive` ORIG). The `Int` carrier does not record
+/// which `Number` it is; report `Signed` (`typeOf` of a Python `int`).
+/// `Int128` is `SignedLongLongLong`; `UInt128` is `UnsignedLongLongLong`.
+/// A one-char `Str` is `Char`, or
+/// `UniChar` when `TGT` is `UniChar`, so `ORIG == TGT` identity holds
+/// for both character primitives that share the carrier.
 fn primitive_type_of_llvalue(
     value: &LLValue,
     TGT: &LowLevelType,
 ) -> Result<LowLevelType, TaskError> {
     match value {
         LLValue::Int(_) => Ok(LowLevelType::Signed),
+        LLValue::Int128(_) => Ok(LowLevelType::SignedLongLongLong),
+        LLValue::UInt128(_) => Ok(LowLevelType::UnsignedLongLongLong),
         LLValue::Bool(_) => Ok(LowLevelType::Bool),
         LLValue::Float(_) => Ok(LowLevelType::Float),
         LLValue::Str(s) if s.chars().count() == 1 => {
@@ -2305,21 +2523,120 @@ fn primitive_type_of_llvalue(
     }
 }
 
-/// `lltype.py Number._cast`: wrap to the Number's width and signedness.
-/// The `LLValue::Int` carrier is the 64-bit word, so Signed / Unsigned /
-/// longlong wrap is the identity on that word.
-fn number_cast(TGT: &LowLevelType, value: i64) -> LLValue {
-    match TGT {
-        LowLevelType::Unsigned
-        | LowLevelType::UnsignedLongLong
-        | LowLevelType::UnsignedLongLongLong => LLValue::Int(value as u64 as i64),
-        _ => LLValue::Int(value),
+/// Exact host integer used by `Number._cast` / `_to_primitive`.
+///
+/// Signed sources (and Bool / Char / UniChar code points) are `I`;
+/// `Unsigned` / `UnsignedLongLong` / `UnsignedLongLongLong` are `U`.
+#[derive(Clone, Copy)]
+enum ExactInt {
+    I(i128),
+    U(u128),
+}
+
+impl ExactInt {
+    fn low128(self) -> u128 {
+        match self {
+            ExactInt::I(n) => n as u128,
+            ExactInt::U(u) => u,
+        }
+    }
+
+    fn wrapping_i128(self) -> i128 {
+        match self {
+            ExactInt::I(n) => n,
+            ExactInt::U(u) => u as i128,
+        }
+    }
+
+    fn is_nonzero(self) -> bool {
+        match self {
+            ExactInt::I(n) => n != 0,
+            ExactInt::U(u) => u != 0,
+        }
+    }
+
+    fn to_f64(self) -> f64 {
+        match self {
+            ExactInt::I(n) => n as f64,
+            ExactInt::U(u) => u as f64,
+        }
     }
 }
 
-/// Python `long(float)` then the 64-bit word of `Number._cast`. Truncates
-/// toward zero; inf / nan raise like host `long()`.
-fn float_to_long(f: f64) -> Result<i64, TaskError> {
+/// `intmask` (signed) / `unsigned_int.__new__` (unsigned) down to `LONG_BIT`.
+fn mask_to_i64(low128: u128, word: usize, signed: bool) -> i64 {
+    if word == 8 {
+        if signed {
+            low128 as i64
+        } else {
+            (low128 as u64) as i64
+        }
+    } else if signed {
+        low128 as u32 as i32 as i64
+    } else {
+        (low128 as u32) as i64
+    }
+}
+
+/// `lltype.py Number._cast` over an exact integer.
+///
+/// * `Signed` → `intmask` (wrap to `LONG_BIT` via `layout::target_word_size`)
+/// * `Unsigned` → `unsigned_int.__new__` / `r_uint` (mask to `LONG_BIT`)
+/// * `SignedLongLong` → `longlongmask` (wrap 64); on a 64-bit host this IS `Signed`
+/// * `UnsignedLongLong` → `unsigned_int.__new__` / `r_ulonglong` (mask 64)
+/// * `SignedLongLongLong` → `longlonglongmask` = `r_longlonglong` =
+///   `signed_int.__new__` (value must fit i128, else OverflowError)
+/// * `UnsignedLongLongLong` → `unsigned_int.__new__` / `r_ulonglonglong`
+///   (mask 128)
+///
+/// Word-sized and 64-bit results stay in `LLValue::Int`; signed 128-bit
+/// results use `LLValue::Int128`; unsigned 128-bit results use
+/// `LLValue::UInt128`.
+fn number_cast(TGT: &LowLevelType, v: ExactInt) -> Result<LLValue, TaskError> {
+    let low128 = v.low128();
+    match TGT {
+        LowLevelType::Signed | LowLevelType::Unsigned => {
+            let signed = matches!(TGT, LowLevelType::Signed);
+            Ok(LLValue::Int(mask_to_i64(
+                low128,
+                crate::layout::target_word_size(),
+                signed,
+            )))
+        }
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
+            Ok(LLValue::Int(low128 as i64))
+        }
+        LowLevelType::SignedLongLongLong => {
+            let n = match v {
+                ExactInt::I(n) => n,
+                ExactInt::U(u) => {
+                    if u > i128::MAX as u128 {
+                        return Err(TaskError {
+                            message: format!(
+                                "OverflowError: {u} does not fit in signed 128-bit integer"
+                            ),
+                        });
+                    }
+                    u as i128
+                }
+            };
+            Ok(LLValue::Int128(n))
+        }
+        LowLevelType::UnsignedLongLongLong => Ok(LLValue::UInt128(low128)),
+        other => Err(TaskError {
+            message: format!(
+                "lltype.cast_primitive: unsupported cast -> {}",
+                other.short_name()
+            ),
+        }),
+    }
+}
+
+/// `long(f)` reduced mod 2**128 (`lltype.cast_primitive` Float source).
+///
+/// `|f| >= 2**128` has low 128 bits all zero (the integer is a multiple of
+/// `2**e` with `e >= 128`).
+fn float_to_long_low_bits(f: f64) -> Result<i128, TaskError> {
     if f.is_nan() {
         return Err(TaskError {
             message: "ValueError: cannot convert float NaN to integer".to_string(),
@@ -2330,111 +2647,281 @@ fn float_to_long(f: f64) -> Result<i64, TaskError> {
             message: "OverflowError: cannot convert float infinity to integer".to_string(),
         });
     }
-    let t = f.trunc();
-    if t.abs() < 2f64.powi(127) {
-        Ok((t as i128) as i64)
+    let bits = f.to_bits();
+    let abs_bits = bits & 0x7fff_ffff_ffff_ffff;
+    if abs_bits == 0 {
+        return Ok(0);
+    }
+    let exp_raw = ((abs_bits >> 52) & 0x7ff) as i32;
+    let frac = abs_bits & 0x000f_ffff_ffff_ffff;
+    let (m, e) = if exp_raw == 0 {
+        (frac, -1074)
     } else {
-        Ok(0)
+        (frac | (1u64 << 52), exp_raw - 1075)
+    };
+    let mag = if e <= 0 {
+        f.trunc() as i128
+    } else if e < 128 {
+        ((m as u128) << e) as i128
+    } else {
+        0
+    };
+    if e <= 0 {
+        Ok(mag)
+    } else if f.is_sign_negative() {
+        Ok(mag.wrapping_neg())
+    } else {
+        Ok(mag)
     }
 }
 
-/// `lltype.cast_primitive(TGT, value)`.
-fn cast_primitive(TGT: &LowLevelType, value: &LLValue, opname: &str) -> Result<LLValue, TaskError> {
-    let ORIG = primitive_type_of_llvalue(value, TGT)?;
-    if !TGT.is_primitive() {
+fn chr_from_i128(v: i128) -> Result<LLValue, TaskError> {
+    if !(0..=255).contains(&v) {
         return Err(TaskError {
-            message: "lltype.cast_primitive: can only primitive to primitive".to_string(),
+            message: "ValueError: chr() arg not in range(256)".to_string(),
         });
     }
-    // `if ORIG == TGT: return value`. The Int carrier does not record
-    // which Number it is, so integer→integer always applies `TGT._cast`
-    // (identity on the 64-bit Signed/Unsigned/longlong word).
-    if ORIG == *TGT && !matches!(value, LLValue::Int(_)) {
-        return Ok(value.clone());
-    }
-    let mut working: Option<i64> = None;
-    if ORIG == LowLevelType::Char || ORIG == LowLevelType::UniChar {
-        let LLValue::Str(s) = value else {
-            return Err(TaskError {
-                message: format!("{opname}: expected Char, got {value:?}"),
-            });
-        };
-        let ch = s.chars().next().ok_or_else(|| TaskError {
-            message: format!("{opname}: empty char"),
-        })?;
-        working = Some(ch as i64);
-    } else if ORIG == LowLevelType::Float {
-        let f = value.as_f64(opname)?;
-        if *TGT == LowLevelType::SingleFloat {
-            // No SingleFloat carrier: round through f32 and store the
-            // widened f64 bits, matching `llvalue_to_lowlevel_of_type`
-            // / `any_to_llvalue` SingleFloat round trip (`r_singlefloat`).
-            return Ok(LLValue::Float(((f as f32) as f64).to_bits()));
-        } else if *TGT == LowLevelType::LongFloat {
-            return Ok(LLValue::Float(f.to_bits()));
-        }
-        working = Some(float_to_long(f)?);
-    } else if let LLValue::Int(n) = value {
-        working = Some(*n);
-    } else if let LLValue::Bool(b) = value {
-        working = Some(i64::from(*b));
-    }
-    let Some(value_n) = working else {
-        if ORIG == LowLevelType::SingleFloat && *TGT == LowLevelType::Float {
-            return Ok(LLValue::Float(value.as_f64(opname)?.to_bits()));
-        }
-        if ORIG == LowLevelType::LongFloat && *TGT == LowLevelType::Float {
-            return Ok(LLValue::Float(value.as_f64(opname)?.to_bits()));
-        }
+    Ok(LLValue::Str((v as u8 as char).to_string()))
+}
+
+fn unichr_from_i128(v: i128) -> Result<LLValue, TaskError> {
+    if !(0..=0x10_FFFF).contains(&v) {
         return Err(TaskError {
+            message: "ValueError: unichr() arg not in range".to_string(),
+        });
+    }
+    let cp = v as u32;
+    match char::from_u32(cp) {
+        Some(ch) => Ok(LLValue::Str(ch.to_string())),
+        None => Err(TaskError {
+            message: format!(
+                "cast_primitive: UniChar carrier cannot hold surrogate code point 0x{cp:X}"
+            ),
+        }),
+    }
+}
+
+fn chr_from_float_trunc(f: f64) -> Result<LLValue, TaskError> {
+    let t = f.trunc();
+    if !(0.0..=255.0).contains(&t) {
+        return Err(TaskError {
+            message: "ValueError: chr() arg not in range(256)".to_string(),
+        });
+    }
+    Ok(LLValue::Str((t as u8 as char).to_string()))
+}
+
+fn unichr_from_float_trunc(f: f64) -> Result<LLValue, TaskError> {
+    let t = f.trunc();
+    if !(0.0..=(0x10_FFFF as f64)).contains(&t) {
+        return Err(TaskError {
+            message: "ValueError: unichr() arg not in range".to_string(),
+        });
+    }
+    unichr_from_i128(t as i128)
+}
+
+fn apply_primitive_target(
+    ORIG: &LowLevelType,
+    TGT: &LowLevelType,
+    v: ExactInt,
+) -> Result<LLValue, TaskError> {
+    match TGT {
+        LowLevelType::Char => chr_from_i128(v.wrapping_i128()),
+        LowLevelType::UniChar => unichr_from_i128(v.wrapping_i128()),
+        LowLevelType::Float => Ok(LLValue::Float(v.to_f64().to_bits())),
+        LowLevelType::Bool => Ok(LLValue::Bool(v.is_nonzero())),
+        t if is_number_type(t) => number_cast(t, v),
+        _ => Err(TaskError {
             message: format!(
                 "lltype.cast_primitive: unsupported cast {} -> {}",
                 ORIG.short_name(),
                 TGT.short_name()
             ),
-        });
+        }),
+    }
+}
+
+/// `lltype.typeOf` (`str`/`unicode` length-1) and `ord` require a
+/// single character. Shared by the `ORIG == TGT` identity return and
+/// the Char/UniChar `ord` branch of [`cast_primitive`].
+fn require_single_character(value: &LLValue) -> Result<(), TaskError> {
+    let n = match value {
+        LLValue::Str(s) => s.chars().count(),
+        LLValue::Const(ConstValue::UniStr(s)) => s.chars().count(),
+        LLValue::Const(ConstValue::ByteStr(b)) => b.len(),
+        _ => return Ok(()),
     };
-    // `_to_primitive = {Char: chr, UniChar: unichr, Float: float, Bool: bool}`
-    match TGT {
-        LowLevelType::Char => {
-            let ch = u8::try_from(value_n).map_err(|_| TaskError {
-                message: format!("opimpl.py op_cast_int_to_char: {value_n} out of char range"),
-            })? as char;
-            return Ok(LLValue::Str(ch.to_string()));
+    if n == 1 {
+        Ok(())
+    } else {
+        Err(TaskError {
+            message: format!(
+                "TypeError: ord() expected a character, but string of length {n} found"
+            ),
+        })
+    }
+}
+
+/// `lltype.cast_primitive(TGT, value)`.
+///
+/// `ORIG` is the operand's `concretetype` (`lltype.typeOf`). When
+/// `None`, fall back to [`primitive_type_of_llvalue`]. Integer targets
+/// use [`number_cast`] (`intmask` / `longlongmask` / `longlonglongmask`
+/// / `signed_int.__new__` / `unsigned_int.__new__`).
+fn cast_primitive(
+    TGT: &LowLevelType,
+    ORIG: Option<&LowLevelType>,
+    value: &LLValue,
+    opname: &str,
+) -> Result<LLValue, TaskError> {
+    let inferred;
+    let ORIG: &LowLevelType = match ORIG {
+        Some(t) => t,
+        None => {
+            inferred = primitive_type_of_llvalue(value, TGT)?;
+            &inferred
         }
-        LowLevelType::UniChar => {
-            let ch = u32::try_from(value_n)
-                .ok()
-                .and_then(char::from_u32)
-                .ok_or_else(|| TaskError {
-                    message: format!("{opname}: {value_n} is not a valid UniChar"),
+    };
+    if !TGT.is_primitive() || !ORIG.is_primitive() {
+        return Err(TaskError {
+            message: "lltype.cast_primitive: can only primitive to primitive".to_string(),
+        });
+    }
+    if ORIG == TGT {
+        if *ORIG == LowLevelType::Char || *ORIG == LowLevelType::UniChar {
+            require_single_character(value)?;
+        }
+        return Ok(value.clone());
+    }
+    if *ORIG == LowLevelType::Void {
+        if *TGT == LowLevelType::Bool {
+            return Ok(LLValue::Bool(false));
+        }
+        return Err(TaskError {
+            message: format!("TypeError: cannot cast None to {}", TGT.short_name()),
+        });
+    }
+    if *ORIG == LowLevelType::Char || *ORIG == LowLevelType::UniChar {
+        require_single_character(value)?;
+        let code = match value {
+            LLValue::Str(s) => {
+                let ch = s.chars().next().ok_or_else(|| TaskError {
+                    message: format!("{opname}: empty char"),
                 })?;
-            return Ok(LLValue::Str(ch.to_string()));
+                u32::from(ch) as i128
+            }
+            LLValue::Const(ConstValue::UniStr(s)) if *ORIG == LowLevelType::UniChar => {
+                let ch = s.chars().next().ok_or_else(|| TaskError {
+                    message: format!("{opname}: empty char"),
+                })?;
+                u32::from(ch) as i128
+            }
+            LLValue::Const(ConstValue::ByteStr(b)) if *ORIG == LowLevelType::Char => {
+                let byte = b.first().copied().ok_or_else(|| TaskError {
+                    message: format!("{opname}: empty char"),
+                })?;
+                i128::from(byte)
+            }
+            _ => {
+                return Err(TaskError {
+                    message: format!("{opname}: expected Char, got {value:?}"),
+                });
+            }
+        };
+        return apply_primitive_target(ORIG, TGT, ExactInt::I(code));
+    }
+    if *ORIG == LowLevelType::Float {
+        let f = value.as_f64(opname)?;
+        if *TGT == LowLevelType::SingleFloat {
+            return Ok(LLValue::Float(((f as f32) as f64).to_bits()));
+        } else if *TGT == LowLevelType::LongFloat {
+            return Ok(LLValue::Float(f.to_bits()));
         }
-        LowLevelType::Float => {
-            return Ok(LLValue::Float((value_n as f64).to_bits()));
+        if f.is_nan() {
+            return Err(TaskError {
+                message: "ValueError: cannot convert float NaN to integer".to_string(),
+            });
         }
-        LowLevelType::Bool => {
-            return Ok(LLValue::Bool(value_n != 0));
+        if f.is_infinite() {
+            return Err(TaskError {
+                message: "OverflowError: cannot convert float infinity to integer".to_string(),
+            });
         }
-        _ => {}
+        return match TGT {
+            LowLevelType::Bool => Ok(LLValue::Bool(f.trunc() != 0.0)),
+            LowLevelType::Char => chr_from_float_trunc(f),
+            LowLevelType::UniChar => unichr_from_float_trunc(f),
+            LowLevelType::Float => unreachable!("ORIG == TGT"),
+            t if is_number_type(t) => {
+                if *t == LowLevelType::SignedLongLongLong {
+                    let trunc = f.trunc();
+                    if trunc >= 2f64.powi(127) || trunc < -(2f64.powi(127)) {
+                        return Err(TaskError {
+                            message: format!(
+                                "OverflowError: {trunc:.0} does not fit in signed 128-bit integer"
+                            ),
+                        });
+                    }
+                }
+                number_cast(t, ExactInt::I(float_to_long_low_bits(f)?))
+            }
+            _ => Err(TaskError {
+                message: format!(
+                    "lltype.cast_primitive: unsupported cast {} -> {}",
+                    ORIG.short_name(),
+                    TGT.short_name()
+                ),
+            }),
+        };
     }
-    if is_number_type(TGT) {
-        return Ok(number_cast(TGT, value_n));
+    if *ORIG == LowLevelType::SingleFloat || *ORIG == LowLevelType::LongFloat {
+        if *TGT == LowLevelType::Float {
+            return Ok(LLValue::Float(value.as_f64(opname)?.to_bits()));
+        }
+        let inst = if *ORIG == LowLevelType::SingleFloat {
+            "r_singlefloat"
+        } else {
+            "r_longfloat"
+        };
+        return Err(TaskError {
+            message: format!("TypeError: not supported on {inst} instances"),
+        });
     }
-    if ORIG == LowLevelType::SingleFloat && *TGT == LowLevelType::Float {
-        return Ok(LLValue::Float((value_n as f64).to_bits()));
+    // `lltype.cast_primitive`: Address is a Primitive;
+    // `_to_primitive[Bool]` is `bool`, i.e. `fakeaddress.__nonzero__`
+    // (non-null). Other Address targets keep the unsupported-cast error.
+    if *ORIG == LowLevelType::Address && *TGT == LowLevelType::Bool {
+        return Ok(LLValue::Bool(value.as_address(opname)?.nonzero()));
     }
-    if ORIG == LowLevelType::LongFloat && *TGT == LowLevelType::Float {
-        return Ok(LLValue::Float((value_n as f64).to_bits()));
-    }
-    Err(TaskError {
-        message: format!(
-            "lltype.cast_primitive: unsupported cast {} -> {}",
-            ORIG.short_name(),
-            TGT.short_name()
-        ),
-    })
+    let unsigned = matches!(
+        ORIG,
+        LowLevelType::Unsigned
+            | LowLevelType::UnsignedLongLong
+            | LowLevelType::UnsignedLongLongLong
+    );
+    let v = match value {
+        LLValue::Int(n) => {
+            if unsigned {
+                ExactInt::U(*n as u64 as u128)
+            } else {
+                ExactInt::I(*n as i128)
+            }
+        }
+        LLValue::Int128(n) => ExactInt::I(*n),
+        LLValue::UInt128(u) => ExactInt::U(*u),
+        LLValue::Bool(b) => ExactInt::I(i128::from(*b)),
+        _ => {
+            return Err(TaskError {
+                message: format!(
+                    "lltype.cast_primitive: unsupported cast {} -> {}",
+                    ORIG.short_name(),
+                    TGT.short_name()
+                ),
+            });
+        }
+    };
+    apply_primitive_target(ORIG, TGT, v)
 }
 
 fn restype_ptr(vals: &[LLValue], opname: &str) -> Result<Ptr, TaskError> {
@@ -2471,15 +2958,38 @@ fn exitcase_is_default(exitcase: &Option<Hlvalue>) -> bool {
 
 fn llvalue_matches_const(value: &LLValue, case: &ConstValue) -> bool {
     // `LLFrame.eval_block` picks the link whose `llexitcase` equals the
-    // switch value. Unsigned constants convert to `LLValue::Int` via
-    // `n as i64` (`const_to_llvalue` / `any_to_llvalue`); match that
-    // bit pattern against `ConstValue::UInt` exit cases.
+    // switch value. Python integer equality holds across the `Number`
+    // types (`r_longlonglong` / `r_ulonglonglong` / `int` / `r_uint`).
     if matches!(
         (value, case),
         (LLValue::Int(a), ConstValue::Int(b)) if a == b
     ) || matches!(
         (value, case),
         (LLValue::Int(a), ConstValue::UInt(b)) if *a == *b as i64
+    ) || matches!(
+        (value, case),
+        (LLValue::Int128(a), ConstValue::Int128(b)) if a == b
+    ) || matches!(
+        (value, case),
+        (LLValue::Int128(a), ConstValue::Int(b)) if *a == *b as i128
+    ) || matches!(
+        (value, case),
+        (LLValue::Int128(a), ConstValue::UInt(b)) if *a == *b as i128
+    ) || matches!(
+        (value, case),
+        (LLValue::Int128(a), ConstValue::UInt128(b)) if *a >= 0 && *a as u128 == *b
+    ) || matches!(
+        (value, case),
+        (LLValue::UInt128(a), ConstValue::UInt128(b)) if a == b
+    ) || matches!(
+        (value, case),
+        (LLValue::UInt128(a), ConstValue::UInt(b)) if *a == *b as u128
+    ) || matches!(
+        (value, case),
+        (LLValue::UInt128(a), ConstValue::Int(b)) if *b >= 0 && *a == *b as u128
+    ) || matches!(
+        (value, case),
+        (LLValue::UInt128(a), ConstValue::Int128(b)) if *b >= 0 && *a == *b as u128
     ) || matches!(
         (value, case),
         (LLValue::Bool(a), ConstValue::Bool(b)) if a == b
@@ -2492,7 +3002,9 @@ fn llvalue_matches_const(value: &LLValue, case: &ConstValue) -> bool {
     // it; the comparison itself stays Python 2-bytes-shaped.
     if let LLValue::Str(a) = value {
         match case {
-            ConstValue::ByteStr(b) => return a.as_bytes() == b.as_slice(),
+            ConstValue::ByteStr(b) => {
+                return a.chars().map(|c| c as u32).eq(b.iter().map(|&x| x as u32));
+            }
             ConstValue::UniStr(b) => return a == b,
             _ => {}
         }
@@ -2587,11 +3099,11 @@ pub fn enumerate_exceptions_top_down() -> Vec<HostObject> {
         result.push(cls.clone());
         seen.insert(cls.clone());
     }
-    // HOST_ENV.builtins is a HashMap and has no order; sort by builtin
-    // name so the walk is deterministic.
-    let mut builtins = HOST_ENV.builtin_values();
-    builtins.sort_by(|a, b| a.simple_name().cmp(b.simple_name()));
-    for cls in &builtins {
+    let classes = HOST_ENV
+        .import_module("exceptions")
+        .expect("HOST_ENV exceptions module")
+        .module_values();
+    for cls in &classes {
         addcls(cls, &base_exc, &mut result, &mut seen);
     }
     result
@@ -2744,7 +3256,11 @@ mod tests {
             "addr_frame",
             Block::shared(vec![]),
         )));
-        let frame = Rc::new(RefCell::new(LLFrame::new(graph, Vec::new())));
+        let frame = Rc::new(RefCell::new(LLFrame::new(
+            graph,
+            Vec::new(),
+            dummy_interpreter(),
+        )));
         let v = Variable::named("p");
         v.set_concretetype(Some(LowLevelType::Ptr(Box::new(typeOf(&ptr)))));
         frame
@@ -3789,6 +4305,24 @@ mod tests {
     }
 
     #[test]
+    fn eval_graph_caught_exception_does_not_cycle_interpreter() {
+        // Callee raises OverflowError; the caller catches it and
+        // returns. `eval_graph` does not call `print_traceback`, so
+        // `traceback_frames` still holds the raising frame. The frame's
+        // back-reference is `Weak`, so dropping the interpreter `Rc`
+        // frees it.
+        let callee = graph_raising_overflow();
+        let caller = canraise_direct_call_graph("catch_ovf", &callee, "OverflowError", 0, 1);
+        let interp = Rc::new(LLInterpreter::new(fixture_typer(), false, None));
+        let weak = Rc::downgrade(&interp);
+        interp
+            .eval_graph(caller as Rc<dyn Any>, Vec::new(), false)
+            .expect("caller catches OverflowError from direct_call");
+        drop(interp);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
     fn print_traceback_reverses_frames_and_marks_the_raising_op() {
         // Bypass `eval_graph` so `traceback_frames` is not cleared;
         // `LLFrame.eval` still appends (innermost first). Reverse order
@@ -3800,7 +4334,11 @@ mod tests {
             *cell.borrow_mut() = Rc::downgrade(&interp);
             old
         });
-        let frame = Rc::new(RefCell::new(LLFrame::new(graph, Vec::new())));
+        let frame = Rc::new(RefCell::new(LLFrame::new(
+            graph,
+            Vec::new(),
+            interp.clone(),
+        )));
         frame
             .borrow_mut()
             .eval(&interp, frame.clone())
@@ -3867,6 +4405,47 @@ mod tests {
         LLValue::Ptr(Box::new(vtable))
     }
 
+    fn vtable_with_subclassrange(name: &str, min: i64, max: i64, super_vt: Option<&_ptr>) -> _ptr {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            MallocFlavor, Struct, malloc, typeOf,
+        };
+        use crate::translator::rtyper::lltypesystem::rstr::llstr;
+
+        let name_str = llstr(name.as_bytes()).expect("llstr");
+        let name_ty = LowLevelType::Ptr(Box::new(typeOf(&name_str)));
+        let mut fields = vec![
+            ("subclassrange_min".into(), LowLevelType::Signed),
+            ("subclassrange_max".into(), LowLevelType::Signed),
+            ("name".into(), name_ty),
+        ];
+        if let Some(s) = super_vt {
+            fields.push(("super".into(), LowLevelType::Ptr(Box::new(typeOf(s)))));
+        }
+        let vtable_t = Struct::new("object_vtable", fields);
+        let mut vtable = malloc(
+            LowLevelType::Struct(Box::new(vtable_t)),
+            None,
+            MallocFlavor::Raw,
+            true,
+        )
+        .expect("malloc vtable");
+        vtable
+            .setattr("subclassrange_min", LowLevelValue::Signed(min))
+            .expect("set subclassrange_min");
+        vtable
+            .setattr("subclassrange_max", LowLevelValue::Signed(max))
+            .expect("set subclassrange_max");
+        vtable
+            .setattr("name", LowLevelValue::Ptr(Box::new(name_str)))
+            .expect("setattr name");
+        if let Some(s) = super_vt {
+            vtable
+                .setattr("super", LowLevelValue::Ptr(Box::new(s.clone())))
+                .expect("setattr super");
+        }
+        vtable
+    }
+
     #[test]
     fn find_exception_resolves_vtable_name_chars_to_host_class() {
         let etype = vtable_with_exception_name("ValueError");
@@ -3891,6 +4470,37 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_exceptions_top_down_walks_the_exceptions_module() {
+        let classes = enumerate_exceptions_top_down();
+        let names: Vec<&str> = classes.iter().map(|c| c.simple_name()).collect();
+        assert!(
+            names.contains(&"MemoryError"),
+            "MemoryError missing: {names:?}"
+        );
+        assert!(
+            names.contains(&"ArithmeticError"),
+            "ArithmeticError missing: {names:?}"
+        );
+        assert!(
+            !names.contains(&"StackOverflow"),
+            "StackOverflow must stay off the exceptions module"
+        );
+        for (i, cls) in classes.iter().enumerate() {
+            for base in cls.class_bases().unwrap_or(&[]) {
+                let base_pos = classes.iter().position(|c| c == base).unwrap_or_else(|| {
+                    panic!("{} missing base {}", cls.simple_name(), base.simple_name())
+                });
+                assert!(
+                    base_pos < i,
+                    "{} appears before its base {}",
+                    cls.simple_name(),
+                    base.simple_name()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exception_link_matches_a_superclass_handler() {
         // `exceptiondata.fn_exception_match` / `rclass.py ll_issubclass`:
         // a superclass handler catches a subclass.
@@ -3909,62 +4519,207 @@ mod tests {
         let super_case = Hlvalue::Constant(Constant::new(ConstValue::HostObject(exception)));
         let unrelated = Hlvalue::Constant(Constant::new(ConstValue::HostObject(type_error)));
 
-        assert!(frame.exception_link_matches(Some(&super_case), &etype));
-        assert!(!frame.exception_link_matches(Some(&unrelated), &etype));
+        assert!(
+            frame
+                .exception_link_matches(Some(&super_case), &etype)
+                .unwrap()
+        );
+        assert!(
+            !frame
+                .exception_link_matches(Some(&unrelated), &etype)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn exception_link_matches_vtable_pointers_via_ll_issubclass() {
+        // `rclass.ll_issubclass`: child etype matches a parent exitcase;
+        // parent etype does not match a child exitcase.
+        let frame = dummy_frame();
+        let parent = vtable_with_subclassrange("Exception", 0, 10, None);
+        let child = vtable_with_subclassrange("ValueError", 1, 5, Some(&parent));
+        let etype_child = LLValue::Ptr(Box::new(child.clone()));
+        let etype_parent = LLValue::Ptr(Box::new(parent.clone()));
+        let parent_case =
+            Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(parent.clone()))));
+        let child_case =
+            Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(child.clone()))));
+        assert!(
+            frame
+                .exception_link_matches(Some(&parent_case), &etype_child)
+                .unwrap()
+        );
+        assert!(
+            !frame
+                .exception_link_matches(Some(&child_case), &etype_parent)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn exception_link_matches_rejects_mixed_representations() {
+        let frame = dummy_frame();
+        let parent = vtable_with_subclassrange("Exception", 0, 10, None);
+        let etype_vtable = LLValue::Ptr(Box::new(parent.clone()));
+        let host_exception = HOST_ENV
+            .lookup_exception_class("Exception")
+            .expect("Exception");
+        let host_case = Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+            host_exception.clone(),
+        )));
+        let vtable_case =
+            Hlvalue::Constant(Constant::new(ConstValue::LLPtr(Box::new(parent.clone()))));
+        let etype_host = LLValue::Const(ConstValue::HostObject(host_exception));
+        let mixed_msg = "LLFrame.eval_block: raised etype and link.llexitcase have different representations (low-level vtable vs host class)";
+
+        match frame
+            .exception_link_matches(Some(&host_case), &etype_vtable)
+            .expect_err("vtable etype vs host llexitcase")
+        {
+            FrameError::Task(e) => assert_eq!(e.message, mixed_msg),
+            other => panic!("expected FrameError::Task, got {other:?}"),
+        }
+        match frame
+            .exception_link_matches(Some(&vtable_case), &etype_host)
+            .expect_err("host etype vs vtable llexitcase")
+        {
+            FrameError::Task(e) => assert_eq!(e.message, mixed_msg),
+            other => panic!("expected FrameError::Task, got {other:?}"),
+        }
     }
 
     fn pending_overflow_name(frame: &LLFrame) -> Option<String> {
         match &frame.pending_exception {
-            Some((LLValue::Const(c), _)) => c.host_class_name().map(str::to_owned),
-            _ => None,
+            Some((etype, _)) => find_exception(etype)
+                .ok()
+                .map(|cls| cls.simple_name().to_owned()),
+            None => None,
         }
+    }
+
+    fn assert_pending_overflowerror_ptrs(frame: &LLFrame) {
+        match &frame.pending_exception {
+            Some((LLValue::Ptr(_), LLValue::Ptr(_))) => {}
+            other => panic!("expected Ptr/Ptr pending_exception, got {other:?}"),
+        }
+        assert_eq!(
+            pending_overflow_name(frame).as_deref(),
+            Some("OverflowError")
+        );
     }
 
     #[test]
     fn int_add_ovf_returns_sum_and_raises_overflowerror() {
         // `LLFrame.op_int_add_ovf`: ovfcheck(x + y); OverflowError becomes
-        // pending_exception via `make_llexception`.
-        let mut frame = dummy_frame();
+        // pending_exception via `make_llexception`. Keep the annotator
+        // alive: `RPythonTyper` holds only a Weak to it.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper.finish_exceptiondata().expect("finish_exceptiondata");
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+        let interp = Rc::new(LLInterpreter::new(rtyper, false, None));
+        let prior = CURRENT_INTERPRETER.with(|cell| {
+            let old = cell.borrow().clone();
+            *cell.borrow_mut() = Rc::downgrade(&interp);
+            old
+        });
+
+        let mut frame = LLFrame::new(
+            Rc::new(RefCell::new(FunctionGraph::new(
+                "op_frame",
+                Block::shared(vec![]),
+            ))),
+            Vec::new(),
+            interp.clone(),
+        );
         let sum = frame
-            .getoperationhandler("int_add_ovf", &[LLValue::Int(40), LLValue::Int(2)])
+            .getoperationhandler("int_add_ovf", &[LLValue::Int(40), LLValue::Int(2)], None)
             .expect("int_add_ovf sum");
         assert_eq!(sum, LLValue::Int(42));
         assert!(frame.pending_exception.is_none());
 
         let overflowed = frame
-            .getoperationhandler("int_add_ovf", &[LLValue::Int(i64::MAX), LLValue::Int(1)])
+            .getoperationhandler(
+                "int_add_ovf",
+                &[LLValue::Int(i64::MAX), LLValue::Int(1)],
+                None,
+            )
             .expect("int_add_ovf overflow returns default_error_value");
         assert_eq!(overflowed, LLValue::Int(0));
-        assert_eq!(
-            pending_overflow_name(&frame).as_deref(),
-            Some("OverflowError")
-        );
+        assert_pending_overflowerror_ptrs(&frame);
 
         frame.pending_exception = None;
         let nonneg = frame
-            .getoperationhandler("int_add_nonneg_ovf", &[LLValue::Int(3), LLValue::Int(4)])
+            .getoperationhandler(
+                "int_add_nonneg_ovf",
+                &[LLValue::Int(3), LLValue::Int(4)],
+                None,
+            )
             .expect("int_add_nonneg_ovf sum");
         assert_eq!(nonneg, LLValue::Int(7));
         assert!(frame.pending_exception.is_none());
 
         let sub = frame
-            .getoperationhandler("int_sub_ovf", &[LLValue::Int(i64::MIN), LLValue::Int(1)])
+            .getoperationhandler(
+                "int_sub_ovf",
+                &[LLValue::Int(i64::MIN), LLValue::Int(1)],
+                None,
+            )
             .expect("int_sub_ovf overflow");
         assert_eq!(sub, LLValue::Int(0));
-        assert_eq!(
-            pending_overflow_name(&frame).as_deref(),
-            Some("OverflowError")
-        );
+        assert_pending_overflowerror_ptrs(&frame);
 
         frame.pending_exception = None;
         let mul = frame
-            .getoperationhandler("int_mul_ovf", &[LLValue::Int(i64::MAX), LLValue::Int(2)])
+            .getoperationhandler(
+                "int_mul_ovf",
+                &[LLValue::Int(i64::MAX), LLValue::Int(2)],
+                None,
+            )
             .expect("int_mul_ovf overflow");
         assert_eq!(mul, LLValue::Int(0));
-        assert_eq!(
-            pending_overflow_name(&frame).as_deref(),
-            Some("OverflowError")
-        );
+        assert_pending_overflowerror_ptrs(&frame);
+
+        CURRENT_INTERPRETER.with(|cell| {
+            *cell.borrow_mut() = prior;
+        });
+    }
+
+    #[test]
+    fn make_llexception_uses_frame_llinterpreter_without_current_interpreter() {
+        // `LLFrame.make_llexception` reads `self.llinterpreter`
+        // (`typer = self.llinterpreter.typer`). CURRENT_INTERPRETER stays
+        // empty for the calling code.
+        assert!(LLInterpreter::current_interpreter().is_none());
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper.finish_exceptiondata().expect("finish_exceptiondata");
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+        let interp = Rc::new(LLInterpreter::new(rtyper, false, None));
+        let graph = Rc::new(RefCell::new(FunctionGraph::new(
+            "op_frame",
+            Block::shared(vec![]),
+        )));
+        let mut frame = LLFrame::new(graph.clone(), Vec::new(), interp.clone());
+        let overflowed = frame
+            .getoperationhandler(
+                "int_add_ovf",
+                &[LLValue::Int(i64::MAX), LLValue::Int(1)],
+                None,
+            )
+            .expect("int_add_ovf overflow uses frame.llinterpreter");
+        assert_eq!(overflowed, LLValue::Int(0));
+        assert_pending_overflowerror_ptrs(&frame);
+        assert!(LLInterpreter::current_interpreter().is_none());
+        let child = frame.newsubframe(graph, Vec::new());
+        assert!(Rc::ptr_eq(&frame.llinterpreter(), &child.llinterpreter()));
+        assert!(Rc::ptr_eq(&frame.llinterpreter(), &interp));
     }
 
     fn malloc_resized_signed_list(list_lltype: &LowLevelType, items: &[i64]) -> _ptr {
@@ -4560,7 +5315,38 @@ mod tests {
             "op_frame",
             Block::shared(vec![]),
         )));
-        LLFrame::new(graph, Vec::new())
+        LLFrame::new(graph, Vec::new(), dummy_interpreter())
+    }
+
+    fn run_llop(opname: &str, args: &[LLValue]) -> Result<LLValue, TaskError> {
+        dummy_frame()
+            .getoperationhandler(opname, args, None)
+            .map_err(FrameError::into_task_error)
+    }
+
+    fn run_cast_primitive(
+        src_ty: LowLevelType,
+        tgt: LowLevelType,
+        value: LLValue,
+    ) -> Result<LLValue, TaskError> {
+        let mut frame = dummy_frame();
+        let src = Variable::named("src");
+        src.set_concretetype(Some(src_ty));
+        frame.setvar(&Hlvalue::Variable(src.clone()), value)?;
+        let result = Variable::named("dst");
+        result.set_concretetype(Some(tgt));
+        let op = SpaceOperation::new("cast_primitive", vec![src.into()], result.clone().into());
+        frame.eval_operation(&op)?;
+        frame.getval(&Hlvalue::Variable(result))
+    }
+
+    fn run_cast_primitive_const(src: Constant, tgt: LowLevelType) -> Result<LLValue, TaskError> {
+        let mut frame = dummy_frame();
+        let result = Variable::named("dst");
+        result.set_concretetype(Some(tgt));
+        let op = SpaceOperation::new("cast_primitive", vec![src.into()], result.clone().into());
+        frame.eval_operation(&op)?;
+        frame.getval(&Hlvalue::Variable(result))
     }
 
     #[test]
@@ -4597,7 +5383,11 @@ mod tests {
     fn char_eq_rejects_non_char() {
         let mut frame = dummy_frame();
         let err = frame
-            .getoperationhandler("char_eq", &[LLValue::Int(1), LLValue::Str("a".into())])
+            .getoperationhandler(
+                "char_eq",
+                &[LLValue::Int(1), LLValue::Str("a".into())],
+                None,
+            )
             .expect_err("non-char")
             .into_task_error();
         assert!(err.message.contains("TypeError"), "{}", err.message);
@@ -4605,6 +5395,7 @@ mod tests {
             .getoperationhandler(
                 "unichar_eq",
                 &[LLValue::Str("ab".into()), LLValue::Str("a".into())],
+                None,
             )
             .expect_err("multi-char")
             .into_task_error();
@@ -4613,7 +5404,8 @@ mod tests {
             frame
                 .getoperationhandler(
                     "char_eq",
-                    &[LLValue::Str("a".into()), LLValue::Str("a".into())]
+                    &[LLValue::Str("a".into()), LLValue::Str("a".into())],
+                    None,
                 )
                 .unwrap(),
             LLValue::Bool(true)
@@ -4622,10 +5414,269 @@ mod tests {
             frame
                 .getoperationhandler(
                     "char_eq",
-                    &[LLValue::Str("a".into()), LLValue::Str("b".into())]
+                    &[LLValue::Str("a".into()), LLValue::Str("b".into())],
+                    None,
                 )
                 .unwrap(),
             LLValue::Bool(false)
+        );
+    }
+
+    #[test]
+    fn lllong_ulllong_primitive_ops() {
+        let err = run_llop(
+            "lllong_add",
+            &[LLValue::Int128(i128::MAX), LLValue::Int128(1)],
+        )
+        .expect_err("lllong_add overflow");
+        assert!(err.message.contains("OverflowError"), "{}", err.message);
+
+        assert_eq!(
+            run_llop(
+                "ulllong_add",
+                &[LLValue::UInt128(u128::MAX), LLValue::UInt128(1)],
+            )
+            .unwrap(),
+            LLValue::UInt128(0)
+        );
+
+        assert_eq!(
+            run_llop(
+                "lllong_floordiv",
+                &[LLValue::Int128(-7), LLValue::Int128(2)],
+            )
+            .unwrap(),
+            LLValue::Int128(-3)
+        );
+        assert_eq!(
+            run_llop("lllong_mod", &[LLValue::Int128(-7), LLValue::Int128(2)]).unwrap(),
+            LLValue::Int128(-1)
+        );
+
+        assert_eq!(
+            run_llop(
+                "lllong_eq",
+                &[LLValue::Int128(1i128 << 100), LLValue::Int128(1i128 << 100)],
+            )
+            .unwrap(),
+            LLValue::Bool(true)
+        );
+
+        assert_eq!(
+            run_llop("ulllong_lshift", &[LLValue::UInt128(1), LLValue::Int(127)],).unwrap(),
+            LLValue::UInt128(1u128 << 127)
+        );
+        let err = run_llop("lllong_lshift", &[LLValue::Int128(1), LLValue::Int(127)])
+            .expect_err("lllong_lshift overflow");
+        assert!(err.message.contains("OverflowError"), "{}", err.message);
+
+        let err = run_llop("lllong_add", &[LLValue::Int(1), LLValue::Int128(1)])
+            .expect_err("lllong_add TypeError");
+        assert_eq!(
+            err.message,
+            "TypeError: 'lllong_add' arg 1 must be lllong, got 'int' instead"
+        );
+
+        let err = run_llop("ulllong_invert", &[LLValue::Int128(1)])
+            .expect_err("ulllong_invert TypeError");
+        assert_eq!(
+            err.message,
+            "TypeError: 'ulllong_invert' arg must be ulllong, got 'r_longlonglong' instead"
+        );
+
+        let err = run_llop("lllong_floordiv", &[LLValue::Int(1), LLValue::Int128(1)])
+            .expect_err("lllong_floordiv AssertionError");
+        assert!(
+            err.message.starts_with("AssertionError:"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn ll_hash_int_helper_intmasks_128bit() {
+        use crate::translator::rtyper::rint::{signedlonglonglong_repr, unsignedlonglonglong_repr};
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let signed_fn = signedlonglonglong_repr()
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function SignedLongLongLong")
+            .expect("Some");
+        assert_eq!(
+            signed_fn
+                .graph
+                .as_ref()
+                .unwrap()
+                .graph
+                .borrow()
+                .startblock
+                .borrow()
+                .operations[0]
+                .opname,
+            "cast_primitive"
+        );
+        let signed_ptr = funcptr_for_hash_helper(signed_fn);
+        assert_eq!(
+            eval_funcptr(&signed_ptr, &[LowLevelValue::SignedLongLongLong(1)]).unwrap(),
+            LowLevelValue::Signed(1)
+        );
+        assert_eq!(
+            eval_funcptr(
+                &signed_ptr,
+                &[LowLevelValue::SignedLongLongLong(1i128 << 64 | 5)],
+            )
+            .unwrap(),
+            LowLevelValue::Signed(5)
+        );
+
+        let unsigned_fn = unsignedlonglonglong_repr()
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function UnsignedLongLongLong")
+            .expect("Some");
+        assert_eq!(
+            unsigned_fn
+                .graph
+                .as_ref()
+                .unwrap()
+                .graph
+                .borrow()
+                .startblock
+                .borrow()
+                .operations[0]
+                .opname,
+            "cast_primitive"
+        );
+        let unsigned_ptr = funcptr_for_hash_helper(unsigned_fn);
+        assert_eq!(
+            eval_funcptr(
+                &unsigned_ptr,
+                &[LowLevelValue::UnsignedLongLongLong(u128::MAX)],
+            )
+            .unwrap(),
+            LowLevelValue::Signed(-1)
+        );
+
+        assert_eq!(
+            run_cast_primitive(
+                LowLevelType::SignedLongLongLong,
+                LowLevelType::Signed,
+                LLValue::Int128(1),
+            )
+            .unwrap(),
+            LLValue::Int(1)
+        );
+        assert_eq!(
+            run_cast_primitive(
+                LowLevelType::UnsignedLongLongLong,
+                LowLevelType::Signed,
+                LLValue::UInt128(u128::MAX),
+            )
+            .unwrap(),
+            LLValue::Int(-1)
+        );
+        assert_eq!(
+            run_cast_primitive(
+                LowLevelType::SignedLongLongLong,
+                LowLevelType::Signed,
+                LLValue::Int128(1i128 << 64 | 5),
+            )
+            .unwrap(),
+            LLValue::Int(5)
+        );
+    }
+
+    #[test]
+    fn lllong_shift_counts_follow_is_valid_int() {
+        assert_eq!(
+            run_llop("lllong_lshift", &[LLValue::Int128(1), LLValue::Bool(true)]).unwrap(),
+            LLValue::Int128(2)
+        );
+        assert_eq!(
+            run_llop("lllong_rshift", &[LLValue::Int128(8), LLValue::Int128(1)]).unwrap(),
+            LLValue::Int128(4)
+        );
+        assert_eq!(
+            run_llop(
+                "ulllong_rshift",
+                &[LLValue::UInt128(8), LLValue::UInt128(1)],
+            )
+            .unwrap(),
+            LLValue::UInt128(4)
+        );
+        assert_eq!(
+            run_llop(
+                "ulllong_lshift",
+                &[LLValue::UInt128(1), LLValue::Bool(true)],
+            )
+            .unwrap(),
+            LLValue::UInt128(2)
+        );
+        let err = run_llop("ulllong_lshift", &[LLValue::UInt128(1), LLValue::Int128(1)])
+            .expect_err("ulllong_lshift Int128 count");
+        assert!(
+            err.message.starts_with("AssertionError:"),
+            "{}",
+            err.message
+        );
+        let err = run_llop(
+            "lllong_lshift",
+            &[LLValue::Int128(1), LLValue::Float(1.0f64.to_bits())],
+        )
+        .expect_err("lllong_lshift Float count");
+        assert!(
+            err.message.starts_with("AssertionError:"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn lllong_overflow_prints_exact_result() {
+        let err = run_llop(
+            "lllong_add",
+            &[LLValue::Int128(i128::MIN), LLValue::Int128(-1)],
+        )
+        .expect_err("lllong_add negative overflow");
+        assert!(
+            err.message
+                .contains("-170141183460469231731687303715884105729"),
+            "{}",
+            err.message
+        );
+        let err = run_llop(
+            "lllong_mul",
+            &[LLValue::Int128(i128::MAX), LLValue::Int128(2)],
+        )
+        .expect_err("lllong_mul overflow");
+        assert!(
+            err.message
+                .contains("340282366920938463463374607431768211454"),
+            "{}",
+            err.message
+        );
+        let err = run_llop(
+            "lllong_lshift",
+            &[LLValue::Int128(i128::MAX), LLValue::Int(2)],
+        )
+        .expect_err("lllong_lshift overflow");
+        assert!(
+            err.message
+                .contains("680564733841876926926749214863536422908"),
+            "{}",
+            err.message
+        );
+        let err = run_llop("lllong_lshift", &[LLValue::Int128(1), LLValue::Int(200)])
+            .expect_err("lllong_lshift y>=128");
+        assert!(
+            err.message
+                .contains("1606938044258990275541962092341162602522202993782792835301376"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            crate::translator::rtyper::lltypesystem::opimpl::exact_int_decimal(false, &[0]),
+            "0"
         );
     }
 
@@ -4634,21 +5685,7 @@ mod tests {
         // Drive `op_cast_primitive` through `LLFrame.eval_operation` so
         // `need_result_type` inserts the result Variable's concretetype
         // as TYPE (`opimpl.py` `op_cast_primitive.need_result_type`).
-        fn run(
-            src_ty: LowLevelType,
-            tgt: LowLevelType,
-            value: LLValue,
-        ) -> Result<LLValue, TaskError> {
-            let mut frame = dummy_frame();
-            let src = Variable::named("src");
-            src.set_concretetype(Some(src_ty));
-            frame.setvar(&Hlvalue::Variable(src.clone()), value)?;
-            let result = Variable::named("dst");
-            result.set_concretetype(Some(tgt));
-            let op = SpaceOperation::new("cast_primitive", vec![src.into()], result.clone().into());
-            frame.eval_operation(&op)?;
-            frame.getval(&Hlvalue::Variable(result))
-        }
+        let run = run_cast_primitive;
 
         assert_eq!(
             run(LowLevelType::Signed, LowLevelType::Char, LLValue::Int(65)).unwrap(),
@@ -4706,18 +5743,827 @@ mod tests {
         );
         let err = run(LowLevelType::Signed, LowLevelType::Char, LLValue::Int(300))
             .expect_err("Signed→Char 300");
-        assert!(err.message.contains("out of char range"), "{}", err.message);
+        assert!(
+            err.message
+                .contains("ValueError: chr() arg not in range(256)"),
+            "{}",
+            err.message
+        );
         let tgt = LowLevelType::Func(Box::new(FuncType {
             args: vec![],
             result: LowLevelType::Void,
         }));
-        let err = super::cast_primitive(&tgt, &LLValue::Int(1), "cast_primitive")
+        let err = super::cast_primitive(&tgt, None, &LLValue::Int(1), "cast_primitive")
             .expect_err("non-Primitive TGT");
         assert!(
             err.message.contains("can only primitive to primitive"),
             "{}",
             err.message
         );
+
+        assert_eq!(
+            run(
+                LowLevelType::Unsigned,
+                LowLevelType::Float,
+                LLValue::Int(-1)
+            )
+            .unwrap(),
+            LLValue::Float((1.8446744073709552e19f64).to_bits())
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Unsigned,
+                LowLevelType::Signed,
+                LLValue::Int(-1)
+            )
+            .unwrap(),
+            LLValue::Int(-1)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Signed,
+                LowLevelType::Unsigned,
+                LLValue::Int(-1)
+            )
+            .unwrap(),
+            LLValue::Int(-1)
+        );
+
+        let f64_pow64 = LLValue::Float((2.0f64).powi(64).to_bits());
+        assert_eq!(
+            run(LowLevelType::Float, LowLevelType::Bool, f64_pow64.clone()).unwrap(),
+            LLValue::Bool(true)
+        );
+        let err = run(LowLevelType::Float, LowLevelType::Char, f64_pow64)
+            .expect_err("Float 2**64 → Char");
+        assert!(
+            err.message
+                .contains("ValueError: chr() arg not in range(256)"),
+            "{}",
+            err.message
+        );
+        let err = run(
+            LowLevelType::Float,
+            LowLevelType::Char,
+            LLValue::Float(300.0f64.to_bits()),
+        )
+        .expect_err("Float 300 → Char");
+        assert!(
+            err.message
+                .contains("ValueError: chr() arg not in range(256)"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::Char,
+                LLValue::Float(65.7f64.to_bits()),
+            )
+            .unwrap(),
+            LLValue::Str("A".into())
+        );
+
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::Signed,
+                LLValue::Float((2.0f64).powi(80).to_bits()),
+            )
+            .unwrap(),
+            LLValue::Int(0)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::Signed,
+                LLValue::Float((-(2.0f64).powi(63)).to_bits()),
+            )
+            .unwrap(),
+            LLValue::Int(i64::MIN)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::Unsigned,
+                LLValue::Float(((2.0f64).powi(64) + (2.0f64).powi(12)).to_bits()),
+            )
+            .unwrap(),
+            LLValue::Int(4096)
+        );
+
+        let sf = LLValue::Float(1.5f64.to_bits());
+        let err = run(LowLevelType::SingleFloat, LowLevelType::Bool, sf.clone())
+            .expect_err("SingleFloat → Bool");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+        assert_eq!(
+            run(LowLevelType::SingleFloat, LowLevelType::Float, sf.clone()).unwrap(),
+            sf.clone()
+        );
+        let err = run(LowLevelType::SingleFloat, LowLevelType::Signed, sf)
+            .expect_err("SingleFloat → Signed");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+
+        assert_eq!(
+            run(
+                LowLevelType::Signed,
+                LowLevelType::SignedLongLongLong,
+                LLValue::Int(1),
+            )
+            .unwrap(),
+            LLValue::Int128(1)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Signed,
+                LowLevelType::UnsignedLongLongLong,
+                LLValue::Int(1),
+            )
+            .unwrap(),
+            LLValue::UInt128(1)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Signed,
+                LowLevelType::UnsignedLongLongLong,
+                LLValue::Int(-1),
+            )
+            .unwrap(),
+            LLValue::UInt128(u128::MAX)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::UnsignedLongLongLong,
+                LowLevelType::Signed,
+                LLValue::UInt128(u128::MAX),
+            )
+            .unwrap(),
+            LLValue::Int(-1)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::UnsignedLongLongLong,
+                LowLevelType::Float,
+                LLValue::UInt128(u128::MAX),
+            )
+            .unwrap(),
+            LLValue::Float(3.402823669209385e38f64.to_bits())
+        );
+        assert_eq!(
+            run(
+                LowLevelType::UnsignedLongLong,
+                LowLevelType::SignedLongLongLong,
+                LLValue::Int(-1),
+            )
+            .unwrap(),
+            LLValue::Int128(18446744073709551615)
+        );
+        let err = run(
+            LowLevelType::UnsignedLongLongLong,
+            LowLevelType::SignedLongLongLong,
+            LLValue::UInt128(u128::MAX),
+        )
+        .expect_err("UnsignedLongLongLong 2**128-1 → SignedLongLongLong");
+        assert!(err.message.contains("OverflowError"), "{}", err.message);
+        let f_pow128 = LLValue::Float(2f64.powi(128).to_bits());
+        let err = run(
+            LowLevelType::Float,
+            LowLevelType::SignedLongLongLong,
+            f_pow128.clone(),
+        )
+        .expect_err("Float 2**128 → SignedLongLongLong");
+        assert!(err.message.contains("OverflowError"), "{}", err.message);
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::UnsignedLongLongLong,
+                f_pow128,
+            )
+            .unwrap(),
+            LLValue::UInt128(0)
+        );
+        assert_eq!(
+            run(
+                LowLevelType::Float,
+                LowLevelType::UnsignedLongLongLong,
+                LLValue::Float((-1.0f64).to_bits()),
+            )
+            .unwrap(),
+            LLValue::UInt128(u128::MAX)
+        );
+
+        let err = run(
+            LowLevelType::Signed,
+            LowLevelType::UniChar,
+            LLValue::Int(0xD800),
+        )
+        .expect_err("UniChar surrogate");
+        assert!(
+            err.message.contains(
+                "cast_primitive: UniChar carrier cannot hold surrogate code point 0xD800"
+            ),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn eval_operation_cast_primitive_unichar_const_to_unsigned() {
+        // `const_to_llvalue` keeps `ConstValue::UniStr` as
+        // `LLValue::Const`; `LowLevelType._enforce` for UniChar must
+        // accept a one-character UniStr (`typeOf(u"x")` is UniChar).
+        assert_eq!(
+            run_cast_primitive_const(
+                Constant::with_concretetype(ConstValue::UniStr("x".into()), LowLevelType::UniChar),
+                LowLevelType::Unsigned,
+            )
+            .unwrap(),
+            LLValue::Int(0x78)
+        );
+        run_cast_primitive_const(
+            Constant::with_concretetype(ConstValue::UniStr("xy".into()), LowLevelType::UniChar),
+            LowLevelType::Unsigned,
+        )
+        .expect_err("two-char UniStr");
+    }
+
+    #[test]
+    fn eval_operation_cast_primitive_void_operand_and_address_to_bool() {
+        // `LLFrame.getval` does not enforce Void; `cast_primitive` ORIG
+        // is `typeOf(value)`. `Constant(7, Void)` is Signed at runtime.
+        assert_eq!(
+            run_cast_primitive_const(
+                Constant::with_concretetype(ConstValue::Int(7), LowLevelType::Void),
+                LowLevelType::Bool,
+            )
+            .unwrap(),
+            LLValue::Bool(true)
+        );
+        assert_eq!(
+            run_cast_primitive_const(
+                Constant::with_concretetype(ConstValue::Int(0), LowLevelType::Void),
+                LowLevelType::Bool,
+            )
+            .unwrap(),
+            LLValue::Bool(false)
+        );
+        // Real `None`: inferred ORIG stays Void; Void -> Bool is
+        // `bool(None)` = False.
+        assert_eq!(
+            run_cast_primitive_const(
+                Constant::with_concretetype(ConstValue::None, LowLevelType::Void),
+                LowLevelType::Bool,
+            )
+            .unwrap(),
+            LLValue::Bool(false)
+        );
+        // No `_to_primitive` entry, Void is not a Number, not a float pair.
+        let err = run_cast_primitive_const(
+            Constant::with_concretetype(ConstValue::Int(7), LowLevelType::Void),
+            LowLevelType::Void,
+        )
+        .expect_err("Signed → Void");
+        assert!(
+            err.message.contains("unsupported cast") || err.message.contains("TypeError"),
+            "{}",
+            err.message
+        );
+
+        // Address -> Bool: `_to_primitive[Bool] = bool` =
+        // `fakeaddress.__nonzero__`.
+        assert_eq!(
+            run_cast_primitive(
+                LowLevelType::Address,
+                LowLevelType::Bool,
+                LLValue::Address(_address::Null),
+            )
+            .unwrap(),
+            LLValue::Bool(false)
+        );
+        let live = malloc(
+            LowLevelType::Struct(Box::new(Struct::new(
+                "thing",
+                vec![("x".into(), LowLevelType::Signed)],
+            ))),
+            None,
+            MallocFlavor::Raw,
+            false,
+        )
+        .expect("live");
+        assert_eq!(
+            run_cast_primitive(
+                LowLevelType::Address,
+                LowLevelType::Bool,
+                LLValue::Address(llmemory::cast_ptr_to_adr(&live)),
+            )
+            .unwrap(),
+            LLValue::Bool(true)
+        );
+    }
+
+    #[test]
+    fn cast_primitive_bytestr_unichar_void_and_128bit() {
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::SignedLongLongLong,
+                Some(&LowLevelType::Signed),
+                &LLValue::Int(1),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Int128(1)
+        );
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::UnsignedLongLongLong,
+                Some(&LowLevelType::Signed),
+                &LLValue::Int(1),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::UInt128(1)
+        );
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::UnsignedLongLongLong,
+                Some(&LowLevelType::Signed),
+                &LLValue::Int(-1),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::UInt128(u128::MAX)
+        );
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::Signed,
+                Some(&LowLevelType::UnsignedLongLongLong),
+                &LLValue::UInt128(u128::MAX),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Int(-1)
+        );
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::Float,
+                Some(&LowLevelType::UnsignedLongLongLong),
+                &LLValue::UInt128(u128::MAX),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Float(3.402823669209385e38f64.to_bits())
+        );
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::SignedLongLongLong,
+                Some(&LowLevelType::UnsignedLongLong),
+                &LLValue::Int(-1),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Int128(18446744073709551615)
+        );
+        let err = super::cast_primitive(
+            &LowLevelType::SignedLongLongLong,
+            Some(&LowLevelType::UnsignedLongLongLong),
+            &LLValue::UInt128(u128::MAX),
+            "cast_primitive",
+        )
+        .expect_err("UnsignedLongLongLong 2**128-1 → SignedLongLongLong");
+        assert!(err.message.contains("OverflowError"), "{}", err.message);
+        let f_pow128 = LLValue::Float(2f64.powi(128).to_bits());
+        let err = super::cast_primitive(
+            &LowLevelType::SignedLongLongLong,
+            Some(&LowLevelType::Float),
+            &f_pow128,
+            "cast_primitive",
+        )
+        .expect_err("Float 2**128 → SignedLongLongLong");
+        assert!(err.message.contains("OverflowError"), "{}", err.message);
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::UnsignedLongLongLong,
+                Some(&LowLevelType::Float),
+                &f_pow128,
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::UInt128(0)
+        );
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::UnsignedLongLongLong,
+                Some(&LowLevelType::Float),
+                &LLValue::Float((-1.0f64).to_bits()),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::UInt128(u128::MAX)
+        );
+
+        let bytestr = Constant::new(ConstValue::ByteStr(b"\xff".to_vec()));
+        let ll = super::const_to_llvalue(&bytestr);
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::Signed,
+                Some(&LowLevelType::Char),
+                &ll,
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Int(255)
+        );
+        let any_bytestr: Rc<dyn Any> = Rc::new(ConstValue::ByteStr(b"\xff".to_vec()));
+        let ll = super::any_to_llvalue(&any_bytestr).unwrap();
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::Signed,
+                Some(&LowLevelType::Char),
+                &ll,
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Int(255)
+        );
+
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::Signed,
+                Some(&LowLevelType::UniChar),
+                &LLValue::Const(ConstValue::UniStr("A".into())),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Int(65)
+        );
+
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::Bool,
+                Some(&LowLevelType::Void),
+                &LLValue::Void,
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::Bool(false)
+        );
+        let err = super::cast_primitive(
+            &LowLevelType::Signed,
+            Some(&LowLevelType::Void),
+            &LLValue::Void,
+            "cast_primitive",
+        )
+        .expect_err("Void → Signed");
+        assert!(
+            err.message
+                .contains("TypeError: cannot cast None to Signed"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn llvalue_to_lowlevel_of_type_keeps_128bit_variants() {
+        let signed = super::cast_primitive(
+            &LowLevelType::SignedLongLongLong,
+            Some(&LowLevelType::Signed),
+            &LLValue::Int(1),
+            "cast_primitive",
+        )
+        .unwrap();
+        let stored = super::llvalue_to_lowlevel_of_type(
+            &signed,
+            &LowLevelType::SignedLongLongLong,
+            "eval_funcptr",
+        )
+        .unwrap();
+        assert_eq!(stored, LowLevelValue::SignedLongLongLong(1));
+        assert_eq!(
+            super::lowlevel_to_llvalue(stored, "eval_funcptr").unwrap(),
+            LLValue::Int128(1)
+        );
+
+        let unsigned = super::cast_primitive(
+            &LowLevelType::UnsignedLongLongLong,
+            Some(&LowLevelType::Signed),
+            &LLValue::Int(-1),
+            "cast_primitive",
+        )
+        .unwrap();
+        let stored = super::llvalue_to_lowlevel_of_type(
+            &unsigned,
+            &LowLevelType::UnsignedLongLongLong,
+            "eval_funcptr",
+        )
+        .unwrap();
+        assert_eq!(stored, LowLevelValue::UnsignedLongLongLong(u128::MAX));
+        assert_eq!(
+            super::lowlevel_to_llvalue(stored, "eval_funcptr").unwrap(),
+            LLValue::UInt128(u128::MAX)
+        );
+    }
+
+    #[test]
+    fn llvalue_to_lowlevel_of_type_rejects_word_int_for_128bit() {
+        assert!(
+            super::llvalue_to_lowlevel_of_type(
+                &LLValue::Int(1),
+                &LowLevelType::SignedLongLongLong,
+                "t",
+            )
+            .is_err()
+        );
+        assert!(
+            super::llvalue_to_lowlevel_of_type(
+                &LLValue::Int(1),
+                &LowLevelType::UnsignedLongLongLong,
+                "t",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn eval_funcptr_returns_signedlonglonglong_cast() {
+        let x = Variable::named("x");
+        x.set_concretetype(Some(LowLevelType::Signed));
+        let y = Variable::named("y");
+        y.set_concretetype(Some(LowLevelType::SignedLongLongLong));
+        let start = Block::shared(vec![x.clone().into()]);
+        start.borrow_mut().operations.push(SpaceOperation::new(
+            "cast_primitive",
+            vec![x.into()],
+            y.clone().into(),
+        ));
+        let retvar = Hlvalue::Variable(Variable::named("ret"));
+        if let Hlvalue::Variable(v) = &retvar {
+            v.set_concretetype(Some(LowLevelType::SignedLongLongLong));
+        }
+        let graph = Rc::new(RefCell::new(FunctionGraph::with_return_var(
+            "cast_to_lllong",
+            start.clone(),
+            retvar,
+        )));
+        let returnblock = graph.borrow().returnblock.clone();
+        start.closeblock(vec![
+            Link::new(vec![y.into()], Some(returnblock), None).into_ref(),
+        ]);
+        let ft = FuncType {
+            args: vec![LowLevelType::Signed],
+            result: LowLevelType::SignedLongLongLong,
+        };
+        let ptr = functionptr_for_graph_with_type(&graph, ft);
+        let out = eval_funcptr(&ptr, &[LowLevelValue::Signed(1)]).expect("cast to 128-bit");
+        assert_eq!(out, LowLevelValue::SignedLongLongLong(1));
+    }
+
+    #[test]
+    fn const_to_llvalue_maps_int128_carriers() {
+        assert_eq!(
+            super::const_to_llvalue(&Constant::new(ConstValue::Int128(-5))),
+            LLValue::Int128(-5)
+        );
+        assert_eq!(
+            super::const_to_llvalue(&Constant::new(ConstValue::UInt128(u128::MAX))),
+            LLValue::UInt128(u128::MAX)
+        );
+    }
+
+    #[test]
+    fn cast_primitive_char_requires_exactly_one_character() {
+        let err = super::cast_primitive(
+            &LowLevelType::Signed,
+            Some(&LowLevelType::Char),
+            &LLValue::Str("ab".into()),
+            "cast_primitive",
+        )
+        .expect_err("Char \"ab\" → Signed");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+        let err = super::cast_primitive(
+            &LowLevelType::Char,
+            Some(&LowLevelType::Char),
+            &LLValue::Str("ab".into()),
+            "cast_primitive",
+        )
+        .expect_err("Char \"ab\" → Char");
+        assert!(err.message.contains("TypeError"), "{}", err.message);
+    }
+
+    #[test]
+    fn llvalue_matches_const_compares_bytestr_as_latin1() {
+        assert!(super::llvalue_matches_const(
+            &LLValue::Str("\u{ff}".into()),
+            &ConstValue::ByteStr(vec![0xff]),
+        ));
+    }
+
+    #[test]
+    fn enforce_value_rejects_int128_for_signed() {
+        let mut frame = dummy_frame();
+        let v = Variable::named("x");
+        v.set_concretetype(Some(LowLevelType::Signed));
+        let err = frame
+            .setvar(&Hlvalue::Variable(v.clone()), LLValue::Int128(1i128 << 100))
+            .expect_err("Signed Variable + Int128");
+        assert!(err.message.contains("type error"), "{}", err.message);
+
+        let c =
+            Constant::with_concretetype(ConstValue::UInt128(1u128 << 100), LowLevelType::Signed);
+        let err = frame
+            .getval(&Hlvalue::Constant(c))
+            .expect_err("Signed Constant + UInt128");
+        assert!(err.message.contains("type error"), "{}", err.message);
+    }
+
+    #[test]
+    fn enforce_value_unsignedlonglonglong_accepts_uint128_only() {
+        let frame = dummy_frame();
+        let err = frame
+            .enforce_value(Some(LowLevelType::UnsignedLongLongLong), LLValue::Int128(5))
+            .expect_err("UnsignedLongLongLong + Int128");
+        assert!(err.message.contains("type error"), "{}", err.message);
+        let err = frame
+            .enforce_value(Some(LowLevelType::UnsignedLongLongLong), LLValue::Int(5))
+            .expect_err("UnsignedLongLongLong + Int");
+        assert!(err.message.contains("type error"), "{}", err.message);
+        let err = frame
+            .enforce_value(
+                Some(LowLevelType::UnsignedLongLongLong),
+                LLValue::Bool(true),
+            )
+            .expect_err("UnsignedLongLongLong + Bool");
+        assert!(err.message.contains("type error"), "{}", err.message);
+        assert_eq!(
+            frame
+                .enforce_value(
+                    Some(LowLevelType::UnsignedLongLongLong),
+                    LLValue::UInt128(5),
+                )
+                .unwrap(),
+            LLValue::UInt128(5)
+        );
+    }
+
+    #[test]
+    fn enforce_value_signedlonglonglong_accepts_int128_only() {
+        let frame = dummy_frame();
+        let err = frame
+            .enforce_value(Some(LowLevelType::SignedLongLongLong), LLValue::Int(5))
+            .expect_err("SignedLongLongLong + Int");
+        assert!(err.message.contains("type error"), "{}", err.message);
+        let err = frame
+            .enforce_value(Some(LowLevelType::SignedLongLongLong), LLValue::Bool(true))
+            .expect_err("SignedLongLongLong + Bool");
+        assert!(err.message.contains("type error"), "{}", err.message);
+        assert_eq!(
+            frame
+                .enforce_value(Some(LowLevelType::SignedLongLongLong), LLValue::Int128(5))
+                .unwrap(),
+            LLValue::Int128(5)
+        );
+    }
+
+    #[test]
+    fn cast_primitive_signed_minus_one_to_unsignedlonglonglong() {
+        assert_eq!(
+            super::cast_primitive(
+                &LowLevelType::UnsignedLongLongLong,
+                Some(&LowLevelType::Signed),
+                &LLValue::Int(-1),
+                "cast_primitive",
+            )
+            .unwrap(),
+            LLValue::UInt128(u128::MAX)
+        );
+    }
+
+    #[test]
+    fn setfield_getfield_roundtrips_uint128() {
+        let body = Struct::gc(
+            "u128s",
+            vec![("f".into(), LowLevelType::UnsignedLongLongLong)],
+        );
+        let p = malloc(
+            LowLevelType::Struct(Box::new(body)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("u128 struct");
+        let mut frame = dummy_frame();
+        frame
+            .getoperationhandler(
+                "setfield",
+                &[
+                    LLValue::Ptr(Box::new(p.clone())),
+                    LLValue::Str("f".into()),
+                    LLValue::UInt128(u128::MAX),
+                ],
+                None,
+            )
+            .expect("setfield UInt128");
+        let got = frame
+            .getoperationhandler(
+                "getfield",
+                &[LLValue::Ptr(Box::new(p)), LLValue::Str("f".into())],
+                None,
+            )
+            .expect("getfield UInt128");
+        assert_eq!(got, LLValue::UInt128(u128::MAX));
+    }
+
+    fn accented_field_ptr() -> _ptr {
+        let body = Struct::gc("accented", vec![("é".into(), LowLevelType::Signed)]);
+        malloc(
+            LowLevelType::Struct(Box::new(body)),
+            None,
+            MallocFlavor::Gc,
+            true,
+        )
+        .expect("accented struct")
+    }
+
+    fn accented_field_bytestr() -> LLValue {
+        LLValue::Const(ConstValue::ByteStr("é".as_bytes().to_vec()))
+    }
+
+    fn accented_field_latin1() -> LLValue {
+        LLValue::Str("é".bytes().map(|b| b as char).collect())
+    }
+
+    #[test]
+    fn getfield_setfield_non_ascii_name_from_bytestr() {
+        let p = accented_field_ptr();
+        let mut frame = dummy_frame();
+        let name = accented_field_bytestr();
+        frame
+            .getoperationhandler(
+                "setfield",
+                &[
+                    LLValue::Ptr(Box::new(p.clone())),
+                    name.clone(),
+                    LLValue::Int(42),
+                ],
+                None,
+            )
+            .expect("setfield ByteStr é");
+        let got = frame
+            .getoperationhandler(
+                "getfield",
+                &[LLValue::Ptr(Box::new(p.clone())), name.clone()],
+                None,
+            )
+            .expect("getfield ByteStr é");
+        assert_eq!(got, LLValue::Int(42));
+        let interior = frame
+            .getoperationhandler("getinteriorfield", &[LLValue::Ptr(Box::new(p)), name], None)
+            .expect("getinteriorfield ByteStr é");
+        assert_eq!(interior, LLValue::Int(42));
+    }
+
+    #[test]
+    fn getfield_setfield_non_ascii_name_from_latin1_str() {
+        let p = accented_field_ptr();
+        let mut frame = dummy_frame();
+        let name = accented_field_latin1();
+        frame
+            .getoperationhandler(
+                "setfield",
+                &[
+                    LLValue::Ptr(Box::new(p.clone())),
+                    name.clone(),
+                    LLValue::Int(7),
+                ],
+                None,
+            )
+            .expect("setfield latin-1 é");
+        let got = frame
+            .getoperationhandler("getfield", &[LLValue::Ptr(Box::new(p)), name], None)
+            .expect("getfield latin-1 é");
+        assert_eq!(got, LLValue::Int(7));
+    }
+
+    #[test]
+    fn field_name_rejects_char_above_u00ff() {
+        let err = super::field_name(&LLValue::Str("\u{100}".into()), "getfield")
+            .expect_err("char above U+00FF");
+        assert!(err.message.contains("names no field"), "{}", err.message);
+    }
+
+    #[test]
+    fn llvalue_matches_const_compares_128bit_integers() {
+        assert!(super::llvalue_matches_const(
+            &LLValue::Int128(-3),
+            &ConstValue::Int128(-3),
+        ));
+        assert!(super::llvalue_matches_const(
+            &LLValue::UInt128(7),
+            &ConstValue::UInt(7),
+        ));
+        assert!(!super::llvalue_matches_const(
+            &LLValue::UInt128(7),
+            &ConstValue::Int(-1),
+        ));
     }
 
     fn nested_struct_ptr() -> _ptr {
@@ -4748,6 +6594,7 @@ mod tests {
             .getoperationhandler(
                 "getfield",
                 &[LLValue::Ptr(Box::new(p)), LLValue::Str("sub".into())],
+                None,
             )
             .expect_err("container field")
             .into_task_error();
@@ -4764,6 +6611,7 @@ mod tests {
             .getoperationhandler(
                 "getinteriorfield",
                 &[LLValue::Ptr(Box::new(p)), LLValue::Str("sub".into())],
+                None,
             )
             .expect_err("interior pointer")
             .into_task_error();

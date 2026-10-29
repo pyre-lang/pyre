@@ -523,7 +523,9 @@ mod tests {
     fn origin(graph: &FunctionGraph, mut var: Variable) -> Variable {
         for _ in 0..8 {
             match def_kind(graph, &var) {
-                Some(OpKind::UnaryOp { op, operand, .. }) if op == "same_as" => {
+                Some(OpKind::UnaryOp { op, operand, .. })
+                    if crate::codewriter::jtransform::is_same_as_follow_unary(op) =>
+                {
                     var = operand.clone();
                 }
                 _ => break,
