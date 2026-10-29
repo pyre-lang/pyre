@@ -1693,10 +1693,7 @@ pub fn fbw_foriter_inflight_take_for_resume(
     frame: usize,
     resume_py_pc: usize,
 ) -> Option<(pyre_object::PyObjectRef, usize)> {
-    let body_pc = resume_py_pc + 1;
-    if !foriter_header_at(frame, resume_py_pc) {
-        return None;
-    }
+    let body_pc = foriter_unit_at(frame, resume_py_pc)? + 1;
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
         let at = stack.iter().position(|e| {
@@ -1735,10 +1732,10 @@ pub fn fbw_foriter_inflight_take_for_resume(
 /// consume could re-apply the failed attempt's effect) — same signals as the
 /// delivery selector above.
 pub fn fbw_foriter_inflight_completed_at_resume(frame: usize, resume_py_pc: usize) -> bool {
-    let body_pc = resume_py_pc + 1;
-    if !foriter_header_at(frame, resume_py_pc) {
+    let Some(unit) = foriter_unit_at(frame, resume_py_pc) else {
         return false;
-    }
+    };
+    let body_pc = unit + 1;
     FBW_FORITER_INFLIGHT.with(|c| {
         let stack = c.borrow();
         let Some(at) = stack.iter().position(|e| {
@@ -1950,6 +1947,11 @@ pub fn fbw_foriter_inflight_take(
     // the single-slot drop.
     //
     let census_on = super::foriter_inflight_census_enabled();
+    // The body coordinate of the FOR_ITER the frame is parked at, past any
+    // `EXTENDED_ARG` prefix ([`foriter_unit_at`]).  A resume pc that does
+    // not decode to a FOR_ITER keeps the plain `resume_py_pc + 1`.
+    let parked_body_pc =
+        foriter_unit_at(frame, resume_py_pc).map_or(resume_py_pc + 1, |unit| unit + 1);
     let (stash, dropped) = FBW_FORITER_INFLIGHT.with(|c| {
         let mut stack = c.borrow_mut();
         let at = inflight_take_index(
@@ -1959,7 +1961,7 @@ pub fn fbw_foriter_inflight_take(
                 .enumerate()
                 .filter(|(_, entry)| {
                     entry.owner.is_portal()
-                        && foriter_body_matches_frame(entry.body, frame, resume_py_pc + 1)
+                        && foriter_body_matches_frame(entry.body, frame, parked_body_pc)
                 })
                 .map(|(at, _)| at),
         );
@@ -2093,18 +2095,95 @@ mod foriter_delivery_tests {
         crate::trace::fbw_diag::get(crate::trace::fbw_diag::FORITER_ITEM_DROPPED)
     }
 
+    /// A live frame over code with an outer and an inner `for`, and the
+    /// coordinates the take matches against: the pc the frame parks at for
+    /// the outer loop, and each loop's body pc (its FOR_ITER unit + 1).
+    struct LoopFrame {
+        frame: pyre_interpreter::pyframe::FrameBox,
+        outer_header: usize,
+        outer_body: usize,
+        inner_body: usize,
+        not_a_header: usize,
+    }
+
+    impl LoopFrame {
+        fn addr(&self) -> usize {
+            &*self.frame as *const pyre_interpreter::pyframe::PyFrame as usize
+        }
+    }
+
+    fn function_code(src: &str) -> pyre_interpreter::CodeObject {
+        use pyre_interpreter::bytecode::ConstantData;
+        use pyre_interpreter::{Mode, compile_source};
+        let module = compile_source(src, Mode::Exec).expect("compile should succeed");
+        module
+            .constants
+            .iter()
+            .find_map(|c| match c {
+                ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("source should contain a function body")
+    }
+
+    fn foriter_units(code: &pyre_interpreter::CodeObject) -> Vec<usize> {
+        (0..code.instructions.len())
+            .filter(|&u| {
+                matches!(
+                    pyre_interpreter::decode_instruction_at(code, u),
+                    Some((pyre_interpreter::Instruction::ForIter { .. }, _))
+                )
+            })
+            .collect()
+    }
+
+    fn loop_frame() -> LoopFrame {
+        let code =
+            function_code("def f(xs):\n    for x in xs:\n        for y in x:\n            pass\n");
+        let units = foriter_units(&code);
+        assert_eq!(units.len(), 2);
+        let outer = units[0];
+        let inner = units[1];
+        assert!(!matches!(
+            pyre_interpreter::decode_instruction_at(&code, outer - 1),
+            Some((pyre_interpreter::Instruction::ExtendedArg, _))
+        ));
+        let outer_header = outer;
+        let outer_body = outer + 1;
+        let inner_body = inner + 1;
+        let not_a_header = 0;
+        let frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let lf = LoopFrame {
+            frame,
+            outer_header,
+            outer_body,
+            inner_body,
+            not_a_header,
+        };
+        assert_eq!(super::super::foriter_unit_at(lf.addr(), not_a_header), None);
+        assert_eq!(
+            super::super::foriter_unit_at(lf.addr(), outer_header),
+            Some(outer)
+        );
+        lf
+    }
+
     /// A take that hands an item out has NOT delivered it: the deliver site
     /// still refuses on its header check.  Counting the take as the delivery
     /// is what made a refusal read as a success.
     #[test]
     fn the_take_alone_records_no_outcome() {
         reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
 
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((item, lf.outer_body))
+        );
 
-        let r = row(34);
+        let r = row(lf.outer_body);
         assert_eq!(
             (
                 r.delivered,
@@ -2121,14 +2200,18 @@ mod foriter_delivery_tests {
     #[test]
     fn a_push_at_the_header_is_the_only_delivery() {
         reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((item, lf.outer_body))
+        );
 
         fbw_foriter_report_delivered();
 
-        assert_eq!(row(34).delivered, 1);
-        assert_eq!(row(34).refused_header, 0);
+        assert_eq!(row(lf.outer_body).delivered, 1);
+        assert_eq!(row(lf.outer_body).refused_header, 0);
         reset();
     }
 
@@ -2138,15 +2221,23 @@ mod foriter_delivery_tests {
     #[test]
     fn a_header_refusal_is_not_a_delivery() {
         reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((item, lf.outer_body))
+        );
 
         let before = dropped_tally();
         fbw_foriter_report_refused_header();
 
-        assert_eq!(row(34).refused_header, 1);
-        assert_eq!(row(34).delivered, 0, "a refusal must not read as a success");
+        assert_eq!(row(lf.outer_body).refused_header, 1);
+        assert_eq!(
+            row(lf.outer_body).delivered,
+            0,
+            "a refusal must not read as a success"
+        );
         assert!(
             dropped_tally() > before,
             "a header refusal loses the iteration and must reach the gated tally"
@@ -2159,14 +2250,18 @@ mod foriter_delivery_tests {
     #[test]
     fn an_r1_refusal_is_its_own_column() {
         reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
         fbw_mark_foriter_body_effect_since_consume();
 
         let before = dropped_tally();
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            None
+        );
 
-        let r = row(34);
+        let r = row(lf.outer_body);
         assert_eq!((r.refused_effect, r.refused_header, r.delivered), (1, 0, 0));
         assert!(
             dropped_tally() > before,
@@ -2182,17 +2277,25 @@ mod foriter_delivery_tests {
     #[test]
     fn the_entries_the_clear_destroys_are_named() {
         reset();
+        let lf = loop_frame();
         let outer = 1usize as pyre_object::PyObjectRef;
         let inner = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, outer, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(OWNER, inner, InflightForiterBody::Py(35), false);
+        fbw_foriter_inflight_capture(OWNER, outer, InflightForiterBody::Py(lf.outer_body), false);
+        fbw_foriter_inflight_capture(OWNER, inner, InflightForiterBody::Py(lf.inner_body), false);
 
         // Parked at the OUTER header, so the inner entry is the one destroyed.
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
-
-        assert_eq!(row(35).dropped_unmatched, 1, "the inner entry is gone");
         assert_eq!(
-            row(6).dropped_unmatched,
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((outer, lf.outer_body))
+        );
+
+        assert_eq!(
+            row(lf.inner_body).dropped_unmatched,
+            1,
+            "the inner entry is gone"
+        );
+        assert_eq!(
+            row(lf.outer_body).dropped_unmatched,
             0,
             "the taken entry is not dropped"
         );
@@ -2202,12 +2305,16 @@ mod foriter_delivery_tests {
     #[test]
     fn recorded_but_unexecuted_residual_keeps_consumed_item_for_replay() {
         fbw_store_journal_reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
         fbw_mark_unjournaled_effect(ResidualDecline::Symbolic);
 
         assert!(!fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), Some((item, 34)));
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((item, lf.outer_body))
+        );
 
         fbw_store_journal_reset();
     }
@@ -2241,13 +2348,17 @@ mod foriter_delivery_tests {
     #[test]
     fn take_selects_the_entry_the_parked_frame_can_accept_not_the_most_recent() {
         fbw_store_journal_reset();
+        let lf = loop_frame();
         let outer = 1usize as pyre_object::PyObjectRef;
         let inner = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, outer, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(OWNER, inner, InflightForiterBody::Py(35), false);
+        fbw_foriter_inflight_capture(OWNER, outer, InflightForiterBody::Py(lf.outer_body), false);
+        fbw_foriter_inflight_capture(OWNER, inner, InflightForiterBody::Py(lf.inner_body), false);
 
-        // Parked at the OUTER header (pc 5), whose fallthrough body pc is 6.
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((outer, 6)));
+        // Parked at the OUTER header, whose fallthrough body pc is the outer loop's body pc.
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((outer, lf.outer_body))
+        );
 
         fbw_store_journal_reset();
     }
@@ -2259,14 +2370,25 @@ mod foriter_delivery_tests {
     #[test]
     fn a_frame_owns_its_items_and_pops_only_them() {
         fbw_store_journal_reset();
+        let lf = loop_frame();
         let callee = InflightForiterOwner {
             call_id: 1,
             ..OWNER
         };
         let caller_item = 1usize as pyre_object::PyObjectRef;
         let callee_item = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, caller_item, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
+        fbw_foriter_inflight_capture(
+            OWNER,
+            caller_item,
+            InflightForiterBody::Py(lf.outer_body),
+            false,
+        );
+        fbw_foriter_inflight_capture(
+            callee,
+            callee_item,
+            InflightForiterBody::Py(lf.outer_body),
+            false,
+        );
         assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 2);
 
         fbw_foriter_inflight_popframe(callee);
@@ -2274,13 +2396,29 @@ mod foriter_delivery_tests {
 
         // An abort inside the callee: its item is on top and names the same
         // code and body pc, but the live frame is the portal's.
-        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), Some((caller_item, 6)));
+        fbw_foriter_inflight_capture(
+            callee,
+            callee_item,
+            InflightForiterBody::Py(lf.outer_body),
+            false,
+        );
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            Some((caller_item, lf.outer_body))
+        );
 
         // With only the callee's item in flight there is nothing the portal
         // frame owns: the take delivers nothing and still empties the stash.
-        fbw_foriter_inflight_capture(callee, callee_item, InflightForiterBody::Py(6), false);
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 5), None);
+        fbw_foriter_inflight_capture(
+            callee,
+            callee_item,
+            InflightForiterBody::Py(lf.outer_body),
+            false,
+        );
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            None
+        );
         assert_eq!(FBW_FORITER_INFLIGHT.with(|c| c.borrow().len()), 0);
         fbw_store_journal_reset();
     }
@@ -2291,12 +2429,16 @@ mod foriter_delivery_tests {
     #[test]
     fn take_falls_back_to_the_most_recent_entry_when_none_matches_the_frame() {
         fbw_store_journal_reset();
+        let lf = loop_frame();
         let older = 1usize as pyre_object::PyObjectRef;
         let newer = 2usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, older, InflightForiterBody::Py(6), false);
-        fbw_foriter_inflight_capture(OWNER, newer, InflightForiterBody::Py(35), false);
+        fbw_foriter_inflight_capture(OWNER, older, InflightForiterBody::Py(lf.outer_body), false);
+        fbw_foriter_inflight_capture(OWNER, newer, InflightForiterBody::Py(lf.inner_body), false);
 
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 99), Some((newer, 35)));
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.not_a_header),
+            Some((newer, lf.inner_body))
+        );
 
         fbw_store_journal_reset();
     }
@@ -2342,12 +2484,16 @@ mod foriter_delivery_tests {
     #[test]
     fn a_rolled_back_namespace_binding_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
         fbw_namespace_store_mark_rolled_back();
 
         assert!(fbw_namespace_store_rolled_back());
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            None
+        );
 
         fbw_store_journal_reset();
         assert!(
@@ -2359,12 +2505,16 @@ mod foriter_delivery_tests {
     #[test]
     fn executed_body_effect_still_refuses_consumed_item_delivery() {
         fbw_store_journal_reset();
+        let lf = loop_frame();
         let item = 1usize as pyre_object::PyObjectRef;
-        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(34), false);
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(lf.outer_body), false);
         fbw_mark_foriter_body_effect_since_consume();
 
         assert!(fbw_foriter_any_body_effect_signal());
-        assert_eq!(fbw_foriter_inflight_take(0, 0, 33), None);
+        assert_eq!(
+            fbw_foriter_inflight_take(0, lf.addr(), lf.outer_header),
+            None
+        );
 
         fbw_store_journal_reset();
     }
@@ -2403,6 +2553,45 @@ mod foriter_delivery_tests {
 
         fbw_store_journal_rollback();
         assert_eq!(unsafe { w_list_len(list) }, len0);
+    }
+
+    /// A frame parks at an instruction's first code unit, which for a FOR_ITER
+    /// whose oparg needs EXTENDED_ARG is the prefix.  The take has to find the
+    /// FOR_ITER past that prefix, or the item is never matched to the frame.
+    #[test]
+    fn an_extended_arg_prefixed_header_matches_its_body() {
+        let mut src = String::from("def f(xs):\n    for x in xs:\n");
+        for i in 0..120 {
+            src.push_str(&format!("        x = x + {i}\n"));
+        }
+        let code = function_code(&src);
+        let unit = foriter_units(&code)[0];
+        assert!(matches!(
+            pyre_interpreter::decode_instruction_at(&code, unit - 1),
+            Some((pyre_interpreter::Instruction::ExtendedArg, _))
+        ));
+        let mut start = unit;
+        while start > 0
+            && matches!(
+                pyre_interpreter::decode_instruction_at(&code, start - 1),
+                Some((pyre_interpreter::Instruction::ExtendedArg, _))
+            )
+        {
+            start -= 1;
+        }
+        let frame = pyre_interpreter::pyframe::PyFrame::new(code);
+        let addr = &*frame as *const pyre_interpreter::pyframe::PyFrame as usize;
+        assert_eq!(super::super::foriter_unit_at(addr, start), Some(unit));
+        reset();
+        let item = 1usize as pyre_object::PyObjectRef;
+        let other = 2usize as pyre_object::PyObjectRef;
+        fbw_foriter_inflight_capture(OWNER, item, InflightForiterBody::Py(unit + 1), false);
+        fbw_foriter_inflight_capture(OWNER, other, InflightForiterBody::Py(9999), false);
+        assert_eq!(
+            fbw_foriter_inflight_take(0, addr, start),
+            Some((item, unit + 1))
+        );
+        reset();
     }
 }
 

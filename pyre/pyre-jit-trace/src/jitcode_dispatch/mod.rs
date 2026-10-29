@@ -9511,17 +9511,28 @@ thread_local! {
     };
 }
 
-/// Whether the opcode at `resume_py_pc` in the live frame's code is a
-/// FOR_ITER — a non-FOR_ITER resume pc that merely happens to satisfy
-/// `body_pc == some entry's resolved body pc` is Shape B.
-fn foriter_header_at(frame: usize, resume_py_pc: usize) -> bool {
-    let Some(raw_code) = frame_raw_code(frame) else {
-        return false;
-    };
+/// The `FOR_ITER` code unit of the instruction the live `frame` is parked at.
+///
+/// A frame parks at an instruction's first code unit, which for an oparg that
+/// needs `EXTENDED_ARG` is the first prefix, not the `FOR_ITER` itself.  The
+/// in-flight body coordinate is the `FOR_ITER` unit + 1, so the header the
+/// frame is parked at is found by skipping that prefix run.  `None` when the
+/// instruction at `resume_py_pc` is not a `FOR_ITER`.
+pub fn foriter_unit_at(frame: usize, resume_py_pc: usize) -> Option<usize> {
+    let raw_code = frame_raw_code(frame)?;
+    let code = unsafe { &*raw_code };
+    let mut unit = resume_py_pc;
+    while matches!(
+        pyre_interpreter::decode_instruction_at(code, unit),
+        Some((pyre_interpreter::Instruction::ExtendedArg, _))
+    ) {
+        unit += 1;
+    }
     matches!(
-        pyre_interpreter::decode_instruction_at(unsafe { &*raw_code }, resume_py_pc),
+        pyre_interpreter::decode_instruction_at(code, unit),
         Some((pyre_interpreter::Instruction::ForIter { .. }, _))
     )
+    .then_some(unit)
 }
 
 /// Whether an in-flight FOR_ITER continuation belongs to `frame` at this
