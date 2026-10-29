@@ -401,6 +401,18 @@
       align-items: start;
     }
 
+    .output-wrap[hidden] {
+      display: none;
+    }
+
+    .playground-grid.comparing {
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    }
+
+    .playground-grid.comparing .editor-wrap {
+      grid-column: 1 / -1;
+    }
+
     .editor-wrap,
     .output-wrap {
       display: grid;
@@ -509,6 +521,44 @@
 
     .run-time:empty {
       display: none;
+    }
+
+    .compare-verdict {
+      margin: 0;
+      margin-top: 14px;
+      color: var(--text);
+      font-weight: 600;
+      min-height: 1.4em;
+    }
+
+    .compare-verdict .match {
+      color: var(--success);
+      font-weight: 500;
+      margin-left: 10px;
+    }
+
+    .compare-verdict .mismatch {
+      color: var(--danger);
+      font-weight: 500;
+      margin-left: 10px;
+    }
+
+    .compare-verdict[hidden] {
+      display: none;
+    }
+
+    .example-group {
+      color: var(--dim);
+      font-size: 0.8rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      flex-basis: 100%;
+      margin: 6px 0 0 2px;
+    }
+
+    #compare-toggle[aria-pressed="true"] {
+      border-color: var(--accent);
+      color: var(--accent);
     }
 
     .ghost {
@@ -645,6 +695,10 @@
       .install-grid {
         grid-template-columns: 1fr;
       }
+
+      .playground-grid.comparing {
+        grid-template-columns: 1fr;
+      }
     }
 
     @media (max-width: 720px) {
@@ -748,7 +802,7 @@
             </div>
           </div>
 
-          <div class="playground-grid">
+          <div class="playground-grid" id="playground-grid">
             <div class="editor-wrap">
               <div class="label">Source</div>
               <div class="example-bar" id="example-bar" role="group" aria-label="Examples"></div>
@@ -761,18 +815,28 @@
 print(fib(100))</textarea>
               <div class="playground-controls">
                 <button class="button primary" id="run-button" disabled>Run</button>
+                <button class="button secondary" id="compare-toggle" type="button" aria-pressed="false">Show Pyodide</button>
               </div>
             </div>
 
             <div class="output-wrap">
-              <div class="label">Output</div>
+              <div class="label" id="pyre-label">Output</div>
               <pre id="output">Initializing pyre...</pre>
               <div class="status-row">
                 <span class="run-time" id="run-time"></span>
                 <div class="status" id="playground-status">Loading WebAssembly module...</div>
               </div>
             </div>
+            <div class="output-wrap" id="pyodide-wrap" hidden>
+              <div class="label">Pyodide 0.28.3 · CPython 3.13</div>
+              <pre id="pyodide-output">Pyodide is not loaded yet.</pre>
+              <div class="status-row">
+                <span class="run-time" id="pyodide-time"></span>
+                <div class="status" id="pyodide-status">Not loaded</div>
+              </div>
+            </div>
           </div>
+          <p class="compare-verdict" id="compare-verdict" hidden></p>
         </div>
       </section>
 
@@ -855,6 +919,14 @@ print(fib(100))</textarea>
     const runButton = document.getElementById("run-button");
     const exampleBar = document.getElementById("example-bar");
     const themeToggle = document.getElementById("theme-toggle");
+    const compareToggle = document.getElementById("compare-toggle");
+    const playgroundGrid = document.getElementById("playground-grid");
+    const pyreLabel = document.getElementById("pyre-label");
+    const pyodideWrap = document.getElementById("pyodide-wrap");
+    const pyodideOutput = document.getElementById("pyodide-output");
+    const pyodideTime = document.getElementById("pyodide-time");
+    const pyodideStatus = document.getElementById("pyodide-status");
+    const compareVerdict = document.getElementById("compare-verdict");
     const sunIcon = '<svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"></path></svg>';
     const moonIcon = '<svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20.5 14.2A8.5 8.5 0 0 1 9.8 3.5 8.5 8.5 0 1 0 20.5 14.2Z"></path></svg>';
 
@@ -895,6 +967,7 @@ print(fib(100))</textarea>
       syncingPanelHeight = true;
       sourceNode.style.height = `${height}px`;
       outputNode.style.height = `${height}px`;
+      pyodideOutput.style.height = `${height}px`;
       requestAnimationFrame(() => {
         syncingPanelHeight = false;
       });
@@ -906,8 +979,10 @@ print(fib(100))</textarea>
     );
     sourceNode.style.height = `${Math.round(initialPanelHeight)}px`;
     outputNode.style.height = `${Math.round(initialPanelHeight)}px`;
+    pyodideOutput.style.height = `${Math.round(initialPanelHeight)}px`;
     panelResizeObserver.observe(sourceNode);
     panelResizeObserver.observe(outputNode);
+    panelResizeObserver.observe(pyodideOutput);
 
     let runPython = null;
 
@@ -916,8 +991,74 @@ print(fib(100))</textarea>
       statusNode.className = "status" + (kind ? " " + kind : "");
     }
 
+    function setPyodideStatus(text, kind) {
+      pyodideStatus.textContent = text;
+      pyodideStatus.className = "status" + (kind ? " " + kind : "");
+    }
+
     function setOutput(text) {
       outputNode.textContent = text;
+    }
+
+    const PYODIDE_URL = "https://cdn.jsdelivr.net/pyodide/v0.28.3/full/";
+    let compareOn = false;
+    let pyodidePromise = null;
+
+    function loadPyodideOnce() {
+      if (pyodidePromise === null) {
+        pyodidePromise = (async () => {
+          setPyodideStatus("Loading Pyodide...", "");
+          pyodideOutput.textContent = "Loading Pyodide (about 10 MB)...";
+          try {
+            const { loadPyodide } = await import(PYODIDE_URL + "pyodide.mjs");
+            const pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
+            setPyodideStatus("Ready", "ready");
+            pyodideOutput.textContent = "Pyodide is ready.\n\nPress Run to run the source on both.";
+            return pyodide;
+          } catch (error) {
+            setPyodideStatus("Failed to load Pyodide", "error");
+            pyodideOutput.textContent = String(error.message || error);
+            pyodidePromise = null;
+            throw error;
+          }
+        })();
+      }
+      return pyodidePromise;
+    }
+
+    function setCompare(on) {
+      compareOn = on;
+      pyodideWrap.hidden = !on;
+      playgroundGrid.classList.toggle("comparing", on);
+      compareToggle.setAttribute("aria-pressed", String(on));
+      compareToggle.textContent = on ? "Hide Pyodide" : "Show Pyodide";
+      pyreLabel.textContent = on ? "pyre" : "Output";
+      if (on) {
+        loadPyodideOnce().catch(() => {});
+      } else {
+        compareVerdict.hidden = true;
+      }
+    }
+
+    compareToggle.addEventListener("click", () => {
+      setCompare(!compareOn);
+    });
+
+    function runOnPyodide(pyodide, source) {
+      let text = "";
+      pyodide.setStdout({ batched: (s) => { text += s + "\n"; } });
+      pyodide.setStderr({ batched: (s) => { text += s + "\n"; } });
+      const t0 = performance.now();
+      try {
+        pyodide.runPython(source, { globals: pyodide.globals.get("dict")() });
+      } catch (error) {
+        text += String(error.message || error);
+      }
+      const ms = performance.now() - t0;
+      if (text.endsWith("\n")) {
+        text = text.slice(0, -1);
+      }
+      return { text, ms };
     }
 
     async function setup() {
@@ -927,6 +1068,10 @@ print(fib(100))</textarea>
         const { jit_set_memory, jit_set_table } = await import("./jit_glue.js");
         jit_set_memory(wasm.memory);
         if (wasm.__indirect_function_table) { jit_set_table(wasm.__indirect_function_table); }
+        // Initialize the interpreter now so the first Run times only the program,
+        // as loadPyodide does for Pyodide.
+        setStatus("Starting interpreter...", "");
+        run_python("pass");
         runPython = run_python;
         runButton.disabled = false;
         setStatus("Ready", "ready");
@@ -943,29 +1088,73 @@ print(fib(100))</textarea>
         return;
       }
 
+      const comparing = compareOn;
       runButton.disabled = true;
       setStatus("Running...", "");
       runTimeNode.textContent = "";
+      if (comparing) {
+        pyodideTime.textContent = "";
+        setPyodideStatus("Waiting for pyre...", "");
+        compareVerdict.hidden = true;
+      }
 
-      setTimeout(() => {
+      setTimeout(async () => {
+        let pyreOk = false;
+        let result;
+        let pyreElapsedMs;
         try {
           const t0 = performance.now();
-          const result = runPython(sourceNode.value);
-          const elapsed = (performance.now() - t0).toFixed(1);
+          result = runPython(sourceNode.value);
+          pyreElapsedMs = performance.now() - t0;
+          const elapsed = pyreElapsedMs.toFixed(1);
           setOutput(result);
           runTimeNode.textContent = elapsed + " ms";
           setStatus("Ready", "ready");
+          pyreOk = true;
         } catch (error) {
           console.error(error);
           setStatus("Execution failed", "error");
           setOutput(String(error));
-        } finally {
-          runButton.disabled = false;
         }
+
+        if (pyreOk && comparing) {
+          try {
+            setPyodideStatus("Running...", "");
+            const pyodide = await loadPyodideOnce();
+            await new Promise((r) => setTimeout(r, 10));
+            const { text, ms } = runOnPyodide(pyodide, sourceNode.value);
+            pyodideOutput.textContent = text;
+            pyodideTime.textContent = ms.toFixed(1) + " ms";
+            setPyodideStatus("Ready", "ready");
+            compareVerdict.textContent = "";
+            const verdict = pyreElapsedMs <= ms
+              ? "pyre is " + (ms / pyreElapsedMs).toFixed(1) + "× faster"
+              : "Pyodide is " + (pyreElapsedMs / ms).toFixed(1) + "× faster";
+            compareVerdict.appendChild(document.createTextNode(verdict));
+            const matchSpan = document.createElement("span");
+            if (result.trim() === text.trim()) {
+              matchSpan.className = "match";
+              matchSpan.textContent = "✓ same output";
+            } else {
+              matchSpan.className = "mismatch";
+              matchSpan.textContent = "outputs differ";
+            }
+            compareVerdict.appendChild(matchSpan);
+            compareVerdict.hidden = false;
+          } catch (error) {
+            console.error(error);
+            setPyodideStatus("Error", "error");
+            pyodideOutput.textContent = String(error.message || error);
+          }
+        } else if (comparing) {
+          setPyodideStatus("Ready", "ready");
+        }
+
+        runButton.disabled = false;
       }, 10);
     });
 
-    for (const example of examples) {
+    function addExampleChip(example) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "example-chip";
@@ -973,6 +1162,23 @@ print(fib(100))</textarea>
       button.dataset.example = example.id;
       button.setAttribute("aria-pressed", example.id === "fib" ? "true" : "false");
       exampleBar.appendChild(button);
+    }
+
+    for (const example of examples) {
+      if (!example.bench) {
+        addExampleChip(example);
+      }
+    }
+
+    const exampleGroup = document.createElement("span");
+    exampleGroup.className = "example-group";
+    exampleGroup.textContent = "Benchmarks";
+    exampleBar.appendChild(exampleGroup);
+
+    for (const example of examples) {
+      if (example.bench) {
+        addExampleChip(example);
+      }
     }
 
     exampleBar.addEventListener("click", (event) => {
