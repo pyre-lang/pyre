@@ -1,3 +1,10 @@
+# pyre-check: max-pypy-ratio=9.5
+#
+# Floor is 9.5 / 6 = 1.583x. macOS arm64 dynasm measured 5.8x, 5.9x, 5.8x,
+# 5.8x, 5.7x against pypy (0.35s vs 0.06s exec time on the median run).
+# Before the LOAD_GLOBAL residual was classified replay-safe the same
+# workload ran about 8x slower, past this ceiling.
+#
 # A self-recursive function defined and driven in code executed with a
 # plain `{}` as globals.  Its `LOAD_GLOBAL` cannot fold to a constant, so
 # the walker runs the globals lookup as a residual; that lookup reads only
@@ -14,7 +21,7 @@ def fib(n):
     return fib(n - 1) + fib(n - 2)
 
 total = 0
-for i in range(27):
+for i in range(30):
     total += fib(i)
 '''
 
